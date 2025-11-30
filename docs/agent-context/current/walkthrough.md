@@ -1,27 +1,36 @@
-# Walkthrough - Phase 3: Documentation & Design Refinement
+# Phase 3.5: Self-Hosting & Robustness Walkthrough
 
-**Goal**: Establish a documentation site (Astro Starlight) to document the tool, serving the needs of our modes.
+## Overview
+
+In this sub-phase, we focused on "dogfooding" `locald` by using it to host its own documentation site (`locald-docs`). This process exposed several issues with process management and CLI ergonomics, which we addressed.
 
 ## Changes
 
-### Design Refinement
+### 1. Self-Hosting Documentation
+We created a `locald.toml` in `locald-docs/` to run the Astro dev server.
+```toml
+[project]
+name = "locald-docs"
 
-- Updated `docs/design/interaction-modes.md` to explicitly define the **Personas** associated with each mode:
-  - **Daemon Mode** -> **The System**
-  - **Project Mode** -> **The Developer**
-  - **Global Mode** -> **The Operator**
-  - **Interactive Mode** -> **The Observer**
-- Conducted a "Fresh Eyes" review of the Axioms vs. Implementation.
-  - Confirmed that Phase 1 & 2 implementation aligns with Axioms 1, 2, 4, and 6.
-  - Confirmed that Axiom 3 (Managed Ports) is partially implemented (Dynamic Ports), with DNS/Proxy scheduled for Phase 4.
+[services.web]
+command = "pnpm astro dev --port $PORT"
+```
 
-### Documentation Site
+### 2. Daemon Robustness
+- **Stdin Handling**: We discovered that background processes inheriting `stdin` from the daemon would crash (SIGTTIN/EIO) when the daemon was detached. We fixed this by explicitly setting `stdin(Stdio::null())` for child processes in `ProcessManager`.
+- **Detachment**: We switched to using `setsid` when spawning the daemon from the CLI. This creates a new session, ensuring the daemon is fully detached from the CLI's terminal and survives `Ctrl+C`.
+- **Idempotency**: We updated `locald server` to check if the daemon is already running (via IPC Ping) before attempting to start it. This prevents "Address in use" errors and zombie processes.
 
-- Initialized a new Astro Starlight project in `locald-docs/`.
-- Configured `astro.config.mjs` with project metadata and sidebar structure.
-- Created core documentation content:
-  - **Landing Page**: Overview of features and value proposition.
-  - **Concepts**: Detailed explanation of the 4 Interaction Modes and Personas, plus Architecture.
-  - **Guides**: "Getting Started" guide for installation and first run.
-  - **Reference**: Configuration options (`locald.toml`) and CLI command reference.
-- Verified the site builds successfully with `pnpm build`.
+### 3. CLI Improvements
+- **`shutdown`**: Added a dedicated command to gracefully stop the daemon.
+- **`stop`**: Made the command context-aware. If run without arguments in a directory with `locald.toml`, it stops the services defined in that file.
+- **`status`**: Improved the output table to include a `URL` column, making it easier to access running services.
+- **Error Handling**: Improved client error messages when the daemon is not running.
+
+## Verification
+We verified these changes by:
+1. Starting the daemon (`locald server`).
+2. Starting the docs (`cd locald-docs && locald start`).
+3. Verifying the site is accessible at the URL shown in `locald status`.
+4. Stopping the docs (`locald stop`).
+5. Shutting down the daemon (`locald shutdown`).

@@ -57,6 +57,7 @@ This provides a real-time view of the system.
 ### The Daemon (`locald-server`)
 
 The daemon is a long-running process that:
+
 1.  Manages child processes (your services).
 2.  Assigns dynamic ports.
 3.  Routes traffic (future).
@@ -65,6 +66,7 @@ The daemon is a long-running process that:
 ### The Client (`locald-cli`)
 
 The `locald` command is a thin client. When you run a command:
+
 1.  It reads the local configuration (`locald.toml`).
 2.  It connects to the daemon via the Unix Socket.
 3.  It sends a JSON command (e.g., "Start this service").

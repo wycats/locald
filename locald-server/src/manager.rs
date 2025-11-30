@@ -138,4 +138,15 @@ impl ProcessManager {
         }
         results
     }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut services = self.services.lock().await;
+        for (name, service) in services.iter_mut() {
+            if let Some(mut child) = service.process.take() {
+                info!("Stopping service {} (shutdown)", name);
+                let _ = child.kill().await;
+            }
+        }
+        Ok(())
+    }
 }

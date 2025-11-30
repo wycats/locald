@@ -41,3 +41,15 @@
 **Context**: Users expect `locald server` to run in the background without blocking the terminal.
 **Decision**: The `locald-cli`'s `server` command spawns the `locald-server` binary as a detached child process. This keeps the server binary simple (foreground only) while providing a good UX.
 **Status**: Accepted.
+
+## 008. Daemon Detachment: setsid
+
+**Context**: Simply spawning a background process isn't enough; if the CLI is killed (Ctrl-C), the child might die if it's in the same process group.
+**Decision**: Use `setsid` when spawning `locald-server` to create a new session and fully detach it from the CLI's terminal.
+**Status**: Accepted.
+
+## 009. Server Idempotency
+
+**Context**: Running `locald server` multiple times shouldn't cause errors or zombie processes.
+**Decision**: The CLI checks if the daemon is already running (via IPC Ping) before attempting to start it. If running, it exits gracefully.
+**Status**: Accepted.

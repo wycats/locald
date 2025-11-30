@@ -182,6 +182,7 @@ dependencies = [
  "clap",
  "locald-core",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

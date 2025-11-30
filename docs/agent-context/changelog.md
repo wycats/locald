@@ -12,6 +12,9 @@ History of completed phases and key changes.
 - Documented core concepts: Interaction Modes, Personas, and Architecture.
 - Created "Getting Started" guide and CLI/Configuration references.
 - Refined design axioms and interaction modes based on "Fresh Eyes" review.
+- **Self-Hosting**: Configured `locald` to host its own documentation (`locald-docs`).
+- **Robustness**: Implemented `setsid` for true daemon detachment and server idempotency.
+- **CLI Improvements**: Added `shutdown` command, context-aware `stop`, and URL display in `status`.
 
 ## Phase 2: Process Management (2025-11-30)
 
