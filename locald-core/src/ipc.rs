@@ -15,6 +15,7 @@ pub enum IpcRequest {
     Start { path: PathBuf },
     Stop { name: String },
     Status,
+    Shutdown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

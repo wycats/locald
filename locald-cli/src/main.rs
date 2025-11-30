@@ -31,6 +31,8 @@ enum Commands {
     },
     /// List running services
     Status,
+    /// Shutdown the locald daemon
+    Shutdown,
 }
 
 fn main() -> Result<()> {
@@ -48,7 +50,7 @@ fn main() -> Result<()> {
             let running = matches!(client::send_request(IpcRequest::Ping), Ok(IpcResponse::Pong));
 
             if running {
-                println!("locald-server is already running. Attaching to logs...");
+                println!("locald-server is already running.");
             } else {
                 let exe_path = std::env::current_exe()?;
                 let server_path = exe_path.parent().unwrap().join("locald-server");
@@ -67,19 +69,8 @@ fn main() -> Result<()> {
                     .stderr(log_file)
                     .spawn()?;
                     
-                println!("locald-server started. Attaching to logs...");
-                // Give it a moment to start logging
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                println!("locald-server started. Logs at /tmp/locald.log");
             }
-
-            // Tail the logs
-            let mut tail = std::process::Command::new("tail")
-                .arg("-f")
-                .arg("/tmp/locald.log")
-                .spawn()?;
-            
-            // Wait for tail to finish (e.g. user presses Ctrl-C)
-            let _ = tail.wait();
         }
         Commands::Start { path } => {
             let abs_path = std::fs::canonicalize(path)?;
@@ -96,6 +87,12 @@ fn main() -> Result<()> {
         }
         Commands::Status => {
             match client::send_request(IpcRequest::Status) {
+                Ok(response) => println!("{:?}", response),
+                Err(e) => println!("Error: {}", e),
+            }
+        }
+        Commands::Shutdown => {
+            match client::send_request(IpcRequest::Shutdown) {
                 Ok(response) => println!("{:?}", response),
                 Err(e) => println!("Error: {}", e),
             }

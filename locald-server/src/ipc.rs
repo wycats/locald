@@ -2,12 +2,13 @@ use anyhow::Result;
 use locald_core::{IpcRequest, IpcResponse};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::Sender;
 use tracing::{info, error};
 use crate::manager::ProcessManager;
 
 const SOCKET_PATH: &str = "/tmp/locald.sock";
 
-pub async fn run_ipc_server(manager: ProcessManager) -> Result<()> {
+pub async fn run_ipc_server(manager: ProcessManager, shutdown_tx: Sender<()>) -> Result<()> {
     if std::fs::metadata(SOCKET_PATH).is_ok() {
         // Try to connect to see if it's alive
         if UnixStream::connect(SOCKET_PATH).await.is_ok() {
@@ -24,8 +25,9 @@ pub async fn run_ipc_server(manager: ProcessManager) -> Result<()> {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let manager = manager.clone();
+                let shutdown_tx = shutdown_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, manager).await {
+                    if let Err(e) = handle_connection(stream, manager, shutdown_tx).await {
                         error!("Error handling connection: {}", e);
                     }
                 });
@@ -37,7 +39,7 @@ pub async fn run_ipc_server(manager: ProcessManager) -> Result<()> {
     }
 }
 
-async fn handle_connection(mut stream: UnixStream, manager: ProcessManager) -> Result<()> {
+async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shutdown_tx: Sender<()>) -> Result<()> {
     let mut buf = [0; 4096];
     let n = stream.read(&mut buf).await?;
     
@@ -65,6 +67,10 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager) -> R
         IpcRequest::Status => {
             let status = manager.list().await;
             IpcResponse::Status(status)
+        }
+        IpcRequest::Shutdown => {
+            let _ = shutdown_tx.send(()).await;
+            IpcResponse::Ok
         }
     };
 
