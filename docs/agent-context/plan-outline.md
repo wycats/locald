@@ -17,9 +17,9 @@
 
 **Goal**: The daemon can spawn and manage child processes based on configuration.
 
-- [ ] Implement Process Manager (spawn, stop, restart).
-- [ ] Capture stdout/stderr.
-- [ ] Handle environment variables (PORT assignment).
+- [x] Implement Process Manager (spawn, stop, restart).
+- [x] Capture stdout/stderr.
+- [x] Handle environment variables (PORT assignment).
 
 ### Phase 3: Local DNS & Routing
 

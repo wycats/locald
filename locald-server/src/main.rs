@@ -1,7 +1,9 @@
 use anyhow::Result;
 use tracing::{info, warn};
+use crate::manager::ProcessManager;
 
 mod ipc;
+mod manager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -9,9 +11,11 @@ async fn main() -> Result<()> {
 
     info!("locald-server starting...");
 
+    let manager = ProcessManager::new();
+
     // Run IPC server
-    tokio::spawn(async {
-        if let Err(e) = ipc::run_ipc_server().await {
+    tokio::spawn(async move {
+        if let Err(e) = ipc::run_ipc_server(manager).await {
             warn!("IPC server error: {}", e);
         }
     });

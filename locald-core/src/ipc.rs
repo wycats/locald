@@ -1,15 +1,26 @@
 use serde::{Deserialize, Serialize};
-use crate::config::LocaldConfig;
+use std::path::PathBuf;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServiceStatus {
+    pub name: String,
+    pub pid: Option<u32>,
+    pub port: Option<u16>,
+    pub status: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcRequest {
     Ping,
-    Register(LocaldConfig),
+    Start { path: PathBuf },
+    Stop { name: String },
+    Status,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcResponse {
     Pong,
     Ok,
+    Status(Vec<ServiceStatus>),
     Error(String),
 }

@@ -1,0 +1,5 @@
+[project]
+name = "dummy"
+
+[services.web]
+command = "./server.sh"

@@ -1,32 +1,31 @@
-# Phase 1 Walkthrough: Scaffolding & Basic IPC
+# Walkthrough - Phase 2: Process Management
 
-## Overview
-In this phase, we established the foundational structure of the `locald` project. We set up a Rust workspace with three crates: `locald-server` (the daemon), `locald-cli` (the user interface), and `locald-core` (shared types and configuration). We also implemented a basic IPC mechanism using Unix Domain Sockets to allow the CLI to communicate with the server.
+**Goal**: The daemon can spawn and manage child processes based on configuration.
 
 ## Changes
 
-### 1. Workspace Structure
-We created a Cargo workspace with the following members:
-- **`locald-core`**: Contains shared definitions, including the `LocaldConfig` struct (using `serde`) and the IPC protocol (`IpcRequest`, `IpcResponse`).
-- **`locald-server`**: The long-running daemon process. It currently sets up a Tokio runtime, handles `SIGINT` for graceful shutdown, and runs the IPC server.
-- **`locald-cli`**: The command-line interface. It parses arguments using `clap` and communicates with the server via the IPC socket.
+### Process Manager
+We implemented a `ProcessManager` in `locald-server` that maintains a registry of running services.
+- It uses `tokio::process::Command` to spawn child processes.
+- It automatically assigns a free port and injects it as `PORT` environment variable.
+- It captures `stdout` and `stderr` (currently inheriting to the daemon's output).
 
-### 2. IPC Mechanism
-We implemented a simple request/response protocol over Unix Domain Sockets (`/tmp/locald.sock`).
-- The server listens on the socket and spawns a task for each incoming connection.
-- The protocol uses newline-delimited JSON for simplicity and debuggability.
-- We implemented a `Ping` command to verify connectivity.
+### IPC Protocol
+We added new commands to the IPC protocol:
+- `Start { path }`: Tells the daemon to read `locald.toml` at the given path and start the services defined therein.
+- `Stop { name }`: Stops a service by name.
+- `Status`: Returns a list of services with their PID, port, and status.
 
-### 3. Configuration Schema
-We defined the initial `LocaldConfig` schema in `locald-core`. This schema is designed to be decentralized, living in `locald.toml` files within project repositories.
+### CLI
+We added corresponding subcommands to the CLI:
+- `locald server`: Starts the `locald-server` daemon in the background (detached).
+- `locald start [path]`: Starts the project in the given path (defaults to current dir).
+- `locald stop <name>`: Stops a service.
+- `locald status`: Lists running services.
 
-### 4. Design Documentation
-We fleshed out the architectural principles of the project:
-- **Design Axioms**: A set of 6 core principles guiding the development (Decentralized Config, Daemon First, Managed Ports/DNS, Process Ownership, Interface Parity, 12-Factor).
-- **Interaction Modes**: Defined the different ways users will interact with the system (Foreman, Hostctl, etc.).
-
-## Verification
-We verified the implementation by running the `locald-server` and executing `locald-cli ping`. The server successfully received the request and responded with "Pong".
-
-## Next Steps
-With the foundation in place, we are ready to move to **Phase 2: Process Management**, where we will implement the core logic for spawning and managing child processes defined in the configuration.
+## Verification Results
+We verified the functionality using a dummy service script (`examples/dummy-service`).
+- The daemon starts in the background.
+- The service starts and receives a random port.
+- `locald status` correctly reports the service as running.
+- `locald stop` terminates the process.

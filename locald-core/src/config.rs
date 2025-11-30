@@ -1,21 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocaldConfig {
     pub project: ProjectConfig,
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: String,
     /// The domain to serve the project on. Defaults to `{name}.local`.
     pub domain: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     /// The command to run to start the service.
     pub command: String,

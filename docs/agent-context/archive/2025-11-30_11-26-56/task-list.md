@@ -1,0 +1,7 @@
+- [x] Initialize Rust workspace (server, cli, core)
+- [x] Define configuration schema (`locald.toml`)
+- [x] Implement basic Daemon (server) with Tokio
+- [x] Implement basic CLI with Clap
+- [x] Implement IPC mechanism (Unix Domain Sockets)
+- [x] Implement `ping` command for verification
+- [x] Create initial Design Axioms and Interaction Modes documentation
