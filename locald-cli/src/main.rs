@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use locald_core::IpcRequest;
+use locald_core::{IpcRequest, IpcResponse};
 
 mod client;
 
@@ -44,22 +44,42 @@ fn main() -> Result<()> {
             }
         }
         Commands::Server => {
-            let exe_path = std::env::current_exe()?;
-            let server_path = exe_path.parent().unwrap().join("locald-server");
+            // Check if already running
+            let running = matches!(client::send_request(IpcRequest::Ping), Ok(IpcResponse::Pong));
 
-            if !server_path.exists() {
-                anyhow::bail!("Could not find locald-server binary at {:?}", server_path);
+            if running {
+                println!("locald-server is already running. Attaching to logs...");
+            } else {
+                let exe_path = std::env::current_exe()?;
+                let server_path = exe_path.parent().unwrap().join("locald-server");
+
+                if !server_path.exists() {
+                    anyhow::bail!("Could not find locald-server binary at {:?}", server_path);
+                }
+
+                println!("Starting locald-server in the background...");
+                let log_file = std::fs::File::create("/tmp/locald.log")?;
+                
+                // Use setsid to detach the server from the current session so it survives Ctrl-C
+                std::process::Command::new("setsid")
+                    .arg(server_path)
+                    .stdout(log_file.try_clone()?)
+                    .stderr(log_file)
+                    .spawn()?;
+                    
+                println!("locald-server started. Attaching to logs...");
+                // Give it a moment to start logging
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
 
-            println!("Starting locald-server in the background...");
-            let log_file = std::fs::File::create("/tmp/locald.log")?;
-            
-            std::process::Command::new(server_path)
-                .stdout(log_file.try_clone()?)
-                .stderr(log_file)
+            // Tail the logs
+            let mut tail = std::process::Command::new("tail")
+                .arg("-f")
+                .arg("/tmp/locald.log")
                 .spawn()?;
-                
-            println!("locald-server started. Logs at /tmp/locald.log");
+            
+            // Wait for tail to finish (e.g. user presses Ctrl-C)
+            let _ = tail.wait();
         }
         Commands::Start { path } => {
             let abs_path = std::fs::canonicalize(path)?;

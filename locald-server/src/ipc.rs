@@ -9,6 +9,11 @@ const SOCKET_PATH: &str = "/tmp/locald.sock";
 
 pub async fn run_ipc_server(manager: ProcessManager) -> Result<()> {
     if std::fs::metadata(SOCKET_PATH).is_ok() {
+        // Try to connect to see if it's alive
+        if UnixStream::connect(SOCKET_PATH).await.is_ok() {
+            anyhow::bail!("Socket {} is already in use. Is locald-server already running?", SOCKET_PATH);
+        }
+        // If we can't connect, it's likely a stale socket
         std::fs::remove_file(SOCKET_PATH)?;
     }
 
