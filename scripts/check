@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+echo "Running cargo build..."
+cargo build
+
+echo "Running IPC verification..."
+./target/debug/locald-server &
+SERVER_PID=$!
+sleep 2
+
+if ./target/debug/locald-cli ping | grep -q "Pong"; then
+    echo "IPC Ping successful"
+else
+    echo "IPC Ping failed"
+    kill $SERVER_PID
+    exit 1
+fi
+
+kill $SERVER_PID
+echo "All checks passed."

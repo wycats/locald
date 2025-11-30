@@ -1,0 +1,1 @@
+/home/ykatz/Code/Personal/dotlocal/target/debug/liblocald_core.rlib: /home/ykatz/Code/Personal/dotlocal/locald-core/src/config.rs /home/ykatz/Code/Personal/dotlocal/locald-core/src/ipc.rs /home/ykatz/Code/Personal/dotlocal/locald-core/src/lib.rs

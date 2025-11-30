@@ -1,0 +1,1 @@
+/home/ykatz/Code/Personal/dotlocal/target/debug/locald-cli: /home/ykatz/Code/Personal/dotlocal/locald-cli/src/client.rs /home/ykatz/Code/Personal/dotlocal/locald-cli/src/main.rs /home/ykatz/Code/Personal/dotlocal/locald-core/src/config.rs /home/ykatz/Code/Personal/dotlocal/locald-core/src/ipc.rs /home/ykatz/Code/Personal/dotlocal/locald-core/src/lib.rs

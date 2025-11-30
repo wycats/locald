@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "locald-server",
+    "locald-cli",
+    "locald-core",
+]
+resolver = "2"
