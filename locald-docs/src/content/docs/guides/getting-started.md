@@ -35,9 +35,11 @@ locald ping
 2.  Create a `locald.toml` file:
 
 ```toml
-[service]
+[project]
 name = "my-app"
-command = "python3 -m http.server $PORT"
+
+[services]
+web = { command = "python3 -m http.server $PORT" }
 ```
 
 3.  Start the service:
@@ -53,3 +55,37 @@ locald status
 ```
 
 You should see your app running on a dynamically assigned port!
+
+## Next Steps: Go Public (Locally)
+
+Accessing `localhost:34123` is annoying. Let's give it a real domain.
+
+1.  Update `locald.toml` to add a domain:
+
+```toml
+[project]
+name = "my-app"
+domain = "my-app.local"
+
+[services]
+web = { command = "python3 -m http.server $PORT" }
+```
+
+2.  Restart the service:
+
+```bash
+locald stop
+locald start
+```
+
+3.  Configure your system (one-time setup):
+
+```bash
+# Allow locald to bind port 80
+sudo locald admin setup
+
+# Point my-app.local to 127.0.0.1
+sudo locald admin sync-hosts
+```
+
+4.  Visit `http://my-app.local` in your browser!

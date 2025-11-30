@@ -8,24 +8,30 @@ The `locald.toml` file defines how `locald` runs your service.
 ## Schema
 
 ```toml
-[service]
-# The name of the service. Must be unique per project.
-name = "my-service"
+[project]
+# The name of the project. Used for namespacing services.
+name = "my-project"
 
-# The command to run.
-# $PORT will be replaced by the assigned port.
-command = "npm start"
+# Optional: The domain to serve the project on.
+# If set, locald will route requests from this domain to your services.
+domain = "my-app.local"
 
+[services]
+# Define services as a map. The key is the service name.
+web = { command = "npm start", port = 3000 }
+worker = { command = "npm run worker" }
+
+# Extended syntax for more options
+[services.api]
+command = "cargo run"
 # Optional: Working directory (defaults to the directory containing locald.toml)
-# work_dir = "./backend"
-
+workdir = "./backend"
 # Optional: Environment variables
-[service.env]
-NODE_ENV = "development"
+env = { RUST_LOG = "debug" }
 ```
 
 ## Environment Variables
 
 `locald` automatically injects the following environment variables into your process:
 
-- `PORT`: The dynamically assigned TCP port.
+- `PORT`: The dynamically assigned TCP port. Your service **must** listen on this port.
