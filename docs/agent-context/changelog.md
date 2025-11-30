@@ -6,6 +6,14 @@ History of completed phases and key changes.
 
 <!-- agent-template end -->
 
+## Phase 4: Local DNS & Routing (2025-11-30)
+
+- **Reverse Proxy**: Implemented a `hyper`-based reverse proxy in `locald-server` listening on port 80 (with 8080 fallback).
+- **Domain Routing**: Requests are routed to services based on the `Host` header matching the project's `domain` config.
+- **Hosts File Management**: Implemented `HostsFileSection` manager in `locald-core` to safely manage local domains in `/etc/hosts`.
+- **Admin Commands**: Added `locald admin setup` (for `setcap`) and `locald admin sync-hosts` to `locald-cli`.
+- **Documentation**: Added "DNS and Domains" guide and updated CLI reference.
+
 ## Phase 3: Documentation & Design Refinement (2025-11-30)
 
 - Established documentation site using Astro Starlight in `locald-docs/`.

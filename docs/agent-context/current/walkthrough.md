@@ -1,36 +1,25 @@
-# Phase 3.5: Self-Hosting & Robustness Walkthrough
+# Phase 4 Walkthrough: Local DNS & Routing
 
 ## Overview
-
-In this sub-phase, we focused on "dogfooding" `locald` by using it to host its own documentation site (`locald-docs`). This process exposed several issues with process management and CLI ergonomics, which we addressed.
+This phase focuses on enabling domain-based access to services (e.g., `http://app.local`) via a reverse proxy and `hosts` file management.
 
 ## Changes
 
-### 1. Self-Hosting Documentation
-We created a `locald.toml` in `locald-docs/` to run the Astro dev server.
-```toml
-[project]
-name = "locald-docs"
+### Hosts File Management
+We implemented a `HostsFileSection` manager in `locald-core` that safely manages a block of domains in `/etc/hosts` (or Windows equivalent). It uses `# BEGIN locald` and `# END locald` markers to avoid touching other entries.
 
-[services.web]
-command = "pnpm astro dev --port $PORT"
-```
+### CLI Admin Commands
+We added a new `admin` subcommand group to `locald-cli`:
+- `locald admin setup`: Applies `setcap cap_net_bind_service=+ep` to the `locald-server` binary, allowing it to bind port 80 without running as root.
+- `locald admin sync-hosts`: Fetches the list of running services from the daemon and updates the hosts file to point their domains to `127.0.0.1`.
 
-### 2. Daemon Robustness
-- **Stdin Handling**: We discovered that background processes inheriting `stdin` from the daemon would crash (SIGTTIN/EIO) when the daemon was detached. We fixed this by explicitly setting `stdin(Stdio::null())` for child processes in `ProcessManager`.
-- **Detachment**: We switched to using `setsid` when spawning the daemon from the CLI. This creates a new session, ensuring the daemon is fully detached from the CLI's terminal and survives `Ctrl+C`.
-- **Idempotency**: We updated `locald server` to check if the daemon is already running (via IPC Ping) before attempting to start it. This prevents "Address in use" errors and zombie processes.
+### Reverse Proxy
+We implemented a `ProxyManager` in `locald-server` using `hyper` and `hyper-util`.
+- It listens on Port 80 by default.
+- If Port 80 is unavailable (e.g., permission denied), it falls back to Port 8080.
+- It inspects the `Host` header of incoming requests.
+- It queries the `ProcessManager` to find a running service with a matching `domain` in its configuration.
+- It forwards the request to the service's assigned port.
 
-### 3. CLI Improvements
-- **`shutdown`**: Added a dedicated command to gracefully stop the daemon.
-- **`stop`**: Made the command context-aware. If run without arguments in a directory with `locald.toml`, it stops the services defined in that file.
-- **`status`**: Improved the output table to include a `URL` column, making it easier to access running services.
-- **Error Handling**: Improved client error messages when the daemon is not running.
-
-## Verification
-We verified these changes by:
-1. Starting the daemon (`locald server`).
-2. Starting the docs (`cd locald-docs && locald start`).
-3. Verifying the site is accessible at the URL shown in `locald status`.
-4. Stopping the docs (`locald stop`).
-5. Shutting down the daemon (`locald shutdown`).
+### Integration
+The `locald-server` main loop now starts the `ProxyManager` alongside the IPC server.

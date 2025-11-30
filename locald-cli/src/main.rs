@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
+use locald_core::{IpcRequest, IpcResponse, LocaldConfig, HostsFileSection};
+use std::collections::HashSet;
 
 mod client;
 
@@ -33,6 +34,19 @@ enum Commands {
     Status,
     /// Shutdown the locald daemon
     Shutdown,
+    /// Administrative commands
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommands {
+    /// Setup locald permissions (requires sudo)
+    Setup,
+    /// Sync hosts file with running services (requires sudo)
+    SyncHosts,
 }
 
 fn main() -> Result<()> {
@@ -131,6 +145,64 @@ fn main() -> Result<()> {
             match client::send_request(IpcRequest::Shutdown) {
                 Ok(response) => println!("{:?}", response),
                 Err(e) => println!("Error: {}", e),
+            }
+        }
+        Commands::Admin { command } => {
+            match command {
+                AdminCommands::Setup => {
+                    #[cfg(unix)]
+                    if unsafe { libc::getuid() != 0 } {
+                        anyhow::bail!("This command requires root privileges. Please run with sudo.");
+                    }
+
+                    let exe_path = std::env::current_exe()?;
+                    let server_path = exe_path.parent().unwrap().join("locald-server");
+
+                    if !server_path.exists() {
+                        anyhow::bail!("Could not find locald-server binary at {:?}", server_path);
+                    }
+
+                    println!("Applying capabilities to {:?}", server_path);
+                    let status = std::process::Command::new("setcap")
+                        .arg("cap_net_bind_service=+ep")
+                        .arg(&server_path)
+                        .status()
+                        .context("Failed to run setcap")?;
+
+                    if status.success() {
+                        println!("Successfully applied cap_net_bind_service to locald-server.");
+                    } else {
+                        anyhow::bail!("setcap failed.");
+                    }
+                }
+                AdminCommands::SyncHosts => {
+                    #[cfg(unix)]
+                    if unsafe { libc::getuid() != 0 } {
+                        anyhow::bail!("This command requires root privileges. Please run with sudo.");
+                    }
+
+                    // Fetch services
+                    let services = match client::send_request(IpcRequest::Status)? {
+                        IpcResponse::Status(s) => s,
+                        _ => anyhow::bail!("Unexpected response from daemon"),
+                    };
+
+                    let domains: HashSet<String> = services.into_iter()
+                        .filter_map(|s| s.domain)
+                        .collect();
+
+                    let mut domain_list: Vec<String> = domains.into_iter().collect();
+                    domain_list.sort();
+
+                    println!("Syncing {} domains to hosts file...", domain_list.len());
+
+                    let hosts = HostsFileSection::new();
+                    let content = hosts.read().context("Failed to read hosts file")?;
+                    let new_content = hosts.update_content(&content, &domain_list);
+                    hosts.write(&new_content).context("Failed to write hosts file")?;
+
+                    println!("Hosts file updated.");
+                }
             }
         }
     }

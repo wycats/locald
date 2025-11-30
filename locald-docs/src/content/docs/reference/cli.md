@@ -32,3 +32,23 @@ Starts the service defined in the current directory's `locald.toml`.
 ### `locald stop`
 
 Stops the service defined in the current directory's `locald.toml`.
+
+## Admin Commands
+
+### `locald admin setup`
+
+Applies necessary capabilities to the `locald-server` binary to allow binding to privileged ports (like port 80).
+Requires `sudo`.
+
+```bash
+sudo locald admin setup
+```
+
+### `locald admin sync-hosts`
+
+Updates your system's hosts file (`/etc/hosts` or equivalent) to map configured domains to `127.0.0.1`.
+Requires `sudo`.
+
+```bash
+sudo locald admin sync-hosts
+```

@@ -1,9 +1,11 @@
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use crate::manager::ProcessManager;
+use crate::proxy::ProxyManager;
 
 mod ipc;
 mod manager;
+mod proxy;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,6 +21,18 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = ipc::run_ipc_server(manager_clone, shutdown_tx).await {
             warn!("IPC server error: {}", e);
+        }
+    });
+
+    // Run Proxy server
+    let proxy = ProxyManager::new(manager.clone());
+    tokio::spawn(async move {
+        // Try port 80 first
+        if let Err(e) = proxy.start(80).await {
+            warn!("Failed to bind port 80: {}. Trying port 8080...", e);
+            if let Err(e) = proxy.start(8080).await {
+                error!("Failed to bind port 8080: {}. Proxy disabled.", e);
+            }
         }
     });
 

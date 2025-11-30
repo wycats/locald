@@ -34,9 +34,9 @@
 
 **Goal**: Integrate `hostsfile` and a reverse proxy to route `app.local` to the managed port.
 
-- [ ] Implement `hostsfile` integration to manage `/etc/hosts`.
-- [ ] Implement basic HTTP proxy (Hyper/Axum) in the daemon.
-- [ ] Route requests based on Host header.
+- [x] Implement `hostsfile` integration to manage `/etc/hosts`.
+- [x] Implement basic HTTP proxy (Hyper/Axum) in the daemon.
+- [x] Route requests based on Host header.
 
 ### Phase 5: Web UI & TUI Basics
 

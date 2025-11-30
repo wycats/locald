@@ -134,6 +134,7 @@ impl ProcessManager {
                 } else {
                     None
                 },
+                domain: service.config.project.domain.clone(),
             });
         }
         results
@@ -148,5 +149,18 @@ impl ProcessManager {
             }
         }
         Ok(())
+    }
+
+    pub async fn find_port_by_domain(&self, domain: &str) -> Option<u16> {
+        let services = self.services.lock().await;
+        for service in services.values() {
+            if let Some(d) = &service.config.project.domain {
+                if d == domain {
+                    // TODO: Handle multiple services with same domain (e.g. pick 'web')
+                    return service.port;
+                }
+            }
+        }
+        None
     }
 }

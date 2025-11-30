@@ -8,6 +8,7 @@ pub struct ServiceStatus {
     pub port: Option<u16>,
     pub status: String,
     pub url: Option<String>,
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

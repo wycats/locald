@@ -53,3 +53,15 @@
 **Context**: Running `locald server` multiple times shouldn't cause errors or zombie processes.
 **Decision**: The CLI checks if the daemon is already running (via IPC Ping) before attempting to start it. If running, it exits gracefully.
 **Status**: Accepted.
+
+## 010. Privileged Ports: Capabilities over Root
+
+**Context**: We want to bind port 80 for clean URLs, but running the entire daemon as root violates Axiom 04 (Process Ownership).
+**Decision**: The daemon runs as the user. We use `setcap cap_net_bind_service=+ep` on the binary to allow binding low ports. A `locald admin setup` command handles this.
+**Status**: Accepted.
+
+## 011. Hosts File: Section Management
+
+**Context**: We need to map local domains to 127.0.0.1. Modifying `/etc/hosts` is risky and requires root.
+**Decision**: We implement a safe "Section Manager" that only touches lines between `# BEGIN locald` and `# END locald`. The user runs `locald admin sync-hosts` with sudo to apply changes.
+**Status**: Accepted.
