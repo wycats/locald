@@ -1,31 +1,27 @@
-# Walkthrough - Phase 2: Process Management
+# Walkthrough - Phase 3: Documentation & Design Refinement
 
-**Goal**: The daemon can spawn and manage child processes based on configuration.
+**Goal**: Establish a documentation site (Astro Starlight) to document the tool, serving the needs of our modes.
 
 ## Changes
 
-### Process Manager
-We implemented a `ProcessManager` in `locald-server` that maintains a registry of running services.
-- It uses `tokio::process::Command` to spawn child processes.
-- It automatically assigns a free port and injects it as `PORT` environment variable.
-- It captures `stdout` and `stderr` (currently inheriting to the daemon's output).
+### Design Refinement
 
-### IPC Protocol
-We added new commands to the IPC protocol:
-- `Start { path }`: Tells the daemon to read `locald.toml` at the given path and start the services defined therein.
-- `Stop { name }`: Stops a service by name.
-- `Status`: Returns a list of services with their PID, port, and status.
+- Updated `docs/design/interaction-modes.md` to explicitly define the **Personas** associated with each mode:
+  - **Daemon Mode** -> **The System**
+  - **Project Mode** -> **The Developer**
+  - **Global Mode** -> **The Operator**
+  - **Interactive Mode** -> **The Observer**
+- Conducted a "Fresh Eyes" review of the Axioms vs. Implementation.
+  - Confirmed that Phase 1 & 2 implementation aligns with Axioms 1, 2, 4, and 6.
+  - Confirmed that Axiom 3 (Managed Ports) is partially implemented (Dynamic Ports), with DNS/Proxy scheduled for Phase 4.
 
-### CLI
-We added corresponding subcommands to the CLI:
-- `locald server`: Starts the `locald-server` daemon in the background (detached).
-- `locald start [path]`: Starts the project in the given path (defaults to current dir).
-- `locald stop <name>`: Stops a service.
-- `locald status`: Lists running services.
+### Documentation Site
 
-## Verification Results
-We verified the functionality using a dummy service script (`examples/dummy-service`).
-- The daemon starts in the background.
-- The service starts and receives a random port.
-- `locald status` correctly reports the service as running.
-- `locald stop` terminates the process.
+- Initialized a new Astro Starlight project in `locald-docs/`.
+- Configured `astro.config.mjs` with project metadata and sidebar structure.
+- Created core documentation content:
+  - **Landing Page**: Overview of features and value proposition.
+  - **Concepts**: Detailed explanation of the 4 Interaction Modes and Personas, plus Architecture.
+  - **Guides**: "Getting Started" guide for installation and first run.
+  - **Reference**: Configuration options (`locald.toml`) and CLI command reference.
+- Verified the site builds successfully with `pnpm build`.

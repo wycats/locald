@@ -21,7 +21,16 @@
 - [x] Capture stdout/stderr.
 - [x] Handle environment variables (PORT assignment).
 
-### Phase 3: Local DNS & Routing
+### Phase 3: Documentation & Design Refinement
+
+**Goal**: Establish a documentation site (Astro Starlight) to document the tool, serving the needs of our modes.
+
+- [x] Firm up Interaction Modes & Personas.
+- [x] Fresh Eyes review of Axioms & Implementation.
+- [x] Set up Astro Starlight project.
+- [x] Document existing features.
+
+### Phase 4: Local DNS & Routing
 
 **Goal**: Integrate `hostsfile` and a reverse proxy to route `app.local` to the managed port.
 
@@ -29,7 +38,7 @@
 - [ ] Implement basic HTTP proxy (Hyper/Axum) in the daemon.
 - [ ] Route requests based on Host header.
 
-### Phase 4: Web UI & TUI Basics
+### Phase 5: Web UI & TUI Basics
 
 **Goal**: A dashboard to see running apps and logs.
 

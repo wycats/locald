@@ -1,0 +1,36 @@
+---
+title: locald
+description: The local development daemon for the 12-factor era.
+template: splash
+hero:
+  tagline: Manage local services, ports, and domains with ease.
+  image:
+    file: ../../assets/houston.webp
+  actions:
+    - text: Get Started
+      link: /guides/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: Read the Docs
+      link: /concepts/modes/
+      icon: external
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Why locald?
+
+<CardGrid stagger>
+	<Card title="Zero Config Ports" icon="puzzle">
+		Forget `PORT=3000`. `locald` assigns ports dynamically and injects them into your app.
+	</Card>
+	<Card title="Process Management" icon="rocket">
+		Run your backend, frontend, and workers as background services. No more terminal tab explosion.
+	</Card>
+	<Card title="Local Domains" icon="magnifier">
+		Access your apps via `app.local` instead of `localhost:45231`. (Coming Soon)
+	</Card>
+	<Card title="Interaction Modes" icon="open-book">
+		Designed for Developers, Operators, and Observers.
+	</Card>
+</CardGrid>

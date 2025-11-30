@@ -1,23 +1,20 @@
-# Task List - Phase 2: Process Management
+# Task List - Phase 3: Documentation & Design Refinement
 
-- [x] **IPC Protocol**
-  - [x] Update `locald-core/src/ipc.rs` with `Start`, `Stop`, `Status` commands.
-  - [x] Update `locald-core/src/ipc.rs` with `ServiceStatus` response structures.
+- [x] **Design Refinement**
 
-- [x] **Process Manager Core**
-  - [x] Create `locald-server/src/process.rs` (or `manager.rs`).
-  - [x] Implement `Service` struct to hold child process handle and config.
-  - [x] Implement `ProcessManager` struct with `start`, `stop`, `list` methods.
-  - [x] Implement port assignment logic (find free port).
-  - [x] Integrate `ProcessManager` into `locald-server/src/main.rs` (shared state).
+  - [x] Review and update `docs/design/interaction-modes.md`.
+  - [x] Review `docs/design/axioms.md` and implementation alignment.
+  - [x] Update axioms or code if discrepancies are found. (None found, implementation aligns with axioms).
 
-- [x] **CLI Implementation**
-  - [x] Update `locald-cli/src/main.rs` with new subcommands.
-  - [x] Implement `start` command handler (read `locald.toml`, send absolute path to daemon).
-  - [x] Implement `stop` command handler.
-  - [x] Implement `status` command handler.
+- [x] **Documentation Site Setup**
 
-- [x] **Verification**
-  - [x] Verify `start` spawns process.
-  - [x] Verify `PORT` is injected.
-  - [x] Verify `stop` kills process.
+  - [x] Initialize Astro Starlight project in `locald-docs/`.
+  - [x] Configure `astro.config.mjs`.
+  - [x] Ensure site runs locally.
+
+- [x] **Content Creation**
+  - [x] Write `index.mdx` (Landing page).
+  - [x] Write `concepts/modes.md`.
+  - [x] Write `guides/getting-started.md`.
+  - [x] Write `reference/configuration.md`.
+  - [x] Write `reference/cli.md`.
