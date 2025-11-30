@@ -7,6 +7,7 @@ pub struct ServiceStatus {
     pub pid: Option<u32>,
     pub port: Option<u16>,
     pub status: String,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

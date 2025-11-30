@@ -123,6 +123,17 @@ impl ProcessManager {
                 pid: service.process.as_ref().and_then(|p| p.id()),
                 port: service.port,
                 status: if is_running { "running".to_string() } else { "stopped".to_string() },
+                url: if is_running {
+                    service.port.map(|port| {
+                        if let Some(domain) = &service.config.project.domain {
+                            format!("http://{}:{}", domain, port)
+                        } else {
+                            format!("http://localhost:{}", port)
+                        }
+                    })
+                } else {
+                    None
+                },
             });
         }
         results

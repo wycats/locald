@@ -111,13 +111,14 @@ fn main() -> Result<()> {
                     if services.is_empty() {
                         println!("No services running.");
                     } else {
-                        println!("{:<30} {:<10} {:<10} {:<10}", "NAME", "STATUS", "PID", "PORT");
+                        println!("{:<30} {:<10} {:<10} {:<10} {:<30}", "NAME", "STATUS", "PID", "PORT", "URL");
                         for service in services {
-                            println!("{:<30} {:<10} {:<10} {:<10}", 
+                            println!("{:<30} {:<10} {:<10} {:<10} {:<30}", 
                                 service.name, 
                                 service.status, 
                                 service.pid.map(|p| p.to_string()).unwrap_or_default(),
-                                service.port.map(|p| p.to_string()).unwrap_or_default()
+                                service.port.map(|p| p.to_string()).unwrap_or_default(),
+                                service.url.unwrap_or_default()
                             );
                         }
                     }
