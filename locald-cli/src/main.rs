@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use locald_core::{IpcRequest, IpcResponse};
+use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
 
 mod client;
 
@@ -24,10 +24,10 @@ enum Commands {
         #[arg(default_value = ".")]
         path: std::path::PathBuf,
     },
-    /// Stop a running service
+    /// Stop a running service. If no name is provided, stops all services defined in locald.toml in the current directory.
     Stop {
         /// Name of the service to stop
-        name: String,
+        name: Option<String>,
     },
     /// List running services
     Status,
@@ -80,14 +80,49 @@ fn main() -> Result<()> {
             }
         }
         Commands::Stop { name } => {
-            match client::send_request(IpcRequest::Stop { name: name.clone() }) {
-                Ok(response) => println!("{:?}", response),
-                Err(e) => println!("Error: {}", e),
+            let names = if let Some(n) = name {
+                vec![n.clone()]
+            } else {
+                // Try to read locald.toml in current directory
+                let config_path = std::env::current_dir()?.join("locald.toml");
+                if !config_path.exists() {
+                    anyhow::bail!("No service name provided and no locald.toml found in current directory.");
+                }
+                let config_content = std::fs::read_to_string(&config_path)
+                    .context("Failed to read locald.toml")?;
+                let config: LocaldConfig = toml::from_str(&config_content)
+                    .context("Failed to parse locald.toml")?;
+                
+                config.services.keys()
+                    .map(|service_name| format!("{}:{}", config.project.name, service_name))
+                    .collect()
+            };
+
+            for service_name in names {
+                match client::send_request(IpcRequest::Stop { name: service_name.clone() }) {
+                    Ok(response) => println!("Stopping {}: {:?}", service_name, response),
+                    Err(e) => println!("Error stopping {}: {}", service_name, e),
+                }
             }
         }
         Commands::Status => {
             match client::send_request(IpcRequest::Status) {
-                Ok(response) => println!("{:?}", response),
+                Ok(IpcResponse::Status(services)) => {
+                    if services.is_empty() {
+                        println!("No services running.");
+                    } else {
+                        println!("{:<30} {:<10} {:<10} {:<10}", "NAME", "STATUS", "PID", "PORT");
+                        for service in services {
+                            println!("{:<30} {:<10} {:<10} {:<10}", 
+                                service.name, 
+                                service.status, 
+                                service.pid.map(|p| p.to_string()).unwrap_or_default(),
+                                service.port.map(|p| p.to_string()).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+                Ok(response) => println!("Unexpected response: {:?}", response),
                 Err(e) => println!("Error: {}", e),
             }
         }

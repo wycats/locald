@@ -8,3 +8,4 @@ anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
 locald-core = { version = "0.1.0", path = "../locald-core" }
 serde_json = "1.0.145"
+toml = "0.9.8"
