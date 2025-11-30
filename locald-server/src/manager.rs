@@ -67,6 +67,7 @@ impl ProcessManager {
             for (k, v) in &service_config.env {
                 cmd.env(k, v);
             }
+            cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::inherit()); 
             cmd.stderr(Stdio::inherit());
 

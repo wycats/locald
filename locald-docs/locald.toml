@@ -1,0 +1,5 @@
+[project]
+name = "locald-docs"
+
+[services.web]
+command = "pnpm astro dev --port $PORT"
