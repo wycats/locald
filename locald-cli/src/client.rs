@@ -6,7 +6,15 @@ use std::os::unix::net::UnixStream;
 const SOCKET_PATH: &str = "/tmp/locald.sock";
 
 pub fn send_request(request: IpcRequest) -> Result<IpcResponse> {
-    let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    let mut stream = UnixStream::connect(SOCKET_PATH).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("locald is not running (socket not found at {})", SOCKET_PATH)
+        } else if e.kind() == std::io::ErrorKind::ConnectionRefused {
+            anyhow::anyhow!("locald is not running (connection refused at {})", SOCKET_PATH)
+        } else {
+            anyhow::Error::new(e)
+        }
+    })?;
     
     let request_bytes = serde_json::to_vec(&request)?;
     stream.write_all(&request_bytes)?;
