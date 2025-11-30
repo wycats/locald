@@ -19,3 +19,8 @@
 **Context**: Processes need to run in the background, independent of the terminal session.
 **Decision**: Split into `locald-server` (daemon) and `locald-cli` (client).
 **Status**: Accepted.
+
+## 005. IPC: Unix Domain Sockets
+**Context**: The CLI needs a low-latency, reliable way to send commands to the local daemon.
+**Decision**: Use Unix Domain Sockets (specifically `/tmp/locald.sock`) with a newline-delimited JSON protocol.
+**Status**: Accepted.

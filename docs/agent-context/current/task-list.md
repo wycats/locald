@@ -1,8 +1,7 @@
-# Phase 1 Task List
-
-- [x] Initialize Rust workspace (server, cli, core) <!-- id: 0 -->
-- [x] Define `locald.toml` schema in `locald-core` <!-- id: 1 -->
-- [x] Implement `locald-server` entrypoint (Tokio runtime) <!-- id: 2 -->
-- [x] Implement `locald-cli` entrypoint (Clap) <!-- id: 3 -->
-- [x] Implement IPC mechanism (Unix Domain Socket) <!-- id: 4 -->
-- [x] Implement `locald ping` command to verify connectivity <!-- id: 5 -->
+- [x] Initialize Rust workspace (server, cli, core)
+- [x] Define configuration schema (`locald.toml`)
+- [x] Implement basic Daemon (server) with Tokio
+- [x] Implement basic CLI with Clap
+- [x] Implement IPC mechanism (Unix Domain Sockets)
+- [x] Implement `ping` command for verification
+- [x] Create initial Design Axioms and Interaction Modes documentation
