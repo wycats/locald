@@ -4,6 +4,8 @@ use locald_core::{IpcRequest, IpcResponse, LocaldConfig, HostsFileSection};
 use std::collections::HashSet;
 
 mod client;
+mod init;
+mod monitor;
 
 #[derive(Parser)]
 #[command(name = "locald")]
@@ -15,6 +17,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a new locald project
+    Init,
+    /// Monitor running services (TUI)
+    Monitor,
     /// Ping the locald daemon
     Ping,
     /// Start the locald daemon
@@ -54,14 +60,30 @@ enum AdminCommands {
     SyncHosts,
 }
 
+fn handle_ipc_error(e: anyhow::Error) {
+    let msg = e.to_string();
+    if msg.contains("locald is not running") {
+        eprintln!("Error: {}", msg);
+        eprintln!("Hint: Run `locald server` to start the daemon.");
+    } else {
+        eprintln!("Error: {}", e);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Commands::Init => {
+            init::run()?;
+        }
+        Commands::Monitor => {
+            monitor::run()?;
+        }
         Commands::Ping => {
             match client::send_request(IpcRequest::Ping) {
                 Ok(response) => println!("Received: {:?}", response),
-                Err(e) => println!("Error communicating with locald: {}", e),
+                Err(e) => handle_ipc_error(e),
             }
         }
         Commands::Server => {
@@ -95,7 +117,7 @@ fn main() -> Result<()> {
             let abs_path = std::fs::canonicalize(path)?;
             match client::send_request(IpcRequest::Start { path: abs_path }) {
                 Ok(response) => println!("{:?}", response),
-                Err(e) => println!("Error: {}", e),
+                Err(e) => handle_ipc_error(e),
             }
         }
         Commands::Stop { name } => {
@@ -120,7 +142,7 @@ fn main() -> Result<()> {
             for service_name in names {
                 match client::send_request(IpcRequest::Stop { name: service_name.clone() }) {
                     Ok(response) => println!("Stopping {}: {:?}", service_name, response),
-                    Err(e) => println!("Error stopping {}: {}", service_name, e),
+                    Err(e) => handle_ipc_error(e),
                 }
             }
         }
@@ -143,18 +165,18 @@ fn main() -> Result<()> {
                     }
                 }
                 Ok(response) => println!("Unexpected response: {:?}", response),
-                Err(e) => println!("Error: {}", e),
+                Err(e) => handle_ipc_error(e),
             }
         }
         Commands::Logs { service } => {
             if let Err(e) = client::stream_logs(service.clone()) {
-                println!("Error streaming logs: {}", e);
+                handle_ipc_error(e);
             }
         }
         Commands::Shutdown => {
             match client::send_request(IpcRequest::Shutdown) {
                 Ok(response) => println!("{:?}", response),
-                Err(e) => println!("Error: {}", e),
+                Err(e) => handle_ipc_error(e),
             }
         }
         Commands::Admin { command } => {

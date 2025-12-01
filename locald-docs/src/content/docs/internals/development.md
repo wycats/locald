@@ -5,8 +5,8 @@ description: How to set up the development environment for locald.
 
 ## Prerequisites
 
-*   **Rust**: Latest stable version. [Install Rust](https://rustup.rs/).
-*   **Node.js**: Required for building documentation. [Install Node.js](https://nodejs.org/).
+- **Rust**: Latest stable version. [Install Rust](https://rustup.rs/).
+- **Node.js**: Required for building documentation. [Install Node.js](https://nodejs.org/).
 
 ## Building the Project
 
@@ -31,11 +31,11 @@ cargo test
 
 ## Project Structure
 
-*   `locald-cli/`: The command-line interface binary.
-*   `locald-server/`: The daemon binary.
-*   `locald-core/`: Shared library (types, config, IPC).
-*   `locald-docs/`: This documentation site (Astro Starlight).
-*   `examples/`: Example projects for testing.
+- `locald-cli/`: The command-line interface binary.
+- `locald-server/`: The daemon binary.
+- `locald-core/`: Shared library (types, config, IPC).
+- `locald-docs/`: This documentation site (Astro Starlight).
+- `examples/`: Example projects for testing.
 
 ## Working on Documentation
 
@@ -48,4 +48,3 @@ npm run dev
 ```
 
 This will start a local development server at `http://localhost:4321`.
-

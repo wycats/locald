@@ -45,6 +45,7 @@ History of completed phases and key changes.
 **Goal**: Ensure `locald` persists state across restarts.
 
 **Work Completed**:
+
 - Implemented JSON state persistence in `~/.local/share/locald/state.json`.
 - Added `StateManager` to handle loading/saving state.
 - Implemented "Kill & Restart" strategy for process recovery to handle zombie processes.
@@ -56,7 +57,18 @@ History of completed phases and key changes.
 **Goal**: Restructure documentation to serve specific user personas.
 
 **Work Completed**:
+
 - Defined "App Builder", "Power User", and "Contributor" personas in `docs/design/personas.md`.
 - Restructured documentation sidebar into Guides, Concepts, Reference, and Internals.
 - Created new guides: "Basic Configuration", "Architecture Overview", "Development Setup".
 - Refined reference docs for Configuration and CLI.
+
+## Phase 9: CLI Ergonomics & Interactive Mode (2025-11-30)
+
+**Goal**: Improve CLI UX for all personas.
+
+**Work Completed**:
+- Implemented `locald init` using `dialoguer` for interactive project creation.
+- Implemented `locald monitor` using `ratatui` for a real-time TUI dashboard.
+- Improved error handling with actionable hints (e.g., suggesting to start the server).
+- Updated CLI reference documentation.

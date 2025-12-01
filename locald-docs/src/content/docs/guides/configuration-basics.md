@@ -34,6 +34,7 @@ web = { command = "python3 -m http.server $PORT" }
 ```
 
 After adding this, you'll need to run:
+
 1.  `locald stop` and `locald start` to reload the config.
 2.  `sudo locald admin sync-hosts` to update your `/etc/hosts` file (only needed once per new domain).
 

@@ -83,3 +83,15 @@
 **Context**: Documentation was becoming a mix of tutorials and references without a clear audience.
 **Decision**: Structure documentation explicitly around three personas: App Builder (Guides), Power User (Reference), and Contributor (Internals).
 **Status**: Accepted.
+
+## 015. CLI: Interactive Init
+
+**Context**: New users struggle to create valid `locald.toml` files manually.
+**Decision**: Implement `locald init` using `dialoguer` to guide users through project creation.
+**Status**: Accepted.
+
+## 016. CLI: TUI Monitor
+
+**Context**: Users want a real-time dashboard of running services without leaving the terminal.
+**Decision**: Implement `locald monitor` using `ratatui` (community fork of tui-rs) for a robust TUI experience.
+**Status**: Accepted.

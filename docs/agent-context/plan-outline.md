@@ -85,9 +85,9 @@
 
 **Goal**: Improve the user experience of the CLI.
 
-- [ ] Better error messages and help text.
-- [ ] Interactive `locald init` to create `locald.toml`.
-- [ ] `locald monitor` (TUI) using `ratatui`?
+- [x] Better error messages and help text.
+- [x] Interactive `locald init` to create `locald.toml`.
+- [x] `locald monitor` (TUI) using `ratatui`?
 
 ### Phase 10: Multi-Service Dependencies
 

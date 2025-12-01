@@ -1,25 +1,27 @@
-# Phase 8 Walkthrough: Documentation Overhaul
+# Phase 9 Walkthrough: CLI Ergonomics & Interactive Mode
 
 ## Overview
-In this phase, we are restructuring the documentation to better serve our target audiences.
+In this phase, we are focusing on the "User Experience" of the CLI.
 
 ## Key Decisions
 
-### 1. Persona-Based Documentation
-We are explicitly designing documentation sections for specific personas (App Builder, Power User, Contributor) to avoid "one size fits none" content.
+### 1. Interactive Init
+We used `dialoguer` to create a wizard-style interface for `locald init`. This guides the user through creating a valid `locald.toml` without needing to read the documentation first.
+
+### 2. TUI Library
+We chose `ratatui` as it is the community standard fork of `tui-rs`. It provides a robust framework for building terminal UIs.
+
+### 3. Error Hints
+We added a `handle_ipc_error` helper to detect common connection errors and suggest running `locald server`. This directly addresses the "App Builder" persona's need for clear error messages.
 
 ## Changes
 
-### Documentation
-- **`docs/design/personas.md`**: Defined "App Builder", "Power User", and "Contributor" personas.
-- **`locald-docs/astro.config.mjs`**: Updated sidebar to group content by persona needs (Guides, Concepts, Reference, Internals).
-- **`locald-docs/src/content/docs/guides/configuration-basics.md`**: New guide for common config patterns (App Builder).
-- **`locald-docs/src/content/docs/reference/configuration.md`**: Renamed and formatted as a strict reference (Power User).
-- **`locald-docs/src/content/docs/reference/cli.md`**: Updated with clear tables and command lists (Power User).
-- **`locald-docs/src/content/docs/internals/architecture.md`**: New architecture overview with diagrams (Contributor).
-- **`locald-docs/src/content/docs/internals/development.md`**: New setup guide for contributors (Contributor).
+### Codebase
+- **`locald-cli/src/init.rs`**: Implemented interactive project initialization.
+- **`locald-cli/src/monitor.rs`**: Implemented TUI monitor using `ratatui`.
+- **`locald-cli/src/main.rs`**: Added `init` and `monitor` commands, and improved error handling.
+- **`locald-cli/Cargo.toml`**: Added `dialoguer`, `ratatui`, `crossterm`.
 
-## Verification
-- Verified that the new sidebar structure aligns with the personas.
-- Reviewed content for tone and clarity for each target audience.
+### Documentation
+- (Pending updates to CLI reference)
 

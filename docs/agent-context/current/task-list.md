@@ -1,23 +1,20 @@
-# Phase 8 Task List
+# Phase 9 Task List
 
-- [x] **Foundation**
-  - [x] Create `docs/design/personas.md`.
+- [x] **Interactive Init**
+  - [x] Add `dialoguer` to `locald-cli`.
+  - [x] Implement `locald init` logic.
+  - [x] Generate `locald.toml` from user input.
 
-- [x] **Structure**
-  - [x] Audit existing docs.
-  - [x] Update sidebar structure in `locald-docs`.
+- [x] **Error Handling**
+  - [x] Audit existing error messages.
+  - [x] Implement actionable error hints.
 
-- [x] **Content: App Builder**
-  - [x] Write "Getting Started".
-  - [x] Write "Basic Configuration".
-
-- [x] **Content: Power User**
-  - [x] Write "Configuration Reference".
-  - [x] Write "CLI Reference".
-
-- [x] **Content: Contributor**
-  - [x] Write "Architecture Overview".
-  - [x] Write "Development Setup".
+- [x] **TUI Monitor**
+  - [x] Add `ratatui` dependencies.
+  - [x] Implement TUI rendering loop.
+  - [x] Integrate IPC status polling.
 
 - [x] **Verification**
-  - [x] "Fresh Eyes" review: Read through the new docs as each persona.
+  - [x] Test `locald init` in a clean directory.
+  - [x] Test error scenarios.
+  - [x] Verify `locald monitor` updates in real-time.
