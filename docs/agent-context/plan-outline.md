@@ -95,3 +95,15 @@
 
 - [x] Support `depends_on` in `locald.toml`.
 - [x] Topological sort for startup order.
+
+## Epoch 3: Hybrid Development & Advanced Features
+
+**Goal**: Support hybrid workflows (Docker + Local) and advanced networking.
+
+### Phase 11: Docker Integration
+
+**Goal**: Unified lifecycle for local apps and Docker containers.
+
+- [ ] Support `image` in `locald.toml`.
+- [ ] Manage Docker container lifecycle (run/stop).
+- [ ] Unified logging for containers.

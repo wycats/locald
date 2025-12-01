@@ -1,16 +1,14 @@
-# Phase 10 Task List
+# Phase 11 Task List
 
-- [x] **Schema Update**
-  - [x] Add `depends_on` to `ServiceConfig` in `locald-core`.
+- [ ] **Schema Update**
+  - [ ] Add `image`, `container_port`, `volumes` to `ServiceConfig`.
 
-- [x] **Dependency Logic**
-  - [x] Implement topological sort in `locald-server`.
-  - [x] Handle cycle detection.
+- [ ] **Docker Logic**
+  - [ ] Implement container cleanup on start (`docker rm -f`).
+  - [ ] Implement `docker run` command construction.
+  - [ ] Handle port mapping.
 
-- [x] **Process Manager**
-  - [x] Update `start()` to respect startup order.
-
-- [x] **Verification**
-  - [x] Verify startup order with unit tests.
-  - [x] Verify startup order with a test project (manual verification).
-  - [x] Verify cycle detection with unit tests.
+- [ ] **Verification**
+  - [ ] Verify container startup.
+  - [ ] Verify log streaming.
+  - [ ] Verify cleanup on stop.
