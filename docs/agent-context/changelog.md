@@ -11,16 +11,17 @@ History of completed phases and key changes.
 **Goal**: Ensure documentation fully serves the defined personas before adding more complexity.
 
 **Work Completed**:
+
 - **Fresh Eyes Review**: Audited all documentation against the "App Builder", "Power User", and "Contributor" personas.
 - **App Builder**:
-    - Updated "Getting Started" to use `locald init`.
-    - Created "Common Patterns" guide with copy-pasteable examples for Node, Python, Go, and Rust.
-    - Implemented sticky language tabs using Starlight's `<Tabs syncKey="lang">`.
+  - Updated "Getting Started" to use `locald init`.
+  - Created "Common Patterns" guide with copy-pasteable examples for Node, Python, Go, and Rust.
+  - Implemented sticky language tabs using Starlight's `<Tabs syncKey="lang">`.
 - **Power User**:
-    - Updated "Configuration Reference" to include `depends_on`.
-    - Documented environment variables injected by `locald`.
+  - Updated "Configuration Reference" to include `depends_on`.
+  - Documented environment variables injected by `locald`.
 - **Contributor**:
-    - Updated "Architecture Overview" to reflect dependency resolution and state persistence.
+  - Updated "Architecture Overview" to reflect dependency resolution and state persistence.
 - **Verification**: Built and verified the documentation site.
 
 ## Phase 4: Local DNS & Routing (2025-11-30)
@@ -85,6 +86,7 @@ History of completed phases and key changes.
 **Goal**: Support complex project structures where services depend on each other.
 
 **Work Completed**:
+
 - **Schema**: Added `depends_on` field to `ServiceConfig` in `locald-core`.
 - **Logic**: Implemented topological sort (Kahn's algorithm) in `locald-server` to resolve startup order.
 - **Process Manager**: Updated `start` logic to respect the resolved order.

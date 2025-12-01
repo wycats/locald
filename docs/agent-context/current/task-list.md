@@ -1,19 +1,27 @@
-# Phase 11 Task List
+# Phase 12 Task List
 
-- [x] **Audit**
-  - [x] Review existing docs.
-  - [x] Identify gaps.
+- [x] **Research**
 
-- [x] **App Builder Docs**
-  - [x] Update Getting Started.
-  - [x] Create Common Patterns guide.
+  - [x] Evaluate `bollard` crate.
+  - [x] Define `ServiceConfig` schema for containers.
 
-- [x] **Power User Docs**
-  - [x] Update Configuration Reference.
-  - [x] Document Env Vars.
+- [x] **Core**
 
-- [x] **Contributor Docs**
-  - [x] Update Architecture Overview.
+  - [x] Add `image` field to `ServiceConfig`.
+  - [x] Add `container_port` field to `ServiceConfig`.
+
+- [x] **Server Implementation**
+
+  - [x] Refactor `ProcessManager` to support multiple runtimes (or add `ContainerManager`).
+  - [x] Implement Docker lifecycle (pull, run, stop).
+  - [x] Implement Docker log streaming.
+
+- [x] **Refactor: Self-Daemonization**
+  - [x] Add `daemonize` crate.
+  - [x] Implement self-forking and PID file management.
+  - [x] Add `--foreground` flag.
+  - [x] Redirect logs to `/tmp/locald.out`.
 
 - [x] **Verification**
-  - [x] Build docs site.
+  - [x] Test with Redis container.
+  - [x] Test mixed workload (Process depends on Container).

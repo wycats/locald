@@ -45,6 +45,7 @@ locald ping
     ```
 
     Follow the interactive prompts to set up your project name and first service. For this example, you can use:
+
     - **Project Name**: `my-app`
     - **Service Name**: `web`
     - **Command**: `python3 -m http.server $PORT`
@@ -66,6 +67,7 @@ locald monitor
 ```
 
 This opens a TUI (Text User Interface) where you can:
+
 - See the status of all services.
 - View real-time logs (stdout/stderr).
 - See the assigned ports and URLs.

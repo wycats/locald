@@ -1,37 +1,57 @@
-# Phase 11 Implementation Plan: Documentation & Persona Alignment
+# Phase 12 Implementation Plan: Docker Integration
 
 ## Goal
-Perform a "Fresh Eyes" review of the current documentation and codebase to ensure it aligns with our defined Personas (App Builder, Power User, Contributor). Fill in gaps and improve clarity before adding significant new complexity (Docker).
+
+Unified lifecycle for local apps and Docker containers. The user should be able to define a service as a Docker image in `locald.toml`, and `locald` should manage it just like a local process.
 
 ## User Requirements
-- **App Builder**: Needs a frictionless "Getting Started" experience and clear examples for common tasks.
-- **Power User**: Needs comprehensive reference documentation to understand capabilities and limitations.
-- **Contributor**: Needs a clear mental model of the architecture to contribute effectively.
+
+- **App Builder**: Wants to spin up a database (e.g., Postgres, Redis) or a backend service (e.g., Keycloak) without installing it on their machine.
+- **Power User**: Wants to configure container ports, environment variables, and volumes.
+- **Contributor**: Wants a clean abstraction for "Runners" (Process vs Container).
 
 ## Strategy
-1.  **Review**: Audit existing docs against `docs/design/personas.md`.
-2.  **Refine**: Rewrite or restructure confusing sections.
-3.  **Expand**: Write missing guides or references.
+
+1.  **Schema Extension**: Add `image` and `container_port` to `ServiceConfig`.
+2.  **Abstraction**: Refactor `ProcessManager` into a trait or enum that can handle both `Process` and `Container` workloads. Let's call it `WorkloadManager` or just keep `ProcessManager` but make it smarter.
+    - _Better approach_: Create a `Runtime` trait? Or just an enum `ServiceType { Process, Container }`.
+    - Let's keep it simple: `ProcessManager` currently manages _processes_. We might need a `ContainerManager`.
+    - The `Service` struct in `locald-server` will hold either a `Child` (process) or a `ContainerId`.
+3.  **Docker Interaction**: Use the `bollard` crate for robust, async interaction with the Docker Daemon.
+    - Fallback: If `bollard` is too heavy, wrap the `docker` CLI. (Decision: Start with `bollard` research).
+4.  **Networking**:
+    - `locald` assigns a host port (as usual).
+    - We map `host_port:container_port` when starting the container.
+    - We proxy traffic to `localhost:host_port`.
 
 ## Step-by-Step Plan
 
-### Step 1: Audit
-- [x] Review `locald-docs/src/content/docs/index.mdx` (Landing Page).
-- [x] Review `locald-docs/src/content/docs/guides/getting-started.md`.
-- [x] Review `locald-docs/src/content/docs/reference/configuration.md`.
-- [x] Identify gaps.
+### Step 1: Research & Design
 
-### Step 2: App Builder Focus
-- [x] Create/Update "Common Patterns" guide (e.g., "How to run a Node app", "How to run a Python app").
-    - Use Starlight's `<Tabs syncKey="lang">` feature to make language selection sticky.
-- [x] Ensure error messages in the CLI are helpful (audit `locald-cli` output).
+- [ ] Research `bollard` crate capabilities and compile-time impact.
+- [ ] Design the `ServiceConfig` changes.
+- [ ] Design the `Runtime` abstraction (Process vs Container).
 
-### Step 3: Power User Focus
-- [x] Ensure `locald.toml` reference is complete (including new `depends_on`).
-- [x] Document environment variables injected by `locald`.
+### Step 2: Core Changes
 
-### Step 4: Contributor Focus
-- [x] Update Architecture docs to reflect recent changes (State Persistence, Dependency Resolution).
+- [ ] Update `locald-core` with `image` and `container_port` fields.
+- [ ] Update `locald.toml` parser.
+
+### Step 3: Docker Implementation
+
+- [ ] Add `bollard` dependency.
+- [ ] Implement `ContainerRuntime` (start, stop, logs).
+  - `start`: Pull image (if needed), create container, start container.
+  - `stop`: Stop and remove container.
+  - `logs`: Stream logs from Docker API.
+
+### Step 4: Integration
+
+- [ ] Integrate `ContainerRuntime` into the main loop.
+- [ ] Ensure `depends_on` works with containers (wait for them to be "running").
 
 ### Step 5: Verification
-- [x] Build and preview the documentation site.
+
+- [ ] Create a `redis` example in `examples/`.
+- [ ] Verify `locald start` brings up the container.
+- [ ] Verify `locald stop` tears it down.

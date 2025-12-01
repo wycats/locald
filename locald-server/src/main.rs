@@ -1,4 +1,8 @@
 use anyhow::Result;
+use clap::Parser;
+use daemonize::Daemonize;
+use std::fs::File;
+use std::os::unix::net::UnixStream;
 use tracing::{info, warn, error};
 use crate::manager::ProcessManager;
 use crate::proxy::ProxyManager;
@@ -8,10 +12,60 @@ mod manager;
 mod proxy;
 mod state;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Run in the foreground (do not daemonize)
+    #[arg(short, long)]
+    foreground: bool,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Idempotency check: if already running, exit successfully
+    if is_already_running() {
+        println!("locald is already running.");
+        return Ok(());
+    }
+
+    if !args.foreground {
+        let stdout = File::create("/tmp/locald.out").unwrap();
+        let stderr = File::create("/tmp/locald.err").unwrap();
+
+        let daemonize = Daemonize::new()
+            .pid_file("/tmp/locald.pid")
+            .chown_pid_file(true)
+            .working_directory("/tmp")
+            .stdout(stdout)
+            .stderr(stderr);
+
+        match daemonize.start() {
+            Ok(_) => println!("locald-server started in background"),
+            Err(e) => {
+                eprintln!("Error starting daemon: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    // Initialize logging
     tracing_subscriber::fmt::init();
 
+    // Start Tokio runtime
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main())
+}
+
+fn is_already_running() -> bool {
+    // Try to connect to the socket to see if a server is listening
+    UnixStream::connect("/tmp/locald.sock").is_ok()
+}
+
+async fn async_main() -> Result<()> {
     info!("locald-server starting...");
 
     let manager = ProcessManager::new();
@@ -57,6 +111,7 @@ async fn main() -> Result<()> {
     }
 
     let _ = std::fs::remove_file("/tmp/locald.sock");
+    let _ = std::fs::remove_file("/tmp/locald.pid");
 
     info!("locald-server stopped");
     Ok(())

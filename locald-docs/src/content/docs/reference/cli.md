@@ -13,14 +13,14 @@ locald <COMMAND> [ARGS]
 
 ## Core Commands
 
-| Command | Description |
-| :--- | :--- |
-| `init` | Interactively creates a `locald.toml` file in the current directory. |
-| `server` | Starts the `locald-server` daemon in the background. Safe to run multiple times (idempotent). |
-| `ping` | Checks if the daemon is running and reachable via IPC. |
-| `status` | Lists all currently running services and their status (PID, Port, etc.). |
-| `monitor` | Opens a TUI dashboard to view running services in real-time. |
-| `logs` | Streams logs from running services. |
+| Command   | Description                                                                                   |
+| :-------- | :-------------------------------------------------------------------------------------------- |
+| `init`    | Interactively creates a `locald.toml` file in the current directory.                          |
+| `server`  | Starts the `locald-server` daemon in the background. Safe to run multiple times (idempotent). |
+| `ping`    | Checks if the daemon is running and reachable via IPC.                                        |
+| `status`  | Lists all currently running services and their status (PID, Port, etc.).                      |
+| `monitor` | Opens a TUI dashboard to view running services in real-time.                                  |
+| `logs`    | Streams logs from running services.                                                           |
 
 ## Project Commands
 

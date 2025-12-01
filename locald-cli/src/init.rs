@@ -66,11 +66,13 @@ pub fn run() -> Result<()> {
         let workdir = if workdir.trim().is_empty() { None } else { Some(workdir) };
 
         let service_config = ServiceConfig {
-            command,
+            command: Some(command),
             workdir,
             env: HashMap::new(),
             port,
             depends_on: Vec::new(),
+            image: None,
+            container_port: None,
         };
 
         services.insert(service_name, service_config);

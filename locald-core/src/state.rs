@@ -8,6 +8,7 @@ pub struct ServiceState {
     pub config: LocaldConfig,
     pub path: PathBuf,
     pub pid: Option<u32>,
+    pub container_id: Option<String>,
     pub port: Option<u16>,
     pub status: String, // "running", "stopped"
 }

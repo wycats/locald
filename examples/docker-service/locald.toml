@@ -1,0 +1,11 @@
+[project]
+name = "docker-test"
+domain = "docker.test"
+
+[services.redis]
+image = "redis:alpine"
+container_port = 6379
+
+[services.worker]
+command = "echo 'Worker started'; while true; do echo 'Working...'; sleep 5; done"
+depends_on = ["redis"]

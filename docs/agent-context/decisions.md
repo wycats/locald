@@ -36,10 +36,10 @@
 **Decision**: The daemon dynamically assigns a free port to each service and injects it as the `PORT` environment variable. Services must respect this variable.
 **Status**: Accepted.
 
-## 007. Daemonization: CLI-Managed
+## 007. Daemonization: Self-Managed (Supersedes 007)
 
-**Context**: Users expect `locald server` to run in the background without blocking the terminal.
-**Decision**: The `locald-cli`'s `server` command spawns the `locald-server` binary as a detached child process. This keeps the server binary simple (foreground only) while providing a good UX.
+**Context**: Users expect `locald-server` to run in the background. Relying on the CLI to spawn it creates complexity around process groups and signal handling.
+**Decision**: The `locald-server` binary handles its own daemonization using the `daemonize` crate. It forks into the background, detaches from the terminal, and manages its own PID file. A `--foreground` flag is provided for debugging.
 **Status**: Accepted.
 
 ## 008. Daemon Detachment: setsid
@@ -48,10 +48,10 @@
 **Decision**: Use `setsid` when spawning `locald-server` to create a new session and fully detach it from the CLI's terminal.
 **Status**: Accepted.
 
-## 009. Server Idempotency
+## 009. Server Idempotency: Socket Check (Supersedes 009)
 
-**Context**: Running `locald server` multiple times shouldn't cause errors or zombie processes.
-**Decision**: The CLI checks if the daemon is already running (via IPC Ping) before attempting to start it. If running, it exits gracefully.
+**Context**: Running `locald-server` multiple times shouldn't cause errors or zombie processes.
+**Decision**: The server binary checks if the IPC socket is already active before starting. If it detects a running instance, it exits successfully with a message, ensuring idempotency at the binary level.
 **Status**: Accepted.
 
 ## 010. Privileged Ports: Capabilities over Root
@@ -99,7 +99,7 @@
 ## 017. Dependency Resolution: Topological Sort
 
 **Context**: Services may depend on other services (e.g., API depends on DB). We need to start them in the correct order.
-**Decision**: Use a topological sort (Kahn's algorithm) to determine the startup sequence. For the MVP, we only guarantee the *spawn* order, not the "ready" state (which would require health checks).
+**Decision**: Use a topological sort (Kahn's algorithm) to determine the startup sequence. For the MVP, we only guarantee the _spawn_ order, not the "ready" state (which would require health checks).
 **Status**: Accepted.
 
 ## 018. Documentation: Sticky Language Tabs
