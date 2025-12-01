@@ -42,10 +42,18 @@
 
 **Goal**: A dashboard to see running apps and logs.
 
-- [ ] Serve a basic Web UI from the daemon.
-- [ ] Implement WebSocket for log streaming.
-- [ ] Add `locald logs` command to CLI.
+- [x] Serve a basic Web UI from the daemon.
+- [x] Implement WebSocket for log streaming.
+- [x] Add `locald logs` command to CLI.
 
 ## Epoch 2: Refinement & Robustness
 
 **Goal**: Improve ergonomics, persistence, and multi-service support.
+
+### Phase 6: Persona & Axiom Update
+
+**Goal**: Review and update the project's personas and axioms based on the implementation experience of Epoch 1.
+
+- [x] Review `docs/design/axioms.md`.
+- [x] Review `docs/design/modes.md`.
+- [x] Ensure alignment between code and philosophy.

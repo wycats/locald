@@ -1,27 +1,18 @@
-# Phase 5 Task List
+# Phase 6 Task List
 
-- [ ] **Infrastructure: Log Broadcasting**
-  - [ ] Add `tokio::sync::broadcast` to `ProcessManager`.
-  - [ ] Implement `LogBuffer` (Ring Buffer).
-  - [ ] Wire up stdout/stderr capture to the broadcaster.
+- [ ] **Review**
+  - [ ] Read `docs/design/axioms.md` and `docs/design/axioms/*.md`.
+  - [ ] Read `docs/design/modes.md`.
+  - [ ] Read `docs/design/interaction-modes.md`.
 
-- [ ] **Backend: Internal API & WebSockets**
-  - [ ] Decide on Router (Axum vs Raw Hyper) for `locald.local`. (Recommendation: Axum for ergonomics).
-  - [ ] Implement `GET /api/state`.
-  - [ ] Implement `GET /api/logs` (WebSocket).
-  - [ ] Integrate `rust-embed` for static assets.
+- [ ] **Update Axioms**
+  - [ ] Refine "Managed Ports" axiom to reflect the `PORT` env var reality.
+  - [ ] Refine "12-Factor" axiom to emphasize the "Service vs. Project" distinction.
+  - [ ] Ensure "Process Ownership" axiom matches our `setsid` and signal handling implementation.
 
-- [ ] **Frontend: Dashboard**
-  - [ ] Create basic HTML/CSS structure.
-  - [ ] Implement `ConnectionManager` (Reconnection logic, status UI).
-  - [ ] Implement `ServiceList` component.
-  - [ ] Implement `LogViewer` component.
-  - [ ] Add Start/Stop/Restart controls.
+- [ ] **Update Modes**
+  - [ ] Refine "Thinking Partner" vs "Maker" distinction based on recent chats.
+  - [ ] Document the "Fresh Eyes" review pattern formally.
 
-- [ ] **CLI: Logs Command**
-  - [ ] Implement `locald logs` subcommand.
-  - [ ] Stream logs to terminal.
-
-- [ ] **Verification**
-  - [ ] Verify UI robustness (disconnect/reconnect).
-  - [ ] Verify log streaming performance.
+- [ ] **Alignment Check**
+  - [ ] Confirm `locald-server` implementation aligns with updated axioms.

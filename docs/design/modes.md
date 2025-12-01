@@ -38,4 +38,16 @@ Instead of rigid "personas", we operate in different **Modes** depending on the 
 - **Incremental Updates**: Update `walkthrough.md` *as* you complete tasks, not just at the end.
 - **Verification**: Ensure the work passes `verify-phase.sh`.
   **Key Documents**: `implementation-plan.md`, Source Code.
+
+## 4. The Reviewer (Fresh Eyes Mode)
+
+**Focus**: Clarity, Coherence, "The New User Experience".
+**When to use**: End of Phase, Documentation Polish, "Sanity Checks".
+**Mindset**:
+
+- **Forget the Context**: Read the docs as if you've never seen the project before.
+- **Spot the Drift**: Identify where the code has diverged from the documentation (or vice versa).
+- **Advocate for the User**: If an error message is confusing, flag it. If a command is awkward, challenge it.
+- **12-Factor Audit**: Ensure we aren't slipping into bad habits (e.g., hardcoded ports).
+  **Key Documents**: `walkthrough.md`, `docs/design/axioms.md`, `README.md`.
 <!-- agent-template end -->
