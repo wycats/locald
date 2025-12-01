@@ -3,6 +3,7 @@ use clap::Parser;
 use daemonize::Daemonize;
 use std::fs::File;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use tracing::{info, warn, error};
 use crate::manager::ProcessManager;
 use crate::proxy::ProxyManager;
@@ -11,6 +12,7 @@ mod ipc;
 mod manager;
 mod proxy;
 mod state;
+mod notify;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -68,12 +70,38 @@ fn is_already_running() -> bool {
 async fn async_main() -> Result<()> {
     info!("locald-server starting...");
 
-    let manager = ProcessManager::new();
+    let notify_path = PathBuf::from("/tmp/locald-notify.sock");
+    let manager = ProcessManager::new(notify_path.clone());
+
+    // Notify Server
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(100);
+    // We need to handle potential failure binding the socket
+    let notify_server = match crate::notify::NotifyServer::new(notify_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to bind notify socket: {}", e);
+            return Err(e);
+        }
+    };
+    
+    tokio::spawn(async move {
+        notify_server.run(notify_tx).await;
+    });
+
+    let manager_clone = manager.clone();
+    tokio::spawn(async move {
+        while let Some((pid, _msg)) = notify_rx.recv().await {
+            manager_clone.handle_notify(pid).await;
+        }
+    });
 
     // Restore state
-    if let Err(e) = manager.restore().await {
-        warn!("Failed to restore state: {}", e);
-    }
+    let manager_restore = manager.clone();
+    tokio::spawn(async move {
+        if let Err(e) = manager_restore.restore().await {
+            warn!("Failed to restore state: {}", e);
+        }
+    });
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 

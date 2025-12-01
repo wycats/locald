@@ -1,0 +1,5 @@
+[project]
+name = "dotlocal"
+
+[services.docs]
+command = "python3 -m http.server $PORT --directory docs"

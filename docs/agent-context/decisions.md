@@ -107,3 +107,25 @@
 **Context**: The "Common Patterns" guide needs to show examples for multiple languages (Node, Python, Go, Rust). Users typically care about one language at a time.
 **Decision**: Use Astro Starlight's `<Tabs syncKey="lang">` component. This persists the user's language selection across different examples on the page (and potentially across pages), reducing cognitive load.
 **Status**: Accepted.
+
+## 019. Health Checks: Zero-Config Hierarchy
+
+**Context**: Users shouldn't have to manually configure health checks for standard setups.
+**Decision**: Implement a hierarchy of detection strategies:
+1. Docker Native (`HEALTHCHECK` in image)
+2. `sd_notify` (if app supports systemd notification)
+3. TCP Probe (if port is defined)
+4. Explicit `health_check` command (override)
+**Status**: Accepted.
+
+## 020. Notify Protocol: Unix Datagram
+
+**Context**: We need a standard way for apps to signal readiness. `systemd`'s `sd_notify` is the de-facto standard.
+**Decision**: Implement a Unix Datagram socket server that mimics `systemd`'s notification socket. Inject `NOTIFY_SOCKET` env var into child processes.
+**Status**: Accepted.
+
+## 021. Docker Health: Polling
+
+**Context**: We need to know when a Docker container is healthy.
+**Decision**: Poll `inspect_container` every few seconds to check the health status. This is simpler than listening to the Docker event stream for this phase.
+**Status**: Accepted.

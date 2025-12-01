@@ -16,7 +16,7 @@ hyper = { version = "1.8.1", features = ["full"] }
 hyper-util = { version = "0.1.18", features = ["full"] }
 locald-core = { version = "0.1.0", path = "../locald-core" }
 mime_guess = "2.0.5"
-nix = { version = "0.30.1", features = ["process", "signal"] }
+nix = { version = "0.30.1", features = ["process", "signal", "socket", "user"] }
 rand = "0.8.5"
 rust-embed = "8.5.0"
 serde_json = "1.0.145"

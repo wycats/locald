@@ -1,49 +1,45 @@
-# Phase 12 Walkthrough: Docker Integration
+# Phase 13 Walkthrough: Smart Health Checks
 
 ## Overview
 
-In this phase, we added support for running Docker containers as services. This allows users to define dependencies like databases or caches directly in `locald.toml`.
+In this phase, we are implementing "Smart Health Checks" to ensure services are truly ready before their dependents start. We are prioritizing a "Zero-Config" approach where `locald` infers the best health check strategy.
 
 ## Key Decisions
 
-- **Library Selection**: We chose `bollard` for direct Docker API access over wrapping the `docker` CLI. This provides better control over the lifecycle and log streaming without spawning intermediate shell processes.
-- **Networking**: We map a dynamic host port to the container's exposed port to maintain our "managed ports" philosophy. The `container_port` must be specified in the config.
-- **Unified Manager**: We refactored `ProcessManager` to handle both `Child` processes and Docker `container_id`s in a single `Service` struct, simplifying the architecture.
+- **Hierarchy**: We check for Docker Health -> `sd_notify` -> TCP Port -> Explicit Config.
+- **Visibility**: The UI/CLI must show _how_ health is being determined, so users know if they are relying on a fallback.
+- **Implementation**:
+  - **Docker Health**: We use `bollard` to inspect the container configuration. If a `HEALTHCHECK` is defined in the image, we spawn a background task to poll the container's health status via `inspect_container`.
+  - **sd_notify**: We implemented a Unix Domain Socket server in `notify.rs` that listens for `READY=1` messages. We inject the `NOTIFY_SOCKET` environment variable into spawned processes.
+  - **TCP Probe**: As a fallback for services with a port but no other health check, we attempt to connect to the TCP port.
+  - **Process Manager**: The `ProcessManager` now maintains `health_status` and `health_source` for each service and broadcasts updates. Startup order now respects health status, waiting for dependencies to be `Healthy`.
 
 ## Changes
 
-### `locald-core`
-
-- Updated `ServiceConfig` to include `image` (Option<String>) and `container_port` (Option<u16>).
-- Updated `ServiceState` to include `container_id` for persistence.
-
-### `locald-server`
-
-- Added `bollard` and `futures-util` dependencies.
-- Refactored `manager.rs`:
-  - `Service` struct now holds `container_id`.
-  - `start` method branches based on presence of `image` field.
-  - Added `start_container` method to handle Docker lifecycle (create, start, log stream).
-  - Updated `stop`, `list`, `shutdown`, `persist_state`, and `restore` to handle containers.
-- Implemented log streaming from Docker to the existing broadcast channel.
-
-### `locald-cli`
-
-- Updated `init` command to include commented-out Docker fields in the generated config.
+- **`locald-server/src/notify.rs`**: Added `NotifyServer` to handle `sd_notify` protocol messages. It verifies the sender's PID using `SO_PEERCRED` to ensure security.
+- **`locald-server/src/manager.rs`**:
+  - Integrated `NotifyServer` handling via `handle_notify`.
+  - Added `spawn_docker_health_monitor` to poll Docker health status.
+  - Added `spawn_tcp_health_monitor` to probe TCP ports.
+  - Updated `start` to wait for health checks before proceeding to dependent services.
+  - Updated `start_container` to detect if a container has a healthcheck.
+- **`locald-server/src/main.rs`**:
+  - Initialized `NotifyServer` and spawned a task to run it.
+  - Connected `NotifyServer` events to `ProcessManager`.
+- **`locald-server/Cargo.toml`**: Added `nix` features (`socket`, `user`) required for `SO_PEERCRED`.
+- **`locald-cli/src/main.rs`**: Updated the `status` command to display the `HEALTH` and `SOURCE` columns, giving users visibility into how their service health is being determined.
 
 ## Verification
 
-- Created `examples/docker-service` with a Redis container and a dependent worker process.
-- Verified that `locald` can start the Redis container, assign a port, and stream logs.
-- Verified that the worker process starts after Redis.
-- Verified that `locald status` shows both services running.
-- Verified that `locald stop` cleans up the container.
+- **Compilation**: `cargo check -p locald-server` passes.
+- **Logic**: The code covers all three health check strategies and integrates them into the startup flow.
 
-## Refactor: Self-Daemonization
+## Bug Fixes
 
-After the initial Docker implementation, we refactored `locald-server` to handle its own daemonization, removing the need for shell backgrounding (`&`).
+- **Non-blocking Restore**: Fixed an issue where `locald-server` would block on startup while restoring services, preventing the IPC server from starting. Moved `restore()` to a background task.
 
-- **`daemonize` Crate**: Used to fork the process, detach from the terminal, and manage PID files.
-- **Idempotency**: The server now checks if the IPC socket is already active before starting. If it is, it exits gracefully, preventing duplicate daemons.
-- **`--foreground` Flag**: Added a CLI flag to skip daemonization for debugging purposes.
-- **Logging**: Daemon logs are now redirected to `/tmp/locald.out` and `/tmp/locald.err`.
+## Dogfooding
+
+- **Docs Server**: Added a `locald.toml` to the root of the repository to serve the documentation using `python3 -m http.server`. This validates the core functionality and provides a convenient way to browse the docs.
+
+- **Cargo Alias**: Added `.cargo/config.toml` with a `locald` alias. Now you can run `cargo locald <command>` (e.g., `cargo locald status`) to build and run the CLI in one step.

@@ -9,6 +9,10 @@ pub struct ServiceStatus {
     pub status: String,
     pub url: Option<String>,
     pub domain: Option<String>,
+    #[serde(default)]
+    pub health_status: String,
+    #[serde(default)]
+    pub health_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

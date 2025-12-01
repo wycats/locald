@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::{ServiceStatus, LogEntry};
-use locald_core::state::{ServerState, ServiceState};
+use locald_core::state::{ServerState, ServiceState, HealthStatus, HealthSource};
 use crate::state::StateManager;
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use tracing::{info, error};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use bollard::Docker;
-use bollard::container::{Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions, LogsOptions};
+use bollard::container::{Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions, LogsOptions, InspectContainerOptions};
 use bollard::models::HostConfig;
 use futures_util::StreamExt;
 
@@ -27,6 +27,8 @@ pub struct Service {
     pub container_id: Option<String>,
     pub port: Option<u16>,
     pub path: PathBuf,
+    pub health_status: HealthStatus,
+    pub health_source: HealthSource,
 }
 
 #[derive(Clone)]
@@ -36,16 +38,22 @@ pub struct ProcessManager {
     log_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
     state_manager: Arc<StateManager>,
     docker: Arc<Docker>,
+    notify_socket_path: PathBuf,
 }
 
 impl ProcessManager {
-    pub fn new() -> Self {
+    pub fn new(notify_socket_path: PathBuf) -> Self {
         let (tx, _) = broadcast::channel(100);
         // Initialize Docker client. We assume the socket is available.
+        // If it fails, we log a warning but don't crash (unless we try to use it).
         let docker = match Docker::connect_with_local_defaults() {
             Ok(d) => Arc::new(d),
             Err(e) => {
                 error!("Failed to connect to Docker: {}", e);
+                // This might panic if we try to use it later. 
+                // Ideally we'd wrap it in Option or Result, but for now let's assume it works or fail fast.
+                // Actually, let's just panic here if we can't connect, as it's a core requirement for this phase.
+                // Or better: create a dummy client? No, let's just panic for now to be safe.
                 panic!("Failed to connect to Docker: {}", e);
             }
         };
@@ -56,6 +64,7 @@ impl ProcessManager {
             log_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_SIZE))),
             state_manager: Arc::new(StateManager::new().expect("Failed to initialize state manager")),
             docker,
+            notify_socket_path,
         }
     }
 
@@ -92,6 +101,8 @@ impl ProcessManager {
                 container_id: service.container_id.clone(),
                 port: service.port,
                 status,
+                health_status: service.health_status.clone(),
+                health_source: service.health_source.clone(),
             });
         }
         
@@ -103,6 +114,7 @@ impl ProcessManager {
             error!("Failed to persist state: {}", e);
         }
     }
+
     pub async fn restore(&self) -> Result<()> {
         let state = match self.state_manager.load().await {
             Ok(s) => s,
@@ -111,17 +123,27 @@ impl ProcessManager {
 
         info!("Restoring state: found {} services", state.services.len());
 
-        // Cleanup old processes
+        // Cleanup old processes and containers
         for service_state in &state.services {
             if let Some(pid) = service_state.pid {
                 // Try to kill it. 
                 let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            }
+            if let Some(container_id) = &service_state.container_id {
+                // Try to stop/remove container
+                let _ = self.docker.remove_container(container_id, Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                })).await;
             }
         }
 
         // Restart projects
         let mut paths = HashSet::new();
         for service_state in state.services {
+            // Only restore if it was running or we want to be aggressive?
+            // For now, let's restore everything that was in the state file as "running"
+            // But wait, the state file has a "status" field.
             if service_state.status == "running" {
                 paths.insert(service_state.path);
             }
@@ -135,6 +157,45 @@ impl ProcessManager {
         }
         
         Ok(())
+    }
+
+    pub async fn handle_notify(&self, pid: u32) {
+        let mut services = self.services.lock().await;
+        for (name, service) in services.iter_mut() {
+            if let Some(child) = &service.process {
+                if child.id() == Some(pid) {
+                    info!("Service {} is ready (via notify)", name);
+                    service.health_status = HealthStatus::Healthy;
+                    service.health_source = HealthSource::Notify;
+                    // TODO: Trigger dependency check?
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_health(&self, name: &str) -> Result<()> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30); // TODO: Make configurable
+
+        loop {
+            if start.elapsed() > timeout {
+                anyhow::bail!("Service {} timed out waiting for health check", name);
+            }
+
+            {
+                let services = self.services.lock().await;
+                if let Some(service) = services.get(name) {
+                    if service.health_status == HealthStatus::Healthy {
+                        return Ok(());
+                    }
+                } else {
+                    anyhow::bail!("Service {} disappeared", name);
+                }
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     pub async fn start(&self, path: PathBuf) -> Result<()> {
@@ -176,17 +237,25 @@ impl ProcessManager {
             if let Some(image) = &service_config.image {
                 // Docker Service
                 let container_port = service_config.container_port.context("container_port is required for Docker services")?;
-                let container_id = self.start_container(name.clone(), image, port, container_port, &service_config.env, &service_config.command).await?;
+                let (container_id, has_healthcheck) = self.start_container(name.clone(), image, port, container_port, &service_config.env, &service_config.command).await?;
                 
                 {
                     let mut services = self.services.lock().await;
-                    services.insert(name, Service {
+                    services.insert(name.clone(), Service {
                         config: config.clone(),
                         process: None,
-                        container_id: Some(container_id),
+                        container_id: Some(container_id.clone()),
                         port: Some(port),
                         path: path.clone(),
+                        health_status: HealthStatus::Starting,
+                        health_source: if has_healthcheck { HealthSource::Docker } else { HealthSource::None },
                     });
+                }
+
+                if has_healthcheck {
+                    self.spawn_docker_health_monitor(name.clone(), container_id);
+                } else {
+                    self.spawn_tcp_health_monitor(name.clone(), port);
                 }
             } else {
                 // Process Service
@@ -198,6 +267,7 @@ impl ProcessManager {
                 }
                 cmd.current_dir(&path);
                 cmd.env("PORT", port.to_string());
+                cmd.env("NOTIFY_SOCKET", &self.notify_socket_path);
                 for (k, v) in &service_config.env {
                     cmd.env(k, v);
                 }
@@ -243,14 +313,25 @@ impl ProcessManager {
 
                 {
                     let mut services = self.services.lock().await;
-                    services.insert(name, Service {
+                    services.insert(name.clone(), Service {
                         config: config.clone(),
                         process: Some(child),
                         container_id: None,
                         port: Some(port),
                         path: path.clone(),
+                        health_status: HealthStatus::Starting,
+                        health_source: HealthSource::None,
                     });
                 }
+                
+                self.spawn_tcp_health_monitor(name.clone(), port);
+            }
+
+            // Wait for health before starting next service (which might depend on this one)
+            info!("Waiting for service {} to be ready...", name);
+            if let Err(e) = self.wait_for_health(&name).await {
+                error!("Dependency failed: {}", e);
+                return Err(e);
             }
         }
 
@@ -258,7 +339,7 @@ impl ProcessManager {
         Ok(())
     }
 
-    async fn start_container(&self, name: String, image: &str, host_port: u16, container_port: u16, env: &HashMap<String, String>, command: &Option<String>) -> Result<String> {
+    async fn start_container(&self, name: String, image: &str, host_port: u16, container_port: u16, env: &HashMap<String, String>, command: &Option<String>) -> Result<(String, bool)> {
         // 1. Pull image (TODO: Make this smarter/optional?)
         // For now, we assume the image exists or Docker will pull it if we use create_container?
         // Actually create_container fails if image missing.
@@ -309,6 +390,10 @@ impl ProcessManager {
 
         let id = res.id;
 
+        // Check if image has healthcheck
+        let inspect = self.docker.inspect_container(&id, None::<InspectContainerOptions>).await?;
+        let has_healthcheck = inspect.config.and_then(|c| c.healthcheck).is_some();
+
         // 3. Start Container
         self.docker.start_container(&id, None::<StartContainerOptions<String>>).await.context("Failed to start Docker container")?;
 
@@ -352,7 +437,7 @@ impl ProcessManager {
             }
         });
 
-        Ok(id)
+        Ok((id, has_healthcheck))
     }
 
     fn resolve_startup_order(config: &LocaldConfig) -> Result<Vec<String>> {
@@ -478,6 +563,8 @@ impl ProcessManager {
                     None
                 },
                 domain: service.config.project.domain.clone(),
+                health_status: format!("{:?}", service.health_status),
+                health_source: format!("{:?}", service.health_source),
             });
         }
         results
@@ -514,5 +601,75 @@ impl ProcessManager {
             }
         }
         None
+    }
+
+    async fn update_health(&self, name: &str, status: HealthStatus, source: HealthSource) {
+        let mut services = self.services.lock().await;
+        if let Some(service) = services.get_mut(name) {
+            if service.health_status != status {
+                info!("Service {} health changed to {:?} (source: {:?})", name, status, source);
+                service.health_status = status;
+                service.health_source = source;
+            }
+        }
+    }
+
+    fn spawn_docker_health_monitor(&self, name: String, container_id: String) {
+        let manager = self.clone();
+        let docker = self.docker.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                match docker.inspect_container(&container_id, None::<InspectContainerOptions>).await {
+                    Ok(inspect) => {
+                        if let Some(state) = inspect.state {
+                            if let Some(health) = state.health {
+                                let status = match health.status {
+                                    Some(bollard::models::HealthStatusEnum::HEALTHY) => HealthStatus::Healthy,
+                                    Some(bollard::models::HealthStatusEnum::UNHEALTHY) => HealthStatus::Unhealthy,
+                                    Some(bollard::models::HealthStatusEnum::STARTING) => HealthStatus::Starting,
+                                    _ => HealthStatus::Unknown,
+                                };
+                                
+                                manager.update_health(&name, status, HealthSource::Docker).await;
+                            }
+                        }
+                    }
+                    Err(_) => break, // Container gone?
+                }
+            }
+        });
+    }
+
+    fn spawn_tcp_health_monitor(&self, name: String, port: u16) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // Wait a bit for process to start
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            
+            loop {
+                if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                    // Only update if not already healthy (e.g. via Notify)
+                    // But update_health handles idempotency mostly.
+                    // However, if Notify set it to Healthy, we don't want to overwrite source to Tcp?
+                    // Actually, maybe we do? Or maybe Notify is "better"?
+                    // Let's check current state.
+                    {
+                        let services = manager.services.lock().await;
+                        if let Some(service) = services.get(&name) {
+                            if service.health_status == HealthStatus::Healthy {
+                                break; // Already healthy
+                            }
+                        } else {
+                            break; // Service gone
+                        }
+                    }
+
+                    manager.update_health(&name, HealthStatus::Healthy, HealthSource::Tcp).await;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
     }
 }

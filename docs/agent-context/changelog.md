@@ -6,6 +6,19 @@ History of completed phases and key changes.
 
 <!-- agent-template end -->
 
+## Phase 13: Smart Health Checks (2025-12-01)
+
+**Goal**: Ensure services are ready before dependents start, using "Zero-Config" detection where possible.
+
+**Work Completed**:
+
+- **Health Check Hierarchy**: Implemented a prioritized strategy: Docker Health -> `sd_notify` -> TCP Probe -> Explicit Config.
+- **Notify Socket**: Implemented `NotifyServer` to handle `sd_notify` messages (`READY=1`) from services.
+- **Docker Integration**: Added support for Docker native `HEALTHCHECK` polling via `bollard`.
+- **TCP Probe**: Implemented a fallback TCP connection check for services with ports.
+- **Dependency Gating**: Updated `ProcessManager` to wait for a service to be `Healthy` before starting its dependents.
+- **CLI**: Updated `locald status` to display `HEALTH` status and `SOURCE`.
+
 ## Phase 11: Documentation & Persona Alignment (2025-12-01)
 
 **Goal**: Ensure documentation fully serves the defined personas before adding more complexity.

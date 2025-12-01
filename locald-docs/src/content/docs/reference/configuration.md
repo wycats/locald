@@ -20,12 +20,14 @@ Defines the processes to run. Keys are service names (e.g., `web`, `worker`). Va
 
 ### Service Options
 
-| Key          | Type         | Required | Description                                                                                     |
-| :----------- | :----------- | :------- | :---------------------------------------------------------------------------------------------- |
-| `command`    | String       | **Yes**  | The shell command to execute. Supports environment variable expansion (e.g., `$PORT`).          |
-| `workdir`    | String       | No       | The working directory for the command, relative to `locald.toml`. Defaults to the project root. |
-| `env`        | Table        | No       | Key-value pairs of environment variables to inject into the process.                            |
-| `depends_on` | List<String> | No       | A list of other service names that must start before this service.                              |
+| Key              | Type         | Required | Description                                                                                                                                                           |
+| :--------------- | :----------- | :------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`        | String       | Cond.    | The shell command to execute. Required for process services. Supports environment variable expansion (e.g., `$PORT`).                                                 |
+| `image`          | String       | Cond.    | The Docker image to run. Required for container services.                                                                                                             |
+| `container_port` | Integer      | Cond.    | The port exposed by the container. Required if `image` is set.                                                                                                        |
+| `workdir`        | String       | No       | The working directory for the command, relative to `locald.toml`. Defaults to the project root.                                                                       |
+| `env`            | Table        | No       | Key-value pairs of environment variables to inject into the process.                                                                                                  |
+| `depends_on`     | List<String> | No       | A list of other service names that must start before this service. `locald` waits for dependencies to be [Healthy](/concepts/health-checks) before starting the dependent. |
 
 ### Example: Full Specification
 
@@ -33,6 +35,11 @@ Defines the processes to run. Keys are service names (e.g., `web`, `worker`). Va
 [project]
 name = "complex-app"
 domain = "complex.local"
+
+[services.db]
+image = "postgres:15"
+container_port = 5432
+env = { POSTGRES_PASSWORD = "password" }
 
 [services.api]
 command = "./target/debug/api"
@@ -46,7 +53,7 @@ DB_HOST = "localhost"
 [services.worker]
 command = "celery -A proj worker"
 workdir = "./worker"
-depends_on = ["api", "redis"]
+depends_on = ["api"]
 ```
 
 ## Injected Environment Variables
@@ -54,4 +61,5 @@ depends_on = ["api", "redis"]
 `locald` guarantees the following variables are present in the service environment:
 
 - `PORT`: A dynamically assigned, free TCP port. The service **must** bind to this port to be reachable via the proxy.
+- `NOTIFY_SOCKET`: The path to the Unix socket for `sd_notify` readiness checks. See [Smart Health Checks](/concepts/health-checks) for details.
 - `PATH`: Inherited from the `locald` process (usually your user's shell path).

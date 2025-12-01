@@ -1,0 +1,20 @@
+[project]
+name = "health-check"
+
+[services.redis]
+image = "redis:alpine"
+container_port = 6379
+
+[services.notify-app]
+command = "./notify.sh"
+depends_on = ["redis"]
+
+[services.tcp-app]
+command = "./tcp.sh"
+# We don't specify port here, locald assigns it.
+# But for TCP probe to work, we need to know the port.
+# locald assigns it and passes it as PORT.
+# And locald knows it.
+# But wait, `tcp.sh` needs to listen on that port.
+# `nc -l -p $PORT` does that.
+depends_on = ["notify-app"]

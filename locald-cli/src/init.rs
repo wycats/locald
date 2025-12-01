@@ -73,6 +73,7 @@ pub fn run() -> Result<()> {
             depends_on: Vec::new(),
             image: None,
             container_port: None,
+            health_check: None,
         };
 
         services.insert(service_name, service_config);

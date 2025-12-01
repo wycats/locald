@@ -33,4 +33,7 @@ pub struct ServiceConfig {
     /// List of services that must be started before this one.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Optional command to run to check if the service is healthy.
+    /// If not provided, locald will attempt to infer a health check (Docker, Notify, or TCP).
+    pub health_check: Option<String>,
 }

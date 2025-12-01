@@ -5,7 +5,7 @@ echo "Running cargo build..."
 cargo build
 
 echo "Running IPC verification..."
-./target/debug/locald-server &
+./target/debug/locald-server --foreground &
 SERVER_PID=$!
 sleep 2
 

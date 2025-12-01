@@ -113,6 +113,25 @@
 
 **Goal**: Unified lifecycle for local apps and Docker containers.
 
-- [ ] Support `image` in `locald.toml`.
-- [ ] Manage Docker container lifecycle (run/stop).
-- [ ] Unified logging for containers.
+- [x] Support `image` in `locald.toml`.
+- [x] Manage Docker container lifecycle (run/stop).
+- [x] Unified logging for containers.
+
+### Phase 13: Smart Health Checks
+
+**Goal**: Ensure services are ready before dependents start, using "Zero-Config" detection where possible.
+
+- [x] Implement `sd_notify` listener for local processes.
+- [x] Integrate Docker native health checks.
+- [x] Implement TCP port probing as a fallback.
+- [x] Update `depends_on` logic to wait for health.
+- [x] Expose health source/status in UI/CLI.
+
+### Phase 14: Dogfooding & Polish
+
+**Goal**: Smooth out the rough edges before broader adoption. Focus on error messages, CLI output, and common workflow friction.
+
+- [ ] "Papercut" pass on CLI output (formatting, colors, clarity).
+- [ ] Verify "Zero-Config" flows work as expected in real scenarios.
+- [ ] Improve error handling for common misconfigurations.
+- [ ] Validate the "Happy Path" for a new user.
