@@ -39,3 +39,14 @@ History of completed phases and key changes.
 - Implemented `locald-server` with Tokio runtime.
 - Implemented `locald-cli` with Clap.
 - Implemented IPC via Unix Domain Sockets (`ping` command).
+
+## Phase 7: Persistence & State Recovery (2025-11-30)
+
+**Goal**: Ensure `locald` persists state across restarts.
+
+**Work Completed**:
+- Implemented JSON state persistence in `~/.local/share/locald/state.json`.
+- Added `StateManager` to handle loading/saving state.
+- Implemented "Kill & Restart" strategy for process recovery to handle zombie processes.
+- Refactored `locald-server/src/proxy.rs` to use `axum`, resolving dependency conflicts.
+- Verified persistence manually (services restart automatically).

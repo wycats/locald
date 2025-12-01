@@ -65,3 +65,15 @@
 **Context**: We need to map local domains to 127.0.0.1. Modifying `/etc/hosts` is risky and requires root.
 **Decision**: We implement a safe "Section Manager" that only touches lines between `# BEGIN locald` and `# END locald`. The user runs `locald admin sync-hosts` with sudo to apply changes.
 **Status**: Accepted.
+
+## 012. State Persistence: JSON in XDG Data Dir
+
+**Context**: The daemon needs to remember running services across restarts.
+**Decision**: Store state in a human-readable JSON file (`state.json`) located in the standard XDG data directory (`~/.local/share/locald/`).
+**Status**: Accepted.
+
+## 013. Process Recovery: Kill & Restart
+
+**Context**: When the daemon restarts, it finds "zombie" processes from the previous session. Adopting them is complex due to lost I/O pipes.
+**Decision**: The daemon kills the old PID (if running) and restarts the service from scratch. This ensures a clean state and re-establishes log capture.
+**Status**: Accepted.

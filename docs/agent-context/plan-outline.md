@@ -57,3 +57,31 @@
 - [x] Review `docs/design/axioms.md`.
 - [x] Review `docs/design/modes.md`.
 - [x] Ensure alignment between code and philosophy.
+
+## Epoch 2: Refinement & Robustness
+
+**Goal**: Improve ergonomics, persistence, and multi-service support.
+
+### Phase 7: Persistence & State Recovery
+
+**Goal**: The daemon should persist the list of registered projects/services so they can be restored after a restart.
+
+- [x] Define a state file format (JSON/TOML).
+- [x] Implement state saving on change/shutdown.
+- [x] Implement state loading on startup.
+- [x] Handle "zombie" processes (processes that are still running but the daemon forgot about them, or vice versa).
+
+### Phase 8: CLI Ergonomics & Interactive Mode
+
+**Goal**: Improve the user experience of the CLI.
+
+- [ ] Better error messages and help text.
+- [ ] Interactive `locald init` to create `locald.toml`.
+- [ ] `locald monitor` (TUI) using `ratatui`?
+
+### Phase 9: Multi-Service Dependencies
+
+**Goal**: Support complex project structures.
+
+- [ ] Support `depends_on` in `locald.toml`.
+- [ ] Topological sort for startup order.

@@ -6,6 +6,7 @@ use crate::proxy::ProxyManager;
 mod ipc;
 mod manager;
 mod proxy;
+mod state;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,6 +15,12 @@ async fn main() -> Result<()> {
     info!("locald-server starting...");
 
     let manager = ProcessManager::new();
+
+    // Restore state
+    if let Err(e) = manager.restore().await {
+        warn!("Failed to restore state: {}", e);
+    }
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
     // Run IPC server

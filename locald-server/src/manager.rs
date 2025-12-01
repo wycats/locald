@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::{ServiceStatus, LogEntry};
-use std::collections::{HashMap, VecDeque};
+use locald_core::state::{ServerState, ServiceState};
+use crate::state::StateManager;
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -10,6 +12,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast};
 use tokio::io::{BufReader, AsyncBufReadExt};
 use tracing::{info, error};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 
 const LOG_BUFFER_SIZE: usize = 1000;
 
@@ -25,6 +29,7 @@ pub struct ProcessManager {
     services: Arc<Mutex<HashMap<String, Service>>>,
     pub log_sender: broadcast::Sender<LogEntry>,
     log_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
+    state_manager: Arc<StateManager>,
 }
 
 impl ProcessManager {
@@ -34,6 +39,7 @@ impl ProcessManager {
             services: Arc::new(Mutex::new(HashMap::new())),
             log_sender: tx,
             log_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_SIZE))),
+            state_manager: Arc::new(StateManager::new().expect("Failed to initialize state manager")),
         }
     }
 
@@ -54,6 +60,67 @@ impl ProcessManager {
         buffer.iter().cloned().collect()
     }
 
+    async fn persist_state(&self) {
+        let services = self.services.lock().await;
+        let mut service_states = Vec::new();
+        
+        for (name, service) in services.iter() {
+            let pid = service.process.as_ref().and_then(|p| p.id());
+            let status = if pid.is_some() { "running".to_string() } else { "stopped".to_string() };
+            
+            service_states.push(ServiceState {
+                name: name.clone(),
+                config: service.config.clone(),
+                path: service.path.clone(),
+                pid,
+                port: service.port,
+                status,
+            });
+        }
+        
+        let state = ServerState {
+            services: service_states,
+        };
+        
+        if let Err(e) = self.state_manager.save(&state).await {
+            error!("Failed to persist state: {}", e);
+        }
+    }
+
+    pub async fn restore(&self) -> Result<()> {
+        let state = match self.state_manager.load().await {
+            Ok(s) => s,
+            Err(_) => return Ok(()), // No state to restore
+        };
+
+        info!("Restoring state: found {} services", state.services.len());
+
+        // Cleanup old processes
+        for service_state in &state.services {
+            if let Some(pid) = service_state.pid {
+                // Try to kill it. 
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            }
+        }
+
+        // Restart projects
+        let mut paths = HashSet::new();
+        for service_state in state.services {
+            if service_state.status == "running" {
+                paths.insert(service_state.path);
+            }
+        }
+
+        for path in paths {
+            info!("Restoring project at {:?}", path);
+            if let Err(e) = self.start(path.clone()).await {
+                error!("Failed to restore project at {:?}: {}", path, e);
+            }
+        }
+        
+        Ok(())
+    }
+
     pub async fn start(&self, path: PathBuf) -> Result<()> {
         // Read config
         let config_path = path.join("locald.toml");
@@ -66,16 +133,18 @@ impl ProcessManager {
             let name = format!("{}:{}", config.project.name, service_name);
             
             // Check if already running
-            let mut services = self.services.lock().await;
-            if let Some(service) = services.get_mut(&name) {
-                 // Check if actually running
-                 if let Some(child) = &mut service.process {
-                     if let Ok(None) = child.try_wait() {
-                         info!("Service {} is already running", name);
-                         continue;
+            {
+                let mut services = self.services.lock().await;
+                if let Some(service) = services.get_mut(&name) {
+                     // Check if actually running
+                     if let Some(child) = &mut service.process {
+                         if let Ok(None) = child.try_wait() {
+                             info!("Service {} is already running", name);
+                             continue;
+                         }
                      }
-                 }
-            }
+                }
+            } // Drop lock before spawning
 
             // Find free port
             let port = {
@@ -133,26 +202,33 @@ impl ProcessManager {
                 }
             });
 
-            services.insert(name, Service {
-                config: config.clone(),
-                process: Some(child),
-                port: Some(port),
-                path: path.clone(),
-            });
+            {
+                let mut services = self.services.lock().await;
+                services.insert(name, Service {
+                    config: config.clone(),
+                    process: Some(child),
+                    port: Some(port),
+                    path: path.clone(),
+                });
+            }
         }
 
+        self.persist_state().await;
         Ok(())
     }
 
     pub async fn stop(&self, name: &str) -> Result<()> {
-        let mut services = self.services.lock().await;
-        if let Some(service) = services.get_mut(name) {
-            if let Some(mut child) = service.process.take() {
-                info!("Stopping service {}", name);
-                child.kill().await?;
-                service.port = None;
+        {
+            let mut services = self.services.lock().await;
+            if let Some(service) = services.get_mut(name) {
+                if let Some(mut child) = service.process.take() {
+                    info!("Stopping service {}", name);
+                    let _ = child.kill().await;
+                    service.port = None;
+                }
             }
         }
+        self.persist_state().await;
         Ok(())
     }
 
@@ -201,11 +277,13 @@ impl ProcessManager {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let mut services = self.services.lock().await;
-        for (name, service) in services.iter_mut() {
-            if let Some(mut child) = service.process.take() {
-                info!("Stopping service {} (shutdown)", name);
-                let _ = child.kill().await;
+        {
+            let mut services = self.services.lock().await;
+            for (name, service) in services.iter_mut() {
+                if let Some(mut child) = service.process.take() {
+                    info!("Stopping service {} (shutdown)", name);
+                    let _ = child.kill().await;
+                }
             }
         }
         Ok(())

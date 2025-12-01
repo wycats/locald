@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use axum::{
     extract::{State, WebSocketUpgrade, ws::WebSocket, Request},

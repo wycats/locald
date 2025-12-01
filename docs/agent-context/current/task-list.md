@@ -1,18 +1,24 @@
-# Phase 6 Task List
+# Phase 7 Task List
 
-- [ ] **Review**
-  - [ ] Read `docs/design/axioms.md` and `docs/design/axioms/*.md`.
-  - [ ] Read `docs/design/modes.md`.
-  - [ ] Read `docs/design/interaction-modes.md`.
+- [x] **Core: State Schema**
+  - [x] Create `locald-core/src/state.rs`.
+  - [x] Define `ServiceState` and `ServerState` structs.
+  - [x] Add `serde` derives.
 
-- [ ] **Update Axioms**
-  - [ ] Refine "Managed Ports" axiom to reflect the `PORT` env var reality.
-  - [ ] Refine "12-Factor" axiom to emphasize the "Service vs. Project" distinction.
-  - [ ] Ensure "Process Ownership" axiom matches our `setsid` and signal handling implementation.
+- [x] **Server: State Manager**
+  - [x] Create `locald-server/src/state.rs`.
+  - [x] Implement `load()` and `save()`.
+  - [x] Handle XDG paths (`directories` crate).
 
-- [ ] **Update Modes**
-  - [ ] Refine "Thinking Partner" vs "Maker" distinction based on recent chats.
-  - [ ] Document the "Fresh Eyes" review pattern formally.
+- [x] **Server: Integration**
+  - [x] Add `StateManager` to `ProcessManager`.
+  - [x] Call `save()` on service start/stop.
+  - [x] Implement `restore()` method in `ProcessManager`.
 
-- [ ] **Alignment Check**
-  - [ ] Confirm `locald-server` implementation aligns with updated axioms.
+- [x] **Server: Reconciliation**
+  - [x] Implement PID liveness check (`nix` crate).
+  - [x] Handle port re-binding for restored services (handled by `start` logic).
+
+- [x] **Verification**
+  - [x] Verify persistence across restarts.
+  - [x] Verify zombie cleanup/adoption.
