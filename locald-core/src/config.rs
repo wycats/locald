@@ -26,4 +26,7 @@ pub struct ServiceConfig {
     pub env: HashMap<String, String>,
     /// Working directory for the command. Defaults to the project root.
     pub workdir: Option<String>,
+    /// List of services that must be started before this one.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }

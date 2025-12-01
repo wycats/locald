@@ -70,6 +70,7 @@ pub fn run() -> Result<()> {
             workdir,
             env: HashMap::new(),
             port,
+            depends_on: Vec::new(),
         };
 
         services.insert(service_name, service_config);

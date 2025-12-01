@@ -1,0 +1,9 @@
+[project]
+name = "dep-test"
+
+[services.a]
+command = "./script.sh a"
+depends_on = ["b"]
+
+[services.b]
+command = "./script.sh b"

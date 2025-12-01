@@ -129,7 +129,10 @@ impl ProcessManager {
         let config: LocaldConfig = toml::from_str(&config_content)
             .context("Failed to parse locald.toml")?;
 
-        for (service_name, service_config) in &config.services {
+        let sorted_services = Self::resolve_startup_order(&config)?;
+
+        for service_name in sorted_services {
+            let service_config = &config.services[&service_name];
             let name = format!("{}:{}", config.project.name, service_name);
             
             // Check if already running
@@ -217,6 +220,59 @@ impl ProcessManager {
         Ok(())
     }
 
+    fn resolve_startup_order(config: &LocaldConfig) -> Result<Vec<String>> {
+        let mut in_degree: HashMap<String, usize> = HashMap::new();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+
+        // Initialize
+        for name in config.services.keys() {
+            in_degree.insert(name.clone(), 0);
+            dependents.insert(name.clone(), Vec::new());
+        }
+
+        // Build graph
+        for (name, service) in &config.services {
+            for dep in &service.depends_on {
+                if !config.services.contains_key(dep) {
+                    anyhow::bail!("Service '{}' depends on unknown service '{}'", name, dep);
+                }
+                
+                // dep -> name
+                dependents.get_mut(dep).unwrap().push(name.clone());
+                *in_degree.get_mut(name).unwrap() += 1;
+            }
+        }
+
+        // Find initial nodes (0 dependencies)
+        for (name, &degree) in &in_degree {
+            if degree == 0 {
+                queue.push_back(name.clone());
+            }
+        }
+
+        let mut sorted = Vec::new();
+        while let Some(node) = queue.pop_front() {
+            sorted.push(node.clone());
+
+            if let Some(neighbors) = dependents.get(&node) {
+                for neighbor in neighbors {
+                    let degree = in_degree.get_mut(neighbor).unwrap();
+                    *degree -= 1;
+                    if *degree == 0 {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+
+        if sorted.len() != config.services.len() {
+            anyhow::bail!("Circular dependency detected in services");
+        }
+
+        Ok(sorted)
+    }
+
     pub async fn stop(&self, name: &str) -> Result<()> {
         {
             let mut services = self.services.lock().await;
@@ -300,5 +356,83 @@ impl ProcessManager {
             }
         }
         None
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locald_core::config::{ServiceConfig, ProjectConfig};
+
+    #[test]
+    fn test_resolve_startup_order() {
+        let mut services = HashMap::new();
+        
+        services.insert("db".to_string(), ServiceConfig {
+            command: "echo db".to_string(),
+            port: None,
+            env: HashMap::new(),
+            workdir: None,
+            depends_on: vec![],
+        });
+        
+        services.insert("backend".to_string(), ServiceConfig {
+            command: "echo backend".to_string(),
+            port: None,
+            env: HashMap::new(),
+            workdir: None,
+            depends_on: vec!["db".to_string()],
+        });
+        
+        services.insert("frontend".to_string(), ServiceConfig {
+            command: "echo frontend".to_string(),
+            port: None,
+            env: HashMap::new(),
+            workdir: None,
+            depends_on: vec!["backend".to_string()],
+        });
+
+        let config = LocaldConfig {
+            project: ProjectConfig { name: "test".to_string(), domain: None },
+            services,
+        };
+
+        let order = ProcessManager::resolve_startup_order(&config).unwrap();
+        
+        // db must be before backend
+        let db_idx = order.iter().position(|s| s == "db").unwrap();
+        let backend_idx = order.iter().position(|s| s == "backend").unwrap();
+        let frontend_idx = order.iter().position(|s| s == "frontend").unwrap();
+
+        assert!(db_idx < backend_idx);
+        assert!(backend_idx < frontend_idx);
+    }
+
+    #[test]
+    fn test_circular_dependency() {
+        let mut services = HashMap::new();
+        
+        services.insert("a".to_string(), ServiceConfig {
+            command: "echo a".to_string(),
+            port: None,
+            env: HashMap::new(),
+            workdir: None,
+            depends_on: vec!["b".to_string()],
+        });
+        
+        services.insert("b".to_string(), ServiceConfig {
+            command: "echo b".to_string(),
+            port: None,
+            env: HashMap::new(),
+            workdir: None,
+            depends_on: vec!["a".to_string()],
+        });
+
+        let config = LocaldConfig {
+            project: ProjectConfig { name: "test".to_string(), domain: None },
+            services,
+        };
+
+        let result = ProcessManager::resolve_startup_order(&config);
+        assert!(result.is_err());
     }
 }

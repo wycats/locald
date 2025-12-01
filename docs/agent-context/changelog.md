@@ -63,12 +63,12 @@ History of completed phases and key changes.
 - Created new guides: "Basic Configuration", "Architecture Overview", "Development Setup".
 - Refined reference docs for Configuration and CLI.
 
-## Phase 9: CLI Ergonomics & Interactive Mode (2025-11-30)
+## Phase 10: Multi-Service Dependencies (2025-12-01)
 
-**Goal**: Improve CLI UX for all personas.
+**Goal**: Support complex project structures where services depend on each other.
 
 **Work Completed**:
-- Implemented `locald init` using `dialoguer` for interactive project creation.
-- Implemented `locald monitor` using `ratatui` for a real-time TUI dashboard.
-- Improved error handling with actionable hints (e.g., suggesting to start the server).
-- Updated CLI reference documentation.
+- **Schema**: Added `depends_on` field to `ServiceConfig` in `locald-core`.
+- **Logic**: Implemented topological sort (Kahn's algorithm) in `locald-server` to resolve startup order.
+- **Process Manager**: Updated `start` logic to respect the resolved order.
+- **Verification**: Verified startup order and cycle detection with unit tests and a manual test project.

@@ -1,20 +1,16 @@
-# Phase 9 Task List
+# Phase 10 Task List
 
-- [x] **Interactive Init**
-  - [x] Add `dialoguer` to `locald-cli`.
-  - [x] Implement `locald init` logic.
-  - [x] Generate `locald.toml` from user input.
+- [x] **Schema Update**
+  - [x] Add `depends_on` to `ServiceConfig` in `locald-core`.
 
-- [x] **Error Handling**
-  - [x] Audit existing error messages.
-  - [x] Implement actionable error hints.
+- [x] **Dependency Logic**
+  - [x] Implement topological sort in `locald-server`.
+  - [x] Handle cycle detection.
 
-- [x] **TUI Monitor**
-  - [x] Add `ratatui` dependencies.
-  - [x] Implement TUI rendering loop.
-  - [x] Integrate IPC status polling.
+- [x] **Process Manager**
+  - [x] Update `start()` to respect startup order.
 
 - [x] **Verification**
-  - [x] Test `locald init` in a clean directory.
-  - [x] Test error scenarios.
-  - [x] Verify `locald monitor` updates in real-time.
+  - [x] Verify startup order with unit tests.
+  - [x] Verify startup order with a test project (manual verification).
+  - [x] Verify cycle detection with unit tests.

@@ -95,3 +95,9 @@
 **Context**: Users want a real-time dashboard of running services without leaving the terminal.
 **Decision**: Implement `locald monitor` using `ratatui` (community fork of tui-rs) for a robust TUI experience.
 **Status**: Accepted.
+
+## 017. Dependency Resolution: Topological Sort
+
+**Context**: Services may depend on other services (e.g., API depends on DB). We need to start them in the correct order.
+**Decision**: Use a topological sort (Kahn's algorithm) to determine the startup sequence. For the MVP, we only guarantee the *spawn* order, not the "ready" state (which would require health checks).
+**Status**: Accepted.

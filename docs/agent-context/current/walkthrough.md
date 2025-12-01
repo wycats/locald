@@ -1,27 +1,25 @@
-# Phase 9 Walkthrough: CLI Ergonomics & Interactive Mode
+# Phase 10 Walkthrough: Multi-Service Dependencies
 
 ## Overview
-In this phase, we are focusing on the "User Experience" of the CLI.
+In this phase, we are adding support for service dependencies. This allows users to define startup order (e.g., start the database before the API).
 
 ## Key Decisions
 
-### 1. Interactive Init
-We used `dialoguer` to create a wizard-style interface for `locald init`. This guides the user through creating a valid `locald.toml` without needing to read the documentation first.
+### 1. Topological Sort
+We use a topological sort (Kahn's algorithm) to determine the startup order. This ensures that all dependencies are started before the service that depends on them. We detect circular dependencies and fail if one is found.
 
-### 2. TUI Library
-We chose `ratatui` as it is the community standard fork of `tui-rs`. It provides a robust framework for building terminal UIs.
-
-### 3. Error Hints
-We added a `handle_ipc_error` helper to detect common connection errors and suggest running `locald server`. This directly addresses the "App Builder" persona's need for clear error messages.
+### 2. MVP: Start Order Only
+For this phase, `depends_on` only guarantees that the *process spawn command* is issued in the correct order. It does not wait for the service to be "ready" (listening on a port), as that requires health checks which are out of scope for now.
 
 ## Changes
 
 ### Codebase
-- **`locald-cli/src/init.rs`**: Implemented interactive project initialization.
-- **`locald-cli/src/monitor.rs`**: Implemented TUI monitor using `ratatui`.
-- **`locald-cli/src/main.rs`**: Added `init` and `monitor` commands, and improved error handling.
-- **`locald-cli/Cargo.toml`**: Added `dialoguer`, `ratatui`, `crossterm`.
+- **`locald-core`**: Added `depends_on` field to `ServiceConfig`.
+- **`locald-cli`**: Updated `init` command to initialize `depends_on`.
+- **`locald-server`**: 
+    - Implemented `resolve_startup_order` using Kahn's algorithm.
+    - Updated `ProcessManager::start` to start services in the resolved order.
+    - Added unit tests for dependency resolution and cycle detection.
 
 ### Documentation
-- (Pending updates to CLI reference)
-
+- Updated `task-list.md` to reflect progress.

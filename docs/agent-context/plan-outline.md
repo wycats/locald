@@ -93,5 +93,5 @@
 
 **Goal**: Support complex project structures.
 
-- [ ] Support `depends_on` in `locald.toml`.
-- [ ] Topological sort for startup order.
+- [x] Support `depends_on` in `locald.toml`.
+- [x] Topological sort for startup order.

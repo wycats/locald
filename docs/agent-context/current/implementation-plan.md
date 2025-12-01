@@ -1,37 +1,38 @@
-# Phase 9 Implementation Plan: CLI Ergonomics & Interactive Mode
+# Phase 10 Implementation Plan: Multi-Service Dependencies
 
 ## Goal
-Improve the user experience of the `locald` CLI by making it more helpful, interactive, and visually appealing. We want to reduce the friction for new users ("App Builder" persona) and provide better visibility for power users.
+Support complex project structures where services depend on each other. Ensure services start in the correct order based on a dependency graph.
 
 ## User Requirements
-- **App Builder**: "I don't know how to write the config file. Can you help me?" -> `locald init`.
-- **App Builder**: "Something went wrong, but I don't understand the error." -> Better error messages.
-- **Power User**: "I want to see what's happening with all my services in real-time." -> `locald monitor`.
+- **App Builder**: "My API crashes if the database isn't running. I want to say `depends_on = ['db']`."
+- **Power User**: "I have a complex microservices setup. I need a DAG startup."
+- **Contributor**: "I want to implement topological sorting in the process manager."
 
 ## Strategy
-1.  **Interactive Init**: Use `dialoguer` or `inquire` to prompt the user for project name and service command, then generate `locald.toml`.
-2.  **Better Errors**: Use `miette` or `thiserror` (already using `anyhow`, maybe refine usage) to provide context-aware error messages. Ensure IPC errors are propagated clearly.
-3.  **TUI Monitor**: Use `ratatui` to build a terminal user interface that shows running services, their status, and potentially streams logs.
+1.  **Config Schema**: Add `depends_on: Vec<String>` to `ServiceConfig` in `locald-core`.
+2.  **Dependency Graph**: In `locald-server`, when starting a project:
+    *   Build a graph of services.
+    *   Detect cycles (A -> B -> A) and error out.
+    *   Perform a topological sort to determine startup order.
+3.  **Sequential Startup**: Spawn processes in the sorted order.
+    *   *MVP*: Just wait for the `spawn` call to succeed before moving to the next.
+    *   *Future*: Wait for port binding or health check.
 
 ## Step-by-Step Plan
 
-### Step 1: Interactive Init
-- [ ] Add `dialoguer` dependency to `locald-cli`.
-- [ ] Implement `locald init` command.
-- [ ] Prompt for: Project Name, Service Name, Command, Port (optional).
-- [ ] Generate `locald.toml`.
+### Step 1: Schema Update
+- [ ] Update `locald-core/src/config.rs` to include `depends_on` in `ServiceConfig`.
+- [ ] Update `locald-cli/src/init.rs` to optionally prompt for dependencies (or just leave it manual for now).
 
-### Step 2: Error Handling Polish
-- [ ] Review current error output for common failure modes (daemon not running, config missing, port conflict).
-- [ ] Improve error messages to be actionable (e.g., "Daemon not running. Run `locald server` first.").
+### Step 2: Topological Sort Logic
+- [ ] Add `petgraph` or implement a simple Kahn's algorithm in `locald-server`.
+- [ ] Implement `resolve_startup_order(config: &LocaldConfig) -> Result<Vec<String>>`.
 
-### Step 3: TUI Monitor (`locald monitor`)
-- [ ] Add `ratatui` and `crossterm` dependencies to `locald-cli`.
-- [ ] Implement `locald monitor` command.
-- [ ] Create a basic layout: List of services on the left, details/logs on the right.
-- [ ] Fetch status periodically from `locald-server` via IPC.
+### Step 3: Process Manager Update
+- [ ] Refactor `ProcessManager::start` to use the resolved order.
+- [ ] Ensure that if a dependency fails to start, dependent services are skipped.
 
 ### Step 4: Verification
-- [ ] Test `locald init` in a clean directory.
-- [ ] Test error scenarios.
-- [ ] Verify `locald monitor` updates in real-time.
+- [ ] Create a test project with `db` and `api` where `api` depends on `db`.
+- [ ] Verify `db` starts before `api`.
+- [ ] Verify cycle detection (A -> B -> A) returns an error.
