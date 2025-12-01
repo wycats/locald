@@ -2,7 +2,7 @@ use anyhow::Result;
 use locald_core::{IpcRequest, IpcResponse};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc::Sender, broadcast};
 use tracing::{info, error};
 use crate::manager::ProcessManager;
 
@@ -50,6 +50,38 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shut
     let request: IpcRequest = serde_json::from_slice(&buf[..n])?;
     info!("Received request: {:?}", request);
 
+    if let IpcRequest::Logs { service } = request {
+        let mut rx = manager.log_sender.subscribe();
+        let recent = manager.get_recent_logs().await;
+        
+        for entry in recent {
+            if let Some(ref s) = service {
+                if &entry.service != s { continue; }
+            }
+            let mut bytes = serde_json::to_vec(&entry)?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(entry) => {
+                    if let Some(ref s) = service {
+                        if &entry.service != s { continue; }
+                    }
+                    let mut bytes = serde_json::to_vec(&entry)?;
+                    bytes.push(b'\n');
+                    if stream.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        return Ok(());
+    }
+
     let response = match request {
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::Start { path } => {
@@ -72,6 +104,7 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shut
             let _ = shutdown_tx.send(()).await;
             IpcResponse::Ok
         }
+        IpcRequest::Logs { .. } => unreachable!(),
     };
 
     let response_bytes = serde_json::to_vec(&response)?;

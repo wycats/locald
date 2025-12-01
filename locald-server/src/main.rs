@@ -31,7 +31,10 @@ async fn main() -> Result<()> {
         if let Err(e) = proxy.start(80).await {
             warn!("Failed to bind port 80: {}. Trying port 8080...", e);
             if let Err(e) = proxy.start(8080).await {
-                error!("Failed to bind port 8080: {}. Proxy disabled.", e);
+                warn!("Failed to bind port 8080: {}. Trying port 8081...", e);
+                if let Err(e) = proxy.start(8081).await {
+                    error!("Failed to bind port 8081: {}. Proxy disabled.", e);
+                }
             }
         }
     });

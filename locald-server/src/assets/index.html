@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>locald dashboard</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>locald</h1>
+            <div id="connection-status" class="status-indicator disconnected">Connecting...</div>
+        </header>
+        <main>
+            <section id="services-section">
+                <h2>Services</h2>
+                <div id="service-list" class="loading">Loading services...</div>
+            </section>
+            <section id="logs-section">
+                <h2>Logs</h2>
+                <div id="log-viewer"></div>
+            </section>
+        </main>
+    </div>
+    <script type="module" src="/app.js"></script>
+</body>
+</html>

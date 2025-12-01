@@ -32,6 +32,11 @@ enum Commands {
     },
     /// List running services
     Status,
+    /// Stream logs from services
+    Logs {
+        /// Name of the service to stream logs for (optional)
+        service: Option<String>,
+    },
     /// Shutdown the locald daemon
     Shutdown,
     /// Administrative commands
@@ -139,6 +144,11 @@ fn main() -> Result<()> {
                 }
                 Ok(response) => println!("Unexpected response: {:?}", response),
                 Err(e) => println!("Error: {}", e),
+            }
+        }
+        Commands::Logs { service } => {
+            if let Err(e) = client::stream_logs(service.clone()) {
+                println!("Error streaming logs: {}", e);
             }
         }
         Commands::Shutdown => {

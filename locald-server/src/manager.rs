@@ -1,13 +1,17 @@
 use anyhow::{Context, Result};
 use locald_core::config::LocaldConfig;
-use locald_core::ipc::ServiceStatus;
-use std::collections::HashMap;
+use locald_core::ipc::{ServiceStatus, LogEntry};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+use tokio::io::{BufReader, AsyncBufReadExt};
 use tracing::{info, error};
+
+const LOG_BUFFER_SIZE: usize = 1000;
 
 pub struct Service {
     pub config: LocaldConfig,
@@ -19,13 +23,35 @@ pub struct Service {
 #[derive(Clone)]
 pub struct ProcessManager {
     services: Arc<Mutex<HashMap<String, Service>>>,
+    pub log_sender: broadcast::Sender<LogEntry>,
+    log_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
 impl ProcessManager {
     pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(100);
         Self {
             services: Arc::new(Mutex::new(HashMap::new())),
+            log_sender: tx,
+            log_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_SIZE))),
         }
+    }
+
+    async fn broadcast_log(&self, entry: LogEntry) {
+        // Add to buffer
+        let mut buffer = self.log_buffer.lock().await;
+        if buffer.len() >= LOG_BUFFER_SIZE {
+            buffer.pop_front();
+        }
+        buffer.push_back(entry.clone());
+
+        // Broadcast (ignore error if no receivers)
+        let _ = self.log_sender.send(entry);
+    }
+
+    pub async fn get_recent_logs(&self) -> Vec<LogEntry> {
+        let buffer = self.log_buffer.lock().await;
+        buffer.iter().cloned().collect()
     }
 
     pub async fn start(&self, path: PathBuf) -> Result<()> {
@@ -68,10 +94,44 @@ impl ProcessManager {
                 cmd.env(k, v);
             }
             cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::inherit()); 
-            cmd.stderr(Stdio::inherit());
+            cmd.stdout(Stdio::piped()); 
+            cmd.stderr(Stdio::piped());
 
-            let child = cmd.spawn().context("Failed to spawn process")?;
+            let mut child = cmd.spawn().context("Failed to spawn process")?;
+
+            // Spawn log readers
+            let stdout = child.stdout.take().expect("Failed to capture stdout");
+            let stderr = child.stderr.take().expect("Failed to capture stderr");
+            
+            let manager = self.clone();
+            let service_name_clone = name.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                    manager.broadcast_log(LogEntry {
+                        timestamp,
+                        service: service_name_clone.clone(),
+                        stream: "stdout".to_string(),
+                        message: line,
+                    }).await;
+                }
+            });
+
+            let manager = self.clone();
+            let service_name_clone = name.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                    manager.broadcast_log(LogEntry {
+                        timestamp,
+                        service: service_name_clone.clone(),
+                        stream: "stderr".to_string(),
+                        message: line,
+                    }).await;
+                }
+            });
 
             services.insert(name, Service {
                 config: config.clone(),

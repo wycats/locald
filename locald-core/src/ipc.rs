@@ -11,6 +11,14 @@ pub struct ServiceStatus {
     pub domain: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub timestamp: i64,
+    pub service: String,
+    pub stream: String, // "stdout" or "stderr"
+    pub message: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcRequest {
     Ping,
@@ -18,6 +26,7 @@ pub enum IpcRequest {
     Stop { name: String },
     Status,
     Shutdown,
+    Logs { service: Option<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

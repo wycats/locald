@@ -1,16 +1,24 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
-use hyper_util::rt::TokioIo;
+use axum::{
+    extract::{State, WebSocketUpgrade, ws::WebSocket, Request},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+    body::Body,
+    http::Uri,
+};
+use hyper::StatusCode;
 use tokio::net::TcpListener;
 use tracing::{error, info};
+use rust_embed::RustEmbed;
 
 use crate::manager::ProcessManager;
+
+#[derive(RustEmbed)]
+#[folder = "src/assets/"]
+struct Assets;
 
 pub struct ProxyManager {
     process_manager: ProcessManager,
@@ -26,91 +34,106 @@ impl ProxyManager {
         let listener = TcpListener::bind(addr).await?;
         info!("Proxy listening on http://{}", addr);
 
-        let pm = self.process_manager.clone();
         let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(hyper_util::client::legacy::connect::HttpConnector::new());
-        let client = Arc::new(client);
+        
+        let state = AppState {
+            pm: self.process_manager.clone(),
+            client,
+        };
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-            let pm = pm.clone();
-            let client = client.clone();
+        let app = Router::new()
+            .route("/api/state", get(handle_state))
+            .route("/api/logs", get(handle_ws))
+            .fallback(handle_proxy)
+            .with_state(state);
 
-            tokio::task::spawn(async move {
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service_fn(move |req| proxy_request(req, pm.clone(), client.clone())))
-                    .await
-                {
-                    error!("Error serving connection: {:?}", err);
-                }
-            });
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    pm: ProcessManager,
+    client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
+}
+
+async fn handle_state(State(state): State<AppState>) -> impl IntoResponse {
+    let services = state.pm.list().await;
+    axum::Json(services)
+}
+
+async fn handle_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state.pm))
+}
+
+async fn handle_socket(mut socket: WebSocket, pm: ProcessManager) {
+    let mut rx = pm.log_sender.subscribe();
+    let recent = pm.get_recent_logs().await;
+    for entry in recent {
+        if let Ok(msg) = serde_json::to_string(&entry) {
+             if socket.send(axum::extract::ws::Message::Text(msg)).await.is_err() {
+                 return;
+             }
+        }
+    }
+
+    while let Ok(entry) = rx.recv().await {
+        if let Ok(msg) = serde_json::to_string(&entry) {
+            if socket.send(axum::extract::ws::Message::Text(msg)).await.is_err() {
+                break;
+            }
         }
     }
 }
 
-fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
-    Full::new(chunk.into())
-        .map_err(|never| match never {})
-        .boxed()
+async fn handle_assets(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([(axum::http::header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+    }
 }
 
-async fn proxy_request(
-    req: Request<hyper::body::Incoming>,
-    pm: ProcessManager,
-    client: Arc<hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, hyper::body::Incoming>>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+async fn handle_proxy(
+    State(state): State<AppState>,
+    mut req: Request,
+) -> Response {
     let host = match req.headers().get("host") {
         Some(h) => h.to_str().unwrap_or_default().split(':').next().unwrap_or_default(),
-        None => return Ok(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(full("Missing Host header"))
-            .unwrap()),
+        None => return (StatusCode::BAD_REQUEST, "Missing Host header").into_response(),
     };
 
-    if let Some(port) = pm.find_port_by_domain(host).await {
+    if host == "locald.local" {
+        return handle_assets(req.uri().clone()).await.into_response();
+    }
+
+    if let Some(port) = state.pm.find_port_by_domain(host).await {
         let uri_string = format!("http://127.0.0.1:{}{}", port, req.uri().path_and_query().map(|x| x.as_str()).unwrap_or(""));
-        let uri: Uri = uri_string.parse().unwrap();
-        
-        let mut new_req = Request::builder()
-            .method(req.method())
-            .uri(uri)
-            .version(req.version());
-            
-        for (key, value) in req.headers() {
-            // Don't forward host header? Or do we?
-            // Usually we want to preserve it or set it to the target.
-            // But the target is localhost, so maybe it doesn't matter.
-            // However, if the app checks Host header, it should match what the browser sent.
-            if key.as_str() != "host" {
-                 new_req.headers_mut().unwrap().insert(key, value.clone());
-            }
+        if let Ok(uri) = uri_string.parse() {
+            *req.uri_mut() = uri;
+        } else {
+             return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response();
         }
-        // Set host header to localhost? Or keep original?
-        // If we keep original, the app might be confused if it's not configured for it.
-        // But usually we want to pass the original Host header.
-        new_req.headers_mut().unwrap().insert("host", host.parse().unwrap());
         
-        let new_req = new_req.body(req.into_body()).unwrap();
-        
-        match client.request(new_req).await {
-            Ok(res) => {
-                let (parts, body) = res.into_parts();
-                let boxed_body = body.map_err(|e| e).boxed();
-                Ok(Response::from_parts(parts, boxed_body))
-            }
+        // Forward the request
+        match state.client.request(req).await {
+            Ok(res) => res.into_response(),
             Err(e) => {
                 error!("Proxy error: {}", e);
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full(format!("Proxy error: {}", e)))
-                    .unwrap())
+                (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response()
             }
         }
     } else {
-        Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(full(format!("Domain {} not found", host)))
-            .unwrap())
+        (StatusCode::NOT_FOUND, format!("Domain {} not found", host)).into_response()
     }
 }
