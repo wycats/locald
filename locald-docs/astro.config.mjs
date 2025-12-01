@@ -16,16 +16,20 @@ export default defineConfig({
       ],
       sidebar: [
         {
-          label: "Concepts",
-          autogenerate: { directory: "concepts" },
-        },
-        {
           label: "Guides",
           autogenerate: { directory: "guides" },
         },
         {
+          label: "Concepts",
+          autogenerate: { directory: "concepts" },
+        },
+        {
           label: "Reference",
           autogenerate: { directory: "reference" },
+        },
+        {
+          label: "Internals",
+          autogenerate: { directory: "internals" },
         },
       ],
     }),

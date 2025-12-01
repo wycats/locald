@@ -71,7 +71,17 @@
 - [x] Implement state loading on startup.
 - [x] Handle "zombie" processes (processes that are still running but the daemon forgot about them, or vice versa).
 
-### Phase 8: CLI Ergonomics & Interactive Mode
+### Phase 8: Documentation Overhaul
+
+**Goal**: Update docs to better serve specific user personas (App Builder, Power User, Contributor).
+
+- [x] Create `docs/design/personas.md`.
+- [x] Review and restructure existing documentation.
+- [x] Create "How-to" guides for "Regular Joe".
+- [x] Create Reference docs for "Power User".
+- [x] Create Architecture docs for "Contributor".
+
+### Phase 9: CLI Ergonomics & Interactive Mode
 
 **Goal**: Improve the user experience of the CLI.
 
@@ -79,7 +89,7 @@
 - [ ] Interactive `locald init` to create `locald.toml`.
 - [ ] `locald monitor` (TUI) using `ratatui`?
 
-### Phase 9: Multi-Service Dependencies
+### Phase 10: Multi-Service Dependencies
 
 **Goal**: Support complex project structures.
 

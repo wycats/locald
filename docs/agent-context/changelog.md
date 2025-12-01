@@ -50,3 +50,13 @@ History of completed phases and key changes.
 - Implemented "Kill & Restart" strategy for process recovery to handle zombie processes.
 - Refactored `locald-server/src/proxy.rs` to use `axum`, resolving dependency conflicts.
 - Verified persistence manually (services restart automatically).
+
+## Phase 8: Documentation Overhaul (2025-11-30)
+
+**Goal**: Restructure documentation to serve specific user personas.
+
+**Work Completed**:
+- Defined "App Builder", "Power User", and "Contributor" personas in `docs/design/personas.md`.
+- Restructured documentation sidebar into Guides, Concepts, Reference, and Internals.
+- Created new guides: "Basic Configuration", "Architecture Overview", "Development Setup".
+- Refined reference docs for Configuration and CLI.

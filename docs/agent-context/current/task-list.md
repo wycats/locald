@@ -1,24 +1,23 @@
-# Phase 7 Task List
+# Phase 8 Task List
 
-- [x] **Core: State Schema**
-  - [x] Create `locald-core/src/state.rs`.
-  - [x] Define `ServiceState` and `ServerState` structs.
-  - [x] Add `serde` derives.
+- [x] **Foundation**
+  - [x] Create `docs/design/personas.md`.
 
-- [x] **Server: State Manager**
-  - [x] Create `locald-server/src/state.rs`.
-  - [x] Implement `load()` and `save()`.
-  - [x] Handle XDG paths (`directories` crate).
+- [x] **Structure**
+  - [x] Audit existing docs.
+  - [x] Update sidebar structure in `locald-docs`.
 
-- [x] **Server: Integration**
-  - [x] Add `StateManager` to `ProcessManager`.
-  - [x] Call `save()` on service start/stop.
-  - [x] Implement `restore()` method in `ProcessManager`.
+- [x] **Content: App Builder**
+  - [x] Write "Getting Started".
+  - [x] Write "Basic Configuration".
 
-- [x] **Server: Reconciliation**
-  - [x] Implement PID liveness check (`nix` crate).
-  - [x] Handle port re-binding for restored services (handled by `start` logic).
+- [x] **Content: Power User**
+  - [x] Write "Configuration Reference".
+  - [x] Write "CLI Reference".
+
+- [x] **Content: Contributor**
+  - [x] Write "Architecture Overview".
+  - [x] Write "Development Setup".
 
 - [x] **Verification**
-  - [x] Verify persistence across restarts.
-  - [x] Verify zombie cleanup/adoption.
+  - [x] "Fresh Eyes" review: Read through the new docs as each persona.

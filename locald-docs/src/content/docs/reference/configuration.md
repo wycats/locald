@@ -1,37 +1,55 @@
 ---
-title: Configuration
-description: Reference for locald.toml.
+title: Configuration Reference
+description: Complete specification for locald.toml.
 ---
 
-The `locald.toml` file defines how `locald` runs your service.
+The `locald.toml` file is the source of truth for your project's configuration. It uses the [TOML](https://toml.io/) format.
 
-## Schema
+## `[project]` Section
+
+Defines global settings for the project.
+
+| Key | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `name` | String | **Yes** | A unique identifier for the project. Used for namespacing logs and services. |
+| `domain` | String | No | A local domain (e.g., `app.local`) to route to this project. Requires `locald admin sync-hosts`. |
+
+## `[services]` Section
+
+Defines the processes to run. Keys are service names (e.g., `web`, `worker`). Values can be a simple table or an inline table.
+
+### Service Options
+
+| Key | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `command` | String | **Yes** | The shell command to execute. Supports environment variable expansion (e.g., `$PORT`). |
+| `workdir` | String | No | The working directory for the command, relative to `locald.toml`. Defaults to the project root. |
+| `env` | Table | No | Key-value pairs of environment variables to inject into the process. |
+
+### Example: Full Specification
 
 ```toml
 [project]
-# The name of the project. Used for namespacing services.
-name = "my-project"
+name = "complex-app"
+domain = "complex.local"
 
-# Optional: The domain to serve the project on.
-# If set, locald will route requests from this domain to your services.
-domain = "my-app.local"
-
-[services]
-# Define services as a map. The key is the service name.
-web = { command = "npm start", port = 3000 }
-worker = { command = "npm run worker" }
-
-# Extended syntax for more options
 [services.api]
-command = "cargo run"
-# Optional: Working directory (defaults to the directory containing locald.toml)
+command = "./target/debug/api"
 workdir = "./backend"
-# Optional: Environment variables
-env = { RUST_LOG = "debug" }
+
+[services.api.env]
+RUST_LOG = "debug"
+DB_HOST = "localhost"
+
+[services.worker]
+command = "celery -A proj worker"
+workdir = "./worker"
 ```
 
-## Environment Variables
+## Injected Environment Variables
 
-`locald` automatically injects the following environment variables into your process:
+`locald` guarantees the following variables are present in the service environment:
 
-- `PORT`: The dynamically assigned TCP port. Your service **must** listen on this port.
+*   `PORT`: A dynamically assigned, free TCP port. The service **must** bind to this port to be reachable via the proxy.
+*   `PATH`: Inherited from the `locald` process (usually your user's shell path).
+

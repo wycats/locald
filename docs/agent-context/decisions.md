@@ -77,3 +77,9 @@
 **Context**: When the daemon restarts, it finds "zombie" processes from the previous session. Adopting them is complex due to lost I/O pipes.
 **Decision**: The daemon kills the old PID (if running) and restarts the service from scratch. This ensures a clean state and re-establishes log capture.
 **Status**: Accepted.
+
+## 014. Documentation: Persona-Based Structure
+
+**Context**: Documentation was becoming a mix of tutorials and references without a clear audience.
+**Decision**: Structure documentation explicitly around three personas: App Builder (Guides), Power User (Reference), and Contributor (Internals).
+**Status**: Accepted.

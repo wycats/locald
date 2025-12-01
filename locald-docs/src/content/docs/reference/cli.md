@@ -1,54 +1,58 @@
 ---
 title: CLI Reference
-description: Command reference for the locald CLI.
+description: Complete command reference for the locald CLI.
 ---
 
-## Global Commands
+The `locald` CLI is the primary interface for interacting with the daemon.
 
-### `locald server`
+## Usage
 
-Starts the `locald-server` daemon in the background.
+```bash
+locald <COMMAND> [ARGS]
+```
 
-### `locald ping`
+## Core Commands
 
-Checks if the daemon is reachable.
-
-### `locald status`
-
-Lists all running processes managed by the daemon.
-
-### `locald stop <name>`
-
-Stops a specific service by name.
+| Command | Description |
+| :--- | :--- |
+| `server` | Starts the `locald-server` daemon in the background. Safe to run multiple times (idempotent). |
+| `ping` | Checks if the daemon is running and reachable via IPC. |
+| `status` | Lists all currently running services and their status (PID, Port, etc.). |
+| `logs` | Streams logs from running services. |
 
 ## Project Commands
 
-These commands must be run from a directory containing a `locald.toml`.
+These commands operate on the project defined in the `locald.toml` of the current directory.
 
-### `locald start`
-
-Starts the service defined in the current directory's `locald.toml`.
-
-### `locald stop`
-
-Stops the service defined in the current directory's `locald.toml`.
+| Command | Description |
+| :--- | :--- |
+| `start` | Registers and starts the services defined in `locald.toml`. |
+| `stop` | Stops the services defined in `locald.toml`. |
 
 ## Admin Commands
 
-### `locald admin setup`
+These commands require elevated privileges (`sudo`) to modify system configuration.
 
-Applies necessary capabilities to the `locald-server` binary to allow binding to privileged ports (like port 80).
-Requires `sudo`.
+| Command | Description |
+| :--- | :--- |
+| `admin setup` | Grants `cap_net_bind_service` to the `locald-server` binary, allowing it to bind port 80. |
+| `admin sync-hosts` | Updates `/etc/hosts` to map project domains (e.g., `app.local`) to `127.0.0.1`. Only touches the `# BEGIN locald` block. |
 
+## Examples
+
+**Start the server:**
 ```bash
-sudo locald admin setup
+locald server
 ```
 
-### `locald admin sync-hosts`
-
-Updates your system's hosts file (`/etc/hosts` or equivalent) to map configured domains to `127.0.0.1`.
-Requires `sudo`.
-
+**Start a project:**
 ```bash
-sudo locald admin sync-hosts
+cd ~/my-project
+locald start
 ```
+
+**Check status:**
+```bash
+locald status
+```
+
