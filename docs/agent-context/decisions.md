@@ -101,3 +101,9 @@
 **Context**: Services may depend on other services (e.g., API depends on DB). We need to start them in the correct order.
 **Decision**: Use a topological sort (Kahn's algorithm) to determine the startup sequence. For the MVP, we only guarantee the *spawn* order, not the "ready" state (which would require health checks).
 **Status**: Accepted.
+
+## 018. Documentation: Sticky Language Tabs
+
+**Context**: The "Common Patterns" guide needs to show examples for multiple languages (Node, Python, Go, Rust). Users typically care about one language at a time.
+**Decision**: Use Astro Starlight's `<Tabs syncKey="lang">` component. This persists the user's language selection across different examples on the page (and potentially across pages), reducing cognitive load.
+**Status**: Accepted.

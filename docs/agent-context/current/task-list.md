@@ -1,19 +1,19 @@
 # Phase 11 Task List
 
-- [ ] **Audit**
-  - [ ] Review existing docs.
-  - [ ] Identify gaps.
+- [x] **Audit**
+  - [x] Review existing docs.
+  - [x] Identify gaps.
 
-- [ ] **App Builder Docs**
-  - [ ] Update Getting Started.
-  - [ ] Create Common Patterns guide.
+- [x] **App Builder Docs**
+  - [x] Update Getting Started.
+  - [x] Create Common Patterns guide.
 
-- [ ] **Power User Docs**
-  - [ ] Update Configuration Reference.
-  - [ ] Document Env Vars.
+- [x] **Power User Docs**
+  - [x] Update Configuration Reference.
+  - [x] Document Env Vars.
 
-- [ ] **Contributor Docs**
-  - [ ] Update Architecture Overview.
+- [x] **Contributor Docs**
+  - [x] Update Architecture Overview.
 
-- [ ] **Verification**
-  - [ ] Build docs site.
+- [x] **Verification**
+  - [x] Build docs site.

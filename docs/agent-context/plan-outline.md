@@ -100,10 +100,10 @@
 
 **Goal**: Ensure documentation fully serves the defined personas before adding more complexity.
 
-- [ ] Fresh Eyes review of existing docs.
-- [ ] Flesh out "App Builder" guides (Getting Started, Common Patterns).
-- [ ] Flesh out "Power User" reference (Configuration, CLI).
-- [ ] Flesh out "Contributor" docs (Architecture, Dev Setup).
+- [x] Fresh Eyes review of existing docs.
+- [x] Flesh out "App Builder" guides (Getting Started, Common Patterns).
+- [x] Flesh out "Power User" reference (Configuration, CLI).
+- [x] Flesh out "Contributor" docs (Architecture, Dev Setup).
 
 ## Epoch 3: Hybrid Development & Advanced Features
 

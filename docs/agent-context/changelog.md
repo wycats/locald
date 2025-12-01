@@ -6,6 +6,23 @@ History of completed phases and key changes.
 
 <!-- agent-template end -->
 
+## Phase 11: Documentation & Persona Alignment (2025-12-01)
+
+**Goal**: Ensure documentation fully serves the defined personas before adding more complexity.
+
+**Work Completed**:
+- **Fresh Eyes Review**: Audited all documentation against the "App Builder", "Power User", and "Contributor" personas.
+- **App Builder**:
+    - Updated "Getting Started" to use `locald init`.
+    - Created "Common Patterns" guide with copy-pasteable examples for Node, Python, Go, and Rust.
+    - Implemented sticky language tabs using Starlight's `<Tabs syncKey="lang">`.
+- **Power User**:
+    - Updated "Configuration Reference" to include `depends_on`.
+    - Documented environment variables injected by `locald`.
+- **Contributor**:
+    - Updated "Architecture Overview" to reflect dependency resolution and state persistence.
+- **Verification**: Built and verified the documentation site.
+
 ## Phase 4: Local DNS & Routing (2025-11-30)
 
 - **Reverse Proxy**: Implemented a `hyper`-based reverse proxy in `locald-server` listening on port 80 (with 8080 fallback).

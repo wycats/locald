@@ -44,11 +44,14 @@ graph TD
 ### Starting a Service
 
 1.  User runs `locald start` in a project directory.
-2.  CLI reads `locald.toml`.
-3.  CLI sends `Register(service_config)` message to Server.
-4.  Server assigns a free port.
-5.  Server spawns the command with `PORT` env var.
-6.  Server updates `state.json`.
+2.  CLI resolves the absolute path and sends `Start { path }` message to Server.
+3.  Server reads `locald.toml` from the provided path.
+4.  **Dependency Resolution**: Server builds a dependency graph and performs a topological sort to determine startup order.
+5.  **Sequential Startup**: For each service in order:
+    - Server assigns a free port.
+    - Server spawns the command with `PORT` env var.
+    - Server updates internal state.
+6.  Server persists state to `state.json`.
 7.  Server returns success to CLI.
 
 ### Request Routing

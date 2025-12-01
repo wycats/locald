@@ -20,11 +20,12 @@ Defines the processes to run. Keys are service names (e.g., `web`, `worker`). Va
 
 ### Service Options
 
-| Key       | Type   | Required | Description                                                                                     |
-| :-------- | :----- | :------- | :---------------------------------------------------------------------------------------------- |
-| `command` | String | **Yes**  | The shell command to execute. Supports environment variable expansion (e.g., `$PORT`).          |
-| `workdir` | String | No       | The working directory for the command, relative to `locald.toml`. Defaults to the project root. |
-| `env`     | Table  | No       | Key-value pairs of environment variables to inject into the process.                            |
+| Key          | Type         | Required | Description                                                                                     |
+| :----------- | :----------- | :------- | :---------------------------------------------------------------------------------------------- |
+| `command`    | String       | **Yes**  | The shell command to execute. Supports environment variable expansion (e.g., `$PORT`).          |
+| `workdir`    | String       | No       | The working directory for the command, relative to `locald.toml`. Defaults to the project root. |
+| `env`        | Table        | No       | Key-value pairs of environment variables to inject into the process.                            |
+| `depends_on` | List<String> | No       | A list of other service names that must start before this service.                              |
 
 ### Example: Full Specification
 
@@ -36,6 +37,7 @@ domain = "complex.local"
 [services.api]
 command = "./target/debug/api"
 workdir = "./backend"
+depends_on = ["db"]
 
 [services.api.env]
 RUST_LOG = "debug"
@@ -44,6 +46,7 @@ DB_HOST = "localhost"
 [services.worker]
 command = "celery -A proj worker"
 workdir = "./worker"
+depends_on = ["api", "redis"]
 ```
 
 ## Injected Environment Variables

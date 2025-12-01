@@ -31,30 +31,52 @@ locald ping
 
 ## Your First Service
 
-1.  Create a new directory for your project.
-2.  Create a `locald.toml` file:
+1.  Create a new directory for your project:
 
-```toml
-[project]
-name = "my-app"
+    ```bash
+    mkdir my-app
+    cd my-app
+    ```
 
-[services]
-web = { command = "python3 -m http.server $PORT" }
-```
+2.  Initialize the project:
+
+    ```bash
+    locald init
+    ```
+
+    Follow the interactive prompts to set up your project name and first service. For this example, you can use:
+    - **Project Name**: `my-app`
+    - **Service Name**: `web`
+    - **Command**: `python3 -m http.server $PORT`
+
+    This will generate a `locald.toml` file for you.
 
 3.  Start the service:
 
+    ```bash
+    locald start
+    ```
+
+## Monitoring Your App
+
+`locald` provides a real-time dashboard to see your running services and logs.
+
 ```bash
-locald start
+locald monitor
 ```
 
-4.  Check the status:
+This opens a TUI (Text User Interface) where you can:
+- See the status of all services.
+- View real-time logs (stdout/stderr).
+- See the assigned ports and URLs.
+
+Press `q` or `Ctrl+C` to exit the monitor (your services will keep running!).
+
+You can also check the status via the CLI:
 
 ```bash
 locald status
 ```
-
-You should see your app running on a dynamically assigned port!
 
 ## Next Steps: Go Public (Locally)
 

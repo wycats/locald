@@ -16,21 +16,22 @@ Perform a "Fresh Eyes" review of the current documentation and codebase to ensur
 ## Step-by-Step Plan
 
 ### Step 1: Audit
-- [ ] Review `locald-docs/src/content/docs/index.mdx` (Landing Page).
-- [ ] Review `locald-docs/src/content/docs/guides/getting-started.md`.
-- [ ] Review `locald-docs/src/content/docs/reference/configuration.md`.
-- [ ] Identify gaps.
+- [x] Review `locald-docs/src/content/docs/index.mdx` (Landing Page).
+- [x] Review `locald-docs/src/content/docs/guides/getting-started.md`.
+- [x] Review `locald-docs/src/content/docs/reference/configuration.md`.
+- [x] Identify gaps.
 
 ### Step 2: App Builder Focus
-- [ ] Create/Update "Common Patterns" guide (e.g., "How to run a Node app", "How to run a Python app").
-- [ ] Ensure error messages in the CLI are helpful (audit `locald-cli` output).
+- [x] Create/Update "Common Patterns" guide (e.g., "How to run a Node app", "How to run a Python app").
+    - Use Starlight's `<Tabs syncKey="lang">` feature to make language selection sticky.
+- [x] Ensure error messages in the CLI are helpful (audit `locald-cli` output).
 
 ### Step 3: Power User Focus
-- [ ] Ensure `locald.toml` reference is complete (including new `depends_on`).
-- [ ] Document environment variables injected by `locald`.
+- [x] Ensure `locald.toml` reference is complete (including new `depends_on`).
+- [x] Document environment variables injected by `locald`.
 
 ### Step 4: Contributor Focus
-- [ ] Update Architecture docs to reflect recent changes (State Persistence, Dependency Resolution).
+- [x] Update Architecture docs to reflect recent changes (State Persistence, Dependency Resolution).
 
 ### Step 5: Verification
-- [ ] Build and preview the documentation site.
+- [x] Build and preview the documentation site.
