@@ -96,11 +96,20 @@
 - [x] Support `depends_on` in `locald.toml`.
 - [x] Topological sort for startup order.
 
+### Phase 11: Documentation & Persona Alignment
+
+**Goal**: Ensure documentation fully serves the defined personas before adding more complexity.
+
+- [ ] Fresh Eyes review of existing docs.
+- [ ] Flesh out "App Builder" guides (Getting Started, Common Patterns).
+- [ ] Flesh out "Power User" reference (Configuration, CLI).
+- [ ] Flesh out "Contributor" docs (Architecture, Dev Setup).
+
 ## Epoch 3: Hybrid Development & Advanced Features
 
 **Goal**: Support hybrid workflows (Docker + Local) and advanced networking.
 
-### Phase 11: Docker Integration
+### Phase 12: Docker Integration
 
 **Goal**: Unified lifecycle for local apps and Docker containers.
 

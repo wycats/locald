@@ -1,20 +1,14 @@
-# Phase 11 Walkthrough: Docker Integration
+# Phase 11 Walkthrough: Documentation & Persona Alignment
 
 ## Overview
-In this phase, we are adding support for running Docker containers as services.
+In this phase, we are pausing feature development to ensure our documentation is up to par. We are reviewing all docs through the lens of our Personas.
 
 ## Key Decisions
 
-### 1. Native Docker Support
-We are wrapping the `docker` CLI directly rather than using `docker-compose`. This allows us to integrate container ports into our dynamic port assignment system.
-
-### 2. Minimal Schema
-We only support `image`, `container_port`, and `volumes`. Complex setups should use `docker-compose` via the `command` field.
+### 1. Persona-First Documentation
+We are structuring the documentation to explicitly serve the "App Builder", "Power User", and "Contributor" personas, rather than just having a flat list of topics.
 
 ## Changes
-
-### Codebase
-- (List changes here)
 
 ### Documentation
 - (List changes here)

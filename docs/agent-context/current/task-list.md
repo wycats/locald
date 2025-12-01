@@ -1,14 +1,19 @@
 # Phase 11 Task List
 
-- [ ] **Schema Update**
-  - [ ] Add `image`, `container_port`, `volumes` to `ServiceConfig`.
+- [ ] **Audit**
+  - [ ] Review existing docs.
+  - [ ] Identify gaps.
 
-- [ ] **Docker Logic**
-  - [ ] Implement container cleanup on start (`docker rm -f`).
-  - [ ] Implement `docker run` command construction.
-  - [ ] Handle port mapping.
+- [ ] **App Builder Docs**
+  - [ ] Update Getting Started.
+  - [ ] Create Common Patterns guide.
+
+- [ ] **Power User Docs**
+  - [ ] Update Configuration Reference.
+  - [ ] Document Env Vars.
+
+- [ ] **Contributor Docs**
+  - [ ] Update Architecture Overview.
 
 - [ ] **Verification**
-  - [ ] Verify container startup.
-  - [ ] Verify log streaming.
-  - [ ] Verify cleanup on stop.
+  - [ ] Build docs site.

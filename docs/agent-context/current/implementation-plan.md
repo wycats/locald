@@ -1,37 +1,36 @@
-# Phase 11 Implementation Plan: Docker Integration
+# Phase 11 Implementation Plan: Documentation & Persona Alignment
 
 ## Goal
-Support "Hybrid" development where some services run locally (binaries) and others run in Docker containers (databases, queues), all managed by `locald`.
+Perform a "Fresh Eyes" review of the current documentation and codebase to ensure it aligns with our defined Personas (App Builder, Power User, Contributor). Fill in gaps and improve clarity before adding significant new complexity (Docker).
 
 ## User Requirements
-- **App Builder**: "I want to add a Postgres database to my project without writing a `docker-compose.yml`."
-- **Power User**: "I want `locald` to manage the ports for my containers so they don't conflict."
+- **App Builder**: Needs a frictionless "Getting Started" experience and clear examples for common tasks.
+- **Power User**: Needs comprehensive reference documentation to understand capabilities and limitations.
+- **Contributor**: Needs a clear mental model of the architecture to contribute effectively.
 
 ## Strategy
-1.  **Schema Update**: Add `image`, `container_port`, and `volumes` to `ServiceConfig`.
-2.  **Process Manager**:
-    - Detect if a service is a Docker service (`image` is present).
-    - Construct `docker run` commands instead of shell commands.
-    - Ensure robust cleanup (remove old containers on start).
-3.  **Port Management**:
-    - Bind ephemeral host ports and map them to `container_port`.
-    - Inject these ports into other services.
+1.  **Review**: Audit existing docs against `docs/design/personas.md`.
+2.  **Refine**: Rewrite or restructure confusing sections.
+3.  **Expand**: Write missing guides or references.
 
 ## Step-by-Step Plan
 
-### Step 1: Schema Update
-- [ ] Update `locald-core/src/config.rs` to add `image`, `container_port`, `volumes`.
-- [ ] Update `locald-cli/src/init.rs` (optional, maybe just leave as manual edit for now).
+### Step 1: Audit
+- [ ] Review `locald-docs/src/content/docs/index.mdx` (Landing Page).
+- [ ] Review `locald-docs/src/content/docs/guides/getting-started.md`.
+- [ ] Review `locald-docs/src/content/docs/reference/configuration.md`.
+- [ ] Identify gaps.
 
-### Step 2: Docker Process Logic
-- [ ] In `locald-server/src/manager.rs`, modify `start()`:
-    - Check if `service.image` is set.
-    - If so, run `docker rm -f locald-<project>-<service>` first.
-    - Then run `docker run --rm --name locald-<project>-<service> -p <host_port>:<container_port> ...`.
-- [ ] Ensure `stop()` kills the docker CLI process (and maybe runs `docker stop` explicitly if needed).
+### Step 2: App Builder Focus
+- [ ] Create/Update "Common Patterns" guide (e.g., "How to run a Node app", "How to run a Python app").
+- [ ] Ensure error messages in the CLI are helpful (audit `locald-cli` output).
 
-### Step 3: Verification
-- [ ] Create a test project with a `postgres` service.
-- [ ] Verify it starts and binds a port.
-- [ ] Verify `locald logs` shows postgres logs.
-- [ ] Verify `locald stop` cleans up the container.
+### Step 3: Power User Focus
+- [ ] Ensure `locald.toml` reference is complete (including new `depends_on`).
+- [ ] Document environment variables injected by `locald`.
+
+### Step 4: Contributor Focus
+- [ ] Update Architecture docs to reflect recent changes (State Persistence, Dependency Resolution).
+
+### Step 5: Verification
+- [ ] Build and preview the documentation site.
