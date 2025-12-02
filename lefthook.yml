@@ -15,4 +15,4 @@ pre-push:
       run: cargo test --workspace
     docs-build:
       root: locald-docs
-      run: pnpm install && pnpm build
+      run: CI=true pnpm install && pnpm build
