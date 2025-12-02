@@ -4,3 +4,5 @@ target/
 node_modules/
 dist/
 .env
+locald-docs/node_modules/
+locald-docs/dist/
