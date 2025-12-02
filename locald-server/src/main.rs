@@ -1,18 +1,18 @@
+use crate::manager::ProcessManager;
+use crate::proxy::ProxyManager;
 use anyhow::Result;
 use clap::Parser;
 use daemonize::Daemonize;
 use std::fs::File;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use tracing::{info, warn, error};
-use crate::manager::ProcessManager;
-use crate::proxy::ProxyManager;
+use tracing::{error, info, warn};
 
 mod ipc;
 mod manager;
+mod notify;
 mod proxy;
 mod state;
-mod notify;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,8 +32,8 @@ fn main() -> Result<()> {
     }
 
     if !args.foreground {
-        let stdout = File::create("/tmp/locald.out").unwrap();
-        let stderr = File::create("/tmp/locald.err").unwrap();
+        let stdout = File::create("/tmp/locald.out")?;
+        let stderr = File::create("/tmp/locald.err")?;
 
         let daemonize = Daemonize::new()
             .pid_file("/tmp/locald.pid")
@@ -43,9 +43,9 @@ fn main() -> Result<()> {
             .stderr(stderr);
 
         match daemonize.start() {
-            Ok(_) => println!("locald-server started in background"),
+            Ok(()) => println!("locald-server started in background"),
             Err(e) => {
-                eprintln!("Error starting daemon: {}", e);
+                eprintln!("Error starting daemon: {e}");
                 return Err(e.into());
             }
         }
@@ -57,8 +57,7 @@ fn main() -> Result<()> {
     // Start Tokio runtime
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()
-        .unwrap()
+        .build()?
         .block_on(async_main())
 }
 
@@ -71,7 +70,7 @@ async fn async_main() -> Result<()> {
     info!("locald-server starting...");
 
     let notify_path = PathBuf::from("/tmp/locald-notify.sock");
-    let manager = ProcessManager::new(notify_path.clone());
+    let manager = ProcessManager::new(notify_path.clone())?;
 
     // Notify Server
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(100);
@@ -79,11 +78,11 @@ async fn async_main() -> Result<()> {
     let notify_server = match crate::notify::NotifyServer::new(notify_path).await {
         Ok(s) => s,
         Err(e) => {
-            error!("Failed to bind notify socket: {}", e);
+            error!("Failed to bind notify socket: {e}");
             return Err(e);
         }
     };
-    
+
     tokio::spawn(async move {
         notify_server.run(notify_tx).await;
     });
@@ -99,7 +98,7 @@ async fn async_main() -> Result<()> {
     let manager_restore = manager.clone();
     tokio::spawn(async move {
         if let Err(e) = manager_restore.restore().await {
-            warn!("Failed to restore state: {}", e);
+            warn!("Failed to restore state: {e}");
         }
     });
 
@@ -109,7 +108,7 @@ async fn async_main() -> Result<()> {
     let manager_clone = manager.clone();
     tokio::spawn(async move {
         if let Err(e) = ipc::run_ipc_server(manager_clone, shutdown_tx).await {
-            warn!("IPC server error: {}", e);
+            warn!("IPC server error: {e}");
         }
     });
 
@@ -118,11 +117,11 @@ async fn async_main() -> Result<()> {
     tokio::spawn(async move {
         // Try port 80 first
         if let Err(e) = proxy.start(80).await {
-            warn!("Failed to bind port 80: {}. Trying port 8080...", e);
+            warn!("Failed to bind port 80: {e}. Trying port 8080...");
             if let Err(e) = proxy.start(8080).await {
-                warn!("Failed to bind port 8080: {}. Trying port 8081...", e);
+                warn!("Failed to bind port 8080: {e}. Trying port 8081...");
                 if let Err(e) = proxy.start(8081).await {
-                    error!("Failed to bind port 8081: {}. Proxy disabled.", e);
+                    error!("Failed to bind port 8081: {e}. Proxy disabled.");
                 }
             }
         }
@@ -135,7 +134,7 @@ async fn async_main() -> Result<()> {
 
     info!("Stopping all services...");
     if let Err(e) = manager.shutdown().await {
-        warn!("Error shutting down services: {}", e);
+        warn!("Error shutting down services: {e}");
     }
 
     let _ = std::fs::remove_file("/tmp/locald.sock");

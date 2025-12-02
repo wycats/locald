@@ -1,0 +1,10 @@
+{
+  "name": "dotlocal-tools",
+  "private": true,
+  "scripts": {
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "lefthook": "^1.0.0"
+  }
+}

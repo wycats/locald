@@ -1,13 +1,11 @@
+use anyhow::Result;
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::path::PathBuf;
 use tokio::net::UnixDatagram;
-use anyhow::Result;
-use tracing::{info, warn, error};
-use std::os::unix::io::AsRawFd;
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use tracing::{error, info};
 
 pub struct NotifyServer {
     socket: UnixDatagram,
-    path: PathBuf,
 }
 
 impl NotifyServer {
@@ -16,11 +14,7 @@ impl NotifyServer {
             tokio::fs::remove_file(&path).await?;
         }
         let socket = UnixDatagram::bind(&path)?;
-        Ok(Self { socket, path })
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
+        Ok(Self { socket })
     }
 
     pub async fn run(self, tx: tokio::sync::mpsc::Sender<(u32, String)>) {
@@ -34,10 +28,10 @@ impl NotifyServer {
                         Ok(creds) => {
                             let pid = creds.pid();
                             info!("Received notify from PID {}: {}", pid, data);
-                            if data.contains("READY=1") {
-                                if let Err(e) = tx.send((pid as u32, "READY".to_string())).await {
-                                    error!("Failed to send notify event: {}", e);
-                                }
+                            if data.contains("READY=1")
+                                && let Err(e) = tx.send((pid as u32, "READY".to_string())).await
+                            {
+                                error!("Failed to send notify event: {}", e);
                             }
                         }
                         Err(e) => {

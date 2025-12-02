@@ -1,7 +1,9 @@
+use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct HostsFileSection {
     path: PathBuf,
 }
@@ -22,7 +24,7 @@ impl HostsFileSection {
         Self { path }
     }
 
-    pub fn with_path(path: PathBuf) -> Self {
+    pub const fn with_path(path: PathBuf) -> Self {
         Self { path }
     }
 
@@ -38,19 +40,19 @@ impl HostsFileSection {
         new_section.push_str(start_marker);
         new_section.push('\n');
         for domain in domains {
-            new_section.push_str(&format!("127.0.0.1 {}\n", domain));
+            let _ = writeln!(new_section, "127.0.0.1 {domain}");
         }
         new_section.push_str(end_marker);
 
-        if let Some(start) = current_content.find(start_marker) {
-            if let Some(end_idx) = current_content[start..].find(end_marker) {
-                let end = start + end_idx;
-                // Replace existing section
-                let mut output = String::from(&current_content[..start]);
-                output.push_str(&new_section);
-                output.push_str(&current_content[end + end_marker.len()..]);
-                return output;
-            }
+        if let Some(start) = current_content.find(start_marker)
+            && let Some(end_idx) = current_content[start..].find(end_marker)
+        {
+            let end = start + end_idx;
+            // Replace existing section
+            let mut output = String::from(&current_content[..start]);
+            output.push_str(&new_section);
+            output.push_str(&current_content[end + end_marker.len()..]);
+            return output;
         }
 
         // Append if not found
@@ -77,9 +79,9 @@ mod tests {
         let hosts = HostsFileSection::with_path(PathBuf::from("/tmp/hosts"));
         let content = "127.0.0.1 localhost\n";
         let domains = vec!["app.local".to_string(), "api.local".to_string()];
-        
+
         let new_content = hosts.update_content(content, &domains);
-        
+
         assert!(new_content.contains("# BEGIN locald"));
         assert!(new_content.contains("127.0.0.1 app.local"));
         assert!(new_content.contains("127.0.0.1 api.local"));
@@ -92,9 +94,9 @@ mod tests {
         let hosts = HostsFileSection::with_path(PathBuf::from("/tmp/hosts"));
         let content = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.local\n# END locald\n";
         let domains = vec!["new.local".to_string()];
-        
+
         let new_content = hosts.update_content(content, &domains);
-        
+
         assert!(new_content.contains("127.0.0.1 new.local"));
         assert!(!new_content.contains("127.0.0.1 old.local"));
         assert_eq!(new_content.matches("# BEGIN locald").count(), 1);

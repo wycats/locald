@@ -1,23 +1,27 @@
-use anyhow::{Context, Result};
-use locald_core::config::LocaldConfig;
-use locald_core::ipc::{ServiceStatus, LogEntry};
-use locald_core::state::{ServerState, ServiceState, HealthStatus, HealthSource};
 use crate::state::StateManager;
-use std::collections::{HashMap, VecDeque, HashSet};
+use anyhow::{Context, Result};
+use bollard::Docker;
+use bollard::models::ContainerCreateBody;
+use bollard::models::HostConfig;
+use bollard::query_parameters::{
+    CreateContainerOptions, InspectContainerOptions, LogsOptions, RemoveContainerOptions,
+    StartContainerOptions,
+};
+use futures_util::StreamExt;
+use locald_core::config::LocaldConfig;
+use locald_core::ipc::{LogEntry, ServiceStatus};
+use locald_core::state::{HealthSource, HealthStatus, ServerState, ServiceState};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast};
-use tokio::io::{BufReader, AsyncBufReadExt};
-use tracing::{info, error};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-use bollard::Docker;
-use bollard::container::{Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions, LogsOptions, InspectContainerOptions};
-use bollard::models::HostConfig;
-use futures_util::StreamExt;
+use tracing::{error, info};
 
 const LOG_BUFFER_SIZE: usize = 1000;
 
@@ -42,39 +46,34 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    pub fn new(notify_socket_path: PathBuf) -> Self {
+    pub fn new(notify_socket_path: PathBuf) -> Result<Self> {
         let (tx, _) = broadcast::channel(100);
-        // Initialize Docker client. We assume the socket is available.
-        // If it fails, we log a warning but don't crash (unless we try to use it).
-        let docker = match Docker::connect_with_local_defaults() {
-            Ok(d) => Arc::new(d),
-            Err(e) => {
-                error!("Failed to connect to Docker: {}", e);
-                // This might panic if we try to use it later. 
-                // Ideally we'd wrap it in Option or Result, but for now let's assume it works or fail fast.
-                // Actually, let's just panic here if we can't connect, as it's a core requirement for this phase.
-                // Or better: create a dummy client? No, let's just panic for now to be safe.
-                panic!("Failed to connect to Docker: {}", e);
-            }
-        };
+        // Initialize Docker client.
+        let docker = Docker::connect_with_local_defaults()
+            .map(Arc::new)
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {e}"))?;
 
-        Self {
+        Ok(Self {
             services: Arc::new(Mutex::new(HashMap::new())),
             log_sender: tx,
             log_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_SIZE))),
-            state_manager: Arc::new(StateManager::new().expect("Failed to initialize state manager")),
+            state_manager: Arc::new(
+                StateManager::new().context("Failed to initialize state manager")?,
+            ),
             docker,
             notify_socket_path,
-        }
+        })
     }
 
     async fn broadcast_log(&self, entry: LogEntry) {
         // Add to buffer
-        let mut buffer = self.log_buffer.lock().await;
-        if buffer.len() >= LOG_BUFFER_SIZE {
-            buffer.pop_front();
+        {
+            let mut buffer = self.log_buffer.lock().await;
+            if buffer.len() >= LOG_BUFFER_SIZE {
+                buffer.pop_front();
+            }
+            buffer.push_back(entry.clone());
         }
-        buffer.push_back(entry.clone());
 
         // Broadcast (ignore error if no receivers)
         let _ = self.log_sender.send(entry);
@@ -86,39 +85,45 @@ impl ProcessManager {
     }
 
     async fn persist_state(&self) {
-        let services = self.services.lock().await;
-        let mut service_states = Vec::new();
-        
-        for (name, service) in services.iter() {
-            let pid = service.process.as_ref().and_then(|p| p.id());
-            let status = if pid.is_some() || service.container_id.is_some() { "running".to_string() } else { "stopped".to_string() };
-            
-            service_states.push(ServiceState {
-                name: name.clone(),
-                config: service.config.clone(),
-                path: service.path.clone(),
-                pid,
-                container_id: service.container_id.clone(),
-                port: service.port,
-                status,
-                health_status: service.health_status.clone(),
-                health_source: service.health_source.clone(),
-            });
-        }
-        
+        let service_states: Vec<ServiceState> = {
+            let services = self.services.lock().await;
+            services
+                .iter()
+                .map(|(name, service)| {
+                    let pid = service.process.as_ref().and_then(Child::id);
+                    let status_str = if pid.is_some() || service.container_id.is_some() {
+                        "running".to_string()
+                    } else {
+                        "stopped".to_string()
+                    };
+
+                    ServiceState {
+                        name: name.clone(),
+                        config: service.config.clone(),
+                        path: service.path.clone(),
+                        pid,
+                        container_id: service.container_id.clone(),
+                        port: service.port,
+                        status: status_str,
+                        health_status: service.health_status,
+                        health_source: service.health_source,
+                    }
+                })
+                .collect()
+        };
+
         let state = ServerState {
             services: service_states,
         };
-        
+
         if let Err(e) = self.state_manager.save(&state).await {
-            error!("Failed to persist state: {}", e);
+            error!("Failed to persist state: {e}");
         }
     }
 
     pub async fn restore(&self) -> Result<()> {
-        let state = match self.state_manager.load().await {
-            Ok(s) => s,
-            Err(_) => return Ok(()), // No state to restore
+        let Ok(state) = self.state_manager.load().await else {
+            return Ok(()); // No state to restore
         };
 
         info!("Restoring state: found {} services", state.services.len());
@@ -126,15 +131,21 @@ impl ProcessManager {
         // Cleanup old processes and containers
         for service_state in &state.services {
             if let Some(pid) = service_state.pid {
-                // Try to kill it. 
+                // Try to kill it.
                 let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
             }
             if let Some(container_id) = &service_state.container_id {
                 // Try to stop/remove container
-                let _ = self.docker.remove_container(container_id, Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                })).await;
+                let _ = self
+                    .docker
+                    .remove_container(
+                        container_id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
             }
         }
 
@@ -150,26 +161,26 @@ impl ProcessManager {
         }
 
         for path in paths {
-            info!("Restoring project at {:?}", path);
+            info!("Restoring project at {path:?}");
             if let Err(e) = self.start(path.clone()).await {
-                error!("Failed to restore project at {:?}: {}", path, e);
+                error!("Failed to restore project at {path:?}: {e}");
             }
         }
-        
+
         Ok(())
     }
 
     pub async fn handle_notify(&self, pid: u32) {
         let mut services = self.services.lock().await;
         for (name, service) in services.iter_mut() {
-            if let Some(child) = &service.process {
-                if child.id() == Some(pid) {
-                    info!("Service {} is ready (via notify)", name);
-                    service.health_status = HealthStatus::Healthy;
-                    service.health_source = HealthSource::Notify;
-                    // TODO: Trigger dependency check?
-                    break;
-                }
+            if let Some(child) = &service.process
+                && child.id() == Some(pid)
+            {
+                info!("Service {} is ready (via notify)", name);
+                service.health_status = HealthStatus::Healthy;
+                service.health_source = HealthSource::Notify;
+                // TODO: Trigger dependency check?
+                break;
             }
         }
     }
@@ -180,7 +191,7 @@ impl ProcessManager {
 
         loop {
             if start.elapsed() > timeout {
-                anyhow::bail!("Service {} timed out waiting for health check", name);
+                anyhow::bail!("Service {name} timed out waiting for health check");
             }
 
             {
@@ -190,10 +201,10 @@ impl ProcessManager {
                         return Ok(());
                     }
                 } else {
-                    anyhow::bail!("Service {} disappeared", name);
+                    anyhow::bail!("Service {name} disappeared");
                 }
             }
-            
+
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
@@ -201,28 +212,29 @@ impl ProcessManager {
     pub async fn start(&self, path: PathBuf) -> Result<()> {
         // Read config
         let config_path = path.join("locald.toml");
-        let config_content = tokio::fs::read_to_string(&config_path).await
+        let config_content = tokio::fs::read_to_string(&config_path)
+            .await
             .context("Failed to read locald.toml")?;
-        let config: LocaldConfig = toml::from_str(&config_content)
-            .context("Failed to parse locald.toml")?;
+        let config: LocaldConfig =
+            toml::from_str(&config_content).context("Failed to parse locald.toml")?;
 
         let sorted_services = Self::resolve_startup_order(&config)?;
 
         for service_name in sorted_services {
             let service_config = &config.services[&service_name];
             let name = format!("{}:{}", config.project.name, service_name);
-            
+
             // Check if already running
             {
                 let mut services = self.services.lock().await;
                 if let Some(service) = services.get_mut(&name) {
-                     // Check if actually running
-                     if let Some(child) = &mut service.process {
-                         if let Ok(None) = child.try_wait() {
-                             info!("Service {} is already running", name);
-                             continue;
-                         }
-                     }
+                    // Check if actually running
+                    if let Some(child) = &mut service.process
+                        && matches!(child.try_wait(), Ok(None))
+                    {
+                        info!("Service {name} is already running");
+                        continue;
+                    }
                 }
             } // Drop lock before spawning
 
@@ -232,24 +244,42 @@ impl ProcessManager {
                 listener.local_addr()?.port()
             };
 
-            info!("Starting service {} on port {}", name, port);
+            info!("Starting service {name} on port {port}");
 
             if let Some(image) = &service_config.image {
                 // Docker Service
-                let container_port = service_config.container_port.context("container_port is required for Docker services")?;
-                let (container_id, has_healthcheck) = self.start_container(name.clone(), image, port, container_port, &service_config.env, &service_config.command).await?;
-                
+                let container_port = service_config
+                    .container_port
+                    .context("container_port is required for Docker services")?;
+                let (container_id, has_healthcheck) = self
+                    .start_container(
+                        name.clone(),
+                        image,
+                        port,
+                        container_port,
+                        &service_config.env,
+                        service_config.command.as_ref(),
+                    )
+                    .await?;
+
                 {
                     let mut services = self.services.lock().await;
-                    services.insert(name.clone(), Service {
-                        config: config.clone(),
-                        process: None,
-                        container_id: Some(container_id.clone()),
-                        port: Some(port),
-                        path: path.clone(),
-                        health_status: HealthStatus::Starting,
-                        health_source: if has_healthcheck { HealthSource::Docker } else { HealthSource::None },
-                    });
+                    services.insert(
+                        name.clone(),
+                        Service {
+                            config: config.clone(),
+                            process: None,
+                            container_id: Some(container_id.clone()),
+                            port: Some(port),
+                            path: path.clone(),
+                            health_status: HealthStatus::Starting,
+                            health_source: if has_healthcheck {
+                                HealthSource::Docker
+                            } else {
+                                HealthSource::None
+                            },
+                        },
+                    );
                 }
 
                 if has_healthcheck {
@@ -263,7 +293,7 @@ impl ProcessManager {
                 if let Some(command_str) = &service_config.command {
                     cmd.arg("-c").arg(command_str);
                 } else {
-                    anyhow::bail!("Service {} has no command", name);
+                    anyhow::bail!("Service {name} has no command");
                 }
                 cmd.current_dir(&path);
                 cmd.env("PORT", port.to_string());
@@ -272,27 +302,38 @@ impl ProcessManager {
                     cmd.env(k, v);
                 }
                 cmd.stdin(Stdio::null());
-                cmd.stdout(Stdio::piped()); 
+                cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::piped());
 
                 let mut child = cmd.spawn().context("Failed to spawn process")?;
 
                 // Spawn log readers
-                let stdout = child.stdout.take().expect("Failed to capture stdout");
-                let stderr = child.stderr.take().expect("Failed to capture stderr");
-                
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+
                 let manager = self.clone();
                 let service_name_clone = name.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
-                        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-                        manager.broadcast_log(LogEntry {
-                            timestamp,
-                            service: service_name_clone.clone(),
-                            stream: "stdout".to_string(),
-                            message: line,
-                        }).await;
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        manager
+                            .broadcast_log(LogEntry {
+                                timestamp,
+                                service: service_name_clone.clone(),
+                                stream: "stdout".to_string(),
+                                message: line,
+                            })
+                            .await;
                     }
                 });
 
@@ -301,29 +342,37 @@ impl ProcessManager {
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
-                        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-                        manager.broadcast_log(LogEntry {
-                            timestamp,
-                            service: service_name_clone.clone(),
-                            stream: "stderr".to_string(),
-                            message: line,
-                        }).await;
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        manager
+                            .broadcast_log(LogEntry {
+                                timestamp,
+                                service: service_name_clone.clone(),
+                                stream: "stderr".to_string(),
+                                message: line,
+                            })
+                            .await;
                     }
                 });
 
                 {
                     let mut services = self.services.lock().await;
-                    services.insert(name.clone(), Service {
-                        config: config.clone(),
-                        process: Some(child),
-                        container_id: None,
-                        port: Some(port),
-                        path: path.clone(),
-                        health_status: HealthStatus::Starting,
-                        health_source: HealthSource::None,
-                    });
+                    services.insert(
+                        name.clone(),
+                        Service {
+                            config: config.clone(),
+                            process: Some(child),
+                            container_id: None,
+                            port: Some(port),
+                            path: path.clone(),
+                            health_status: HealthStatus::Starting,
+                            health_source: HealthSource::None,
+                        },
+                    );
                 }
-                
+
                 self.spawn_tcp_health_monitor(name.clone(), port);
             }
 
@@ -339,7 +388,15 @@ impl ProcessManager {
         Ok(())
     }
 
-    async fn start_container(&self, name: String, image: &str, host_port: u16, container_port: u16, env: &HashMap<String, String>, command: &Option<String>) -> Result<(String, bool)> {
+    async fn start_container(
+        &self,
+        name: String,
+        image: &str,
+        host_port: u16,
+        container_port: u16,
+        env: &HashMap<String, String>,
+        command: Option<&String>,
+    ) -> Result<(String, bool)> {
         // 1. Pull image (TODO: Make this smarter/optional?)
         // For now, we assume the image exists or Docker will pull it if we use create_container?
         // Actually create_container fails if image missing.
@@ -349,33 +406,37 @@ impl ProcessManager {
         // If it fails, we can error out telling user to `docker pull`.
 
         // 2. Create Container
-        let container_name = format!("locald-{}", name.replace(":", "-"));
-        
-        // Remove existing if any (cleanup)
-        let _ = self.docker.remove_container(&container_name, Some(RemoveContainerOptions {
-            force: true,
-            ..Default::default()
-        })).await;
+        let container_name = format!("locald-{}", name.replace(':', "-"));
 
-        let mut env_vars: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        env_vars.push(format!("PORT={}", container_port)); // Inject PORT inside too, though usually fixed
+        // Remove existing if any (cleanup)
+        let _ = self
+            .docker
+            .remove_container(
+                &container_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let mut env_vars: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        env_vars.push(format!("PORT={container_port}")); // Inject PORT inside too, though usually fixed
 
         let host_config = HostConfig {
-            port_bindings: Some(HashMap::from([
-                (
-                    format!("{}/tcp", container_port),
-                    Some(vec![bollard::models::PortBinding {
-                        host_ip: Some("127.0.0.1".to_string()),
-                        host_port: Some(host_port.to_string()),
-                    }]),
-                )
-            ])),
+            port_bindings: Some(HashMap::from([(
+                format!("{container_port}/tcp"),
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some(host_port.to_string()),
+                }]),
+            )])),
             ..Default::default()
         };
 
-        let cmd = command.as_ref().map(|s| shlex::split(s).unwrap_or_default());
+        let cmd = command.map(|s| shlex::split(s).unwrap_or_default());
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(image.to_string()),
             env: Some(env_vars),
             host_config: Some(host_config),
@@ -383,19 +444,32 @@ impl ProcessManager {
             ..Default::default()
         };
 
-        let res = self.docker.create_container(
-            Some(CreateContainerOptions { name: container_name.clone(), platform: None }),
-            config,
-        ).await.context("Failed to create Docker container")?;
+        let res = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: Some(container_name.clone()),
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .context("Failed to create Docker container")?;
 
         let id = res.id;
 
         // Check if image has healthcheck
-        let inspect = self.docker.inspect_container(&id, None::<InspectContainerOptions>).await?;
+        let inspect = self
+            .docker
+            .inspect_container(&id, None::<InspectContainerOptions>)
+            .await?;
         let has_healthcheck = inspect.config.and_then(|c| c.healthcheck).is_some();
 
         // 3. Start Container
-        self.docker.start_container(&id, None::<StartContainerOptions<String>>).await.context("Failed to start Docker container")?;
+        self.docker
+            .start_container(&id, None::<StartContainerOptions>)
+            .await
+            .context("Failed to start Docker container")?;
 
         // 4. Stream Logs
         let manager = self.clone();
@@ -404,7 +478,7 @@ impl ProcessManager {
         let id_clone = id.clone();
 
         tokio::spawn(async move {
-            let options = Some(LogsOptions::<String> {
+            let options = Some(LogsOptions {
                 follow: true,
                 stdout: true,
                 stderr: true,
@@ -415,23 +489,28 @@ impl ProcessManager {
 
             while let Some(msg) = stream.next().await {
                 if let Ok(msg) = msg {
-                    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
                     let (stream_type, payload) = match msg {
                         bollard::container::LogOutput::StdOut { message } => ("stdout", message),
                         bollard::container::LogOutput::StdErr { message } => ("stderr", message),
                         bollard::container::LogOutput::Console { message } => ("console", message),
-                        _ => continue,
+                        bollard::container::LogOutput::StdIn { .. } => continue,
                     };
-                    
+
                     let message = String::from_utf8_lossy(&payload).to_string();
                     // Docker logs might contain newlines, split them?
                     for line in message.lines() {
-                         manager.broadcast_log(LogEntry {
-                            timestamp,
-                            service: service_name.clone(),
-                            stream: stream_type.to_string(),
-                            message: line.to_string(),
-                        }).await;
+                        manager
+                            .broadcast_log(LogEntry {
+                                timestamp,
+                                service: service_name.clone(),
+                                stream: stream_type.to_string(),
+                                message: line.to_string(),
+                            })
+                            .await;
                     }
                 }
             }
@@ -455,12 +534,18 @@ impl ProcessManager {
         for (name, service) in &config.services {
             for dep in &service.depends_on {
                 if !config.services.contains_key(dep) {
-                    anyhow::bail!("Service '{}' depends on unknown service '{}'", name, dep);
+                    anyhow::bail!("Service '{name}' depends on unknown service '{dep}'");
                 }
-                
+
                 // dep -> name
-                dependents.get_mut(dep).unwrap().push(name.clone());
-                *in_degree.get_mut(name).unwrap() += 1;
+                dependents
+                    .get_mut(dep)
+                    .ok_or_else(|| anyhow::anyhow!("Service {dep} not found in dependents map"))?
+                    .push(name.clone());
+
+                *in_degree.get_mut(name).ok_or_else(|| {
+                    anyhow::anyhow!("Service {name} not found in in_degree map")
+                })? += 1;
             }
         }
 
@@ -477,7 +562,9 @@ impl ProcessManager {
 
             if let Some(neighbors) = dependents.get(&node) {
                 for neighbor in neighbors {
-                    let degree = in_degree.get_mut(neighbor).unwrap();
+                    let degree = in_degree.get_mut(neighbor).ok_or_else(|| {
+                        anyhow::anyhow!("Service {neighbor} not found in in_degree map")
+                    })?;
                     *degree -= 1;
                     if *degree == 0 {
                         queue.push_back(neighbor.clone());
@@ -503,10 +590,16 @@ impl ProcessManager {
                 }
                 if let Some(container_id) = service.container_id.take() {
                     info!("Stopping service {} (container {})", name, container_id);
-                    let _ = self.docker.remove_container(&container_id, Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    })).await;
+                    let _ = self
+                        .docker
+                        .remove_container(
+                            &container_id,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
                 }
                 service.port = None;
             }
@@ -516,56 +609,61 @@ impl ProcessManager {
     }
 
     pub async fn list(&self) -> Vec<ServiceStatus> {
-        let mut services = self.services.lock().await;
         let mut results = Vec::new();
-        
-        for (name, service) in services.iter_mut() {
-            let mut is_running = false;
-            
-            if let Some(child) = &mut service.process {
-                 match child.try_wait() {
-                     Ok(Some(_)) => {
-                         // Exited
-                         service.process = None;
-                         service.port = None;
-                     }
-                     Ok(None) => {
-                         is_running = true;
-                     }
-                     Err(e) => {
-                         error!("Error checking process status for {}: {}", name, e);
-                     }
-                 }
-            } else if let Some(container_id) = &service.container_id {
-                // Check container status
-                // This is async, but we are in a sync loop over the lock.
-                // We shouldn't hold the lock while calling Docker API.
-                // For now, let's assume it's running if we have an ID, 
-                // or we need to refactor list to not hold the lock.
-                // Refactoring list is better.
-                is_running = true; // Optimistic for now to avoid deadlock/complexity in this step
-            }
-            
-            results.push(ServiceStatus {
-                name: name.clone(),
-                pid: service.process.as_ref().and_then(|p| p.id()),
-                port: service.port,
-                status: if is_running { "running".to_string() } else { "stopped".to_string() },
-                url: if is_running {
-                    service.port.map(|port| {
-                        if let Some(domain) = &service.config.project.domain {
-                            format!("http://{}:{}", domain, port)
-                        } else {
-                            format!("http://localhost:{}", port)
+        {
+            let mut services = self.services.lock().await;
+
+            for (name, service) in services.iter_mut() {
+                let mut is_running = false;
+
+                if let Some(child) = &mut service.process {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            // Exited
+                            service.process = None;
+                            service.port = None;
                         }
-                    })
-                } else {
-                    None
-                },
-                domain: service.config.project.domain.clone(),
-                health_status: format!("{:?}", service.health_status),
-                health_source: format!("{:?}", service.health_source),
-            });
+                        Ok(None) => {
+                            is_running = true;
+                        }
+                        Err(e) => {
+                            error!("Error checking process status for {name}: {e}");
+                        }
+                    }
+                } else if let Some(_container_id) = &service.container_id {
+                    // Check container status
+                    // This is async, but we are in a sync loop over the lock.
+                    // We shouldn't hold the lock while calling Docker API.
+                    // For now, let's assume it's running if we have an ID,
+                    // or we need to refactor list to not hold the lock.
+                    // Refactoring list is better.
+                    is_running = true; // Optimistic for now to avoid deadlock/complexity in this step
+                }
+
+                results.push(ServiceStatus {
+                    name: name.clone(),
+                    pid: service.process.as_ref().and_then(tokio::process::Child::id),
+                    port: service.port,
+                    status: if is_running {
+                        "running".to_string()
+                    } else {
+                        "stopped".to_string()
+                    },
+                    url: if is_running {
+                        service.port.map(|port| {
+                            service.config.project.domain.as_ref().map_or_else(
+                                || format!("http://localhost:{port}"),
+                                |domain| format!("http://{domain}:{port}"),
+                            )
+                        })
+                    } else {
+                        None
+                    },
+                    domain: service.config.project.domain.clone(),
+                    health_status: format!("{:?}", service.health_status),
+                    health_source: format!("{:?}", service.health_source),
+                });
+            }
         }
         results
     }
@@ -580,10 +678,16 @@ impl ProcessManager {
                 }
                 if let Some(container_id) = service.container_id.take() {
                     info!("Stopping service {} (container {})", name, container_id);
-                    let _ = self.docker.remove_container(&container_id, Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    })).await;
+                    let _ = self
+                        .docker
+                        .remove_container(
+                            &container_id,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
                 }
             }
         }
@@ -592,25 +696,28 @@ impl ProcessManager {
 
     pub async fn find_port_by_domain(&self, domain: &str) -> Option<u16> {
         let services = self.services.lock().await;
-        for service in services.values() {
-            if let Some(d) = &service.config.project.domain {
-                if d == domain {
-                    // TODO: Handle multiple services with same domain (e.g. pick 'web')
-                    return service.port;
-                }
+        services.values().find_map(|service| {
+            if let Some(d) = &service.config.project.domain
+                && d == domain
+            {
+                service.port
+            } else {
+                None
             }
-        }
-        None
+        })
     }
 
     async fn update_health(&self, name: &str, status: HealthStatus, source: HealthSource) {
         let mut services = self.services.lock().await;
-        if let Some(service) = services.get_mut(name) {
-            if service.health_status != status {
-                info!("Service {} health changed to {:?} (source: {:?})", name, status, source);
-                service.health_status = status;
-                service.health_source = source;
-            }
+        if let Some(service) = services.get_mut(name)
+            && service.health_status != status
+        {
+            info!(
+                "Service {} health changed to {:?} (source: {:?})",
+                name, status, source
+            );
+            service.health_status = status;
+            service.health_source = source;
         }
     }
 
@@ -620,19 +727,30 @@ impl ProcessManager {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                match docker.inspect_container(&container_id, None::<InspectContainerOptions>).await {
+                match docker
+                    .inspect_container(&container_id, None::<InspectContainerOptions>)
+                    .await
+                {
                     Ok(inspect) => {
-                        if let Some(state) = inspect.state {
-                            if let Some(health) = state.health {
-                                let status = match health.status {
-                                    Some(bollard::models::HealthStatusEnum::HEALTHY) => HealthStatus::Healthy,
-                                    Some(bollard::models::HealthStatusEnum::UNHEALTHY) => HealthStatus::Unhealthy,
-                                    Some(bollard::models::HealthStatusEnum::STARTING) => HealthStatus::Starting,
-                                    _ => HealthStatus::Unknown,
-                                };
-                                
-                                manager.update_health(&name, status, HealthSource::Docker).await;
-                            }
+                        if let Some(state) = inspect.state
+                            && let Some(health) = state.health
+                        {
+                            let status = match health.status {
+                                Some(bollard::models::HealthStatusEnum::HEALTHY) => {
+                                    HealthStatus::Healthy
+                                }
+                                Some(bollard::models::HealthStatusEnum::UNHEALTHY) => {
+                                    HealthStatus::Unhealthy
+                                }
+                                Some(bollard::models::HealthStatusEnum::STARTING) => {
+                                    HealthStatus::Starting
+                                }
+                                _ => HealthStatus::Unknown,
+                            };
+
+                            manager
+                                .update_health(&name, status, HealthSource::Docker)
+                                .await;
                         }
                     }
                     Err(_) => break, // Container gone?
@@ -646,9 +764,9 @@ impl ProcessManager {
         tokio::spawn(async move {
             // Wait a bit for process to start
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            
+
             loop {
-                if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
                     // Only update if not already healthy (e.g. via Notify)
                     // But update_health handles idempotency mostly.
                     // However, if Notify set it to Healthy, we don't want to overwrite source to Tcp?
@@ -665,7 +783,9 @@ impl ProcessManager {
                         }
                     }
 
-                    manager.update_health(&name, HealthStatus::Healthy, HealthSource::Tcp).await;
+                    manager
+                        .update_health(&name, HealthStatus::Healthy, HealthSource::Tcp)
+                        .await;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

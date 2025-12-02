@@ -1,28 +1,27 @@
-# Phase 13 Task List
+# Phase 14 Task List
 
-- [x] **Core**
+- [x] **Installation & Naming**
 
-  - [x] Update `ServiceConfig` struct in `locald-core`.
-  - [x] Update `ServiceState` struct to include health metadata.
+  - [x] Configure `locald-cli` to output `locald` binary.
+  - [x] Verify `cargo install` workflow.
 
-- [x] **Server: Notify Socket**
+- [x] **CLI Polish**
 
-  - [x] Implement `NotifyServer` (Unix Datagram listener).
-  - [x] Inject `NOTIFY_SOCKET` into process environment.
-  - [x] Wire up `READY=1` to service state.
+  - [x] Improve `status` command output (colors, formatting).
+  - [x] Improve `logs` command output.
+  - [x] Improve `start`/`stop` command feedback.
 
-- [x] **Server: Docker Health**
+- [x] **Code Quality**
 
-  - [x] Check `bollard` container config for `Healthcheck`.
-  - [x] Implement health polling for Docker containers.
+  - [x] Setup `lefthook` for pre-commit checks.
+  - [x] Fix all `clippy` warnings (including `bollard` deprecations).
 
-- [x] **Server: TCP Probe**
+- [ ] **Workflow Validation**
 
-  - [x] Implement default TCP connect loop for services with ports.
+  - [ ] Verify multi-project registration workflow.
+  - [ ] Investigate `.dev` domain support and SSL.
 
-- [x] **Server: Logic**
-
-  - [x] Update `start` flow to wait for health before unblocking dependents.
-
-- [x] **CLI**
-  - [x] Update `status` command to show Health Status and Source.
+- [ ] **Error Handling**
+  - [ ] Improve error message for missing Docker.
+  - [ ] Improve error message for invalid config.
+  - [ ] Improve error message for port conflicts.

@@ -112,11 +112,12 @@
 
 **Context**: Users shouldn't have to manually configure health checks for standard setups.
 **Decision**: Implement a hierarchy of detection strategies:
+
 1. Docker Native (`HEALTHCHECK` in image)
 2. `sd_notify` (if app supports systemd notification)
 3. TCP Probe (if port is defined)
 4. Explicit `health_check` command (override)
-**Status**: Accepted.
+   **Status**: Accepted.
 
 ## 020. Notify Protocol: Unix Datagram
 
@@ -128,4 +129,10 @@
 
 **Context**: We need to know when a Docker container is healthy.
 **Decision**: Poll `inspect_container` every few seconds to check the health status. This is simpler than listening to the Docker event stream for this phase.
+**Status**: Accepted.
+
+## 022. Code Quality: Strict Linting
+
+**Context**: To ensure long-term maintainability and prevent common runtime panics.
+**Decision**: Enforce strict clippy lints in the workspace `Cargo.toml`. Specifically deny `unwrap_used`, `expect_used`, and `panic` to force proper error handling via `anyhow` or `Result`.
 **Status**: Accepted.

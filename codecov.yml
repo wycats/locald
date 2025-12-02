@@ -1,0 +1,18 @@
+coverage:
+  status:
+    project:
+      default:
+        # target: auto  # auto updates the target to the current coverage %
+        target: 70% # target 70% overall coverage
+        threshold: 1% # allow 1% drop before failing
+    patch:
+      default:
+        target: 85% # require 85% coverage on new code
+        threshold: 5% # allow some wiggle room
+
+ignore:
+  - "tests/*"
+  - "examples/*"
+  - "**/*.toml"
+  - "scripts/*"
+  - "locald-docs/*"

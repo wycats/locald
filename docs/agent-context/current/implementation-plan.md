@@ -1,69 +1,54 @@
-# Phase 13 Implementation Plan: Smart Health Checks
+# Phase 14 Implementation Plan: Dogfooding & Polish
 
 ## Goal
 
-Ensure services are fully ready to accept connections before dependent services are started. Minimize configuration burden by using "Zero-Config" detection strategies.
+Smooth out the rough edges before broader adoption. Focus on error messages, CLI output, and common workflow friction. Ensure the "Zero-Config" promise holds up in real-world usage.
 
 ## User Requirements
 
-- **App Builder**: "I want my API to wait until Redis is actually ready, not just started."
-- **Power User**: "I want to see _why_ a service is considered healthy (Docker, Port, etc.) in the status output."
-- **Zero-Config**: Standard setups (Postgres in Docker, Node app on port) should work without extra config.
+- **App Builder**: "I want to start using this for my real projects today without fighting the tool."
+- **Power User**: "I want clear error messages when things go wrong, not stack traces."
+- **Dogfooder**: "I want to run `locald` in multiple projects and have `.dev` domains just work."
 
-## Strategy: The "Zero-Config" Hierarchy
+## Strategy
 
-1.  **Docker Native**: If `image` is present AND container has `HEALTHCHECK`, use it.
-2.  **Notify Socket**: Always set `NOTIFY_SOCKET`. If the app sends `READY=1`, mark healthy.
-3.  **TCP Probe**: If `port` is defined, wait for it to accept connections.
-4.  **Explicit Config**: User defines `health_check` in `locald.toml`.
-
-## Architecture Changes
-
-### `locald-core`
-
-- Update `ServiceConfig` to add optional `health_check` field (for explicit overrides).
-- Update `ServiceState` (or runtime struct) to track:
-  - `health_status`: `Unknown`, `Starting`, `Healthy`, `Unhealthy`.
-  - `health_source`: `Docker`, `Notify`, `Tcp`, `Explicit`, `None`.
-
-### `locald-server`
-
-- **Notify Listener**: Create a `NotifyServer` that manages a Unix Datagram socket and maps incoming packets to service IDs.
-- **Docker Monitor**: Poll `inspect_container` or listen to events for health status changes.
-- **TCP Prober**: A background task that attempts to connect to `localhost:port` if no other health check is active.
-- **Dependency Logic**: Update the startup sequence. `depends_on` currently waits for `Process` to exist. It must now wait for `health_status == Healthy`.
-
-### `locald-cli`
-
-- Update `status` command to display health status and source.
-- (Optional) Warn if a service has `health_source: None`.
+1.  **Installation Experience**:
+    - Rename `locald-cli` binary to `locald` so users type `locald`.
+    - Ensure `cargo install --path locald-cli` and `cargo install --path locald-server` places binaries correctly in `~/.cargo/bin`.
+    - Verify the CLI can find the server when both are installed.
+2.  **Papercut Pass**: Review and improve CLI output for all common commands. Add colors and better formatting.
+3.  **Workflow Verification**:
+    - Verify the "start server in each project" mental model. Ensure `locald start` in a new project directory works seamlessly with the background daemon.
+    - Investigate and document the `.dev` domain workflow (SSL implications).
+4.  **Error Handling**: Improve error messages for common failure modes (Docker missing, port conflicts, invalid config).
 
 ## Step-by-Step Plan
 
-### Step 1: Core Data Structures
+### Step 1: Installation & Naming
 
-- [ ] Update `locald-core` structs.
-- [ ] Add `health_check` to `locald.toml` parser.
+- [ ] Configure `locald-cli` to produce a binary named `locald`.
+- [ ] Verify `cargo install` workflow puts both binaries in the same place.
+- [ ] Verify `locald` finds `locald-server` in the installation directory.
 
-### Step 2: Notify Socket (The Standard)
+### Step 2: CLI Polish
 
-- [ ] Implement `NotifyServer` in `locald-server`.
-- [ ] Inject `NOTIFY_SOCKET` env var into child processes.
-- [ ] Handle `READY=1` messages.
+- [ ] Review `locald status` output (alignment, colors).
+- [ ] Review `locald logs` output (prefixing, colors).
+- [ ] Review `locald start/stop` feedback.
 
-### Step 3: Docker Integration
+### Step 2: Workflow Validation
 
-- [ ] Update `start_container` to check for `HEALTHCHECK` config.
-- [ ] Implement polling/event loop for Docker health.
+- [ ] Verify `locald start` in a new project registers it correctly.
+- [ ] Verify `locald stop` stops the project.
+- [ ] Test `.dev` domain configuration and document findings/limitations.
 
-### Step 4: TCP Fallback
+### Step 3: Error Handling
 
-- [ ] Implement TCP connect loop for services with `port` but no other health check.
+- [ ] Test behavior when Docker is down.
+- [ ] Test behavior when ports are in use.
+- [ ] Test behavior with invalid `locald.toml`.
 
-### Step 5: Dependency Gating
+### Step 4: Documentation
 
-- [ ] Update `ServiceManager::start` to block (async) or defer dependent startup until health check passes.
-
-### Step 6: UI/CLI Updates
-
-- [ ] Update `locald status` output.
+- [ ] Update "Troubleshooting" guide with new findings.
+- [ ] Add a "Dogfooding" section or notes for early adopters.

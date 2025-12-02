@@ -1,10 +1,10 @@
+use crate::manager::ProcessManager;
 use anyhow::Result;
 use locald_core::{IpcRequest, IpcResponse};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc::Sender, broadcast};
-use tracing::{info, error};
-use crate::manager::ProcessManager;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{broadcast, mpsc::Sender};
+use tracing::{error, info};
 
 const SOCKET_PATH: &str = "/tmp/locald.sock";
 
@@ -12,7 +12,9 @@ pub async fn run_ipc_server(manager: ProcessManager, shutdown_tx: Sender<()>) ->
     if std::fs::metadata(SOCKET_PATH).is_ok() {
         // Try to connect to see if it's alive
         if UnixStream::connect(SOCKET_PATH).await.is_ok() {
-            anyhow::bail!("Socket {} is already in use. Is locald-server already running?", SOCKET_PATH);
+            anyhow::bail!(
+                "Socket {SOCKET_PATH} is already in use. Is locald-server already running?"
+            );
         }
         // If we can't connect, it's likely a stale socket
         std::fs::remove_file(SOCKET_PATH)?;
@@ -39,10 +41,14 @@ pub async fn run_ipc_server(manager: ProcessManager, shutdown_tx: Sender<()>) ->
     }
 }
 
-async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shutdown_tx: Sender<()>) -> Result<()> {
+async fn handle_connection(
+    mut stream: UnixStream,
+    manager: ProcessManager,
+    shutdown_tx: Sender<()>,
+) -> Result<()> {
     let mut buf = [0; 4096];
     let n = stream.read(&mut buf).await?;
-    
+
     if n == 0 {
         return Ok(());
     }
@@ -53,10 +59,12 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shut
     if let IpcRequest::Logs { service } = request {
         let mut rx = manager.log_sender.subscribe();
         let recent = manager.get_recent_logs().await;
-        
+
         for entry in recent {
-            if let Some(ref s) = service {
-                if &entry.service != s { continue; }
+            if let Some(ref s) = service
+                && &entry.service != s
+            {
+                continue;
             }
             let mut bytes = serde_json::to_vec(&entry)?;
             bytes.push(b'\n');
@@ -66,8 +74,10 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shut
         loop {
             match rx.recv().await {
                 Ok(entry) => {
-                    if let Some(ref s) = service {
-                        if &entry.service != s { continue; }
+                    if let Some(ref s) = service
+                        && &entry.service != s
+                    {
+                        continue;
                     }
                     let mut bytes = serde_json::to_vec(&entry)?;
                     bytes.push(b'\n');
@@ -75,7 +85,7 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shut
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -84,18 +94,14 @@ async fn handle_connection(mut stream: UnixStream, manager: ProcessManager, shut
 
     let response = match request {
         IpcRequest::Ping => IpcResponse::Pong,
-        IpcRequest::Start { path } => {
-            match manager.start(path).await {
-                Ok(_) => IpcResponse::Ok,
-                Err(e) => IpcResponse::Error(e.to_string()),
-            }
-        }
-        IpcRequest::Stop { name } => {
-            match manager.stop(&name).await {
-                Ok(_) => IpcResponse::Ok,
-                Err(e) => IpcResponse::Error(e.to_string()),
-            }
-        }
+        IpcRequest::Start { path } => match manager.start(path).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::Stop { name } => match manager.stop(&name).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
         IpcRequest::Status => {
             let status = manager.list().await;
             IpcResponse::Status(status)

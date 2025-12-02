@@ -1,17 +1,17 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{State, WebSocketUpgrade, ws::WebSocket, Request},
-    response::{IntoResponse, Response},
-    routing::get,
     Router,
     body::Body,
+    extract::{Request, State, WebSocketUpgrade, ws::WebSocket},
     http::Uri,
+    response::{IntoResponse, Response},
+    routing::get,
 };
 use hyper::StatusCode;
+use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use rust_embed::RustEmbed;
 
 use crate::manager::ProcessManager;
 
@@ -24,18 +24,19 @@ pub struct ProxyManager {
 }
 
 impl ProxyManager {
-    pub fn new(process_manager: ProcessManager) -> Self {
+    pub const fn new(process_manager: ProcessManager) -> Self {
         Self { process_manager }
     }
 
     pub async fn start(&self, port: u16) -> anyhow::Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = TcpListener::bind(addr).await?;
-        info!("Proxy listening on http://{}", addr);
+        info!("Proxy listening on http://{addr}");
 
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(hyper_util::client::legacy::connect::HttpConnector::new());
-        
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(hyper_util::client::legacy::connect::HttpConnector::new());
+
         let state = AppState {
             pm: self.process_manager.clone(),
             client,
@@ -55,7 +56,10 @@ impl ProxyManager {
 #[derive(Clone)]
 struct AppState {
     pm: ProcessManager,
-    client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
+    client: hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        Body,
+    >,
 }
 
 async fn handle_state(State(state): State<AppState>) -> impl IntoResponse {
@@ -63,10 +67,7 @@ async fn handle_state(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(services)
 }
 
-async fn handle_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn handle_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state.pm))
 }
 
@@ -74,18 +75,24 @@ async fn handle_socket(mut socket: WebSocket, pm: ProcessManager) {
     let mut rx = pm.log_sender.subscribe();
     let recent = pm.get_recent_logs().await;
     for entry in recent {
-        if let Ok(msg) = serde_json::to_string(&entry) {
-             if socket.send(axum::extract::ws::Message::Text(msg)).await.is_err() {
-                 return;
-             }
+        if let Ok(msg) = serde_json::to_string(&entry)
+            && socket
+                .send(axum::extract::ws::Message::Text(msg))
+                .await
+                .is_err()
+        {
+            return;
         }
     }
 
     while let Ok(entry) = rx.recv().await {
-        if let Ok(msg) = serde_json::to_string(&entry) {
-            if socket.send(axum::extract::ws::Message::Text(msg)).await.is_err() {
-                break;
-            }
+        if let Ok(msg) = serde_json::to_string(&entry)
+            && socket
+                .send(axum::extract::ws::Message::Text(msg))
+                .await
+                .is_err()
+        {
+            break;
         }
     }
 }
@@ -93,22 +100,28 @@ async fn handle_socket(mut socket: WebSocket, pm: ProcessManager) {
 async fn handle_assets(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
-    
+
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            ([(axum::http::header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+            (
+                [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
+                content.data,
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
     }
 }
 
-async fn handle_proxy(
-    State(state): State<AppState>,
-    mut req: Request,
-) -> Response {
+async fn handle_proxy(State(state): State<AppState>, mut req: Request) -> Response {
     let host = match req.headers().get("host") {
-        Some(h) => h.to_str().unwrap_or_default().split(':').next().unwrap_or_default(),
+        Some(h) => h
+            .to_str()
+            .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default(),
         None => return (StatusCode::BAD_REQUEST, "Missing Host header").into_response(),
     };
 
@@ -117,22 +130,25 @@ async fn handle_proxy(
     }
 
     if let Some(port) = state.pm.find_port_by_domain(host).await {
-        let uri_string = format!("http://127.0.0.1:{}{}", port, req.uri().path_and_query().map(|x| x.as_str()).unwrap_or(""));
+        let uri_string = format!(
+            "http://127.0.0.1:{port}{}",
+            req.uri().path_and_query().map_or("", |x| x.as_str())
+        );
         if let Ok(uri) = uri_string.parse() {
             *req.uri_mut() = uri;
         } else {
-             return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response();
         }
-        
+
         // Forward the request
         match state.client.request(req).await {
             Ok(res) => res.into_response(),
             Err(e) => {
-                error!("Proxy error: {}", e);
-                (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response()
+                error!("Proxy error: {e}");
+                (StatusCode::BAD_GATEWAY, format!("Proxy error: {e}")).into_response()
             }
         }
     } else {
-        (StatusCode::NOT_FOUND, format!("Domain {} not found", host)).into_response()
+        (StatusCode::NOT_FOUND, format!("Domain {host} not found")).into_response()
     }
 }

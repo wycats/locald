@@ -1,34 +1,24 @@
+use crate::config::LocaldConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::config::LocaldConfig;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthStatus {
+    #[default]
     Unknown,
     Starting,
     Healthy,
     Unhealthy,
 }
 
-impl Default for HealthStatus {
-    fn default() -> Self {
-        HealthStatus::Unknown
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthSource {
+    #[default]
     None,
     Docker,
     Notify,
     Tcp,
     Explicit,
-}
-
-impl Default for HealthSource {
-    fn default() -> Self {
-        HealthSource::None
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

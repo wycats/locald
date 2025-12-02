@@ -17,5 +17,6 @@ else
     exit 1
 fi
 
-kill $SERVER_PID
+./target/debug/locald-cli shutdown
+wait $SERVER_PID
 echo "All checks passed."

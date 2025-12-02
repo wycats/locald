@@ -1,16 +1,16 @@
+use crate::client;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use locald_core::{IpcRequest, IpcResponse};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use std::{io, time::Duration};
-use locald_core::{IpcRequest, IpcResponse};
-use crate::client;
 
 pub fn run() -> Result<()> {
     // Setup terminal
@@ -24,14 +24,11 @@ pub fn run() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
-        println!("{:?}", err);
+        println!("{err:?}");
     }
 
     Ok(())
@@ -40,7 +37,7 @@ pub fn run() -> Result<()> {
 fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     loop {
         // Fetch status
-        let services = match client::send_request(IpcRequest::Status) {
+        let services = match client::send_request(&IpcRequest::Status) {
             Ok(IpcResponse::Status(s)) => s,
             _ => vec![], // Handle error gracefully in UI later
         };
@@ -49,13 +46,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
-                .constraints(
-                    [
-                        Constraint::Percentage(10),
-                        Constraint::Percentage(90),
-                    ]
-                    .as_ref(),
-                )
+                .constraints([Constraint::Percentage(10), Constraint::Percentage(90)].as_ref())
                 .split(f.area());
 
             let title = Paragraph::new("locald monitor (Press 'q' to quit)")
@@ -75,25 +66,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                         "{:<20} [{}] PID: {:<6} Port: {:<5} URL: {}",
                         s.name,
                         s.status,
-                        s.pid.map(|p| p.to_string()).unwrap_or("-".into()),
-                        s.port.map(|p| p.to_string()).unwrap_or("-".into()),
+                        s.pid.map_or_else(|| "-".into(), |p| p.to_string()),
+                        s.port.map_or_else(|| "-".into(), |p| p.to_string()),
                         s.url.as_deref().unwrap_or("-")
                     );
                     ListItem::new(content).style(status_style)
                 })
                 .collect();
 
-            let list = List::new(items)
-                .block(Block::default().title("Services").borders(Borders::ALL));
+            let list =
+                List::new(items).block(Block::default().title("Services").borders(Borders::ALL));
             f.render_widget(list, chunks[1]);
         })?;
 
-        if event::poll(Duration::from_millis(500))? {
-            if let Event::Key(key) = event::read()? {
-                if let KeyCode::Char('q') = key.code {
-                    return Ok(());
-                }
-            }
+        if event::poll(Duration::from_millis(500))?
+            && let Event::Key(key) = event::read()?
+            && key.code == KeyCode::Char('q')
+        {
+            return Ok(());
         }
     }
 }
