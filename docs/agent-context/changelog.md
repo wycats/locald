@@ -6,6 +6,19 @@ History of completed phases and key changes.
 
 <!-- agent-template end -->
 
+## Phase 14: Dogfooding & Polish (2025-12-02)
+
+**Goal**: Smooth out the rough edges before broader adoption. Focus on error messages, CLI output, and common workflow friction.
+
+**Work Completed**:
+
+- **Unified Binary**: Renamed `locald-cli` to `locald` for better ergonomics.
+- **CLI Polish**: Added colored output, improved tables, and better feedback for `start`/`stop`.
+- **New Feature**: Implemented `locald run <command>` for quick, config-free service execution.
+- **Code Quality**: Established strict linting (`clippy`), pre-commit hooks (`lefthook`), and CI/CD (GitHub Actions).
+- **Verification**: Verified multi-project workflow (running multiple projects simultaneously).
+- **SSL Design**: Researched and designed a "Pure Rust" SSL stack for `.dev` domain support.
+
 ## Phase 13: Smart Health Checks (2025-12-01)
 
 **Goal**: Ensure services are ready before dependents start, using "Zero-Config" detection where possible.

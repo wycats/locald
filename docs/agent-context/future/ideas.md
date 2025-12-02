@@ -15,3 +15,8 @@ Ideas for future work.
 
 - **Goal**: Support non-network services (workers, cron jobs) that do not bind a port.
 - **Mechanism**: Add `type = "worker"` to service config. Skip port assignment and TCP probe for workers.
+
+## Single Binary Distribution
+
+- **Goal**: Simplify installation by merging `locald-server` and `locald-cli` into a single `locald` binary.
+- **Mechanism**: Refactor server logic into a library crate. `locald server` subcommand runs the daemon. `locald start` sends IPC.

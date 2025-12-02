@@ -1,4 +1,3 @@
 [alias]
 locald = "run --bin locald-cli --"
 server = "run --bin locald-server --"
-install-all = "!sh -c 'cargo install --path locald-cli && cargo install --path locald-server'"
