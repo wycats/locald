@@ -142,4 +142,3 @@
 **Context**: `.local` domains rely on mDNS which is flaky on macOS and not treated as a Secure Context by browsers.
 **Decision**: Switch the default domain suffix from `.local` to `.localhost`. This provides reliability and Secure Context benefits without requiring SSL configuration.
 **Status**: Accepted.
-

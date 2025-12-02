@@ -138,10 +138,10 @@
 
 ### Phase 15: Zero-Config SSL & .dev Support
 
-**Goal**: Enable HTTPS support for `.dev` domains using a pure Rust stack, bringing the local environment to production parity.
+**Goal**: Enable HTTPS support for `.dev` domains using a pure Rust stack, bringing the local environment to production parity. Also, simplify installation by merging the CLI and Server into a single binary.
 
-- [ ] Implement "Pure Rust" CA generation (`rcgen`) and trust store injection (`devcert`).
-- [ ] Implement on-the-fly certificate signing in `locald-server` (`rustls`).
-- [ ] Switch default domain from `.local` to `.localhost`.
-- [ ] Verify `.dev` domain support in browsers (Chrome/Firefox/Safari).
-
+- [ ] **Merge Binaries**: Refactor `locald-server` into a library and integrate it into `locald` CLI.
+- [ ] **SSL Stack**: Implement "Pure Rust" CA generation (`rcgen`) and trust store injection (`devcert`).
+- [ ] **On-the-fly Signing**: Implement `ResolvesServerCert` in `rustls` to sign certificates dynamically.
+- [ ] **Default Domain**: Switch default domain from `.local` to `.localhost`.
+- [ ] **Verification**: Verify `.dev` domain support in browsers (Chrome/Firefox/Safari).
