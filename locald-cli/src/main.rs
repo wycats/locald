@@ -8,6 +8,7 @@ use std::collections::HashSet;
 mod client;
 mod init;
 mod monitor;
+mod run;
 
 #[derive(Parser)]
 #[command(name = "locald")]
@@ -21,6 +22,17 @@ struct Cli {
 enum Commands {
     /// Initialize a new locald project
     Init,
+    /// Run a command as a service (creates/updates locald.toml)
+    Run {
+        /// Command to run
+        command: String,
+        /// Name of the service (default: web)
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Port the service listens on
+        #[arg(short, long)]
+        port: Option<u16>,
+    },
     /// Monitor running services (TUI)
     Monitor,
     /// Ping the locald daemon
@@ -78,6 +90,13 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Init => {
             init::run()?;
+        }
+        Commands::Run {
+            command,
+            name,
+            port,
+        } => {
+            run::run(command.clone(), name.clone(), *port)?;
         }
         Commands::Monitor => {
             monitor::run()?;
