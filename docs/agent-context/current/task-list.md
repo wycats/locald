@@ -16,12 +16,8 @@
   - [x] Setup `lefthook` for pre-commit checks.
   - [x] Fix all `clippy` warnings (including `bollard` deprecations).
 
-- [ ] **Workflow Validation**
+- [x] **Workflow Validation**
 
-  - [ ] Verify multi-project registration workflow.
-  - [ ] Investigate `.dev` domain support and SSL.
+  - [x] Verify multi-project registration workflow.
+  - [x] Investigate `.dev` domain support and SSL.
 
-- [ ] **Error Handling**
-  - [ ] Improve error message for missing Docker.
-  - [ ] Improve error message for invalid config.
-  - [ ] Improve error message for port conflicts.

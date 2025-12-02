@@ -131,7 +131,17 @@
 
 **Goal**: Smooth out the rough edges before broader adoption. Focus on error messages, CLI output, and common workflow friction.
 
-- [ ] "Papercut" pass on CLI output (formatting, colors, clarity).
-- [ ] Verify "Zero-Config" flows work as expected in real scenarios.
-- [ ] Improve error handling for common misconfigurations.
-- [ ] Validate the "Happy Path" for a new user.
+- [x] "Papercut" pass on CLI output (formatting, colors, clarity).
+- [x] Verify "Zero-Config" flows work as expected in real scenarios.
+- [x] Improve error handling for common misconfigurations.
+- [x] Validate the "Happy Path" for a new user.
+
+### Phase 15: Zero-Config SSL & .dev Support
+
+**Goal**: Enable HTTPS support for `.dev` domains using a pure Rust stack, bringing the local environment to production parity.
+
+- [ ] Implement "Pure Rust" CA generation (`rcgen`) and trust store injection (`devcert`).
+- [ ] Implement on-the-fly certificate signing in `locald-server` (`rustls`).
+- [ ] Switch default domain from `.local` to `.localhost`.
+- [ ] Verify `.dev` domain support in browsers (Chrome/Firefox/Safari).
+

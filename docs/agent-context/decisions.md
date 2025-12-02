@@ -131,8 +131,15 @@
 **Decision**: Poll `inspect_container` every few seconds to check the health status. This is simpler than listening to the Docker event stream for this phase.
 **Status**: Accepted.
 
-## 022. Code Quality: Strict Linting
+## 023. SSL Strategy: Pure Rust Stack
 
-**Context**: To ensure long-term maintainability and prevent common runtime panics.
-**Decision**: Enforce strict clippy lints in the workspace `Cargo.toml`. Specifically deny `unwrap_used`, `expect_used`, and `panic` to force proper error handling via `anyhow` or `Result`.
+**Context**: We need to support `.dev` domains which require HTTPS (HSTS). We want to avoid external dependencies like `mkcert` or `openssl` binaries to maintain our "Single Binary" philosophy.
+**Decision**: Use `rcgen` for certificate generation and `devcert` (or similar logic) for trust store injection. Implement `ResolvesServerCert` in `rustls` to sign certificates on-the-fly during the TLS handshake.
 **Status**: Accepted.
+
+## 024. Default Domain: .localhost
+
+**Context**: `.local` domains rely on mDNS which is flaky on macOS and not treated as a Secure Context by browsers.
+**Decision**: Switch the default domain suffix from `.local` to `.localhost`. This provides reliability and Secure Context benefits without requiring SSL configuration.
+**Status**: Accepted.
+

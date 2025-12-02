@@ -1,0 +1,9 @@
+[project]
+name = "validation-test"
+domain = "validation-test.local"
+
+[services.web]
+command = "python3 -m http.server $PORT"
+depends_on = []
+
+[services.web.env]
