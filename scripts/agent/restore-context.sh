@@ -16,46 +16,32 @@ else
 fi
 echo ""
 
+echo "=== Active RFCs (Implementation Context) ==="
+# Get list of Stage 2 RFCs
+# Note: rfc-status tool moved to exosuit repo. Using grep for now.
+RFC_FILES=$(grep -l "^stage: 2" docs/rfcs/*.md 2>/dev/null | xargs -n 1 basename 2>/dev/null)
+
+if [ -z "$RFC_FILES" ]; then
+    echo "No active RFCs (Stage 2)."
+else
+    for rfc in $RFC_FILES; do
+        echo "--- $rfc ---"
+        if [ -f "docs/rfcs/$rfc" ]; then
+             cat "docs/rfcs/$rfc"
+        else
+             echo "Could not find file for RFC: $rfc"
+        fi
+        echo ""
+    done
+fi
+echo ""
+
 echo "=== Progress (Changelog) ==="
 if [ -f "docs/agent-context/changelog.md" ]; then
     cat docs/agent-context/changelog.md
 else
     echo "No changelog found."
 fi
-echo ""
-
-echo "=== Current Phase State ==="
-echo "--- Implementation Plan ---"
-if [ -f "docs/agent-context/current/implementation-plan.md" ]; then
-    cat docs/agent-context/current/implementation-plan.md
-else
-    echo "(Empty or missing)"
-fi
-echo ""
-
-echo "--- Task List ---"
-if [ -f "docs/agent-context/current/task-list.md" ]; then
-    cat docs/agent-context/current/task-list.md
-else
-    echo "(Empty or missing)"
-fi
-echo ""
-
-echo "--- Walkthrough (Draft) ---"
-if [ -f "docs/agent-context/current/walkthrough.md" ]; then
-    cat docs/agent-context/current/walkthrough.md
-else
-    echo "(Empty or missing)"
-fi
-echo ""
-
-echo "--- Other Context Files ---"
-# List files in current/ that are NOT the standard 3
-find docs/agent-context/current -maxdepth 1 -type f \
-    ! -name "implementation-plan.md" \
-    ! -name "task-list.md" \
-    ! -name "walkthrough.md" \
-    -exec basename {} \;
 echo ""
 
 echo "=== Available Design Docs ==="

@@ -31,8 +31,8 @@ cargo test
 
 ## Project Structure
 
-- `locald-cli/`: The command-line interface binary.
-- `locald-server/`: The daemon binary.
+- `locald-cli/`: The main binary (contains both CLI and Server).
+- `locald-server/`: The daemon library/module (internal).
 - `locald-core/`: Shared library (types, config, IPC).
 - `locald-docs/`: This documentation site (Astro Starlight).
 - `examples/`: Example projects for testing.

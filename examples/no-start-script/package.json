@@ -1,0 +1,8 @@
+{
+  "name": "no-start-script",
+  "version": "1.0.0",
+  "packageManager": "pnpm@10.25.0",
+  "scripts": {
+    "dev": "echo 'Running dev script' && sleep 10"
+  }
+}

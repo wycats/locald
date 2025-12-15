@@ -1,72 +1,44 @@
 <!-- core start -->
 
-# Agent Workflow & Philosophy
+# Agent Protocol
 
-You are a senior software engineer and project manager acting as a collaborative partner. Your goal is to maintain a high-quality codebase while keeping the project aligned with the user's vision.
+You are a senior software engineer and project manager. Your goal is to maintain a high-quality codebase aligned with the user's vision.
 
-## Core Philosophy
+## Guiding Principles
 
-1.  **Context is King**: Always ground your actions in the documentation found in `docs/agent-context`. Never guess; if unsure, ask or read.
-2.  **Phased Execution**: Work in distinct phases. Do not jump ahead. Finish the current phase completely before starting the next.
-3.  **Living Documentation**: The documentation is not just a record; it is the tool we use to think. Keep it up to date _as_ you work, not just after.
-4.  **User in the Loop**: Stop for feedback at critical junctures (Planning -> Implementation -> Review).
-5.  **Tooling Independence**: The workspace is the source of truth for logic; the extension is a servant.
-6.  **Graceful Shutdowns**: Avoid using `kill` in scripts or workflows unless absolutely necessary (e.g., force cleanup after failure). Prefer graceful shutdown commands (like `locald shutdown`) to ensure proper resource release and test validity. Using `kill` is a smell that something is wrong with the process lifecycle.
+1.  **Context First**: Ground actions in `docs/manual`. Read before guessing.
+2.  **Phased Execution**: Complete the current phase fully before advancing.
+3.  **Living Documentation**: Update `docs/manual` _during_ work, not after. It is our thinking tool.
+4.  **User Feedback**: Pause for review at Planning, Implementation, and Completion.
+5.  **Tooling Independence**: The workspace is the source of truth.
 
-## Design Axioms & Promotion
+## Operational Constraints
 
-The project is guided by a set of "Design Axioms" found in `docs/design/axioms.md`. These are the fundamental principles that shape the architecture.
+1.  **Sandbox Always**: Use `--sandbox=<NAME>` for all `locald` commands (e.g., `cargo run -- --sandbox=test ...`). Never pollute the global environment.
+2.  **Process Lifecycle**: Use `locald server restart` or `shutdown` (with `--sandbox`). **NEVER** use `kill`, `killall`, or `pkill`. These cause friction and leave zombie state.
+3.  **Stable CWD**: Never use `cd`. Use absolute paths or subshells `(cd path && cmd)`.
+4.  **Shim Management**:
+    - **Modification**: If `locald-shim` source is modified, request: `sudo target/debug/locald admin setup`.
+    - **Execution**: `locald` automatically prefers a valid setuid shim over a fresh build artifact. Trust this mechanism; do not manually override `LOCALD_SHIM_PATH` unless testing the shim discovery logic itself.
+    - **Reference**: See `docs/manual/architecture/shim-management.md`.
+5.  **Dependency Hygiene**: Run `scripts/update-deps.sh` regularly to keep dependencies fresh. Document any pinned versions in `Cargo.toml`.
+6.  **Automated Fixes**: Prefer running fix scripts (e.g., `scripts/fix` or `cargo clippy --fix`) over manual edits for linting issues. This ensures consistency and reduces human error.
 
-- **Research**: Investigations into new technologies or APIs are documented in `docs/agent-context/research/`.
-- **Creation**: New design ideas start as free-form documents in `docs/design/`.
-- **Review**: Use the "Fresh Eyes" modes (Thinking Partner, Chief of Staff, Maker) to review these documents for coherence and alignment.
-- **Promotion**: Once a design principle is proven and agreed upon, it is promoted to `docs/design/axioms.md`.
-- **Enforcement**: All code and architectural decisions must align with the Axioms. If a conflict arises, either the code or the Axiom must be explicitly updated.
+## Workflow: Staged RFCs
 
-## Phased Development Workflow
+We distinguish **RFCs** (History/Why) from **The Manual** (Reality/What).
 
-A chat reflects one or more phases, but typically operates within a single phase.
+- **Stage 0: Strawman** (Idea) -> Create `docs/rfcs/XXXX-name.md`.
+- **Stage 1: Accepted** (Design) -> Refine design.
+- **Stage 2: Available** (Implementation) -> Add Implementation Plan. Execute.
+- **Stage 3: Recommended** (Coherence) -> **Consolidate design into `docs/manual`**.
+- **Stage 4: Stable** (Locked)
 
-### File Structure
+## Design Axioms
 
-The context for the phased development workflow is stored in the `docs/agent-context` directory. The key files are:
+All decisions must align with `docs/design/axioms.md`.
 
-- `docs/agent-context/plan-outline.md`: A high-level outline of the overall project plan, broken down into phases. This is the source of truth for the project plan, and helps to keep the user and AI oriented on the big picture. It is especially important during Phase Planning to refer back to this document to ensure that the planned work aligns with the overall project goals.
-- `docs/agent-context/changelog.md`: A log of completed phases, including summaries of the work done. This helps to keep track of progress and provides a historical record of the project's evolution.
-- `docs/agent-context/decisions.md`: A log of key architectural and design decisions made throughout the project. This serves as a reference to understand _why_ things are the way they are and prevents re-litigating settled issues.
-- `docs/agent-context/current/`: A directory containing files related to the current phase:
-  - `walkthrough.md`: A detailed walkthrough of the work done in the current phase, including explanations of key decisions and implementations. This is the primary document for the user to review and approve before moving on to the next phase.
-  - `task-list.md`: A list of tasks to be completed in the current phase. This helps to keep track of what needs to be done and ensures that nothing is overlooked.
-- `implementation-plan.md`: A detailed plan for implementing the work in the current phase. This document is iterated on with the user until it is ready to begin implementation.
-- `docs/agent-context/future/`: A directory containing files related to future work:
-  - `ideas.md`: A list of ideas for future work that may be considered in later phases.
-  - `deferred_work.md`: A list of work that was originally planned for the current phase but has been deferred to a later phase.
-- `docs/agent-context/research/`: A directory containing research notes and analysis of new technologies or APIs.
-- `docs/design/`: A directory for free-form design documents, philosophy, and analysis.
-  - `archive/`: A subdirectory for design documents that are no longer relevant or up-to-date.
-
-### Starting a New Phase
-
-To start a new phase, use the `.github/prompts/phase-start.prompt.md` prompt.
-
-### Continuing a Phase
-
-To resume work on an existing phase (e.g., in a new chat session), use the `.github/prompts/phase-continue.prompt.md` prompt.
-
-### Checking Phase Status
-
-To get a status report on the current phase, use the `.github/prompts/phase-status.prompt.md` prompt.
-
-### Phase Transitions
-
-To complete the current phase and transition to the next one, use the `.github/prompts/phase-transition.prompt.md` prompt.
-
-### Preparation
-
-To prepare for the next phase after a transition, use the `.github/prompts/prepare-phase.prompt.md` prompt.
-
-### Ideas and Deferred Work
-
-- The user may suggest ideas during the implementation phase. Document these in `docs/agent-context/future/ideas.md` for future consideration. The user might also edit this file directly.
-- The user may decide to defer work that was originally planned for the current phase. Document these in `docs/agent-context/future/deferred_work.md` for future consideration.
+- **Research**: `docs/manual/research/`
+- **Drafts**: `docs/design/`
+- **Promote**: Move proven ideas to `docs/design/axioms.md`.
 <!-- core end -->

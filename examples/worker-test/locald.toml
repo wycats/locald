@@ -1,0 +1,6 @@
+[project]
+name = "worker-test"
+
+[services.worker]
+type = "worker"
+command = "while true; do echo 'working...'; sleep 1; done"

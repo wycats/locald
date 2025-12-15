@@ -3,33 +3,54 @@ members = [
     "locald-server",
     "locald-cli",
     "locald-core",
+    "locald-shim",
+    "locald-builder",
+    "locald-e2e",
+    "examples/cnb-test/rust-extractor",
+    "examples/oci-example",
+    "locald-utils",
+    "locald-oci",
+    "cnb-client",
+    "locald-vmm",
+    "tools/fetch-kernel",
 ]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_debug_implementations = "warn"
 missing_copy_implementations = "warn"
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 # Groups
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
+# Architecture & Safety Lints
+print_stdout = "warn"
+print_stderr = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+await_holding_lock = "warn"
+let_underscore_must_use = "warn"
+
 # Deny specific ones that are definitely bad
-unwrap_used = "deny"
-expect_used = "deny"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
-await_holding_lock = "deny"
 needless_pass_by_value = "deny"
 trivially_copy_pass_by_ref = "deny"
 
+# Documentation Lints
+missing_errors_doc = "warn"
+
 # Allow noisy pedantic lints
 module_name_repetitions = "allow"
-missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 cast_possible_truncation = "allow"
@@ -43,3 +64,13 @@ unused_async = "allow"
 match_bool = "allow"
 single_match_else = "allow"
 
+# Build performance defaults
+#
+# Cargo enables incremental compilation for `dev` by default, but we make it
+# explicit so it stays true if defaults ever change or if we later add more
+# profile tuning.
+[profile.dev]
+incremental = true
+
+[profile.test]
+incremental = true

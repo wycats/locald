@@ -1,0 +1,11 @@
+[project]
+name = "adhoc-test"
+domain = "adhoc-test.local"
+
+[services.myservice]
+type = "exec"
+command = "echo 'Hello from try'"
+
+[services.web]
+type = "exec"
+command = "last --name myservice"

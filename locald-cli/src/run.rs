@@ -1,52 +1,59 @@
+use crate::client;
 use anyhow::{Context, Result};
-use locald_core::config::{LocaldConfig, ProjectConfig, ServiceConfig};
-use std::collections::HashMap;
+use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
+use std::process::Command;
 
-pub fn run(command: String, name: Option<String>, port: Option<u16>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let config_path = cwd.join("locald.toml");
-    let service_name = name.unwrap_or_else(|| "web".to_string());
-
-    let mut config = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        toml::from_str(&content).context("Failed to parse existing locald.toml")?
-    } else {
-        let project_name = cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("my-project")
-            .to_string();
-
-        LocaldConfig {
-            project: ProjectConfig {
-                name: project_name.clone(),
-                domain: Some(format!("{project_name}.local")),
-            },
-            services: HashMap::new(),
+pub fn run_task(service_name: &str, command: &[String]) -> Result<()> {
+    // Resolve full name if needed
+    let full_name = {
+        let config_path = std::env::current_dir()?.join("locald.toml");
+        if config_path.exists() {
+            std::fs::read_to_string(&config_path).map_or_else(
+                |_| service_name.to_string(),
+                |content| {
+                    if let Ok(config) = toml::from_str::<LocaldConfig>(&content) {
+                        format!("{}:{}", config.project.name, service_name)
+                    } else {
+                        service_name.to_string()
+                    }
+                },
+            )
+        } else {
+            service_name.to_string()
         }
     };
 
-    let service_config = ServiceConfig {
-        command: Some(command),
-        workdir: None,
-        env: HashMap::new(),
-        port,
-        depends_on: Vec::new(),
-        image: None,
-        container_port: None,
-        health_check: None,
+    // Fetch environment
+    let env = match client::send_request(&IpcRequest::GetServiceEnv {
+        name: full_name.clone(),
+    })? {
+        IpcResponse::ServiceEnv(env) => env,
+        IpcResponse::Error(msg) => {
+            // Check if it's a "Service not found" error and hint about `try`
+            if msg.contains("not found") {
+                eprintln!("Error: Service '{service_name}' not found.");
+                eprintln!("Hint: If you meant to run an ad-hoc command, use `locald try` instead.");
+                eprintln!(
+                    "      Example: `locald try \"{service_name} {}\"`",
+                    command.join(" ")
+                );
+            }
+            anyhow::bail!("Failed to get environment for {full_name}: {msg}")
+        }
+        r => anyhow::bail!("Unexpected response: {r:?}"),
     };
 
-    config.services.insert(service_name.clone(), service_config);
+    // Run command
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(command.join(" "))
+        .envs(env)
+        .status()
+        .context("Failed to execute command")?;
 
-    let toml_string = toml::to_string_pretty(&config)?;
-    std::fs::write(&config_path, toml_string)?;
-
-    println!("Updated locald.toml with service '{service_name}'");
-
-    // Now start the project
-    crate::client::send_request(&locald_core::IpcRequest::Start { path: cwd })?;
-    println!("Project started successfully.");
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     Ok(())
 }

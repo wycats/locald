@@ -1,0 +1,7 @@
+[project]
+name = "locald-dashboard"
+domain = "dev.locald.localhost"
+
+[services.web]
+type = "exec"
+command = "pnpm dev --port $PORT"

@@ -1,0 +1,7 @@
+[project]
+name = "container-test"
+
+[services.redis]
+type = "container"
+image = "redis:7"
+container_port = 6379

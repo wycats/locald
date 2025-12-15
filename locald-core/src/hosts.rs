@@ -1,7 +1,8 @@
+#![allow(clippy::collapsible_if)]
 use std::fmt::Write;
-use std::fs;
 use std::io;
 use std::path::PathBuf;
+use tokio::fs;
 
 #[derive(Debug)]
 pub struct HostsFileSection {
@@ -28,8 +29,8 @@ impl HostsFileSection {
         Self { path }
     }
 
-    pub fn read(&self) -> io::Result<String> {
-        fs::read_to_string(&self.path)
+    pub async fn read(&self) -> io::Result<String> {
+        fs::read_to_string(&self.path).await
     }
 
     pub fn update_content(&self, current_content: &str, domains: &[String]) -> String {
@@ -44,15 +45,15 @@ impl HostsFileSection {
         }
         new_section.push_str(end_marker);
 
-        if let Some(start) = current_content.find(start_marker)
-            && let Some(end_idx) = current_content[start..].find(end_marker)
-        {
-            let end = start + end_idx;
-            // Replace existing section
-            let mut output = String::from(&current_content[..start]);
-            output.push_str(&new_section);
-            output.push_str(&current_content[end + end_marker.len()..]);
-            return output;
+        if let Some(start) = current_content.find(start_marker) {
+            if let Some(end_idx) = current_content[start..].find(end_marker) {
+                let end = start + end_idx;
+                // Replace existing section
+                let mut output = String::from(&current_content[..start]);
+                output.push_str(&new_section);
+                output.push_str(&current_content[end + end_marker.len()..]);
+                return output;
+            }
         }
 
         // Append if not found
@@ -65,8 +66,8 @@ impl HostsFileSection {
         output
     }
 
-    pub fn write(&self, content: &str) -> io::Result<()> {
-        fs::write(&self.path, content)
+    pub async fn write(&self, content: &str) -> io::Result<()> {
+        fs::write(&self.path, content).await
     }
 }
 

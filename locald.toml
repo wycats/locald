@@ -1,5 +1,25 @@
 [project]
 name = "dotlocal"
 
+[services.test-postgres-3]
+type = "postgres"
+
 [services.docs]
-command = "python3 -m http.server $PORT --directory docs"
+type = "site"
+path = "docs"
+
+[services.docs-dev]
+command = "./scripts/sync-manifesto.sh && pnpm astro dev --port $PORT"
+workdir = "locald-docs"
+
+[services.dashboard]
+command = "pnpm dev --port $PORT"
+workdir = "locald-dashboard"
+depends_on = ["test-postgres-3"]
+[services.dashboard.env]
+DEMO_DB_URL = "${services.test-postgres-3.url}"
+
+# [services.rustdocs]
+# type = "site"
+# path = "target/doc"
+# build = "cargo doc --workspace --no-deps"

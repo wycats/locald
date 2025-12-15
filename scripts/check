@@ -4,12 +4,20 @@ set -e
 echo "Running cargo build..."
 cargo build
 
+echo "Running clippy..."
+cargo clippy --workspace -- -D warnings
+
+echo "Running dashboard check..."
+(cd locald-dashboard && pnpm check)
+
 echo "Running IPC verification..."
-./target/debug/locald-server --foreground &
+export LOCALD_HTTP_PORT=8080
+export LOCALD_HTTPS_PORT=8443
+./target/debug/locald server start &
 SERVER_PID=$!
 sleep 2
 
-if ./target/debug/locald-cli ping | grep -q "Pong"; then
+if ./target/debug/locald ping | grep -q "Pong"; then
     echo "IPC Ping successful"
 else
     echo "IPC Ping failed"
@@ -17,6 +25,6 @@ else
     exit 1
 fi
 
-./target/debug/locald-cli shutdown
+./target/debug/locald server shutdown
 wait $SERVER_PID
 echo "All checks passed."
