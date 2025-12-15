@@ -1,0 +1,25 @@
+[[ideas]]
+id = "687e7bc9-d746-4e7d-9f99-2dc746725d32"
+title = "Root config with subdirectory execution"
+description = "Allow a locald.toml in the repo root to define commands that run in a specific subdirectory (useful for monorepos and constellation-style setups)."
+status = "new"
+created_at = "2025-12-15T19:32:58.372Z"
+source = "user"
+tags = [
+    "config",
+    "monorepo",
+]
+related_tasks = []
+
+[[ideas]]
+id = "ecea43dd-5b2b-4c20-a9cd-7081fa3976e0"
+title = "Context-aware bare commands"
+description = "Make commands like `locald restart` or `locald status` (no args) default to the service implied by the current directory when possible, instead of requiring a service name."
+status = "new"
+created_at = "2025-12-15T19:32:58.397Z"
+source = "user"
+tags = [
+    "cli",
+    "ergonomics",
+]
+related_tasks = []

@@ -14,6 +14,7 @@ You are helping the user define a new **Mode** (collaboration style) or **Person
 1.  **Determine Type**: Ask if the user is defining a **Mode** (how the AI works) or a **Persona** (who the user is).
 
 2.  **Drafting a Mode**:
+
     - **Name**: A descriptive title (e.g., "The Architect").
     - **Focus**: What is the primary concern? (e.g., "Exploration", "Execution").
     - **When to use**: In what phase or situation is this mode active?
@@ -21,6 +22,7 @@ You are helping the user define a new **Mode** (collaboration style) or **Person
     - **Key Documents**: What files are most relevant to this mode?
 
 3.  **Drafting a Persona**:
+
     - **Name**: A catchy title (e.g., "The Pragmatist").
     - **Description**: A brief summary of who they are.
     - **Needs**: What do they need from the project?

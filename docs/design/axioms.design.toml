@@ -1,0 +1,98 @@
+# READ-ONLY: Use 'exo' CLI to modify this file.
+# Design Axioms
+
+[[axioms]]
+id = "design-experience-01-decentralized-configuration"
+principle = "Project configuration lives in the project repository, not a central registry."
+rationale = "In-repo config is portable, versioned with the code, and avoids projects stepping on each other."
+implications = ["locald discovers and loads configuration from the workspace (e.g., locald.toml)."]
+
+[[axioms]]
+id = "design-experience-02-dashboard-workspace"
+principle = "The dashboard is the primary workspace, not just a log viewer."
+rationale = "A development environment needs stable, interactive, organized control surfaces."
+implications = ["Dashboard state and layout should be stable and persistent."]
+
+[[axioms]]
+id = "design-experience-03-interface-parity"
+principle = "Web UI and terminal UI must have parity of information and control."
+rationale = "Developers live in the terminal, but the web is better for at-a-glance and dense visualization."
+implications = ["Both UIs must consume the same structured daemon API."]
+
+[[axioms]]
+id = "design-experience-04-respectful-output"
+principle = "Output is a user interface: relevant, respectful, and persistent."
+rationale = "Raw logs overwhelm users; the tool must present domain-level signal and preserve it for later."
+implications = ["Unexpected failures must write a crash log and point the user to it."]
+
+[[axioms]]
+id = "design-experience-05-dashboard-living-workspace"
+principle = "The dashboard is a living workspace: calm surface and glass box transparency."
+rationale = "The dashboard should reflect the user’s mental model and expose reality without magic."
+implications = ["Prefer progressive disclosure over noisy event firehoses."]
+
+[[axioms]]
+id = "design-architecture-04-daemon-first"
+principle = "Core logic runs as a background daemon."
+rationale = "Development processes must outlive terminals and remain controllable from multiple clients."
+implications = ["The CLI should be a thin client that talks to the daemon over IPC."]
+
+[[axioms]]
+id = "design-architecture-05-process-ownership"
+principle = "locald owns the child processes; it is a process manager."
+rationale = "Lifecycle control enables restarts, shutdown, and consistent environment injection."
+implications = ["Implement graceful shutdown (SIGTERM then SIGKILL after timeout) for process groups."]
+
+[[axioms]]
+id = "design-architecture-06-secure-privilege-separation"
+principle = "Use least privilege: delegate privileged operations to a small, auditable shim."
+rationale = "Privileged operations are sometimes necessary, but a root daemon is an unnecessary security risk."
+implications = ["The shim must not execute arbitrary user-controlled binaries with elevated privileges."]
+
+[[axioms]]
+id = "design-architecture-07-ephemeral-runtime-persistent-context"
+principle = "Runtime state is ephemeral; surrounding context is persistent."
+rationale = "Debugging and resilience require keeping logs and history even after processes restart or crash."
+implications = ["Persist logs and recent status history on disk."]
+
+[[axioms]]
+id = "design-architecture-11-self-hosting-platform"
+principle = "locald is a self-hosting platform with built-in operational services."
+rationale = "The platform’s UI and docs should be available offline and integrated as first-class surfaces."
+implications = ["Serve dashboard and docs at well-known *.localhost domains and allow overriding for dogfooding."]
+
+[[axioms]]
+id = "design-architecture-12-source-of-truth"
+principle = "Discover, don’t invent: derive behavior from workspace artifacts."
+rationale = "locald is a guest in the workspace and must respect the user’s existing tools and configuration."
+implications = ["Avoid shadow configuration that overrides the workspace."]
+
+[[axioms]]
+id = "design-architecture-13-development-loop"
+principle = "Build is isolated; runtime is interactive."
+rationale = "Hermetic builds improve reproducibility; bind-mounted runs enable hot reload and debugging."
+implications = ["Snapshot sources for builds, bind-mount sources for runs."]
+
+[[axioms]]
+id = "design-architecture-14-precise-abstractions"
+principle = "Use crates for primitives, not mismatched policies."
+rationale = "High-level abstractions can conflict with constraints like single binary distribution and privilege separation."
+implications = ["Prefer low-level mechanisms and own the glue code."]
+
+[[axioms]]
+id = "design-environment-08-structured-service-hierarchy"
+principle = "Services exist in a hierarchy: System > Constellation > Project > Service."
+rationale = "Hierarchy matches how users think and enables sensible grouping, inheritance, and navigation."
+implications = ["UIs and configuration should reflect the hierarchy."]
+
+[[axioms]]
+id = "design-environment-09-managed-ports-and-dns"
+principle = "Users should not manage ports or hosts entries manually."
+rationale = "Port conflict and ad-hoc DNS are major sources of friction and wasted attention."
+implications = ["Use dynamic ports and a reverse proxy to map semantic domains to services."]
+
+[[axioms]]
+id = "design-environment-10-cross-platform-portability"
+principle = "Core features must work across Linux, macOS, and Windows."
+rationale = "locald aims to be a universal tool; OS-specific features must be gated or have fallbacks."
+implications = ["Avoid shell scripts for core logic; implement portability in Rust where possible."]
