@@ -36,6 +36,6 @@ This provides a real-time view of the system.
 - **Persona**: **The Observer** (Monitoring, Debugging, Insight).
 - **Interfaces**:
   - **TUI**: `locald ui` or `locald monitor`. A terminal-based dashboard.
-  - **Web UI**: `http://locald.local` (or similar). A browser-based dashboard.
+  - **Web UI**: `http://locald.localhost`. A browser-based dashboard.
 - **Features**: Streaming logs, process status, start/stop controls.
 - **Constraint**: Both interfaces consume the same API/Event Stream from the Daemon (Axiom 5).

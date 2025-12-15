@@ -78,7 +78,7 @@
 			const { FitAddon } = await import('@xterm/addon-fit');
 
 			terminal = new Terminal({
-				cursorBlink: true,
+				cursorBlink: false,
 				theme: {
 					background: '#09090b',
 					foreground: '#d4d4d8'

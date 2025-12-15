@@ -1,0 +1,35 @@
+/* Docs-only helpers for embedding UI screenshots at a readable size. */
+
+.screenshot-wide {
+  /* Make this a container so we can size to the docs column, not the viewport. */
+  container-type: inline-size;
+  margin: 1rem auto 1.5rem;
+  width: 100%;
+}
+
+/* Markdown images are wrapped in a <p>. */
+.screenshot-wide p {
+  margin: 0;
+}
+
+.screenshot-wide img {
+  display: block;
+  /* 100cqi = 100% of this container's inline-size */
+  width: min(1100px, 100cqi);
+  height: auto;
+  border-radius: 10px;
+  border: 1px solid var(--sl-color-gray-5);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+}
+
+.screenshot-wide a {
+  display: block;
+}
+
+.screenshot-wide figcaption,
+.screenshot-caption {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--sl-color-gray-3);
+  text-align: center;
+}

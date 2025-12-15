@@ -35,6 +35,40 @@ Run a specific test file:
 pnpm test -- tests/resilience.spec.ts
 ```
 
+## Capturing Dashboard Screenshots (Docs)
+
+If you have the dashboard running at `http://locald.localhost/`, you can generate/update the screenshots used in the docs site:
+
+```bash
+pnpm screenshots
+```
+
+This writes images to `locald-docs/src/assets/screenshots/`.
+
+### Visual approval (Playwright snapshots)
+
+For a reviewable workflow (diff UI + approved baselines), use the screenshot test:
+
+- Open the visual UI:
+
+```bash
+pnpm screenshots:ui
+```
+
+- Update baselines (accept the new screenshots):
+
+```bash
+pnpm screenshots:update
+```
+
+- Sync the approved baselines into the docs site (served at `/screenshots/...`):
+
+```bash
+pnpm screenshots:sync
+```
+
+By default the screenshot test targets `https://dev.locald.localhost/`. Override with `DASHBOARD_URL=...`.
+
 ## Test Architecture
 
 - **Harness**: `src/locald-process.ts` manages the `locald` server process. It runs `locald` in a sandbox environment.

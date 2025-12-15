@@ -13,3 +13,7 @@ In practical terms, the project aims to make "clone → `locald up`" feel as coh
 
 - The design-oriented vision statement lives in [docs/design/vision.md](../design/vision.md).
 - The manual is the source of truth for "how it works now"; if there is drift, update the manual.
+
+## Development Playbooks
+
+- Cross-surface work (UI + docs + automation): [docs/manual/development/cross-surface-projects.md](development/cross-surface-projects.md)

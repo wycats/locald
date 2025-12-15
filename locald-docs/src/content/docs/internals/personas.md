@@ -12,7 +12,7 @@ To ensure `locald` serves its users effectively, we design features and document
 - **Needs**:
   - Simple, "magic" configuration (zero-config where possible).
   - Clear, actionable error messages.
-  - "It just works" local domains (`myapp.local`).
+  - "It just works" local domains (`myapp.localhost`).
   - Easy access to logs when things break.
   - **Managed Services**: "I need a database (Postgres/Redis) but I don't want to learn Docker or write a Compose file."
 - **Frustrations**:

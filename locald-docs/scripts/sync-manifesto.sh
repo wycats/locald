@@ -26,6 +26,8 @@ copy_with_frontmatter() {
         return
     fi
 
+    mkdir -p "$(dirname "$dest_file")"
+
     # Extract title from the first line starting with #
     local title
     if [ -n "$title_override" ]; then
@@ -64,9 +66,13 @@ copy_with_frontmatter "$SRC_DESIGN/axioms.md" "$DEST_INTERNALS/axioms.md"
 
 # Sync Internals (Axioms Subfiles)
 if [ -d "$SRC_DESIGN/axioms" ]; then
+    # Avoid stale generated pages if the source tree changes.
+    rm -rf "$DEST_INTERNALS/axioms"
+    mkdir -p "$DEST_INTERNALS/axioms"
+
     find "$SRC_DESIGN/axioms" -name "*.md" | while read src_file; do
-        filename=$(basename "$src_file")
-        copy_with_frontmatter "$src_file" "$DEST_INTERNALS/axioms/$filename"
+        rel_path="${src_file#"$SRC_DESIGN/axioms/"}"
+        copy_with_frontmatter "$src_file" "$DEST_INTERNALS/axioms/$rel_path"
     done
 fi
 
