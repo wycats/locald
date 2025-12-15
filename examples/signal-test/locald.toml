@@ -1,0 +1,6 @@
+[project]
+name = "signal-test"
+
+[services.trapper]
+command = "./trap.sh"
+stop_signal = "SIGINT"

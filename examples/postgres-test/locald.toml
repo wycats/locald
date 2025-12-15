@@ -1,0 +1,8 @@
+[project]
+name = "test-postgres"
+domain = "test-postgres.local"
+
+[services.db]
+type = "postgres"
+version = "15"
+port = 5432

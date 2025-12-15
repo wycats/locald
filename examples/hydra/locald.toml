@@ -1,0 +1,18 @@
+[project]
+name = "hydra"
+domain = "hydra.localhost"
+
+[services.hydra]
+type = "exec"
+command = "python3 hydra/server.py"
+port = 4444
+depends_on = ["db"]
+
+[services.consent]
+type = "exec"
+command = "python3 -m http.server $PORT --directory consent"
+port = 3001
+
+[services.db]
+type = "postgres"
+version = "15"

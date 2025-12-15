@@ -1,35 +1,20 @@
 #!/bin/bash
 
-# Check if task-list.md exists and all items are checked
-TASK_LIST="docs/agent-context/current/task-list.md"
-if [ ! -f "$TASK_LIST" ]; then
-    echo "Error: $TASK_LIST not found."
-    exit 1
+# Get active RFCs (Stage 2)
+# Note: rfc-status tool moved to exosuit repo. Using grep for now.
+ACTIVE_RFCS=$(grep -l "^stage: 2" docs/rfcs/*.md 2>/dev/null | wc -l)
+
+if [ "$ACTIVE_RFCS" -eq 0 ]; then
+    echo "Note: No active RFCs (Stage 2: Available) found."
+    echo "If you are implementing a feature, ensure you have an RFC in Stage 2."
+else
+    echo "Found $ACTIVE_RFCS active RFC(s)."
 fi
 
-UNCHECKED=$(grep -c "\- \[ \]" "$TASK_LIST")
-if [ "$UNCHECKED" -ne 0 ]; then
-    echo "Error: $TASK_LIST has $UNCHECKED unchecked items."
-    echo "Please complete all tasks before transitioning."
-    exit 1
-fi
-
-# Check if walkthrough.md exists and is not empty
-WALKTHROUGH="docs/agent-context/current/walkthrough.md"
-if [ ! -f "$WALKTHROUGH" ]; then
-    echo "Error: $WALKTHROUGH not found."
-    exit 1
-fi
-
-if [ ! -s "$WALKTHROUGH" ]; then
-    echo "Error: $WALKTHROUGH is empty."
-    exit 1
-fi
-
-# Check if walkthrough.md has "Changes" section
-if ! grep -q "## Changes" "$WALKTHROUGH"; then
-    echo "Error: $WALKTHROUGH missing '## Changes' section."
-    exit 1
+# Check if plan-outline.md exists
+PLAN="docs/agent-context/plan-outline.md"
+if [ ! -f "$PLAN" ]; then
+    echo "Warning: $PLAN not found."
 fi
 
 echo "Documentation checks passed."

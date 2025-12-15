@@ -142,3 +142,219 @@
 **Context**: `.local` domains rely on mDNS which is flaky on macOS and not treated as a Secure Context by browsers.
 **Decision**: Switch the default domain suffix from `.local` to `.localhost`. This provides reliability and Secure Context benefits without requiring SSL configuration.
 **Status**: Accepted.
+
+## 025. Single Binary Distribution (Supersedes 004)
+
+**Context**: Distributing and updating two separate binaries (`locald-server` and `locald-cli`) is cumbersome for users and complicates version synchronization.
+**Decision**: Merge the server logic into the CLI binary. The `locald` binary now contains both the client and the server (invoked via `locald server start`). This simplifies distribution to a single executable.
+**Status**: Accepted.
+
+## 026. Global Configuration
+
+**Context**: Users need to configure system-wide behavior, such as port binding preferences (privileged vs. unprivileged), that applies across all projects.
+**Decision**: Introduce a global configuration file (e.g., `~/.config/locald/config.toml`) managed by `GlobalConfig`. This allows users to opt-out of privileged port binding or enable fallback behavior without modifying per-project configs.
+**Status**: Accepted.
+
+## 027. Managed Postgres: postgresql_embedded
+
+**Context**: Users need a zero-config database for local development without requiring Docker or manual installation.
+**Decision**: Use the `postgresql_embedded` crate. It handles downloading the correct binary for the OS/Arch, initializing the data directory, and starting the server on a dynamic port.
+
+## 028. VMM Reactor: rust-vmm event-manager
+
+**Context**: Supporting virtio-net and asynchronous I/O completions requires a consistent event loop/reactor model.
+**Decision**: Standardize on rust-vmm `event-manager` as the reactor for Phase 102.
+**Status**: Accepted.
+**Status**: Accepted.
+
+## 028. Service Configuration: Typed Enum
+
+**Context**: Different service types (Exec, Postgres) have different configuration requirements (e.g., Postgres doesn't need a `command`).
+**Decision**: Refactor `ServiceConfig` to use a Serde tagged enum (`type` field). This allows strict validation and type-safe configuration for different service runners.
+**Status**: Accepted.
+
+## 029. Service Reset: Explicit Command
+
+**Context**: Stateful services like Postgres sometimes need to be wiped clean. Users shouldn't have to manually find and delete hidden directories.
+**Decision**: Implement `locald service reset <name>`. This command stops the service, deletes its data directory (if applicable), and restarts it.
+**Status**: Accepted.
+
+## 030. Gitignore: Automated Management
+
+**Context**: `locald` creates a `.locald` directory for state and logs. Users often forget to add this to `.gitignore`, leading to accidental commits of local state.
+**Decision**: `locald init` and `locald service add` will automatically check for and append `.locald/` to the project's `.gitignore` file if it exists.
+**Status**: Accepted.
+
+## 031. Dashboard Stack: Svelte 5 & xterm.js
+
+**Context**: The dashboard needs to be responsive, type-safe, and capable of rendering high-frequency log streams without bogging down the DOM.
+**Decision**: Use Svelte 5 for its fine-grained reactivity and performance. Use `xterm.js` for canvas-based terminal rendering, which is significantly more performant than DOM-based log rendering and supports full ANSI codes.
+**Status**: Accepted.
+
+## 046. The Manifesto Structure
+
+**Context**: The design axioms were a flat list that was growing unwieldy.
+**Decision**: Group axioms into three pillars: **Experience** (User-facing), **Architecture** (Internal structure), and **Environment** (System integration).
+**Consequences**: Makes the philosophy easier to digest and ensures we cover all bases when designing new features.
+
+## 033. Ephemeral Runtime, Persistent Context (Axiom 7)
+
+**Context**: Users need to debug crashes, but processes are transient.
+**Decision**: Explicitly decouple the _runtime state_ (PID, port) from the _contextual state_ (logs, history, config). The system must preserve context even when the runtime is gone.
+**Consequences**: Requires persistent storage for logs and history, not just in-memory state.
+
+## 034. Dashboard as Workspace
+
+**Context**: The dashboard was treated as a passive monitor.
+**Decision**: The dashboard is the primary _workspace_ for development. It must support active control (restart, stop) and organization (grouping, filtering).
+**Consequences**: Drives the requirements for Phase 24 (Ergonomics) and Phase 25 (Constellations).
+
+## 035. Advanced Proxying Strategy
+
+**Context**: Simple port mapping is insufficient for modern apps (microservices, H2/H3).
+**Decision**: `locald` will support path-based routing (`/api` -> Service A) and modern protocols (HTTP/2, HTTP/3) to provide a production-grade networking layer.
+**Consequences**: Will require a significant upgrade to the proxy implementation in a future phase.
+
+## 036. Project Registry: Centralized Tracking
+
+**Context**: The user needs to manage multiple projects and know which ones are active or "pinned" for auto-start.
+**Decision**: Implement a centralized `registry.json` in the user's data directory. This file tracks known projects, their paths, and their pinned status. It serves as the source of truth for multi-project management commands.
+**Status**: Accepted.
+
+## 037. Sandbox Environments: Explicit Isolation
+
+**Context**: Developers and AI agents need to test `locald` itself without corrupting the main user environment or leaking state.
+**Decision**: Implement a `--sandbox <NAME>` flag that isolates `XDG_*` directories and the IPC socket. Enforce strict safety by panicking if `LOCALD_SOCKET` is set without the sandbox flag.
+**Status**: Accepted.
+
+## 045. Shim Versioning: Strict Handshake
+
+**Context**: The privileged `locald-shim` is updated separately from the daemon (requires sudo). Mismatches can cause silent failures or security risks.
+**Decision**: Implement a strict version handshake. The daemon embeds the expected shim version and verifies it at runtime by calling `locald-shim --shim-version`. If they don't match, the daemon aborts privileged operations and instructs the user to update.
+**Status**: Accepted.
+
+## 052. Runc Execution Strategy
+
+**Context**: "Native" execution of CNB lifecycles is brittle due to path assumptions. "Rootless" runc fails on strict systems (SELinux).
+**Decision**: Use `locald-shim` (setuid root) to invoke `runc`. This allows creating namespaces/cgroups while mapping the container user back to the host user for file ownership.
+**Status**: Accepted.
+
+**Note**: This describes a historical implementation strategy. It has been superseded by Phase 97 (RFC 0098), which removes the external `runc` dependency and executes OCI bundles via an embedded `libcontainer` runtime in `locald-shim`.
+
+## 053. Service Resolver Abstraction
+
+**Context**: The Proxy was tightly coupled to the ProcessManager, making it hard to test and reason about.
+**Decision**: Introduce a `ServiceResolver` trait to abstract port lookups. The Proxy now depends on `Arc<dyn ServiceResolver>`, allowing for easier testing and future alternative implementations.
+**Status**: Accepted.
+
+## 054. Source of Truth: OCI Config (Axiom 12)
+
+**Context**: Hardcoding paths (like `/cnb/lifecycle`) in the runtime is brittle and violates the contract of the OCI image.
+**Decision**: The OCI Image Config (Env, Entrypoint, Cmd) is the single source of truth. The runtime must extract and respect these values, not guess them.
+**Status**: Accepted.
+
+## 055. Development Loop: Split Lifecycle (Axiom 13)
+
+**Context**: We need fast feedback loops (`locald run`) but also reproducible builds (`locald build`).
+**Decision**: Split the lifecycle into "Build" (Snapshot) and "Run" (Bind Mount).
+
+- **Build**: Creates an immutable OCI image.
+- **Run**: Mounts the source code into the container for live reloading, overlaying the immutable image.
+  **Status**: Accepted.
+
+## 056. Crash Protocol: Black Box Logging (Axiom 4 Update)
+
+**Context**: When `locald` crashes, the error is often lost or opaque ("exit status 51").
+**Decision**: Implement a "Black Box" recorder.
+
+- **Panic Hook**: Catch panics and write stack traces to disk.
+- **Error Boundary**: Catch `Result::Err` at the top level and write context to disk.
+- **Location**: `~/.locald/crashes/crash-TIMESTAMP.log`.
+  **Status**: Accepted.
+
+## 057. Boot Feedback: Progress UI (RFC 0062)
+
+**Context**: `locald up` can take time (building, starting services), leaving the user wondering if it's stuck.
+**Decision**: Implement a rich TUI progress display during boot.
+
+- **Steps**: Show "Building...", "Starting DB...", "Waiting for Health...".
+- **Logs**: Stream logs for failing steps immediately.
+  **Status**: Accepted.
+
+## 058. Auto-Update Trigger: Build Script Watcher
+
+**Context**: `locald up` relies on `LOCALD_BUILD_VERSION` to detect binary changes. By default, Cargo only rebuilds if the binary's source changes, missing changes in dependencies like `locald-core`.
+**Decision**: Update `locald-cli/build.rs` to explicitly watch sibling crate source directories (`../locald-*/src`). This ensures the build version timestamp updates whenever any part of the workspace changes.
+**Status**: Accepted.
+
+## 059. E2E Testing: Rust Harness (RFC 0063)
+
+**Context**: Bash scripts are insufficient for testing complex interactions involving the daemon, shim, and containers.
+**Decision**: Implement a dedicated `locald-e2e` crate using `TestContext` (RAII) for daemon lifecycle management and `assert_cmd` for CLI interaction. This provides a type-safe, robust testing environment.
+**Status**: Accepted.
+
+## 060. Host-First Execution Strategy
+
+**Context**: Defaulting to CNB/Container execution introduces friction and complexity for simple use cases.
+**Decision**: Default to running processes directly on the host ("Host-First"). Make CNB/Container execution an opt-in feature via `[service.build]` or `image`.
+**Status**: Accepted.
+
+## 062. Unified Service Trait (RFC 0079)
+
+**Context**: The `ProcessManager` was becoming a "God Object" with large match statements for every service type (Process, Docker, Postgres). Adding new services was difficult and error-prone.
+**Decision**: Adopt a polymorphic architecture using `ServiceController` (runtime behavior) and `ServiceFactory` (instantiation) traits. This allows new service types to be added as plugins without modifying the core manager.
+**Status**: Accepted.
+
+## 063. Embedded Shim Distribution (RFC 0078)
+
+**Context**: `cargo install` only installs the main binary, leaving the privileged `locald-shim` behind or stale.
+**Decision**: Embed the compiled `locald-shim` binary directly into the `locald` CLI executable at compile time. `locald admin setup` extracts this embedded binary, ensuring version synchronization.
+**Status**: Accepted.
+
+## 064. Runc Setuid Fix (RFC 0077)
+
+**Context**: `runc` failed to run rootless containers when invoked by the setuid `locald-shim` because it detected a mismatch between Real and Effective UIDs.
+**Decision**: Modify `locald-shim` to explicitly promote the Real UID to 0 (root) before executing `runc`. This aligns the process identity, preventing `runc` from dropping privileges prematurely.
+**Status**: Accepted.
+
+**Note**: This decision remains accurate historically, but Phase 97 (RFC 0098) removes the `runc` execution path in favor of `locald-shim bundle run ...` backed by an embedded runtime.
+
+## 065. Dashboard E2E: Glass Box Testing
+
+**Context**: E2E tests need to verify internal state (like SSE connection status) that isn't always visible in the UI or takes time to reflect.
+**Decision**: Instrument the frontend to expose internal state via DOM attributes (e.g., `data-sse-connected`). This allows tests to deterministically wait for state changes without relying on fragile UI polling or arbitrary sleeps.
+**Status**: Accepted.
+
+## 066. Cybernetic Dashboard Paradigm (RFC 0087)
+
+**Context**: The previous dashboard design ("Admin Panel") used a Grid + Drawer layout that forced context switching and had low information density. It failed to provide "ambient awareness" of the system.
+**Decision**: Adopt the "Cybernetic Workspace" paradigm.
+
+- **The Rack**: High-density sidebar with "Eyebrow Tags" and Sparklines.
+- **The Stream**: Unified log stream for ambient awareness.
+- **The Deck**: Tiling window manager for focused interaction (pinned terminals).
+  **Status**: Accepted.
+
+## 067. Ephemeral Containers (RFC 0076)
+
+**Context**: We need to validate our OCI stack and support ad-hoc tasks that require isolation.
+**Decision**: Implement `locald container run` as a distinct command group for raw container execution.
+
+- **Pipeline**: Pull -> Unpack -> Generate Spec -> Run (via Shim).
+- **Policy**: Ad-hoc containers are for _tasks_, not _services_. Persistent services belong in `locald.toml`.
+  **Status**: Accepted.
+
+## 068. Container Execution: Fat Shim via `libcontainer` (RFC 0098)
+
+**Context**: External `runc` introduces distribution and orchestration fragility (PATH/setup requirements, opaque stderr parsing, and a complex process tree). We already rely on a privileged `locald-shim` for secure privilege separation.
+
+**Decision**: Execute OCI bundles via an embedded `libcontainer` runtime inside `locald-shim`.
+
+- **Stable command surface**: `locald-shim bundle run --bundle <PATH> --id <ID>`
+- **Back-compat**: Keep `locald-shim bundle <bundle-path>` supported as a legacy form.
+
+**Consequences**:
+
+- Container execution no longer requires `runc` to be installed.
+- The setuid shim is larger and has a larger security surface area; keep dependencies updated and continue to minimize shim responsibilities (caller generates bundle, shim executes it).
+  **Status**: Accepted.

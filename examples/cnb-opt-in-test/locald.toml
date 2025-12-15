@@ -1,0 +1,6 @@
+[project]
+name = "cnb-opt-in-test"
+
+[services.web]
+command = "npm start"
+build = { builder = "heroku/builder:22" }

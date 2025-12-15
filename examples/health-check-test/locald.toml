@@ -1,0 +1,16 @@
+[project]
+name = "health-check-test"
+
+[services.http-web]
+command = "python3 -m http.server 8081"
+port = 8081
+# health_check = "curl localhost:8081"
+[services.http-web.health_check]
+type = "http"
+path = "/"
+
+[services.cmd-worker]
+type = "worker"
+command = "sh -c \"sleep 5; touch ready; sleep 1000\""
+health_check = "test -f ready"
+

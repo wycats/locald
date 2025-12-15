@@ -1,0 +1,134 @@
+---
+title: Your First Workspace
+description: From zero to a fully managed local development platform.
+---
+
+Welcome to the **Cybernetic Workspace**.
+
+`locald` is different from tools you might have used before. It doesn't just run commands; it creates a **Platform** on your local machine. When you use `locald`, you are building a structured, observable, and robust environment for your applications—giving you the **immediacy** of local development with the **rigor** of a cloud deployment.
+
+In this guide, we'll walk through the lifecycle of a `locald` project, from a single command to a fully managed workspace.
+
+## 1. Installation
+
+Currently, `locald` is built from source.
+
+```bash
+git clone https://github.com/ykatz/dotlocal.git
+cd dotlocal
+cargo install --path locald-cli
+```
+
+## 2. The "Hello World" Moment
+
+Let's start with something ephemeral. You don't need a config file to see `locald` in action.
+
+```bash
+locald run 'python3 -m http.server $PORT'
+```
+
+**What just happened?**
+
+1.  **Port Management**: `locald` assigned a random, free port to your process and injected it as `$PORT`. No more "Address already in use" errors.
+2.  **Process Supervision**: Your command isn't just running in your shell; it's being supervised by the `locald` daemon.
+3.  **Graceful Shutdown**: Press `Ctrl+C`. `locald` catches the signal and shuts down the process cleanly.
+
+It will ask if you want to save this service. For now, say **No**. We'll build a real project next.
+
+## 3. Defining the Source of Truth
+
+A `locald` project starts with a `locald.toml` file. This file is the **Source of Truth** for your workspace. It defines _what_ should run, not _how_ to run it (that's the platform's job).
+
+Create a directory for your new project:
+
+```bash
+mkdir my-app
+cd my-app
+```
+
+Initialize the workspace:
+
+```bash
+locald init
+```
+
+Follow the prompts. For this example, let's create a simple web service:
+
+- **Project Name**: `my-app`
+- **Service Name**: `web`
+- **Command**: `python3 -m http.server $PORT`
+
+This generates a `locald.toml` that looks like this:
+
+```toml
+[project]
+name = "my-app"
+
+[services]
+web = { command = "python3 -m http.server $PORT" }
+```
+
+## 4. Bringing Up the Workspace
+
+Now, let's bring the platform to life.
+
+```bash
+locald up
+```
+
+**The Shift to "Daemon-First"**
+Unlike `npm start` or `make run`, `locald up` doesn't block your terminal with application logs. It contacts the background daemon and tells it: _"Ensure the state defined in `locald.toml` matches reality."_
+
+- The daemon starts your `web` service.
+- It captures `stdout` and `stderr`.
+- It keeps the service running (restarting it if it crashes).
+
+Your terminal is now free. You can close it, open a new one, or walk away. Your workspace persists.
+
+## 5. The Cybernetic Dashboard
+
+To see what's happening, we need observability. `locald` provides a rich web interface that acts as your cockpit.
+
+Visit **[http://locald.localhost](http://locald.localhost)**.
+
+This is your **Workspace**.
+
+- **The Rack** (Left): See all your running services at a glance.
+- **The Stream** (Center): A unified timeline of logs from all services.
+- **Control**: Start, stop, or restart services with a click.
+
+_Tip: You can also use `locald monitor` for a terminal-based version of this dashboard._
+
+## 6. Production Parity (HTTPS)
+
+Accessing `localhost:34123` feels like a toy. Production uses HTTPS and real domains. `locald` brings that to your machine.
+
+First, perform a **one-time system setup** to trust the local Certificate Authority:
+
+```bash
+sudo locald admin setup
+```
+
+Now, update your `locald.toml` to claim a domain:
+
+```toml
+[project]
+name = "my-app"
+domain = "my-app.localhost"  # <--- Add this line
+
+[services]
+web = { command = "python3 -m http.server $PORT" }
+```
+
+Run `locald up` again to apply the changes.
+
+Open **[https://my-app.localhost](https://my-app.localhost)**.
+You now have a secure, domain-bound service running locally, mirroring a production environment.
+
+## 7. Next Steps
+
+You have a running workspace. Where to next?
+
+- **[Add a Database](/guides/managed-services/)**: Need Postgres or Redis? Don't install them; let `locald` manage them.
+- **[Configure Your Stack](/guides/project-setup/)**: See examples for Node, Python, Go, and Rust.
+- **[Understand the Philosophy](/concepts/philosophy/)**: Learn _why_ we built it this way.

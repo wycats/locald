@@ -1,0 +1,9 @@
+[project]
+name = "ansi-test"
+
+[services.ansi-log]
+command = "bash"
+args = [
+  "-c",
+  "while true; do echo -e '\\x1b[31mRed Log\\x1b[0m'; echo -e '\\x1b[32mGreen Log\\x1b[0m'; sleep 1; done",
+]

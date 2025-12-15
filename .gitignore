@@ -4,5 +4,29 @@ target/
 node_modules/
 dist/
 .env
+.tmp
 locald-docs/node_modules/
 locald-docs/dist/
+locald-server/src/assets/docs/
+
+.locald/
+buildpacks/
+layers/
+
+# CNB / Buildpack artifacts
+cache/
+platform/
+lifecycle/
+oci-output/
+builder-data/
+
+# Temporary test directories
+manual-test/
+tmp-container-test/
+.references/
+.plans/
+references/
+
+# locald-vmm build/runtime artifacts
+locald-vmm/assets/
+

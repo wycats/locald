@@ -1,0 +1,18 @@
+[project]
+name = "color-system"
+domain = "color-system.localhost"
+
+[services.web]
+type = "exec"
+command = "python3 -m http.server $PORT --directory web"
+port = 3000
+
+[services.api]
+type = "exec"
+command = "python3 api/server.py"
+port = 4000
+depends_on = ["db"]
+
+[services.db]
+type = "postgres"
+version = "15"

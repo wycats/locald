@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+
+# The "Universal Fix" Script
+# Axiom: If CI complains, this script must silence it.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+echo "🔧 Running Universal Fix..."
+
+# 1. Rust (Core, Server, CLI, etc.)
+echo "🦀 Fixing Rust (fmt & clippy)..."
+cargo fmt
+cargo clippy --workspace --fix --allow-dirty --allow-staged -- -D warnings
+
+# 2. Dashboard (Frontend)
+if [ -d "locald-dashboard" ]; then
+    echo "🖥️  Fixing Dashboard (Prettier & ESLint)..."
+    (
+        cd locald-dashboard
+        # Ensure dependencies are installed so we have the right tools
+        if [ ! -d "node_modules" ]; then
+            echo "   Installing dashboard dependencies..."
+            pnpm install --silent
+        fi
+        npm run format
+        npx eslint . --fix
+    )
+fi
+
+# 3. Documentation (Astro)
+# Currently no auto-fixers configured, but placeholder for future.
+# if [ -d "locald-docs" ]; then ... fi
+
+echo "✅ All fixes applied."

@@ -1,0 +1,238 @@
+---
+title: Common Patterns
+description: Copy-pasteable configurations for common languages and frameworks.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+This guide provides standard `locald.toml` configurations for popular languages and frameworks.
+
+## Basic Web Server
+
+Most web frameworks allow you to configure the listening port via an environment variable. `locald` injects the `PORT` variable automatically.
+
+<Tabs syncKey="lang">
+  <TabItem label="Node.js" icon="node">
+    **Framework**: Express / Fastify / Next.js
+
+    Ensure your app listens on `process.env.PORT`.
+
+    ```toml
+    [project]
+    name = "my-node-app"
+
+    [services.web]
+    command = "npm run dev"
+    # Or: command = "node server.js"
+
+    [services.web.env]
+    NODE_ENV = "development"
+    ```
+
+    **Code Example (Express):**
+    ```javascript
+    const port = process.env.PORT || 3000;
+    app.listen(port, () => {
+      console.log(`Listening on port ${port}`);
+    });
+    ```
+
+  </TabItem>
+
+  <TabItem label="Python" icon="python">
+    **Framework**: Flask / Django / FastAPI
+
+    Ensure your app listens on `os.environ.get("PORT")`.
+
+    ```toml
+    [project]
+    name = "my-python-app"
+
+    [services.web]
+    # Flask
+    command = "flask run --port $PORT"
+    # FastAPI (uvicorn)
+    # command = "uvicorn main:app --port $PORT"
+    ```
+
+    **Code Example (Flask):**
+    ```python
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(port=port)
+    ```
+
+  </TabItem>
+
+  <TabItem label="Go" icon="golang">
+    **Framework**: Gin / Echo / Stdlib
+
+    Ensure your app listens on `os.Getenv("PORT")`.
+
+    ```toml
+    [project]
+    name = "my-go-app"
+
+    [services.web]
+    command = "go run main.go"
+    ```
+
+    **Code Example (Gin):**
+    ```go
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8080"
+    }
+    r.Run(":" + port)
+    ```
+
+  </TabItem>
+
+  <TabItem label="Rust" icon="rust">
+    **Framework**: Axum / Actix
+
+    Ensure your app listens on `std::env::var("PORT")`.
+
+    ```toml
+    [project]
+    name = "my-rust-app"
+
+    [services.web]
+    command = "cargo run"
+    ```
+
+    **Code Example (Axum):**
+    ```rust
+    let port = std::env::var("PORT").unwrap_or("3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+    ```
+
+  </TabItem>
+</Tabs>
+
+## Frontend Development (SPA)
+
+For Single Page Applications (React, Vue, Svelte), you typically run a dev server (Vite, Webpack).
+
+<Tabs syncKey="lang">
+  <TabItem label="Node.js" icon="node">
+    **Tool**: Vite
+
+    Vite needs to know which port to listen on.
+
+    ```toml
+    [project]
+    name = "my-frontend"
+
+    [services.app]
+    # Vite supports the PORT env var out of the box
+    command = "npm run dev"
+    ```
+
+    *Note: If your tool doesn't support `PORT`, you might need to pass it as a flag, e.g., `npm start -- --port $PORT`.*
+
+  </TabItem>
+</Tabs>
+
+## Database Integration
+
+You can easily add a managed Postgres database and connect your app to it.
+
+1.  **Add the database:**
+
+    ```bash
+    locald service add postgres db
+    ```
+
+2.  **Inject the URL:**
+    Update your `locald.toml` to inject the connection string.
+
+<Tabs syncKey="lang">
+  <TabItem label="Node.js" icon="node">
+    **Config:**
+    ```toml
+    [services.web.env]
+    DATABASE_URL = "${services.db.url}"
+    ```
+
+    **Code (pg/Prisma):**
+    ```javascript
+    const { Client } = require('pg');
+    const client = new Client({
+      connectionString: process.env.DATABASE_URL,
+    });
+    await client.connect();
+    ```
+
+  </TabItem>
+
+  <TabItem label="Python" icon="python">
+    **Config:**
+    ```toml
+    [services.web.env]
+    DATABASE_URL = "${services.db.url}"
+    ```
+
+    **Code (SQLAlchemy/Psycopg):**
+    ```python
+    import os
+    from sqlalchemy import create_engine
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+    ```
+
+  </TabItem>
+
+  <TabItem label="Go" icon="golang">
+    **Config:**
+    ```toml
+    [services.web.env]
+    DATABASE_URL = "${services.db.url}"
+    ```
+
+    **Code (pgx/database/sql):**
+    ```go
+    import (
+        "database/sql"
+        "os"
+        _ "github.com/lib/pq"
+    )
+
+    func main() {
+        connStr := os.Getenv("DATABASE_URL")
+        db, err := sql.Open("postgres", connStr)
+        // ...
+    }
+    ```
+
+  </TabItem>
+
+  <TabItem label="Rust" icon="rust">
+    **Config:**
+    ```toml
+    [services.web.env]
+    DATABASE_URL = "${services.db.url}"
+    ```
+
+    **Code (sqlx):**
+    ```rust
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = PgPoolOptions::new()
+        .connect(&url)
+        .await?;
+    ```
+
+  </TabItem>
+</Tabs>
+
+## Background Workers
+
+Workers often don't need a port, but they need access to the same environment variables (like DB credentials).
+
+```toml
+[services.worker]
+command = "npm run worker"
+# locald will still assign a PORT, but you can ignore it.
+```

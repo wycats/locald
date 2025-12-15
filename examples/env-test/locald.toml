@@ -1,0 +1,5 @@
+[project]
+name = "env-test"
+
+[services.printer]
+command = "echo FOO=$FOO BAZ=$BAZ"

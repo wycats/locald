@@ -1,6 +1,7 @@
 [project]
 name = "shop-frontend"
-domain = "shop.local"
+domain = "shop.localhost"
 
 [services.web]
 command = "python3 -m http.server $PORT"
+
