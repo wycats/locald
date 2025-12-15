@@ -1,3 +1,5 @@
+//! Minimal example for parsing an `exec` service config.
+
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 
 fn main() {

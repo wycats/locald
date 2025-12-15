@@ -4,9 +4,10 @@
   "version": "0.0.1",
   "packageManager": "pnpm@10.25.0",
   "scripts": {
-    "dev": "pnpm sync-manifesto && astro dev",
-    "start": "pnpm sync-manifesto && astro dev",
-    "build": "pnpm sync-manifesto && astro build",
+    "dev": "pnpm sync-axioms && pnpm sync-manifesto && astro dev",
+    "start": "pnpm sync-axioms && pnpm sync-manifesto && astro dev",
+    "build": "pnpm sync-axioms && pnpm sync-manifesto && astro build",
+    "sync-axioms": "node ./scripts/sync-axioms.mjs",
     "sync-manifesto": "./scripts/sync-manifesto.sh",
     "preview": "astro preview",
     "astro": "astro"

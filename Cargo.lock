@@ -2367,6 +2367,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "caps",
+ "clap",
  "libc",
  "libcontainer",
  "listeners",

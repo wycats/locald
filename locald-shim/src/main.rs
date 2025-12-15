@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
 use listeners::get_all;
 use nix::unistd::{Gid, Uid};
 use std::env;
@@ -10,49 +11,94 @@ use std::path::{Path, PathBuf};
 // const PR_CAP_AMBIENT_RAISE: i32 = 2;
 // const CAP_NET_BIND_SERVICE: u64 = 10;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(name = "locald-shim")]
+#[command(about = "Privileged helper for locald (internal protocol)")]
+#[command(disable_help_subcommand = true)]
+struct Cli {
+    /// Print the shim version and exit.
+    #[arg(long = "shim-version", action = clap::ArgAction::SetTrue)]
+    shim_version: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Execute an OCI bundle.
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
+
+    /// Bind a privileged TCP port and pass the FD over a unix socket.
+    Bind(BindArgs),
+
+    /// Privileged admin operations.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+
+    /// Debug helpers.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BundleCommand {
+    /// Run a bundle as the container init process.
+    Run(BundleRunArgs),
+}
+
+#[derive(Debug, Args)]
 struct BundleRunArgs {
+    /// Path to OCI bundle directory.
+    #[arg(long)]
     bundle: PathBuf,
+
+    /// Container identifier.
+    #[arg(long)]
     id: String,
 }
 
-fn parse_bundle_run_args(args: &[String]) -> Result<BundleRunArgs> {
-    // Supported forms:
-    // - bundle run --bundle <PATH> --id <ID>
-    // - bundle run <PATH> <ID>
-    let mut bundle: Option<PathBuf> = None;
-    let mut id: Option<String> = None;
+#[derive(Debug, Args)]
+struct BindArgs {
+    port: u16,
+    socket_path: PathBuf,
+}
 
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "--bundle" | "-b" => {
-                let value = args.get(idx + 1).context("Missing value for --bundle")?;
-                bundle = Some(PathBuf::from(value));
-                idx += 2;
-            }
-            "--id" | "-i" => {
-                let value = args.get(idx + 1).context("Missing value for --id")?;
-                id = Some(value.clone());
-                idx += 2;
-            }
-            other => {
-                // Positional fallback
-                if bundle.is_none() {
-                    bundle = Some(PathBuf::from(other));
-                } else if id.is_none() {
-                    id = Some(other.to_string());
-                } else {
-                    return Err(anyhow::anyhow!("Unexpected argument: {other}"));
-                }
-                idx += 1;
-            }
-        }
-    }
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    /// Synchronize /etc/hosts section for locald domains.
+    SyncHosts(AdminSyncHostsArgs),
 
-    let bundle = bundle.context("Missing bundle path")?;
-    let id = id.context("Missing container id")?;
-    Ok(BundleRunArgs { bundle, id })
+    /// Recursively remove a locald-managed directory.
+    Cleanup(AdminCleanupArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdminSyncHostsArgs {
+    domains: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct AdminCleanupArgs {
+    path: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Show processes listening on a port (requires root for full visibility).
+    Port(DebugPortArgs),
+}
+
+#[derive(Debug, Args)]
+struct DebugPortArgs {
+    port: u16,
 }
 
 fn run_bundle(bundle_path: &Path, container_id: &str) -> Result<i32> {
@@ -232,43 +278,16 @@ fn main() -> Result<()> {
         env::remove_var("LOCALD_SHIM_ACTIVE");
     }
 
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        eprintln!("Usage: locald-shim <command> [args...]");
-        std::process::exit(1);
-    }
-
-    // Check for version flag
-    if args[0] == "--shim-version" {
+    let cli = Cli::parse();
+    if cli.shim_version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    let command = &args[0];
-
-    // Handle bundle command (Fat Shim)
-    if command == "bundle" {
-        let bundle_args = &args[1..];
-
-        // Legacy form (still supported): `locald-shim bundle <bundle-path>`
-        if let Some(bundle_path) = bundle_args.first().filter(|s| s.as_str() != "run") {
-            let id = format!("locald-bootstrap-{}", std::process::id());
-            let code = run_bundle(Path::new(bundle_path), &id)?;
-            std::process::exit(code);
-        }
-
-        // New form: `locald-shim bundle run --bundle <path> --id <id>`
-        if bundle_args.first().map(|s| s.as_str()) == Some("run") {
-            let parsed =
-                parse_bundle_run_args(&bundle_args[1..]).context("Invalid bundle run arguments")?;
-            let code = run_bundle(&parsed.bundle, &parsed.id)?;
-            std::process::exit(code);
-        }
-
-        return Err(anyhow::anyhow!(
-            "Usage: locald-shim bundle run --bundle <PATH> --id <ID>"
-        ));
-    }
+    let Some(command) = cli.command else {
+        // clap will print help for `--help`; this is just for the no-args case.
+        anyhow::bail!("Missing command. Run with --help for usage.");
+    };
 
     // Determine the real user (who ran the shim)
     let _real_uid = Uid::current();
@@ -285,112 +304,69 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    if command == "server" && args.get(1).map(|s| s.as_str()) == Some("start") {
-        eprintln!("The 'server start' command is deprecated in locald-shim.");
-        eprintln!("Please use 'bind' for privileged port binding.");
-        std::process::exit(1);
-    } else if command == "bind" {
-        // Case 5: Bind - Run as root
-        // Bind a privileged port and pass the FD to locald via Unix socket.
-        // Usage: locald-shim bind <port> <socket_path>
+    match command {
+        Commands::Bundle {
+            command: BundleCommand::Run(args),
+        } => {
+            let code = run_bundle(&args.bundle, &args.id)?;
+            std::process::exit(code);
+        }
+        Commands::Bind(args) => {
+            // Case: Bind - Run as root
+            // Bind a privileged port and pass the FD to locald via Unix socket.
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", args.port))
+                .with_context(|| format!("Failed to bind to port {}", args.port))?;
 
-        let port_str = args.get(1).context("Missing port argument")?;
-        let socket_path = args.get(2).context("Missing socket path argument")?;
+            let stream =
+                std::os::unix::net::UnixStream::connect(&args.socket_path).with_context(|| {
+                    format!("Failed to connect to socket {}", args.socket_path.display())
+                })?;
 
-        let port: u16 = port_str.parse().context("Invalid port number")?;
+            let fd = listener.as_raw_fd();
+            let stream_fd = stream.as_raw_fd();
 
-        // 1. Bind the TCP port
-        let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-            .context(format!("Failed to bind to port {}", port))?;
+            let iov = [std::io::IoSlice::new(b"fd")];
+            let cmsgs = [nix::sys::socket::ControlMessage::ScmRights(&[fd])];
 
-        // 2. Connect to the Unix socket
-        let stream = std::os::unix::net::UnixStream::connect(socket_path)
-            .context(format!("Failed to connect to socket {}", socket_path))?;
+            nix::sys::socket::sendmsg::<nix::sys::socket::UnixAddr>(
+                stream_fd,
+                &iov,
+                &cmsgs,
+                nix::sys::socket::MsgFlags::empty(),
+                None,
+            )
+            .context("Failed to send file descriptor")?;
 
-        // 3. Send the FD
-        let fd = listener.as_raw_fd();
-        let stream_fd = stream.as_raw_fd();
+            Ok(())
+        }
+        Commands::Admin {
+            command: AdminCommand::SyncHosts(args),
+        } => {
+            update_hosts_file(&args.domains)?;
+            Ok(())
+        }
+        Commands::Admin {
+            command: AdminCommand::Cleanup(args),
+        } => {
+            let path = &args.path;
 
-        let iov = [std::io::IoSlice::new(b"fd")];
-        let cmsgs = [nix::sys::socket::ControlMessage::ScmRights(&[fd])];
-
-        nix::sys::socket::sendmsg::<nix::sys::socket::UnixAddr>(
-            stream_fd,
-            &iov,
-            &cmsgs,
-            nix::sys::socket::MsgFlags::empty(),
-            None,
-        )
-        .context("Failed to send file descriptor")?;
-
-        Ok(())
-    } else if command == "admin" && args.get(1).map(|s| s.as_str()) == Some("sync-hosts") {
-        // Case 3: Admin Sync Hosts - Run as root
-        // We stay as root to modify /etc/hosts.
-        // New behavior: Expect domains as subsequent arguments
-        let domains: Vec<String> = args.iter().skip(2).cloned().collect();
-        update_hosts_file(&domains)?;
-        Ok(())
-    } else if command == "admin" && args.get(1).map(|s| s.as_str()) == Some("cleanup") {
-        // Case 4: Admin Cleanup - Run as root
-        // Recursively remove a directory.
-        // Security: Must be absolute and contain ".locald" to prevent arbitrary deletion.
-
-        if let Some(path_str) = args.get(2) {
-            let path = std::path::Path::new(path_str);
-
-            // 1. Must be absolute
             if !path.is_absolute() {
-                return Err(anyhow::anyhow!("Cleanup path must be absolute"));
+                anyhow::bail!("Cleanup path must be absolute");
             }
 
-            // 2. Must contain ".locald"
-            // This is a heuristic to ensure we are only deleting locald-managed files.
-            // We check if any component is exactly ".locald".
             let is_safe = path.components().any(|c| c.as_os_str() == ".locald");
-
             if !is_safe {
-                return Err(anyhow::anyhow!(
-                    "Cleanup path must be within a .locald directory"
-                ));
+                anyhow::bail!("Cleanup path must be within a .locald directory");
             }
-
-            // 3. No traversal (implied by components check, but good to be sure)
-            // Rust's Path components handle ".." as Normal components if they are present in the string,
-            // but canonicalization would resolve them. We don't canonicalize here because the path might not exist fully?
-            // Actually, remove_dir_all requires the path to exist.
-            // If we just check for ".locald" component, that's reasonably safe against accidental deletion of /etc.
-            // e.g. /etc/.locald/foo is technically allowed by this rule, but user can't create /etc/.locald.
 
             std::fs::remove_dir_all(path).context("Failed to remove directory")?;
             Ok(())
-        } else {
-            Err(anyhow::anyhow!("Missing path for cleanup"))
         }
-    } else if command == "debug" {
-        // Case 2: Debug - Run as root
-        // We stay as root and execute the logic directly.
-        // We do NOT exec locald here, to prevent privilege escalation.
-
-        if args.get(1).map(|s| s.as_str()) == Some("port") {
-            if let Some(port_str) = args.get(2) {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    check_port(port)?;
-                    Ok(())
-                } else {
-                    eprintln!("Invalid port number: {}", port_str);
-                    std::process::exit(1);
-                }
-            } else {
-                eprintln!("Usage: locald debug port <port>");
-                std::process::exit(1);
-            }
-        } else {
-            eprintln!("Unknown debug command");
-            std::process::exit(1);
+        Commands::Debug {
+            command: DebugCommand::Port(args),
+        } => {
+            check_port(args.port)?;
+            Ok(())
         }
-    } else {
-        eprintln!("Unknown command: {}", command);
-        std::process::exit(1);
     }
 }

@@ -27,13 +27,13 @@ This cleanup is also explicitly aimed at removing “false confidence” artifac
 ### 3.1 Success Criteria
 
 1. A repository “front door” exists at the root (README) with:
-	- What `locald` is
-	- Where to start reading
-	- The canonical CI-equivalent local validation commands
+   - What `locald` is
+   - Where to start reading
+   - The canonical CI-equivalent local validation commands
 2. Comments about safety/lints are accurate (no contradictions like “no panics” while allowing `unwrap`).
 3. Repo scripts follow the operational constraints documented in `AGENTS.md`:
-	- sandboxed daemon operations
-	- no `kill`/`pkill` usage
+   - sandboxed daemon operations
+   - no `kill`/`pkill` usage
 4. CI remains green (and local instructions reproduce CI behavior).
 
 ### 3.2 Non-Goals
@@ -47,19 +47,19 @@ This cleanup is also explicitly aimed at removing “false confidence” artifac
 #### A. “Front Door” for Reviewers
 
 1. Add a root-level README.
-	- Provide a 90-second overview and a “start here” map (CLI/server/core/shim/dashboard/docs).
+   - Provide a 90-second overview and a “start here” map (CLI/server/core/shim/dashboard/docs).
 2. Provide a single canonical “validate like CI” section.
-	- Primary: run the exact CI-aligned scripts/commands (see Validation).
+   - Primary: run the exact CI-aligned scripts/commands (see Validation).
 3. Document the privileged shim requirement in one obvious place.
 
 #### B. Validation Should Match CI
 
 1. Make it explicit that CI is the contract and local validation should reproduce it.
 2. Ensure local scripts do not drift from `.github/workflows/ci.yml`.
-	- Prefer keeping `scripts/ci-rust-checks-local.sh` aligned with CI (it already states this intent).
+   - Prefer keeping `scripts/ci-rust-checks-local.sh` aligned with CI (it already states this intent).
 3. Decide what `scripts/check` is:
-	- Option 1: make it CI-equivalent.
-	- Option 2: make it a fast developer sanity check, and rename it to avoid implying CI equivalence.
+   - Option 1: make it CI-equivalent.
+   - Option 2: make it a fast developer sanity check, and rename it to avoid implying CI equivalence.
 
 Current mismatch inventory:
 
@@ -73,32 +73,32 @@ Current mismatch inventory:
 1. Any script that starts a daemon uses `--sandbox=<name>`.
 2. Failure paths do not use `kill`; use `locald server shutdown --sandbox=<name>` and `wait`.
 3. Use a consistent sandbox naming scheme:
-	- `--sandbox=prepush` for pre-push tooling
-	- `--sandbox=ci` for CI
-	- `--sandbox=check` for local “scripts/check”
+   - `--sandbox=prepush` for pre-push tooling
+   - `--sandbox=ci` for CI
+   - `--sandbox=check` for local “scripts/check”
 
 #### D. Lint Policy & Comment Accuracy
 
 The cleanup pass should specifically address contradictions that undermine trust.
 
 1. Align lint declarations and their comments.
-	- Example: `locald-server/src/lib.rs` currently has:
-	  - `#![allow(clippy::unwrap_used)] // Force error propagation (no panics)`
-	  - This is contradictory and should be corrected.
+   - Example: `locald-server/src/lib.rs` currently has:
+     - `#![allow(clippy::unwrap_used)] // Force error propagation (no panics)`
+     - This is contradictory and should be corrected.
 2. Reduce crate-level `allow(...)` usage where possible.
-	- Prefer narrow scope allowances with a reason and a tracking reference.
+   - Prefer narrow scope allowances with a reason and a tracking reference.
 3. Ensure “ban println” policies match actual code expectations.
-	- If a crate uses CLI-style stdout printing intentionally, don’t label it as banned.
+   - If a crate uses CLI-style stdout printing intentionally, don’t label it as banned.
 
 #### E. Panic/unwrap/expect Audit Policy
 
 We should be explicit about where `unwrap/expect` is acceptable.
 
 1. Define a tiered policy:
-	- **Tier 1 (Production paths):** prefer error propagation; avoid `unwrap/expect`.
-	- **Tier 2 (Build scripts / tooling):** `expect` is acceptable with precise messages.
-	- **Tier 3 (Tests/examples):** `unwrap/expect` is acceptable.
-	- **Tier 4 (Experimental crates):** may allow more, but should be labeled as such.
+   - **Tier 1 (Production paths):** prefer error propagation; avoid `unwrap/expect`.
+   - **Tier 2 (Build scripts / tooling):** `expect` is acceptable with precise messages.
+   - **Tier 3 (Tests/examples):** `unwrap/expect` is acceptable.
+   - **Tier 4 (Experimental crates):** may allow more, but should be labeled as such.
 2. Use a mechanical audit to track remaining instances.
 
 Initial hotspots (non-exhaustive examples):
@@ -115,11 +115,11 @@ Initial hotspots (non-exhaustive examples):
 #### G. Documentation Hygiene That Impacts Review
 
 1. Root README points at the most useful deep references:
-	- `docs/manual/architecture/`
-	- `docs/manual/features/`
-	- “how to run CI locally”
+   - `docs/manual/architecture/`
+   - `docs/manual/features/`
+   - “how to run CI locally”
 2. Verify rustdoc metadata URLs are intentional and not stale branch references.
-	- If they must be URLs, prefer a stable branch (e.g. default branch) or a stable asset location.
+   - If they must be URLs, prefer a stable branch (e.g. default branch) or a stable asset location.
 
 #### H. “AI-smell” Prevention Guardrails (Process)
 

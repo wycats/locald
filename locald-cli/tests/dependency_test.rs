@@ -1,3 +1,5 @@
+//! Integration test: dependency injection via `${services.*}` interpolation.
+
 use std::process::{Child, Command};
 use std::time::Duration;
 use tokio::time::sleep;

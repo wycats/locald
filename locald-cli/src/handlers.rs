@@ -473,21 +473,15 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
 
                         // Try to escalate via shim
-                        if let Ok(Some(shim_path)) = locald_utils::shim::find() {
-                            // Check if shim is setuid
-                            if let Ok(metadata) = std::fs::metadata(&shim_path) {
-                                use std::os::unix::fs::MetadataExt;
-                                if (metadata.mode() & 0o4000) != 0 {
-                                    // Exec shim
-                                    use std::os::unix::process::CommandExt;
-                                    let err = std::process::Command::new(&shim_path)
-                                        .arg("admin")
-                                        .arg("sync-hosts")
-                                        .args(&domain_list)
-                                        .exec();
-                                    eprintln!("Failed to exec shim: {err}");
-                                }
-                            }
+                        if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
+                            // Exec shim
+                            use std::os::unix::process::CommandExt;
+                            let err = std::process::Command::new(&shim_path)
+                                .arg("admin")
+                                .arg("sync-hosts")
+                                .args(&domain_list)
+                                .exec();
+                            eprintln!("Failed to exec shim: {err}");
                         }
 
                         anyhow::bail!(

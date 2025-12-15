@@ -56,15 +56,30 @@ pub fn is_privileged(shim_path: &Path) -> Result<bool> {
 ///
 /// Returns an error if shim discovery fails or if filesystem metadata cannot be read.
 pub fn find_privileged() -> Result<Option<PathBuf>> {
-    let Some(path) = find()? else {
-        return Ok(None);
-    };
+    // Prefer a privileged shim next to the current executable.
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(dir) = exe_path.parent()
+    {
+        let sibling = dir.join("locald-shim");
+        if sibling.exists() {
+            debug!("Found shim sibling candidate: {:?}", sibling);
+            if is_privileged(&sibling)? {
+                return Ok(Some(sibling));
+            }
+        }
 
-    if is_privileged(&path)? {
-        Ok(Some(path))
-    } else {
-        Ok(None)
+        // Useful for cargo test where exe is in deps/.
+        if let Some(parent) = dir.parent() {
+            let candidate = parent.join("locald-shim");
+            if candidate.exists() {
+                debug!("Found shim parent candidate: {:?}", candidate);
+                if is_privileged(&candidate)? {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
     }
+    Ok(None)
 }
 
 /// Create a `tokio::process::Command` preconfigured to invoke `locald-shim`.

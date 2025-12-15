@@ -1,3 +1,5 @@
+//! Optional (ignored) integration test for the Postgres service type.
+
 use sqlx::postgres::PgPoolOptions;
 use std::process::{Child, Command};
 use std::time::Duration;
