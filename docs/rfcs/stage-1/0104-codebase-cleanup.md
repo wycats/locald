@@ -4,8 +4,12 @@ stage: 3
 feature: Engineering Excellence
 ---
 
-
 # RFC 0104: Codebase Cleanup
+
+## Status
+
+- **Status**: Implemented (Stage 3)
+- **Shipped**: Merged via PR #5 (2025-12-15)
 
 ## 1. Summary
 
@@ -65,8 +69,8 @@ This cleanup is also explicitly aimed at removing “false confidence” artifac
 Current mismatch inventory:
 
 - `scripts/check`:
-  - Historically drifted from CI (notably running dashboard `pnpm check` instead of `pnpm build`).
-  - Target direction: treat CI as the contract and keep `scripts/check` either CI-equivalent or explicitly branded as a fast sanity check.
+  - Previously drifted from CI (notably running dashboard `pnpm check` instead of `pnpm build`).
+  - Current direction: treat CI as the contract; `scripts/check` is kept CI-aligned and non-interactive.
 
 #### C. Sandbox & Daemon Lifecycle Consistency
 
@@ -145,8 +149,8 @@ These commands produce an objective inventory that can be used to track progress
 
 Implementation should proceed in small PR-sized steps.
 
-- [ ] Add root README with “Start Here” + CI-equivalent commands.
-- [ ] Decide role of `scripts/check` (CI-equivalent vs fast sanity) and align it accordingly.
+- [x] Add root README with “Start Here” + CI-equivalent commands.
+- [x] Decide role of `scripts/check` (CI-equivalent vs fast sanity) and align it accordingly.
 - [ ] Update scripts that start/stop daemons to always use `--sandbox` and avoid `kill`.
 - [ ] Fix contradictory lint comments (start with `locald-server/src/lib.rs`).
 - [ ] Audit and triage `unwrap/expect` in Tier 1 (production) paths.
@@ -155,8 +159,8 @@ Implementation should proceed in small PR-sized steps.
 
 ## 5. Context Updates (Stage 3)
 
-- [ ] Update `docs/manual/` with a “Contributing / Validation” page that mirrors CI.
-- [ ] Update `docs/agent-context/plan-outline.md` to record completion of this cleanup pass.
+- [x] Update `docs/manual/` with a “Contributing / Validation” page that mirrors CI.
+- [x] Record completion in the project plan (tracked in `docs/agent-context/plan.toml`).
 
 ## 6. Drawbacks
 
@@ -171,11 +175,16 @@ Implementation should proceed in small PR-sized steps.
 ## 8. Unresolved Questions
 
 1. Should `scripts/check` be CI-equivalent, or should we make CI-equivalence explicit via a separate `scripts/ci-local.sh` wrapper?
+   - Current answer: `scripts/check` is CI-aligned and should stay that way.
 2. Should `locald-vmm` be explicitly labeled experimental (or feature-gated) to avoid confusing “production expectations”?
 
 ## 9. Validation (CI Equivalence)
 
 These checks should remain aligned with `.github/workflows/ci.yml`.
+
+One command:
+
+- `./scripts/check`
 
 Rust:
 
