@@ -76,6 +76,9 @@ impl ContainerManager {
                 workdir: None,
             }));
 
+        let cgroup_path =
+            locald_utils::cgroup::maybe_cgroup_path_for_leaf(&format!("adhoc-{container_id}"));
+
         let spec = generate_from_service(
             &service_config,
             &image_config,
@@ -84,6 +87,7 @@ impl ContainerManager {
             gid,
             0, // container uid (root)
             0, // container gid (root)
+            cgroup_path.as_deref(),
         )?;
 
         let config_path = bundle_path.join("config.json");

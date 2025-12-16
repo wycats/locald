@@ -9,6 +9,7 @@ pub struct TestContext {
     pub locald_bin: PathBuf,
     pub daemon_process: Option<Child>,
     pub socket_path: PathBuf,
+    pub sandbox: String,
 }
 
 impl TestContext {
@@ -22,11 +23,23 @@ impl TestContext {
 
         let socket_path = root.path().join("locald.sock");
 
+        let tmp_name = root
+            .path()
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_else(|| "tmp".into());
+        let tmp_name_sanitized: String = tmp_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let sandbox = format!("e2e-{}-{}", std::process::id(), tmp_name_sanitized);
+
         Ok(Self {
             root,
             locald_bin,
             daemon_process: None,
             socket_path,
+            sandbox,
         })
     }
 
@@ -43,6 +56,7 @@ impl TestContext {
             .arg("start")
             .env("LOCALD_SOCKET", &self.socket_path)
             .env("LOCALD_SANDBOX_ACTIVE", "1")
+            .env("LOCALD_SANDBOX_NAME", &self.sandbox)
             // Isolate state for the daemon.
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
@@ -76,6 +90,7 @@ impl TestContext {
             .args(args)
             .env("LOCALD_SOCKET", &self.socket_path)
             .env("LOCALD_SANDBOX_ACTIVE", "1")
+            .env("LOCALD_SANDBOX_NAME", &self.sandbox)
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_STATE_HOME", self.root.path().join("state"))
@@ -128,6 +143,7 @@ impl Drop for TestContext {
                 .arg("shutdown")
                 .env("LOCALD_SOCKET", &self.socket_path)
                 .env("LOCALD_SANDBOX_ACTIVE", "1")
+                .env("LOCALD_SANDBOX_NAME", &self.sandbox)
                 .env("XDG_DATA_HOME", self.root.path().join("data"))
                 .env("XDG_CONFIG_HOME", self.root.path().join("config"))
                 .env("XDG_STATE_HOME", self.root.path().join("state"))

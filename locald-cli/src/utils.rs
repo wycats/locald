@@ -37,6 +37,7 @@ pub fn setup_sandbox(name: &str) -> Result<()> {
         std::env::set_var("XDG_STATE_HOME", &state_dir);
         std::env::set_var("LOCALD_SOCKET", &socket_path);
         std::env::set_var("LOCALD_SANDBOX_ACTIVE", "1");
+        std::env::set_var("LOCALD_SANDBOX_NAME", name);
     }
 
     eprintln!("{} Running in sandbox: {}", style::PACKAGE, name.bold());

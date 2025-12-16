@@ -27,6 +27,7 @@ pub struct ExecController {
     child: Option<StdMutex<Box<dyn Child + Send>>>,
     pty_master: Option<StdMutex<Box<dyn MasterPty + Send>>>,
     container_id: Option<String>,
+    cgroup_path: Option<String>,
     port: Option<u16>,
     log_tx: broadcast::Sender<LogEntry>,
     bundle_dir: Option<PathBuf>,
@@ -65,6 +66,7 @@ impl ExecController {
             child: None,
             pty_master: None,
             container_id: None,
+            cgroup_path: None,
             port,
             log_tx,
             bundle_dir: None,
@@ -85,6 +87,9 @@ impl ServiceController for ExecController {
     }
 
     async fn prepare(&mut self) -> Result<()> {
+        // Phase 99: only set cgroupsPath once the cgroup root exists (admin setup).
+        self.cgroup_path = locald_utils::cgroup::maybe_cgroup_path_for_service(&self.id);
+
         match &self.config {
             ServiceConfig::Typed(TypedServiceConfig::Exec(c)) | ServiceConfig::Legacy(c) => {
                 if let Some(_build_config) = &c.build {
@@ -127,6 +132,7 @@ impl ServiceController for ExecController {
                             self.port,
                             false, // TODO: Pass verbose flag?
                             Some(log_callback),
+                            self.cgroup_path.as_deref(),
                         )
                         .await?;
 
@@ -144,6 +150,7 @@ impl ServiceController for ExecController {
                         &env,
                         self.port,
                         &self.project_root,
+                        self.cgroup_path.as_deref(),
                     )
                     .await?;
                 self.bundle_dir = Some(bundle_dir);
@@ -232,6 +239,45 @@ impl ServiceController for ExecController {
             }
         }
 
+        // Phase 99: after graceful termination, ensure no leaked subprocesses remain by
+        // killing the whole cgroup subtree.
+        if let Some(cgroup_path) = self.cgroup_path.as_deref() {
+            match locald_utils::shim::find_privileged() {
+                Ok(Some(shim_path)) => {
+                    let status = locald_utils::shim::tokio_command(&shim_path)
+                        .arg("admin")
+                        .arg("cgroup")
+                        .arg("kill")
+                        .arg("--path")
+                        .arg(cgroup_path)
+                        .status()
+                        .await;
+
+                    match status {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            warn!(
+                                "Cgroup cleanup failed for {}: locald-shim exited with status {status}",
+                                self.id
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Cgroup cleanup failed for {}: {e}", self.id);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "Skipping cgroup cleanup for {}: privileged locald-shim not configured. Run sudo locald admin setup",
+                        self.id
+                    );
+                }
+                Err(e) => {
+                    warn!("Skipping cgroup cleanup for {}: {e}", self.id);
+                }
+            }
+        }
+
         if let Some(container_id) = &self.container_id {
             if let Err(e) = self.runtime.stop_shim_container(container_id) {
                 warn!("Cleanup warning: {:#}", e);
@@ -280,6 +326,7 @@ impl ServiceController for ExecController {
     fn get_metadata(&self, key: &str) -> Option<String> {
         match key {
             "port" => self.port.map(|p| p.to_string()),
+            "cgroup_path" => self.cgroup_path.clone(),
             _ => None,
         }
     }

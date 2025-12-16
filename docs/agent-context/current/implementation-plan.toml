@@ -2,12 +2,67 @@
 # Implementation Plan
 
 [phase]
-id = "none"
-title = "No active phase"
-rfcs = []
+id = "99"
+title = "Structured Cgroup Hierarchy"
+rfcs = ["0099"]
 
 [plan]
 
+[[plan.changes]]
+name = "Docs: define Phase 99 acceptance"
+type = "docs"
+details = "Align RFC 0099 + manual with current reality and clarify acceptance criteria: when cgroup hierarchy is considered implemented, how sandbox/service names map to cgroup paths, and how stop/restart guarantees cleanup."
+files = ["docs/rfcs/0099-cgroup-hierarchy.md", "docs/manual/architecture/resource-management.md"]
+tests = []
+no_test_reason = "Docs-only change"
+
+[[plan.changes]]
+name = "Sandbox identity for cgroups"
+type = "feat"
+details = "Introduce a stable sandbox identifier available to the daemon (e.g. LOCALD_SANDBOX_NAME) so cgroup paths can use locald-<sandbox>.slice deterministically."
+files = ["locald-cli/src/utils.rs", "locald-utils/src/env.rs", "locald-server/src/config_loader.rs"]
+tests = []
+no_test_reason = "Will be verified in Phase 99 end-to-end"
+
+[[plan.changes]]
+name = "Cgroup path generator"
+type = "feat"
+details = "Implement a small shared utility to compute absolute cgroup v2 paths for a given (sandbox, service). Support Systemd Anchor (/locald.slice/...) and Driver fallback (/locald/...). Ensure names are sanitized."
+files = ["locald-utils/src", "locald-core/src"]
+tests = []
+no_test_reason = "Covered by Phase 99 verification"
+
+[[plan.changes]]
+name = "Wire linux.cgroupsPath into OCI bundles"
+type = "feat"
+details = "Plumb computed cgroup_path into OCI spec generation for all shim-run bundles (CNB containers, container services, locald run). Store cgroup_path as controller metadata for later stop/kill."
+files = ["locald-oci/src/runtime_spec.rs", "locald-server/src/runtime/process.rs", "locald-server/src/container.rs", "locald-server/src/service/exec.rs"]
+tests = []
+no_test_reason = "Covered by Phase 99 verification"
+
+[[plan.changes]]
+name = "Shim: cgroup setup + scorched-earth kill"
+type = "feat"
+details = "Extend locald-shim admin commands to (a) establish delegated cgroup root (systemd slice unit with Delegate=yes; or direct controller enabling) and (b) kill+cleanup a cgroup by path using cgroup.kill (fallback: enumerate cgroup.procs)."
+files = ["locald-shim/src/main.rs"]
+tests = []
+no_test_reason = "Requires privileged Linux environment; verified via manual/e2e"
+
+[[plan.changes]]
+name = "Daemon stop uses cgroup kill"
+type = "fix"
+details = "Update stop/restart to guarantee no leaked subprocesses: after SIGTERM grace, invoke shim cgroup kill for the service leaf (then prune)."
+files = ["locald-server/src/service/exec.rs", "locald-server/src/manager.rs"]
+tests = []
+no_test_reason = "Verified via Phase 99 end-to-end"
+
+[[plan.changes]]
+name = "Verification: cgroup tree + leak checks"
+type = "test"
+details = "Add optional verification: (1) manual instructions for systemd-cgls tree, (2) e2e test gated to Linux+cgroupv2+privileged shim that starts a service that forks and confirms stop removes it."
+files = ["locald-e2e/tests", "docs/manual/architecture/resource-management.md"]
+tests = []
+
 [verification]
-automated = []
+automated = ["Run scripts/verify-phase.sh"]
 manual = []

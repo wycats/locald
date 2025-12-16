@@ -56,6 +56,8 @@ When you modify `locald-shim` source code:
 ```bash
 # Rebuilds and sets up permissions for the debug binary
 sudo target/debug/locald admin setup
+
+This installs/repairs the privileged shim and also configures the cgroup root needed for Phase 99 cgroup lifecycle enforcement.
 ```
 
 ### Agent Protocol
@@ -112,6 +114,17 @@ Allows `locald` to recursively remove directories that contain root-owned files 
     - Path must be absolute.
     - Path must contain `.locald` as a path segment (scoping it to locald-managed directories).
   - It performs `rm -rf` on the target.
+
+### 5. `admin cgroup` (Cgroup Root Setup + Kill)
+
+Allows `locald` to establish the cgroup v2 root used by the “Tree of Life” hierarchy and to reliably kill/prune a service’s entire process tree.
+
+- **Why**: cgroup hierarchy creation and cgroup-wide kill operations require privileged access on most hosts.
+- **Commands**:
+  - `locald-shim admin cgroup setup`
+  - `locald-shim admin cgroup kill --path <absolute-cgroupsPath>`
+
+These commands are invoked indirectly by `sudo locald admin setup` (for setup) and by service stop/restart paths (for kill/prune) when the host is configured.
 
 ## Architecture: The Leaf Node Axiom
 

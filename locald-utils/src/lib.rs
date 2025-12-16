@@ -2,6 +2,8 @@
 
 /// Certificate management utilities.
 pub mod cert;
+/// Cgroup v2 helpers.
+pub mod cgroup;
 /// Port discovery utilities.
 pub mod discovery;
 /// Environment variable utilities.

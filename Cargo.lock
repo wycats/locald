@@ -2283,6 +2283,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "locald-core",
+ "locald-utils",
  "predicates",
  "reqwest",
  "serde",
