@@ -1,8 +1,10 @@
 {
   "name": "dotlocal-tools",
   "private": true,
+  "packageManager": "pnpm@10.25.0",
   "scripts": {
-    "prepare": "lefthook install"
+    "build:assets": "./scripts/build-assets.sh",
+    "test:e2e": "./scripts/test-dashboard-e2e.sh"
   },
   "devDependencies": {
     "lefthook": "^1.0.0"

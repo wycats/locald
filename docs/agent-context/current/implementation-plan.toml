@@ -1,0 +1,13 @@
+# READ-ONLY: Use 'exo' CLI to modify this file.
+# Implementation Plan
+
+[phase]
+id = "none"
+title = "No active phase"
+rfcs = []
+
+[plan]
+
+[verification]
+automated = []
+manual = []

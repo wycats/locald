@@ -1,0 +1,25 @@
+[package]
+name = "locald-shim"
+version = "0.2.2"
+edition.workspace = true
+
+[dependencies]
+nix = { version = "0.30.1", features = [
+  "user",
+  "sched",
+  "process",
+  "socket",
+  "uio",
+  "fs",
+  "mount",
+] }
+caps = "0.5.5"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive", "std"], default-features = false }
+libc = "0.2.178"
+listeners = "0.3.0"
+signal-hook = "0.3.18"
+libcontainer = { version = "0.5.7", default-features = false, features = [
+  "v2",
+  "systemd",
+] }

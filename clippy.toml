@@ -1,0 +1,11 @@
+# Warn if a function gets too complex (forcing componentization)
+cognitive-complexity-threshold = 25
+
+# Ban blocking operations in our Async code
+disallowed-methods = [
+  { path = "std::fs::read_to_string", reason = "BLOCKING I/O: Use tokio::fs::read_to_string" },
+  { path = "std::fs::read", reason = "BLOCKING I/O: Use tokio::fs::read" },
+  { path = "std::fs::write", reason = "BLOCKING I/O: Use tokio::fs::write" },
+  { path = "std::thread::sleep", reason = "BLOCKING: Use tokio::time::sleep" },
+  { path = "std::process::Command::new", reason = "BLOCKING: Use tokio::process::Command (async) or a dedicated wrapper" },
+]

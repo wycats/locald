@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Opt-in build speedups without imposing toolchain requirements on contributors.
+#
+# - Uses sccache if available (RUSTC_WRAPPER)
+# - Uses mold (preferred) or lld if available (via RUSTFLAGS)
+# - Defaults to `cargo build` if no args are provided
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+cargo_cmd=(cargo)
+if [[ $# -gt 0 ]]; then
+  cargo_cmd+=("$@")
+else
+  cargo_cmd+=(build)
+fi
+
+# Enable sccache if installed and not already configured.
+if [[ -z "${RUSTC_WRAPPER:-}" ]] && have sccache; then
+  export RUSTC_WRAPPER=sccache
+fi
+
+# Pick a fast linker if available.
+# We *append* to existing RUSTFLAGS so callers can still override.
+link_arg=""
+if have mold; then
+  link_arg="-C link-arg=-fuse-ld=mold"
+elif have ld.lld || have lld; then
+  link_arg="-C link-arg=-fuse-ld=lld"
+fi
+
+if [[ -n "$link_arg" ]]; then
+  if [[ -n "${RUSTFLAGS:-}" ]]; then
+    export RUSTFLAGS="${RUSTFLAGS} ${link_arg}"
+  else
+    export RUSTFLAGS="$link_arg"
+  fi
+fi
+
+exec "${cargo_cmd[@]}"

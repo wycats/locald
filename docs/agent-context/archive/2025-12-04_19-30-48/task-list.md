@@ -1,0 +1,8 @@
+- [x] **Global Config**
+  - [x] Define `GlobalConfig` struct
+  - [x] Implement `ConfigLoader` with Provenance
+  - [x] Implement `locald config show`
+- [x] **Registry**
+  - [x] Define `Registry` struct & persistence
+  - [x] Implement `locald registry` CLI commands
+  - [x] Integrate Registry with Daemon startup

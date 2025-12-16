@@ -1,32 +1,67 @@
 [package]
 name = "locald-server"
-version = "0.1.0"
-edition = "2024"
+version = "0.1.2"
+edition.workspace = true
+
+[features]
+# Default builds embed and serve the dashboard + docs UI.
+default = ["ui"]
+
+# When enabled, build.rs will ensure frontend assets exist (building them with
+# pnpm if necessary) and embed them into the server binary.
+ui = ["dep:include_dir"]
 
 [dependencies]
 anyhow = "1.0.100"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
 axum = { version = "0.7.5", features = ["ws"] }
+axum-server = { version = "0.7.3", features = ["tls-rustls"] }
 bollard = "0.19.4"
-clap = { version = "4.5.53", features = ["derive"] }
 daemonize = "0.5.0"
 directories = "6.0.0"
+dotenvy = "0.15.7"
 futures-util = "0.3.31"
 http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["full"] }
 hyper-util = { version = "0.1.18", features = ["full"] }
+libc = "0.2.178"
+locald-builder = { version = "0.1.0", path = "../locald-builder" }
 locald-core = { version = "0.1.0", path = "../locald-core" }
+locald-utils = { version = "0.1.0", path = "../locald-utils" }
+locald-oci = { version = "0.1.0", path = "../locald-oci" }
 mime_guess = "2.0.5"
-nix = { version = "0.30.1", features = ["process", "signal", "socket", "user"] }
+nix = { version = "0.30.1", features = [
+  "process",
+  "signal",
+  "socket",
+  "user",
+  "uio",
+] }
+notify = "8.2.0"
+portable-pty = "0.9.0"
 rand = "0.8.5"
-rust-embed = "8.5.0"
+rcgen = "0.14.5"
+regex = "1.12.2"
+reqwest = "0.12.24"
+include_dir = { version = "0.7.4", optional = true }
+rustls = { version = "0.23.35", features = ["ring"] }
+schemars = "1.1.0"
 serde_json = "1.0.145"
 shlex = "1.3.0"
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26.4"
 toml = "0.9.8"
 tower = "0.5.2"
-tower-http = { version = "0.5.2", features = ["fs", "cors"] }
+tower-http = { version = "0.5.2", features = ["fs", "cors", "trace"] }
 tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
+uuid = { version = "1.19.0", features = ["v4"] }
+sysinfo = "0.37.2"
+futures = "0.3.31"
+chrono = "0.4.42"
+tempfile = "3.23.0"
+percent-encoding = "2.3.1"
 
 [lints]
 workspace = true

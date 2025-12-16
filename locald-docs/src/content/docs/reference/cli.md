@@ -1,62 +1,45 @@
 ---
 title: CLI Reference
-description: Complete command reference for the locald CLI.
 ---
 
-The `locald` CLI is the primary interface for interacting with the daemon.
-
-## Usage
-
-```bash
-locald <COMMAND> [ARGS]
-```
+`locald` provides a powerful CLI for managing your development environment.
 
 ## Core Commands
 
-| Command   | Description                                                                                   |
-| :-------- | :-------------------------------------------------------------------------------------------- |
-| `init`    | Interactively creates a `locald.toml` file in the current directory.                          |
-| `server`  | Starts the `locald-server` daemon in the background. Safe to run multiple times (idempotent). |
-| `ping`    | Checks if the daemon is running and reachable via IPC.                                        |
-| `status`  | Lists all currently running services and their status (PID, Port, etc.).                      |
-| `monitor` | Opens a TUI dashboard to view running services in real-time.                                  |
-| `logs`    | Streams logs from running services.                                                           |
+### `locald up`
 
-## Project Commands
+Starts the `locald` daemon and the services defined in your `locald.toml`.
 
-These commands operate on the project defined in the `locald.toml` of the current directory.
+It displays a dynamic progress UI that shows the status of builds and service startups.
 
-| Command | Description                                                 |
-| :------ | :---------------------------------------------------------- |
-| `start` | Registers and starts the services defined in `locald.toml`. |
-| `stop`  | Stops the services defined in `locald.toml`.                |
+- **Building**: Shows build progress for services that require it.
+- **Starting**: Shows health check status.
+- **Ready**: Indicates when services are fully up and running.
 
-## Admin Commands
+If a step fails, the UI will persist the error details for debugging.
 
-These commands require elevated privileges (`sudo`) to modify system configuration.
+### `locald down`
 
-| Command            | Description                                                                                                              |
-| :----------------- | :----------------------------------------------------------------------------------------------------------------------- |
-| `admin setup`      | Grants `cap_net_bind_service` to the `locald-server` binary, allowing it to bind port 80.                                |
-| `admin sync-hosts` | Updates `/etc/hosts` to map project domains (e.g., `app.local`) to `127.0.0.1`. Only touches the `# BEGIN locald` block. |
+Stops all running services and the daemon.
 
-## Examples
+## Ad-Hoc Execution
 
-**Start the server:**
+### `locald try`
+
+Run a command in a temporary, isolated environment. This is useful for trying out tools or running one-off scripts without installing them globally.
 
 ```bash
-locald server
+# Run a python script without installing python
+locald try python:3.9 python my_script.py
 ```
 
-**Start a project:**
+### `locald run`
+
+Run a command within the context of a defined service. This injects the service's environment variables and network context.
 
 ```bash
-cd ~/my-project
-locald start
+# Run a database migration using the 'web' service's environment
+locald run web -- rails db:migrate
 ```
 
-**Check status:**
-
-```bash
-locald status
-```
+Note: This runs the command _locally_ on your machine (as a host process), but with the environment configuration of the service.

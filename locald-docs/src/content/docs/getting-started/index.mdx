@@ -1,0 +1,148 @@
+---
+title: Your First Workspace
+description: From zero to running services with clean URLs.
+---
+
+This tutorial gets you from “nothing running” to a working local service with:
+
+- a free port via `$PORT`
+- a supervised process (auto-restart, logs captured)
+- a stable `*.localhost` URL
+- a dashboard at `http://locald.localhost`
+
+## 1. Installation
+
+Currently, `locald` is built from source.
+
+```bash
+git clone https://github.com/ykatz/dotlocal.git
+cd dotlocal
+cargo install --path locald-cli
+```
+
+## 2. The "Hello World" Moment
+
+Let's start with something ephemeral. You don't need a config file to see `locald` in action.
+
+```bash
+locald run 'python3 -m http.server $PORT'
+```
+
+**What just happened?**
+
+1.  **Port Management**: `locald` assigned a random, free port to your process and injected it as `$PORT`. No more "Address already in use" errors.
+2.  **Process Supervision**: Your command isn’t just running in your shell; it’s supervised by the `locald` daemon.
+3.  **Graceful Shutdown**: Press `Ctrl+C`. `locald` catches the signal and shuts down the process cleanly.
+
+It will ask if you want to save this service. For now, say **No**. We'll build a real project next.
+
+## 3. Defining the Source of Truth
+
+A `locald` project starts with a `locald.toml` file. It defines _what_ should run, not _how_ to run it.
+
+Create a directory for your new project:
+
+```bash
+mkdir my-app
+cd my-app
+```
+
+Initialize the workspace:
+
+```bash
+locald init
+```
+
+Follow the prompts. For this example, let's create a simple web service:
+
+- **Project Name**: `my-app`
+- **Service Name**: `web`
+- **Command**: `python3 -m http.server $PORT`
+
+This generates a `locald.toml` that looks like this:
+
+```toml
+[project]
+name = "my-app"
+
+[services]
+web = { command = "python3 -m http.server $PORT" }
+```
+
+## 4. Bringing Up the Workspace
+
+Now, let's bring the platform to life.
+
+```bash
+locald up
+```
+
+Unlike `npm start` or `make run`, `locald up` doesn’t block your terminal with application logs. It asks the background daemon to make reality match what’s in `locald.toml`.
+
+- The daemon starts your `web` service.
+- It captures `stdout` and `stderr`.
+- It keeps the service running (restarting it if it crashes).
+
+Your terminal is now free. You can close it, open a new one, or walk away. Your workspace persists.
+
+## 5. The Dashboard
+
+To see what's happening, we need observability. `locald` provides a rich web interface that acts as your cockpit.
+
+Visit **[http://locald.localhost](http://locald.localhost)**.
+
+This is your **Workspace**.
+
+<div class="screenshot-wide">
+
+[![Dashboard overview showing the Rack sidebar, Stream timeline, and pinned tiles](/screenshots/dashboard-overview.png)](/screenshots/dashboard-overview.png)
+
+</div>
+
+- **The Rack** (Left): See all your running services at a glance.
+- **The Stream** (Center): A unified timeline of logs from all services.
+- **The Deck**: Pin services into a focused, tiled layout.
+- **System Plane**: Pin `locald` itself (via “System Normal”) to view daemon logs and status.
+- **Control**: Start, stop, or restart services with a click.
+
+<div class="screenshot-wide">
+
+[![System Plane view showing locald pinned as a virtual service](/screenshots/dashboard-system-plane.png)](/screenshots/dashboard-system-plane.png)
+
+</div>
+
+_Tip: You can also use `locald monitor` for a terminal-based version of this dashboard._
+
+## 6. HTTPS (optional)
+
+If you want HTTPS locally (with real-looking domains), `locald` can set that up too.
+
+First, perform a **one-time system setup** to trust the local Certificate Authority:
+
+```bash
+sudo locald admin setup
+```
+
+Now, update your `locald.toml` to claim a domain:
+
+```toml
+[project]
+name = "my-app"
+domain = "my-app.localhost"  # <--- Add this line
+
+[services]
+web = { command = "python3 -m http.server $PORT" }
+```
+
+Run `locald up` again to apply the changes.
+
+Open **[https://my-app.localhost](https://my-app.localhost)**.
+You now have a secure, domain-bound service running locally.
+
+## 7. Next Steps
+
+You have a running workspace. Where to next?
+
+- **[Add a Database](/guides/managed-services/)**: Need Postgres or Redis? Don't install them; let `locald` manage them.
+- **[Configure Your Stack](/guides/project-setup/)**: See examples for Node, Python, Go, and Rust.
+- **[Learn the Dashboard Model](/concepts/workspace/)**: Rack, Stream, Deck, and the System Plane.

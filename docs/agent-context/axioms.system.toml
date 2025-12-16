@@ -1,0 +1,14 @@
+# READ-ONLY: Use 'exo' CLI to modify this file.
+# System Axioms
+
+[[axioms]]
+id = "single-binary-distribution"
+principle = "Ship as a single executable."
+rationale = "A single-binary distribution reduces install friction and eliminates version skew between components."
+implications = ["Prefer embedding/packaging over multi-binary orchestration."]
+
+[[axioms]]
+id = "sandbox-isolation-contract"
+principle = "Sandboxing must isolate state, sockets, and XDG directories."
+rationale = "Isolation is a safety boundary for both developers and automation."
+implications = ["Unsafe global execution should fail fast rather than silently sharing state."]

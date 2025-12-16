@@ -5,7 +5,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use locald_core::{IpcRequest, IpcResponse};
+use locald_core::{IpcRequest, IpcResponse, state::ServiceState};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -56,10 +56,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             let items: Vec<ListItem> = services
                 .iter()
                 .map(|s| {
-                    let status_style = match s.status.as_str() {
-                        "running" => Style::default().fg(Color::Green),
-                        "stopped" => Style::default().fg(Color::Red),
-                        _ => Style::default(),
+                    let status_style = match s.status {
+                        ServiceState::Running => Style::default().fg(Color::Green),
+                        ServiceState::Stopped => Style::default().fg(Color::Red),
+                        ServiceState::Building => Style::default().fg(Color::Blue),
                     };
 
                     let content = format!(

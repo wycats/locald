@@ -1,12 +1,28 @@
 ---
 agent: agent
-description: This prompt is used to prepare the next phase in the phased development workflow.
+description: Prepares the Implementation Plan for the *next* phase after the current phase is finished.
 ---
 
-### Preparation
+### Phase Staging
 
-- The `complete-phase-transition.sh` script will have displayed the contents of `docs/agent-context/future/`. Review this output and the chat history.
-- Propose a high-level outline for the next phase to the user.
-- Once the user has approved the high-level outline, update `${workspaceFolder}/docs/agent-context/current/implementation-plan.md` with the agreed outline. Do not include detailed implementation steps yet.
-- Update `${workspaceFolder}/docs/agent-context/plan-outline.md` to reflect the portion of the outline that will be tackled in the next phase.
-- Update `${workspaceFolder}/docs/agent-context/future/` files to remove any items that will be addressed in the next phase, and add any new ideas or deferred work that arose during the iteration with the user.
+Use this prompt **after** `phase-transition` is complete, but **before** starting the new phase in a new chat.
+
+**Goal**: Set the stage for the next phase so the next agent can hit the ground running.
+
+#### 1. Identify Next Phase
+- Read `docs/agent-context/plan.toml`.
+- Identify the next phase in the sequence.
+
+#### 2. Draft Implementation Plan
+- Create or update `docs/agent-context/current/implementation-plan.toml`.
+- **Goal**: Copy the high-level goal from `plan.toml`.
+- **Proposed Changes**: Draft a high-level outline of changes based on `docs/agent-context/future/ideas.toml` or known requirements.
+- **Verification**: Add a placeholder for verification steps.
+
+#### 3. Clean Up
+- Remove any items from `docs/agent-context/future/` that are now covered by this new plan.
+
+#### 4. Handoff
+- Do **not** start the phase.
+- Do **not** write code.
+- Just leave the `implementation-plan.toml` ready for the next session to review and refine.

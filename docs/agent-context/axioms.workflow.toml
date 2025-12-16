@@ -1,0 +1,38 @@
+# READ-ONLY: Use 'exo' CLI to modify this file.
+# Workflow Axioms
+
+[[axioms]]
+id = "context-is-king"
+principle = "Context is king: docs/agent-context is the source of truth."
+rationale = "To avoid guesswork and drift, every session must start from the project context and update it as work progresses."
+implications = ["Run exo context restore before planning or coding."]
+
+[[axioms]]
+id = "phased-execution"
+principle = "Work in phases: Plan, Implement, Verify."
+rationale = "Separating thinking from execution reduces churn and keeps work reviewable."
+implications = ["Do not write code until the implementation plan is agreed."]
+
+[[axioms]]
+id = "user-in-the-loop"
+principle = "The user is the ultimate arbiter; stop for feedback at critical points."
+rationale = "The project must stay aligned with user intent and quality bars."
+implications = ["Pause for review at plan approval and before finishing a phase."]
+
+[[axioms]]
+id = "sandbox-always"
+principle = "Always use an explicit sandbox for locald commands."
+rationale = "Testing and automation must never pollute or corrupt the user’s real environment."
+implications = ["Use --sandbox=<name> for all locald invocations and tests."]
+
+[[axioms]]
+id = "stable-cwd"
+principle = "Keep a stable working directory in automation and agent work."
+rationale = "Using a fixed CWD prevents subtle path bugs and makes logs reproducible."
+implications = ["Avoid interactive cd; use absolute paths or subshells."]
+
+[[axioms]]
+id = "no-blunt-kill"
+principle = "Prefer graceful lifecycle management over kill/pkill."
+rationale = "Blunt process killing leaves state behind and creates hard-to-debug failure modes."
+implications = ["Use locald shutdown/restart paths instead of kill signals in scripts."]

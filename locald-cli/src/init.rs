@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input};
-use locald_core::config::{LocaldConfig, ProjectConfig, ServiceConfig};
+use locald_core::config::{
+    CommonServiceConfig, ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig,
+    TypedServiceConfig,
+};
 use std::collections::HashMap;
 
 pub fn run() -> Result<()> {
@@ -74,16 +77,20 @@ pub fn run() -> Result<()> {
             Some(workdir)
         };
 
-        let service_config = ServiceConfig {
+        let service_config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
+            common: CommonServiceConfig {
+                port,
+                env: HashMap::new(),
+                depends_on: Vec::new(),
+                health_check: None,
+                stop_signal: None,
+            },
             command: Some(command),
             workdir,
-            env: HashMap::new(),
-            port,
-            depends_on: Vec::new(),
             image: None,
             container_port: None,
-            health_check: None,
-        };
+            build: None,
+        }));
 
         services.insert(service_name, service_config);
 

@@ -1,0 +1,7 @@
+- [x] **Sandbox Implementation**
+  - [x] Add `--sandbox` flag to CLI
+  - [x] Implement `setup_sandbox` logic (XDG paths, Socket path)
+  - [x] Implement Safety Check (`LOCALD_SOCKET` requires `LOCALD_SANDBOX_ACTIVE`)
+- [x] **Documentation & Process**
+  - [x] Update `AGENTS.md`
+  - [x] Update Tests to use Sandbox

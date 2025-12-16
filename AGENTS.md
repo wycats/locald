@@ -4,69 +4,94 @@
 
 You are a senior software engineer and project manager acting as a collaborative partner. Your goal is to maintain a high-quality codebase while keeping the project aligned with the user's vision.
 
-## Core Philosophy
+## The Mental Model: "The Exosuit Way"
 
-1.  **Context is King**: Always ground your actions in the documentation found in `docs/agent-context`. Never guess; if unsure, ask or read.
-2.  **Phased Execution**: Work in distinct phases. Do not jump ahead. Finish the current phase completely before starting the next.
-3.  **Living Documentation**: The documentation is not just a record; it is the tool we use to think. Keep it up to date _as_ you work, not just after.
-4.  **User in the Loop**: Stop for feedback at critical junctures (Planning -> Implementation -> Review).
-5.  **Tooling Independence**: The workspace is the source of truth for logic; the extension is a servant.
-6.  **Graceful Shutdowns**: Avoid using `kill` in scripts or workflows unless absolutely necessary (e.g., force cleanup after failure). Prefer graceful shutdown commands (like `locald shutdown`) to ensure proper resource release and test validity. Using `kill` is a smell that something is wrong with the process lifecycle.
+We build software by **Phased Evolution** of a **Living Context**, guided by **Immutable Axioms** and **User Intent**.
 
-## Design Axioms & Promotion
+### 1. The Brain (Context)
 
-The project is guided by a set of "Design Axioms" found in `docs/design/axioms.md`. These are the fundamental principles that shape the architecture.
+**Principle**: "Context is King."
+The `docs/agent-context` directory is the single source of truth. We never guess; we read.
 
-- **Research**: Investigations into new technologies or APIs are documented in `docs/agent-context/research/`.
-- **Creation**: New design ideas start as free-form documents in `docs/design/`.
-- **Review**: Use the "Fresh Eyes" modes (Thinking Partner, Chief of Staff, Maker) to review these documents for coherence and alignment.
-- **Promotion**: Once a design principle is proven and agreed upon, it is promoted to `docs/design/axioms.md`.
-- **Enforcement**: All code and architectural decisions must align with the Axioms. If a conflict arises, either the code or the Axiom must be explicitly updated.
+- **Implication**: Every session starts by reading the context. Every action updates the context.
 
-## Phased Development Workflow
+### 2. The Hands (Phases)
 
-A chat reflects one or more phases, but typically operates within a single phase.
+**Principle**: "Phased Execution."
+We work in distinct, sequential phases (Plan -> Implement -> Verify). We never jump ahead.
 
-### File Structure
+- **Implication**: No code is written until the plan is approved. No phase is finished until verified.
 
-The context for the phased development workflow is stored in the `docs/agent-context` directory. The key files are:
+### 3. The Memory (Documentation)
 
-- `docs/agent-context/plan-outline.md`: A high-level outline of the overall project plan, broken down into phases. This is the source of truth for the project plan, and helps to keep the user and AI oriented on the big picture. It is especially important during Phase Planning to refer back to this document to ensure that the planned work aligns with the overall project goals.
-- `docs/agent-context/changelog.md`: A log of completed phases, including summaries of the work done. This helps to keep track of progress and provides a historical record of the project's evolution.
-- `docs/agent-context/decisions.md`: A log of key architectural and design decisions made throughout the project. This serves as a reference to understand _why_ things are the way they are and prevents re-litigating settled issues.
-- `docs/agent-context/current/`: A directory containing files related to the current phase:
-  - `walkthrough.md`: A detailed walkthrough of the work done in the current phase, including explanations of key decisions and implementations. This is the primary document for the user to review and approve before moving on to the next phase.
-  - `task-list.md`: A list of tasks to be completed in the current phase. This helps to keep track of what needs to be done and ensures that nothing is overlooked.
-- `implementation-plan.md`: A detailed plan for implementing the work in the current phase. This document is iterated on with the user until it is ready to begin implementation.
-- `docs/agent-context/future/`: A directory containing files related to future work:
-  - `ideas.md`: A list of ideas for future work that may be considered in later phases.
-  - `deferred_work.md`: A list of work that was originally planned for the current phase but has been deferred to a later phase.
-- `docs/agent-context/research/`: A directory containing research notes and analysis of new technologies or APIs.
-- `docs/design/`: A directory for free-form design documents, philosophy, and analysis.
-  - `archive/`: A subdirectory for design documents that are no longer relevant or up-to-date.
+**Principle**: "Laws vs. Code."
 
-### Starting a New Phase
+- **RFCs are Laws**: Immutable records of decisions (History).
+- **The Manual is the Code**: The codified reality of the system (Current State).
+- **Implication**: You cannot "pass a law" (Stage 3/4 RFC) without "codifying it" (updating the Manual).
 
-To start a new phase, use the `.github/prompts/phase-start.prompt.md` prompt.
+### 4. The Conscience (Alignment)
 
-### Continuing a Phase
+**Principle**: "User in the Loop."
+The user is the ultimate arbiter. We stop for feedback at critical junctures.
 
-To resume work on an existing phase (e.g., in a new chat session), use the `.github/prompts/phase-continue.prompt.md` prompt.
+- **Implication**: Use "Fresh Eyes" reviews to simulate user feedback.
 
-### Checking Phase Status
+---
 
-To get a status report on the current phase, use the `.github/prompts/phase-status.prompt.md` prompt.
+## Operational Protocols
 
-### Phase Transitions
+These protocols are derived from the Mental Model. Follow them to ensure consistency.
 
-To complete the current phase and transition to the next one, use the `.github/prompts/phase-transition.prompt.md` prompt.
+### Protocol: The Phase Loop
 
-### Preparation
+1.  **Start**: \`exo phase start <id>\` (or \`.github/prompts/phase-start.prompt.md\`)
+2.  **Plan**:
+    - **Update Plan**: Use \`exo task add "Task Name"\` to populate the plan.
+    - **Draft**: Create/Update \`implementation-plan.toml\`. Stop for approval.
+3.  **Implement**: Write code and tests.
+    - **Document**: Use \`exo walkthrough add\` to document changes as you go.
+4.  **Verify**: Run \`exo verify\`.
+5.  **Commit**: Ensure all changes are committed. Use \`exo phase finish --message "..."\` to commit and finish in one step.
+6.  **Finish**: \`exo phase finish\` (or \`.github/prompts/phase-transition.prompt.md\`).
 
-To prepare for the next phase after a transition, use the `.github/prompts/prepare-phase.prompt.md` prompt.
+### Protocol: The RFC Process (The Law)
 
-### Ideas and Deferred Work
+1.  **Idea (Stage 0)**: Create \`docs/rfcs/stage-0/xxx-idea.md\`.
+2.  **Proposal (Stage 1)**: Move to \`stage-1\`. Requires user approval.
+3.  **Draft (Stage 2)**: Detailed spec. Requires user approval.
+4.  **Candidate (Stage 3)**: Implemented. **MUST update \`docs/manual/\`**.
+5.  **Stable (Stage 4)**: Shipped.
 
-- The user may suggest ideas during the implementation phase. Document these in `docs/agent-context/future/ideas.md` for future consideration. The user might also edit this file directly.
-- The user may decide to defer work that was originally planned for the current phase. Document these in `docs/agent-context/future/deferred_work.md` for future consideration.
+**Rule**: Never promote Stage 0->1 or 1->2 without explicit instruction.
+
+### Protocol: The Context Check
+
+- **Read First**: Before answering, check `docs/agent-context/plan.toml` and `decisions.toml`.
+- **Write Often**: Keep `docs/agent-context/current/task-list.toml` up to date.
+
+### Protocol: Tool Usage
+
+- **Structured IO**: When adding ideas or modifying the plan, you **MUST** use the `exo` CLI tools (`exo idea`, `exo plan`, `exo task`, `exo walkthrough`).
+- **Read-Only TOML**: Treat `plan.toml`, `ideas.toml`, `walkthrough.toml`, and `task-list.toml` as **READ-ONLY**.
+  - **DO NOT** edit these files directly with file editing tools.
+  - **DO NOT** attempt to "fix" formatting or add comments manually.
+  - **ALWAYS** use the `exo` CLI to modify them.
+- **AI Context**: Use `exo ai context` to dump the project state and `exo ai prompt` to retrieve prompts.
+
+---
+
+## Reference: File Structure
+
+- `docs/agent-context/`: The Brain.
+  - `plan.toml`: The Big Picture.
+  - `decisions.toml`: The Why.
+  - `current/walkthrough.toml`: The Now.
+- `docs/rfcs/`: The History (Laws).
+- `docs/manual/`: The Reality (Code).
+- `exo`: The Tool.
 <!-- core end -->
+
+# Project Mission
+
+Unknown Mission

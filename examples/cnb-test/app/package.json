@@ -1,0 +1,11 @@
+{
+  "name": "cnb-test-app",
+  "version": "1.0.0",
+  "packageManager": "pnpm@10.25.0",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}

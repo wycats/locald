@@ -15,35 +15,26 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "=== Archiving Current Context ==="
-TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-ARCHIVE_DIR="docs/agent-context/archive/$TIMESTAMP"
-mkdir -p "$ARCHIVE_DIR"
-cp docs/agent-context/current/* "$ARCHIVE_DIR/" 2>/dev/null
-echo "Context archived to $ARCHIVE_DIR"
+echo "=== Checking RFC Status ==="
+# Check if any RFCs are still in Stage 2
+# Note: rfc-status tool moved to exosuit repo. Using grep for now.
+ACTIVE_RFCS=$(grep -l "^stage: 2" docs/rfcs/*.md 2>/dev/null | wc -l)
 
-echo "=== Emptying Current Context ==="
-# Remove all files in current
-rm -f docs/agent-context/current/*
-# Recreate standard files
-touch docs/agent-context/current/task-list.md
-touch docs/agent-context/current/walkthrough.md
-touch docs/agent-context/current/implementation-plan.md
-echo "Context files emptied and reset."
+if [ "$ACTIVE_RFCS" -gt 0 ]; then
+    echo "Warning: There are still $ACTIVE_RFCS RFCs in Stage 2 (Available)."
+    echo "You should update them to Stage 3 (Recommended) if the work is complete."
+else
+    echo "No active RFCs found. Transition complete."
+fi
 
-echo "=== Future Work Context ==="
-for file in docs/agent-context/future/*; do
-    if [ -f "$file" ]; then
-        echo "--- $file ---"
-        cat "$file"
-        echo ""
-    fi
-done
+echo "=== Future Work Context (Stage 0/1 RFCs) ==="
+# Show the board
+# Note: rfc-status tool moved to exosuit repo. Listing files for now.
+ls docs/rfcs/*.md
 
 echo "========================================================"
 echo "NEXT STEPS:"
-echo "1. Review the future work and current chat context."
-echo "2. Propose a plan for the next phase to the user."
-echo "3. Once agreed, update 'docs/agent-context/current/task-list.md' and 'docs/agent-context/current/implementation-plan.md'."
-echo "4. Prepare to begin the new phase in a new chat session."
+echo "1. Review the future work (Stage 0/1 RFCs)."
+echo "2. Select an RFC to work on, or propose a new one (Stage 0)."
+echo "3. Move the selected RFC to Stage 2 (Available) to begin implementation."
 echo "========================================================"

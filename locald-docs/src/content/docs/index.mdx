@@ -1,38 +1,47 @@
 ---
 title: locald
-description: The local development daemon for the 12-factor era.
+description: Run local services with clean URLs, logs, and a dashboard.
 template: splash
 hero:
-  tagline: Manage local services, ports, and domains with ease.
+  tagline: Start services, see logs, and visit them at *.localhost.
   image:
     file: ../../assets/houston.webp
   actions:
-    - text: Get Started
-      link: /guides/getting-started/
+    - text: Run my first app
+      link: /getting-started/
       icon: right-arrow
       variant: primary
-    - text: Read the Docs
-      link: /concepts/modes/
-      icon: external
+    - text: Configure locald
+      link: /reference/locald-toml/
+      icon: setting
+      variant: secondary
 ---
 
 import { Card, CardGrid } from "@astrojs/starlight/components";
 
-## Why locald?
+## Choose your path
 
 <CardGrid stagger>
-  <Card title="Zero Config Ports" icon="puzzle">
-    Forget `PORT=3000`. `locald` assigns ports dynamically and injects them into
-    your app.
+  <Card title="App Builder" icon="rocket">
+    You want to run an app (and maybe a database), get a stable URL, and keep
+    going without babysitting terminals. [Start here &rarr;](/getting-started/)
   </Card>
-  <Card title="Process Management" icon="rocket">
-    Run your backend, frontend, and workers as background services. No more
-    terminal tab explosion.
+  <Card title="System Tweaker" icon="setting">
+    You want exact knobs: configuration, CLI commands, service types, and
+    execution details. [Reference &rarr;](/reference/locald-toml/)
   </Card>
-  <Card title="Local Domains" icon="magnifier">
-    Access your apps via `app.local` instead of `localhost:45231`.
+  <Card title="Contributor" icon="puzzle">
+    You want to work on locald itself: architecture, security model, and RFCs.
+    [Internals &rarr;](/internals/architecture/)
   </Card>
-  <Card title="Interaction Modes" icon="open-book">
-    Designed for Developers, Operators, and Observers.
+  <Card title="Concepts (optional)" icon="open-book">
+    You want a quick mental model for the dashboard and workflows. [Dashboard
+    model &rarr;](/concepts/workspace/)
   </Card>
 </CardGrid>
+
+<div class="screenshot-wide">
+
+[![Dashboard overview showing the Rack sidebar, Stream timeline, and pinned tiles](/screenshots/dashboard-overview.png)](/screenshots/dashboard-overview.png)
+
+</div>

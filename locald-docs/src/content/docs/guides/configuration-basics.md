@@ -22,12 +22,12 @@ web = { command = "python3 -m http.server $PORT" }
 
 ## Adding a Local Domain
 
-Accessing your app via `localhost:45123` is tedious. You can assign a `.local` domain to make it easier to remember.
+Accessing your app via `localhost:45123` is tedious. You can assign a `.localhost` domain to make it easier to remember.
 
 ```toml
 [project]
 name = "my-website"
-domain = "my-website.local"
+domain = "my-website.localhost"
 
 [services]
 web = { command = "python3 -m http.server $PORT" }
@@ -35,10 +35,10 @@ web = { command = "python3 -m http.server $PORT" }
 
 After adding this, you'll need to run:
 
-1.  `locald stop` and `locald start` to reload the config.
+1.  `locald up` to reload the config.
 2.  `sudo locald admin sync-hosts` to update your `/etc/hosts` file (only needed once per new domain).
 
-Now you can visit `http://my-website.local`!
+Now you can visit `https://my-website.localhost`!
 
 ## Setting Environment Variables
 

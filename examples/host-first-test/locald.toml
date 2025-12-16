@@ -1,0 +1,5 @@
+[project]
+name = "host-first-test"
+
+[services.web]
+command = "./run.sh"

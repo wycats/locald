@@ -1,0 +1,12 @@
+{
+  "name": "CNB Dev Environment",
+  "image": "heroku/heroku:22",
+  "customizations": {
+    "vscode": {
+      "settings": {},
+      "extensions": []
+    }
+  },
+  "postCreateCommand": "./setup.sh && ./run-creator.sh",
+  "remoteUser": "vscode"
+}

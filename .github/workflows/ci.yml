@@ -2,55 +2,19 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["setup-ci-and-linting", "main"]
   pull_request:
-    branches: ["main"]
+    branches: ["setup-ci-and-linting", "main"]
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TERM_PROGRESS_WHEN: always
+  CARGO_TERM_PROGRESS_WIDTH: "80"
 
 jobs:
-  rust-checks:
-    name: Rust Checks
+  web-build:
+    name: Web Build (Dashboard + Docs)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Lint with Clippy
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Run tests and generate coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: false
-
-  docs-build:
-    name: Build Docs
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: locald-docs
     steps:
       - uses: actions/checkout@v4
 
@@ -62,10 +26,246 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 8
+          version: 10
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Build dashboard and docs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pnpm -C locald-dashboard install --frozen-lockfile
+          pnpm -C locald-dashboard build
+
+          pnpm -C locald-docs install --frozen-lockfile
+          pnpm -C locald-docs build
+
+  rust-fmt:
+    name: Rust Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Install dependencies
-        run: pnpm install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Build Astro site
-        run: pnpm build
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  rust-clippy:
+    name: Rust Clippy
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}-${{ github.job }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.job }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Lint with Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  rust-tests-coverage:
+    name: Rust Tests + Coverage
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}-${{ github.job }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.job }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Cache OCI layout blobs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/locald/oci-layout
+          key: oci-layout-${{ runner.os }}-v1
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run tests and generate coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Build + test in distinct steps so we can run `locald admin setup`
+          # after the instrumented `locald` binary is built (to avoid
+          # "locald-shim is outdated" failures).
+          eval "$(cargo llvm-cov show-env --export-prefix --no-cfg-coverage)"
+
+          export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
+          export LLVM_PROFILE_FILE="$CARGO_TARGET_DIR/dotlocal-%p-%m.profraw"
+          export CARGO_LLVM_COV_TARGET_DIR="$CARGO_TARGET_DIR"
+          export CARGO_LLVM_COV_BUILD_DIR="$CARGO_TARGET_DIR"
+
+          cargo build -p locald-cli --all-features
+          cargo build -p locald-shim
+          sudo "$CARGO_TARGET_DIR/debug/locald" admin setup
+
+          # Run most tests first. This may rebuild workspace binaries (including `locald-shim`).
+          cargo test --tests --workspace --all-features --exclude locald-e2e
+
+          # Re-install the privileged shim right before the OCI e2e tests.
+          sudo "$CARGO_TARGET_DIR/debug/locald" admin setup
+
+          cargo test -p locald-e2e --tests --all-features
+
+          # Some tests intentionally kill background daemons, which can leave behind
+          # partially-written (corrupt) .profraw files. Filter them out so
+          # `llvm-profdata merge` can succeed.
+          SYSROOT="$(rustc --print sysroot)"
+          HOST="$(rustc -vV | sed -n 's/^host: //p')"
+          LLVM_PROFDATA="$SYSROOT/lib/rustlib/$HOST/bin/llvm-profdata"
+
+          found=0
+          deleted=0
+
+          while IFS= read -r -d '' profraw; do
+            found=$((found + 1))
+            if ! "$LLVM_PROFDATA" merge -sparse "$profraw" -o /tmp/locald.profdata >/dev/null 2>&1; then
+              echo "Removing corrupt profraw: $profraw"
+              rm -f "$profraw"
+              deleted=$((deleted + 1))
+            fi
+          done < <(find "$CARGO_TARGET_DIR" -type f -name '*.profraw' -print0)
+
+          remaining="$(find "$CARGO_TARGET_DIR" -type f -name '*.profraw' | wc -l | tr -d '[:space:]')"
+          echo "profraw summary: found=$found deleted=$deleted remaining=$remaining"
+
+          if [ "$remaining" = "0" ]; then
+            echo "::error::No valid .profraw files remain; coverage cannot be generated"
+            exit 1
+          fi
+
+          if [ "$deleted" != "0" ]; then
+            echo "::error::Found $deleted corrupt .profraw files; tests should terminate instrumented processes cleanly"
+            exit 1
+          fi
+
+          # Generate the report without re-running tests.
+          cargo llvm-cov --no-run --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false

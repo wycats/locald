@@ -1,0 +1,11 @@
+[project]
+name = "postgres-multi-test"
+domain = "postgres-multi.local"
+
+[services.db1]
+type = "postgres"
+version = "15"
+
+[services.db2]
+type = "postgres"
+version = "15"

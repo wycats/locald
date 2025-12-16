@@ -1,0 +1,2 @@
+web: python3 -m http.server $PORT
+worker: while true; do echo 'working...'; sleep 1; done

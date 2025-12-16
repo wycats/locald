@@ -10,8 +10,9 @@ To ensure `locald` serves its users effectively, we design features and document
 - **Needs**:
   - Simple, "magic" configuration (zero-config where possible).
   - Clear, actionable error messages.
-  - "It just works" local domains (`myapp.local`).
+  - "It just works" local domains (`myapp.localhost`).
   - Easy access to logs when things break.
+  - **Managed Services**: "I need a database (Postgres/Redis) but I don't want to learn Docker or write a Compose file."
 - **Frustrations**:
   - Manually editing `/etc/hosts`.
   - Port conflicts ("Address already in use").
@@ -58,3 +59,22 @@ To ensure `locald` serves its users effectively, we design features and document
   - Architecture Overview (Diagrams, Data Flow).
   - Development Setup Guide.
   - Contribution Guidelines.
+
+## 4. The Platform Engineer ("Terence")
+
+**"I want to build the foundation."**
+
+- **Goal**: Implement core specifications (like CNB) and ensure compliance and interoperability.
+- **Needs**:
+  - Strict adherence to specifications (CNB Platform Spec, OCI).
+  - Low-level control over process execution and signals.
+  - Performance and correctness (no race conditions).
+  - Isolation and security boundaries.
+- **Frustrations**:
+  - Ambiguous specifications.
+  - Tools that "almost" follow the spec but break in edge cases.
+  - Bloated implementations.
+- **Documentation Needs**:
+  - RFCs detailing implementation strategies.
+  - References to external specs.
+  - Compliance testing plans.

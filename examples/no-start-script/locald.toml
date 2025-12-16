@@ -1,0 +1,6 @@
+[project]
+name = "no-start-script"
+
+[services.web]
+# No command specified, relies on CNB default
+[services.web.build]

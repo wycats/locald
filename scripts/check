@@ -1,22 +1,53 @@
 #!/bin/bash
 set -e
 
+SANDBOX="check"
+
+echo "Running rustfmt..."
+cargo fmt --all -- --check
+
 echo "Running cargo build..."
 cargo build
 
+echo "Running clippy..."
+cargo clippy --workspace -- -D warnings
+
+echo "Building dashboard (CI-equivalent)..."
+CI=1 pnpm -C locald-dashboard install --frozen-lockfile
+pnpm -C locald-dashboard build
+
+echo "Running docs checks..."
+node ./scripts/check-docs-sidebar-links.mjs
+node ./scripts/check-docs-screenshots.mjs
+
+echo "Running docs build..."
+CI=1 pnpm -C locald-docs install --frozen-lockfile
+pnpm -C locald-docs build
+
 echo "Running IPC verification..."
-./target/debug/locald-server --foreground &
+export LOCALD_HTTP_PORT=8080
+export LOCALD_HTTPS_PORT=8443
+
+cleanup() {
+    ./target/debug/locald server shutdown --sandbox="$SANDBOX" >/dev/null 2>&1 || true
+    if [ -n "${SERVER_PID:-}" ]; then
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+
+./target/debug/locald server start --sandbox="$SANDBOX" &
 SERVER_PID=$!
 sleep 2
 
-if ./target/debug/locald-cli ping | grep -q "Pong"; then
+if ./target/debug/locald ping --sandbox="$SANDBOX" | grep -q "Pong"; then
     echo "IPC Ping successful"
 else
     echo "IPC Ping failed"
-    kill $SERVER_PID
     exit 1
 fi
 
-./target/debug/locald-cli shutdown
+./target/debug/locald server shutdown --sandbox="$SANDBOX"
 wait $SERVER_PID
 echo "All checks passed."
