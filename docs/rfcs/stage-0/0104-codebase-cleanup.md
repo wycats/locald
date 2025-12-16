@@ -64,9 +64,8 @@ This cleanup is also explicitly aimed at removing “false confidence” artifac
 Current mismatch inventory:
 
 - `scripts/check`:
-  - Uses `kill` on failure (conflicts with `AGENTS.md` process lifecycle constraint).
-  - Starts a daemon without `--sandbox`.
-  - Runs `pnpm check` for dashboard, while CI runs `pnpm build`.
+  - Historically drifted from CI (notably running dashboard `pnpm check` instead of `pnpm build`).
+  - Target direction: treat CI as the contract and keep `scripts/check` either CI-equivalent or explicitly branded as a fast sanity check.
 
 #### C. Sandbox & Daemon Lifecycle Consistency
 
