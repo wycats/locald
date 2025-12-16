@@ -17,6 +17,7 @@ pub fn generate_from_service(
     host_gid: u32,
     container_uid: u32,
     container_gid: u32,
+    cgroup_path: Option<&str>,
 ) -> anyhow::Result<Spec> {
     let config = image_config.config().as_ref();
 
@@ -91,7 +92,7 @@ pub fn generate_from_service(
         container_uid,
         container_gid,
         cwd,
-        None,
+        cgroup_path,
     )
 }
 

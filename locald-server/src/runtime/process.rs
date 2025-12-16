@@ -179,6 +179,7 @@ impl ProcessRuntime {
         port: Option<u16>,
         verbose: bool,
         log_callback: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+        cgroup_path: Option<&str>,
     ) -> Result<PathBuf> {
         info!("Preparing containerized service {}", name);
 
@@ -344,7 +345,7 @@ impl ProcessRuntime {
             0, // Run as root inside container for now
             0,
             None,
-            None,
+            cgroup_path,
         )?;
 
         let bundle_dir = build_dir.clone();
@@ -404,6 +405,7 @@ impl ProcessRuntime {
                 port,
                 verbose,
                 log_callback,
+                None,
             )
             .await?;
 
@@ -411,6 +413,7 @@ impl ProcessRuntime {
         Self::spawn_bundle_process(name, &bundle_dir)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare_container(
         &self,
         name: String,
@@ -419,6 +422,7 @@ impl ProcessRuntime {
         env: &HashMap<String, String>,
         port: Option<u16>,
         path: &Path,
+        cgroup_path: Option<&str>,
     ) -> Result<PathBuf> {
         info!("Preparing container service {} from image {}", name, image);
 
@@ -476,7 +480,7 @@ impl ProcessRuntime {
             0,
             0,
             bundle_info.workdir.as_deref(),
-            None,
+            cgroup_path,
         )?;
 
         let config_path = bundle_dir.join("config.json");
@@ -496,7 +500,7 @@ impl ProcessRuntime {
         path: &Path,
     ) -> Result<ProcessHandle> {
         let bundle_dir = self
-            .prepare_container(name.clone(), image, command, env, port, path)
+            .prepare_container(name.clone(), image, command, env, port, path, None)
             .await?;
         // 4. Run via Shim
         Self::spawn_bundle_process(name, &bundle_dir)

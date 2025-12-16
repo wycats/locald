@@ -1,5 +1,3 @@
-surgical_strikes = []
-
 [[epochs]]
 id = "E1"
 title = "MVP (The Walking Skeleton)"
@@ -1563,3 +1561,17 @@ status = "pending"
 id = "102.4"
 label = "Library Decision: Evaluate adopting `dbs-virtio-devices` (or similar) once the reactor exists."
 status = "pending"
+
+[[epochs.phases]]
+id = "99"
+title = "Structured Cgroup Hierarchy"
+status = "active"
+tasks = []
+rfcs = ["0099"]
+
+[[surgical_strikes]]
+id = "strike-1765875312"
+name = "rfc-0099-cgroups"
+goal = "Implement structured cgroup hierarchy (Tree of Life) per RFC 0099"
+started_at = "2025-12-16T08:55:12.519684071+00:00"
+tasks = []

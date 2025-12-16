@@ -6,6 +6,17 @@
 - **Created**: 2025-12-12
 - **Manual**: `docs/manual/architecture/resource-management.md`
 
+## Implementation Status
+
+As of 2025-12-16, this RFC is **partially implemented**:
+
+- `locald-shim` already executes OCI bundles via embedded `libcontainer`.
+- The OCI generator supports `linux.cgroupsPath`.
+- `locald-server` computes per-sandbox/per-service cgroup paths and wires them into bundle generation (gated on a configured cgroup root).
+- Service stop now triggers a cgroup-level kill (via `locald-shim`) when a cgroup path is available, ensuring cleanup even for double-forked subprocess trees.
+
+Phase 99 implements the remaining pieces.
+
 ## Context
 
 Currently, `locald` delegates cgroup management entirely to the OCI runtime (currently `runc`, moving to `libcontainer`). By default, this results in a "Wild West" scenario where processes are spawned in the user's slice or an ad-hoc scope, with no predictable hierarchy.
@@ -82,6 +93,28 @@ To stop a service, we will no longer rely solely on `SIGTERM` to the PID.
     - **Method**: Write `1` to `cgroup.kill` (Linux 5.13+).
     - **Fallback**: Freeze the cgroup, iterate `cgroup.procs`, kill all PIDs, thaw.
 3.  **Prune**: Remove the empty cgroup directory.
+
+  ## Acceptance Criteria (Phase 99)
+
+  This RFC is considered complete when:
+
+  1. **Root ownership is established**
+    - `locald admin setup` (via the shim) establishes either:
+      - Systemd Anchor: `/sys/fs/cgroup/locald.slice` exists and is delegated, or
+      - Driver fallback: `/sys/fs/cgroup/locald` exists and has controllers enabled for nesting.
+
+  2. **Deterministic hierarchy is applied at runtime**
+    - Every shim-run service is placed in a leaf cgroup at:
+      - Systemd: `/locald.slice/locald-<sandbox>.slice/service-<name>.scope`, or
+      - Driver: `/locald/locald-<sandbox>/service-<name>`.
+    - The computed absolute path is written to `linux.cgroupsPath` in the OCI bundle `config.json`.
+
+  3. **Stop/restart guarantees cleanup**
+    - `locald stop` and `locald restart` use cgroup-level kill semantics after a grace period.
+    - No leaked subprocesses remain after stop/restart, including double-fork cases.
+
+  4. **Verification is documented**
+    - Manual verification instructions exist (e.g. using `systemd-cgls` or filesystem inspection under `/sys/fs/cgroup`).
 
 ## Consequences
 

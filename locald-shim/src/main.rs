@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use listeners::get_all;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use nix::unistd::{Gid, Uid};
 use std::env;
 use std::os::unix::io::AsRawFd;
@@ -78,6 +80,12 @@ enum AdminCommand {
 
     /// Recursively remove a locald-managed directory.
     Cleanup(AdminCleanupArgs),
+
+    /// Cgroup v2 operations.
+    Cgroup {
+        #[command(subcommand)]
+        command: AdminCgroupCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +96,23 @@ struct AdminSyncHostsArgs {
 #[derive(Debug, Args)]
 struct AdminCleanupArgs {
     path: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCgroupCommand {
+    /// Establish the locald cgroup root (systemd Anchor or direct Driver).
+    Setup,
+
+    /// Kill all processes in a locald-managed cgroup and prune it.
+    Kill(AdminCgroupKillArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdminCgroupKillArgs {
+    /// Absolute cgroupsPath (as used by OCI linux.cgroupsPath), e.g.
+    /// /locald.slice/locald-default.slice/service-project-web.scope
+    #[arg(long)]
+    path: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -215,6 +240,211 @@ fn check_port(port: u16) -> Result<()> {
     Ok(())
 }
 
+fn is_systemd_present() -> bool {
+    Path::new("/run/systemd/system").exists()
+}
+
+fn ensure_cgroup2_mount() -> Result<()> {
+    // Heuristic: cgroup v2 exposes these files at the mount root.
+    let root = Path::new("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        anyhow::bail!(
+            "/sys/fs/cgroup does not look like a cgroup v2 mount (missing cgroup.controllers)"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::disallowed_methods)]
+fn write_file(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+#[allow(clippy::disallowed_methods)]
+fn read_to_string(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
+fn enable_controllers(parent: &Path) -> Result<()> {
+    let controllers_path = parent.join("cgroup.controllers");
+    let subtree_control_path = parent.join("cgroup.subtree_control");
+
+    let controllers = read_to_string(&controllers_path)?;
+    let mut tokens = Vec::new();
+    for c in controllers.split_whitespace() {
+        tokens.push(format!("+{c}"));
+    }
+
+    if tokens.is_empty() {
+        // Not necessarily an error, but it means there's nothing to enable.
+        return Ok(());
+    }
+
+    let value = tokens.join(" ");
+    write_file(&subtree_control_path, &value)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn cgroup_setup_systemd() -> Result<()> {
+    // Write /etc/systemd/system/locald.slice
+    let unit_path = Path::new("/etc/systemd/system/locald.slice");
+    let unit = "[Unit]\nDescription=Locald Container Runtime Root\n\n[Slice]\nDelegate=yes\n";
+    write_file(unit_path, unit)?;
+
+    // Reload systemd so the slice exists.
+    let status = std::process::Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()
+        .context("Failed to execute systemctl daemon-reload")?;
+
+    if !status.success() {
+        anyhow::bail!("systemctl daemon-reload failed: {status}");
+    }
+
+    Ok(())
+}
+
+fn cgroup_setup_driver() -> Result<()> {
+    ensure_cgroup2_mount()?;
+    let root = Path::new("/sys/fs/cgroup");
+
+    // Create /sys/fs/cgroup/locald
+    let locald_root = root.join("locald");
+    std::fs::create_dir_all(&locald_root)
+        .with_context(|| format!("Failed to create {}", locald_root.display()))?;
+
+    // Enable controllers for nesting.
+    // 1) Enable at the root
+    enable_controllers(root)?;
+    // 2) Propagate into /locald
+    enable_controllers(&locald_root)?;
+
+    Ok(())
+}
+
+fn cgroup_setup() -> Result<()> {
+    if is_systemd_present() {
+        cgroup_setup_systemd()?;
+
+        // Best-effort check: locald.slice should now exist.
+        let slice = Path::new("/sys/fs/cgroup/locald.slice");
+        if !slice.exists() {
+            anyhow::bail!(
+                "systemd is present but /sys/fs/cgroup/locald.slice did not appear after setup"
+            );
+        }
+        Ok(())
+    } else {
+        cgroup_setup_driver()
+    }
+}
+
+fn validate_locald_cgroup_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("cgroup path must be absolute (start with /)");
+    }
+
+    // Guardrails: only allow locald-managed roots.
+    if !(path.starts_with("/locald.slice/") || path.starts_with("/locald/")) {
+        anyhow::bail!("refusing to operate on non-locald cgroup path: {path}");
+    }
+
+    // Disallow parent traversal.
+    if path.split('/').any(|c| c == "..") {
+        anyhow::bail!("cgroup path must not contain ..");
+    }
+
+    Ok(())
+}
+
+fn cgroup_mount_path(cgroups_path: &str) -> Result<PathBuf> {
+    validate_locald_cgroup_path(cgroups_path)?;
+    let rel = cgroups_path.trim_start_matches('/');
+    Ok(Path::new("/sys/fs/cgroup").join(rel))
+}
+
+fn collect_cgroup_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+
+    out.push(root.to_path_buf());
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("Failed to read cgroup directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(collect_cgroup_dirs(&path)?);
+        }
+    }
+    Ok(out)
+}
+
+fn kill_all_pids_in_dir(dir: &Path) -> Result<()> {
+    let procs_path = dir.join("cgroup.procs");
+    if !procs_path.exists() {
+        return Ok(());
+    }
+
+    let content = read_to_string(&procs_path)?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let pid_i32: i32 = line
+            .parse()
+            .with_context(|| format!("Invalid pid in {}: {line}", procs_path.display()))?;
+
+        // Best-effort kill; ignore ESRCH.
+        match kill(Pid::from_raw(pid_i32), Signal::SIGKILL) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to SIGKILL pid {pid_i32} from {}: {e}",
+                    procs_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
+    ensure_cgroup2_mount()?;
+    let dir = cgroup_mount_path(cgroups_path)?;
+
+    if !dir.exists() {
+        // Already gone, nothing to do.
+        return Ok(());
+    }
+
+    let kill_path = dir.join("cgroup.kill");
+    if kill_path.exists() {
+        // Preferred: kernel-level kill of entire subtree.
+        write_file(&kill_path, "1")?;
+    } else {
+        // Fallback: recursively enumerate cgroup.procs and SIGKILL.
+        // Note: this is a best-effort implementation; it is intentionally conservative and
+        // avoids freezer semantics.
+        let dirs = collect_cgroup_dirs(&dir)?;
+        for d in dirs.into_iter().rev() {
+            kill_all_pids_in_dir(&d)?;
+        }
+    }
+
+    // Best-effort cleanup.
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        return Err(anyhow::anyhow!(e)).context("Failed to remove cgroup directory after kill");
+    }
+
+    Ok(())
+}
+
 use std::fmt::Write;
 
 #[allow(clippy::disallowed_methods)]
@@ -300,7 +530,7 @@ fn main() -> Result<()> {
         // We must NOT exec locald, as that creates a loop if locald called us.
         eprintln!("locald-shim must be setuid root to function.");
         eprintln!("Current effective UID: {}", effective_uid);
-        eprintln!("Please run `sudo locald admin setup` to fix permissions.");
+        eprintln!("Please run sudo locald admin setup to fix permissions.");
         std::process::exit(1);
     }
 
@@ -360,6 +590,24 @@ fn main() -> Result<()> {
             }
 
             std::fs::remove_dir_all(path).context("Failed to remove directory")?;
+            Ok(())
+        }
+        Commands::Admin {
+            command:
+                AdminCommand::Cgroup {
+                    command: AdminCgroupCommand::Setup,
+                },
+        } => {
+            cgroup_setup()?;
+            Ok(())
+        }
+        Commands::Admin {
+            command:
+                AdminCommand::Cgroup {
+                    command: AdminCgroupCommand::Kill(args),
+                },
+        } => {
+            cgroup_kill_and_prune(&args.path)?;
             Ok(())
         }
         Commands::Debug {

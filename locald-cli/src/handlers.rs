@@ -437,6 +437,20 @@ pub fn run(cli: Cli) -> Result<()> {
                         println!("Installing locald-shim to {}", shim_path.display());
                         locald_utils::shim::install(&shim_path, SHIM_BYTES)?;
 
+                        println!("Configuring cgroup root...");
+                        let status = std::process::Command::new(&shim_path)
+                            .arg("admin")
+                            .arg("cgroup")
+                            .arg("setup")
+                            .status()
+                            .context("Failed to run locald-shim admin cgroup setup")?;
+
+                        if !status.success() {
+                            anyhow::bail!(
+                                "locald-shim admin cgroup setup failed with status: {status}"
+                            );
+                        }
+
                         println!("locald-shim installed and configured.");
                         println!("Next: run `locald up`.");
                     }

@@ -1,6 +1,15 @@
 # Architecture: Resource Management (Cgroups)
 
-`locald` implements a strict, hierarchical Cgroup v2 structure to ensure reliable lifecycle management and resource accounting. This structure is known as the **"Tree of Life"**.
+This page describes the cgroup v2 structure that `locald` is implementing to ensure reliable lifecycle management and resource accounting. This structure is known as the **"Tree of Life"**.
+
+## Current Status
+
+As of 2025-12-16, the “Tree of Life” is not yet fully enforced.
+
+- OCI spec generation supports `linux.cgroupsPath`, but most bundle generation paths currently leave it unset.
+- Service stop/restart is primarily PID/signal-based, which cannot guarantee cleanup for double-fork subprocess trees.
+
+Phase 99 (RFC 0099) completes the missing wiring and kill semantics.
 
 ## The Hierarchy
 
@@ -65,9 +74,27 @@ If Systemd is absent (e.g., inside a specialized container or minimal VM), `loca
 The hierarchy allows `locald` to implement a robust kill strategy.
 
 1.  **Graceful**: Send `SIGTERM` to the main PID.
-2.  **Forceful**: If the service persists, `locald` targets the **Cgroup**, not the PID.
+2.  **Forceful**: `locald` targets the **Cgroup**, not just the PID.
     - It writes `1` to `cgroup.kill` (if available).
     - Or it freezes the cgroup, kills all PIDs in `cgroup.procs`, and thaws.
 3.  **Cleanup**: The empty cgroup directories are removed.
 
 This guarantees that no orphaned subprocesses (double-forks) survive a service restart.
+
+## Verification
+
+Verification is easiest on a Linux host with cgroup v2 enabled.
+
+1.  Ensure the cgroup root is configured:
+    - `sudo locald admin setup`
+2.  Start a project that uses container execution (CNB or container services).
+3.  Inspect the hierarchy:
+    - `systemd-cgls` (on systemd hosts): confirm the `locald.slice` subtree contains per-sandbox slices and per-service scopes.
+    - Or inspect `/sys/fs/cgroup` directly.
+4.  Stop/restart the service and confirm cleanup:
+    - Leaf `cgroup.procs` becomes empty.
+    - The leaf directory is pruned after stop.
+
+For debugging, you can also invoke the privileged cleanup directly:
+
+- `sudo locald-shim admin cgroup kill --path /locald.slice/locald-default.slice/service-web.scope`

@@ -10,6 +10,31 @@ pub fn is_sandbox_active() -> bool {
     std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok()
 }
 
+/// Returns the sandbox name, if sandbox mode is active.
+///
+/// This is determined by the `LOCALD_SANDBOX_NAME` environment variable.
+///
+/// Note: sandbox mode can be active without a name (older environments). In that case
+/// this returns `None`.
+pub fn sandbox_name() -> Option<String> {
+    if !is_sandbox_active() {
+        return None;
+    }
+
+    let name = std::env::var("LOCALD_SANDBOX_NAME").ok()?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Returns the sandbox name, defaulting to "default" when not running in sandbox mode.
+pub fn sandbox_name_or_default() -> String {
+    sandbox_name().unwrap_or_else(|| "default".to_string())
+}
+
 /// Returns the user's home directory.
 pub fn get_home_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
