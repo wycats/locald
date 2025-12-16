@@ -1036,7 +1036,10 @@ status = "complete"
 id = "109"
 title = "Host Diagnostics (locald doctor)"
 status = "pending"
-rfcs = ["0109"]
+rfcs = [
+    "0109",
+    "0110",
+]
 
 [[epochs.phases.tasks]]
 id = "109.1"

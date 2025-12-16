@@ -166,6 +166,8 @@ Recommended additions:
 - `strategy`: `{ "cgroup_root": "systemd" | "direct", "why": "..." }`
 - `mode`: `enabled | degraded`
 
+Note: the structured model and fix consolidation should be shared with privileged capability acquisition (see RFC 0110) so doctor and privileged operations cannot drift.
+
 ## 9. Implementation Plan (Stage 2)
 
 - Implement `locald doctor` in `locald-cli`.
@@ -176,6 +178,11 @@ Recommended additions:
 - Render either human text or JSON from a single internal report struct.
 
 Where possible, doctor should reuse the same “capability acquisition” checks used by privileged operations (see companion RFC).
+
+Concretely:
+
+- define a shared readiness report (strategy + mode + problems + consolidated fixes)
+- make `locald doctor` primarily a renderer for that report
 
 ## 10. Drawbacks
 
@@ -190,4 +197,5 @@ Where possible, doctor should reuse the same “capability acquisition” checks
 
 - Should `locald doctor` support an explicit `--fix` mode in the future?
 - Should we expand checks to include deeper kernel/runtime prerequisites for `libcontainer` (namespaces, mount options), or keep the scope intentionally narrow?
+
 
