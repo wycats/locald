@@ -1,8 +1,9 @@
 ---
 title: Codebase Cleanup
-stage: 0
+stage: 3
 feature: Engineering Excellence
 ---
+
 
 # RFC 0104: Codebase Cleanup
 
