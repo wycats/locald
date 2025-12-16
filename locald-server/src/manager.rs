@@ -85,7 +85,7 @@ impl HostSyncer for DefaultHostSyncer {
             Some(path) => path,
             None => {
                 warn!(
-                    "Skipping hosts auto-sync: locald-shim is not installed or not setuid root. Run `sudo locald admin setup` to configure it."
+                    "Skipping hosts auto-sync: locald-shim is not installed or not setuid root. Run sudo locald admin setup to configure it."
                 );
                 return Ok(());
             }
