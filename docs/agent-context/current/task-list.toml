@@ -1,4 +1,38 @@
 # READ-ONLY: Use 'exo' CLI to modify this file.
 # Task List
 
-# No tasks found in the active phase/strike.
+[[tasks]]
+id = "99.1"
+title = "Audit whether proptests found bugs"
+status = "completed"
+
+[[tasks]]
+id = "99.2"
+title = "Add RunAdminSetup drift invariants"
+status = "completed"
+
+[[tasks]]
+id = "99.3"
+title = "Update manual with proptest invariants"
+status = "completed"
+
+[[tasks]]
+id = "99.4"
+title = "Update RFC 0109/0110 with invariants"
+status = "completed"
+
+[[tasks]]
+id = "99.5"
+title = "Refine RFC 0111 fix semantics"
+status = "completed"
+
+[[tasks]]
+id = "99.6"
+title = "Add monotonicity proptest for fix consolidation"
+status = "completed"
+
+[[tasks]]
+id = "99.7"
+title = "Add JSON roundtrip meaning proptest"
+status = "completed"
+

@@ -117,6 +117,14 @@ This enables doctor output to:
 1. summarize problems
 2. show a small number of canonical remediations
 
+Testing guidance:
+
+- Treat fix consolidation as a small spec surface.
+- Prefer property tests for invariants like:
+  - no invented advice (every emitted fix key must originate from a failing problem)
+  - deterministic priority ordering
+  - canonical remediation drift prevention (e.g. `RunAdminSetup` always maps to exactly `sudo locald admin setup`)
+
 ### 6.4 Usability Smoke Test (required)
 
 In addition to on-disk checks (exists/version/owner/setuid), acquisition must include a minimal non-destructive smoke test proving “shim can actually do privileged work”.

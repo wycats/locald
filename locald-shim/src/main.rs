@@ -78,6 +78,9 @@ enum AdminCommand {
     /// Synchronize /etc/hosts section for locald domains.
     SyncHosts(AdminSyncHostsArgs),
 
+    /// Non-destructive self-check proving the shim can run with privileges.
+    SelfCheck,
+
     /// Recursively remove a locald-managed directory.
     Cleanup(AdminCleanupArgs),
 
@@ -595,6 +598,25 @@ fn main() -> Result<()> {
             command: AdminCommand::SyncHosts(args),
         } => {
             update_hosts_file(&args.domains)?;
+            Ok(())
+        }
+        Commands::Admin {
+            command: AdminCommand::SelfCheck,
+        } => {
+            // At this point we already verified effective UID is root.
+            // Perform a minimal, non-destructive probe to catch common “looks installed
+            // but can’t actually do privileged work” failures (e.g. nosuid setuid ignored).
+            //
+            // Keep this intentionally conservative: it should not create long-lived state.
+
+            // If cgroup v2 is available, ensure we can at least read the controller list.
+            let root = Path::new("/sys/fs/cgroup");
+            let controllers = root.join("cgroup.controllers");
+            if controllers.exists() {
+                let _ = read_to_string(&controllers)
+                    .context("Failed to read /sys/fs/cgroup/cgroup.controllers")?;
+            }
+
             Ok(())
         }
         Commands::Admin {

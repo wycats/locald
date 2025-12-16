@@ -93,6 +93,17 @@ pub enum Commands {
     },
     /// Open the dashboard in the default browser
     Dashboard,
+
+    /// Diagnose host readiness for running locald
+    Doctor {
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+
+        /// Include extra diagnostic evidence
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Stop a running service. If no name is provided, stops all services defined in locald.toml in the current directory.
     Stop {
         /// Name of the service to stop

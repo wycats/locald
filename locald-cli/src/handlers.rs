@@ -8,8 +8,8 @@ use crate::cli::{
     RegistryCommands, ServerCommands, ServiceCommands,
 };
 use crate::{
-    build, client, container, debug, history, init, monitor, run, service, style, trust, try_cmd,
-    utils,
+    build, client, container, debug, doctor, history, init, monitor, run, service, style, trust,
+    try_cmd, utils,
 };
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -451,6 +451,14 @@ pub fn run(cli: Cli) -> Result<()> {
                             );
                         }
 
+                        println!("Verifying host readiness...");
+                        let code = doctor::run(false, true)?;
+                        if code != 0 {
+                            anyhow::bail!(
+                                "Admin setup completed, but the host is still not ready. See the report above."
+                            );
+                        }
+
                         println!("locald-shim installed and configured.");
                         println!("Next: run `locald up`.");
                     }
@@ -558,6 +566,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        Commands::Doctor { json, verbose } => {
+            let code = doctor::run(*json, *verbose)?;
+            std::process::exit(code);
+        }
         Commands::Dashboard => {
             utils::ensure_daemon_running()?;
             let url = "http://locald.localhost";

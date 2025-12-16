@@ -23,6 +23,18 @@ We adopt the "No Mocks, Just Fakes" philosophy (RFC 0082).
 - **Dependencies**: Uses Fakes for speed and determinism.
 - **Goal**: Verify logic, edge cases, and state transitions.
 
+### 1.5 Property Tests (Invariants)
+
+We use property-based tests (`proptest`) when we can state correctness as an invariant that must hold across a large input space.
+
+Guidelines:
+
+- Prefer **soundness** properties (e.g. fix consolidation never invents advice).
+- Prefer **normalization/stability** properties (e.g. canonical remediation commands cannot drift).
+- For host-dependent behavior, **extract a pure helper** (string/enum mapping) and proptest the helper; keep IO probing as thin as possible.
+- Avoid filesystem/process IO in property tests; reserve those checks for integration/E2E.
+- When a property test finds a counterexample, capture it (seed/case) and turn it into a small deterministic regression test when practical.
+
 ### 2. End-to-End (E2E) Tests (`locald-e2e`)
 
 - **Scope**: The full `locald` binary and CLI.

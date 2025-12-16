@@ -35,6 +35,7 @@ mod client;
 mod container;
 mod crash;
 mod debug;
+mod doctor;
 mod handlers;
 mod hints;
 mod history;
@@ -73,7 +74,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
         cli.command,
         cli::Commands::Admin {
             command: cli::AdminCommands::Setup
-        }
+        } | cli::Commands::Doctor { .. }
     ) {
         utils::verify_shim();
     }

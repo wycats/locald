@@ -134,9 +134,9 @@ mod tests {
     fn test_safe_join() {
         let root = PathBuf::from("/tmp/root");
 
-        assert_eq!(safe_join(&root, "foo/bar").unwrap(), root.join("foo/bar"));
+        assert_eq!(safe_join(&root, "foo/bar").ok(), Some(root.join("foo/bar")));
 
-        assert_eq!(safe_join(&root, "foo/../bar").unwrap(), root.join("bar"));
+        assert_eq!(safe_join(&root, "foo/../bar").ok(), Some(root.join("bar")));
 
         assert!(safe_join(&root, "../foo").is_err());
         assert!(safe_join(&root, "foo/../../bar").is_err());

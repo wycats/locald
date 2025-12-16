@@ -16,6 +16,8 @@ pub mod ipc;
 pub mod notify;
 /// Postgres management utilities.
 pub mod postgres;
+/// Privileged capability acquisition + readiness reporting.
+pub mod privileged;
 /// Probe utilities.
 pub mod probe;
 /// Process management utilities.

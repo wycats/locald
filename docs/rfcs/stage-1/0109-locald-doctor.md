@@ -184,6 +184,12 @@ Concretely:
 - define a shared readiness report (strategy + mode + problems + consolidated fixes)
 - make `locald doctor` primarily a renderer for that report
 
+Testing notes:
+
+- Prefer invariant-driven tests over brittle output snapshots.
+- Add property tests for fix consolidation soundness and ordering.
+- Add an invariant test preventing canonical remediation drift (e.g. `RunAdminSetup` always maps to exactly `sudo locald admin setup`).
+
 ## 10. Drawbacks
 
 - Adds a new “front door” command that must be kept accurate as features evolve.

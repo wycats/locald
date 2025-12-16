@@ -1,3 +1,5 @@
+surgical_strikes = []
+
 [[epochs]]
 id = "E1"
 title = "MVP (The Walking Skeleton)"
@@ -1617,10 +1619,3 @@ title = "Structured Cgroup Hierarchy"
 status = "active"
 tasks = []
 rfcs = ["0099"]
-
-[[surgical_strikes]]
-id = "strike-1765875312"
-name = "rfc-0099-cgroups"
-goal = "Implement structured cgroup hierarchy (Tree of Life) per RFC 0099"
-started_at = "2025-12-16T08:55:12.519684071+00:00"
-tasks = []

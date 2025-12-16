@@ -1,3 +1,22 @@
 # READ-ONLY: Use 'exo' CLI to modify this file.
 # Walkthrough
 
+[[entries]]
+type = "design"
+description = "RFC 0111: property tests as invariant specs"
+details = "Created Stage-0 RFC 0111 to formalize invariant-driven property testing for doctor/capability readiness and fix consolidation; updated manual testing strategy and RFC 0109/0110 to call out soundness + drift-prevention invariants."
+
+[[entries]]
+type = "test"
+description = "Lock down RunAdminSetup canonical remediation"
+details = "Added a property test in locald-utils ensuring FixKey::RunAdminSetup is dominant when present and its commands list is exactly 'sudo locald admin setup'."
+
+[[entries]]
+type = "test"
+description = "Fix consolidation semantic proptests"
+details = "Added semantic property tests for fix consolidation completeness (no dropped fix keys) and monotonicity under added failing problems, matching precedence-not-subsumption semantics in RFC 0111."
+
+[[entries]]
+type = "test"
+description = "JSON roundtrip preserves doctor semantics"
+details = "Added a property test asserting that DoctorReport JSON roundtrip preserves has_critical_failures() and the sets of fix keys (from failing problems and from fixes)."
