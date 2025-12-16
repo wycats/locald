@@ -4,12 +4,12 @@ This page describes the cgroup v2 structure that `locald` is implementing to ens
 
 ## Current Status
 
-As of 2025-12-16, the “Tree of Life” is not yet fully enforced.
+As of 2025-12-16, Phase 99 (RFC 0099) is implemented, with one important safety gate.
 
-- OCI spec generation supports `linux.cgroupsPath`, but most bundle generation paths currently leave it unset.
-- Service stop/restart is primarily PID/signal-based, which cannot guarantee cleanup for double-fork subprocess trees.
-
-Phase 99 (RFC 0099) completes the missing wiring and kill semantics.
+- `locald` now computes a deterministic cgroup path per sandbox + service and wires it into OCI bundle generation via `linux.cgroupsPath`.
+- `locald` only sets `linux.cgroupsPath` when the expected cgroup root is already established (to avoid creating stray/incorrect trees on partially configured hosts).
+- When a service has an assigned cgroup path, stop/restart uses privileged cgroup kill + prune semantics (via `locald-shim`) to guarantee cleanup.
+- When a service does not have an assigned cgroup path (because the host is not configured), lifecycle falls back to PID/signal-based management.
 
 ## The Hierarchy
 
@@ -85,16 +85,41 @@ This guarantees that no orphaned subprocesses (double-forks) survive a service r
 
 Verification is easiest on a Linux host with cgroup v2 enabled.
 
-1.  Ensure the cgroup root is configured:
+1.  Ensure the shim and cgroup root are configured:
     - `sudo locald admin setup`
 2.  Start a project that uses container execution (CNB or container services).
 3.  Inspect the hierarchy:
     - `systemd-cgls` (on systemd hosts): confirm the `locald.slice` subtree contains per-sandbox slices and per-service scopes.
     - Or inspect `/sys/fs/cgroup` directly.
 4.  Stop/restart the service and confirm cleanup:
-    - Leaf `cgroup.procs` becomes empty.
+    - The leaf `cgroup.procs` becomes empty.
     - The leaf directory is pruned after stop.
 
 For debugging, you can also invoke the privileged cleanup directly:
 
 - `sudo locald-shim admin cgroup kill --path /locald.slice/locald-default.slice/service-web.scope`
+
+## Common Failure Modes
+
+### The shim is missing or not privileged
+
+**Symptoms**:
+
+- You see warnings about the shim not being installed / not setuid root.
+- Container execution and cgroup cleanup do not work reliably.
+
+**Fix**:
+
+- Run `sudo locald admin setup` (this installs the embedded shim next to the `locald` binary and configures the cgroup root).
+
+### The cgroup root is not ready
+
+**Symptoms**:
+
+- Container services start, but cgroup-based cleanup does not engage.
+- You do not see the expected `locald.slice/...` (systemd) or `/sys/fs/cgroup/locald/...` (direct) subtree.
+
+**Fix**:
+
+- Run `sudo locald admin setup`.
+- Confirm your host is using cgroup v2 (`/sys/fs/cgroup/cgroup.controllers` exists).
