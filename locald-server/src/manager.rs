@@ -81,29 +81,34 @@ impl HostSyncer for DefaultHostSyncer {
             return Ok(());
         }
 
-        // Find the locald binary
-        let exe_path = std::env::current_exe()?;
-        // If we are running as "locald-server", we need to find "locald"
-        let locald_path = if exe_path.file_name().and_then(|s| s.to_str()) == Some("locald-server")
-        {
-            exe_path.parent().unwrap().join("locald")
-        } else {
-            exe_path
+        let shim_path = match locald_utils::shim::find_privileged()? {
+            Some(path) => path,
+            None => {
+                warn!(
+                    "Skipping hosts auto-sync: locald-shim is not installed or not setuid root. Run `sudo locald admin setup` to configure it."
+                );
+                return Ok(());
+            }
         };
 
-        info!("Auto-syncing hosts using {}", locald_path.display());
+        info!("Auto-syncing hosts using {}", shim_path.display());
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio::process::Command::new(locald_path)
+            locald_utils::shim::tokio_command(&shim_path)
                 .arg("admin")
                 .arg("sync-hosts")
+                .args(&domains)
                 .output(),
         )
         .await??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                anyhow::bail!("Failed to sync hosts");
+            }
             anyhow::bail!("Failed to sync hosts: {}", stderr);
         }
 
