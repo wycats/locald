@@ -8,7 +8,7 @@
 
 ## Implementation Status
 
-As of 2025-12-16, this RFC is **partially implemented**:
+As of 2025-12-16, this RFC is implemented with a safety gate:
 
 - `locald-shim` already executes OCI bundles via embedded `libcontainer`.
 - The OCI generator supports `linux.cgroupsPath`.
@@ -56,11 +56,12 @@ The hierarchy will mirror the logical structure of `locald`'s runtime:
 
     - The `locald-shim` (via `admin setup`) will detect the environment and establish the root.
     - **Strategy A: The Anchor (Systemd)**:
-      - **Detection**: `/run/systemd/system` exists.
+      - **Detection**: PID 1 is systemd (`/proc/1/comm` is `systemd`).
+        - Note: `/run/systemd/system` is not sufficient on its own (common CI/container false positives).
       - **Action**: Write `/etc/systemd/system/locald.slice` with `Delegate=yes` and reload systemd.
       - **Result**: Systemd grants us `/sys/fs/cgroup/locald.slice` with full delegation.
     - **Strategy B: The Driver (Direct/Fallback)**:
-      - **Detection**: `/run/systemd/system` does NOT exist.
+      - **Detection**: PID 1 is not systemd.
       - **Prerequisite**: `/sys/fs/cgroup` must be a cgroup2 filesystem.
       - **Action**:
         1.  `mkdir -p /sys/fs/cgroup/locald`
@@ -91,7 +92,7 @@ To stop a service, we will no longer rely solely on `SIGTERM` to the PID.
 1.  **Signal**: Send `SIGTERM` to the main PID (as before) to allow graceful shutdown.
 2.  **Kill**: If the service does not exit, or to ensure cleanup, we use the cgroup to kill _everything_.
     - **Method**: Write `1` to `cgroup.kill` (Linux 5.13+).
-    - **Fallback**: Freeze the cgroup, iterate `cgroup.procs`, kill all PIDs, thaw.
+  - **Fallback**: Recursively enumerate `cgroup.procs` in the subtree and `SIGKILL` PIDs (best-effort, intentionally conservative; no freezer semantics).
 3.  **Prune**: Remove the empty cgroup directory.
 
   ## Acceptance Criteria (Phase 99)

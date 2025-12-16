@@ -36,7 +36,9 @@ The hierarchy mirrors the logical structure of `locald`'s runtime, ensuring that
 
 ### Strategy A: The Anchor (Systemd)
 
-If the host uses Systemd (detected by the presence of `/run/systemd/system`), `locald` behaves as a polite tenant.
+If the host uses Systemd (detected by PID 1 being `systemd`, i.e. `/proc/1/comm` is `systemd`), `locald` behaves as a polite tenant.
+
+Note: `/run/systemd/system` is not sufficient on its own; some CI/container environments include systemd files on disk even when systemd is not PID 1.
 
 1.  **Lease**: The `locald-shim` (via `admin setup`) writes a Unit File to `/etc/systemd/system/locald.slice`.
 
@@ -53,7 +55,7 @@ If the host uses Systemd (detected by the presence of `/run/systemd/system`), `l
 
 ### Strategy B: The Driver (Direct/Fallback)
 
-If Systemd is absent (e.g., inside a specialized container or minimal VM), `locald` manages the cgroup filesystem directly.
+If Systemd is absent (PID 1 is not `systemd`), `locald` manages the cgroup filesystem directly.
 
 1.  **Create**: `mkdir -p /sys/fs/cgroup/locald`.
 2.  **Enable Controllers**:
@@ -76,7 +78,7 @@ The hierarchy allows `locald` to implement a robust kill strategy.
 1.  **Graceful**: Send `SIGTERM` to the main PID.
 2.  **Forceful**: `locald` targets the **Cgroup**, not just the PID.
     - It writes `1` to `cgroup.kill` (if available).
-    - Or it freezes the cgroup, kills all PIDs in `cgroup.procs`, and thaws.
+    - Or it recursively enumerates `cgroup.procs` in the subtree and `SIGKILL`s PIDs (best-effort, intentionally conservative; no freezer semantics).
 3.  **Cleanup**: The empty cgroup directories are removed.
 
 This guarantees that no orphaned subprocesses (double-forks) survive a service restart.
