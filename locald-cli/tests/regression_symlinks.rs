@@ -1,3 +1,5 @@
+//! Regression tests for handling symlinks during build context creation.
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::process::Command;

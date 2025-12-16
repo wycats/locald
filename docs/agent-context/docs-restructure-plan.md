@@ -2,6 +2,15 @@
 
 **Goal**: Transform `docs.localhost` from a "random assortment of files" into a coherent, persona-driven documentation site that serves as the single entry point for all users.
 
+## 0. Layering: Manual vs. Docs Site
+
+We maintain two different kinds of documentation, and it is important that they do not drift:
+
+- `docs/manual/` is the operational truth for contributors ("how it works now").
+- `locald-docs/` is the published site (persona-driven and curated), but must remain consistent with the manual on user-facing behavior.
+
+**Constraint**: When an RFC graduates into reality (implemented), the manual is updated first, and the published site is then reconciled for user-facing concepts.
+
 ## 1. Information Architecture (IA) Strategy
 
 We will reorganize the site structure to map directly to our [Personas](../design/personas.md).
@@ -48,6 +57,11 @@ We will reorganize the site structure to map directly to our [Personas](../desig
 ## 2. Content Migration Plan
 
 We need to move content from `docs/manual` and `docs/design` into the `locald-docs` content structure (`src/content/docs`).
+
+**Coherence checklist (high-risk drift areas):**
+
+- Dashboard interaction model: Stream vs Deck pinning, plus the System Plane (pinning the virtual `locald` to open a Daemon Control Center).
+- Domains: use `.localhost` consistently (avoid legacy `.local` except in historical context).
 
 | Source                                          | Destination                    | Notes                                   |
 | :---------------------------------------------- | :----------------------------- | :-------------------------------------- |

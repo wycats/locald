@@ -1,0 +1,1560 @@
+surgical_strikes = []
+
+[[epochs]]
+id = "E1"
+title = "MVP (The Walking Skeleton)"
+status = "complete"
+
+[[epochs.phases]]
+id = "1"
+title = "Scaffolding & Daemon Basics"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "1.1"
+label = "Initialize Rust workspace with `locald-server`, `locald-cli`, `locald-core`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "1.2"
+label = "Implement basic Daemon loop (tokio)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "1.3"
+label = "Implement IPC (Unix Socket) for CLI-Daemon communication."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "1.4"
+label = "Create `locald.toml` configuration struct."
+status = "complete"
+
+[[epochs.phases]]
+id = "2"
+title = "Process Management (The Supervisor)"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "2.1"
+label = "Implement Process Manager (spawn, stop, restart)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "2.2"
+label = "Capture stdout/stderr."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "2.3"
+label = "Handle environment variables (PORT assignment)."
+status = "complete"
+
+[[epochs.phases]]
+id = "3"
+title = "Documentation & Design Refinement"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "3.1"
+label = "Firm up Interaction Modes & Personas."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "3.2"
+label = "Fresh Eyes review of Axioms & Implementation."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "3.3"
+label = "Set up Astro Starlight project."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "3.4"
+label = "Document existing features."
+status = "complete"
+
+[[epochs.phases]]
+id = "4"
+title = "Local DNS & Routing"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "4.1"
+label = "Implement `hostsfile` integration to manage `/etc/hosts`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "4.2"
+label = "Implement basic HTTP proxy (Hyper/Axum) in the daemon."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "4.3"
+label = "Route requests based on Host header."
+status = "complete"
+
+[[epochs.phases]]
+id = "5"
+title = "Web UI & TUI Basics"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "5.1"
+label = "Serve a basic Web UI from the daemon."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "5.2"
+label = "Implement WebSocket for log streaming."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "5.3"
+label = "Add `locald logs` command to CLI."
+status = "complete"
+
+[[epochs]]
+id = "E2"
+title = "Refinement & Robustness"
+status = "complete"
+
+[[epochs.phases]]
+id = "6"
+title = "Persona & Axiom Update"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "6.1"
+label = "Review `docs/design/axioms.md`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "6.2"
+label = "Review `docs/design/modes.md`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "6.3"
+label = "Ensure alignment between code and philosophy."
+status = "complete"
+
+[[epochs.phases]]
+id = "7"
+title = "Persistence & State Recovery"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "7.1"
+label = "Define a state file format (JSON/TOML)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "7.2"
+label = "Implement state saving on change/shutdown."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "7.3"
+label = "Implement state loading on startup."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "7.4"
+label = 'Handle "zombie" processes (processes that are still running but the daemon forgot about them, or vice versa).'
+status = "complete"
+
+[[epochs.phases]]
+id = "8"
+title = "Documentation Overhaul"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "8.1"
+label = "Create `docs/design/personas.md`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "8.2"
+label = "Review and restructure existing documentation."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "8.3"
+label = 'Create "How-to" guides for "Regular Joe".'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "8.4"
+label = 'Create Reference docs for "Power User".'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "8.5"
+label = 'Create Architecture docs for "Contributor".'
+status = "complete"
+
+[[epochs.phases]]
+id = "9"
+title = "CLI Ergonomics & Interactive Mode"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "9.1"
+label = "Better error messages and help text."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "9.2"
+label = "Interactive `locald init` to create `locald.toml`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "9.3"
+label = "`locald monitor` (TUI) using `ratatui`?"
+status = "complete"
+
+[[epochs.phases]]
+id = "10"
+title = "Multi-Service Dependencies"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "10.1"
+label = "Support `depends_on` in `locald.toml`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "10.2"
+label = "Topological sort for startup order."
+status = "complete"
+
+[[epochs.phases]]
+id = "11"
+title = "Documentation & Persona Alignment"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "11.1"
+label = "Fresh Eyes review of existing docs."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "11.2"
+label = 'Flesh out "App Builder" guides (Getting Started, Common Patterns).'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "11.3"
+label = 'Flesh out "Power User" reference (Configuration, CLI).'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "11.4"
+label = 'Flesh out "Contributor" docs (Architecture, Dev Setup).'
+status = "complete"
+
+[[epochs]]
+id = "E3"
+title = "Hybrid Development & Advanced Features"
+status = "pending"
+
+[[epochs.phases]]
+id = "12"
+title = "Docker Integration"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "12.1"
+label = "Support `image` in `locald.toml`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "12.2"
+label = "Manage Docker container lifecycle (run/stop)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "12.3"
+label = "Unified logging for containers."
+status = "complete"
+
+[[epochs.phases]]
+id = "13"
+title = "Smart Health Checks"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "13.1"
+label = "Implement `sd_notify` listener for local processes."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "13.2"
+label = "Integrate Docker native health checks."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "13.3"
+label = "Implement TCP port probing as a fallback."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "13.4"
+label = "Update `depends_on` logic to wait for health."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "13.5"
+label = "Expose health source/status in UI/CLI."
+status = "complete"
+
+[[epochs.phases]]
+id = "14"
+title = "Dogfooding & Polish"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "14.1"
+label = '"Papercut" pass on CLI output (formatting, colors, clarity).'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "14.2"
+label = 'Verify "Zero-Config" flows work as expected in real scenarios.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "14.3"
+label = "Improve error handling for common misconfigurations."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "14.4"
+label = 'Validate the "Happy Path" for a new user.'
+status = "complete"
+
+[[epochs.phases]]
+id = "15"
+title = "Zero-Config SSL & Single Binary"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "15.1"
+label = "Merge Binaries: Refactor `locald-server` into a library and integrate it into `locald` CLI."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "15.2"
+label = 'CLI Workflow: Implement `locald run` (with "add on exit" prompt) and `locald shutdown`.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "15.3"
+label = 'SSL Stack: Implement "Pure Rust" CA generation (`rcgen`) and trust store injection (`ca_injector`).'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "15.4"
+label = "On-the-fly Signing: Implement `ResolvesServerCert` in `rustls` to sign certificates dynamically."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "15.5"
+label = "Default Domain: Switch default domain from `.local` to `.localhost`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "15.6"
+label = "Verification: Verify `.localhost` domain support in browsers."
+status = "complete"
+
+[[epochs.phases]]
+id = "16"
+title = "WebSocket Support"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "16.1"
+label = "Upgrade Handling: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "16.2"
+label = "Connection Bridging: Implement bidirectional copying of data between the upgraded client connection and the backend service."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "16.3"
+label = "Verification: Verify with a WebSocket-heavy example app (e.g., a chat app or Vite HMR)."
+status = "pending"
+
+[[epochs.phases]]
+id = "17"
+title = "Linting & Code Quality"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "17.1"
+label = "Configure Clippy: Add a `clippy.toml` or configure workspace-level lints for stricter checking (e.g., `warn` on `clippy::pedantic` but allow subjective ones)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "17.2"
+label = "Fix Lints: Address existing lint warnings across the codebase."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "17.3"
+label = "CI Enforcement: Ensure CI fails on lint warnings."
+status = "complete"
+
+[[epochs.phases]]
+id = "18"
+title = "Documentation Fresh Eyes"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "18.1"
+label = "Review: Walk through all documentation pages."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "18.2"
+label = "Update: Fix outdated references (e.g., `.local` -> `.localhost`, `locald-server` binary references)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "18.3"
+label = 'Polish: Ensure the "Try -> Save -> Run" workflow is well-documented.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "18.4"
+label = "Architecture: Document the graceful shutdown protocol (SIGTERM -> Timeout -> SIGKILL) in the Contributor/Architecture section."
+status = "complete"
+
+[[epochs.phases]]
+id = "19"
+title = "Self-Hosted Documentation"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "19.1"
+label = "Embedded Assets: Used `rust-embed` to compile the static documentation site into the `locald` binary."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "19.2"
+label = "Build Automation: Added a `build.rs` script to `locald-server` to automatically copy build artifacts from `locald-docs`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "19.3"
+label = "Internal Routing: Updated the internal proxy to route `docs.localhost` requests to the embedded assets."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "19.4"
+label = "Verification: Verified that `http://docs.localhost:8081` serves the documentation correctly."
+status = "complete"
+
+[[epochs.phases]]
+id = "20"
+title = "Builtin Services"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "20.1"
+label = "Integration: Integrate `postgresql_embedded` to download/run Postgres binaries."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "20.2"
+label = 'Service Types: Implement "builtin" service type in `locald.toml`.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "20.3"
+label = "Zero-Config: Auto-assign ports, generate passwords, and manage data volumes."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "20.4"
+label = "Injection: Inject connection strings (e.g., `DATABASE_URL`) into dependent services."
+status = "complete"
+
+[[epochs.phases]]
+id = "21"
+title = "UX Improvements (Web & CLI)"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.1"
+label = "Brainstorming: Discuss ideas and flesh out the plan for UX improvements."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.2"
+label = "Backend: Switch to `portable-pty` for true terminal emulation (colors, progress bars)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.3"
+label = "Web UI: Rebuild dashboard with Svelte 5 + `xterm.js` for a robust, terminal-like experience."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.4"
+label = "Service Controls: Add Start/Stop/Restart/Reset buttons to the dashboard."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.5"
+label = "CLI Tables: Improve `locald status` output for narrow terminals (consider `nu-table` or similar)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.6"
+label = "AI Usability: Implement `locald ai context` and `locald ai schema` for LLM integration."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.7"
+label = "Dashboard Alias: Add `locald.localhost` as an alias for the dashboard (Already implemented)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.8"
+label = "Polish: Ensure the UI is responsive and accessible."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.9"
+label = "Environment Clarity: Show configuration sources in UI/CLI to help debug environment issues."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.10"
+label = "Config Watcher: Auto-restart daemon on global config change."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.11"
+label = "Testability: Ensure Web UI is testable (data-testid) and document how to test apps running under locald."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "21.12"
+label = "Security: Implement `locald-shim` for secure privilege separation."
+status = "complete"
+
+[[epochs.phases]]
+id = "22"
+title = "Fresh Eyes Review & Documentation Update"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "22.1"
+label = 'Review: Conduct a "Fresh Eyes" review of the CLI, Dashboard, and Documentation.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "22.2"
+label = "Docs Update: Update `locald-docs` to reflect Phase 20 (Builtin Services) and Phase 21 (UX Improvements)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "22.3"
+label = "CLI Help: Review and update CLI help text and error messages."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "22.4"
+label = "Dashboard Polish: Address any lingering UI/UX issues found during review."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "22.5"
+label = "Axioms: Review and update `docs/design/axioms.md` if necessary."
+status = "complete"
+
+[[epochs.phases]]
+id = "23"
+title = "Advanced Service Configuration"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "23.1"
+label = 'Service Types: Support `type = "worker"` for non-network services (skip port assignment/probes).'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "23.2"
+label = "Procfile Support: Parse `Procfile` for drop-in compatibility; auto-generate config if missing."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "23.3"
+label = "Port Discovery: Auto-detect ports for services that ignore `$PORT` (scan `/proc/net/tcp` or `lsof`)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "23.4"
+label = "Advanced Health Checks: Add HTTP probe and Command execution health checks (e.g., `check_command` for DB readiness)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "23.5"
+label = "Foreman Parity: Support `.env` file loading, signal handling customization, and concurrency control."
+status = "complete"
+
+[[epochs.phases]]
+id = "24"
+title = "Dashboard Ergonomics & Navigation"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "24.1"
+label = 'Global Controls: "Restart All", "Stop All", and Connection Status.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "24.2"
+label = 'Event Stream: Structured "All Services" view with sanitized logs and lifecycle events.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "24.3"
+label = "Deep Linking: Update URL on service selection (`?service=name`)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "24.4"
+label = "Visual Polish: Traffic light indicators, clickable links, refined layout."
+status = "complete"
+
+[[epochs.phases]]
+id = "25"
+title = "Roadmap & Design Organization"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "25.1"
+label = "Inventory: Audit all files in `docs/design`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "25.2"
+label = "Prioritization: Discuss and rank features/phases with the user."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "25.3"
+label = "Restructure: Organize design docs into a folder structure that mirrors the roadmap (e.g., `docs/design/epoch-3-hybrid/`)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "25.4"
+label = "Plan Update: Update `plan-outline.md` to reflect the agreed priorities."
+status = "complete"
+
+[[epochs.phases]]
+id = "26"
+title = "Configuration & Registry"
+status = "complete"
+rfcs = ["0026"]
+
+[[epochs.phases.tasks]]
+id = "26.1"
+label = "Global Config: Implement `~/.config/locald/config.toml`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "26.2"
+label = 'Registry: Persist known projects and support "Always Up".'
+status = "complete"
+
+[[epochs.phases]]
+id = "27"
+title = "Workspace & Constellations"
+status = "pending"
+rfcs = ["0026"]
+
+[[epochs.phases.tasks]]
+id = "27.1"
+label = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "27.2"
+label = "Cascading Config: Implement config inheritance (Global -> Context -> Project)."
+status = "pending"
+
+[[epochs.phases]]
+id = "28"
+title = "Interactive Terminal & Theming"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "28.1"
+label = "Interactive PTY: Bidirectional terminal interaction in the browser."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "28.2"
+label = "Theming: Light/Dark mode, curated themes."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "28.3"
+label = "Command Palette: Quick actions via `Cmd+K`."
+status = "pending"
+
+[[epochs.phases]]
+id = "29"
+title = "Extensibility & Plugins"
+status = "pending"
+rfcs = ["0028"]
+
+[[epochs.phases.tasks]]
+id = "29.1"
+label = "Plugin Mechanism: Formal system for custom services (e.g., `locald.localhost` as a plugin)."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.2"
+label = "Packaging: Support `locald package /path/to/customizations` to create distributable bundles."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3"
+label = 'Distributions: Allow distribution of "flavored" binaries/configs without recompilation.'
+status = "pending"
+
+[[epochs.phases]]
+id = "30"
+title = "Installation & Update Experience"
+status = "pending"
+rfcs = ["0029"]
+
+[[epochs.phases.tasks]]
+id = "30.1"
+label = "Distribution Channels: Support `cargo binstall` and GitHub Releases."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "30.2"
+label = "Self-Upgrade: Implement `locald selfupgrade` to fetch/apply updates and recycle the server."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "30.3"
+label = "Auto-Updates: Implement opt-in auto-updates via a lightweight HEAD check (e.g., GH Pages)."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "30.4"
+label = "Secure Installation: Design a secure alternative to `curl | sh` (signatures, bootstrap binary)."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "30.5"
+label = "Capability Preservation: Preserve `cap_net_bind_service` across updates (wrapper binary or systemd integration)."
+status = "pending"
+
+[[epochs.phases]]
+id = "31"
+title = "Engineering Excellence"
+status = "pending"
+rfcs = ["0030"]
+
+[[epochs.phases.tasks]]
+id = "31.1"
+label = 'Error Handling: Implement "Human-Readable" error strategy with context and full logging to `/tmp`.'
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "31.2"
+label = "Testing Strategy: Implement `trycmd` for CLI testing and `assert_cmd` for integration tests."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "31.3"
+label = "Tested Docs: Ensure documentation code samples are tested."
+status = "pending"
+
+[[epochs.phases]]
+id = "32"
+title = "Sandbox Environments"
+status = "complete"
+rfcs = ["0031"]
+
+[[epochs.phases.tasks]]
+id = "32.1"
+label = "Sandbox Mode: Implement `locald sandbox` command and `--sandbox` flag."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "32.2"
+label = "Isolation: Ensure sandbox instances use isolated config, data, and socket paths."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "32.3"
+label = "CI Integration: Document and verify usage in CI environments (GitHub Actions)."
+status = "complete"
+
+[[epochs.phases]]
+id = "33"
+title = "Ad-Hoc Execution"
+status = "complete"
+rfcs = ["0032"]
+
+[[epochs.phases.tasks]]
+id = "33.1"
+label = "Draft Mode: Implement `locald try <command>` to experiment with commands and prompt to save."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "33.2"
+label = "Task Mode: Implement `locald run <service> <command>` to run tasks with injected environment variables."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "33.3"
+label = "History & Recall: Track `try` history and implement `locald add last`."
+status = "complete"
+
+[[epochs.phases]]
+id = "35"
+title = "Shim Versioning & Upgrades"
+status = "complete"
+rfcs = ["0045"]
+
+[[epochs.phases.tasks]]
+id = "35.1"
+label = "Shim Self-Reporting: `locald-shim` reports its own version via `--shim-version`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "35.2"
+label = "Build Integration: `locald-cli` embeds the expected shim version at build time."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "35.3"
+label = "Runtime Verification: `locald` verifies the shim version on startup and aborts with a clear error if mismatched."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "35.4"
+label = "User Notification: Instruct users to run `sudo locald admin setup` to update (or auto-fix in interactive mode)."
+status = "complete"
+
+[[epochs.phases]]
+id = "36"
+title = "Hot Reloading & Configuration Watcher"
+status = "pending"
+rfcs = ["0050"]
+
+[[epochs.phases.tasks]]
+id = "36.1"
+label = "Fix Manual Restart: Ensure `locald restart` reloads config from disk."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "36.2"
+label = "Project Config Watcher: Implement a watcher for registered project `locald.toml` files."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "36.3"
+label = "Hot Reload Logic: Wire up the watcher to the service restart logic."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "36.4"
+label = "Debouncing: Add debouncing to the watcher."
+status = "pending"
+
+[[epochs.phases]]
+id = "37"
+title = "Port Mismatch Detection"
+status = "pending"
+rfcs = ["0051"]
+
+[[epochs.phases.tasks]]
+id = "37.1"
+label = "Refactor Discovery: Move `locald-server/src/discovery.rs` to `locald-core`."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "37.2"
+label = "Implement Monitor: Create a `PortMonitor` struct."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "37.3"
+label = "Integrate into `try`: Add mismatch warnings to `locald try`."
+status = "pending"
+
+[[epochs.phases]]
+id = "79"
+title = "Unified Service Trait"
+status = "complete"
+rfcs = ["0079"]
+
+[[epochs.phases.tasks]]
+id = "79.1"
+label = "Core Traits: Define `ServiceController` and `ServiceFactory` in `locald-core`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "79.2"
+label = "Implementations: Implement controllers for Postgres, Exec, and Docker."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "79.3"
+label = "Manager Refactor: Update `ProcessManager` to use the factory pattern."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "79.4"
+label = "Site Service: Implement `locald service add site` for static sites."
+status = "complete"
+
+[[epochs.phases]]
+id = "81"
+title = "Dashboard Refinement"
+status = "complete"
+rfcs = ["0081"]
+
+[[epochs.phases.tasks]]
+id = "81.1"
+label = "Frontend Architecture: Implement new Sidebar, Grid, and Inspector layouts."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "81.2"
+label = "Asset Integration: Automate dashboard build and embedding in `locald` binary."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "81.3"
+label = "Real-Time Foundation: Verify `ServiceUpdate` broadcasting (SSE) integration."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "81.4"
+label = 'Log Interaction: Implement explicit "Copy" controls and "Smart Folding" for logs.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "81.5"
+label = 'Global Controls: Add "Restart All" and "Stop All" buttons.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "81.6"
+label = "Polish: Address final UI tweaks (Icon alignment, Sidebar scrolling)."
+status = "complete"
+
+[[epochs.phases]]
+id = "93"
+title = "Proxy Lazy Loading"
+status = "complete"
+rfcs = ["0093"]
+
+[[epochs.phases.tasks]]
+id = "93.1"
+label = "RFC 0093: Create and implement."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "93.2"
+label = "Implementation: Intercept HTML requests and serve loading page."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "93.3"
+label = "Verification: Verify with `examples/shop-frontend`."
+status = "complete"
+
+[[epochs.phases]]
+id = "94"
+title = "Builder Permissions & Context"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "94.1"
+label = "Fix: `cargo install-locald` alias."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "94.2"
+label = "Bug: Builder Permission Denied (Regression)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "94.3"
+label = "Bug: Dev Loop Instability (Fork Bomb)."
+status = "complete"
+
+[[epochs.phases]]
+id = "96"
+title = "Shim Architecture (Leaf Node Axiom)"
+status = "complete"
+rfcs = ["0096"]
+
+[[epochs.phases.tasks]]
+id = "96.1"
+label = 'Axiom: Define the "Leaf Node Axiom".'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "96.2"
+label = "FD Passing: Implement `bind` command in shim using `SCM_RIGHTS`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "96.3"
+label = "Refactor: Remove `server start` and recursive logic from shim."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "96.4"
+label = 'Compliance: Add static analysis tests to forbid `Command::new("locald")`.'
+status = "complete"
+
+[[epochs]]
+id = "E4"
+title = "The Build Era"
+status = "pending"
+
+[[epochs.phases]]
+id = "34"
+title = "Cloud Native Buildpacks (CNB)"
+status = "complete"
+rfcs = ["0043"]
+
+[[epochs.phases.tasks]]
+id = "34.1"
+label = "Research: Investigate `libcnb` and the CNB lifecycle."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "34.2"
+label = "Platform: Implement a basic CNB platform in Rust (or wrap `pack`)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "34.3"
+label = "Integration: Add `locald build` command."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "34.4"
+label = "Environment: Parse OCI Image Config to derive default `Env` (PATH) instead of hardcoding."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "34.5"
+label = 'Crash Protocol: Implement "Black Box" logging for panics and errors.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "34.6"
+label = "Source of Truth: Ensure `locald-builder` and `locald-server` respect OCI config."
+status = "complete"
+
+[[epochs.phases]]
+id = "38"
+title = "E2E Testing Infrastructure"
+status = "complete"
+rfcs = ["0063"]
+
+[[epochs.phases.tasks]]
+id = "38.1"
+label = "Test Harness: Create a harness that builds release binaries and sets up the shim correctly."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "38.2"
+label = "E2E Suite: Implement tests for `locald up`, `locald run`, and CNB builds."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "38.3"
+label = "CI Integration: Run E2E tests in GitHub Actions."
+status = "complete"
+
+[[epochs.phases]]
+id = "58"
+title = "Documentation-Driven Design (DDD) Audit"
+status = "pending"
+rfcs = ["0058"]
+
+[[epochs.phases.tasks]]
+id = "58.1"
+label = 'Audit: Audit code using "New Hire", "Security Auditor", "Test Engineer", and "SRE" personas.'
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "58.2"
+label = "Refactor: Remove friction points identified during the audit."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "58.3"
+label = "Document: Write high-quality Rustdoc and Doctests."
+status = "pending"
+
+[[epochs.phases]]
+id = "59"
+title = "Systematic Investigation Protocol"
+status = "pending"
+rfcs = ["0059"]
+
+[[epochs.phases.tasks]]
+id = "59.1"
+label = "Define Protocol: Create the RFC defining the 5-step investigation process."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "59.2"
+label = "Adopt: Use this protocol to solve the `runc` namespace issue in Phase 34."
+status = "pending"
+
+[[epochs.phases]]
+id = "60"
+title = "Manual Synchronization"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "60.1"
+label = "Audit: Compare `docs/rfcs` (Stage 3+) against `docs/manual`."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "60.2"
+label = "Update: Consolidate RFC content into the manual."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "60.3"
+label = 'Verify: Ensure the manual is the single source of truth for "how it works now".'
+status = "pending"
+
+[[epochs.phases]]
+id = "61"
+title = "Boot Feedback & Progress UI"
+status = "complete"
+rfcs = ["0062"]
+
+[[epochs.phases.tasks]]
+id = "61.1"
+label = "TUI Framework: Integrate `indicatif` or similar for progress bars."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "61.2"
+label = 'Step Tracking: Instrument the boot process to report steps ("Building", "Starting", "Waiting").'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "61.3"
+label = "Log Streaming: Stream logs for failing steps immediately."
+status = "complete"
+
+[[epochs.phases]]
+id = "62"
+title = "Shared Utility Crate"
+status = "complete"
+rfcs = ["0067"]
+
+[[epochs.phases.tasks]]
+id = "62.1"
+label = "Scaffold: Create `locald-utils` crate."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "62.2"
+label = "Migrate: Move `fs`, `process`, `probe`, `cert`, `ipc`, `notify` modules."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "62.3"
+label = "Refactor: Update consumers (`locald-server`, `locald-cli`, `locald-builder`) to use the new crate."
+status = "complete"
+
+[[epochs.phases]]
+id = "63"
+title = "Dependency Hygiene"
+status = "complete"
+rfcs = ["0068"]
+
+[[epochs.phases.tasks]]
+id = "63.1"
+label = "Policy: Establish a dependency management policy."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "63.2"
+label = "Tooling: Create `scripts/update-deps.sh` to automate updates."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "63.3"
+label = "Protocol: Update `AGENTS.md` to enforce regular updates."
+status = "complete"
+
+[[epochs.phases]]
+id = "64"
+title = "Host-First Execution Pivot"
+status = "complete"
+rfcs = ["0069"]
+
+[[epochs.phases.tasks]]
+id = "64.1"
+label = "Configuration: Update `locald.toml` schema to support optional `[service.build]`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "64.2"
+label = "Runtime Split: Refactor `ProcessManager` to default to Host Runtime."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "64.3"
+label = "Opt-In CNB: Gate existing CNB logic behind the `build` configuration."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "64.4"
+label = "Verification: Verify Host-First and CNB Opt-In behavior with examples."
+status = "complete"
+
+[[epochs.phases]]
+id = "65"
+title = "CNB Library Extraction"
+status = "pending"
+rfcs = ["0068"]
+
+[[epochs.phases.tasks]]
+id = "65.1"
+label = "Scaffold: Create `cnb-client` crate."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "65.2"
+label = "Migrate: Move `oci_layout` and `runtime_spec` logic."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "65.3"
+label = "Refactor: Update `locald-builder` to use `cnb-client`."
+status = "pending"
+
+[[epochs.phases]]
+id = "66"
+title = "Rust CNB Launcher (Research)"
+status = "pending"
+rfcs = ["0069"]
+
+[[epochs.phases.tasks]]
+id = "66.1"
+label = "Prototype: Create `cnb-launcher` crate and implement basic config parsing."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "66.2"
+label = "Environment: Implement env var merging logic."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "66.3"
+label = "Execution: Implement `execve` strategy."
+status = "pending"
+
+[[epochs.phases]]
+id = "67"
+title = "Documentation Restructure"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "67.1"
+label = "IA Overhaul: Restructure `locald-docs` to match Personas (Guides, Reference, Internals)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "67.2"
+label = "Landing Page: Redesign `index.mdx` to provide clear pathways."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "67.3"
+label = "Migration: Move and refine content from `docs/manual` and `docs/design`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "67.4"
+label = 'Axiom Placement: Move Axioms/Vision to "Internals" section.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "67.5"
+label = "Refinement: Polish Reference and Internals content to match current implementation."
+status = "complete"
+
+[[epochs.phases]]
+id = "68"
+title = "Runc Container Runtime"
+status = "complete"
+rfcs = ["0075"]
+
+[[epochs.phases.tasks]]
+id = "68.1"
+label = "OCI Crate: Extract OCI logic into `locald-oci` crate."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "68.2"
+label = "Refactor: Consolidate `start_container` and `start_cnb_container` in `locald-server`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "68.3"
+label = "Bundle Source: Implement `BundleSource` trait in `locald-builder`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "68.4"
+label = "Deprecate: Mark `DockerRuntime` as deprecated."
+status = "complete"
+
+[[epochs.phases]]
+id = "76"
+title = "Ephemeral Containers"
+status = "complete"
+rfcs = ["0076"]
+
+[[epochs.phases.tasks]]
+id = "76.1"
+label = "Spec Generation: Implement robust `OciImageConfig` -> `OciRuntimeSpec` conversion in `locald-oci`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "76.2"
+label = "Runtime Interface: Implement `locald_oci::runtime::run` wrapper."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "76.3"
+label = "Shim Integration: Update `locald-shim` to use the new runtime interface."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "76.4"
+label = "Server Logic: Add `ContainerService` to `locald-server`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "76.5"
+label = "CLI Command: Add `locald run` command."
+status = "complete"
+
+[[epochs]]
+id = "E5"
+title = "The Perfect Demo"
+status = "pending"
+
+[[epochs.phases]]
+id = "97"
+title = "Libcontainer Shim (Fat Shim)"
+status = "complete"
+rfcs = ["0098"]
+
+[[epochs.phases.tasks]]
+id = "97.1"
+label = "Refactor Shim: Update `locald-shim` to link `libcontainer` and execute OCI bundles directly."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "97.2"
+label = "Update Daemon: Update `locald-server` to generate OCI bundles and invoke the new shim."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "97.3"
+label = "Verify: Ensure `locald run` works reliably without external `runc`."
+status = "complete"
+
+[[epochs.phases]]
+id = "98"
+title = "Postgres Port Fix"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "98.1"
+label = "Diagnosis: Confirm `PostgresFactory` hardcodes port 5432 when not specified."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "98.2"
+label = "Fix: Update `PostgresFactory` to request a dynamic port if none is configured."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "98.3"
+label = "Verification: Verify multiple Postgres services can run simultaneously without port conflicts."
+status = "complete"
+
+[[epochs.phases]]
+id = "99a"
+title = "Demo Repository Setup"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99a.1"
+label = "Create Repos: Set up `examples/color-system` and `examples/hydra`."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99a.2"
+label = "Configure: Add `locald.toml` with `exec` services (mocked with `python3 -m http.server` or similar)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99a.3"
+label = "Verify: Ensure they boot and are accessible via `*.localhost`."
+status = "complete"
+
+[[epochs.phases]]
+id = "99b"
+title = "Dashboard Polish"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99b.1"
+label = "Visual Check: Verify layout, fonts, and colors match the desired aesthetic."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99b.2"
+label = 'Link Verification: Ensure "Open App" links use `https://` and work correctly.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99b.3"
+label = "Data Accuracy: Verify service status and logs are accurate."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99b.4"
+label = 'Tiled Terminals: Implement "Deck" view with tiled terminals for pinned services.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99b.5"
+label = 'Visual Polish: Apply "Vercel-class" styling (Zinc scale, subtle borders, refined headers).'
+status = "complete"
+
+[[epochs.phases]]
+id = "99e"
+title = "Luminosity & State"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99e.1"
+label = "Active Toolbar: Make toolbar controls persistent and styled when active."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99e.2"
+label = "Global Contrast: Brighten sidebar items, headers, badges, and timestamps."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "99e.3"
+label = "Hover State: Enhance row hover background."
+status = "complete"
+
+[[epochs.phases]]
+id = "100"
+title = "Meta-Hosting Verification"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "100.1"
+label = "Self-Host: Run `locald up` in the `dotlocal` root."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "100.2"
+label = "Conflict Check: Ensure no port conflicts with system services or other `locald` instances."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "100.3"
+label = "Full Stack: Verify Docs, Dashboard, and Postgres are all functional."
+status = "complete"
+
+[[epochs.phases]]
+id = "101"
+title = "System Plane & Unified Pinning"
+status = "complete"
+rfcs = ["0100"]
+
+[[epochs.phases.tasks]]
+id = "101.1"
+label = "RFC 0100: Create and implement."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "101.2"
+label = 'System Plane: Implement "System Normal" footer to toggle Daemon Control Center.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "101.3"
+label = 'Unified Pinning: Deprecate "Solo Mode" in favor of a single "Pin" state.'
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "101.4"
+label = "Daemon Logs: Broadcast `locald` internal logs to the frontend."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "101.5"
+label = "Dev Mode: Add `dashboard` service to `locald.toml` for meta-hosting."
+status = "complete"
+
+[[epochs.phases]]
+id = "102"
+title = "VMM Maturity & Networking"
+status = "pending"
+rfcs = ["0102"]
+
+[[epochs.phases.tasks]]
+id = "102.1"
+label = "Event Loop: Introduce a reactor model (epoll/mio/event-manager) with a VCPU thread + device I/O loop."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "102.2"
+label = "Async I/O: Move virtio-block data path off the VCPU thread (thread pool or io_uring) and signal completion via eventfd/irq."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "102.3"
+label = "Virtio-Net: Add a minimal `virtio-net` device (TAP) and integrate with the reactor."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "102.4"
+label = "Library Decision: Evaluate adopting `dbs-virtio-devices` (or similar) once the reactor exists."
+status = "pending"

@@ -36,6 +36,8 @@ To support "Always Up" services, `locald` needs a **Registry** of known projects
 - **State**: Tracks `path`, `last_seen`, `always_up` flag.
 - **Autostart**: On daemon startup, `locald` reads the registry and starts any project marked `always_up`.
 
+Note: This "Always Up" pinning is separate from dashboard pinning (the Deck), which controls what terminals are visible in the UI.
+
 ### Environment Variables
 
 How do we map this config to environment variables?

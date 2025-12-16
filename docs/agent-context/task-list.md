@@ -10,7 +10,7 @@
     - [ ] Update `locald-server` to generate cgroup paths.
     - [ ] Update `locald-shim` to implement "The Anchor" (Systemd Unit).
     - [ ] Update `locald-shim` to implement "The Driver" (Direct Cgroup).
-    - [ ] Switch execution from `runc` to `libcontainer`.
+    - [x] Container execution via `libcontainer` (completed in Phase 97).
 
 ## Phase 94: Builder Permissions & Context (Completed)
 

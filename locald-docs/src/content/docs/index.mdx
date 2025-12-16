@@ -1,17 +1,17 @@
 ---
 title: locald
-description: The local development platform for the 12-factor era.
+description: Run local services with clean URLs, logs, and a dashboard.
 template: splash
 hero:
-  tagline: Treat the local machine as a first-class platform.
+  tagline: Start services, see logs, and visit them at *.localhost.
   image:
     file: ../../assets/houston.webp
   actions:
-    - text: Get Started
+    - text: Run my first app
       link: /getting-started/
       icon: right-arrow
       variant: primary
-    - text: Configuration
+    - text: Configure locald
       link: /reference/locald-toml/
       icon: setting
       variant: secondary
@@ -19,26 +19,29 @@ hero:
 
 import { Card, CardGrid } from "@astrojs/starlight/components";
 
-## Explore the Documentation
+## Choose your path
 
 <CardGrid stagger>
-  <Card title="Guides" icon="rocket">
-    **For the App Builder.** Zero Friction. Learn how to run apps, databases,
-    and common workflows. [Start Building &rarr;](/getting-started/)
+  <Card title="App Builder" icon="rocket">
+    You want to run an app (and maybe a database), get a stable URL, and keep
+    going without babysitting terminals. [Start here &rarr;](/getting-started/)
   </Card>
-  <Card title="Concepts" icon="open-book">
-    **For the Curious.** Mental Models. Understand the Vision, 12-Factor Local,
-    and the Workspace philosophy. [Read the Vision
-    &rarr;](/concepts/philosophy/)
+  <Card title="System Tweaker" icon="setting">
+    You want exact knobs: configuration, CLI commands, service types, and
+    execution details. [Reference &rarr;](/reference/locald-toml/)
   </Card>
-  <Card title="Reference" icon="setting">
-    **For the System Tweaker.** Precision Control. Complete specifications for
-    `locald.toml`, CLI, and Health Checks. [Configure locald
-    &rarr;](/reference/locald-toml/)
+  <Card title="Contributor" icon="puzzle">
+    You want to work on locald itself: architecture, security model, and RFCs.
+    [Internals &rarr;](/internals/architecture/)
   </Card>
-  <Card title="Internals" icon="puzzle">
-    **For the Contributor.** Under the Hood. Explore the Architecture, IPC
-    protocol, and Design Axioms. [View Architecture
-    &rarr;](/internals/architecture/)
+  <Card title="Concepts (optional)" icon="open-book">
+    You want a quick mental model for the dashboard and workflows. [Dashboard
+    model &rarr;](/concepts/workspace/)
   </Card>
 </CardGrid>
+
+<div class="screenshot-wide">
+
+[![Dashboard overview showing the Rack sidebar, Stream timeline, and pinned tiles](/screenshots/dashboard-overview.png)](/screenshots/dashboard-overview.png)
+
+</div>

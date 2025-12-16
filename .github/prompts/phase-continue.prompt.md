@@ -7,10 +7,10 @@ description: This prompt is used to resume work on an existing phase in a new ch
 
 When picking up work in the middle of a phase (e.g., starting a new chat session for an ongoing task), follow these steps:
 
-- **Context Restoration**: Run `${workspaceFolder}/scripts/agent/resume-phase.sh`.
-  - This script will verify that an active phase exists and output the current project context.
+- **Context Restoration**: Run \`exo context restore\`.
+  - This command will output the current project context, including the active task list and implementation plan.
 - **State Analysis**:
-  - Review the `Task List` output to identify completed and pending items.
+  - Review the \`Task List\` output to identify completed and pending items.
   - Review the `Implementation Plan` to understand the current technical direction.
   - Review the `Walkthrough` (if any) to see what has been accomplished so far.
 - **Resume Work**:

@@ -42,9 +42,23 @@ cargo test
 The documentation is built with [Astro Starlight](https://starlight.astro.build/).
 
 ```bash
-cd locald-docs
-npm install
-npm run dev
+pnpm -C locald-docs install
+pnpm -C locald-docs dev
 ```
 
 This will start a local development server at `http://localhost:4321`.
+
+### Design doc sync
+
+Some pages in this site are generated from the repository’s design documents (for example, `docs/design/*`).
+
+- The sync runs as part of `pnpm -C locald-docs build`.
+- When editing these pages, prefer updating the source document in `docs/design/` rather than the generated copy.
+
+### Embed pipeline
+
+In this repository, the built docs site is embedded into the `locald` binary (behind the default UI feature set) and served at runtime.
+If you change documentation as part of a feature, verify both:
+
+- `pnpm -C locald-docs build`
+- `./scripts/agent/check-docs.sh`

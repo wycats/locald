@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Pin, Terminal as TerminalIcon, Activity } from 'lucide-svelte';
 	import Terminal from './Terminal.svelte';
+	import DaemonControlCenter from './DaemonControlCenter.svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 
@@ -11,7 +12,7 @@
 	}
 </script>
 
-<div class="deck" class:single={pinned.length === 1}>
+<div class="deck" data-testid="deck" class:single={pinned.length === 1}>
 	{#each pinned as serviceName (serviceName)}
 		<div
 			class="terminal-card"
@@ -35,7 +36,11 @@
 				</div>
 			</div>
 			<div class="terminal-body">
-				<Terminal filter={serviceName} />
+				{#if serviceName === 'locald'}
+					<DaemonControlCenter />
+				{:else}
+					<Terminal filter={serviceName} />
+				{/if}
 			</div>
 		</div>
 	{/each}

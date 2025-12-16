@@ -1,13 +1,14 @@
 ---
 title: Your First Workspace
-description: From zero to a fully managed local development platform.
+description: From zero to running services with clean URLs.
 ---
 
-Welcome to the **Cybernetic Workspace**.
+This tutorial gets you from “nothing running” to a working local service with:
 
-`locald` is different from tools you might have used before. It doesn't just run commands; it creates a **Platform** on your local machine. When you use `locald`, you are building a structured, observable, and robust environment for your applications—giving you the **immediacy** of local development with the **rigor** of a cloud deployment.
-
-In this guide, we'll walk through the lifecycle of a `locald` project, from a single command to a fully managed workspace.
+- a free port via `$PORT`
+- a supervised process (auto-restart, logs captured)
+- a stable `*.localhost` URL
+- a dashboard at `http://locald.localhost`
 
 ## 1. Installation
 
@@ -30,14 +31,14 @@ locald run 'python3 -m http.server $PORT'
 **What just happened?**
 
 1.  **Port Management**: `locald` assigned a random, free port to your process and injected it as `$PORT`. No more "Address already in use" errors.
-2.  **Process Supervision**: Your command isn't just running in your shell; it's being supervised by the `locald` daemon.
+2.  **Process Supervision**: Your command isn’t just running in your shell; it’s supervised by the `locald` daemon.
 3.  **Graceful Shutdown**: Press `Ctrl+C`. `locald` catches the signal and shuts down the process cleanly.
 
 It will ask if you want to save this service. For now, say **No**. We'll build a real project next.
 
 ## 3. Defining the Source of Truth
 
-A `locald` project starts with a `locald.toml` file. This file is the **Source of Truth** for your workspace. It defines _what_ should run, not _how_ to run it (that's the platform's job).
+A `locald` project starts with a `locald.toml` file. It defines _what_ should run, not _how_ to run it.
 
 Create a directory for your new project:
 
@@ -76,8 +77,7 @@ Now, let's bring the platform to life.
 locald up
 ```
 
-**The Shift to "Daemon-First"**
-Unlike `npm start` or `make run`, `locald up` doesn't block your terminal with application logs. It contacts the background daemon and tells it: _"Ensure the state defined in `locald.toml` matches reality."_
+Unlike `npm start` or `make run`, `locald up` doesn’t block your terminal with application logs. It asks the background daemon to make reality match what’s in `locald.toml`.
 
 - The daemon starts your `web` service.
 - It captures `stdout` and `stderr`.
@@ -85,7 +85,7 @@ Unlike `npm start` or `make run`, `locald up` doesn't block your terminal with a
 
 Your terminal is now free. You can close it, open a new one, or walk away. Your workspace persists.
 
-## 5. The Cybernetic Dashboard
+## 5. The Dashboard
 
 To see what's happening, we need observability. `locald` provides a rich web interface that acts as your cockpit.
 
@@ -93,15 +93,29 @@ Visit **[http://locald.localhost](http://locald.localhost)**.
 
 This is your **Workspace**.
 
+<div class="screenshot-wide">
+
+[![Dashboard overview showing the Rack sidebar, Stream timeline, and pinned tiles](/screenshots/dashboard-overview.png)](/screenshots/dashboard-overview.png)
+
+</div>
+
 - **The Rack** (Left): See all your running services at a glance.
 - **The Stream** (Center): A unified timeline of logs from all services.
+- **The Deck**: Pin services into a focused, tiled layout.
+- **System Plane**: Pin `locald` itself (via “System Normal”) to view daemon logs and status.
 - **Control**: Start, stop, or restart services with a click.
+
+<div class="screenshot-wide">
+
+[![System Plane view showing locald pinned as a virtual service](/screenshots/dashboard-system-plane.png)](/screenshots/dashboard-system-plane.png)
+
+</div>
 
 _Tip: You can also use `locald monitor` for a terminal-based version of this dashboard._
 
-## 6. Production Parity (HTTPS)
+## 6. HTTPS (optional)
 
-Accessing `localhost:34123` feels like a toy. Production uses HTTPS and real domains. `locald` brings that to your machine.
+If you want HTTPS locally (with real-looking domains), `locald` can set that up too.
 
 First, perform a **one-time system setup** to trust the local Certificate Authority:
 
@@ -123,7 +137,7 @@ web = { command = "python3 -m http.server $PORT" }
 Run `locald up` again to apply the changes.
 
 Open **[https://my-app.localhost](https://my-app.localhost)**.
-You now have a secure, domain-bound service running locally, mirroring a production environment.
+You now have a secure, domain-bound service running locally.
 
 ## 7. Next Steps
 
@@ -131,4 +145,4 @@ You have a running workspace. Where to next?
 
 - **[Add a Database](/guides/managed-services/)**: Need Postgres or Redis? Don't install them; let `locald` manage them.
 - **[Configure Your Stack](/guides/project-setup/)**: See examples for Node, Python, Go, and Rust.
-- **[Understand the Philosophy](/concepts/philosophy/)**: Learn _why_ we built it this way.
+- **[Learn the Dashboard Model](/concepts/workspace/)**: Rack, Stream, Deck, and the System Plane.

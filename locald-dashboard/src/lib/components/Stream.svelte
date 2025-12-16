@@ -5,7 +5,7 @@
 	let filterText = $state('');
 </script>
 
-<div class="stream">
+<div class="stream" data-testid="stream">
 	<div class="stream-header">
 		<div class="search-wrapper">
 			<Search size={14} class="search-icon" />

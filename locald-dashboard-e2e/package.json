@@ -7,7 +7,11 @@
     "test": "playwright test --reporter=list",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
-    "codegen": "playwright codegen"
+    "codegen": "playwright codegen",
+    "screenshots": "node scripts/capture-dashboard-screenshots.mjs",
+    "screenshots:ui": "playwright test tests/docs-screenshots.spec.ts --ui",
+    "screenshots:update": "playwright test tests/docs-screenshots.spec.ts --update-snapshots",
+    "screenshots:sync": "node scripts/sync-doc-screenshots.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",

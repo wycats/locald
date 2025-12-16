@@ -1,3 +1,5 @@
+//! End-to-end tests for the `locald` CLI and daemon lifecycle.
+
 use assert_cmd::Command;
 use std::env;
 use std::fs;
@@ -8,6 +10,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 /// A test context that sets up a sandboxed environment for `locald`.
+#[derive(Debug)]
 pub struct TestContext {
     /// Temporary directory for XDG_DATA_HOME, XDG_CONFIG_HOME, etc.
     pub root: TempDir,
@@ -114,6 +117,7 @@ impl TestContext {
         self.wait_for_ready();
     }
 
+    /// Wait until the daemon responds to `locald ping`.
     pub fn wait_for_ready(&self) {
         let mut attempts = 0;
         while attempts < 50 {
@@ -131,6 +135,7 @@ impl TestContext {
         panic!("daemon failed to become ready\n\nDaemon logs:\n{logs}");
     }
 
+    /// Stop the daemon process (best-effort).
     pub fn stop_daemon(&mut self) {
         if let Some(mut child) = self.daemon.take() {
             // Try graceful shutdown via CLI

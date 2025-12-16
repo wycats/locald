@@ -7,7 +7,7 @@
 	import Deck from '$lib/components/Deck.svelte';
 
 	// --- State ---
-	let pinned: string[] = [];
+	let pinned = $state<string[]>([]);
 
 	onMount(() => {
 		services.refresh();
@@ -15,7 +15,7 @@
 		return cleanup;
 	});
 
-	$: isDeckMode = pinned.length > 0;
+	let isDeckMode = $derived(pinned.length > 0);
 </script>
 
 <div class="workspace">

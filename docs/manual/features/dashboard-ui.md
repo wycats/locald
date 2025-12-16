@@ -23,5 +23,23 @@ The sidebar, known as "The Rack", lists all services in the current constellatio
 
 The main content area, "The Stream", displays logs from running services.
 
-- **Solo Mode**: When a specific service is selected, the view enters "Solo Mode". In this mode, the service name column is hidden to maximize space for log content and reduce visual clutter.
-- **All Services Mode**: When viewing the aggregate stream, service names are displayed to allow correlation between events from different services.
+- **Global Stream**: When nothing is pinned, the Stream shows the aggregate log view. Service names are displayed to allow correlation between events from different services.
+
+## The Deck (Pinned Terminals)
+
+The "Deck" is the focused, interactive surface for one or more pinned services.
+
+- **Unified Pinning**: Selecting a service toggles its pinned state. If one service is pinned, it effectively replaces the old "solo" view; if multiple are pinned, the Deck tiles them.
+- **Behavior**:
+  - 0 pinned: show the global Stream.
+  - 1+ pinned: show the Deck.
+
+This pinning is a dashboard UI concept; it is distinct from registry/"Always Up" pinning used for autostart.
+
+## The System Plane (Daemon Control Center)
+
+The dashboard exposes a dedicated system view for the daemon itself.
+
+- **Entry Point**: The "System Normal" footer at the bottom of the Rack.
+- **Effect**: Pins a virtual service named `locald` into the Deck.
+- **Purpose**: Stream daemon logs and surface platform state without requiring a separate terminal.

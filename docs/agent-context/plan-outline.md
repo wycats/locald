@@ -12,7 +12,7 @@ Conventions:
 
 ## Epoch 1: MVP (The Walking Skeleton)
 
-**Goal**: A functional daemon that can register a local project, manage its process, and route traffic via `*.local`.
+**Goal**: A functional daemon that can register a local project, manage its process, and route traffic via `*.localhost`.
 
 ### Phase 1: Scaffolding & Daemon Basics
 
@@ -157,17 +157,17 @@ Conventions:
 
 **Goal**: Enable full WebSocket support in the reverse proxy to support modern web apps and dev tools (HMR).
 
-- [ ] **Upgrade Handling**: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers).
-- [ ] **Connection Bridging**: Implement bidirectional copying of data between the upgraded client connection and the backend service.
+- [x] **Upgrade Handling**: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers).
+- [x] **Connection Bridging**: Implement bidirectional copying of data between the upgraded client connection and the backend service.
 - [ ] **Verification**: Verify with a WebSocket-heavy example app (e.g., a chat app or Vite HMR).
 
 ### Phase 17: Linting & Code Quality
 
 **Goal**: Enforce stricter code quality standards to catch reliable errors without being overly pedantic.
 
-- [ ] **Configure Clippy**: Add a `clippy.toml` or configure workspace-level lints for stricter checking (e.g., `warn` on `clippy::pedantic` but allow subjective ones).
-- [ ] **Fix Lints**: Address existing lint warnings across the codebase.
-- [ ] **CI Enforcement**: Ensure CI fails on lint warnings.
+- [x] **Configure Clippy**: Add a `clippy.toml` or configure workspace-level lints for stricter checking (e.g., `warn` on `clippy::pedantic` but allow subjective ones).
+- [x] **Fix Lints**: Address existing lint warnings across the codebase.
+- [x] **CI Enforcement**: Ensure CI fails on lint warnings.
 
 ### Phase 18: Documentation Fresh Eyes
 

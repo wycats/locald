@@ -2,7 +2,6 @@ use crate::style;
 use anyhow::{Context, Result};
 use crossterm::style::Stylize;
 use locald_core::IpcRequest;
-use std::os::unix::fs::MetadataExt;
 
 pub fn handle_ipc_error(e: &anyhow::Error) {
     let msg = e.to_string();
@@ -150,23 +149,7 @@ pub fn verify_shim() {
     {
         // Only check if we are NOT already running under the shim
         if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
-            if let Ok(Some(shim_path)) = locald_utils::shim::find() {
-                // Only enforce verification for the installed privileged shim.
-                // In dev/test, there may be an uninstalled `target/debug/locald-shim` present
-                // that is not owned by root and not setuid; that binary is not used for
-                // privileged operations and should not block normal commands like `ping`.
-                if let Ok(metadata) = std::fs::metadata(&shim_path) {
-                    let uid = metadata.uid();
-                    let mode = metadata.mode();
-
-                    let is_root = uid == 0;
-                    let is_setuid = (mode & 0o4000) != 0;
-
-                    if !is_root || !is_setuid {
-                        return;
-                    }
-                }
-
+            if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
                 #[cfg(debug_assertions)]
                 {
                     const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
