@@ -3,20 +3,25 @@ set -e
 
 SANDBOX="check"
 
+echo "Running rustfmt..."
+cargo fmt --all -- --check
+
 echo "Running cargo build..."
 cargo build
 
 echo "Running clippy..."
 cargo clippy --workspace -- -D warnings
 
-echo "Running dashboard check..."
-(cd locald-dashboard && pnpm check)
+echo "Building dashboard (CI-equivalent)..."
+CI=1 pnpm -C locald-dashboard install --frozen-lockfile
+pnpm -C locald-dashboard build
 
 echo "Running docs checks..."
 node ./scripts/check-docs-sidebar-links.mjs
 node ./scripts/check-docs-screenshots.mjs
 
 echo "Running docs build..."
+CI=1 pnpm -C locald-docs install --frozen-lockfile
 pnpm -C locald-docs build
 
 echo "Running IPC verification..."
