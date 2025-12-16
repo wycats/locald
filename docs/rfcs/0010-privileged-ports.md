@@ -8,7 +8,7 @@ feature: Architecture
 
 ## 1. Summary
 
-The daemon shall run as the user, but use `setcap` to bind to privileged ports (80/443).
+The daemon shall run as the user, but use `locald-shim` (setuid root) to bind to privileged ports (80/443) and pass file descriptors back to the unprivileged daemon.
 
 ## 2. Motivation
 
@@ -16,16 +16,21 @@ We want to bind port 80 for clean URLs, but running the entire daemon as root vi
 
 ## 3. Detailed Design
 
-The binary is granted `cap_net_bind_service` capability. This allows it to bind to ports < 1024 without being root.
+Privileged port binding is performed by the setuid-root `locald-shim`, keeping the daemon unprivileged.
+
+This avoids granting extra privileges (capabilities) to the main `locald` binary and keeps all privileged operations centralized in the shim.
 
 ### Terminology
 
 - **Capabilities**: Linux capabilities (fine-grained privileges).
 - **cap_net_bind_service**: The capability to bind to privileged ports.
+- **Shim**: `locald-shim`, a small setuid-root helper for privileged operations.
 
 ### User Experience (UX)
 
-Users run `locald admin setup` (which uses sudo) once to apply the capabilities.
+Users run `sudo locald admin setup` once to install and configure `locald-shim` (owned by root with the setuid bit set).
+
+After setup, the daemon can request privileged ports by invoking the shim as-needed.
 
 ### Architecture
 
@@ -33,12 +38,13 @@ N/A
 
 ### Implementation Details
 
-`setcap cap_net_bind_service=+ep path/to/binary`.
+- `locald-shim bind <port>` binds the privileged port and passes the FD back to the daemon (e.g. via `SCM_RIGHTS`).
+- The daemon uses the received listener for the proxy and remains an unprivileged process.
 
 ## 4. Drawbacks
 
 - Requires `sudo` for setup.
-- Capabilities are cleared when the binary is recompiled/replaced.
+- The shim is a privileged binary and must stay minimal and well-audited.
 
 ## 5. Alternatives
 
@@ -52,4 +58,5 @@ None.
 
 ## 7. Future Possibilities
 
-- `locald-shim` (Phase 21) to avoid giving capabilities to the main binary.
+- If needed, restrict which privileged operations the shim supports even further.
+- Consider additional hardening (seccomp/apparmor) around the shim.

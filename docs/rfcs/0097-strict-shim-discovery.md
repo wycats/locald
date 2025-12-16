@@ -31,9 +31,19 @@ We are **removing** support for `LOCALD_SHIM_PATH` entirely.
 1.  **Development**: When running `cargo run`, the shim will not be found automatically unless it is copied to `target/debug/locald-shim`.
     - **Mitigation**: The `admin setup` command (or a helper script) must be used to copy the shim to the correct location and set permissions.
 2.  **Installation**: The `admin setup` command will extract the embedded shim to the sibling location.
-3.  **Error Handling**: If the shim is not found or has incorrect permissions, `locald` will fail hard.
+3.  **Daemon Safety**: Background/daemon contexts must never trigger interactive privilege escalation.
+    - The daemon will only use an **already-configured** (setuid root) `locald-shim`.
+    - If the shim is missing or not privileged, the daemon will skip privileged “quality of life” actions (e.g. auto hosts sync) and instruct the user to run `sudo locald admin setup`.
+4.  **Error Handling**: If the shim is not found or has incorrect permissions, `locald` will fail hard when a privileged operation is required.
     - **Interactive Mode**: It will attempt to auto-fix the issue by running `sudo locald admin setup`.
     - **Non-Interactive**: It will instruct the user to run `sudo locald admin setup` manually. It will not try to guess or fallback to other locations.
+
+### Note: Hosts Sync
+
+The daemon must not shell out to `locald admin sync-hosts` to update `/etc/hosts`.
+
+- It should invoke `locald-shim admin sync-hosts ...` directly.
+- If the shim is not available, it should log a single actionable message (run `sudo locald admin setup`) and continue.
 
 ## Benefits
 
