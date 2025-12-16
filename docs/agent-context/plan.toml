@@ -785,6 +785,11 @@ id = "31.3"
 label = "Tested Docs: Ensure documentation code samples are tested."
 status = "pending"
 
+[[epochs.phases.tasks]]
+id = "31.4"
+label = "RFC 0104: Codebase cleanup (front door + CI-aligned validation)"
+status = "complete"
+
 [[epochs.phases]]
 id = "32"
 title = "Sandbox Environments"
