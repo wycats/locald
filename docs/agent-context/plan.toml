@@ -1032,6 +1032,52 @@ id = "96.4"
 label = 'Compliance: Add static analysis tests to forbid `Command::new("locald")`.'
 status = "complete"
 
+[[epochs.phases]]
+id = "109"
+title = "Host Diagnostics (locald doctor)"
+status = "pending"
+rfcs = ["0109"]
+
+[[epochs.phases.tasks]]
+id = "109.1"
+label = "CLI: add locald doctor command"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.2"
+label = "Check: privileged shim readiness"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.3"
+label = "Check: cgroup v2 and root readiness"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.4"
+label = "Output: actionable fix suggestions"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.5"
+label = "Output: JSON and verbose modes"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.6"
+label = "Docs: doctor UX + examples"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.7"
+label = "Future: optional auto-fix mode"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.8"
+label = "Future: deeper runtime/kernel checks"
+status = "pending"
+
 [[epochs]]
 id = "E4"
 title = "The Build Era"
