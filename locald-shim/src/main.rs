@@ -240,8 +240,19 @@ fn check_port(port: u16) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)]
 fn is_systemd_present() -> bool {
-    Path::new("/run/systemd/system").exists()
+    if !Path::new("/run/systemd/system").exists() {
+        return false;
+    }
+
+    // A common failure mode in CI/containers is that systemd-related files exist on disk,
+    // but systemd is not actually PID 1. In that case, "systemctl" calls may succeed or
+    // partially work, but the systemd cgroup tree won't exist.
+    match std::fs::read_to_string("/proc/1/comm") {
+        Ok(comm) => comm.trim() == "systemd",
+        Err(_) => false,
+    }
 }
 
 fn ensure_cgroup2_mount() -> Result<()> {
@@ -299,6 +310,17 @@ fn cgroup_setup_systemd() -> Result<()> {
 
     if !status.success() {
         anyhow::bail!("systemctl daemon-reload failed: {status}");
+    }
+
+    // Ensure the slice is actually realized in the cgroup tree.
+    let status = std::process::Command::new("systemctl")
+        .arg("start")
+        .arg("locald.slice")
+        .status()
+        .context("Failed to execute systemctl start locald.slice")?;
+
+    if !status.success() {
+        anyhow::bail!("systemctl start locald.slice failed: {status}");
     }
 
     Ok(())
