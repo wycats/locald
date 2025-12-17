@@ -112,12 +112,10 @@ pub fn tokio_command_interactive() -> Result<tokio::process::Command> {
 ///
 /// Returns an error if a privileged shim cannot be found.
 pub fn tokio_command_privileged() -> Result<tokio::process::Command> {
-    let shim_path = find_privileged()?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "locald-shim is not installed or not setuid root; run `sudo locald admin setup`"
-        )
-    })?;
-    Ok(tokio_command(&shim_path))
+    let privileged =
+        crate::privileged::Privileged::acquire(crate::privileged::AcquireConfig::daemon_default())
+            .map_err(anyhow::Error::new)?;
+    Ok(privileged.tokio_command())
 }
 
 /// Find the locald-shim binary.

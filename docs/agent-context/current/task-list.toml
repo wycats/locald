@@ -1,4 +1,43 @@
 # READ-ONLY: Use 'exo' CLI to modify this file.
 # Task List
 
-# No tasks found in the active phase/strike.
+[[tasks]]
+id = "109.1"
+title = "CLI: add locald doctor command"
+status = "pending"
+
+[[tasks]]
+id = "109.2"
+title = "Check: privileged shim readiness"
+status = "pending"
+
+[[tasks]]
+id = "109.3"
+title = "Check: cgroup v2 and root readiness"
+status = "pending"
+
+[[tasks]]
+id = "109.4"
+title = "Output: actionable fix suggestions"
+status = "pending"
+
+[[tasks]]
+id = "109.5"
+title = "Output: JSON and verbose modes"
+status = "pending"
+
+[[tasks]]
+id = "109.6"
+title = "Docs: doctor UX + examples"
+status = "completed"
+
+[[tasks]]
+id = "109.7"
+title = "Future: optional auto-fix mode"
+status = "pending"
+
+[[tasks]]
+id = "109.8"
+title = "Future: deeper runtime/kernel checks"
+status = "pending"
+

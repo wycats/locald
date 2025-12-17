@@ -1,3 +1,7 @@
 # READ-ONLY: Use 'exo' CLI to modify this file.
 # Walkthrough
 
+[[entries]]
+type = "design"
+description = "Docs: locald doctor usage"
+details = "Documented `locald doctor` in the CLI reference and CI automation guide, including exit-code semantics, `--json`/`--verbose` usage, and canonical remediation via `sudo locald admin setup`. Also added a brief README mention for privileged host readiness diagnostics."

@@ -48,5 +48,6 @@ CI-like (includes installing the privileged shim + running `locald-e2e`; require
 Some features require a privileged shim installed with setuid root permissions.
 
 - Install/repair: `sudo locald admin setup`
+- Diagnose readiness: `locald doctor`
 
 The shim is treated as an internal protocol surface; `locald` will instruct you when the installed shim is outdated.

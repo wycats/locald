@@ -1,3 +1,5 @@
+surgical_strikes = []
+
 [[epochs]]
 id = "E1"
 title = "MVP (The Walking Skeleton)"
@@ -1032,6 +1034,55 @@ id = "96.4"
 label = 'Compliance: Add static analysis tests to forbid `Command::new("locald")`.'
 status = "complete"
 
+[[epochs.phases]]
+id = "109"
+title = "Host Diagnostics (locald doctor)"
+status = "active"
+rfcs = [
+    "0109",
+    "0110",
+]
+
+[[epochs.phases.tasks]]
+id = "109.1"
+label = "CLI: add locald doctor command"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.2"
+label = "Check: privileged shim readiness"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.3"
+label = "Check: cgroup v2 and root readiness"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.4"
+label = "Output: actionable fix suggestions"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.5"
+label = "Output: JSON and verbose modes"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.6"
+label = "Docs: doctor UX + examples"
+status = "completed"
+
+[[epochs.phases.tasks]]
+id = "109.7"
+label = "Future: optional auto-fix mode"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "109.8"
+label = "Future: deeper runtime/kernel checks"
+status = "pending"
+
 [[epochs]]
 id = "E4"
 title = "The Build Era"
@@ -1565,13 +1616,30 @@ status = "pending"
 [[epochs.phases]]
 id = "99"
 title = "Structured Cgroup Hierarchy"
-status = "active"
-tasks = []
+status = "completed"
 rfcs = ["0099"]
 
-[[surgical_strikes]]
-id = "strike-1765875312"
-name = "rfc-0099-cgroups"
-goal = "Implement structured cgroup hierarchy (Tree of Life) per RFC 0099"
-started_at = "2025-12-16T08:55:12.519684071+00:00"
-tasks = []
+[[epochs.phases.tasks]]
+id = "99.1"
+label = "Align RFC 0099 with PID1 detection"
+status = "completed"
+
+[[epochs.phases.tasks]]
+id = "99.2"
+label = "Align manual resource-management with detection + kill semantics"
+status = "completed"
+
+[[epochs.phases.tasks]]
+id = "99.3"
+label = "Sandbox identity for cgroups (tests)"
+status = "completed"
+
+[[epochs.phases.tasks]]
+id = "99.4"
+label = "Docs acceptance: sanitize naming contract"
+status = "completed"
+
+[[epochs.phases.tasks]]
+id = "99.5"
+label = "Phase 99 verification plumbing"
+status = "completed"

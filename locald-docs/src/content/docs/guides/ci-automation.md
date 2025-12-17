@@ -15,6 +15,24 @@ locald --sandbox=ci-job-123 up
 
 This is crucial for CI environments where multiple jobs might be running on the same machine, or when you want to run tests in parallel without port conflicts.
 
+## Preflight: validate the host
+
+Before starting services, it can be useful to validate that the runner is ready (especially if you expect container features or cgroup-based cleanup).
+
+```bash
+# Human-readable output
+locald doctor
+
+# Machine-readable output (useful for gating in CI)
+locald doctor --json
+```
+
+If critical checks fail, the report will usually recommend running:
+
+```bash
+sudo locald admin setup
+```
+
 ## Scripting with `locald`
 
 You can use `locald` to orchestrate your test environment.

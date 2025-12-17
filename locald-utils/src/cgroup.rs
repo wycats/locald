@@ -2,7 +2,8 @@
 //!
 //! This module implements the naming and path conventions described in RFC 0099.
 
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::PathBuf;
 
 /// How `locald` anchors its cgroup hierarchy on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,18 +14,31 @@ pub enum CgroupRootStrategy {
     Direct,
 }
 
-/// Detect which cgroup root strategy should be used on this host.
-///
-/// This is intentionally a best-effort heuristic:
-/// - If systemd is present, we prefer the Systemd strategy.
-/// - Otherwise we fall back to the Direct strategy.
-#[must_use]
-pub fn detect_root_strategy() -> CgroupRootStrategy {
-    if Path::new("/run/systemd/system").exists() {
+fn root_strategy_from_pid1_comm(comm: &str) -> CgroupRootStrategy {
+    if comm.trim() == "systemd" {
         CgroupRootStrategy::Systemd
     } else {
         CgroupRootStrategy::Direct
     }
+}
+
+/// Detect which cgroup root strategy should be used on this host.
+///
+/// This is intentionally a best-effort heuristic:
+/// - If PID 1 is systemd, we prefer the Systemd strategy.
+/// - Otherwise we fall back to the Direct strategy.
+#[must_use]
+pub fn detect_root_strategy() -> CgroupRootStrategy {
+    // A common failure mode in CI/containers is that systemd artifacts exist on disk,
+    // but systemd is not actually PID 1.
+    let mut comm = String::new();
+    if let Ok(mut file) = std::fs::File::open("/proc/1/comm")
+        && file.read_to_string(&mut comm).is_ok()
+    {
+        return root_strategy_from_pid1_comm(&comm);
+    }
+
+    CgroupRootStrategy::Direct
 }
 
 /// Returns the cgroup v2 filesystem mountpoint (`/sys/fs/cgroup`).
@@ -133,4 +147,68 @@ pub fn maybe_cgroup_path_for_leaf(leaf: &str) -> Option<String> {
 
     let sandbox = crate::env::sandbox_name_or_default();
     Some(cgroup_path_for_leaf(strategy, &sandbox, leaf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn pid1_comm_systemd_selects_systemd() {
+        assert_eq!(
+            root_strategy_from_pid1_comm("systemd\n"),
+            CgroupRootStrategy::Systemd
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn pid1_comm_non_systemd_selects_direct(comm in ".*") {
+            prop_assume!(comm.trim() != "systemd");
+            prop_assert_eq!(root_strategy_from_pid1_comm(&comm), CgroupRootStrategy::Direct);
+        }
+
+        #[test]
+        fn sanitize_component_produces_safe_nonempty(raw in ".*") {
+            let out = sanitize_component(&raw);
+            prop_assert!(!out.is_empty());
+            prop_assert!(!out.starts_with('-'));
+            prop_assert!(!out.ends_with('-'));
+
+            for ch in out.chars() {
+                prop_assert!(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+            }
+        }
+
+        #[test]
+        fn cgroup_paths_use_expected_prefix(sandbox in ".*", service in ".*") {
+            let s = cgroup_path_for_service(CgroupRootStrategy::Systemd, &sandbox, &service);
+            prop_assert!(s.starts_with("/locald.slice/"));
+            prop_assert!(!s.contains(':'));
+
+            let d = cgroup_path_for_service(CgroupRootStrategy::Direct, &sandbox, &service);
+            prop_assert!(d.starts_with("/locald/"));
+            prop_assert!(!d.contains(':'));
+        }
+
+        #[test]
+        fn cgroup_paths_have_no_empty_or_parent_components(sandbox in ".*", service in ".*") {
+            for path in [
+                cgroup_path_for_service(CgroupRootStrategy::Systemd, &sandbox, &service),
+                cgroup_path_for_service(CgroupRootStrategy::Direct, &sandbox, &service),
+                cgroup_path_for_leaf(CgroupRootStrategy::Systemd, &sandbox, &service),
+                cgroup_path_for_leaf(CgroupRootStrategy::Direct, &sandbox, &service),
+            ] {
+                prop_assert!(path.starts_with('/'));
+                prop_assert!(!path.contains("//"));
+
+                let rel = path.trim_start_matches('/');
+                for component in rel.split('/') {
+                    prop_assert!(!component.is_empty());
+                    prop_assert_ne!(component, "..");
+                }
+            }
+        }
+    }
 }
