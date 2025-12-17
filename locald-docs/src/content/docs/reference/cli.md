@@ -22,6 +22,35 @@ If a step fails, the UI will persist the error details for debugging.
 
 Stops all running services and the daemon.
 
+## Diagnostics
+
+### `locald doctor`
+
+Diagnose whether your machine is ready to run `locald` (especially features that require the privileged `locald-shim` and cgroup-based cleanup).
+
+Typical output includes:
+
+- Whether a privileged shim is installed and usable
+- Whether cgroup v2 is available and the locald cgroup root is established
+- Suggested next steps (usually `sudo locald admin setup`)
+
+Exit code:
+
+- `0` when critical checks pass
+- non-zero when critical checks fail
+
+Flags:
+
+- `--json` prints a machine-readable report (useful in CI)
+- `--verbose` includes additional evidence details
+
+```bash
+locald doctor
+
+# CI-friendly
+locald doctor --json
+```
+
 ## Ad-Hoc Execution
 
 ### `locald try`
