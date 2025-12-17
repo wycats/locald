@@ -3,40 +3,5 @@
 
 [[entries]]
 type = "design"
-description = "RFC 0111: property tests as invariant specs"
-details = "Created Stage-0 RFC 0111 to formalize invariant-driven property testing for doctor/capability readiness and fix consolidation; updated manual testing strategy and RFC 0109/0110 to call out soundness + drift-prevention invariants."
-
-[[entries]]
-type = "test"
-description = "Lock down RunAdminSetup canonical remediation"
-details = "Added a property test in locald-utils ensuring FixKey::RunAdminSetup is dominant when present and its commands list is exactly 'sudo locald admin setup'."
-
-[[entries]]
-type = "test"
-description = "Fix consolidation semantic proptests"
-details = "Added semantic property tests for fix consolidation completeness (no dropped fix keys) and monotonicity under added failing problems, matching precedence-not-subsumption semantics in RFC 0111."
-
-[[entries]]
-type = "test"
-description = "JSON roundtrip preserves doctor semantics"
-details = "Added a property test asserting that DoctorReport JSON roundtrip preserves has_critical_failures() and the sets of fix keys (from failing problems and from fixes)."
-
-[[entries]]
-type = "design"
-description = "Phase 99 docs: systemd detection and kill semantics"
-details = "Updated RFC 0099 and the resource-management manual to match current implementation: systemd presence is determined by PID 1 (/proc/1/comm) to avoid /run false positives; cgroup kill fallback is best-effort recursive cgroup.procs enumeration (no freezer semantics)."
-
-[[entries]]
-type = "test"
-description = "Sandbox identity stable default"
-details = "Added Phase 99 TDD coverage ensuring LOCALD_SANDBOX_ACTIVE without LOCALD_SANDBOX_NAME still yields a deterministic sandbox name (default), avoiding cgroup path instability in older environments."
-
-[[entries]]
-type = "test"
-description = "Phase 99 acceptance: document sanitization"
-details = "Added a small test guarding RFC 0099 + the resource-management manual against drift: acceptance criteria now explicitly state cgroup name sanitization rules matching the implemented generator."
-
-[[entries]]
-type = "test"
-description = "Phase 99 verification plumbing"
-details = "Added scripts/verify-phase.sh so exo verify runs scripts/check + Phase 99 tests. Made locald-e2e/tests/cgroup_cleanup.rs self-skipping unless LOCALD_E2E_FORCE_CGROUP_CLEANUP=1. Aligned locald-shim systemd detection with PID1 comm-only heuristic."
+description = "Docs: locald doctor usage"
+details = "Documented `locald doctor` in the CLI reference and CI automation guide, including exit-code semantics, `--json`/`--verbose` usage, and canonical remediation via `sudo locald admin setup`. Also added a brief README mention for privileged host readiness diagnostics."

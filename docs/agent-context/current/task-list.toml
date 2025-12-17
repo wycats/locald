@@ -2,27 +2,42 @@
 # Task List
 
 [[tasks]]
-id = "99.1"
-title = "Align RFC 0099 with PID1 detection"
+id = "109.1"
+title = "CLI: add locald doctor command"
+status = "pending"
+
+[[tasks]]
+id = "109.2"
+title = "Check: privileged shim readiness"
+status = "pending"
+
+[[tasks]]
+id = "109.3"
+title = "Check: cgroup v2 and root readiness"
+status = "pending"
+
+[[tasks]]
+id = "109.4"
+title = "Output: actionable fix suggestions"
+status = "pending"
+
+[[tasks]]
+id = "109.5"
+title = "Output: JSON and verbose modes"
+status = "pending"
+
+[[tasks]]
+id = "109.6"
+title = "Docs: doctor UX + examples"
 status = "completed"
 
 [[tasks]]
-id = "99.2"
-title = "Align manual resource-management with detection + kill semantics"
-status = "completed"
+id = "109.7"
+title = "Future: optional auto-fix mode"
+status = "pending"
 
 [[tasks]]
-id = "99.3"
-title = "Sandbox identity for cgroups (tests)"
-status = "completed"
-
-[[tasks]]
-id = "99.4"
-title = "Docs acceptance: sanitize naming contract"
-status = "completed"
-
-[[tasks]]
-id = "99.5"
-title = "Phase 99 verification plumbing"
-status = "completed"
+id = "109.8"
+title = "Future: deeper runtime/kernel checks"
+status = "pending"
 

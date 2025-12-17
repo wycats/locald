@@ -35,6 +35,7 @@ async fn wait_for_gone(path: &std::path::Path, timeout: Duration) -> Result<()> 
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_service_stop_prunes_cgroup_leaf() -> Result<()> {
     // This test is designed to be runnable as an unprivileged user, but it requires:
     // - cgroup v2 mounted

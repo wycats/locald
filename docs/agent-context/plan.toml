@@ -1037,7 +1037,7 @@ status = "complete"
 [[epochs.phases]]
 id = "109"
 title = "Host Diagnostics (locald doctor)"
-status = "pending"
+status = "active"
 rfcs = [
     "0109",
     "0110",
@@ -1071,7 +1071,7 @@ status = "pending"
 [[epochs.phases.tasks]]
 id = "109.6"
 label = "Docs: doctor UX + examples"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "109.7"
