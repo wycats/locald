@@ -14,17 +14,18 @@ pub fn is_sandbox_active() -> bool {
 ///
 /// This is determined by the `LOCALD_SANDBOX_NAME` environment variable.
 ///
-/// Note: sandbox mode can be active without a name (older environments). In that case
-/// this returns `None`.
+/// If sandbox mode is active but no name is set (older environments), this returns
+/// `Some("default")`.
 pub fn sandbox_name() -> Option<String> {
     if !is_sandbox_active() {
         return None;
     }
 
-    let name = std::env::var("LOCALD_SANDBOX_NAME").ok()?;
-    let trimmed = name.trim();
+    let name = std::env::var("LOCALD_SANDBOX_NAME").ok();
+    let trimmed = name.as_deref().unwrap_or("").trim();
+
     if trimmed.is_empty() {
-        None
+        Some("default".to_string())
     } else {
         Some(trimmed.to_string())
     }

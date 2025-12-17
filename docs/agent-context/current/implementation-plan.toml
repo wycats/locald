@@ -21,8 +21,9 @@ name = "Sandbox identity for cgroups"
 type = "feat"
 details = "Introduce a stable sandbox identifier available to the daemon (e.g. LOCALD_SANDBOX_NAME) so cgroup paths can use locald-<sandbox>.slice deterministically."
 files = ["locald-cli/src/utils.rs", "locald-utils/src/env.rs", "locald-server/src/config_loader.rs"]
-tests = []
+tests = ["locald-utils/tests/phase99_sandbox_identity.rs"]
 no_test_reason = "Will be verified in Phase 99 end-to-end"
+status = "completed"
 
 [[plan.changes]]
 name = "Cgroup path generator"

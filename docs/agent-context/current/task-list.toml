@@ -11,3 +11,8 @@ id = "99.2"
 title = "Align manual resource-management with detection + kill semantics"
 status = "completed"
 
+[[tasks]]
+id = "99.3"
+title = "Sandbox identity for cgroups (tests)"
+status = "completed"
+

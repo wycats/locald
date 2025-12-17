@@ -25,3 +25,8 @@ details = "Added a property test asserting that DoctorReport JSON roundtrip pres
 type = "design"
 description = "Phase 99 docs: systemd detection and kill semantics"
 details = "Updated RFC 0099 and the resource-management manual to match current implementation: systemd presence is determined by PID 1 (/proc/1/comm) to avoid /run false positives; cgroup kill fallback is best-effort recursive cgroup.procs enumeration (no freezer semantics)."
+
+[[entries]]
+type = "test"
+description = "Sandbox identity stable default"
+details = "Added Phase 99 TDD coverage ensuring LOCALD_SANDBOX_ACTIVE without LOCALD_SANDBOX_NAME still yields a deterministic sandbox name (default), avoiding cgroup path instability in older environments."
