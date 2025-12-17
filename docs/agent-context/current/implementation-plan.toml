@@ -13,8 +13,9 @@ name = "Docs: define Phase 99 acceptance"
 type = "docs"
 details = "Align RFC 0099 + manual with current reality and clarify acceptance criteria: when cgroup hierarchy is considered implemented, how sandbox/service names map to cgroup paths, and how stop/restart guarantees cleanup."
 files = ["docs/rfcs/0099-cgroup-hierarchy.md", "docs/manual/architecture/resource-management.md"]
-tests = []
+tests = ["locald-utils/tests/phase99_docs_acceptance.rs"]
 no_test_reason = "Docs-only change"
+status = "completed"
 
 [[plan.changes]]
 name = "Sandbox identity for cgroups"

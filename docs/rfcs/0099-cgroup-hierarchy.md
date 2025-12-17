@@ -108,6 +108,7 @@ To stop a service, we will no longer rely solely on `SIGTERM` to the PID.
     - Every shim-run service is placed in a leaf cgroup at:
       - Systemd: `/locald.slice/locald-<sandbox>.slice/service-<name>.scope`, or
       - Driver: `/locald/locald-<sandbox>/service-<name>`.
+    - `<sandbox>` and `<name>` are sanitized into safe cgroup path components (e.g. `:` and other delimiters map to `-`; `..` and empty components are not permitted).
     - The computed absolute path is written to `linux.cgroupsPath` in the OCI bundle `config.json`.
 
   3. **Stop/restart guarantees cleanup**

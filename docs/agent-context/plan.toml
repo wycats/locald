@@ -1617,5 +1617,5 @@ status = "pending"
 id = "99"
 title = "Structured Cgroup Hierarchy"
 status = "active"
-tasks = [{ id = "99.1", label = "Align RFC 0099 with PID1 detection", status = "completed" }, { id = "99.2", label = "Align manual resource-management with detection + kill semantics", status = "completed" }, { id = "99.3", label = "Sandbox identity for cgroups (tests)", status = "completed" }]
+tasks = [{ id = "99.1", label = "Align RFC 0099 with PID1 detection", status = "completed" }, { id = "99.2", label = "Align manual resource-management with detection + kill semantics", status = "completed" }, { id = "99.3", label = "Sandbox identity for cgroups (tests)", status = "completed" }, { id = "99.4", label = "Docs acceptance: sanitize naming contract", status = "completed" }]
 rfcs = ["0099"]

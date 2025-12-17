@@ -30,3 +30,8 @@ details = "Updated RFC 0099 and the resource-management manual to match current 
 type = "test"
 description = "Sandbox identity stable default"
 details = "Added Phase 99 TDD coverage ensuring LOCALD_SANDBOX_ACTIVE without LOCALD_SANDBOX_NAME still yields a deterministic sandbox name (default), avoiding cgroup path instability in older environments."
+
+[[entries]]
+type = "test"
+description = "Phase 99 acceptance: document sanitization"
+details = "Added a small test guarding RFC 0099 + the resource-management manual against drift: acceptance criteria now explicitly state cgroup name sanitization rules matching the implemented generator."

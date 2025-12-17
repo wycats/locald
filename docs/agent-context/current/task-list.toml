@@ -16,3 +16,8 @@ id = "99.3"
 title = "Sandbox identity for cgroups (tests)"
 status = "completed"
 
+[[tasks]]
+id = "99.4"
+title = "Docs acceptance: sanitize naming contract"
+status = "completed"
+

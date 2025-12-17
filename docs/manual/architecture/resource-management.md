@@ -30,6 +30,10 @@ The hierarchy mirrors the logical structure of `locald`'s runtime, ensuring that
 - **Sandbox Root**: `locald-<sandbox>.slice`. Isolates different `locald` instances or environments (e.g., `locald-test.slice`).
 - **Service Leaf**: `service-<name>.scope`. The actual container runs here. We use `.scope` because these are transient units managed programmatically, not static systemd services.
 
+`<sandbox>` and `<name>` are sanitized into safe cgroup path components:
+- Disallowed characters (including `:`) map to `-`.
+- Empty components and parent traversal (`..`) are not permitted.
+
 ## The Anchor & The Driver
 
 `locald` must establish ownership of `locald.slice` before it can manage resources. It uses two strategies depending on the host environment.
