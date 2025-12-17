@@ -115,7 +115,7 @@ pub fn run() -> Result<()> {
     std::fs::write(&config_path, toml_string)?;
 
     println!("\nSuccessfully created locald.toml!");
-    println!("Run `locald start` to launch your project.");
+    println!("Run `locald up` to launch your project.");
 
     Ok(())
 }
