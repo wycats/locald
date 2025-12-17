@@ -245,13 +245,8 @@ fn check_port(port: u16) -> Result<()> {
 
 #[allow(clippy::disallowed_methods)]
 fn is_systemd_present() -> bool {
-    if !Path::new("/run/systemd/system").exists() {
-        return false;
-    }
-
     // A common failure mode in CI/containers is that systemd-related files exist on disk,
-    // but systemd is not actually PID 1. In that case, "systemctl" calls may succeed or
-    // partially work, but the systemd cgroup tree won't exist.
+    // but systemd is not actually PID 1.
     match std::fs::read_to_string("/proc/1/comm") {
         Ok(comm) => comm.trim() == "systemd",
         Err(_) => false,

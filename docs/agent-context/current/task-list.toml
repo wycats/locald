@@ -21,3 +21,8 @@ id = "99.4"
 title = "Docs acceptance: sanitize naming contract"
 status = "completed"
 
+[[tasks]]
+id = "99.5"
+title = "Phase 99 verification plumbing"
+status = "completed"
+

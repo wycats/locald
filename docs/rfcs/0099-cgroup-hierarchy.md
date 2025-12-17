@@ -92,30 +92,40 @@ To stop a service, we will no longer rely solely on `SIGTERM` to the PID.
 1.  **Signal**: Send `SIGTERM` to the main PID (as before) to allow graceful shutdown.
 2.  **Kill**: If the service does not exit, or to ensure cleanup, we use the cgroup to kill _everything_.
     - **Method**: Write `1` to `cgroup.kill` (Linux 5.13+).
-  - **Fallback**: Recursively enumerate `cgroup.procs` in the subtree and `SIGKILL` PIDs (best-effort, intentionally conservative; no freezer semantics).
+
+- **Fallback**: Recursively enumerate `cgroup.procs` in the subtree and `SIGKILL` PIDs (best-effort, intentionally conservative; no freezer semantics).
+
 3.  **Prune**: Remove the empty cgroup directory.
 
-  ## Acceptance Criteria (Phase 99)
+## Acceptance Criteria (Phase 99)
 
-  This RFC is considered complete when:
+This RFC is considered complete when:
 
-  1. **Root ownership is established**
+1. **Root ownership is established**
+
+
     - `locald admin setup` (via the shim) establishes either:
       - Systemd Anchor: `/sys/fs/cgroup/locald.slice` exists and is delegated, or
       - Driver fallback: `/sys/fs/cgroup/locald` exists and has controllers enabled for nesting.
 
-  2. **Deterministic hierarchy is applied at runtime**
+2. **Deterministic hierarchy is applied at runtime**
+
+
     - Every shim-run service is placed in a leaf cgroup at:
       - Systemd: `/locald.slice/locald-<sandbox>.slice/service-<name>.scope`, or
       - Driver: `/locald/locald-<sandbox>/service-<name>`.
     - `<sandbox>` and `<name>` are sanitized into safe cgroup path components (e.g. `:` and other delimiters map to `-`; `..` and empty components are not permitted).
     - The computed absolute path is written to `linux.cgroupsPath` in the OCI bundle `config.json`.
 
-  3. **Stop/restart guarantees cleanup**
+3. **Stop/restart guarantees cleanup**
+
+
     - `locald stop` and `locald restart` use cgroup-level kill semantics after a grace period.
     - No leaked subprocesses remain after stop/restart, including double-fork cases.
 
-  4. **Verification is documented**
+4. **Verification is documented**
+
+
     - Manual verification instructions exist (e.g. using `systemd-cgls` or filesystem inspection under `/sys/fs/cgroup`).
 
 ## Consequences

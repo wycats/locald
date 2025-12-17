@@ -33,6 +33,7 @@ details = "Implement a small shared utility to compute absolute cgroup v2 paths 
 files = ["locald-utils/src", "locald-core/src"]
 tests = []
 no_test_reason = "Covered by Phase 99 verification"
+status = "completed"
 
 [[plan.changes]]
 name = "Wire linux.cgroupsPath into OCI bundles"
@@ -41,6 +42,7 @@ details = "Plumb computed cgroup_path into OCI spec generation for all shim-run 
 files = ["locald-oci/src/runtime_spec.rs", "locald-server/src/runtime/process.rs", "locald-server/src/container.rs", "locald-server/src/service/exec.rs"]
 tests = []
 no_test_reason = "Covered by Phase 99 verification"
+status = "completed"
 
 [[plan.changes]]
 name = "Shim: cgroup setup + scorched-earth kill"
@@ -49,6 +51,7 @@ details = "Extend locald-shim admin commands to (a) establish delegated cgroup r
 files = ["locald-shim/src/main.rs"]
 tests = []
 no_test_reason = "Requires privileged Linux environment; verified via manual/e2e"
+status = "completed"
 
 [[plan.changes]]
 name = "Daemon stop uses cgroup kill"
@@ -57,6 +60,7 @@ details = "Update stop/restart to guarantee no leaked subprocesses: after SIGTER
 files = ["locald-server/src/service/exec.rs", "locald-server/src/manager.rs"]
 tests = []
 no_test_reason = "Verified via Phase 99 end-to-end"
+status = "completed"
 
 [[plan.changes]]
 name = "Verification: cgroup tree + leak checks"
@@ -64,6 +68,7 @@ type = "test"
 details = "Add optional verification: (1) manual instructions for systemd-cgls tree, (2) e2e test gated to Linux+cgroupv2+privileged shim that starts a service that forks and confirms stop removes it."
 files = ["locald-e2e/tests", "docs/manual/architecture/resource-management.md"]
 tests = []
+status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use locald_e2e::TestContext;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,26 +35,61 @@ async fn wait_for_gone(path: &std::path::Path, timeout: Duration) -> Result<()> 
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_service_stop_prunes_cgroup_leaf() -> Result<()> {
-    // This test is intentionally ignored by default.
-    // It is designed to be runnable as an unprivileged user, but it requires:
+    // This test is designed to be runnable as an unprivileged user, but it requires:
     // - cgroup v2 mounted
     // - a setuid-root locald-shim installed next to the locald binary
     // - the locald cgroup root configured (e.g. sudo ./target/debug/locald admin setup)
+    //
+    // By default it self-skips when prerequisites aren't met.
+    // Set LOCALD_E2E_FORCE_CGROUP_CLEANUP=1 to force it.
+
+    let force = std::env::var_os("LOCALD_E2E_FORCE_CGROUP_CLEANUP").is_some();
 
     if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        if !force {
+            eprintln!(
+                "Skipping cgroup cleanup integration test: cgroup v2 not available (missing /sys/fs/cgroup/cgroup.controllers).\n\
+                 Set LOCALD_E2E_FORCE_CGROUP_CLEANUP=1 to force running it."
+            );
+            return Ok(());
+        }
+
         anyhow::bail!(
             "cgroup v2 does not appear to be available (missing /sys/fs/cgroup/cgroup.controllers)"
         );
     }
 
-    let shim = locald_utils::shim::find_privileged()?.context(
-        "locald-shim is not configured; run sudo ./target/debug/locald admin setup first",
-    )?;
+    let shim = match locald_utils::shim::find_privileged()? {
+        Some(shim) => shim,
+        None => {
+            if !force {
+                eprintln!(
+                    "Skipping cgroup cleanup integration test: privileged locald-shim not configured.\n\
+                     Run sudo ./target/debug/locald admin setup first.\n\
+                     Set LOCALD_E2E_FORCE_CGROUP_CLEANUP=1 to force running it."
+                );
+                return Ok(());
+            }
+
+            anyhow::bail!(
+                "locald-shim is not configured; run sudo ./target/debug/locald admin setup first"
+            );
+        }
+    };
 
     let strategy = locald_utils::cgroup::detect_root_strategy();
     if !locald_utils::cgroup::is_root_ready(strategy) {
+        if !force {
+            eprintln!(
+                "Skipping cgroup cleanup integration test: locald cgroup root is not ready.\n\
+                 Run sudo ./target/debug/locald admin setup (shim at {}).\n\
+                 Set LOCALD_E2E_FORCE_CGROUP_CLEANUP=1 to force running it.",
+                shim.display()
+            );
+            return Ok(());
+        }
+
         anyhow::bail!(
             "locald cgroup root is not ready; run sudo ./target/debug/locald admin setup (shim at {})",
             shim.display()

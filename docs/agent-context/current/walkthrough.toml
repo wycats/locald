@@ -35,3 +35,8 @@ details = "Added Phase 99 TDD coverage ensuring LOCALD_SANDBOX_ACTIVE without LO
 type = "test"
 description = "Phase 99 acceptance: document sanitization"
 details = "Added a small test guarding RFC 0099 + the resource-management manual against drift: acceptance criteria now explicitly state cgroup name sanitization rules matching the implemented generator."
+
+[[entries]]
+type = "test"
+description = "Phase 99 verification plumbing"
+details = "Added scripts/verify-phase.sh so exo verify runs scripts/check + Phase 99 tests. Made locald-e2e/tests/cgroup_cleanup.rs self-skipping unless LOCALD_E2E_FORCE_CGROUP_CLEANUP=1. Aligned locald-shim systemd detection with PID1 comm-only heuristic."
