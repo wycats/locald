@@ -6,6 +6,16 @@ title: CLI Reference
 
 ## Core Commands
 
+For a complete list of commands and flags, run:
+
+```bash
+locald --help
+```
+
+### `locald init`
+
+Initialize a new `locald` project by interactively generating a `locald.toml`.
+
 ### `locald up`
 
 Starts the `locald` daemon and the services defined in your `locald.toml`.
@@ -18,9 +28,33 @@ It displays a dynamic progress UI that shows the status of builds and service st
 
 If a step fails, the UI will persist the error details for debugging.
 
-### `locald down`
+### `locald stop`
 
-Stops all running services and the daemon.
+Stop a running service. If no service name is provided, stops all services defined in `locald.toml` for the current project.
+
+### `locald server shutdown`
+
+Shutdown the running daemon.
+
+### `locald status`
+
+List running services.
+
+### `locald logs`
+
+Stream logs from services.
+
+### `locald restart`
+
+Restart a running service.
+
+### `locald monitor`
+
+Open the terminal UI (TUI) to monitor running services.
+
+### `locald dashboard`
+
+Open the dashboard in your default browser.
 
 ## Diagnostics
 
@@ -58,13 +92,13 @@ locald doctor --json
 Run a command in a temporary, isolated environment. This is useful for trying out tools or running one-off scripts without installing them globally.
 
 ```bash
-# Run a python script without installing python
-locald try python:3.9 python my_script.py
+# Run a command with a dynamic PORT and save it later if desired
+locald try python3 -m http.server $PORT
 ```
 
 ### `locald run`
 
-Run a command within the context of a defined service. This injects the service's environment variables and network context.
+Run a one-off task within the context of a defined service. This injects the service's environment variables (DB URL, etc.) and network context.
 
 ```bash
 # Run a database migration using the 'web' service's environment
@@ -72,3 +106,11 @@ locald run web -- rails db:migrate
 ```
 
 Note: This runs the command _locally_ on your machine (as a host process), but with the environment configuration of the service.
+
+### `locald trust`
+
+Install the local Certificate Authority into the system trust store so HTTPS works cleanly.
+
+### `locald admin setup`
+
+Perform one-time privileged setup (install/configure `locald-shim`, cgroups, etc.).
