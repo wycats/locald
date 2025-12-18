@@ -2,7 +2,7 @@ use std::path::Path;
 
 /// A placeholder Linux `VirtualMachine` implementation for non-x86 Linux.
 ///
-/// The current Linux/KVM backend in `locald-vmm` is implemented for x86/x86_64
+/// The current Linux/KVM backend in `locald-vmm` is implemented for `x86/x86_64`
 /// (boot params, CPUID, PIT/IRQ chip, segment regs, etc.).
 ///
 /// On other Linux architectures (e.g. aarch64), we compile a stub so the
@@ -13,7 +13,7 @@ pub struct VirtualMachine;
 impl VirtualMachine {
     /// Creates a new Virtual Machine instance.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 

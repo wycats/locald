@@ -446,10 +446,10 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
     // On a fresh machine this is commonly missing until `locald admin setup`.
     let certs_dir = (|| -> Result<PathBuf> {
         // If running under sudo, check the invoking user's home, not root's.
-        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            if let Ok(Some(user)) = User::from_name(&sudo_user) {
-                return Ok(user.dir.join(".locald").join("certs"));
-            }
+        if let Ok(sudo_user) = std::env::var("SUDO_USER")
+            && let Ok(Some(user)) = User::from_name(&sudo_user)
+        {
+            return Ok(user.dir.join(".locald").join("certs"));
         }
         cert::get_certs_dir()
     })();

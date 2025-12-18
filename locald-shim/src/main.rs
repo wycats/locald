@@ -141,9 +141,22 @@ fn ensure_root_ca(certs_dir: &Path) -> Result<StdPathBuf> {
         let key_pair = KeyPair::generate()?;
         let cert = params.self_signed(&key_pair)?;
 
-        std::fs::write(&ca_cert_path, cert.pem()).context("failed to write rootCA.pem")?;
-        std::fs::write(&ca_key_path, key_pair.serialize_pem())
-            .context("failed to write rootCA-key.pem")?;
+        {
+            use std::io::Write;
+
+            let mut f = std::fs::File::create(&ca_cert_path).context("failed to create rootCA.pem")?;
+            f.write_all(cert.pem().as_bytes())
+                .context("failed to write rootCA.pem")?;
+        }
+
+        {
+            use std::io::Write;
+
+            let mut f =
+                std::fs::File::create(&ca_key_path).context("failed to create rootCA-key.pem")?;
+            f.write_all(key_pair.serialize_pem().as_bytes())
+                .context("failed to write rootCA-key.pem")?;
+        }
     }
 
     Ok(ca_cert_path)
@@ -183,6 +196,7 @@ fn admin_trust() -> Result<i32> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)]
 fn install_ca_linux_fallback(cert_path: &Path) -> Result<()> {
     use std::process::Command;
 
@@ -380,10 +394,18 @@ fn check_port(port: u16) -> Result<()> {
 fn is_systemd_present() -> bool {
     // A common failure mode in CI/containers is that systemd-related files exist on disk,
     // but systemd is not actually PID 1.
-    match std::fs::read_to_string("/proc/1/comm") {
-        Ok(comm) => comm.trim() == "systemd",
-        Err(_) => false,
+    use std::io::Read;
+
+    let mut buf = String::new();
+    let Ok(mut f) = std::fs::File::open("/proc/1/comm") else {
+        return false;
+    };
+
+    if f.read_to_string(&mut buf).is_err() {
+        return false;
     }
+
+    buf.trim() == "systemd"
 }
 
 fn ensure_cgroup2_mount() -> Result<()> {
