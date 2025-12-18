@@ -59,21 +59,23 @@ impl CertManager {
         if !cert_exists && !key_exists {
             // Generate a new CA on the fly so HTTPS can function immediately.
             // The user can then run `locald admin setup` to install it into the system trust store.
-            let (cert_pem, key_pem) = tokio::task::spawn_blocking(|| -> Result<(String, String)> {
-                let mut params = CertificateParams::default();
-                let mut dn = DistinguishedName::new();
-                dn.push(DnType::CommonName, "locald Development CA");
-                dn.push(DnType::OrganizationName, "locald");
-                params.distinguished_name = dn;
-                params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-                params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let (cert_pem, key_pem) =
+                tokio::task::spawn_blocking(|| -> Result<(String, String)> {
+                    let mut params = CertificateParams::default();
+                    let mut dn = DistinguishedName::new();
+                    dn.push(DnType::CommonName, "locald Development CA");
+                    dn.push(DnType::OrganizationName, "locald");
+                    params.distinguished_name = dn;
+                    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+                    params.key_usages =
+                        vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-                let key_pair = KeyPair::generate()?;
-                let cert = params.self_signed(&key_pair)?;
-                Ok((cert.pem(), key_pair.serialize_pem()))
-            })
-            .await
-            .context("CA generation task panicked")??;
+                    let key_pair = KeyPair::generate()?;
+                    let cert = params.self_signed(&key_pair)?;
+                    Ok((cert.pem(), key_pair.serialize_pem()))
+                })
+                .await
+                .context("CA generation task panicked")??;
 
             // Write files atomically-ish (best effort). If this fails, surface the error.
             tokio::fs::write(&ca_cert_path, cert_pem)

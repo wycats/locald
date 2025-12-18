@@ -139,12 +139,8 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
     let anchors_dir = std::path::Path::new("/etc/pki/ca-trust/source/anchors");
     if anchors_dir.exists() {
         let target = anchors_dir.join("locald-rootCA.pem");
-        std::fs::copy(cert_path, &target).with_context(|| {
-            format!(
-                "Failed to copy CA to {} (need root?)",
-                target.display()
-            )
-        })?;
+        std::fs::copy(cert_path, &target)
+            .with_context(|| format!("Failed to copy CA to {} (need root?)", target.display()))?;
 
         let status = Command::new("update-ca-trust")
             .arg("extract")
@@ -160,12 +156,8 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
     let debian_dir = std::path::Path::new("/usr/local/share/ca-certificates");
     if debian_dir.exists() {
         let target = debian_dir.join("locald-rootCA.crt");
-        std::fs::copy(cert_path, &target).with_context(|| {
-            format!(
-                "Failed to copy CA to {} (need root?)",
-                target.display()
-            )
-        })?;
+        std::fs::copy(cert_path, &target)
+            .with_context(|| format!("Failed to copy CA to {} (need root?)", target.display()))?;
 
         let status = Command::new("update-ca-certificates")
             .status()

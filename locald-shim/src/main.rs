@@ -6,8 +6,8 @@ use nix::unistd::Pid;
 use nix::unistd::{Gid, Uid};
 use std::env;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
 use std::path::PathBuf as StdPathBuf;
+use std::path::{Path, PathBuf};
 
 // Constants for prctl
 // const PR_CAP_AMBIENT: i32 = 47;

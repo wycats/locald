@@ -5,8 +5,8 @@
 
 #![allow(missing_docs)]
 
-use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
 use crate::cert;
+use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
 use crate::shim;
 use anyhow::{Context, Result};
 use nix::unistd::User;
@@ -525,7 +525,6 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         fixes,
     })
 }
-
 
 fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
     use std::collections::BTreeSet;
