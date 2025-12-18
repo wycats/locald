@@ -6,8 +6,10 @@
 #![allow(missing_docs)]
 
 use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
+use crate::cert;
 use crate::shim;
 use anyhow::{Context, Result};
+use nix::unistd::User;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -438,6 +440,82 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         }
     }
 
+    // HTTPS readiness (Root CA presence)
+    //
+    // The daemon can run HTTP without certificates, but HTTPS requires a local Root CA.
+    // On a fresh machine this is commonly missing until `locald admin setup`.
+    let certs_dir = (|| -> Result<PathBuf> {
+        // If running under sudo, check the invoking user's home, not root's.
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if let Ok(Some(user)) = User::from_name(&sudo_user) {
+                return Ok(user.dir.join(".locald").join("certs"));
+            }
+        }
+        cert::get_certs_dir()
+    })();
+
+    match certs_dir {
+        Ok(dir) => {
+            let ca_cert_path = dir.join("rootCA.pem");
+            let ca_key_path = dir.join("rootCA-key.pem");
+            let cert_exists = ca_cert_path.exists();
+            let key_exists = ca_key_path.exists();
+
+            if !cert_exists || !key_exists {
+                problems.push(Problem {
+                    id: "https.root_ca".to_string(),
+                    severity: Severity::Warning,
+                    status: Status::Fail,
+                    summary: "HTTPS Root CA is not configured (HTTPS may be disabled or untrusted)"
+                        .to_string(),
+                    details: Some(
+                        "Run `locald admin setup` to generate/install the locald Root CA and configure HTTPS trust."
+                            .to_string(),
+                    ),
+                    remediation: vec![
+                        "locald trust".to_string(),
+                        "sudo locald admin setup".to_string(),
+                    ],
+                    evidence: if config.verbose {
+                        vec![
+                            EvidenceItem {
+                                key: "certs.dir".to_string(),
+                                value: dir.display().to_string(),
+                            },
+                            EvidenceItem {
+                                key: "certs.rootCA.pem".to_string(),
+                                value: if cert_exists { "present" } else { "missing" }
+                                    .to_string(),
+                            },
+                            EvidenceItem {
+                                key: "certs.rootCA-key.pem".to_string(),
+                                value: if key_exists { "present" } else { "missing" }
+                                    .to_string(),
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    },
+                    fix: None,
+                });
+            }
+        }
+        Err(e) => {
+            if config.verbose {
+                problems.push(Problem {
+                    id: "https.root_ca".to_string(),
+                    severity: Severity::Info,
+                    status: Status::Skip,
+                    summary: "Skipped HTTPS Root CA check".to_string(),
+                    details: Some(e.to_string()),
+                    remediation: vec![],
+                    evidence: vec![],
+                    fix: None,
+                });
+            }
+        }
+    }
+
     let fixes = consolidate_fixes(&problems);
 
     Ok(DoctorReport {
@@ -447,6 +525,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         fixes,
     })
 }
+
 
 fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
     use std::collections::BTreeSet;

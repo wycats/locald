@@ -421,45 +421,143 @@ pub fn run(cli: Cli) -> Result<()> {
                 AdminCommands::Setup => {
                     const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
 
-                    #[cfg(unix)]
+                    #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
-                        anyhow::bail!(
-                            "This command requires root privileges. Please run with sudo."
-                        );
+                        use crossterm::tty::IsTty;
+                        use std::process::Command;
+
+                        // `admin setup` fundamentally requires root, but we can be friendly here:
+                        // when run from a TTY, re-exec ourselves via `sudo` so the user doesn't
+                        // have to remember to type it.
+                        if !std::io::stdin().is_tty() {
+                            anyhow::bail!(
+                                "This command requires root privileges. Re-run with `sudo locald admin setup`."
+                            );
+                        }
+
+                        let exe_path = std::env::current_exe()
+                            .context("Failed to resolve current executable path")?;
+
+                        let mut args = std::env::args_os();
+                        let _ = args.next();
+
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::CommandExt;
+                            let err = Command::new("sudo")
+                                .arg("--")
+                                .arg(&exe_path)
+                                .args(args)
+                                .exec();
+                            anyhow::bail!("Failed to exec sudo for admin setup: {err}");
+                        }
+
+                        #[cfg(not(unix))]
+                        {
+                            anyhow::bail!(
+                                "This command requires root privileges. Please run with sudo."
+                            );
+                        }
                     }
 
                     #[cfg(target_os = "linux")]
                     {
+                        cliclack::intro("locald admin setup")?;
+
                         let exe_path = std::env::current_exe()?;
                         let exe_dir = exe_path.parent().context("Failed to get exe directory")?;
                         let shim_path = exe_dir.join("locald-shim");
 
-                        println!("Installing locald-shim to {}", shim_path.display());
-                        locald_utils::shim::install(&shim_path, SHIM_BYTES)?;
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Installing privileged helper...");
+                            locald_utils::shim::install(&shim_path, SHIM_BYTES)?;
+                            s.stop("Privileged helper installed");
+                        }
 
-                        println!("Configuring cgroup root...");
-                        let status = std::process::Command::new(&shim_path)
-                            .arg("admin")
-                            .arg("cgroup")
-                            .arg("setup")
-                            .status()
-                            .context("Failed to run locald-shim admin cgroup setup")?;
+                        // Best-effort: configure HTTPS Root CA + system trust during admin setup.
+                        // This avoids requiring a separate step on fresh machines.
+                        let mut trust_installed = false;
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Configuring HTTPS trust (optional)...");
+                            match crate::trust::install_root_ca_into_trust_store() {
+                                Ok(()) => {
+                                    trust_installed = true;
+                                    s.stop("HTTPS trust configured");
+                                }
+                                Err(_e) => {
+                                    s.stop("HTTPS trust not configured");
+                                }
+                            }
+                        }
 
-                        if !status.success() {
-                            anyhow::bail!(
-                                "locald-shim admin cgroup setup failed with status: {status}"
+                        if !trust_installed {
+                            println!(
+                                "{} HTTPS trust was not installed (optional). If your browser warns, re-run `locald admin setup`.",
+                                style::WARN
                             );
                         }
 
-                        println!("Verifying host readiness...");
-                        let code = doctor::run(false, true)?;
-                        if code != 0 {
-                            anyhow::bail!(
-                                "Admin setup completed, but the host is still not ready. See the report above."
-                            );
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Configuring cgroup root...");
+                            let status = std::process::Command::new(&shim_path)
+                                .arg("admin")
+                                .arg("cgroup")
+                                .arg("setup")
+                                .status()
+                                .context("Failed to run locald-shim admin cgroup setup")?;
+
+                            if !status.success() {
+                                s.error("Cgroup setup failed");
+                                anyhow::bail!(
+                                    "locald-shim admin cgroup setup failed with status: {status}"
+                                );
+                            }
+                            s.stop("Cgroup root configured");
                         }
 
-                        println!("locald-shim installed and configured.");
+                        {
+                            use locald_utils::privileged::{AcquireConfig, Severity, Status};
+
+                            let s = cliclack::spinner();
+                            s.start("Verifying host readiness...");
+
+                            let expected_version = option_env!("LOCALD_EXPECTED_SHIM_VERSION");
+                            let report = locald_utils::privileged::collect_report(AcquireConfig {
+                                verbose: false,
+                                expected_shim_version: expected_version,
+                                expected_shim_bytes: Some(SHIM_BYTES),
+                            })?;
+
+                            if report.has_critical_failures() {
+                                s.error("Host is not ready");
+                                println!(
+                                    "{} Admin setup completed, but the host is still not ready.",
+                                    style::CROSS
+                                );
+
+                                for p in report.problems.iter().filter(|p| {
+                                    p.severity == Severity::Critical && p.status == Status::Fail
+                                }) {
+                                    println!("- {}", p.summary);
+                                    if !p.remediation.is_empty() {
+                                        println!("  Fix:");
+                                        for cmd in &p.remediation {
+                                            println!("    - {}", cmd);
+                                        }
+                                    }
+                                }
+
+                                println!("Run `locald doctor --verbose` for details.");
+                                anyhow::bail!("Host not ready");
+                            }
+
+                            s.stop("Host readiness verified");
+                        }
+
+                        cliclack::outro("Setup complete")?;
                         println!("Next: run `locald up`.");
                     }
 

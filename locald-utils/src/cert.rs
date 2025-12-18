@@ -43,8 +43,50 @@ impl CertManager {
         let ca_cert_path = certs_dir.join("rootCA.pem");
         let ca_key_path = certs_dir.join("rootCA-key.pem");
 
-        if !ca_cert_path.exists() || !ca_key_path.exists() {
-            anyhow::bail!("Root CA not found. Please run `locald trust` first.");
+        tokio::fs::create_dir_all(&certs_dir)
+            .await
+            .context("Failed to create locald certs directory")?;
+
+        let cert_exists = ca_cert_path.exists();
+        let key_exists = ca_key_path.exists();
+
+        if cert_exists != key_exists {
+            anyhow::bail!(
+                "Root CA is partially configured (rootCA.pem/rootCA-key.pem mismatch). Run `locald admin setup` to repair HTTPS setup."
+            );
+        }
+
+        if !cert_exists && !key_exists {
+            // Generate a new CA on the fly so HTTPS can function immediately.
+            // The user can then run `locald admin setup` to install it into the system trust store.
+            let (cert_pem, key_pem) = tokio::task::spawn_blocking(|| -> Result<(String, String)> {
+                let mut params = CertificateParams::default();
+                let mut dn = DistinguishedName::new();
+                dn.push(DnType::CommonName, "locald Development CA");
+                dn.push(DnType::OrganizationName, "locald");
+                params.distinguished_name = dn;
+                params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+                params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+                let key_pair = KeyPair::generate()?;
+                let cert = params.self_signed(&key_pair)?;
+                Ok((cert.pem(), key_pair.serialize_pem()))
+            })
+            .await
+            .context("CA generation task panicked")??;
+
+            // Write files atomically-ish (best effort). If this fails, surface the error.
+            tokio::fs::write(&ca_cert_path, cert_pem)
+                .await
+                .with_context(|| format!("Failed to write {}", ca_cert_path.display()))?;
+            tokio::fs::write(&ca_key_path, key_pem)
+                .await
+                .with_context(|| format!("Failed to write {}", ca_key_path.display()))?;
+
+            info!(
+                "Generated locald Root CA at {} (run `locald admin setup` to install into system trust store)",
+                ca_cert_path.display()
+            );
         }
 
         // Use tokio::fs for reading the key

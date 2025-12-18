@@ -24,3 +24,5 @@ libcontainer = { version = "0.5.7", default-features = false, features = [
   "v2",
   "systemd",
 ] }
+ca_injector = "0.1.2"
+rcgen = "0.14.5"
