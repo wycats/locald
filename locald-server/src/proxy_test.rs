@@ -23,7 +23,7 @@ async fn test_dashboard_routing() {
     let state_manager = Arc::new(StateManager::with_path(temp_dir.join("state.json")));
     let registry = Arc::new(Mutex::new(Registry::default()));
 
-    let pm = ProcessManager::new(notify_path, docker, state_manager, registry, None)
+    let pm = ProcessManager::new(notify_path, Some(docker), state_manager, registry, None)
         .expect("Failed to create ProcessManager");
     let pm = Arc::new(pm);
     let proxy = ProxyManager::new(pm, Router::new(), None);
@@ -65,7 +65,7 @@ async fn test_docs_routing() {
     let state_manager = Arc::new(StateManager::with_path(temp_dir.join("state.json")));
     let registry = Arc::new(Mutex::new(Registry::default()));
 
-    let pm = ProcessManager::new(notify_path, docker, state_manager, registry, None)
+    let pm = ProcessManager::new(notify_path, Some(docker), state_manager, registry, None)
         .expect("Failed to create ProcessManager");
     let pm = Arc::new(pm);
     let proxy = ProxyManager::new(pm, Router::new(), None);
