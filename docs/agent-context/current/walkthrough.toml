@@ -47,3 +47,8 @@ PR
 
 File
 - docs/agent-context/current/claim-ledger-triage-plan.md"""
+
+[[entries]]
+type = "feat"
+description = "Phase 109 status update"
+details = "Recorded completed doctor work in Exosuit context (impl steps linked to 109.1–109.5; tasks 109.1–109.6 completed). Merged PR #20 (doctor + surface coherence scheduling) and PR #21 (commit signing docs)."

@@ -4,27 +4,27 @@
 [[tasks]]
 id = "109.1"
 title = "CLI: add locald doctor command"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "109.2"
 title = "Check: privileged shim readiness"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "109.3"
 title = "Check: cgroup v2 and root readiness"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "109.4"
 title = "Output: actionable fix suggestions"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "109.5"
 title = "Output: JSON and verbose modes"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "109.6"
