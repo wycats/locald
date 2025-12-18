@@ -4,6 +4,8 @@
 
 This repo is a Rust workspace with a small privileged helper (`locald-shim`) and several supporting packages (dashboard, docs, e2e harness).
 
+Contributing guide: see `CONTRIBUTING.md`.
+
 ## Start here
 
 - **CLI (user entrypoint):** `locald-cli/`
