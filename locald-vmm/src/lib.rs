@@ -11,7 +11,19 @@
 //! - **macOS**: Uses `objc2-virtualization` (planned) to use the native Apple Hypervisor.
 
 #[cfg(target_os = "linux")]
-/// Linux-specific KVM implementation.
+/// Linux-specific implementation.
+///
+/// Note: the current KVM boot flow is x86/x86_64-centric (boot params, CPUID,
+/// PIT, segment regs). On other Linux architectures we provide a stub that
+/// compiles but returns an unsupported error at runtime.
+#[cfg_attr(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    path = "linux_x86.rs"
+)]
+#[cfg_attr(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    path = "linux_unsupported.rs"
+)]
 pub mod linux;
 
 /// VirtIO device emulation and transports.
