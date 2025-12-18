@@ -6,6 +6,7 @@ use nix::unistd::Pid;
 use nix::unistd::{Gid, Uid};
 use std::env;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf as StdPathBuf;
 use std::path::{Path, PathBuf};
 
 // Constants for prctl
@@ -89,6 +90,153 @@ enum AdminCommand {
         #[command(subcommand)]
         command: AdminCgroupCommand,
     },
+
+    /// Generate (if needed) and install the locald Root CA into the system trust store.
+    ///
+    /// This runs with privileges and uses the *invoking user's* home directory
+    /// (real uid) for CA material at ~/.locald/certs.
+    Trust,
+}
+
+fn invoking_user_home_dir() -> Result<StdPathBuf> {
+    let uid = nix::unistd::getuid();
+    let user = nix::unistd::User::from_uid(uid)
+        .context("failed to look up invoking user")?
+        .ok_or_else(|| anyhow::anyhow!("invoking user not found for uid {uid}"))?;
+    Ok(user.dir)
+}
+
+fn certs_dir_for_user_home(home: &Path) -> StdPathBuf {
+    home.join(".locald").join("certs")
+}
+
+fn ensure_root_ca(certs_dir: &Path) -> Result<StdPathBuf> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    std::fs::create_dir_all(certs_dir).context("failed to create certs dir")?;
+
+    let ca_cert_path = certs_dir.join("rootCA.pem");
+    let ca_key_path = certs_dir.join("rootCA-key.pem");
+
+    let cert_exists = ca_cert_path.exists();
+    let key_exists = ca_key_path.exists();
+    if cert_exists != key_exists {
+        anyhow::bail!(
+            "Root CA is partially configured (rootCA.pem/rootCA-key.pem mismatch); run `locald admin setup` to repair HTTPS setup"
+        );
+    }
+
+    if !cert_exists {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "locald Development CA");
+        dn.push(DnType::OrganizationName, "locald");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+        let key_pair = KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+
+        {
+            use std::io::Write;
+
+            let mut f =
+                std::fs::File::create(&ca_cert_path).context("failed to create rootCA.pem")?;
+            f.write_all(cert.pem().as_bytes())
+                .context("failed to write rootCA.pem")?;
+        }
+
+        {
+            use std::io::Write;
+
+            let mut f =
+                std::fs::File::create(&ca_key_path).context("failed to create rootCA-key.pem")?;
+            f.write_all(key_pair.serialize_pem().as_bytes())
+                .context("failed to write rootCA-key.pem")?;
+        }
+    }
+
+    Ok(ca_cert_path)
+}
+
+fn admin_trust() -> Result<i32> {
+    let home = invoking_user_home_dir()?;
+    let certs_dir = certs_dir_for_user_home(&home);
+    let ca_cert_path = ensure_root_ca(&certs_dir)?;
+
+    let ca_str = ca_cert_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid CA path"))?;
+
+    if let Err(e) = ca_injector::install_ca(ca_str) {
+        let msg = e.to_string();
+
+        // Fallback to common Linux trust-store tools.
+        // In practice, ca_injector can fail with generic messages on some distros.
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(fallback_err) = install_ca_linux_fallback(&ca_cert_path) {
+                return Err(fallback_err)
+                    .context("failed to install CA into system trust store")
+                    .with_context(|| format!("ca_injector error: {msg}"));
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(e).context("failed to install CA into system trust store");
+        }
+    }
+
+    println!("Installed locald Root CA from {}", ca_cert_path.display());
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)]
+fn install_ca_linux_fallback(cert_path: &Path) -> Result<()> {
+    use std::process::Command;
+
+    let anchors_dir = Path::new("/etc/pki/ca-trust/source/anchors");
+    if anchors_dir.exists() {
+        let target = anchors_dir.join("locald-rootCA.pem");
+        std::fs::copy(cert_path, &target)
+            .with_context(|| format!("Failed to copy CA to {}", target.display()))?;
+
+        let status = Command::new("update-ca-trust")
+            .arg("extract")
+            .status()
+            .context("Failed to execute update-ca-trust extract")?;
+
+        if !status.success() {
+            anyhow::bail!("update-ca-trust extract failed with status: {status}");
+        }
+        return Ok(());
+    }
+
+    let debian_dir = Path::new("/usr/local/share/ca-certificates");
+    if debian_dir.exists() {
+        let target = debian_dir.join("locald-rootCA.crt");
+        std::fs::copy(cert_path, &target)
+            .with_context(|| format!("Failed to copy CA to {}", target.display()))?;
+
+        let status = Command::new("update-ca-certificates")
+            .status()
+            .context("Failed to execute update-ca-certificates")?;
+
+        if !status.success() {
+            anyhow::bail!("update-ca-certificates failed with status: {status}");
+        }
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "No known Linux trust-store directories found; install p11-kit-trust / update-ca-trust or equivalent"
+    );
 }
 
 #[derive(Debug, Args)]
@@ -247,10 +395,18 @@ fn check_port(port: u16) -> Result<()> {
 fn is_systemd_present() -> bool {
     // A common failure mode in CI/containers is that systemd-related files exist on disk,
     // but systemd is not actually PID 1.
-    match std::fs::read_to_string("/proc/1/comm") {
-        Ok(comm) => comm.trim() == "systemd",
-        Err(_) => false,
+    use std::io::Read;
+
+    let mut buf = String::new();
+    let Ok(mut f) = std::fs::File::open("/proc/1/comm") else {
+        return false;
+    };
+
+    if f.read_to_string(&mut buf).is_err() {
+        return false;
     }
+
+    buf.trim() == "systemd"
 }
 
 fn ensure_cgroup2_mount() -> Result<()> {
@@ -613,6 +769,12 @@ fn main() -> Result<()> {
             }
 
             Ok(())
+        }
+        Commands::Admin {
+            command: AdminCommand::Trust,
+        } => {
+            let code = admin_trust()?;
+            std::process::exit(code);
         }
         Commands::Admin {
             command: AdminCommand::Cleanup(args),

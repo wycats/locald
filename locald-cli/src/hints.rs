@@ -22,14 +22,14 @@ fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
 
 pub fn admin_setup_command_for_current_exe() -> String {
     let Ok(current_exe) = std::env::current_exe() else {
-        return "sudo locald admin setup".to_string();
+        return "locald admin setup".to_string();
     };
 
     if let Some(locald_on_path) = find_in_path("locald") {
         if paths_refer_to_same_file(&locald_on_path, &current_exe) {
-            return "sudo locald admin setup".to_string();
+            return "locald admin setup".to_string();
         }
     }
 
-    format!("sudo {} admin setup", current_exe.display())
+    format!("{} admin setup", current_exe.display())
 }

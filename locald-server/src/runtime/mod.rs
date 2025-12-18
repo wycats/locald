@@ -15,7 +15,7 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub fn new(docker: Arc<Docker>, notify_socket_path: PathBuf) -> Self {
+    pub fn new(docker: Option<Arc<Docker>>, notify_socket_path: PathBuf) -> Self {
         Self {
             docker: DockerRuntime::new(docker),
             process: ProcessRuntime::new(notify_socket_path),

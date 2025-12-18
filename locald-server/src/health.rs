@@ -9,7 +9,7 @@ use tracing::info;
 
 #[derive(Debug)]
 pub(crate) struct HealthMonitor {
-    docker: Arc<Docker>,
+    docker: Option<Arc<Docker>>,
     services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
     event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
@@ -17,7 +17,7 @@ pub(crate) struct HealthMonitor {
 
 impl HealthMonitor {
     pub(crate) fn new(
-        docker: Arc<Docker>,
+        docker: Option<Arc<Docker>>,
         services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
         event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
         proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
@@ -195,31 +195,35 @@ impl HealthMonitor {
                 }
 
                 let success = if let Some(cid) = &container_id {
-                    let config = CreateExecOptions {
-                        cmd: Some(vec!["sh", "-c", &command]),
-                        attach_stdout: Some(false),
-                        attach_stderr: Some(false),
-                        ..Default::default()
-                    };
+                    if let Some(docker) = &docker {
+                        let config = CreateExecOptions {
+                            cmd: Some(vec!["sh", "-c", &command]),
+                            attach_stdout: Some(false),
+                            attach_stderr: Some(false),
+                            ..Default::default()
+                        };
 
-                    if let Ok(exec) = docker.create_exec(cid, config).await {
-                        if (docker.start_exec(&exec.id, None).await).is_ok() {
-                            let mut retries = 0;
-                            let mut exit_code = None;
-                            loop {
-                                if let Ok(inspect) = docker.inspect_exec(&exec.id).await {
-                                    if inspect.running == Some(false) {
-                                        exit_code = inspect.exit_code;
+                        if let Ok(exec) = docker.create_exec(cid, config).await {
+                            if (docker.start_exec(&exec.id, None).await).is_ok() {
+                                let mut retries = 0;
+                                let mut exit_code = None;
+                                loop {
+                                    if let Ok(inspect) = docker.inspect_exec(&exec.id).await {
+                                        if inspect.running == Some(false) {
+                                            exit_code = inspect.exit_code;
+                                            break;
+                                        }
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    retries += 1;
+                                    if retries > 50 {
                                         break;
                                     }
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                retries += 1;
-                                if retries > 50 {
-                                    break;
-                                }
+                                exit_code == Some(0)
+                            } else {
+                                false
                             }
-                            exit_code == Some(0)
                         } else {
                             false
                         }
@@ -244,7 +248,10 @@ impl HealthMonitor {
 
     fn spawn_docker_monitor(&self, name: String, container_id: String) {
         let monitor = self.clone();
-        let docker = self.docker.clone();
+        let Some(docker) = self.docker.clone() else {
+            return;
+        };
+
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
