@@ -1046,27 +1046,27 @@ rfcs = [
 [[epochs.phases.tasks]]
 id = "109.1"
 label = "CLI: add locald doctor command"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "109.2"
 label = "Check: privileged shim readiness"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "109.3"
 label = "Check: cgroup v2 and root readiness"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "109.4"
 label = "Output: actionable fix suggestions"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "109.5"
 label = "Output: JSON and verbose modes"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "109.6"
