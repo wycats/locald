@@ -144,7 +144,8 @@ fn ensure_root_ca(certs_dir: &Path) -> Result<StdPathBuf> {
         {
             use std::io::Write;
 
-            let mut f = std::fs::File::create(&ca_cert_path).context("failed to create rootCA.pem")?;
+            let mut f =
+                std::fs::File::create(&ca_cert_path).context("failed to create rootCA.pem")?;
             f.write_all(cert.pem().as_bytes())
                 .context("failed to write rootCA.pem")?;
         }
