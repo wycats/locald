@@ -15,8 +15,8 @@ pub struct ServerConfig {
     pub privileged_ports: bool,
 
     /// Whether to fallback to unprivileged ports (8080/8443) if privileged ports fail.
-    /// Defaults to false to encourage setting up capabilities.
-    #[serde(default = "default_false")]
+    /// Defaults to true to ensure it works out of the box.
+    #[serde(default = "default_true")]
     pub fallback_ports: bool,
 }
 
@@ -24,15 +24,11 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             privileged_ports: true,
-            fallback_ports: false,
+            fallback_ports: true,
         }
     }
 }
 
 const fn default_true() -> bool {
     true
-}
-
-const fn default_false() -> bool {
-    false
 }

@@ -17,18 +17,22 @@ use tracing::info;
     note = "Use ProcessRuntime (locald-shim bundle run --bundle <PATH> --id <ID>) instead"
 )]
 pub struct DockerRuntime {
-    client: Arc<Docker>,
+    client: Option<Arc<Docker>>,
 }
 
 impl DockerRuntime {
     #[must_use]
-    pub fn new(client: Arc<Docker>) -> Self {
+    pub fn new(client: Option<Arc<Docker>>) -> Self {
         Self { client }
     }
 
     pub async fn stop_container(&self, id: &str) -> Result<()> {
+        let Some(client) = &self.client else {
+            return Ok(());
+        };
+
         info!("Stopping Docker container {}", id);
-        self.client
+        client
             .remove_container(
                 id,
                 Some(bollard::container::RemoveContainerOptions {
@@ -49,12 +53,15 @@ impl DockerRuntime {
         env: &HashMap<String, String>,
         command: Option<&String>,
     ) -> Result<(String, bool, mpsc::Receiver<LogEntry>)> {
+        let Some(client) = &self.client else {
+            anyhow::bail!("Docker is not available");
+        };
+
         // 1. Create Container
         let container_name = format!("locald-{}", name.replace(':', "-"));
 
         // Remove existing if any (cleanup)
-        let _ = self
-            .client
+        let _ = client
             .remove_container(
                 &container_name,
                 Some(bollard::container::RemoveContainerOptions {
@@ -88,8 +95,7 @@ impl DockerRuntime {
             ..Default::default()
         };
 
-        let res = self
-            .client
+        let res = client
             .create_container(
                 Some(bollard::container::CreateContainerOptions {
                     name: container_name,
@@ -103,21 +109,20 @@ impl DockerRuntime {
         let id = res.id;
 
         // Check if image has healthcheck
-        let inspect = self
-            .client
+        let inspect = client
             .inspect_container(&id, None::<InspectContainerOptions>)
             .await?;
         let has_healthcheck = inspect.config.and_then(|c| c.healthcheck).is_some();
 
         // 2. Start Container
-        self.client
+        client
             .start_container(&id, None::<StartContainerOptions>)
             .await
             .context("Failed to start Docker container")?;
 
         // 3. Stream Logs
         let (tx, rx) = mpsc::channel(100);
-        let docker = self.client.clone();
+        let docker = client.clone();
         let id_clone = id.clone();
         let service_name = name.clone();
 

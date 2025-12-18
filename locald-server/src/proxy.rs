@@ -245,7 +245,7 @@ async fn handle_proxy(State(state): State<AppState>, mut req: Request) -> Respon
     // Check if there is a running service for this domain first (e.g. locald-dashboard in dev mode)
     if let Some((service_name, port)) = state.resolver.resolve_service_by_domain(host).await {
         let uri_string = format!(
-            "http://127.0.0.1:{port}{}",
+            "http://localhost:{port}{}",
             req.uri().path_and_query().map_or("", |x| x.as_str())
         );
         let uri: Uri = match uri_string.parse() {

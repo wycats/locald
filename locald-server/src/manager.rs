@@ -267,7 +267,7 @@ impl ProcessManager {
     /// * `registry` - Project registry.
     pub fn new(
         notify_socket_path: PathBuf,
-        docker: Arc<Docker>,
+        docker: Option<Arc<Docker>>,
         state_manager: Arc<StateManager>,
         registry: Arc<Mutex<Registry>>,
         external_log_sender: Option<broadcast::Sender<LogEntry>>,

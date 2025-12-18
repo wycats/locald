@@ -206,9 +206,13 @@ async fn async_main(
         .unwrap_or_else(|_| PathBuf::from("/tmp/locald-notify.sock"));
 
     // Initialize dependencies
-    let docker = bollard::Docker::connect_with_local_defaults()
-        .map(std::sync::Arc::new)
-        .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {e}"))?;
+    let docker = match bollard::Docker::connect_with_local_defaults() {
+        Ok(d) => Some(std::sync::Arc::new(d)),
+        Err(e) => {
+            warn!("Failed to connect to Docker: {e}. Docker-based services will be unavailable.");
+            None
+        }
+    };
 
     let state_manager = std::sync::Arc::new(
         crate::state::StateManager::new().context("Failed to initialize state manager")?,
@@ -325,6 +329,7 @@ async fn async_main(
                     error!(
                         "Failed to bind port 80: {e}. You may need to run `sudo locald admin setup` or configure `privileged_ports = false`."
                     );
+                    // We return error here to stop startup if privileged ports are required but failed.
                     return Err(e);
                 }
                 warn!("Failed to bind port 80: {e}. Trying fallback...");
