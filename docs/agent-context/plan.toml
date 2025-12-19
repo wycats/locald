@@ -1652,7 +1652,7 @@ status = "pending"
 [[epochs.phases]]
 id = "110"
 title = "Surface Contract v1 (Docs + Vocabulary Lock)"
-status = "pending"
+status = "active"
 rfcs = [
     "0112",
     "0114",

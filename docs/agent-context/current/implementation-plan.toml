@@ -2,49 +2,17 @@
 # Implementation Plan
 
 [phase]
-id = "109"
-title = "Host Diagnostics (locald doctor)"
-rfcs = ["0109", "0110"]
+id = "110"
+title = "Surface Contract v1 (Docs + Vocabulary Lock)"
+rfcs = ["0112", "0114"]
 
 [plan]
-
 [[plan.changes]]
-name = "Docs: doctor UX + examples"
-type = "docs"
-details = "Add user-facing docs for locald doctor (human + --json/--verbose), describe canonical remediation (sudo locald admin setup), and mention CI preflight usage."
-files = ["locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/guides/ci-automation.md", "README.md"]
-tests = []
-satisfies = ["109.6"]
-no_test_reason = "Docs-only"
-status = "completed"
-
-[[plan.changes]]
-name = "Doctor: command + output formats"
+name = "First Step"
 type = "feat"
-details = """
-Adds the local host diagnostics entrypoint:
-- `locald doctor` prints a human-readable readiness report.
-- `locald doctor --json` prints a stable JSON report.
-- `--verbose` includes evidence details for debugging."""
-files = ["locald-cli/src/cli.rs", "locald-cli/src/handlers.rs", "locald-cli/src/doctor.rs"]
+details = "Description"
+files = []
 tests = []
-satisfies = ["109.1", "109.4", "109.5"]
-no_test_reason = "Behavior covered by existing integration/unit coverage; verified via local runs and CI."
-status = "completed"
-
-[[plan.changes]]
-name = "Doctor: shim + cgroup readiness checks"
-type = "feat"
-details = """
-Extends the readiness report with:
-- Privileged shim presence/version/permissions checks.
-- Cgroup v2/root strategy checks.
-- Actionable remediation commands (e.g. `sudo locald admin setup`)."""
-files = ["locald-utils/src/privileged.rs", "locald-shim/src/main.rs"]
-tests = []
-satisfies = ["109.2", "109.3"]
-no_test_reason = "Verified via CI and local doctor output; readiness logic exercises existing harnesses."
-status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
