@@ -1,6 +1,6 @@
 [project]
 name = "postgres-multi-test"
-domain = "postgres-multi.local"
+domain = "postgres-multi.localhost"
 
 [services.db1]
 type = "postgres"

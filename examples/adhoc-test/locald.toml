@@ -1,6 +1,6 @@
 [project]
 name = "adhoc-test"
-domain = "adhoc-test.local"
+domain = "adhoc-test.localhost"
 
 [services.myservice]
 type = "exec"

@@ -34,7 +34,7 @@ pub fn run() -> Result<()> {
 
     let domain: String = Input::new()
         .with_prompt("Local Domain (optional)")
-        .default(format!("{project_name}.local"))
+        .default(format!("{project_name}.localhost"))
         .allow_empty(true)
         .interact_text()?;
 
