@@ -1037,7 +1037,7 @@ status = "complete"
 [[epochs.phases]]
 id = "109"
 title = "Host Diagnostics (locald doctor)"
-status = "active"
+status = "completed"
 rfcs = [
     "0109",
     "0110",
