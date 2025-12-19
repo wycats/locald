@@ -2,42 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "109.1"
-title = "CLI: add locald doctor command"
+id = "110.1"
+title = "Define Surface Contract (verbs/nouns)"
 status = "completed"
 
 [[tasks]]
-id = "109.2"
-title = "Check: privileged shim readiness"
+id = "110.2"
+title = "Define stability labels + governance"
 status = "completed"
 
 [[tasks]]
-id = "109.3"
-title = "Check: cgroup v2 and root readiness"
+id = "110.3"
+title = "Update docs to match contract"
 status = "completed"
-
-[[tasks]]
-id = "109.4"
-title = "Output: actionable fix suggestions"
-status = "completed"
-
-[[tasks]]
-id = "109.5"
-title = "Output: JSON and verbose modes"
-status = "completed"
-
-[[tasks]]
-id = "109.6"
-title = "Docs: doctor UX + examples"
-status = "completed"
-
-[[tasks]]
-id = "109.7"
-title = "Future: optional auto-fix mode"
-status = "pending"
-
-[[tasks]]
-id = "109.8"
-title = "Future: deeper runtime/kernel checks"
-status = "pending"
 

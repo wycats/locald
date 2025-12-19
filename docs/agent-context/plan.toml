@@ -1037,7 +1037,7 @@ status = "complete"
 [[epochs.phases]]
 id = "109"
 title = "Host Diagnostics (locald doctor)"
-status = "active"
+status = "completed"
 rfcs = [
     "0109",
     "0110",
@@ -1652,7 +1652,7 @@ status = "pending"
 [[epochs.phases]]
 id = "110"
 title = "Surface Contract v1 (Docs + Vocabulary Lock)"
-status = "pending"
+status = "active"
 rfcs = [
     "0112",
     "0114",
@@ -1661,17 +1661,17 @@ rfcs = [
 [[epochs.phases.tasks]]
 id = "110.1"
 label = "Define Surface Contract (verbs/nouns)"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "110.2"
 label = "Define stability labels + governance"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "110.3"
 label = "Update docs to match contract"
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "111"

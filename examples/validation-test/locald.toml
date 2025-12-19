@@ -1,6 +1,6 @@
 [project]
 name = "validation-test"
-domain = "validation-test.local"
+domain = "validation-test.localhost"
 
 [services.web]
 command = "python3 -m http.server $PORT"

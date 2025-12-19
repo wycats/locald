@@ -7,7 +7,7 @@ While `locald.toml` defines your long-running services, development often requir
 
 ## The `try` Command
 
-The `try` command lets you experiment with a command in the context of your project. It injects the same environment variables (like `$PORT` or `DATABASE_URL`) that your services get.
+The `try` command lets you experiment with a scratch command. Today it injects a dynamic `$PORT` and can prompt to save the command into `locald.toml`.
 
 ```bash
 locald try npm run test
@@ -15,13 +15,15 @@ locald try npm run test
 
 If the command is successful, `locald` will ask if you want to save it as a permanent service in your `locald.toml`.
 
-## The `exec` Command
+## The `run` Command
 
-Use `exec` to run a command "inside" the context of an existing service. This is useful for running administrative tasks that need the exact same environment as a running service.
+Use `run` to execute a one-off command in the context of an existing service. This is useful for administrative actions that need the same environment as a running service.
+
+Note: `locald exec` currently exists as an alias for `locald run`, but it is reserved for a future workflow where `exec` _attaches_ to an existing runner for debugging.
 
 ```bash
 # Run a migration using the 'api' service's environment
-locald exec api npm run migrate
+locald run api npm run migrate
 ```
 
 ## Ephemeral Containers

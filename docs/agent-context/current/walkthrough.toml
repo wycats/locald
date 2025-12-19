@@ -3,52 +3,9 @@
 
 [[entries]]
 type = "design"
-description = "Docs: locald doctor usage"
-details = "Documented `locald doctor` in the CLI reference and CI automation guide, including exit-code semantics, `--json`/`--verbose` usage, and canonical remediation via `sudo locald admin setup`. Also added a brief README mention for privileged host readiness diagnostics."
-
-[[entries]]
-type = "fix"
-description = "Epoch T1 front door truth"
+description = "Phase 110: Surface Contract v1 + stability labels"
 details = """
-Summary
-- Update Getting Started to use locald try for a one-off command.
-- Update CLI reference to remove locald down and document stop and server shutdown.
-- Update locald init output to recommend locald up (not start).
-
-PR
-- https://github.com/wycats/dotlocal/pull/17
-
-Files
-- locald-docs/src/content/docs/getting-started/index.mdx
-- locald-docs/src/content/docs/reference/cli.md
-- locald-cli/src/init.rs
-
-Verification
-- pnpm -C locald-docs build
-- cargo test
-
-Notes
-- The earlier PR creation failure was due to the branch not being pushed; pushing fixed it."""
-
-[[entries]]
-type = "design"
-description = "Claim ledger triage schedule and decisions"
-details = """
-Summary
-- Add the claim-ledger triage scheduling artifact.
-- Record bucket model, priority ordering, and resolved decisions.
-
-Key decisions recorded
-- CL-047: hosts syncing should be automatic after admin setup; needing manual sync-hosts indicates a bug.
-- CL-034: staged AI usability plan: default Markdown output plus explicit JSON mode, with later enrichment.
-
-PR
-- https://github.com/wycats/dotlocal/pull/18
-
-File
-- docs/agent-context/current/claim-ledger-triage-plan.md"""
-
-[[entries]]
-type = "feat"
-description = "Phase 109 status update"
-details = "Recorded completed doctor work in Exosuit context (impl steps linked to 109.1–109.5; tasks 109.1–109.6 completed). Merged PR #20 (doctor + surface coherence scheduling) and PR #21 (commit signing docs)."
+- Expanded RFC 0114 with concrete v1 verbs/nouns and remediation language.
+- Defined stability labels plus a vocabulary-lock governance rule.
+- Updated front-door docs to match the contract (Getting Started, CLI reference, RFCs index).
+- Verification: ./scripts/verify-phase.sh (passed)."""

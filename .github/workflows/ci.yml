@@ -5,6 +5,9 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  schedule:
+    # Nightly-ish: keep a heavy lane running even without PR traffic.
+    - cron: "23 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,23 +15,116 @@ env:
   CARGO_TERM_PROGRESS_WIDTH: "80"
 
 jobs:
+  changes:
+    name: Change Classification
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'clippy.toml'
+              - 'rust-toolchain*'
+              - '.github/workflows/**'
+            web:
+              - 'locald-dashboard/**'
+              - 'locald-docs/**'
+              - '.github/workflows/**'
+
+  mainline-health:
+    name: Mainline Health
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Fail PR if main is red
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          url="https://api.github.com/repos/$REPO/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=1"
+          json=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" "$url")
+
+          conclusion=$(jq -r '.workflow_runs[0].conclusion // ""' <<<"$json")
+          html_url=$(jq -r '.workflow_runs[0].html_url // ""' <<<"$json")
+          head_sha=$(jq -r '.workflow_runs[0].head_sha // ""' <<<"$json")
+
+          if [[ -z "$conclusion" ]]; then
+            echo "No main CI run found yet; allowing PR."
+            exit 0
+          fi
+
+          if [[ "$conclusion" != "success" ]]; then
+            echo "main is not green: conclusion=$conclusion sha=$head_sha"
+            echo "See: $html_url"
+            exit 1
+          fi
+
+          echo "main is green: $head_sha"
+
+  tests-tripwire:
+    name: Tripwire (Tests for Rust changes)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if Rust src changed without test deltas
+        run: ./scripts/untested-change-tripwire.sh
+
   web-build:
     name: Web Build (Dashboard + Docs)
+    if: ${{ github.event_name != 'schedule' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Gate
+        id: gate
+        run: echo "run=${{ needs.changes.outputs.web }}" >> "$GITHUB_OUTPUT"
+
+      - name: No web changes
+        if: ${{ steps.gate.outputs.run != 'true' }}
+        run: echo "No dashboard/docs changes; skipping web build."
+
       - name: Setup Node.js
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install pnpm
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: pnpm/action-setup@v2
         with:
           version: 10
 
       - name: Get pnpm store directory
+        if: ${{ steps.gate.outputs.run == 'true' }}
         id: pnpm-store
         shell: bash
         run: |
@@ -36,6 +132,7 @@ jobs:
           echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
@@ -44,6 +141,7 @@ jobs:
             pnpm-store-${{ runner.os }}-
 
       - name: Build dashboard and docs
+        if: ${{ steps.gate.outputs.run == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -56,43 +154,86 @@ jobs:
 
   rust-fmt:
     name: Rust Format
+    if: ${{ github.event_name != 'schedule' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Gate
+        id: gate
+        run: echo "run=${{ needs.changes.outputs.rust }}" >> "$GITHUB_OUTPUT"
+
+      - name: No Rust changes
+        if: ${{ steps.gate.outputs.run != 'true' }}
+        run: echo "No Rust changes; skipping rustfmt."
+
       - name: Install Rust
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Install dependencies
+        if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
 
       - name: Check formatting
+        if: ${{ steps.gate.outputs.run == 'true' }}
         run: cargo fmt --all -- --check
 
   rust-clippy:
     name: Rust Clippy
+    if: ${{ github.event_name != 'schedule' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
 
+      - name: Gate
+        id: gate
+        run: echo "run=${{ needs.changes.outputs.rust }}" >> "$GITHUB_OUTPUT"
+
+      - name: No Rust changes
+        if: ${{ steps.gate.outputs.run != 'true' }}
+        run: echo "No Rust changes; skipping clippy."
+
+      - name: Install Rust
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config mold
+
+      - name: Setup sccache
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Setup Node.js
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install pnpm
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: pnpm/action-setup@v2
         with:
           version: 10
 
       - name: Get pnpm store directory
+        if: ${{ steps.gate.outputs.run == 'true' }}
         id: pnpm-store
         shell: bash
         run: |
@@ -100,27 +241,16 @@ jobs:
           echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}-${{ github.job }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
           restore-keys: |
             pnpm-store-${{ runner.os }}-
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Cache Cargo registry
+        if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/cache@v4
         with:
           path: |
@@ -132,6 +262,7 @@ jobs:
             cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Lint with Clippy
+        if: ${{ steps.gate.outputs.run == 'true' }}
         run: cargo clippy --workspace -- -D warnings
 
   rust-tests-coverage:
@@ -140,20 +271,79 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+            head_sha="${{ github.sha }}"
+          fi
+
+          # Handle unusual push payloads (e.g. first commit) where before is all zeros.
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files=$(git diff --name-only "$base_sha".."$head_sha")
+
+          if echo "$changed_files" | grep -Eq '(^|/)src/.*\.rs$|\.rs$|Cargo\.toml$|Cargo\.lock$|clippy\.toml$|^Cargo\.toml$|^Cargo\.lock$|^rust-toolchain|^\.github/workflows/'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No Rust changes
+        if: ${{ github.event_name != 'schedule' && steps.gate.outputs.run != 'true' }}
+        run: echo "No Rust changes; skipping tests."
+
+      - name: Install Rust
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config mold
+
+      - name: Setup sccache
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Setup Node.js
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install pnpm
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: pnpm/action-setup@v2
         with:
           version: 10
 
       - name: Get pnpm store directory
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         id: pnpm-store
         shell: bash
         run: |
@@ -161,27 +351,16 @@ jobs:
           echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}-${{ github.job }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
           restore-keys: |
             pnpm-store-${{ runner.os }}-
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Cache Cargo registry
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: actions/cache@v4
         with:
           path: |
@@ -193,15 +372,29 @@ jobs:
             cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Cache OCI layout blobs
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/locald/oci-layout
           key: oci-layout-${{ runner.os }}-v1
 
       - name: Install cargo-llvm-cov
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Run tests (PR fast lane)
+        if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build -p locald-cli --all-features
+          cargo build -p locald-shim
+
+          cargo test --tests --workspace --all-features --exclude locald-e2e
+
       - name: Run tests and generate coverage
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -264,6 +457,7 @@ jobs:
           cargo llvm-cov --no-run --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

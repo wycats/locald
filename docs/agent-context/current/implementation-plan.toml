@@ -2,48 +2,91 @@
 # Implementation Plan
 
 [phase]
-id = "109"
-title = "Host Diagnostics (locald doctor)"
-rfcs = ["0109", "0110"]
+id = "110"
+title = "Surface Contract v1 (Docs + Vocabulary Lock)"
+rfcs = ["0112", "0114"]
 
 [plan]
 
 [[plan.changes]]
-name = "Docs: doctor UX + examples"
+name = "Define Surface Contract v1"
 type = "docs"
-details = "Add user-facing docs for locald doctor (human + --json/--verbose), describe canonical remediation (sudo locald admin setup), and mention CI preflight usage."
-files = ["locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/guides/ci-automation.md", "README.md"]
+details = """
+Draft and lock the v1 user-facing Surface Contract.
+
+Deliverable
+- A concrete list of verbs/nouns we commit to teaching as “real” (CLI + docs vocabulary).
+- Prefer the smallest set that matches the current product reality.
+- Explicitly identify what is out-of-scope / not yet promised.
+
+Acceptance
+- Contract is written down in a single place (likely RFC 0114 + docs entry point).
+- Terms are consistent with existing CLI help and docs."""
+files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md", "locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/getting-started/index.mdx"]
 tests = []
-satisfies = ["109.6"]
+satisfies = ["110.1"]
 no_test_reason = "Docs-only"
 status = "completed"
 
 [[plan.changes]]
-name = "Doctor: command + output formats"
-type = "feat"
+name = "Define stability labels + governance"
+type = "docs"
 details = """
-Adds the local host diagnostics entrypoint:
-- `locald doctor` prints a human-readable readiness report.
-- `locald doctor --json` prints a stable JSON report.
-- `--verbose` includes evidence details for debugging."""
-files = ["locald-cli/src/cli.rs", "locald-cli/src/handlers.rs", "locald-cli/src/doctor.rs"]
+Define stability labels that govern what appears in docs/UI/help.
+
+Deliverable
+- A minimal label set (e.g. Stable / Experimental) with rules for:
+  - where experimental surfaces can appear
+  - how promotion works
+  - who can change labels and under what criteria
+- A “vocabulary lock” rule: adding new user-facing terms requires reuse or an RFC.
+
+Acceptance
+- The rules are easy to apply during doc/CLI updates.
+- There is a single canonical description to link to from other docs."""
+files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md", "locald-docs/src/content/docs/internals/rfcs/index.mdx"]
 tests = []
-satisfies = ["109.1", "109.4", "109.5"]
-no_test_reason = "Behavior covered by existing integration/unit coverage; verified via local runs and CI."
+satisfies = ["110.2"]
+no_test_reason = "Docs-only"
 status = "completed"
 
 [[plan.changes]]
-name = "Doctor: shim + cgroup readiness checks"
-type = "feat"
+name = "Update docs to match contract"
+type = "docs"
 details = """
-Extends the readiness report with:
-- Privileged shim presence/version/permissions checks.
-- Cgroup v2/root strategy checks.
-- Actionable remediation commands (e.g. `sudo locald admin setup`)."""
-files = ["locald-utils/src/privileged.rs", "locald-shim/src/main.rs"]
+Apply the Surface Contract + stability labels to the user-facing docs.
+
+Deliverable
+- Update “front door” docs to use only contract terms.
+- Ensure any experimental/unstable surfaces are explicitly labeled and not over-taught.
+
+Acceptance
+- Getting Started and CLI reference match the contract vocabulary.
+- Any mention of experimental features is consistently labeled and points to the canonical governance section."""
+files = ["locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/getting-started/index.mdx", "locald-docs/src/content/docs/guides/ci-automation.md"]
 tests = []
-satisfies = ["109.2", "109.3"]
-no_test_reason = "Verified via CI and local doctor output; readiness logic exercises existing harnesses."
+satisfies = ["110.3"]
+no_test_reason = "Docs-only"
+status = "completed"
+
+[[plan.changes]]
+name = "Align run/exec semantics + Runner noun"
+type = "docs"
+details = "Align Surface Contract + docs + CLI spelling to Heroku-style semantics: run = one-off admin actions; exec reserved for attach. Introduce Runner as the cross-mode noun."
+files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md", "docs/rfcs/stage-0/0112-user-programming-model-audit-and-doc-plan.md", "docs/design/axioms/experience/15-heroku-terminology.md", "locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/guides/adhoc-tasks.md", "locald-cli/src/cli.rs"]
+tests = []
+satisfies = ["110.1", "110.3"]
+no_test_reason = "Docs/CLI help alignment"
+status = "completed"
+
+[[plan.changes]]
+name = "Remove Python from CI watchdog"
+type = "chore"
+details = "Replace inline Python JSON parsing in CI watchdog workflow with jq to reduce dependencies and avoid YAML/heredoc fragility."
+files = [".github/workflows/ci-watchdog.yml"]
+tests = []
+satisfies = ["110.2"]
+no_test_reason = "Workflow-only change"
 status = "completed"
 
 [verification]
