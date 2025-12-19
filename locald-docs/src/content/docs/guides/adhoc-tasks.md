@@ -19,7 +19,7 @@ If the command is successful, `locald` will ask if you want to save it as a perm
 
 Use `run` to execute a one-off command in the context of an existing service. This is useful for administrative actions that need the same environment as a running service.
 
-Note: `locald exec` currently exists as an alias for `locald run`, but it is reserved for a future workflow where `exec` *attaches* to an existing runner for debugging.
+Note: `locald exec` currently exists as an alias for `locald run`, but it is reserved for a future workflow where `exec` _attaches_ to an existing runner for debugging.
 
 ```bash
 # Run a migration using the 'api' service's environment

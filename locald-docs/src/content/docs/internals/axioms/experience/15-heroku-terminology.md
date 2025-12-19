@@ -12,7 +12,7 @@ Using an existing term is not “copying Heroku”; it is naming discipline:
 
 - **Lower cognitive load**: users can transfer a correct mental model.
 - **Fewer invented synonyms**: prevents docs/UI/CLI drift.
-- **Better abstraction boundaries**: forces us to teach the *concept* before the mechanism.
+- **Better abstraction boundaries**: forces us to teach the _concept_ before the mechanism.
 
 ## Implications
 
