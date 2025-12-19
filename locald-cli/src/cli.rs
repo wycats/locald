@@ -317,3 +317,34 @@ pub enum DebugCommands {
         port: u16,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_run_maps_to_exec_variant() {
+        let cli = Cli::try_parse_from(["locald", "run", "api", "echo", "hi"]).unwrap();
+
+        match cli.command {
+            Commands::Exec { service, command } => {
+                assert_eq!(service, "api");
+                assert_eq!(command, vec!["echo".to_string(), "hi".to_string()]);
+            }
+            _ => panic!("expected Commands::Exec"),
+        }
+    }
+
+    #[test]
+    fn parse_exec_alias_maps_to_exec_variant() {
+        let cli = Cli::try_parse_from(["locald", "exec", "api", "echo", "hi"]).unwrap();
+
+        match cli.command {
+            Commands::Exec { service, command } => {
+                assert_eq!(service, "api");
+                assert_eq!(command, vec!["echo".to_string(), "hi".to_string()]);
+            }
+            _ => panic!("expected Commands::Exec"),
+        }
+    }
+}
