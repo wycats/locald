@@ -220,6 +220,35 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Setup Node.js
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
       - name: Cache Cargo registry
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/cache@v4
@@ -300,6 +329,35 @@ jobs:
       - name: Setup sccache
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Node.js
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
 
       - name: Cache Cargo registry
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
