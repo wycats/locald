@@ -7,12 +7,64 @@ title = "Surface Contract v1 (Docs + Vocabulary Lock)"
 rfcs = ["0112", "0114"]
 
 [plan]
+
 [[plan.changes]]
-name = "First Step"
-type = "feat"
-details = "Description"
-files = []
+name = "Define Surface Contract v1"
+type = "docs"
+details = """
+Draft and lock the v1 user-facing Surface Contract.
+
+Deliverable
+- A concrete list of verbs/nouns we commit to teaching as “real” (CLI + docs vocabulary).
+- Prefer the smallest set that matches the current product reality.
+- Explicitly identify what is out-of-scope / not yet promised.
+
+Acceptance
+- Contract is written down in a single place (likely RFC 0114 + docs entry point).
+- Terms are consistent with existing CLI help and docs."""
+files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md", "locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/getting-started/index.mdx"]
 tests = []
+satisfies = ["110.1"]
+no_test_reason = "Docs-only"
+
+[[plan.changes]]
+name = "Define stability labels + governance"
+type = "docs"
+details = """
+Define stability labels that govern what appears in docs/UI/help.
+
+Deliverable
+- A minimal label set (e.g. Stable / Experimental) with rules for:
+  - where experimental surfaces can appear
+  - how promotion works
+  - who can change labels and under what criteria
+- A “vocabulary lock” rule: adding new user-facing terms requires reuse or an RFC.
+
+Acceptance
+- The rules are easy to apply during doc/CLI updates.
+- There is a single canonical description to link to from other docs."""
+files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md", "locald-docs/src/content/docs/internals/rfcs/index.mdx"]
+tests = []
+satisfies = ["110.2"]
+no_test_reason = "Docs-only"
+
+[[plan.changes]]
+name = "Update docs to match contract"
+type = "docs"
+details = """
+Apply the Surface Contract + stability labels to the user-facing docs.
+
+Deliverable
+- Update “front door” docs to use only contract terms.
+- Ensure any experimental/unstable surfaces are explicitly labeled and not over-taught.
+
+Acceptance
+- Getting Started and CLI reference match the contract vocabulary.
+- Any mention of experimental features is consistently labeled and points to the canonical governance section."""
+files = ["locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/getting-started/index.mdx", "locald-docs/src/content/docs/guides/ci-automation.md"]
+tests = []
+satisfies = ["110.3"]
+no_test_reason = "Docs-only"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
