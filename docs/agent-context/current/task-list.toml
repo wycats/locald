@@ -4,15 +4,15 @@
 [[tasks]]
 id = "110.1"
 title = "Define Surface Contract (verbs/nouns)"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "110.2"
 title = "Define stability labels + governance"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "110.3"
 title = "Update docs to match contract"
-status = "pending"
+status = "completed"
 

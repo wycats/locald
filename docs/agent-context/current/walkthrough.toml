@@ -1,3 +1,11 @@
 # READ-ONLY: Use 'exo' CLI to modify this file.
 # Walkthrough
 
+[[entries]]
+type = "design"
+description = "Phase 110: Surface Contract v1 + stability labels"
+details = """
+- Expanded RFC 0114 with concrete v1 verbs/nouns and remediation language.
+- Defined stability labels plus a vocabulary-lock governance rule.
+- Updated front-door docs to match the contract (Getting Started, CLI reference, RFCs index).
+- Verification: ./scripts/verify-phase.sh (passed)."""

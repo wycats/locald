@@ -4,6 +4,8 @@ title: CLI Reference
 
 `locald` provides a powerful CLI for managing your development environment.
 
+For the canonical taught vocabulary (verbs/nouns and stability rules), see RFC 0114 “Surface Contract v1”.
+
 ## Core Commands
 
 For a complete list of commands and flags, run:
@@ -89,20 +91,20 @@ locald doctor --json
 
 ### `locald try`
 
-Run a command in a temporary, isolated environment. This is useful for trying out tools or running one-off scripts without installing them globally.
+Run a scratch command on your host with a dynamically assigned `$PORT` injected into the environment.
 
 ```bash
 # Run a command with a dynamic PORT and save it later if desired
 locald try python3 -m http.server $PORT
 ```
 
-### `locald run`
+### `locald exec`
 
 Run a one-off task within the context of a defined service. This injects the service's environment variables (DB URL, etc.) and network context.
 
 ```bash
 # Run a database migration using the 'web' service's environment
-locald run web -- rails db:migrate
+locald exec web -- rails db:migrate
 ```
 
 Note: This runs the command _locally_ on your machine (as a host process), but with the environment configuration of the service.
