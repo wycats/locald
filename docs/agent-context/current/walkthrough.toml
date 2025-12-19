@@ -52,3 +52,23 @@ File
 type = "feat"
 description = "Phase 109 status update"
 details = "Recorded completed doctor work in Exosuit context (impl steps linked to 109.1–109.5; tasks 109.1–109.6 completed). Merged PR #20 (doctor + surface coherence scheduling) and PR #21 (commit signing docs)."
+
+[[entries]]
+type = "fix"
+description = "CI acceleration workflow fixes"
+details = """
+Summary
+- Implemented CI acceleration topology (fast PR lane, heavy main/schedule lane) with mainline stop-the-line enforcement and a tripwire check.
+- Updated branch protection to require the new PR gates.
+- Diagnosed GitHub Actions runs failing with 0 jobs created; root cause was invalid YAML in `.github/workflows/ci.yml` due to heredoc indentation in a `run: |` block.
+- Fixed workflow parsing by removing embedded Python heredocs and using `jq` for GitHub API JSON parsing.
+- Fixed PR workflow execution issues:
+  - `dorny/paths-filter` required `pull-requests: read` permissions.
+  - `git diff base..head` gating required full history (`fetch-depth: 0`).
+  - Rust jobs needed Node/pnpm because `locald-server/build.rs` runs `pnpm` when UI feature is enabled.
+
+PR
+- https://github.com/wycats/dotlocal/pull/23
+
+Verification
+- GitHub Actions run `CI` on PR #23 is green; required checks are reporting; mergeStateStatus is CLEAN."""
