@@ -26,6 +26,7 @@ files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md",
 tests = []
 satisfies = ["110.1"]
 no_test_reason = "Docs-only"
+status = "completed"
 
 [[plan.changes]]
 name = "Define stability labels + governance"
@@ -47,6 +48,7 @@ files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md",
 tests = []
 satisfies = ["110.2"]
 no_test_reason = "Docs-only"
+status = "completed"
 
 [[plan.changes]]
 name = "Update docs to match contract"
@@ -65,6 +67,7 @@ files = ["locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/conte
 tests = []
 satisfies = ["110.3"]
 no_test_reason = "Docs-only"
+status = "completed"
 
 [[plan.changes]]
 name = "Align run/exec semantics + Runner noun"
@@ -74,6 +77,7 @@ files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md",
 tests = []
 satisfies = ["110.1", "110.3"]
 no_test_reason = "Docs/CLI help alignment"
+status = "completed"
 
 [[plan.changes]]
 name = "Remove Python from CI watchdog"
@@ -83,6 +87,7 @@ files = [".github/workflows/ci-watchdog.yml"]
 tests = []
 satisfies = ["110.2"]
 no_test_reason = "Workflow-only change"
+status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
