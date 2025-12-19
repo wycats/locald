@@ -66,6 +66,24 @@ tests = []
 satisfies = ["110.3"]
 no_test_reason = "Docs-only"
 
+[[plan.changes]]
+name = "Align run/exec semantics + Runner noun"
+type = "docs"
+details = "Align Surface Contract + docs + CLI spelling to Heroku-style semantics: run = one-off admin actions; exec reserved for attach. Introduce Runner as the cross-mode noun."
+files = ["docs/rfcs/stage-0/0114-surface-contract-program-keep-ux-coherent-.md", "docs/rfcs/stage-0/0112-user-programming-model-audit-and-doc-plan.md", "docs/design/axioms/experience/15-heroku-terminology.md", "locald-docs/src/content/docs/reference/cli.md", "locald-docs/src/content/docs/guides/adhoc-tasks.md", "locald-cli/src/cli.rs"]
+tests = []
+satisfies = ["110.1", "110.3"]
+no_test_reason = "Docs/CLI help alignment"
+
+[[plan.changes]]
+name = "Remove Python from CI watchdog"
+type = "chore"
+details = "Replace inline Python JSON parsing in CI watchdog workflow with jq to reduce dependencies and avoid YAML/heredoc fragility."
+files = [".github/workflows/ci-watchdog.yml"]
+tests = []
+satisfies = ["110.2"]
+no_test_reason = "Workflow-only change"
+
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
 manual = []

@@ -47,7 +47,7 @@ pub enum Commands {
     /// This is useful for running database migrations, consoles, or other
     /// ad-hoc tasks that need the same environment variables (DB URL, etc.)
     /// as your running services.
-    #[command(alias = "run")]
+    #[command(name = "run", alias = "exec")]
     Exec {
         /// Name of the service to use as context
         service: String,

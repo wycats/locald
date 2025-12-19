@@ -98,13 +98,15 @@ Run a scratch command on your host with a dynamically assigned `$PORT` injected 
 locald try python3 -m http.server $PORT
 ```
 
-### `locald exec`
+### `locald run`
 
 Run a one-off task within the context of a defined service. This injects the service's environment variables (DB URL, etc.) and network context.
 
+Note: `locald exec` currently exists as an alias for `locald run`, but is reserved for a future “attach to an existing runner” workflow. The docs teach `run` as the canonical spelling.
+
 ```bash
 # Run a database migration using the 'web' service's environment
-locald exec web -- rails db:migrate
+locald run web -- rails db:migrate
 ```
 
 Note: This runs the command _locally_ on your machine (as a host process), but with the environment configuration of the service.
