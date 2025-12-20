@@ -7,68 +7,16 @@ title = "Integration Boundaries Audit"
 rfcs = ["0112", "0114"]
 
 [plan]
-[[plan.changes]]
-name = "First Step"
-type = "feat"
-details = "Description"
-files = []
-tests = []
-
-[[plan.changes]]
-name = "Audit optional integrations"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
-
-[[plan.changes]]
-name = "Docker unavailability explains impact"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
-
-[[plan.changes]]
-name = "Doctor shows Docker socket path"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
-
-[[plan.changes]]
-name = "Doctor respects DOCKER_HOST"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
-
-[[plan.changes]]
-name = "Doctor explains unsupported DOCKER_HOST"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
-
-[[plan.changes]]
-name = "Doctor surfaces CNB/buildpacks"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
-
-[[plan.changes]]
-name = "Doctor surfaces virtualization (KVM)"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+changes= [
+  { details = "Description", files = [], name = "First Step", tests = [], type = "feat" },
+  { details = "TDD Step", files = [], name = "Audit optional integrations", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
+  { details = "TDD Step", files = [], name = "Buildpacks (CNB) unavailability explains impact (shim/libcontainer)", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
+  { details = "TDD Step", files = [], name = "Doctor reports shim evidence (libcontainer)", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
+  { details = "TDD Step", files = [], name = "Doctor does not depend on container-daemon env config", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
+  { details = "TDD Step", files = [], name = "Doctor ignores non-unix container-daemon endpoints", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
+  { details = "TDD Step", files = [], name = "Doctor surfaces CNB/buildpacks", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
+  { details = "TDD Step", files = [], name = "Doctor surfaces virtualization (KVM)", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" }
+]
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

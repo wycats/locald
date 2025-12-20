@@ -4,15 +4,15 @@
 [[tasks]]
 id = "113.1"
 title = "Audit optional integrations + failure modes"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "113.2"
 title = "Document stable/experimental matrix"
-status = "pending"
+status = "completed"
 
 [[tasks]]
 id = "113.3"
 title = "Ensure doctor surfaces integration availability"
-status = "pending"
+status = "completed"
 

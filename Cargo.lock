@@ -2265,6 +2265,7 @@ dependencies = [
  "shlex",
  "sqlx",
  "tempfile",
+ "textwrap",
  "tokio",
  "toml",
  "tracing",
