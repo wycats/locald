@@ -2,17 +2,12 @@
 # Task List
 
 [[tasks]]
-id = "16.1"
-title = "Upgrade Handling: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers)."
-status = "completed"
+id = "27.1"
+title = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
+status = "pending"
 
 [[tasks]]
-id = "16.2"
-title = "Connection Bridging: Implement bidirectional copying of data between the upgraded client connection and the backend service."
-status = "completed"
-
-[[tasks]]
-id = "16.3"
-title = "Verification: Verify with a WebSocket-heavy example app (e.g., a chat app or Vite HMR)."
-status = "completed"
+id = "27.2"
+title = "Cascading Config: Implement config inheritance (Global -> Context -> Project)."
+status = "pending"
 
