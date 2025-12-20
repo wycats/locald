@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "27"
-title = "Workspace & Constellations"
-rfcs = ["0026"]
+id = "113"
+title = "Integration Boundaries Audit"
+rfcs = ["0112", "0114"]
 
 [plan]
 [[plan.changes]]

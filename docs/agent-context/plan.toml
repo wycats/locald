@@ -679,7 +679,7 @@ status = "complete"
 [[epochs.phases]]
 id = "27"
 title = "Workspace & Constellations"
-status = "active"
+status = "pending"
 rfcs = ["0026"]
 
 [[epochs.phases.tasks]]
@@ -1724,7 +1724,7 @@ status = "completed"
 [[epochs.phases]]
 id = "113"
 title = "Integration Boundaries Audit"
-status = "pending"
+status = "active"
 rfcs = [
     "0112",
     "0114",
