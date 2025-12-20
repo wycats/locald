@@ -373,7 +373,7 @@ status = "complete"
 [[epochs.phases]]
 id = "16"
 title = "WebSocket Support"
-status = "pending"
+status = "active"
 
 [[epochs.phases.tasks]]
 id = "16.1"
@@ -388,7 +388,7 @@ status = "complete"
 [[epochs.phases.tasks]]
 id = "16.3"
 label = "Verification: Verify with a WebSocket-heavy example app (e.g., a chat app or Vite HMR)."
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "17"

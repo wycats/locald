@@ -2,6 +2,10 @@
   "name": "websocket-test",
   "version": "1.0.0",
   "packageManager": "pnpm@10.25.0",
+  "scripts": {
+    "start": "node server.js",
+    "client": "node client.js"
+  },
   "dependencies": {
     "ws": "^8.18.0"
   }
