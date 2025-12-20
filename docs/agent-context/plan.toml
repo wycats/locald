@@ -1748,7 +1748,7 @@ status = "pending"
 [[epochs.phases]]
 id = "114"
 title = "Feature Readiness Ledger + RFC Realignment"
-status = "pending"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
@@ -1757,14 +1757,14 @@ rfcs = [
 [[epochs.phases.tasks]]
 id = "114.1"
 label = "Create feature readiness ledger"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "114.2"
 label = "Align docs/RFCs with stability labels"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "114.3"
 label = "Add ongoing drift-prevention checklist"
-status = "pending"
+status = "completed"

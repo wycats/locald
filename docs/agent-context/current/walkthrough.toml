@@ -3,5 +3,5 @@
 
 [[entries]]
 type = "design"
-description = "Dashboard vocabulary: monitor vs pin"
-details = "Aligned dashboard UI and docs to use 'monitor' language for Deck focus (avoids collision with registry pin). Updated tooltips/labels in Deck + Rack and Daemon Control Center copy. Added docs/surface/dashboard-surface-inventory.md."
+description = "Add feature readiness ledger + drift checklist"
+details = "Added a manual Feature Readiness Ledger mapping user-facing features to stability/RFC/docs ownership, plus a small drift-prevention checklist to keep CLI/docs/RFC surfaces aligned."

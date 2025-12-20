@@ -18,7 +18,7 @@ In this mode, `locald` runs your application directly on your host machine as a 
 No special configuration is needed. Just define a command:
 
 ```toml
-[service.web]
+[services.web]
 command = "npm run dev"
 ```
 
@@ -38,7 +38,7 @@ In this mode, `locald` builds your application into an OCI container using Cloud
 To opt-in, add a `[service.build]` section:
 
 ```toml
-[service.web]
+[services.web]
 build = { builder = "paketobuildpacks/builder:base" }
 ```
 
