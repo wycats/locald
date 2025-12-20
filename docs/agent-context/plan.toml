@@ -1724,7 +1724,7 @@ status = "completed"
 [[epochs.phases]]
 id = "113"
 title = "Integration Boundaries Audit"
-status = "pending"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
@@ -1733,17 +1733,17 @@ rfcs = [
 [[epochs.phases.tasks]]
 id = "113.1"
 label = "Audit optional integrations + failure modes"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "113.2"
 label = "Document stable/experimental matrix"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "113.3"
 label = "Ensure doctor surfaces integration availability"
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "114"

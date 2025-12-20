@@ -41,7 +41,9 @@ build = { builder = "paketobuildpacks/builder:base" }
 
 ## Caching
 
-`locald` leverages CNB's advanced caching mechanisms. Dependencies (like `node_modules` or Cargo crates) are cached in a separate Docker volume (or directory) and reused between builds, significantly speeding up subsequent builds.
+`locald` leverages CNB's caching mechanisms. Builder images and build outputs are cached on disk (for example under `~/.local/share/locald/` and your project’s locald state directory), and reused between builds to speed up subsequent runs.
+
+If builds fail due to missing external capabilities (like registry access), see [Integrations](/reference/integrations).
 
 ## Rust Support
 

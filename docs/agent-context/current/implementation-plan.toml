@@ -2,41 +2,38 @@
 # Implementation Plan
 
 [phase]
-id = "112"
-title = "Dashboard Surface Audit"
+id = "113"
+title = "Integration Boundaries Audit"
 rfcs = ["0112", "0114"]
 
 [plan]
 
 [[plan.changes]]
-name = "Inventory dashboard surfaced concepts"
+name = "Audit optional integrations + failure modes"
+type = "chore"
+details = "Inventory optional integrations (Docker, CNB/buildpacks, VMM/OCI, etc) and document: detection, missing-dependency behavior, and what user-facing error/warning appears."
+files = []
+tests = []
+satisfies = ["113.1"]
+no_test_reason = "Audit + documentation step"
+
+[[plan.changes]]
+name = "Document stable/experimental integration matrix"
 type = "docs"
-details = "Inventory user-visible dashboard concepts (nouns, verbs, states, and navigation labels) as they exist in the UI and docs. Capture the canonical list plus where each concept appears (UI route/component and docs page). Output is a short inventory doc used as the source for vocabulary alignment."
+details = "Produce a stable/experimental matrix for integrations (what’s supported, what happens when missing, remediation paths) and align docs with current behavior."
 files = []
 tests = []
-satisfies = ["112.1"]
-no_test_reason = "Docs-only inventory"
-status = "completed"
+satisfies = ["113.2"]
+no_test_reason = "Documentation change"
 
 [[plan.changes]]
-name = "Align dashboard vocabulary to Surface Contract"
-type = "refactor"
-details = "Align dashboard UI strings and docs wording to the Surface Contract (RFCs 0112/0114): rename labels, actions, and states where necessary; remove/avoid out-of-contract terms; ensure terminology is consistent across UI + docs."
+name = "Ensure doctor surfaces integration availability"
+type = "feat"
+details = "Ensure locald doctor reports integration availability/severity consistent with the matrix (warn vs critical), so users can self-diagnose missing optional dependencies."
 files = []
 tests = []
-satisfies = ["112.2"]
-no_test_reason = "String/vocab alignment; validated via Phase 112 flow checks"
-status = "completed"
-
-[[plan.changes]]
-name = "Validate user-visible flows"
-type = "test"
-details = "Run and/or document the minimal flow validation for the dashboard after vocabulary alignment: confirm key pages load, status labels make sense, and primary actions match the contract. Prefer existing automation (dashboard build/lint/e2e) where available; otherwise add a small, targeted check."
-files = []
-tests = []
-satisfies = ["112.3"]
-no_test_reason = "May be manual if no stable automation exists yet"
-status = "completed"
+satisfies = ["113.3"]
+no_test_reason = "May require code changes; tests will be added once we identify the right integration-detection seams, otherwise validated via phase verification + doctor output checks."
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

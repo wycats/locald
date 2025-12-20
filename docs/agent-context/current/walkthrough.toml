@@ -2,6 +2,11 @@
 # Walkthrough
 
 [[entries]]
+type = "feat"
+description = "Doctor surfaces optional integration availability"
+details = "Extended the shared doctor report collection to probe for Docker socket / DOCKER_HOST configuration, and (in verbose mode) /dev/kvm usability, emitting consistent Warning/Skip statuses with actionable remediation."
+
+[[entries]]
 type = "design"
-description = "Dashboard vocabulary: monitor vs pin"
-details = "Aligned dashboard UI and docs to use 'monitor' language for Deck focus (avoids collision with registry pin). Updated tooltips/labels in Deck + Rack and Daemon Control Center copy. Added docs/surface/dashboard-surface-inventory.md."
+description = "Document integration stability matrix"
+details = "Added a dedicated Integrations reference page describing stable vs experimental vs legacy integrations, expected behavior when missing, and remediation; updated related CLI/locald.toml/build docs to match current container runtime boundaries."

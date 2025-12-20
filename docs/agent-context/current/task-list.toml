@@ -2,17 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "112.1"
-title = "Inventory dashboard surfaced concepts"
+id = "113.1"
+title = "Audit optional integrations + failure modes"
 status = "completed"
 
 [[tasks]]
-id = "112.2"
-title = "Align dashboard vocabulary to contract"
+id = "113.2"
+title = "Document stable/experimental matrix"
 status = "completed"
 
 [[tasks]]
-id = "112.3"
-title = "Validate user-visible flows"
+id = "113.3"
+title = "Ensure doctor surfaces integration availability"
 status = "completed"
 

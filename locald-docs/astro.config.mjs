@@ -46,6 +46,7 @@ export default defineConfig({
           items: [
             { label: "locald.toml", link: "/reference/locald-toml/" },
             { label: "CLI", link: "/reference/cli/" },
+            { label: "Integrations", link: "/reference/integrations/" },
             { label: "Service Types", link: "/reference/service-types/" },
             { label: "Execution Modes", link: "/reference/execution-modes/" },
             { label: "Health Checks", link: "/reference/health-checks/" },

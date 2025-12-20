@@ -516,6 +516,14 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         }
     }
 
+    // Optional integrations
+    //
+    // These checks must never block privileged acquisition. They exist to surface
+    // integration availability (warn vs critical) in a way that's consistent with
+    // the documented integration matrix.
+    check_docker_integration(&config, &mut problems);
+    check_kvm_integration(&config, &mut problems);
+
     let fixes = consolidate_fixes(&problems);
 
     Ok(DoctorReport {
@@ -524,6 +532,152 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         problems,
         fixes,
     })
+}
+
+fn check_docker_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        fn is_socket(path: &Path) -> bool {
+            std::fs::metadata(path)
+                .ok()
+                .is_some_and(|m| m.file_type().is_socket())
+        }
+
+        let mut checked: Vec<String> = Vec::new();
+
+        let docker_host = std::env::var("DOCKER_HOST").ok();
+        if let Some(host) = &docker_host {
+            // If DOCKER_HOST points at a unix socket, prefer checking that specific path.
+            if let Some(rest) = host.strip_prefix("unix://") {
+                if !rest.is_empty() {
+                    let p = PathBuf::from(rest);
+                    checked.push(p.display().to_string());
+                    if is_socket(&p) {
+                        return;
+                    }
+                }
+            } else {
+                // Non-unix DOCKER_HOST (tcp/ssh). We can't reliably probe connectivity here
+                // without introducing network calls; treat as configured.
+                return;
+            }
+        }
+
+        // Common defaults.
+        let mut candidates: Vec<PathBuf> = vec![
+            PathBuf::from("/var/run/docker.sock"),
+            PathBuf::from("/run/docker.sock"),
+        ];
+
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            let xdg = PathBuf::from(xdg);
+            candidates.push(xdg.join("docker.sock"));
+            candidates.push(xdg.join("podman/podman.sock"));
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+        }
+
+        for c in candidates {
+            checked.push(c.display().to_string());
+            if is_socket(&c) {
+                return;
+            }
+        }
+
+        problems.push(Problem {
+            id: "integration.docker".to_string(),
+            severity: Severity::Warning,
+            status: Status::Fail,
+            summary: "Docker API socket not found (legacy Docker-based services will be unavailable)"
+                .to_string(),
+            details: Some(
+                "locald can run OCI containers without Docker, but legacy Docker integration requires a reachable Docker-compatible API socket."
+                    .to_string(),
+            ),
+            remediation: vec![
+                "Start Docker (or a Docker-compatible daemon)".to_string(),
+                "If needed, set DOCKER_HOST=unix:///path/to/docker.sock".to_string(),
+            ],
+            evidence: if config.verbose {
+                let mut ev = Vec::new();
+                if let Some(h) = docker_host {
+                    ev.push(EvidenceItem {
+                        key: "docker.host".to_string(),
+                        value: h,
+                    });
+                }
+                ev.push(EvidenceItem {
+                    key: "docker.checked_sockets".to_string(),
+                    value: checked.join(", "),
+                });
+                ev
+            } else {
+                vec![]
+            },
+            fix: None,
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (config, problems);
+    }
+}
+
+fn check_kvm_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>) {
+    // Keep this behind verbose to avoid adding noisy, optional platform details to the
+    // default doctor output.
+    if !config.verbose {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let kvm = Path::new("/dev/kvm");
+        match std::fs::OpenOptions::new().read(true).write(true).open(kvm) {
+            Ok(_f) => {
+                // available
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                problems.push(Problem {
+                    id: "integration.kvm".to_string(),
+                    severity: Severity::Info,
+                    status: Status::Skip,
+                    summary: "KVM is not available (/dev/kvm missing); VMM features disabled"
+                        .to_string(),
+                    details: Some(
+                        "This is expected on many machines and CI runners. locald does not require KVM unless you opt into VMM-based workflows."
+                            .to_string(),
+                    ),
+                    remediation: vec![
+                        "Enable hardware virtualization in BIOS/UEFI".to_string(),
+                        "Install/load KVM modules and ensure /dev/kvm exists".to_string(),
+                    ],
+                    evidence: vec![],
+                    fix: None,
+                });
+            }
+            Err(e) => {
+                problems.push(Problem {
+                    id: "integration.kvm".to_string(),
+                    severity: Severity::Warning,
+                    status: Status::Fail,
+                    summary: "KVM is present but not usable; VMM features may fail".to_string(),
+                    details: Some(e.to_string()),
+                    remediation: vec![
+                        "Ensure your user can access /dev/kvm (often: add to the kvm group, then log out/in)"
+                            .to_string(),
+                    ],
+                    evidence: vec![],
+                    fix: None,
+                });
+            }
+        }
+    }
 }
 
 fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
