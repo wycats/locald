@@ -35,3 +35,18 @@ fn phase113_doctor_explains_docker_unavailability_impact() {
         "Expected doctor output to explain Docker impact, but got:\n{stdout}"
     );
 }
+
+#[test]
+fn phase113_doctor_shows_docker_socket_path() {
+    // Goal: `locald doctor` should show the exact Docker socket path being used.
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
+    cmd.arg("doctor");
+
+    let output = cmd.output().expect("failed to run locald doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("/var/run/docker.sock"),
+        "Expected doctor output to mention the Docker socket path, but got:\n{stdout}"
+    );
+}
