@@ -50,3 +50,26 @@ fn phase113_doctor_shows_docker_socket_path() {
         "Expected doctor output to mention the Docker socket path, but got:\n{stdout}"
     );
 }
+
+#[test]
+fn phase113_doctor_respects_docker_host_env() {
+    // Goal: If DOCKER_HOST is set to a unix socket, `locald doctor` should
+    // report/check that socket (not only /var/run/docker.sock).
+    let docker_host = "unix:///tmp/locald-nonexistent-docker.sock";
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
+    cmd.env("DOCKER_HOST", docker_host);
+    cmd.arg("doctor");
+
+    let output = cmd.output().expect("failed to run locald doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains(docker_host),
+        "Expected doctor output to mention DOCKER_HOST value, but got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("socket not found"),
+        "Expected doctor output to reflect missing DOCKER_HOST socket, but got:\n{stdout}"
+    );
+}
