@@ -2,6 +2,16 @@
 # Walkthrough
 
 [[entries]]
-type = "design"
-description = "Add feature readiness ledger + drift checklist"
-details = "Added a manual Feature Readiness Ledger mapping user-facing features to stability/RFC/docs ownership, plus a small drift-prevention checklist to keep CLI/docs/RFC surfaces aligned."
+type = "test"
+description = "Phase 16.3: WebSocket verification"
+details = """
+Verified WebSocket upgrade end-to-end using examples/websocket-test.
+
+Steps:
+- Started sandbox server: `./target/debug/locald --sandbox=phase-16-ws server start`
+- Registered + started the project: `./target/debug/locald --sandbox=phase-16-ws up examples/websocket-test`
+- locald bound HTTPS on the fallback port (8443) because privileged ports + setuid shim are not configured.
+- Ran the client: `LOCALD_HTTPS_PORT=8443 pnpm run client`
+
+Result:
+- Client connected and received echo: `received: hello`"""

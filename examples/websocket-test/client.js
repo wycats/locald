@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
 
-const ws = new WebSocket('wss://websocket-test.localhost', {
+const httpsPort = process.env.LOCALD_HTTPS_PORT || '443';
+const ws = new WebSocket(`wss://websocket-test.localhost:${httpsPort}`, {
   rejectUnauthorized: false
 });
 

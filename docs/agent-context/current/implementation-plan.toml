@@ -2,40 +2,30 @@
 # Implementation Plan
 
 [phase]
-id = "114"
-title = "Feature Readiness Ledger + RFC Realignment"
-rfcs = ["0112", "0114"]
+id = "16"
+title = "WebSocket Support"
+rfcs = []
 
 [plan]
 
 [[plan.changes]]
-name = "Create feature readiness ledger"
-type = "docs"
-details = "Create a Feature Readiness Ledger mapping each user-facing feature to its stability label (Stable/Experimental/Hidden/Removed), owning RFC(s) (or no RFC yet), and canonical documentation location (or not documented)."
-files = ["docs/manual/features/feature-readiness-ledger.md"]
-tests = []
-satisfies = ["114.1"]
-no_test_reason = "Documentation-only"
-status = "completed"
-
-[[plan.changes]]
-name = "Align docs/RFCs with stability labels"
-type = "docs"
-details = "Audit ledger entries marked Stable and ensure each has an appropriate owning RFC stage (or an explicit 'no RFC needed' decision) and that public docs match the current implementation surface (no invented commands). Make any minimal doc tweaks needed and capture gaps in the ledger."
-files = []
-tests = []
-satisfies = ["114.2"]
-no_test_reason = "Documentation/audit step"
-status = "completed"
-
-[[plan.changes]]
-name = "Add drift-prevention checklist"
+name = "Make websocket-test runnable"
 type = "chore"
-details = "Add a lightweight, ongoing checklist describing what to update when adding/removing user-facing commands/terms/features (surface contract, CLI manifest/docs lint, integrations matrix, readiness ledger)."
-files = ["docs/manual/development/surface-drift-checklist.md"]
+details = "Update examples/websocket-test so it actually runs the Node WebSocket echo server under locald (Procfile + minimal scripts/docs)."
+files = ["examples/websocket-test/Procfile", "examples/websocket-test/server.js", "examples/websocket-test/client.js", "examples/websocket-test/package.json"]
 tests = []
-satisfies = ["114.3"]
-no_test_reason = "Documentation-only"
+satisfies = ["16.3"]
+no_test_reason = "Example-only"
+status = "completed"
+
+[[plan.changes]]
+name = "Verify WebSocket upgrade end-to-end"
+type = "test"
+details = "Run locald up in examples/websocket-test and confirm a client can connect via wss://websocket-test.localhost and receive an echo; record verification in walkthrough."
+files = ["docs/agent-context/current/walkthrough.toml"]
+tests = []
+satisfies = ["16.3"]
+no_test_reason = "Manual verification"
 status = "completed"
 
 [verification]
