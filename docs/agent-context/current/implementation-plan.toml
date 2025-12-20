@@ -2,31 +2,17 @@
 # Implementation Plan
 
 [phase]
-id = "16"
-title = "WebSocket Support"
-rfcs = []
+id = "27"
+title = "Workspace & Constellations"
+rfcs = ["0026"]
 
 [plan]
-
 [[plan.changes]]
-name = "Make websocket-test runnable"
-type = "chore"
-details = "Update examples/websocket-test so it actually runs the Node WebSocket echo server under locald (Procfile + minimal scripts/docs)."
-files = ["examples/websocket-test/Procfile", "examples/websocket-test/server.js", "examples/websocket-test/client.js", "examples/websocket-test/package.json"]
+name = "First Step"
+type = "feat"
+details = "Description"
+files = []
 tests = []
-satisfies = ["16.3"]
-no_test_reason = "Example-only"
-status = "completed"
-
-[[plan.changes]]
-name = "Verify WebSocket upgrade end-to-end"
-type = "test"
-details = "Run locald up in examples/websocket-test and confirm a client can connect via wss://websocket-test.localhost and receive an echo; record verification in walkthrough."
-files = ["docs/agent-context/current/walkthrough.toml"]
-tests = []
-satisfies = ["16.3"]
-no_test_reason = "Manual verification"
-status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
