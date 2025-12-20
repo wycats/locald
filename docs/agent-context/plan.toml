@@ -1724,7 +1724,7 @@ status = "completed"
 [[epochs.phases]]
 id = "113"
 title = "Integration Boundaries Audit"
-status = "active"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
