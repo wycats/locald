@@ -1700,7 +1700,7 @@ status = "completed"
 [[epochs.phases]]
 id = "112"
 title = "Dashboard Surface Audit"
-status = "pending"
+status = "active"
 rfcs = [
     "0112",
     "0114",
@@ -1709,17 +1709,17 @@ rfcs = [
 [[epochs.phases.tasks]]
 id = "112.1"
 label = "Inventory dashboard surfaced concepts"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "112.2"
 label = "Align dashboard vocabulary to contract"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "112.3"
 label = "Validate user-visible flows"
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "113"

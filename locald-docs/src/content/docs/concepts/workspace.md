@@ -28,7 +28,7 @@ The center view (“The Stream”) is a single, time-ordered log timeline.
 
 ## The Deck
 
-For focused work, pin one or more services to “The Deck”.
+For focused work, monitor one or more services in “The Deck”.
 This turns the dashboard into a tiled layout of live service terminals.
 
 - **Interactive**: not just read-only logs; you can send input when a service supports it.
@@ -47,4 +47,4 @@ The Rack footer has a special entry (“System Normal”) that pins a **virtual 
 This is the **System Plane**: a dedicated place to observe the daemon using the same UI as everything else.
 
 - **Daemon logs and status**: view `locald` output without switching back to a terminal.
-- **Unified pinning**: there’s one “pin” concept; pin what you want to focus on.
+- **Unified monitoring**: there’s one “monitor” concept; monitor what you want to focus on.

@@ -2,38 +2,41 @@
 # Implementation Plan
 
 [phase]
-id = "111"
-title = "CLI Surface Audit + Enforcement"
+id = "112"
+title = "Dashboard Surface Audit"
 rfcs = ["0112", "0114"]
 
 [plan]
 
 [[plan.changes]]
-name = "Generate CLI surface manifest"
-type = "chore"
-details = "Add a deterministic, machine-readable CLI surface manifest generator (driven from the clap command definitions) and check in the generated JSON so changes are reviewable in PRs. The generator itself should be an internal-only surface; the manifest becomes the stable input for docs/CI linting."
-files = ["locald-cli/src/cli.rs", "locald-cli/src/surface_manifest.rs", "docs/surface/cli-manifest.json"]
+name = "Inventory dashboard surfaced concepts"
+type = "docs"
+details = "Inventory user-visible dashboard concepts (nouns, verbs, states, and navigation labels) as they exist in the UI and docs. Capture the canonical list plus where each concept appears (UI route/component and docs page). Output is a short inventory doc used as the source for vocabulary alignment."
+files = []
 tests = []
-satisfies = ["111.1"]
-no_test_reason = "Tooling-only; validated via CI check that regenerates and diffs"
+satisfies = ["112.1"]
+no_test_reason = "Docs-only inventory"
+status = "completed"
 
 [[plan.changes]]
-name = "Docs lint against CLI manifest"
-type = "chore"
-details = "Add a docs linter that scans user-facing docs (at minimum locald-docs content plus root README) for referenced locald commands and options and fails if they are not present in the CLI manifest. Scope linting to taught surfaces (primarily shell/bash code blocks) to minimize false positives."
-files = ["scripts/check-cli-surface-docs.mjs", "README.md", "locald-docs/src/content/docs/getting-started/index.mdx", "locald-docs/src/content/docs/reference/cli.md"]
+name = "Align dashboard vocabulary to Surface Contract"
+type = "refactor"
+details = "Align dashboard UI strings and docs wording to the Surface Contract (RFCs 0112/0114): rename labels, actions, and states where necessary; remove/avoid out-of-contract terms; ensure terminology is consistent across UI + docs."
+files = []
 tests = []
-satisfies = ["111.2"]
-no_test_reason = "Tooling-only; exercised in CI"
+satisfies = ["112.2"]
+no_test_reason = "String/vocab alignment; validated via Phase 112 flow checks"
+status = "completed"
 
 [[plan.changes]]
-name = "CI checks for drift"
-type = "chore"
-details = "Wire manifest regeneration and docs lint into CI so drift is caught automatically. CI must fail if (a) the checked-in CLI manifest is out of date, or (b) docs reference commands/options not present in the manifest."
-files = [".github/workflows/ci.yml", "scripts/check", "docs/surface/cli-manifest.json"]
+name = "Validate user-visible flows"
+type = "test"
+details = "Run and/or document the minimal flow validation for the dashboard after vocabulary alignment: confirm key pages load, status labels make sense, and primary actions match the contract. Prefer existing automation (dashboard build/lint/e2e) where available; otherwise add a small, targeted check."
+files = []
 tests = []
-satisfies = ["111.3"]
-no_test_reason = "CI-only"
+satisfies = ["112.3"]
+no_test_reason = "May be manual if no stable automation exists yet"
+status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

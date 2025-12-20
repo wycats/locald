@@ -41,7 +41,9 @@
 					{/if}
 				</span>
 			</div>
-			<div class="muted">This view pins the daemon as a virtual service (“System Normal”).</div>
+			<div class="muted">
+				This view adds the daemon to the Deck as a virtual service (“System Normal”).
+			</div>
 		</div>
 
 		<div class="card">

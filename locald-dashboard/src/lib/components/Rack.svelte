@@ -181,7 +181,7 @@
 					<button
 						class="group-btn"
 						on:click|stopPropagation={() => togglePinGroup(project.name, project.services)}
-						title="Pin Group"
+						title="Monitor group in Deck"
 					>
 						<Layers size={12} />
 					</button>
@@ -240,7 +240,7 @@
 										class="control-btn monitor-btn"
 										class:active={pinned.includes(service.name)}
 										on:click={(e) => togglePin(service.name, e)}
-										title="Pin to Deck"
+										title="Monitor in Deck"
 									>
 										<Monitor size={14} />
 									</button>

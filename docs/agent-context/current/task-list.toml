@@ -2,17 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "111.1"
-title = "Generate CLI surface manifest"
+id = "112.1"
+title = "Inventory dashboard surfaced concepts"
 status = "completed"
 
 [[tasks]]
-id = "111.2"
-title = "Docs lint against CLI manifest"
+id = "112.2"
+title = "Align dashboard vocabulary to contract"
 status = "completed"
 
 [[tasks]]
-id = "111.3"
-title = "CI checks for drift"
+id = "112.3"
+title = "Validate user-visible flows"
 status = "completed"
 
