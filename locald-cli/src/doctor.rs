@@ -107,9 +107,10 @@ fn render_optional_integrations() {
         use std::path::Path;
 
         let docker_sock = Path::new("/var/run/docker.sock");
+        let docker_sock_display = docker_sock.display();
         if !docker_sock.exists() {
             println!(
-                "- Docker: {} (socket not found; Docker-based services will be unavailable)",
+                "- Docker: {} ({docker_sock_display}: socket not found; Docker-based services will be unavailable)",
                 "unavailable".yellow()
             );
             return;
@@ -117,11 +118,11 @@ fn render_optional_integrations() {
 
         match UnixStream::connect(docker_sock) {
             Ok(_) => println!(
-                "- Docker: {} (Docker-based services enabled)",
+                "- Docker: {} ({docker_sock_display}; Docker-based services enabled)",
                 "available".green()
             ),
             Err(e) => println!(
-                "- Docker: {} ({e}; Docker-based services will be unavailable)",
+                "- Docker: {} ({docker_sock_display}; {e}; Docker-based services will be unavailable)",
                 "unavailable".yellow()
             ),
         }
