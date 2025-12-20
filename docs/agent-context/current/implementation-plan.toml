@@ -14,6 +14,14 @@ details = "Description"
 files = []
 tests = []
 
+[[plan.changes]]
+name = "Audit optional integrations"
+type = "feat"
+details = "TDD Step"
+status = "green"
+tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
+files = []
+
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
 manual = []
