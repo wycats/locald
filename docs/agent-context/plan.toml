@@ -1748,7 +1748,7 @@ status = "pending"
 [[epochs.phases]]
 id = "114"
 title = "Feature Readiness Ledger + RFC Realignment"
-status = "active"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
