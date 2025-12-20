@@ -43,6 +43,8 @@ fn render_human(report: &DoctorReport, verbose: bool) {
         }
     );
 
+    render_optional_integrations();
+
     if report.problems.is_empty() {
         println!("{} All critical checks passed.", style::CHECK);
     } else {
@@ -93,5 +95,31 @@ fn render_human(report: &DoctorReport, verbose: bool) {
                 }
             }
         }
+    }
+}
+
+fn render_optional_integrations() {
+    println!("{} Optional integrations:", style::PACKAGE);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        use std::path::Path;
+
+        let docker_sock = Path::new("/var/run/docker.sock");
+        if !docker_sock.exists() {
+            println!("- Docker: {} (socket not found)", "unavailable".yellow());
+            return;
+        }
+
+        match UnixStream::connect(docker_sock) {
+            Ok(_) => println!("- Docker: {}", "available".green()),
+            Err(e) => println!("- Docker: {} ({e})", "unavailable".yellow()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        println!("- Docker: {} (unsupported platform)", "unknown".yellow());
     }
 }
