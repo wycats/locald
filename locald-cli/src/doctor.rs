@@ -2,6 +2,7 @@ use crate::style;
 use anyhow::Result;
 use crossterm::style::Stylize;
 use locald_utils::privileged::{AcquireConfig, CleanupMode, DoctorReport, Severity, Status};
+use std::borrow::Cow;
 
 pub fn run(json: bool, verbose: bool) -> Result<i32> {
     const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
@@ -20,6 +21,16 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
     }
 
     Ok(i32::from(report.has_critical_failures()))
+}
+
+fn render_command(cmd: &str) -> Cow<'_, str> {
+    let cmd = cmd.strip_prefix("sudo locald ").unwrap_or(cmd);
+
+    if let Some(rest) = cmd.strip_prefix("admin ") {
+        return Cow::Owned(format!("locald admin {rest}"));
+    }
+
+    Cow::Borrowed(cmd)
 }
 
 fn render_human(report: &DoctorReport, verbose: bool) {
@@ -80,7 +91,7 @@ fn render_human(report: &DoctorReport, verbose: bool) {
             if !p.remediation.is_empty() {
                 println!("  Fix:");
                 for cmd in &p.remediation {
-                    println!("    - {cmd}");
+                    println!("    - {}", render_command(cmd));
                 }
             }
         }
@@ -90,8 +101,17 @@ fn render_human(report: &DoctorReport, verbose: bool) {
             println!("{} Suggested next steps:", style::PACKAGE);
             for fix in &report.fixes {
                 println!("- {}", fix.summary);
+                let mut saw_admin_setup = false;
                 for cmd in &fix.commands {
-                    println!("  - {cmd}");
+                    let cmd = render_command(cmd);
+                    if cmd.as_ref() == "locald admin setup" {
+                        saw_admin_setup = true;
+                    }
+                    println!("  - {}", cmd);
+                }
+
+                if saw_admin_setup {
+                    println!("  - Next: run locald up.");
                 }
             }
         }

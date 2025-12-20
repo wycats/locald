@@ -140,3 +140,29 @@ fn phase113_doctor_mentions_virtualization_kvm_optional_integration() {
         "Expected doctor output to reference /dev/kvm or KVM availability, but got:\n{stdout}"
     );
 }
+
+#[test]
+fn phase113_doctor_recommends_admin_setup_without_sudo_and_suggests_up_next() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
+    cmd.arg("doctor");
+
+    let output = cmd.output().expect("failed to run locald doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if !stdout.contains("Suggested next steps:") {
+        return;
+    }
+
+    assert!(
+        stdout.contains("locald admin setup"),
+        "Expected doctor output to recommend locald admin setup, but got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("sudo locald"),
+        "Expected doctor output to avoid sudo locald (it can restrict PATH), but got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("- Next: run locald up."),
+        "Expected doctor output to include Next: run locald up. as a structured list item, but got:\n{stdout}"
+    );
+}
