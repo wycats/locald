@@ -1676,7 +1676,7 @@ status = "completed"
 [[epochs.phases]]
 id = "111"
 title = "CLI Surface Audit + Enforcement"
-status = "active"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
