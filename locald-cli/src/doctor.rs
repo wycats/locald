@@ -136,16 +136,17 @@ fn render_optional_integrations() {
             let docker_sock = Path::new(docker_sock_path);
             docker_sock_display = Some(docker_sock.display().to_string());
 
-            if !docker_sock.exists() {
-                docker_unavailable_details =
-                    Some(format!("{}: socket not found", docker_sock.display()));
-            } else {
+            if docker_sock.exists() {
                 match UnixStream::connect(docker_sock) {
                     Ok(_) => docker_available = true,
                     Err(e) => {
-                        docker_unavailable_details = Some(format!("{}; {e}", docker_sock.display()))
+                        docker_unavailable_details =
+                            Some(format!("{}; {e}", docker_sock.display()));
                     }
                 }
+            } else {
+                docker_unavailable_details =
+                    Some(format!("{}: socket not found", docker_sock.display()));
             }
         }
 
