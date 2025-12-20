@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Pin, Terminal as TerminalIcon, Activity } from 'lucide-svelte';
+	import { Monitor, Terminal as TerminalIcon, Activity } from 'lucide-svelte';
 	import Terminal from './Terminal.svelte';
 	import DaemonControlCenter from './DaemonControlCenter.svelte';
 	import { fade, fly } from 'svelte/transition';
@@ -30,8 +30,13 @@
 					{/if}
 				</div>
 				<div class="header-right">
-					<button onclick={() => unpin(serviceName)} class="action-btn" aria-label="Unpin">
-						<Pin size={14} class="pinned-icon" />
+					<button
+						onclick={() => unpin(serviceName)}
+						class="action-btn"
+						aria-label="Stop monitoring"
+						title="Stop monitoring"
+					>
+						<Monitor size={14} class="pinned-icon" />
 					</button>
 				</div>
 			</div>
