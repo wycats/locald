@@ -1700,7 +1700,7 @@ status = "completed"
 [[epochs.phases]]
 id = "112"
 title = "Dashboard Surface Audit"
-status = "active"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
