@@ -146,6 +146,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          node ./scripts/check-cli-surface-docs.mjs
+
           pnpm -C locald-dashboard install --frozen-lockfile
           pnpm -C locald-dashboard build
 
@@ -219,6 +221,15 @@ jobs:
       - name: Setup sccache
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Verify CLI surface manifest is up to date
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo run -p locald-cli --no-default-features -- __surface cli-manifest > /tmp/locald-cli-manifest.json
+          diff -u docs/surface/cli-manifest.json /tmp/locald-cli-manifest.json
 
       - name: Setup Node.js
         if: ${{ steps.gate.outputs.run == 'true' }}

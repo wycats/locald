@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    RegistryCommands, ServerCommands, ServiceCommands,
+    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
 use crate::{
     build, client, container, debug, doctor, history, init, monitor, run, service, style, trust,
@@ -784,6 +784,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     *port, abs_path, tx,
                 ))?;
         }
+
+        Commands::Surface { command } => match command {
+            SurfaceCommands::CliManifest => {
+                use clap::CommandFactory;
+
+                let manifest = crate::surface_manifest::from_clap_command(Cli::command());
+                let json = serde_json::to_string_pretty(&manifest)?;
+                println!("{json}");
+            }
+        },
     }
 
     Ok(())

@@ -2260,6 +2260,7 @@ dependencies = [
  "ratatui",
  "rcgen",
  "rexpect",
+ "serde",
  "serde_json",
  "shlex",
  "sqlx",

@@ -45,6 +45,7 @@ mod progress;
 mod run;
 mod service;
 mod style;
+mod surface_manifest;
 mod trust;
 mod try_cmd;
 mod utils;
@@ -75,6 +76,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
         cli::Commands::Admin {
             command: cli::AdminCommands::Setup
         } | cli::Commands::Doctor { .. }
+            | cli::Commands::Surface { .. }
     ) {
         utils::verify_shim();
     }
