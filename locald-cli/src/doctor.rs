@@ -108,6 +108,15 @@ fn render_optional_integrations() {
         use std::path::Path;
 
         let docker_host = env::var("DOCKER_HOST").ok();
+        if let Some(docker_host) = docker_host.as_deref() {
+            if !docker_host.starts_with("unix://") {
+                println!(
+                    "- Docker: {} ({docker_host}; unsupported DOCKER_HOST scheme; only unix:// sockets are supported; Docker-based services will be unavailable)",
+                    "unavailable".yellow()
+                );
+                return;
+            }
+        }
         let docker_sock_path = docker_host
             .as_deref()
             .and_then(|h| h.strip_prefix("unix://"))

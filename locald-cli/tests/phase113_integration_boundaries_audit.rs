@@ -73,3 +73,30 @@ fn phase113_doctor_respects_docker_host_env() {
         "Expected doctor output to reflect missing DOCKER_HOST socket, but got:\n{stdout}"
     );
 }
+
+#[test]
+fn phase113_doctor_explains_unsupported_docker_host_schemes() {
+    // Goal: If DOCKER_HOST is set to a non-unix scheme (e.g. tcp://), `locald doctor`
+    // should clearly explain that this check only supports unix:// sockets, rather than
+    // silently probing /var/run/docker.sock.
+    let docker_host = "tcp://127.0.0.1:2375";
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
+    cmd.arg("doctor");
+    cmd.env("DOCKER_HOST", docker_host);
+
+    let output = cmd.output().expect("failed to run locald doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains(docker_host),
+        "Expected doctor output to mention DOCKER_HOST value, but got:\n{stdout}"
+    );
+    assert!(
+        stdout.to_lowercase().contains("unsupported") || stdout.contains("only unix://"),
+        "Expected doctor output to explain unsupported DOCKER_HOST scheme, but got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("/var/run/docker.sock"),
+        "Expected doctor output not to fall back to /var/run/docker.sock when DOCKER_HOST is non-unix, but got:\n{stdout}"
+    );
+}
