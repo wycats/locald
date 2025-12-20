@@ -2,40 +2,40 @@
 # Implementation Plan
 
 [phase]
-id = "112"
-title = "Dashboard Surface Audit"
+id = "114"
+title = "Feature Readiness Ledger + RFC Realignment"
 rfcs = ["0112", "0114"]
 
 [plan]
 
 [[plan.changes]]
-name = "Inventory dashboard surfaced concepts"
+name = "Create feature readiness ledger"
 type = "docs"
-details = "Inventory user-visible dashboard concepts (nouns, verbs, states, and navigation labels) as they exist in the UI and docs. Capture the canonical list plus where each concept appears (UI route/component and docs page). Output is a short inventory doc used as the source for vocabulary alignment."
-files = []
+details = "Create a Feature Readiness Ledger mapping each user-facing feature to its stability label (Stable/Experimental/Hidden/Removed), owning RFC(s) (or no RFC yet), and canonical documentation location (or not documented)."
+files = ["docs/manual/features/feature-readiness-ledger.md"]
 tests = []
-satisfies = ["112.1"]
-no_test_reason = "Docs-only inventory"
+satisfies = ["114.1"]
+no_test_reason = "Documentation-only"
 status = "completed"
 
 [[plan.changes]]
-name = "Align dashboard vocabulary to Surface Contract"
-type = "refactor"
-details = "Align dashboard UI strings and docs wording to the Surface Contract (RFCs 0112/0114): rename labels, actions, and states where necessary; remove/avoid out-of-contract terms; ensure terminology is consistent across UI + docs."
+name = "Align docs/RFCs with stability labels"
+type = "docs"
+details = "Audit ledger entries marked Stable and ensure each has an appropriate owning RFC stage (or an explicit 'no RFC needed' decision) and that public docs match the current implementation surface (no invented commands). Make any minimal doc tweaks needed and capture gaps in the ledger."
 files = []
 tests = []
-satisfies = ["112.2"]
-no_test_reason = "String/vocab alignment; validated via Phase 112 flow checks"
+satisfies = ["114.2"]
+no_test_reason = "Documentation/audit step"
 status = "completed"
 
 [[plan.changes]]
-name = "Validate user-visible flows"
-type = "test"
-details = "Run and/or document the minimal flow validation for the dashboard after vocabulary alignment: confirm key pages load, status labels make sense, and primary actions match the contract. Prefer existing automation (dashboard build/lint/e2e) where available; otherwise add a small, targeted check."
-files = []
+name = "Add drift-prevention checklist"
+type = "chore"
+details = "Add a lightweight, ongoing checklist describing what to update when adding/removing user-facing commands/terms/features (surface contract, CLI manifest/docs lint, integrations matrix, readiness ledger)."
+files = ["docs/manual/development/surface-drift-checklist.md"]
 tests = []
-satisfies = ["112.3"]
-no_test_reason = "May be manual if no stable automation exists yet"
+satisfies = ["114.3"]
+no_test_reason = "Documentation-only"
 status = "completed"
 
 [verification]

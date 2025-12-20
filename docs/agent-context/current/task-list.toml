@@ -2,17 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "112.1"
-title = "Inventory dashboard surfaced concepts"
+id = "114.1"
+title = "Create feature readiness ledger"
 status = "completed"
 
 [[tasks]]
-id = "112.2"
-title = "Align dashboard vocabulary to contract"
+id = "114.2"
+title = "Align docs/RFCs with stability labels"
 status = "completed"
 
 [[tasks]]
-id = "112.3"
-title = "Validate user-visible flows"
+id = "114.3"
+title = "Add ongoing drift-prevention checklist"
 status = "completed"
 
