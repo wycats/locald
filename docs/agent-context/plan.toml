@@ -378,12 +378,12 @@ status = "active"
 [[epochs.phases.tasks]]
 id = "16.1"
 label = "Upgrade Handling: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers)."
-status = "complete"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "16.2"
 label = "Connection Bridging: Implement bidirectional copying of data between the upgraded client connection and the backend service."
-status = "complete"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "16.3"

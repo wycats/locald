@@ -4,12 +4,12 @@
 [[tasks]]
 id = "16.1"
 title = "Upgrade Handling: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers)."
-status = "complete"
+status = "completed"
 
 [[tasks]]
 id = "16.2"
 title = "Connection Bridging: Implement bidirectional copying of data between the upgraded client connection and the backend service."
-status = "complete"
+status = "completed"
 
 [[tasks]]
 id = "16.3"
