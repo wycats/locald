@@ -2,12 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "27.1"
-title = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
+id = "113.1"
+title = "Audit optional integrations + failure modes"
 status = "pending"
 
 [[tasks]]
-id = "27.2"
-title = "Cascading Config: Implement config inheritance (Global -> Context -> Project)."
+id = "113.2"
+title = "Document stable/experimental matrix"
+status = "pending"
+
+[[tasks]]
+id = "113.3"
+title = "Ensure doctor surfaces integration availability"
 status = "pending"
 
