@@ -1,0 +1,16 @@
+# yamllint configuration
+# Notes:
+# - GitHub Actions workflows commonly use `on:` which yamllint may flag as “truthy” under YAML 1.1 rules.
+# - This repo’s workflows also contain many long lines (keys/expressions).
+
+extends: default
+
+ignore: |
+  **/node_modules/**
+  target/**
+  .references/**
+
+rules:
+  document-start: disable
+  truthy: disable
+  line-length: disable
