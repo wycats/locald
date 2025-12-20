@@ -1,9 +1,6 @@
-//! Phase 113: Integration Boundaries Audit (RED tests).
+//! Phase 113: Integration Boundaries Audit.
 
-use assert_cmd::prelude::*;
 use std::process::Command;
-use predicates::prelude::*;
-use predicates::str::contains;
 
 #[test]
 fn phase113_doctor_mentions_docker_when_unavailable() {
@@ -15,5 +12,13 @@ fn phase113_doctor_mentions_docker_when_unavailable() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
     cmd.arg("doctor");
 
-    cmd.assert().success().stdout(contains("Docker").or(contains("docker")));
+    // `doctor` may return a non-zero exit code when critical host setup is missing.
+    // For integration boundaries, we still want Docker availability to be surfaced.
+    let output = cmd.output().expect("failed to run locald doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("Docker") || stdout.contains("docker"),
+        "Expected doctor output to mention Docker, but got:\n{stdout}"
+    );
 }

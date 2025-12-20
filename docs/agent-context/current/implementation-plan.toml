@@ -18,7 +18,7 @@ tests = []
 name = "Audit optional integrations"
 type = "feat"
 details = "TDD Step"
-status = "green"
+status = "completed"
 tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
 files = []
 
