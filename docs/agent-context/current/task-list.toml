@@ -2,17 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "110.1"
-title = "Define Surface Contract (verbs/nouns)"
+id = "111.1"
+title = "Generate CLI surface manifest"
 status = "completed"
 
 [[tasks]]
-id = "110.2"
-title = "Define stability labels + governance"
+id = "111.2"
+title = "Docs lint against CLI manifest"
 status = "completed"
 
 [[tasks]]
-id = "110.3"
-title = "Update docs to match contract"
+id = "111.3"
+title = "CI checks for drift"
 status = "completed"
 

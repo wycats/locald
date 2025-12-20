@@ -9,6 +9,10 @@ cargo fmt --all -- --check
 echo "Running cargo build..."
 cargo build
 
+echo "Checking CLI surface manifest is up to date..."
+./target/debug/locald __surface cli-manifest > /tmp/locald-cli-manifest.json
+diff -u docs/surface/cli-manifest.json /tmp/locald-cli-manifest.json
+
 echo "Running clippy..."
 cargo clippy --workspace -- -D warnings
 
@@ -19,6 +23,7 @@ pnpm -C locald-dashboard build
 echo "Running docs checks..."
 node ./scripts/check-docs-sidebar-links.mjs
 node ./scripts/check-docs-screenshots.mjs
+node ./scripts/check-cli-surface-docs.mjs
 
 echo "Running docs build..."
 CI=1 pnpm -C locald-docs install --frozen-lockfile

@@ -166,6 +166,20 @@ pub enum Commands {
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
     },
+
+    /// Internal tooling commands (not part of the taught surface)
+    #[command(name = "__surface", hide = true)]
+    Surface {
+        #[command(subcommand)]
+        command: SurfaceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SurfaceCommands {
+    /// Print a machine-readable CLI surface manifest (JSON)
+    #[command(name = "cli-manifest")]
+    CliManifest,
 }
 
 #[derive(Subcommand)]

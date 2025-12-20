@@ -2,10 +2,26 @@
 # Walkthrough
 
 [[entries]]
-type = "design"
-description = "Phase 110: Surface Contract v1 + stability labels"
+type = "feat"
+description = "Generate deterministic CLI surface manifest"
 details = """
-- Expanded RFC 0114 with concrete v1 verbs/nouns and remediation language.
-- Defined stability labels plus a vocabulary-lock governance rule.
-- Updated front-door docs to match the contract (Getting Started, CLI reference, RFCs index).
-- Verification: ./scripts/verify-phase.sh (passed)."""
+- Added hidden internal CLI command `locald __surface cli-manifest` to emit a stable JSON representation of the clap command tree.
+- Implemented clap->manifest conversion in `locald-cli/src/surface_manifest.rs` (commands, subcommands, args, aliases, hidden/global, positional).
+- Checked in the canonical manifest at `docs/surface/cli-manifest.json`."""
+
+[[entries]]
+type = "feat"
+description = "Lint docs locald snippets against manifest"
+details = """
+- Added `scripts/check-cli-surface-docs.mjs` to scan shell code fences in root README and `locald-docs` content for `locald ...` invocations.
+- Validates command/subcommand paths and only the *leading* flags against `docs/surface/cli-manifest.json` (stops parsing flags at first positional argument to avoid false positives like `python3 -m ...`).
+- Integrated into existing docs checks so docs drift fails fast."""
+
+[[entries]]
+type = "feat"
+description = "Enforce surface contract in CI"
+details = """
+- Updated `scripts/check` and GitHub Actions workflows to:
+  - regenerate CLI manifest and fail if it differs from `docs/surface/cli-manifest.json`
+  - run the docs CLI surface linter
+- Ran `exo verify` to confirm rustfmt, clippy, dashboard build, docs checks, and IPC verification are green."""

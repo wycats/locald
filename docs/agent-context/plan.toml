@@ -1652,7 +1652,7 @@ status = "pending"
 [[epochs.phases]]
 id = "110"
 title = "Surface Contract v1 (Docs + Vocabulary Lock)"
-status = "active"
+status = "completed"
 rfcs = [
     "0112",
     "0114",
@@ -1676,7 +1676,7 @@ status = "completed"
 [[epochs.phases]]
 id = "111"
 title = "CLI Surface Audit + Enforcement"
-status = "pending"
+status = "active"
 rfcs = [
     "0112",
     "0114",
@@ -1685,17 +1685,17 @@ rfcs = [
 [[epochs.phases.tasks]]
 id = "111.1"
 label = "Generate CLI surface manifest"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "111.2"
 label = "Docs lint against CLI manifest"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "111.3"
 label = "CI checks for drift"
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "112"
