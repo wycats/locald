@@ -108,18 +108,30 @@ fn render_optional_integrations() {
 
         let docker_sock = Path::new("/var/run/docker.sock");
         if !docker_sock.exists() {
-            println!("- Docker: {} (socket not found)", "unavailable".yellow());
+            println!(
+                "- Docker: {} (socket not found; Docker-based services will be unavailable)",
+                "unavailable".yellow()
+            );
             return;
         }
 
         match UnixStream::connect(docker_sock) {
-            Ok(_) => println!("- Docker: {}", "available".green()),
-            Err(e) => println!("- Docker: {} ({e})", "unavailable".yellow()),
+            Ok(_) => println!(
+                "- Docker: {} (Docker-based services enabled)",
+                "available".green()
+            ),
+            Err(e) => println!(
+                "- Docker: {} ({e}; Docker-based services will be unavailable)",
+                "unavailable".yellow()
+            ),
         }
     }
 
     #[cfg(not(unix))]
     {
-        println!("- Docker: {} (unsupported platform)", "unknown".yellow());
+        println!(
+            "- Docker: {} (unsupported platform; Docker-based services status unknown)",
+            "unknown".yellow()
+        );
     }
 }
