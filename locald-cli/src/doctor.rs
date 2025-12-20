@@ -185,6 +185,38 @@ fn render_optional_integrations() {
                 "unavailable".yellow()
             );
         }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs::OpenOptions;
+
+            let kvm_path = Path::new("/dev/kvm");
+            if kvm_path.exists() {
+                match OpenOptions::new().read(true).write(true).open(kvm_path) {
+                    Ok(_) => println!(
+                        "- Virtualization (KVM): {} (/dev/kvm; VM-based workflows enabled)",
+                        "available".green()
+                    ),
+                    Err(e) => println!(
+                        "- Virtualization (KVM): {} (/dev/kvm; {e}; VM-based workflows will be unavailable)",
+                        "unavailable".yellow()
+                    ),
+                }
+            } else {
+                println!(
+                    "- Virtualization (KVM): {} (/dev/kvm: not found; VM-based workflows will be unavailable)",
+                    "unavailable".yellow()
+                );
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!(
+                "- Virtualization: {} (not supported on this platform; VM-based workflows status unknown)",
+                "unknown".yellow()
+            );
+        }
     }
 
     #[cfg(not(unix))]
