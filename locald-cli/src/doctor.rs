@@ -108,43 +108,82 @@ fn render_optional_integrations() {
         use std::path::Path;
 
         let docker_host = env::var("DOCKER_HOST").ok();
-        if let Some(docker_host) = docker_host.as_deref() {
-            if !docker_host.starts_with("unix://") {
-                println!(
-                    "- Docker: {} ({docker_host}; unsupported DOCKER_HOST scheme; only unix:// sockets are supported; Docker-based services will be unavailable)",
-                    "unavailable".yellow()
-                );
-                return;
-            }
-        }
-        let docker_sock_path = docker_host
-            .as_deref()
-            .and_then(|h| h.strip_prefix("unix://"))
-            .filter(|p| !p.is_empty())
-            .unwrap_or("/var/run/docker.sock");
-
-        let docker_sock = Path::new(docker_sock_path);
-        let docker_sock_display = docker_sock.display();
         let docker_host_display = docker_host
             .as_deref()
             .unwrap_or("unix:///var/run/docker.sock");
-        if !docker_sock.exists() {
-            println!(
-                "- Docker: {} ({docker_host_display}; {docker_sock_display}: socket not found; Docker-based services will be unavailable)",
-                "unavailable".yellow()
-            );
-            return;
+        let mut docker_available = false;
+        let mut docker_probe_supported = true;
+        let mut docker_sock_display: Option<String> = None;
+        let mut docker_unavailable_details: Option<String> = None;
+
+        if let Some(docker_host) = docker_host.as_deref() {
+            if !docker_host.starts_with("unix://") {
+                docker_probe_supported = false;
+                docker_unavailable_details = Some(
+                    "unsupported DOCKER_HOST scheme; only unix:// sockets are supported"
+                        .to_string(),
+                );
+            }
         }
 
-        match UnixStream::connect(docker_sock) {
-            Ok(_) => println!(
-                "- Docker: {} ({docker_host_display}; {docker_sock_display}; Docker-based services enabled)",
+        if docker_probe_supported {
+            let docker_sock_path = docker_host
+                .as_deref()
+                .and_then(|h| h.strip_prefix("unix://"))
+                .filter(|p| !p.is_empty())
+                .unwrap_or("/var/run/docker.sock");
+
+            let docker_sock = Path::new(docker_sock_path);
+            docker_sock_display = Some(docker_sock.display().to_string());
+
+            if docker_sock.exists() {
+                match UnixStream::connect(docker_sock) {
+                    Ok(_) => docker_available = true,
+                    Err(e) => {
+                        docker_unavailable_details =
+                            Some(format!("{}; {e}", docker_sock.display()));
+                    }
+                }
+            } else {
+                docker_unavailable_details =
+                    Some(format!("{}: socket not found", docker_sock.display()));
+            }
+        }
+
+        if docker_available {
+            println!(
+                "- Docker: {} ({docker_host_display}; {}; Docker-based services enabled)",
+                "available".green(),
+                docker_sock_display.as_deref().unwrap_or("unknown")
+            );
+        } else if docker_probe_supported {
+            println!(
+                "- Docker: {} ({docker_host_display}; {}; Docker-based services will be unavailable)",
+                "unavailable".yellow(),
+                docker_unavailable_details
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            );
+        } else {
+            println!(
+                "- Docker: {} ({docker_host_display}; {}; Docker-based services will be unavailable)",
+                "unavailable".yellow(),
+                docker_unavailable_details
+                    .as_deref()
+                    .unwrap_or("unsupported")
+            );
+        }
+
+        if docker_available {
+            println!(
+                "- Buildpacks (CNB): {} (Docker available; buildpack-based builds enabled)",
                 "available".green()
-            ),
-            Err(e) => println!(
-                "- Docker: {} ({docker_host_display}; {docker_sock_display}; {e}; Docker-based services will be unavailable)",
+            );
+        } else {
+            println!(
+                "- Buildpacks (CNB): {} (requires Docker; buildpack-based builds will be unavailable)",
                 "unavailable".yellow()
-            ),
+            );
         }
     }
 
