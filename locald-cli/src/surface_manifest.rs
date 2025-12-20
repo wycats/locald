@@ -80,3 +80,43 @@ fn arg_manifest(arg: &Arg) -> ArgManifest {
         positional: arg.get_index().is_some(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_manifest_is_deterministic_for_same_cli() {
+        let manifest1 = from_clap_command(Cli::command());
+        let manifest2 = from_clap_command(Cli::command());
+
+        let json1 = serde_json::to_string(&manifest1).unwrap();
+        let json2 = serde_json::to_string(&manifest2).unwrap();
+
+        assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn cli_manifest_includes_hidden_surface_group() {
+        let manifest = from_clap_command(Cli::command());
+
+        let surface = manifest
+            .root
+            .subcommands
+            .iter()
+            .find(|cmd| cmd.name == "__surface")
+            .expect("expected __surface internal command");
+
+        assert!(surface.hidden);
+
+        let cli_manifest_cmd = surface
+            .subcommands
+            .iter()
+            .find(|cmd| cmd.name == "cli-manifest")
+            .expect("expected __surface cli-manifest subcommand");
+
+        assert!(!cli_manifest_cmd.hidden);
+    }
+}
