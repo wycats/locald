@@ -103,14 +103,25 @@ fn render_optional_integrations() {
 
     #[cfg(unix)]
     {
+        use std::env;
         use std::os::unix::net::UnixStream;
         use std::path::Path;
 
-        let docker_sock = Path::new("/var/run/docker.sock");
+        let docker_host = env::var("DOCKER_HOST").ok();
+        let docker_sock_path = docker_host
+            .as_deref()
+            .and_then(|h| h.strip_prefix("unix://"))
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/var/run/docker.sock");
+
+        let docker_sock = Path::new(docker_sock_path);
         let docker_sock_display = docker_sock.display();
+        let docker_host_display = docker_host
+            .as_deref()
+            .unwrap_or("unix:///var/run/docker.sock");
         if !docker_sock.exists() {
             println!(
-                "- Docker: {} ({docker_sock_display}: socket not found; Docker-based services will be unavailable)",
+                "- Docker: {} ({docker_host_display}; {docker_sock_display}: socket not found; Docker-based services will be unavailable)",
                 "unavailable".yellow()
             );
             return;
@@ -118,11 +129,11 @@ fn render_optional_integrations() {
 
         match UnixStream::connect(docker_sock) {
             Ok(_) => println!(
-                "- Docker: {} ({docker_sock_display}; Docker-based services enabled)",
+                "- Docker: {} ({docker_host_display}; {docker_sock_display}; Docker-based services enabled)",
                 "available".green()
             ),
             Err(e) => println!(
-                "- Docker: {} ({docker_sock_display}; {e}; Docker-based services will be unavailable)",
+                "- Docker: {} ({docker_host_display}; {docker_sock_display}; {e}; Docker-based services will be unavailable)",
                 "unavailable".yellow()
             ),
         }
