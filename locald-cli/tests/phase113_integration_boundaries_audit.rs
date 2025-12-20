@@ -100,3 +100,23 @@ fn phase113_doctor_explains_unsupported_docker_host_schemes() {
         "Expected doctor output not to fall back to /var/run/docker.sock when DOCKER_HOST is non-unix, but got:\n{stdout}"
     );
 }
+
+#[test]
+fn phase113_doctor_mentions_buildpacks_cnb_optional_integration() {
+    // Goal: `locald doctor` should surface that Buildpacks/CNB support exists and
+    // clearly communicate its dependency on Docker.
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
+    cmd.arg("doctor");
+
+    let output = cmd.output().expect("failed to run locald doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("Buildpacks") || stdout.contains("CNB"),
+        "Expected doctor output to mention Buildpacks/CNB, but got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("requires Docker") || stdout.contains("Docker available"),
+        "Expected doctor output to explain the Docker dependency for Buildpacks/CNB, but got:\n{stdout}"
+    );
+}

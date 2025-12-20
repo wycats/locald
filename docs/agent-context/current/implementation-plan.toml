@@ -54,6 +54,14 @@ status = "completed"
 tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
 files = []
 
+[[plan.changes]]
+name = "Doctor surfaces CNB/buildpacks"
+type = "feat"
+details = "TDD Step"
+status = "completed"
+tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
+files = []
+
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
 manual = []
