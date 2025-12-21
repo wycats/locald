@@ -102,6 +102,7 @@ pub mod state;
 #[doc(hidden)]
 pub mod static_server;
 #[doc(hidden)]
+#[doc(hidden)]
 pub mod toolbar;
 
 #[cfg(test)]

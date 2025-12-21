@@ -335,6 +335,8 @@ impl ProcessManager {
         health_source: HealthSource,
         snapshot: RuntimeSnapshot,
         service_config: Option<&ServiceConfig>,
+        workspace: Option<String>,
+        constellation: Option<String>,
     ) -> ServiceStatus {
         let (status, pid, port) = match snapshot {
             RuntimeSnapshot::Static {
@@ -397,6 +399,8 @@ impl ProcessManager {
             health_source,
             path,
             domain,
+            workspace,
+            constellation,
         }
     }
 
@@ -434,7 +438,16 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     async fn get_service_status(&self, name: &str) -> Option<ServiceStatus> {
         let proxy_ports = { *self.proxy_ports.lock().await };
-        let (domain, path, health_status, health_source, snapshot, service_config) = {
+        let (
+            domain,
+            path,
+            health_status,
+            health_source,
+            snapshot,
+            service_config,
+            workspace,
+            constellation,
+        ) = {
             let mut services = self.services.lock().await;
             let service = services.get_mut(name)?;
             // We reap here to ensure status is up to date for single service query too
@@ -456,6 +469,8 @@ impl ProcessManager {
                 service.health_source,
                 snapshot,
                 service.service_config.clone(),
+                service.config.project.workspace.clone(),
+                service.config.project.constellation.clone(),
             )
         };
 
@@ -469,6 +484,8 @@ impl ProcessManager {
                 health_source,
                 snapshot,
                 Some(&service_config),
+                workspace,
+                constellation,
             )
             .await,
         )
@@ -1295,13 +1312,24 @@ impl ProcessManager {
                     service.health_source,
                     snapshot,
                     service.service_config.clone(),
+                    service.config.project.workspace.clone(),
+                    service.config.project.constellation.clone(),
                 ));
             }
         }
 
         let mut results = Vec::new();
-        for (name, domain, path, health_status, health_source, snapshot, service_config) in
-            snapshots
+        for (
+            name,
+            domain,
+            path,
+            health_status,
+            health_source,
+            snapshot,
+            service_config,
+            workspace,
+            constellation,
+        ) in snapshots
         {
             results.push(
                 Self::build_service_status(
@@ -1313,6 +1341,8 @@ impl ProcessManager {
                     health_source,
                     snapshot,
                     Some(&service_config),
+                    workspace,
+                    constellation,
                 )
                 .await,
             );
@@ -1739,6 +1769,8 @@ mod tests {
             health_source,
             running_snapshot(),
             None,
+            None,
+            None,
         )
         .await;
         assert_eq!(status.url, Some("http://app.test".to_string()));
@@ -1752,6 +1784,8 @@ mod tests {
             health_status,
             health_source,
             running_snapshot(),
+            None,
+            None,
             None,
         )
         .await;
@@ -1767,6 +1801,8 @@ mod tests {
             health_source,
             running_snapshot(),
             None,
+            None,
+            None,
         )
         .await;
         assert_eq!(status.url, Some("http://app.test:8080".to_string()));
@@ -1780,6 +1816,8 @@ mod tests {
             health_status,
             health_source,
             running_snapshot(),
+            None,
+            None,
             None,
         )
         .await;

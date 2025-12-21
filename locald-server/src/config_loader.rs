@@ -233,6 +233,40 @@ impl ConfigLoader {
         // 2. Read Project Config
         let (mut config, _config_source_path) = Self::read_project_config(path).await?;
 
+        // Populate Workspace and Constellation info
+        for (layer_config, layer_path) in &upstream_configs {
+            let file_name = layer_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if file_name == "locald.workspace.toml" {
+                let workspace_name = layer_config
+                    .project
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .or_else(|| {
+                        layer_path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string())
+                    });
+                config.project.workspace = workspace_name;
+            } else if file_name == ".locald.toml" {
+                let constellation_name = layer_config
+                    .project
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .or_else(|| {
+                        layer_path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string())
+                    });
+                config.project.constellation = constellation_name;
+            }
+        }
+
         // 3. Merge Upstream Services into Project Config
         let mut merged_services = HashMap::new();
         for (layer_config, _) in upstream_configs {
@@ -593,6 +627,8 @@ impl ConfigLoader {
             project: ProjectConfig {
                 name: project_name,
                 domain: None,
+                workspace: None,
+                constellation: None,
             },
             services,
         }

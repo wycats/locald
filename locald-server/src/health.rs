@@ -110,6 +110,8 @@ impl HealthMonitor {
                             proxy_ports,
                             snapshot,
                             service.service_config.clone(),
+                            service.config.project.workspace.clone(),
+                            service.config.project.constellation.clone(),
                         )),
                     )
                 } else {
@@ -121,7 +123,16 @@ impl HealthMonitor {
         };
 
         if changed {
-            if let Some((domain, path, proxy_ports, snapshot, service_config)) = snapshot_info {
+            if let Some((
+                domain,
+                path,
+                proxy_ports,
+                snapshot,
+                service_config,
+                workspace,
+                constellation,
+            )) = snapshot_info
+            {
                 let status = crate::manager::ProcessManager::build_service_status(
                     name.to_string(),
                     domain,
@@ -131,6 +142,8 @@ impl HealthMonitor {
                     source,
                     snapshot,
                     Some(&service_config),
+                    workspace,
+                    constellation,
                 )
                 .await;
 

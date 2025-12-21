@@ -107,6 +107,8 @@ pub fn run() -> Result<()> {
         project: ProjectConfig {
             name: project_name,
             domain,
+            workspace: None,
+            constellation: None,
         },
         services,
     };

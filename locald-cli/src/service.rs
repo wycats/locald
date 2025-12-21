@@ -23,6 +23,8 @@ fn load_or_create_config() -> Result<(std::path::PathBuf, LocaldConfig)> {
             project: ProjectConfig {
                 name: project_name.clone(),
                 domain: Some(format!("{project_name}.localhost")),
+                workspace: None,
+                constellation: None,
             },
             services: HashMap::new(),
         }

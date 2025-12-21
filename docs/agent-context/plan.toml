@@ -685,7 +685,7 @@ rfcs = ["0026"]
 [[epochs.phases.tasks]]
 id = "27.1"
 label = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
-status = "pending"
+status = "in-progress"
 
 [[epochs.phases.tasks]]
 id = "27.2"
@@ -701,6 +701,11 @@ status = "complete"
 id = "27.4"
 label = "RFC Update: Evaluate 'defaults.services' vs 'services' split"
 status = "pending"
+
+[[epochs.phases.tasks]]
+id = "27.1.1"
+label = "Dashboard: Group services by Constellation/Workspace"
+status = "completed"
 
 [[epochs.phases]]
 id = "36"

@@ -2,12 +2,12 @@
 # Task List
 
 [[tasks]]
-id = "27.1"
-title = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
+id = "First Step::27.1.1"
+title = "Dashboard: Group services by Constellation/Workspace"
 status = "pending"
 
 [[tasks]]
-id = "27.2"
-title = "Cascading Config: Implement config inheritance (Global -> Context -> Project)."
+id = "First Step::27.2.1"
+title = "Evaluate splitting defaults.services from services"
 status = "pending"
 

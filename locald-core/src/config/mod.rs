@@ -50,6 +50,12 @@ pub struct ProjectConfig {
     /// The domain to serve the project on. Defaults to `{name}.localhost`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// The name of the workspace the project belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The name of the constellation the project belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constellation: Option<String>,
 }
 
 /// Configuration for a single service.
@@ -450,6 +456,8 @@ impl Default for ProjectConfig {
         Self {
             name: "default".to_string(),
             domain: None,
+            workspace: None,
+            constellation: None,
         }
     }
 }
