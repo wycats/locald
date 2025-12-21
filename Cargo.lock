@@ -2365,6 +2365,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "schemars 1.1.0",
+ "serde",
  "serde_json",
  "shlex",
  "sysinfo",

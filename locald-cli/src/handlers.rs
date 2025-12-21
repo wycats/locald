@@ -656,9 +656,107 @@ pub fn run(cli: Cli) -> Result<()> {
                     .block_on(ConfigLoader::load())?;
 
                 if *provenance {
-                    println!("Global Configuration:");
-                    println!("  Path: {:?}", loader.global_path);
-                    println!("  Values: {:#?}", loader.global);
+                    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+
+                    println!("[server]");
+                    println!(
+                        "privileged_ports = {}  (from {})",
+                        loader.global.server.privileged_ports,
+                        loader.explain_global("server.privileged_ports")
+                    );
+                    println!(
+                        "fallback_ports = {}  (from {})",
+                        loader.global.server.fallback_ports,
+                        loader.explain_global("server.fallback_ports")
+                    );
+
+                    if let Ok(report) = rt.block_on(loader.load_service_provenance_report(&cwd)) {
+                        for (service_name, service) in report.services {
+                            let has_any = service.command.is_some()
+                                || service.workdir.is_some()
+                                || service.port.is_some()
+                                || service.depends_on.is_some();
+
+                            if !has_any {
+                                continue;
+                            }
+
+                            println!();
+                            println!("[services.{service_name}]");
+
+                            if let Some(field) = service.command {
+                                println!(
+                                    "command = {value:?}  (from {source})",
+                                    value = field.value,
+                                    source = field.source.display()
+                                );
+                            }
+
+                            if let Some(field) = service.workdir {
+                                println!(
+                                    "workdir = {value:?}  (from {source})",
+                                    value = field.value,
+                                    source = field.source.display()
+                                );
+                            }
+
+                            if let Some(field) = service.port {
+                                println!(
+                                    "port = {value}  (from {source})",
+                                    value = field.value,
+                                    source = field.source.display()
+                                );
+                            }
+
+                            if let Some(field) = service.depends_on {
+                                println!(
+                                    "depends_on = {value:?}  (from {source})",
+                                    value = field.value,
+                                    source = field.source.display()
+                                );
+                            }
+                        }
+                    }
+
+                    let report = rt.block_on(loader.load_env_provenance_report(&cwd))?;
+
+                    println!();
+                    println!("[env]");
+                    for (key, var) in report.base.vars {
+                        println!(
+                            "{key} = {value:?}  (from {source})",
+                            value = var.value,
+                            source = var.source.path.display()
+                        );
+                    }
+
+                    for (service_name, env) in report.services {
+                        let overrides: Vec<_> = env
+                            .vars
+                            .iter()
+                            .filter(|(_k, v)| {
+                                matches!(v.source.kind, locald_core::config::EnvLayerKind::Project)
+                            })
+                            .collect();
+
+                        if overrides.is_empty() {
+                            continue;
+                        }
+
+                        println!();
+                        println!("[services.{service_name}.env]");
+                        for (key, var) in overrides {
+                            println!(
+                                "{key} = {value:?}  (from {source})",
+                                value = var.value,
+                                source = var.source.path.display()
+                            );
+                        }
+                    }
                 } else {
                     println!("{}", toml::to_string_pretty(&loader.global)?);
                 }

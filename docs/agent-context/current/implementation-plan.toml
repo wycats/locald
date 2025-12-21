@@ -2,21 +2,390 @@
 # Implementation Plan
 
 [phase]
-id = "113"
-title = "Integration Boundaries Audit"
-rfcs = ["0112", "0114"]
+id = "27"
+title = "Workspace & Constellations"
+rfcs = ["0026"]
 
 [plan]
-changes= [
-  { details = "Description", files = [], name = "First Step", tests = [], type = "feat" },
-  { details = "TDD Step", files = [], name = "Audit optional integrations", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
-  { details = "TDD Step", files = [], name = "Buildpacks (CNB) unavailability explains impact (shim/libcontainer)", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
-  { details = "TDD Step", files = [], name = "Doctor reports shim evidence (libcontainer)", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
-  { details = "TDD Step", files = [], name = "Doctor does not depend on container-daemon env config", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
-  { details = "TDD Step", files = [], name = "Doctor ignores non-unix container-daemon endpoints", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
-  { details = "TDD Step", files = [], name = "Doctor surfaces CNB/buildpacks", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" },
-  { details = "TDD Step", files = [], name = "Doctor surfaces virtualization (KVM)", status = "completed", tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"], type = "feat" }
-]
+
+[[plan.changes]]
+name = "Cascading configuration (Global → Context → Workspace → Project)"
+type = "feat"
+details = "Implement the RFC 0026 config layering rules in locald-core: walk up from project root for .locald.toml until /home/wycats/.git/fs root; merge per-type rules; record provenance for each resolved field."
+files = []
+tests = []
+satisfies = ["27.2"]
+no_test_reason = "Planning: test files/locations TBD; will add unit+integration coverage as part of implementation."
+status = "in-progress"
+feedback = [{ author = "Copilot", message = """
+Progress update: implemented env-layer provenance (Global/Context/Workspace/.env + per-service overlays) and extended provenance output to include per-service fields (command/workdir/port/depends_on) sourced from the project config path. Verified with 
+running 12 tests
+test manager::tests::test_get_service_domain_default ... ok
+test manager::tests::test_get_service_domain_explicit ... ok
+test manager::tests::test_get_service_domain_main_service ... ok
+test manager::tests::test_log_buffer_capacity ... ok
+test manager::tests::test_log_buffer_fifo ... ok
+test manager::tests::test_url_generation_clean_ports ... ok
+test config_loader::tests::service_provenance_comes_from_project_config_path ... ok
+test proxy_test::test_docs_routing ... ok
+test proxy_test::test_proxy_error_page ... ok
+test proxy_test::test_proxy_connection_success ... ok
+test proxy_test::test_dashboard_routing ... ok
+test manager::tests::test_concurrency_guard ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s and Running rustfmt...
+Running cargo build...
+Checking CLI surface manifest is up to date...
+Running clippy...
+Building dashboard (CI-equivalent)...
+Lockfile is up to date, resolution step is skipped
+Already up to date
+
+
+> locald-dashboard@0.0.1 prepare /home/wycats/Code/locald/locald-dashboard
+> svelte-kit sync || echo ''
+
+╭ Warning ────────────────────────────────────────────╮
+│                                                     │
+│   Ignored build scripts: esbuild@0.25.12.           │
+│   Run "pnpm approve-builds" to pick which           │
+│   dependencies should be allowed to run scripts.    │
+│                                                     │
+╰─────────────────────────────────────────────────────╯
+Done in 598ms using pnpm v10.25.0
+
+> locald-dashboard@0.0.1 build /home/wycats/Code/locald/locald-dashboard
+> vite build
+
+vite v7.2.6 building ssr environment for production...
+transforming...
+✓ 3772 modules transformed.
+rendering chunks...
+vite v7.2.6 building client environment for production...
+transforming...
+✓ 3726 modules transformed.
+rendering chunks...
+computing gzip size...
+.svelte-kit/output/client/_app/version.json                         0.03 kB │ gzip:  0.05 kB
+.svelte-kit/output/client/.vite/manifest.json                       4.13 kB │ gzip:  0.81 kB
+.svelte-kit/output/client/_app/immutable/assets/0.sufBB6Xu.css      0.65 kB │ gzip:  0.41 kB
+.svelte-kit/output/client/_app/immutable/assets/2.DW5lih9x.css     12.63 kB │ gzip:  2.99 kB
+.svelte-kit/output/client/_app/immutable/entry/start.Chrgj0rF.js    0.08 kB │ gzip:  0.09 kB
+.svelte-kit/output/client/_app/immutable/chunks/IN79Gb6M.js         0.53 kB │ gzip:  0.34 kB
+.svelte-kit/output/client/_app/immutable/nodes/1.BydcRK7q.js        0.55 kB │ gzip:  0.35 kB
+.svelte-kit/output/client/_app/immutable/chunks/COZeDKnD.js         1.33 kB │ gzip:  0.75 kB
+.svelte-kit/output/client/_app/immutable/chunks/CXI1Llue.js         1.53 kB │ gzip:  0.67 kB
+.svelte-kit/output/client/_app/immutable/chunks/BlxrFPDK.js         1.75 kB │ gzip:  0.79 kB
+.svelte-kit/output/client/_app/immutable/nodes/0.CBx0nai4.js        2.96 kB │ gzip:  1.32 kB
+.svelte-kit/output/client/_app/immutable/chunks/CzTj0oKo.js         3.63 kB │ gzip:  1.78 kB
+.svelte-kit/output/client/_app/immutable/entry/app.DvY_0S9p.js      4.28 kB │ gzip:  1.95 kB
+.svelte-kit/output/client/_app/immutable/chunks/CNtBeHb_.js         4.53 kB │ gzip:  2.04 kB
+.svelte-kit/output/client/_app/immutable/chunks/DlQFc35Y.js         4.93 kB │ gzip:  2.28 kB
+.svelte-kit/output/client/_app/immutable/chunks/Bc8zOjvW.js         6.30 kB │ gzip:  2.94 kB
+.svelte-kit/output/client/_app/immutable/chunks/BHlkUKrU.js        23.37 kB │ gzip:  9.12 kB
+.svelte-kit/output/client/_app/immutable/chunks/CZs6MOSw.js        25.72 kB │ gzip: 10.11 kB
+.svelte-kit/output/client/_app/immutable/nodes/2.D4ccXWG1.js       30.05 kB │ gzip: 11.37 kB
+.svelte-kit/output/client/_app/immutable/chunks/BTGVxaYV.js       289.61 kB │ gzip: 72.08 kB
+✓ built in 2.66s
+.svelte-kit/output/server/.vite/manifest.json                           3.77 kB
+.svelte-kit/output/server/_app/immutable/assets/_layout.sufBB6Xu.css    0.65 kB
+.svelte-kit/output/server/_app/immutable/assets/_page.DB8i96EL.css     12.61 kB
+.svelte-kit/output/server/chunks/false.js                               0.04 kB
+.svelte-kit/output/server/internal.js                                   0.33 kB
+.svelte-kit/output/server/chunks/environment.js                         0.62 kB
+.svelte-kit/output/server/chunks/utils.js                               1.15 kB
+.svelte-kit/output/server/entries/fallbacks/error.svelte.js             1.34 kB
+.svelte-kit/output/server/entries/pages/_layout.svelte.js               2.58 kB
+.svelte-kit/output/server/chunks/index.js                               2.66 kB
+.svelte-kit/output/server/chunks/exports.js                             5.52 kB
+.svelte-kit/output/server/remote-entry.js                              18.84 kB
+.svelte-kit/output/server/chunks/internal.js                           28.04 kB
+.svelte-kit/output/server/chunks/index2.js                             29.13 kB
+.svelte-kit/output/server/chunks/shared.js                             32.87 kB
+.svelte-kit/output/server/entries/pages/_page.svelte.js                36.72 kB
+.svelte-kit/output/server/chunks/context.js                            52.97 kB
+.svelte-kit/output/server/index.js                                    146.19 kB
+✓ built in 5.47s
+
+Run npm run preview to preview your production build locally.
+
+> Using @sveltejs/adapter-static
+  Wrote site to "build"
+  ✔ done
+Running docs checks...
+Docs sidebar links: OK
+Docs screenshot assets: OK
+CLI surface docs lint: OK
+Running docs build...
+Lockfile is up to date, resolution step is skipped
+Already up to date
+
+╭ Warning ────────────────────────────────────────────╮
+│                                                     │
+│   Ignored build scripts: esbuild@0.25.12,           │
+│   sharp@0.34.5.                                     │
+│   Run "pnpm approve-builds" to pick which           │
+│   dependencies should be allowed to run scripts.    │
+│                                                     │
+╰─────────────────────────────────────────────────────╯
+Done in 248ms using pnpm v10.25.0
+
+> locald-docs@0.0.1 build /home/wycats/Code/locald/locald-docs
+> pnpm sync-axioms && pnpm sync-manifesto && astro build
+
+
+> locald-docs@0.0.1 sync-axioms /home/wycats/Code/locald/locald-docs
+> node ./scripts/sync-axioms.mjs
+
+sync-axioms: updated 17 file(s)
+
+> locald-docs@0.0.1 sync-manifesto /home/wycats/Code/locald/locald-docs
+> ./scripts/sync-manifesto.sh
+
+Syncing /home/wycats/Code/locald/docs/design/vision.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/concepts/vision.md (Title: Vision: Local Development as a Platform)
+Syncing /home/wycats/Code/locald/docs/design/generative-design.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/concepts/generative-design.md (Title: Generative Design & The Agent Lexicon)
+Syncing /home/wycats/Code/locald/docs/design/modes.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/concepts/modes.md (Title: Modes of Collaboration)
+Syncing /home/wycats/Code/locald/docs/design/personas.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/concepts/personas.md (Title: User Personas)
+Syncing /home/wycats/Code/locald/docs/design/user-interaction-modes.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/concepts/user-interaction-modes.md (Title: Interaction Modes & Personas)
+Syncing /home/wycats/Code/locald/docs/design/workflow-axioms.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/concepts/workflow-axioms.md (Title: Workflow Axioms)
+Syncing /home/wycats/Code/locald/docs/design/axioms.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms.md (Title: Design Axioms)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/04-daemon-first.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/04-daemon-first.md (Title: Axiom 2: Daemon-First Architecture)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/05-process-ownership.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/05-process-ownership.md (Title: Axiom 4: Process Ownership)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/06-secure-privilege-separation.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/06-secure-privilege-separation.md (Title: Axiom 8: Secure Privilege Separation)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/07-ephemeral-runtime.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/07-ephemeral-runtime.md (Title: Axiom 7: Ephemeral Runtime, Persistent Context)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/11-self-hosting-platform.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/11-self-hosting-platform.md (Title: Axiom 11: The Platform is Self-Hosting)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/12-source-of-truth.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/12-source-of-truth.md (Title: Axiom 12: The Source of Truth)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/13-development-loop.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/13-development-loop.md (Title: Axiom 13: The Development Loop)
+Syncing /home/wycats/Code/locald/docs/design/axioms/architecture/14-precise-abstractions.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/architecture/14-precise-abstractions.md (Title: Axiom 14: Precise Abstractions)
+Syncing /home/wycats/Code/locald/docs/design/axioms/environment/08-structured-hierarchy.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/environment/08-structured-hierarchy.md (Title: Axiom 10: Structured Service Hierarchy)
+Syncing /home/wycats/Code/locald/docs/design/axioms/environment/09-managed-networking.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/environment/09-managed-networking.md (Title: Axiom 3: Managed Ports & DNS)
+Syncing /home/wycats/Code/locald/docs/design/axioms/environment/10-portability.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/environment/10-portability.md (Title: Axiom 7: Cross-Platform Portability)
+Syncing /home/wycats/Code/locald/docs/design/axioms/experience/01-zero-friction-start.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/experience/01-zero-friction-start.md (Title: Axiom 1: Decentralized Configuration (In-Repo))
+Syncing /home/wycats/Code/locald/docs/design/axioms/experience/02-dashboard-workspace.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/experience/02-dashboard-workspace.md (Title: Axiom 9: The Dashboard is a Workspace)
+Syncing /home/wycats/Code/locald/docs/design/axioms/experience/03-interface-parity.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/experience/03-interface-parity.md (Title: Axiom 5: Interface Parity (TUI = Web))
+Syncing /home/wycats/Code/locald/docs/design/axioms/experience/04-output-philosophy.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/experience/04-output-philosophy.md (Title: Axiom: Respectful & Relevant Output)
+Syncing /home/wycats/Code/locald/docs/design/axioms/experience/05-dashboard-philosophy.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/experience/05-dashboard-philosophy.md (Title: Axiom: The Dashboard is a Living Workspace)
+Syncing /home/wycats/Code/locald/docs/design/axioms/experience/15-heroku-terminology.md -> /home/wycats/Code/locald/locald-docs/src/content/docs/internals/axioms/experience/15-heroku-terminology.md (Title: Axiom 15: Heroku Terminology (When It Fits))
+Design docs synced to /home/wycats/Code/locald/locald-docs/src/content/docs/concepts and /home/wycats/Code/locald/locald-docs/src/content/docs/internals
+11:02:54 [content] Syncing content
+11:02:54 [content] Synced content
+11:02:54 [types] Generated 216ms
+11:02:54 [build] output: "static"
+11:02:54 [build] mode: "static"
+11:02:54 [build] directory: /home/wycats/Code/locald/locald-docs/dist/
+11:02:54 [build] Collecting build info...
+11:02:54 [build] ✓ Completed in 279ms.
+11:02:54 [build] Building static entrypoints...
+11:02:55 [vite] ✓ built in 1.60s
+11:02:55 [build] ✓ Completed in 1.61s.
+
+ building client (vite) 
+11:02:55 [vite] transforming...
+11:02:55 [vite] ✓ 18 modules transformed.
+11:02:55 [vite] rendering chunks...
+11:02:55 [vite] computing gzip size...
+11:02:55 [vite] dist/_astro/ec.p1z7b.js                                                              2.48 kB
+11:02:55 [vite] dist/_astro/ec.v4551.css                                                            18.22 kB │ gzip:  3.96 kB
+11:02:55 [vite] dist/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.C181hMzK.js   0.67 kB │ gzip:  0.40 kB
+11:02:55 [vite] dist/_astro/TableOfContents.astro_astro_type_script_index_0_lang.CKWWgpjV.js         1.67 kB │ gzip:  0.86 kB
+11:02:55 [vite] dist/_astro/page.B1D-nYk3.js                                                         2.24 kB │ gzip:  1.01 kB
+11:02:55 [vite] dist/_astro/Search.astro_astro_type_script_index_0_lang.cjYDvRdi.js                  2.69 kB │ gzip:  1.38 kB
+11:02:55 [vite] dist/_astro/ui-core.D_Lfcn_I.js                                                     72.93 kB │ gzip: 22.86 kB
+11:02:55 [vite] ✓ built in 87ms
+
+ generating static routes 
+11:02:55 ▶ @astrojs/starlight/routes/static/404.astro
+11:02:55   └─ /404.html (+8ms) 
+11:02:55 ▶ @astrojs/starlight/routes/static/index.astro
+11:02:55   ├─ /index.html (+5ms) 
+11:02:55   ├─ /concepts/generative-design/index.html (+3ms) 
+11:02:55   ├─ /concepts/personas/index.html (+2ms) 
+11:02:55   ├─ /concepts/philosophy/index.html (+2ms) 
+11:02:55   ├─ /concepts/user-interaction-modes/index.html (+2ms) 
+11:02:55   ├─ /concepts/modes/index.html (+2ms) 
+11:02:55   ├─ /concepts/workflow-axioms/index.html (+2ms) 
+11:02:55   ├─ /concepts/workspace/index.html (+2ms) 
+11:02:55   ├─ /concepts/vision/index.html (+2ms) 
+11:02:55   ├─ /guides/adhoc-tasks/index.html (+2ms) 
+11:02:55   ├─ /guides/backend-services/index.html (+2ms) 
+11:02:55   ├─ /guides/configuration-basics/index.html (+2ms) 
+11:02:55   ├─ /guides/dns-and-domains/index.html (+2ms) 
+11:02:55   ├─ /guides/ci-automation/index.html (+2ms) 
+11:02:55   ├─ /guides/project-setup/index.html (+2ms) 
+11:02:55   ├─ /guides/managed-services/index.html (+2ms) 
+11:02:55   ├─ /guides/frontend-development/index.html (+2ms) 
+11:02:55   ├─ /getting-started/index.html (+2ms) 
+11:02:55   ├─ /internals/architecture/index.html (+2ms) 
+11:02:55   ├─ /internals/axioms/index.html (+2ms) 
+11:02:55   ├─ /internals/development/index.html (+1ms) 
+11:02:55   ├─ /internals/personas/index.html (+1ms) 
+11:02:55   ├─ /internals/security/index.html (+1ms) 
+11:02:55   ├─ /reference/builds/index.html (+8ms) 
+11:02:55   ├─ /reference/execution-modes/index.html (+2ms) 
+11:02:55   ├─ /reference/health-checks/index.html (+1ms) 
+11:02:55   ├─ /reference/cli/index.html (+1ms) 
+11:02:55   ├─ /reference/locald-toml/index.html (+1ms) 
+11:02:55   ├─ /reference/service-types/index.html (+1ms) 
+11:02:55   ├─ /internals/architecture/configuration/index.html (+2ms) 
+11:02:55   ├─ /internals/architecture/container-runtime/index.html (+1ms) 
+11:02:55   ├─ /internals/architecture/core/index.html (+4ms) 
+11:02:55   ├─ /internals/architecture/networking/index.html (+3ms) 
+11:02:55   ├─ /internals/architecture/health/index.html (+1ms) 
+11:02:55   ├─ /internals/architecture/security/index.html (+4ms) 
+11:02:55   ├─ /internals/architecture/shim-management/index.html (+2ms) 
+11:02:55   ├─ /internals/rfcs/advanced-service-config/index.html (+3ms) 
+11:02:55   ├─ /internals/rfcs/advanced-proxying/index.html (+2ms) 
+11:02:55   ├─ /internals/rfcs/ai-usability/index.html (+4ms) 
+11:02:55   ├─ /internals/rfcs/constellations-and-config/index.html (+2ms) 
+11:02:55   ├─ /internals/rfcs/dashboard-ergonomics/index.html (+2ms) 
+11:02:55   ├─ /internals/rfcs/index.html (+2ms) 
+11:02:55   ├─ /internals/rfcs/ux-improvements/index.html (+1ms) 
+11:02:55   ├─ /internals/rfcs/docker-integration/index.html (+2ms) 
+11:02:55   ├─ /internals/rfcs/shim-versioning/index.html (+4ms) 
+11:02:56   ├─ /internals/axioms/architecture/05-process-ownership/index.html (+3ms) 
+11:02:56   ├─ /internals/axioms/architecture/04-daemon-first/index.html (+1ms) 
+11:02:56   ├─ /internals/axioms/architecture/06-secure-privilege-separation/index.html (+2ms) 
+11:02:56   ├─ /internals/axioms/architecture/07-ephemeral-runtime/index.html (+3ms) 
+11:02:56   ├─ /internals/axioms/architecture/11-self-hosting-platform/index.html (+3ms) 
+11:02:56   ├─ /internals/axioms/architecture/12-source-of-truth/index.html (+3ms) 
+11:02:56   ├─ /internals/axioms/architecture/13-development-loop/index.html (+14ms) 
+11:02:56   ├─ /internals/axioms/architecture/14-precise-abstractions/index.html (+2ms) 
+11:02:56   ├─ /internals/axioms/environment/09-managed-networking/index.html (+2ms) 
+11:02:56   ├─ /internals/axioms/environment/10-portability/index.html (+1ms) 
+11:02:56   ├─ /internals/axioms/experience/01-zero-friction-start/index.html (+2ms) 
+11:02:56   ├─ /internals/axioms/experience/02-dashboard-workspace/index.html (+1ms) 
+11:02:56   ├─ /internals/axioms/environment/08-structured-hierarchy/index.html (+2ms) 
+11:02:56   ├─ /internals/axioms/experience/03-interface-parity/index.html (+4ms) 
+11:02:56   ├─ /internals/axioms/experience/04-output-philosophy/index.html (+2ms) 
+11:02:56   ├─ /internals/axioms/experience/05-dashboard-philosophy/index.html (+1ms) 
+11:02:56   └─ /internals/axioms/experience/15-heroku-terminology/index.html (+1ms) 
+11:02:56 ✓ Completed in 190ms.
+
+ generating optimized images 
+11:02:56   ▶ /_astro/houston.CZZyCf7p_Z2wV2f.webp (reused cache entry) (+0ms) (1/1)
+11:02:56 ✓ Completed in 1ms.
+
+
+Running Pagefind v1.4.0 (Extended)
+Running from: "/home/wycats/Code/locald/locald-docs/node_modules/.pnpm/@astrojs+starlight@0.37.0_astro@5.16.3_@types+node@24.10.1_rollup@4.53.3_typescript@5.9.3_/node_modules/@astrojs/starlight"
+Source:       "../../../../../../dist"
+Output:       "../../../../../../dist/pagefind"
+
+[Walking source directory]
+Found 63 files matching **/*.{html}
+
+[Parsing files]
+Found a data-pagefind-body element on the site.
+↳ Ignoring pages without this tag.
+
+[Reading languages]
+Discovered 1 language: en
+
+[Building search indexes]
+Total: 
+  Indexed 1 language
+  Indexed 62 pages
+  Indexed 2965 words
+  Indexed 0 filters
+  Indexed 0 sorts
+
+Finished in 0.126 seconds
+11:02:56 [@astrojs/sitemap] `sitemap-index.xml` created at `dist`
+11:02:56 [build] 63 page(s) built in 2.47s
+11:02:56 [build] Complete!
+Running IPC verification...
+\u001B[2m2025-12-21T19:02:56.357730Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(1), interests=READABLE
+\u001B[2m2025-12-21T19:02:56.358700Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m locald-server starting... (version: 0.1.0)
+\u001B[2m2025-12-21T19:02:56.358856Z\u001B[0m \u001B[33m WARN\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m Failed to connect to Docker: Socket not found: /var/run/docker.sock. Docker-based services will be unavailable.
+\u001B[2m2025-12-21T19:02:56.358949Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server::state\u001B[0m\u001B[2m:\u001B[0m State file configured at: "/home/wycats/.local/share/locald/sandboxes/check/data/locald/state.json"
+\u001B[2m2025-12-21T19:02:56.359849Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(187651772497408), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:56.360021Z\u001B[0m \u001B[34mDEBUG\u001B[0m \u001B[1mload\u001B[0m\u001B[2m:\u001B[0m \u001B[2mlocald_server::state\u001B[0m\u001B[2m:\u001B[0m No state file found, returning default state
+\u001B[2m2025-12-21T19:02:56.360077Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server::manager\u001B[0m\u001B[2m:\u001B[0m Restoring state: found 0 services
+\u001B[2m2025-12-21T19:02:56.360088Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(281472023924736), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:56.360120Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server::ipc\u001B[0m\u001B[2m:\u001B[0m IPC server listening on "/home/wycats/.local/share/locald/sandboxes/check/locald.sock"
+\u001B[2m2025-12-21T19:02:56.360987Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m Binding HTTP to configured port: 8080
+\u001B[2m2025-12-21T19:02:56.361034Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(187651772506368), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:56.361058Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server::proxy\u001B[0m\u001B[2m:\u001B[0m Proxy bound to http://0.0.0.0:8080
+\u001B[2m2025-12-21T19:02:56.361105Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m Binding HTTPS to configured port: 8443
+\u001B[2m2025-12-21T19:02:56.361131Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(187651772507520), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:56.361152Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+\u001B[2m2025-12-21T19:02:56.361195Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server::proxy\u001B[0m\u001B[2m:\u001B[0m Proxy bound to https://0.0.0.0:8443
+\u001B[2m2025-12-21T19:02:56.361407Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(281472225284992), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:58.357063Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(187651772507520), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:58.357278Z\u001B[0m \u001B[34mDEBUG\u001B[0m \u001B[2mlocald_server::ipc\u001B[0m\u001B[2m:\u001B[0m Received request: Ping
+\u001B[2m2025-12-21T19:02:58.357321Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+IPC Ping successful
+\u001B[2m2025-12-21T19:02:58.359548Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m registering event source with poller: token=Token(187651772507520), interests=READABLE | WRITABLE
+\u001B[2m2025-12-21T19:02:58.359617Z\u001B[0m \u001B[34mDEBUG\u001B[0m \u001B[2mlocald_server::ipc\u001B[0m\u001B[2m:\u001B[0m Received request: Shutdown
+\u001B[2m2025-12-21T19:02:58.359663Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+Ok
+\u001B[2m2025-12-21T19:02:58.359693Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m Received shutdown signal
+\u001B[2m2025-12-21T19:02:58.359715Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m Stopping all services...
+\u001B[2m2025-12-21T19:02:58.359890Z\u001B[0m \u001B[32m INFO\u001B[0m \u001B[2mlocald_server\u001B[0m\u001B[2m:\u001B[0m locald-server stopped
+\u001B[2m2025-12-21T19:02:58.359948Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+\u001B[2m2025-12-21T19:02:58.359964Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+\u001B[2m2025-12-21T19:02:58.359958Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+\u001B[2m2025-12-21T19:02:58.360014Z\u001B[0m \u001B[35mTRACE\u001B[0m \u001B[2mmio::poll\u001B[0m\u001B[2m:\u001B[0m deregistering event source from poller
+All checks passed.
+
+running 16 tests
+test cgroup::tests::pid1_comm_systemd_selects_systemd ... ok
+test fs::tests::test_safe_join ... ok
+test privileged::tests::consolidate_fixes_dedupes_and_orders ... ok
+test privileged::tests::json_roundtrip_preserves_fields ... ok
+test privileged::tests::report_detects_critical_failures ... ok
+test cgroup::tests::cgroup_paths_use_expected_prefix ... ok
+test cgroup::tests::pid1_comm_non_systemd_selects_direct ... ok
+test cgroup::tests::sanitize_component_produces_safe_nonempty ... ok
+test cgroup::tests::cgroup_paths_have_no_empty_or_parent_components ... ok
+test privileged::tests::consolidate_fixes_is_deduped_and_prioritized ... ok
+test privileged::tests::run_admin_setup_fix_commands_are_canonical_and_dominant ... ok
+test privileged::tests::consolidate_fixes_is_complete_over_failing_fix_keys ... ok
+test privileged::tests::consolidate_fixes_never_invents_advice ... ok
+test privileged::tests::has_critical_failures_matches_predicate ... ok
+test privileged::tests::consolidate_fixes_is_monotone_under_added_failures ... ok
+test privileged::tests::json_roundtrip_preserves_report_meaning ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.74s
+
+
+running 1 test
+test phase99_acceptance_mentions_name_sanitization ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test sandbox_active_without_name_defaults_to_default ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test locald-utils/src/project.rs - project::get_state_dir (line 13) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 1.15s; merged doctests compilation took 1.15s
+
+running 1 test
+test test_service_stop_prunes_cgroup_leaf ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s. Next: implement crisp-rule merging for service fields across layers and track per-field provenance beyond project-only.""" }, { author = "Copilot", message = "Correction: the previous feedback entry was mangled by shell expansion. Clean summary: implemented env provenance (layer discovery + per-key sources) and added minimal per-service field provenance output for command/workdir/port/depends_on (sourced from project config path). Verified by running cargo test -p locald-server and ./scripts/verify-phase.sh successfully. Next: implement crisp-rule merging for service fields across layers and track per-field provenance beyond project-only." }]
+
+[[plan.changes]]
+name = "Workspace sorting & grouping (Constellations)"
+type = "feat"
+details = "Implement stable sorting + grouping in the dashboard/service list, driven by Workspace/Constellation metadata, without changing the underlying service model semantics."
+files = []
+tests = []
+satisfies = ["27.1"]
+no_test_reason = "Planning: test files/locations TBD; will add UI/unit tests during implementation."
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

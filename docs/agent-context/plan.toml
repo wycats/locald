@@ -679,7 +679,7 @@ status = "complete"
 [[epochs.phases]]
 id = "27"
 title = "Workspace & Constellations"
-status = "pending"
+status = "active"
 rfcs = ["0026"]
 
 [[epochs.phases.tasks]]
@@ -690,6 +690,16 @@ status = "pending"
 [[epochs.phases.tasks]]
 id = "27.2"
 label = "Cascading Config: Implement config inheritance (Global -> Context -> Project)."
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "27.3"
+label = "Docs: Document 'Crisp Rules' for config merging (RFC 0026)"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "27.4"
+label = "RFC Update: Evaluate 'defaults.services' vs 'services' split"
 status = "pending"
 
 [[epochs.phases]]

@@ -33,3 +33,45 @@ created_at = "2025-12-20T22:17:38.397Z"
 source = "user"
 tags = []
 related_tasks = []
+
+[[ideas]]
+id = "9b329f24-e742-4ba8-8f0a-aea7a4b79d70"
+title = "Service config cascade provenance (crisp rules)"
+description = """
+Extend provenance beyond env and beyond project-only sources:
+
+- Implement RFC 0026 “crisp rules” merge for service fields across Global/Context/Workspace/Project where applicable:
+  - Scalars (port/command/workdir): replace
+  - depends_on: replace
+- Track per-field provenance (which layer + which file) for each resolved service value.
+- Extend `locald config show --provenance` to show the full cascade for these fields.
+
+Non-goals for the first slice:
+- Secrets providers and resource injection provenance (can be a follow-up)."""
+status = "new"
+created_at = "2025-12-21T19:02:17.109Z"
+source = "user"
+tags = [
+    "config",
+    "provenance",
+]
+related_tasks = []
+
+[[ideas]]
+id = "6ca14603-20e5-4fa0-9e0c-48a2970eb718"
+title = "Config: Separate 'defaults.services' from 'services' (Singleton vs Template)"
+description = """
+Consider splitting configuration inheritance into two concepts:
+1. 'defaults.services.<name>': Template/Defaults that are inherited but not run.
+2. 'services.<name>': Actual service definitions that are run (and can be singletons in a workspace).
+
+This resolves the ambiguity where defining a service in the workspace config currently implies both 'default values for children' and 'a runnable service at the workspace level'."""
+status = "new"
+created_at = "2025-12-21T20:00:21.466Z"
+source = "user"
+tags = [
+    "config",
+    "rfc-0026",
+    "design",
+]
+related_tasks = []

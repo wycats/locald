@@ -2,30 +2,48 @@
 # Walkthrough
 
 [[entries]]
-type = "design"
-description = "Schedule follow-up to retire Docker-daemon container runtime in favor of OCI+shim"
-details = "Added idea in docs/agent-context/ideas.toml: OCI container services via shim (replace legacy Docker runtime). Added Stage-0 RFC docs/rfcs/stage-0/0126-oci-container-services-via-shim.md describing consolidating container services onto locald-oci + locald-shim (libcontainer) and treating Docker daemon as legacy/optional if retained."
+type = "feat"
+description = "Add env provenance to config show"
+details = """
+Implemented minimal, truthful env provenance: added pure env layer merge/provenance helpers in locald-core; updated locald-server config loader to build Global/Context/Workspace/.env env layers and produce an env provenance report; updated Global Configuration:
+  Path: "/home/wycats/.config/locald/config.toml"
+  Values: GlobalConfig {
+    server: ServerConfig {
+        privileged_ports: true,
+        fallback_ports: true,
+    },
+} to print server config provenance and env sources plus per-service overrides."""
 
 [[entries]]
-type = "docs"
-description = "Phase 113 plan synced with OCI+shim/libcontainer direction"
+type = "feat"
+description = "Extend config provenance to service fields"
 details = """
-Marked Phase 113 tasks (113.1–113.3) complete after updating 📦 Strategy: \u001B[1msystemd\u001B[0m (PID 1 is systemd)
-📦 Cleanup mode: \u001B[38;5;10menabled\u001B[39m
-📦 Optional integrations:
-- Docker (optional): \u001B[38;5;11munavailable\u001B[39m
-  - Configured: DOCKER_HOST=unix:///var/run/docker.sock
-  - Checked: /var/run/docker.sock: socket not found
-  - Impact: Docker-based services will be unavailable
-  - If you need this: start Docker
-- Buildpacks (CNB) (optional): \u001B[38;5;11munavailable\u001B[39m
-  - Dependency: requires Docker
-  - Impact: buildpack-based builds will be unavailable
-  - If you need this: enable Docker
-- Virtualization (KVM) (optional): \u001B[38;5;10mavailable\u001B[39m
-  - Checked: /dev/kvm
-  - Impact: VM-based workflows enabled
-✅ All critical checks passed (core).
-⚠ Optional missing (non-blocking):
-  - Docker
-  - Buildpacks (CNB) to remove Docker optional integration checks, aligning optional integrations with privileged  (CNB) and KVM/virtualization. Updated Stage-0 Surface Contract RFC (0114) to use OCI+shim/libcontainer readiness in the integration matrix examples."""
+Added service-field provenance to `locald config show --provenance` for:
+- services.<name>.command
+- services.<name>.workdir
+- services.<name>.port
+- services.<name>.depends_on
+
+Implementation:
+- Added `ConfigLoader::load_service_provenance_report` (server-side) to report these fields and their source config path.
+- Updated the CLI to print `[services.<name>]` sections with per-field `(from <path>)` when `--provenance` is set.
+- Added a unit test in `locald-server` to ensure the source path is the discovered project config path.
+
+Verification:
+- `cargo test -p locald-server`
+- `./scripts/verify-phase.sh`
+
+Notes:
+- This is intentionally minimal and truthful: it reports provenance for values we currently load (project config path), without claiming Context/Workspace provenance for service fields yet."""
+
+[[entries]]
+type = "feat"
+description = "Implement service config cascade"
+details = """
+Implemented RFC 0026 merging rules for service fields:
+- Added LayerConfig to parse intermediate config layers (Global, Context, Workspace).
+- Implemented discover_layers to walk up the directory tree.
+- Implemented merge_service_configs with 'replace' strategy for scalars and depends_on, and 'merge' for env.
+- Updated ConfigLoader to load and merge upstream configs into project config.
+- Updated service provenance report to track source of each field across layers.
+- Added unit test verifying cascading behavior."""

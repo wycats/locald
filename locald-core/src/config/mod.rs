@@ -1,6 +1,12 @@
 pub mod global;
 pub use global::GlobalConfig;
 
+pub mod env_provenance;
+pub use env_provenance::{
+    EnvLayer, EnvLayerKind, EnvLayerSource, ResolvedEnv, ResolvedEnvVar, merge_env_layers,
+    overlay_env,
+};
+
 // FLAG: The `loader` module contains side effects (file I/O, env vars).
 // It has been removed from this pure crate.
 // pub mod loader;
