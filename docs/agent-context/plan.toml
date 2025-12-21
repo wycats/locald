@@ -693,6 +693,53 @@ label = "Cascading Config: Implement config inheritance (Global -> Context -> Pr
 status = "pending"
 
 [[epochs.phases]]
+id = "36"
+title = "Hot Reloading & Configuration Watcher"
+status = "pending"
+rfcs = ["0050"]
+
+[[epochs.phases.tasks]]
+id = "36.1"
+label = "Fix Manual Restart: Ensure `locald restart` reloads config from disk."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "36.2"
+label = "Project Config Watcher: Implement a watcher for registered project `locald.toml` files."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "36.3"
+label = "Hot Reload Logic: Wire up the watcher to the service restart logic."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "36.4"
+label = "Debouncing: Add debouncing to the watcher."
+status = "pending"
+
+[[epochs.phases]]
+id = "37"
+title = "Port Mismatch Detection"
+status = "pending"
+rfcs = ["0051"]
+
+[[epochs.phases.tasks]]
+id = "37.1"
+label = "Refactor Discovery: Move `locald-server/src/discovery.rs` to `locald-core`."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "37.2"
+label = "Implement Monitor: Create a `PortMonitor` struct."
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "37.3"
+label = "Integrate into `try`: Add mismatch warnings to `locald try`."
+status = "pending"
+
+[[epochs.phases]]
 id = "28"
 title = "Interactive Terminal & Theming"
 status = "pending"
@@ -737,7 +784,7 @@ status = "pending"
 id = "30"
 title = "Installation & Update Experience"
 status = "pending"
-rfcs = ["0029"]
+rfcs = ["0039"]
 
 [[epochs.phases.tasks]]
 id = "30.1"
@@ -768,7 +815,7 @@ status = "pending"
 id = "31"
 title = "Engineering Excellence"
 status = "pending"
-rfcs = ["0030"]
+rfcs = ["0040"]
 
 [[epochs.phases.tasks]]
 id = "31.1"
@@ -857,53 +904,6 @@ status = "complete"
 id = "35.4"
 label = "User Notification: Instruct users to run `sudo locald admin setup` to update (or auto-fix in interactive mode)."
 status = "complete"
-
-[[epochs.phases]]
-id = "36"
-title = "Hot Reloading & Configuration Watcher"
-status = "pending"
-rfcs = ["0050"]
-
-[[epochs.phases.tasks]]
-id = "36.1"
-label = "Fix Manual Restart: Ensure `locald restart` reloads config from disk."
-status = "pending"
-
-[[epochs.phases.tasks]]
-id = "36.2"
-label = "Project Config Watcher: Implement a watcher for registered project `locald.toml` files."
-status = "pending"
-
-[[epochs.phases.tasks]]
-id = "36.3"
-label = "Hot Reload Logic: Wire up the watcher to the service restart logic."
-status = "pending"
-
-[[epochs.phases.tasks]]
-id = "36.4"
-label = "Debouncing: Add debouncing to the watcher."
-status = "pending"
-
-[[epochs.phases]]
-id = "37"
-title = "Port Mismatch Detection"
-status = "pending"
-rfcs = ["0051"]
-
-[[epochs.phases.tasks]]
-id = "37.1"
-label = "Refactor Discovery: Move `locald-server/src/discovery.rs` to `locald-core`."
-status = "pending"
-
-[[epochs.phases.tasks]]
-id = "37.2"
-label = "Implement Monitor: Create a `PortMonitor` struct."
-status = "pending"
-
-[[epochs.phases.tasks]]
-id = "37.3"
-label = "Integrate into `try`: Add mismatch warnings to `locald try`."
-status = "pending"
 
 [[epochs.phases]]
 id = "79"
@@ -1170,7 +1170,7 @@ status = "pending"
 id = "59"
 title = "Systematic Investigation Protocol"
 status = "pending"
-rfcs = ["0059"]
+rfcs = ["0066"]
 
 [[epochs.phases.tasks]]
 id = "59.1"
