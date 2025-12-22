@@ -29,6 +29,30 @@ id = "29.3"
 title = "Distributions: Allow flavored binaries/configs"
 status = "pending"
 
+[[plan.changes.tasks]]
+id = "29.1.1"
+title = "Specify plugin contract + fixtures"
+status = "pending"
+notes = "Tie down the minimal host<->plugin contract for Phase 29.1 (RFC 0129): WIT surface, canonical normalization rules, and golden fixtures (JSON is debug-only)."
+
+[[plan.changes.tasks]]
+id = "29.1.2"
+title = "Run WASM component (WASI-only)"
+status = "pending"
+notes = "Implement the host-side runner for WASM components with a minimal capability set (default WASI-only) plus explicit cache/state dirs as needed; no Docker assumptions."
+
+[[plan.changes.tasks]]
+id = "29.1.3"
+title = "ServicePlan IR + apply/merge"
+status = "pending"
+notes = "Introduce the minimal ServicePlan DAG IR and integrate it into the config/service graph pipeline: plugin produces a plan; host applies it to materialize services/controllers."
+
+[[plan.changes.tasks]]
+id = "29.1.4"
+title = "Example plugin + e2e verification"
+status = "pending"
+notes = "Add a small example plugin + an automated verification path (fixtures + at least one e2e test) to prove discovery → execution → plan application works."
+
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
 manual = []
