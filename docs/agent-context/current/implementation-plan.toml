@@ -32,13 +32,13 @@ status = "pending"
 [[plan.changes.tasks]]
 id = "29.1.1"
 title = "Specify plugin contract + fixtures"
-status = "pending"
+status = "completed"
 notes = "Tie down the minimal host<->plugin contract for Phase 29.1 (RFC 0129): WIT surface, canonical normalization rules, and golden fixtures (JSON is debug-only)."
 
 [[plan.changes.tasks]]
 id = "29.1.2"
 title = "Run WASM component (WASI-only)"
-status = "pending"
+status = "completed"
 notes = "Implement the host-side runner for WASM components with a minimal capability set (default WASI-only) plus explicit cache/state dirs as needed; no Docker assumptions."
 
 [[plan.changes.tasks]]

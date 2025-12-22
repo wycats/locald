@@ -11,6 +11,7 @@ exo:
 # RFC 0129: WASM Plugins as Plan Transforms
 
 
+
 ## 1. Summary
 
 Define a **WASM plugin** mechanism for `locald` where plugins perform **data-to-data** transformation:
@@ -362,6 +363,19 @@ interface plugin {
 
 world locald-plugin { export plugin; }
 ```
+
+
+### 3.10.1 WIT Constraints (Implementation Notes)
+
+During initial host implementation we learned a few WIT/Component Model constraints that are important for plugin authors and for keeping the contract stable:
+
+- **Identifiers**: WIT identifiers do not allow underscores. Use kebab-case in WIT (e.g. `workspace-id`, `requested-capabilities`); bindings will map these to idiomatic Rust field names.
+- **Keywords**: some tokens that look natural in IRs (e.g. `string`, `bool`) are not valid as variant case names. Use non-keyword names such as `text`/`boolean`.
+- **Recursion**: WIT rejects self-referential type definitions. A recursively-structured `value` (JSON-like `list<value>` / `record<value>`) is not representable directly.
+
+Phase 29 guidance:
+
+- Treat `types.value` as **non-recursive** in the initial ABI. If a plugin needs richer structure, it should encode it explicitly (e.g. as `bytes` or `text`) and rely on host ops (`render-template`, `write-file`, etc.) rather than smuggling a second language into the IR.
 
 ### 3.11 Example: “redis” plugin
 
