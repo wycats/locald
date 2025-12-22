@@ -63,6 +63,9 @@ chrono = "0.4.42"
 tempfile = "3.23.0"
 percent-encoding = "2.3.1"
 serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+wasmtime = { version = "24.0.0", features = ["component-model"] }
+wasmtime-wasi = "24.0.0"
 
 [lints]
 workspace = true

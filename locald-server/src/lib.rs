@@ -88,6 +88,8 @@ pub mod logging;
 #[doc(hidden)]
 pub mod manager;
 #[doc(hidden)]
+pub mod plugins;
+#[doc(hidden)]
 // pub mod notify; // Moved to locald-utils
 #[doc(hidden)]
 pub mod proxy;
