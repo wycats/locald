@@ -10,8 +10,9 @@ use locald_core::service::{
 };
 use locald_core::state::{HealthStatus, ServiceState};
 use nix::sys::signal::Signal;
-use portable_pty::{Child, MasterPty};
+use portable_pty::{Child, MasterPty, PtySize};
 use std::fmt;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -26,10 +27,12 @@ pub struct ExecController {
     // Runtime state
     child: Option<StdMutex<Box<dyn Child + Send>>>,
     pty_master: Option<StdMutex<Box<dyn MasterPty + Send>>>,
+    pty_writer: Option<StdMutex<Box<dyn std::io::Write + Send>>>,
     container_id: Option<String>,
     cgroup_path: Option<String>,
     port: Option<u16>,
     log_tx: broadcast::Sender<LogEntry>,
+    pty_tx: Option<broadcast::Sender<Vec<u8>>>,
     bundle_dir: Option<PathBuf>,
     env: std::collections::HashMap<String, String>,
     system: StdMutex<System>,
@@ -65,10 +68,12 @@ impl ExecController {
             project_root,
             child: None,
             pty_master: None,
+            pty_writer: None,
             container_id: None,
             cgroup_path: None,
             port,
             log_tx,
+            pty_tx: None,
             bundle_dir: None,
             env,
             system: StdMutex::new(System::new()),
@@ -166,44 +171,48 @@ impl ServiceController for ExecController {
     }
 
     async fn start(&mut self) -> Result<()> {
-        let (child, master, container_id, mut log_rx) = if let Some(bundle_dir) = &self.bundle_dir {
-            self.runtime
-                .start_container_process(self.id.clone(), bundle_dir)?
-        } else {
-            let (command, workdir) = match &self.config {
-                ServiceConfig::Typed(TypedServiceConfig::Exec(c)) | ServiceConfig::Legacy(c) => {
-                    (c.command.clone(), c.workdir.clone())
-                }
-                ServiceConfig::Typed(TypedServiceConfig::Worker(c)) => {
-                    (Some(c.command.clone()), c.workdir.clone())
-                }
-                ServiceConfig::Typed(
-                    TypedServiceConfig::Container(_)
-                    | TypedServiceConfig::Postgres(_)
-                    | TypedServiceConfig::Site(_),
-                ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
+        let (child, master, container_id, mut log_rx, pty_tx) =
+            if let Some(bundle_dir) = &self.bundle_dir {
+                self.runtime
+                    .start_container_process(self.id.clone(), bundle_dir)?
+            } else {
+                let (command, workdir) = match &self.config {
+                    ServiceConfig::Typed(TypedServiceConfig::Exec(c))
+                    | ServiceConfig::Legacy(c) => (c.command.clone(), c.workdir.clone()),
+                    ServiceConfig::Typed(TypedServiceConfig::Worker(c)) => {
+                        (Some(c.command.clone()), c.workdir.clone())
+                    }
+                    ServiceConfig::Typed(
+                        TypedServiceConfig::Container(_)
+                        | TypedServiceConfig::Postgres(_)
+                        | TypedServiceConfig::Site(_),
+                    ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
+                };
+
+                let service_path = workdir.map_or_else(
+                    || self.project_root.clone(),
+                    |wd| self.project_root.join(wd),
+                );
+
+                let env = self.resolve_env();
+
+                let cmd_str = command.ok_or_else(|| anyhow::anyhow!("Command is required"))?;
+                self.runtime.start_host_process(
+                    self.id.clone(),
+                    &service_path,
+                    &cmd_str,
+                    &env,
+                    self.port,
+                )?
             };
 
-            let service_path = workdir.map_or_else(
-                || self.project_root.clone(),
-                |wd| self.project_root.join(wd),
-            );
-
-            let env = self.resolve_env();
-
-            let cmd_str = command.ok_or_else(|| anyhow::anyhow!("Command is required"))?;
-            self.runtime.start_host_process(
-                self.id.clone(),
-                &service_path,
-                &cmd_str,
-                &env,
-                self.port,
-            )?
-        };
+        let writer = master.take_writer()?;
 
         self.child = Some(StdMutex::new(child));
         self.pty_master = Some(StdMutex::new(master));
+        self.pty_writer = Some(StdMutex::new(writer));
         self.container_id = Some(container_id);
+        self.pty_tx = Some(pty_tx);
 
         // Spawn log forwarder
         let log_tx = self.log_tx.clone();
@@ -285,8 +294,30 @@ impl ServiceController for ExecController {
         }
 
         self.pty_master = None;
+        self.pty_writer = None;
         self.container_id = None;
 
+        Ok(())
+    }
+
+    async fn write_stdin(&self, data: &[u8]) -> Result<()> {
+        if let Some(writer) = &self.pty_writer {
+            let mut writer = writer.lock().unwrap();
+            writer.write_all(data)?;
+        }
+        Ok(())
+    }
+
+    async fn resize_pty(&self, rows: u16, cols: u16) -> Result<()> {
+        if let Some(master) = &self.pty_master {
+            let master = master.lock().unwrap();
+            master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+        }
         Ok(())
     }
 
@@ -333,6 +364,12 @@ impl ServiceController for ExecController {
 
     async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
         Ok(())
+    }
+
+    fn subscribe_pty(&self) -> Option<broadcast::Receiver<Vec<u8>>> {
+        self.pty_tx
+            .as_ref()
+            .map(tokio::sync::broadcast::Sender::subscribe)
     }
 
     fn snapshot(&self) -> serde_json::Value {

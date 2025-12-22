@@ -1,0 +1,62 @@
+{
+  "name": "redis-basic",
+  "input": {
+    "workspace_context": {
+      "workspace_id": "demo",
+      "root": "<redacted>"
+    },
+    "host_capabilities": {
+      "supported_ir_versions": [1],
+      "granted": ["oci_pull"]
+    },
+    "service_spec": {
+      "name": "redis",
+      "kind": "redis",
+      "depends_on": [],
+      "config": {
+        "image": "redis:7"
+      }
+    }
+  },
+  "expect": {
+    "type": "ok",
+    "normalized_plan_debug_json": {
+      "ir_version": 1,
+      "requested_capabilities": ["oci_pull"],
+      "steps": [
+        {
+          "id": "port",
+          "needs": [],
+          "op": { "allocate_port": { "name": "redis" } }
+        },
+        {
+          "id": "pull",
+          "needs": [],
+          "op": { "oci_pull": { "image": "redis:7" } }
+        },
+        {
+          "id": "service",
+          "needs": ["port", "pull"],
+          "op": {
+            "declare_service": {
+              "name": "redis",
+              "runtime": "container",
+              "settings": [
+                ["image", { "lit": { "string": "redis:7" } }],
+                [
+                  "port",
+                  {
+                    "get": {
+                      "step_id": "port",
+                      "path": [{ "field": "port" }]
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

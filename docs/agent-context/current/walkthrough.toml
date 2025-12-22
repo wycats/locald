@@ -1,3 +1,64 @@
 # READ-ONLY: Use 'exo' CLI to modify this file.
 # Walkthrough
 
+[[entries]]
+type = "feat"
+description = "Add env provenance to config show"
+details = """
+Implemented minimal, truthful env provenance: added pure env layer merge/provenance helpers in locald-core; updated locald-server config loader to build Global/Context/Workspace/.env env layers and produce an env provenance report; updated Global Configuration:
+  Path: "/home/wycats/.config/locald/config.toml"
+  Values: GlobalConfig {
+    server: ServerConfig {
+        privileged_ports: true,
+        fallback_ports: true,
+    },
+} to print server config provenance and env sources plus per-service overrides."""
+
+[[entries]]
+type = "feat"
+description = "Extend config provenance to service fields"
+details = """
+Added service-field provenance to `locald config show --provenance` for:
+- services.<name>.command
+- services.<name>.workdir
+- services.<name>.port
+- services.<name>.depends_on
+
+Implementation:
+- Added `ConfigLoader::load_service_provenance_report` (server-side) to report these fields and their source config path.
+- Updated the CLI to print `[services.<name>]` sections with per-field `(from <path>)` when `--provenance` is set.
+- Added a unit test in `locald-server` to ensure the source path is the discovered project config path.
+
+Verification:
+- `cargo test -p locald-server`
+- `./scripts/verify-phase.sh`
+
+Notes:
+- This is intentionally minimal and truthful: it reports provenance for values we currently load (project config path), without claiming Context/Workspace provenance for service fields yet."""
+
+[[entries]]
+type = "feat"
+description = "Implement service config cascade"
+details = """
+Implemented RFC 0026 merging rules for service fields:
+- Added LayerConfig to parse intermediate config layers (Global, Context, Workspace).
+- Implemented discover_layers to walk up the directory tree.
+- Implemented merge_service_configs with 'replace' strategy for scalars and depends_on, and 'merge' for env.
+- Updated ConfigLoader to load and merge upstream configs into project config.
+- Updated service provenance report to track source of each field across layers.
+- Added unit test verifying cascading behavior."""
+
+[[entries]]
+type = "feat"
+description = "Implemented PTY support and WebSocket endpoint in locald-server"
+details = "Added ServiceController::write_stdin/resize_pty/subscribe_pty. Implemented in ExecController using portable-pty. Added /services/:name/pty WebSocket endpoint."
+
+[[entries]]
+type = "feat"
+description = "Integrated xterm.js for interactive terminal support."
+details = "Added InteractiveTerminal.svelte for PTY interaction. Updated InspectorDrawer.svelte to include a toggle for the terminal view. Created theme.ts for centralized terminal theming and updated Terminal.svelte to use it."
+
+[[entries]]
+type = "feat"
+description = "Implemented Command Palette in locald-dashboard."
+details = "Added CommandPalette.svelte component with keyboard shortcut (Cmd+K/Ctrl+K). Integrated it into the main layout. Supports global commands (Restart All, Stop All) and service-specific commands (Start, Stop, Restart)."

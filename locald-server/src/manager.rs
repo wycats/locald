@@ -214,11 +214,13 @@ pub(crate) struct Service {
     pub config: LocaldConfig,
     #[allow(clippy::struct_field_names)]
     pub service_config: ServiceConfig,
+    pub resolved_env: HashMap<String, String>,
     pub runtime_state: ServiceRuntime,
     pub sticky_port: Option<u16>,
     pub path: PathBuf,
     pub health_status: HealthStatus,
     pub health_source: HealthSource,
+    pub warnings: Vec<String>,
 }
 
 impl Service {}
@@ -257,6 +259,19 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
+    pub async fn get_service_controller(
+        &self,
+        name: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<dyn ServiceController>>> {
+        let services = self.services.lock().await;
+        if let Some(service) = services.get(name) {
+            if let ServiceRuntime::Controller(c) = &service.runtime_state {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
     /// Create a new `ProcessManager`.
     ///
     /// # Arguments
@@ -335,6 +350,9 @@ impl ProcessManager {
         health_source: HealthSource,
         snapshot: RuntimeSnapshot,
         service_config: Option<&ServiceConfig>,
+        workspace: Option<String>,
+        constellation: Option<String>,
+        warnings: Vec<String>,
     ) -> ServiceStatus {
         let (status, pid, port) = match snapshot {
             RuntimeSnapshot::Static {
@@ -397,6 +415,9 @@ impl ProcessManager {
             health_source,
             path,
             domain,
+            workspace,
+            constellation,
+            warnings,
         }
     }
 
@@ -434,7 +455,17 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     async fn get_service_status(&self, name: &str) -> Option<ServiceStatus> {
         let proxy_ports = { *self.proxy_ports.lock().await };
-        let (domain, path, health_status, health_source, snapshot, service_config) = {
+        let (
+            domain,
+            path,
+            health_status,
+            health_source,
+            snapshot,
+            service_config,
+            workspace,
+            constellation,
+            warnings,
+        ) = {
             let mut services = self.services.lock().await;
             let service = services.get_mut(name)?;
             // We reap here to ensure status is up to date for single service query too
@@ -456,6 +487,9 @@ impl ProcessManager {
                 service.health_source,
                 snapshot,
                 service.service_config.clone(),
+                service.config.project.workspace.clone(),
+                service.config.project.constellation.clone(),
+                service.warnings.clone(),
             )
         };
 
@@ -469,6 +503,9 @@ impl ProcessManager {
                 health_source,
                 snapshot,
                 Some(&service_config),
+                workspace,
+                constellation,
+                warnings,
             )
             .await,
         )
@@ -767,37 +804,65 @@ impl ProcessManager {
             }
         }
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
         let manager = self.clone();
         let path_clone = path.clone();
-        let handle = tokio::runtime::Handle::current();
 
-        let watcher_res =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        if event.kind.is_modify() || event.kind.is_create() {
-                            let relevant = event
-                                .paths
-                                .iter()
-                                .any(|p| p.ends_with("locald.toml") || p.ends_with("Procfile"));
+        // Spawn debouncer task
+        tokio::spawn(async move {
+            loop {
+                // Wait for first event
+                if rx.recv().await.is_none() {
+                    break;
+                }
 
-                            if relevant {
-                                info!("Config changed: {:?}", event.paths);
-                                let manager = manager.clone();
-                                let path = path_clone.clone();
-                                handle.spawn(async move {
-                                    // Debounce?
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    if let Err(e) = manager.apply_config(path, None, false).await {
-                                        error!("Failed to reload config: {e}");
-                                    }
-                                });
+                // Debounce loop
+                loop {
+                    let timeout = tokio::time::sleep(std::time::Duration::from_millis(500));
+                    tokio::select! {
+                        res = rx.recv() => {
+                            if res.is_none() {
+                                return;
                             }
+                            // Received another event, loop again (reset timeout)
+                        }
+                        () = timeout => {
+                            // Timeout expired, trigger reload
+                            info!("Reloading config for {:?}", path_clone);
+                            if let Err(e) = manager.apply_config(path_clone.clone(), None, false).await {
+                                error!("Failed to reload config: {e}");
+                            }
+                            break; // Break inner loop, go back to waiting for first event
                         }
                     }
-                    Err(e) => error!("Watch error: {e}"),
                 }
-            });
+            }
+        });
+
+        let handle = tokio::runtime::Handle::current();
+
+        let watcher_res = notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| match res {
+                Ok(event) => {
+                    if event.kind.is_modify() || event.kind.is_create() {
+                        let relevant = event.paths.iter().any(|p| {
+                            p.ends_with("locald.toml")
+                                || p.ends_with("Procfile")
+                                || p.ends_with(".env")
+                        });
+
+                        if relevant {
+                            info!("Config changed: {:?}", event.paths);
+                            let tx = tx.clone();
+                            handle.spawn(async move {
+                                let _ = tx.send(()).await;
+                            });
+                        }
+                    }
+                }
+                Err(e) => error!("Watch error: {e}"),
+            },
+        );
 
         match watcher_res {
             Ok(mut watcher) => {
@@ -890,6 +955,19 @@ impl ProcessManager {
             let name = format!("{}:{}", config.project.name, service_name);
             active_services.insert(name.clone());
 
+            let mut combined_env = dot_env_vars.clone();
+            for (k, v) in service_config.env() {
+                combined_env.insert(k.clone(), v.clone());
+            }
+
+            let manager = self.clone();
+            let lookup = move |service_name: String, field: String| {
+                let manager = manager.clone();
+                async move { manager.get_service_field(&service_name, &field).await }
+            };
+
+            let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
+
             // Check if already running and config matches
             {
                 let mut services = self.services.lock().await;
@@ -904,7 +982,9 @@ impl ProcessManager {
                     };
 
                     if is_running {
-                        if &service.service_config == service_config {
+                        if &service.service_config == service_config
+                            && service.resolved_env == resolved_env
+                        {
                             info!("Service {name} is already running and up to date");
                             if let Some(tx) = &event_tx {
                                 let _ = tx
@@ -980,19 +1060,6 @@ impl ProcessManager {
                     .await;
             }
 
-            let mut combined_env = dot_env_vars.clone();
-            for (k, v) in service_config.env() {
-                combined_env.insert(k.clone(), v.clone());
-            }
-
-            let manager = self.clone();
-            let lookup = move |service_name: String, field: String| {
-                let manager = manager.clone();
-                async move { manager.get_service_field(&service_name, &field).await }
-            };
-
-            let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
-
             let mut handled = false;
             for factory in &self.factories {
                 if factory.can_handle(service_config) {
@@ -1025,11 +1092,13 @@ impl ProcessManager {
                             Service {
                                 config: config.clone(),
                                 service_config: service_config.clone(),
+                                resolved_env: resolved_env.clone(),
                                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                                 sticky_port: port,
                                 path: path.clone(),
                                 health_status: HealthStatus::Unknown,
                                 health_source: HealthSource::None,
+                                warnings: Vec::new(),
                             },
                         );
                     }
@@ -1065,6 +1134,7 @@ impl ProcessManager {
                         name.clone(),
                         service_config,
                         state.port,
+                        state.pid,
                         None,
                         false,
                         Some(path.clone()),
@@ -1295,13 +1365,26 @@ impl ProcessManager {
                     service.health_source,
                     snapshot,
                     service.service_config.clone(),
+                    service.config.project.workspace.clone(),
+                    service.config.project.constellation.clone(),
+                    service.warnings.clone(),
                 ));
             }
         }
 
         let mut results = Vec::new();
-        for (name, domain, path, health_status, health_source, snapshot, service_config) in
-            snapshots
+        for (
+            name,
+            domain,
+            path,
+            health_status,
+            health_source,
+            snapshot,
+            service_config,
+            workspace,
+            constellation,
+            warnings,
+        ) in snapshots
         {
             results.push(
                 Self::build_service_status(
@@ -1313,6 +1396,9 @@ impl ProcessManager {
                     health_source,
                     snapshot,
                     Some(&service_config),
+                    workspace,
+                    constellation,
+                    warnings,
                 )
                 .await,
             );
@@ -1530,7 +1616,7 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     pub async fn inspect(&self, name: &str) -> Result<serde_json::Value> {
         let proxy_ports = { *self.proxy_ports.lock().await };
-        let (service_config, path, health_status, health_source, runtime_info, domain) = {
+        let (service_config, path, health_status, health_source, runtime_info, domain, warnings) = {
             let services = self.services.lock().await;
             let service = services
                 .get(name)
@@ -1551,6 +1637,7 @@ impl ProcessManager {
                 service.health_source,
                 runtime_info,
                 Some(Self::get_service_domain(name, &service.config.project)),
+                service.warnings.clone(),
             )
         };
 
@@ -1607,6 +1694,7 @@ impl ProcessManager {
             "health_status": health_status,
             "health_source": health_source,
             "url": url,
+            "warnings": warnings,
         });
 
         if let Some(obj) = info.as_object_mut() {
@@ -1739,6 +1827,9 @@ mod tests {
             health_source,
             running_snapshot(),
             None,
+            None,
+            None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("http://app.test".to_string()));
@@ -1753,6 +1844,9 @@ mod tests {
             health_source,
             running_snapshot(),
             None,
+            None,
+            None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("https://app.test".to_string()));
@@ -1767,6 +1861,9 @@ mod tests {
             health_source,
             running_snapshot(),
             None,
+            None,
+            None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("http://app.test:8080".to_string()));
@@ -1781,6 +1878,9 @@ mod tests {
             health_source,
             running_snapshot(),
             None,
+            None,
+            None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("https://app.test:8443".to_string()));

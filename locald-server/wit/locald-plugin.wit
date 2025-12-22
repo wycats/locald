@@ -1,0 +1,91 @@
+package locald:plugins@0.1.0;
+
+interface types {
+  record path { value: string }
+  record url { value: string }
+  record datetime { value: string }
+
+  variant value {
+    null,
+    boolean(bool),
+    text(string),
+    signed(s64),
+    unsigned(u64),
+    float(f64),
+    bytes(list<u8>),
+    path(path),
+    url(url),
+    datetime(datetime),
+  }
+
+  record output-ref {
+    step-id: string,
+    path: list<selector>,
+  }
+
+  variant selector { field(string), index(u32) }
+
+  variant expr { lit(value), get(output-ref) }
+
+  record diagnostics {
+    warnings: list<string>,
+    errors: list<string>,
+  }
+
+  record host-capabilities {
+    supported-ir-versions: list<u32>,
+    granted: list<string>,
+  }
+
+  record workspace-context {
+    workspace-id: string,
+    root: string,
+  }
+
+  record service-spec {
+    name: string,
+    kind: string,
+    depends-on: list<string>,
+    config: list<tuple<string, value>>,
+  }
+
+  record plan {
+    ir-version: u32,
+    requested-capabilities: list<string>,
+    steps: list<step>,
+  }
+
+  record step {
+    id: string,
+    needs: list<string>,
+    op: op,
+  }
+
+  variant op {
+    declare-service(declare-service-op),
+    allocate-port(allocate-port-op),
+    oci-pull(oci-pull-op),
+    render-template(render-template-op),
+    write-file(write-file-op),
+  }
+
+  record declare-service-op {
+    name: string,
+    runtime: string,
+    settings: list<tuple<string, expr>>,
+  }
+
+  record allocate-port-op { name: string }
+  record oci-pull-op { image: string }
+  record render-template-op { template: string }
+  record write-file-op { path: path, contents: string }
+}
+
+interface plugin {
+  use types.{workspace-context, host-capabilities, service-spec, plan, diagnostics};
+
+  detect: func(ctx: workspace-context, spec: service-spec) -> option<string>;
+  apply: func(ctx: workspace-context, caps: host-capabilities, spec: service-spec) -> result<plan, diagnostics>;
+}
+
+world locald-plugin { export plugin; }

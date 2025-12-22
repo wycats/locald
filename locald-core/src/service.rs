@@ -51,6 +51,11 @@ pub trait ServiceController: Send + Sync + std::fmt::Debug {
     /// Get a stream of logs from the service.
     async fn logs(&self) -> BoxStream<'static, LogEntry>;
 
+    /// Subscribe to PTY output if available.
+    fn subscribe_pty(&self) -> Option<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+        None
+    }
+
     /// Get metadata about the service (e.g., "port", "url", "connection_string").
     fn get_metadata(&self, key: &str) -> Option<String>;
 
@@ -58,6 +63,16 @@ pub trait ServiceController: Send + Sync + std::fmt::Debug {
     /// This provides an escape hatch for capabilities like "reset", "snapshot", etc.
     /// Returns `NotSupported` if the service doesn't handle the command.
     async fn execute_command(&mut self, cmd: ServiceCommand) -> Result<()>;
+
+    /// Write data to the service's standard input (PTY).
+    async fn write_stdin(&self, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resize the service's PTY.
+    async fn resize_pty(&self, _rows: u16, _cols: u16) -> Result<()> {
+        Ok(())
+    }
 
     /// Serialize the runtime state for persistence.
     fn snapshot(&self) -> serde_json::Value;

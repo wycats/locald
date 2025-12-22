@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "113"
-title = "Integration Boundaries Audit"
-rfcs = ["0112", "0114"]
+id = "29"
+title = "Extensibility & Plugins"
+rfcs = ["0028"]
 
 [plan]
 [[plan.changes]]
@@ -14,61 +14,44 @@ details = "Description"
 files = []
 tests = []
 
-[[plan.changes]]
-name = "Audit optional integrations"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+[[plan.changes.tasks]]
+id = "29.1"
+title = "Plugin Mechanism: Formal system for custom services"
+status = "pending"
 
-[[plan.changes]]
-name = "Docker unavailability explains impact"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+[[plan.changes.tasks]]
+id = "29.2"
+title = "Packaging: Support locald package command"
+status = "pending"
 
-[[plan.changes]]
-name = "Doctor shows Docker socket path"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+[[plan.changes.tasks]]
+id = "29.3"
+title = "Distributions: Allow flavored binaries/configs"
+status = "pending"
 
-[[plan.changes]]
-name = "Doctor respects DOCKER_HOST"
-type = "feat"
-details = "TDD Step"
+[[plan.changes.tasks]]
+id = "29.1.1"
+title = "Specify plugin contract + fixtures"
 status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+notes = "Tie down the minimal host<->plugin contract for Phase 29.1 (RFC 0129): WIT surface, canonical normalization rules, and golden fixtures (JSON is debug-only)."
 
-[[plan.changes]]
-name = "Doctor explains unsupported DOCKER_HOST"
-type = "feat"
-details = "TDD Step"
+[[plan.changes.tasks]]
+id = "29.1.2"
+title = "Run WASM component (WASI-only)"
 status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+notes = "Implement the host-side runner for WASM components with a minimal capability set (default WASI-only) plus explicit cache/state dirs as needed; no Docker assumptions."
 
-[[plan.changes]]
-name = "Doctor surfaces CNB/buildpacks"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+[[plan.changes.tasks]]
+id = "29.1.3"
+title = "ServicePlan IR + apply/merge"
+status = "pending"
+notes = "Introduce the minimal ServicePlan DAG IR and integrate it into the config/service graph pipeline: plugin produces a plan; host applies it to materialize services/controllers."
 
-[[plan.changes]]
-name = "Doctor surfaces virtualization (KVM)"
-type = "feat"
-details = "TDD Step"
-status = "completed"
-tests = ["locald-cli/tests/phase113_integration_boundaries_audit.rs"]
-files = []
+[[plan.changes.tasks]]
+id = "29.1.4"
+title = "Example plugin + e2e verification"
+status = "pending"
+notes = "Add a small example plugin + an automated verification path (fixtures + at least one e2e test) to prove discovery → execution → plan application works."
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

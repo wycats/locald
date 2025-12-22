@@ -10,12 +10,13 @@ directories = "6.0.0"
 flate2 = "1.1.5"
 futures = "0.3.31"
 oci-distribution = "0.11.0"
+portable-pty = "0.9.0"
 schemars = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 tar = "0.4.44"
-tokio = { version = "1", features = ["io-util", "process", "fs"] }
+tokio = { version = "1", features = ["io-util", "process", "fs", "sync"] }
 tokio-stream = { version = "0.1", features = ["io-util"] }
 toml = "0.9.8"
 

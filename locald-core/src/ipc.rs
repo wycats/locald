@@ -69,6 +69,15 @@ pub struct ServiceStatus {
     /// The file system path to the service's project root.
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// The name of the workspace the service belongs to.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// The name of the constellation the service belongs to.
+    #[serde(default)]
+    pub constellation: Option<String>,
+    /// Any warnings associated with the service (e.g. port mismatch).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A log entry from a service.
@@ -345,6 +354,9 @@ impl ServiceStatus {
             health_status: HealthStatus::Unknown,
             health_source: HealthSource::None,
             path: None,
+            workspace: None,
+            constellation: None,
+            warnings: Vec::new(),
         }
     }
 }
