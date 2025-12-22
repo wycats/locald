@@ -379,6 +379,14 @@ pub fn run(cli: Cli) -> Result<()> {
                                 port_str,
                                 url
                             );
+
+                            if !service.warnings.is_empty() {
+                                println!(
+                                    "  {} {}",
+                                    "WARNING:".yellow().bold(),
+                                    service.warnings.join(", ")
+                                );
+                            }
                         }
                     }
                 }

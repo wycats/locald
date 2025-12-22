@@ -220,6 +220,7 @@ pub(crate) struct Service {
     pub path: PathBuf,
     pub health_status: HealthStatus,
     pub health_source: HealthSource,
+    pub warnings: Vec<String>,
 }
 
 impl Service {}
@@ -338,6 +339,7 @@ impl ProcessManager {
         service_config: Option<&ServiceConfig>,
         workspace: Option<String>,
         constellation: Option<String>,
+        warnings: Vec<String>,
     ) -> ServiceStatus {
         let (status, pid, port) = match snapshot {
             RuntimeSnapshot::Static {
@@ -402,6 +404,7 @@ impl ProcessManager {
             domain,
             workspace,
             constellation,
+            warnings,
         }
     }
 
@@ -448,6 +451,7 @@ impl ProcessManager {
             service_config,
             workspace,
             constellation,
+            warnings,
         ) = {
             let mut services = self.services.lock().await;
             let service = services.get_mut(name)?;
@@ -472,6 +476,7 @@ impl ProcessManager {
                 service.service_config.clone(),
                 service.config.project.workspace.clone(),
                 service.config.project.constellation.clone(),
+                service.warnings.clone(),
             )
         };
 
@@ -487,6 +492,7 @@ impl ProcessManager {
                 Some(&service_config),
                 workspace,
                 constellation,
+                warnings,
             )
             .await,
         )
@@ -1083,6 +1089,7 @@ impl ProcessManager {
                                 path: path.clone(),
                                 health_status: HealthStatus::Unknown,
                                 health_source: HealthSource::None,
+                                warnings: Vec::new(),
                             },
                         );
                     }
@@ -1118,6 +1125,7 @@ impl ProcessManager {
                         name.clone(),
                         service_config,
                         state.port,
+                        state.pid,
                         None,
                         false,
                         Some(path.clone()),
@@ -1350,6 +1358,7 @@ impl ProcessManager {
                     service.service_config.clone(),
                     service.config.project.workspace.clone(),
                     service.config.project.constellation.clone(),
+                    service.warnings.clone(),
                 ));
             }
         }
@@ -1365,6 +1374,7 @@ impl ProcessManager {
             service_config,
             workspace,
             constellation,
+            warnings,
         ) in snapshots
         {
             results.push(
@@ -1379,6 +1389,7 @@ impl ProcessManager {
                     Some(&service_config),
                     workspace,
                     constellation,
+                    warnings,
                 )
                 .await,
             );
@@ -1596,7 +1607,7 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     pub async fn inspect(&self, name: &str) -> Result<serde_json::Value> {
         let proxy_ports = { *self.proxy_ports.lock().await };
-        let (service_config, path, health_status, health_source, runtime_info, domain) = {
+        let (service_config, path, health_status, health_source, runtime_info, domain, warnings) = {
             let services = self.services.lock().await;
             let service = services
                 .get(name)
@@ -1617,6 +1628,7 @@ impl ProcessManager {
                 service.health_source,
                 runtime_info,
                 Some(Self::get_service_domain(name, &service.config.project)),
+                service.warnings.clone(),
             )
         };
 
@@ -1673,6 +1685,7 @@ impl ProcessManager {
             "health_status": health_status,
             "health_source": health_source,
             "url": url,
+            "warnings": warnings,
         });
 
         if let Some(obj) = info.as_object_mut() {
@@ -1807,6 +1820,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("http://app.test".to_string()));
@@ -1823,6 +1837,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("https://app.test".to_string()));
@@ -1839,6 +1854,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("http://app.test:8080".to_string()));
@@ -1855,6 +1871,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
         .await;
         assert_eq!(status.url, Some("https://app.test:8443".to_string()));

@@ -35,10 +35,16 @@ impl HealthMonitor {
         name: String,
         config: &ServiceConfig,
         port: Option<u16>,
+        pid: Option<u32>,
         container_id: Option<String>,
         has_docker_healthcheck: bool,
         cwd: Option<std::path::PathBuf>,
     ) {
+        // Spawn port mismatch detector if we have a PID and an expected port
+        if let (Some(pid), Some(expected_port)) = (pid, port) {
+            self.spawn_port_mismatch_monitor(name.clone(), pid, expected_port);
+        }
+
         if let Some(hc) = config.health_check() {
             match hc {
                 HealthCheckConfig::Command(cmd) => {
@@ -70,6 +76,60 @@ impl HealthMonitor {
         } else if let Some(p) = port {
             self.spawn_tcp_monitor(name, p);
         }
+    }
+
+    fn spawn_port_mismatch_monitor(&self, name: String, pid: u32, expected_port: u16) {
+        let monitor = self.clone();
+        tokio::spawn(async move {
+            // Give the service some time to start listening
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            loop {
+                // Check if service is still running and managed by us
+                {
+                    let services = monitor.services.lock().await;
+                    if let Some(service) = services.get(&name) {
+                        match &service.runtime_state {
+                            crate::manager::ServiceRuntime::Controller(_) => {
+                                // Still running
+                            }
+                            _ => break, // Service stopped
+                        }
+                    } else {
+                        break; // Service removed
+                    }
+                }
+
+                match locald_utils::discovery::find_listening_ports(pid).await {
+                    Ok(ports) => {
+                        let mut warnings = Vec::new();
+                        if !ports.contains(&expected_port) && !ports.is_empty() {
+                            // Sort ports for consistent message
+                            let mut sorted_ports = ports.clone();
+                            sorted_ports.sort_unstable();
+                            
+                            let ports_str = sorted_ports
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                                
+                            warnings.push(format!(
+                                "Service is listening on port(s) {} but configured for {}. Update locald.toml or the service configuration.",
+                                ports_str, expected_port
+                            ));
+                        }
+                        
+                        monitor.update_warnings(&name, warnings).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to check ports for service {}: {}", name, e);
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
     }
 
     async fn update_health(&self, name: &str, status: HealthStatus, source: HealthSource) {
@@ -112,6 +172,7 @@ impl HealthMonitor {
                             service.service_config.clone(),
                             service.config.project.workspace.clone(),
                             service.config.project.constellation.clone(),
+                            service.warnings.clone(),
                         )),
                     )
                 } else {
@@ -131,6 +192,7 @@ impl HealthMonitor {
                 service_config,
                 workspace,
                 constellation,
+                warnings,
             )) = snapshot_info
             {
                 let status = crate::manager::ProcessManager::build_service_status(
@@ -144,6 +206,92 @@ impl HealthMonitor {
                     Some(&service_config),
                     workspace,
                     constellation,
+                    warnings,
+                )
+                .await;
+
+                let _ = self
+                    .event_sender
+                    .send(locald_core::ipc::Event::ServiceUpdate(status));
+            }
+        }
+    }
+
+    async fn update_warnings(&self, name: &str, warnings: Vec<String>) {
+        let (changed, snapshot_info) = {
+            let mut services = self.services.lock().await;
+            if let Some(service) = services.get_mut(name) {
+                if service.warnings != warnings {
+                    info!("Service {} warnings changed: {:?}", name, warnings);
+                    service.warnings = warnings.clone();
+
+                    let proxy_ports = { *self.proxy_ports.lock().await };
+
+                    let snapshot = match &service.runtime_state {
+                        crate::manager::ServiceRuntime::Controller(c) => {
+                            crate::manager::RuntimeSnapshot::Controller(c.clone())
+                        }
+                        crate::manager::ServiceRuntime::None => {
+                            crate::manager::RuntimeSnapshot::Static {
+                                is_running: false,
+                                pid: None,
+                                port: None,
+                            }
+                        }
+                    };
+
+                    (
+                        true,
+                        Some((
+                            Some(crate::manager::ProcessManager::get_service_domain(
+                                name,
+                                &service.config.project,
+                            )),
+                            Some(service.path.clone()),
+                            proxy_ports,
+                            snapshot,
+                            service.service_config.clone(),
+                            service.config.project.workspace.clone(),
+                            service.config.project.constellation.clone(),
+                            service.warnings.clone(),
+                            service.health_status.clone(),
+                            service.health_source.clone(),
+                        )),
+                    )
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            }
+        };
+
+        if changed {
+            if let Some((
+                domain,
+                path,
+                proxy_ports,
+                snapshot,
+                service_config,
+                workspace,
+                constellation,
+                warnings,
+                health_status,
+                health_source,
+            )) = snapshot_info
+            {
+                let status = crate::manager::ProcessManager::build_service_status(
+                    name.to_string(),
+                    domain,
+                    path,
+                    proxy_ports,
+                    health_status,
+                    health_source,
+                    snapshot,
+                    Some(&service_config),
+                    workspace,
+                    constellation,
+                    warnings,
                 )
                 .await;
 

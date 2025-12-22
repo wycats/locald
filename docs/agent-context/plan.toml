@@ -710,7 +710,7 @@ status = "completed"
 [[epochs.phases]]
 id = "36"
 title = "Hot Reloading & Configuration Watcher"
-status = "active"
+status = "completed"
 rfcs = ["0050"]
 
 [[epochs.phases.tasks]]
@@ -736,23 +736,23 @@ status = "completed"
 [[epochs.phases]]
 id = "37"
 title = "Port Mismatch Detection"
-status = "pending"
+status = "active"
 rfcs = ["0051"]
 
 [[epochs.phases.tasks]]
 id = "37.1"
 label = "Refactor Discovery: Move `locald-server/src/discovery.rs` to `locald-core`."
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "37.2"
 label = "Implement Monitor: Create a `PortMonitor` struct."
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "37.3"
 label = "Integrate into `try`: Add mismatch warnings to `locald try`."
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "28"

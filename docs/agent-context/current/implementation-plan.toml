@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "36"
-title = "Hot Reloading & Configuration Watcher"
-rfcs = ["0050"]
+id = "37"
+title = "Port Mismatch Detection"
+rfcs = ["0051"]
 
 [plan]
 [[plan.changes]]
@@ -15,24 +15,24 @@ files = []
 tests = []
 
 [[plan.changes.tasks]]
-id = "36.1"
-title = "Fix Manual Restart: Reload config from disk"
-status = "pending"
+id = "37.1"
+title = "Update ServiceStatus to include warnings"
+status = "completed"
 
 [[plan.changes.tasks]]
-id = "36.2"
-title = "Project Config Watcher: Watch locald.toml files"
-status = "pending"
+id = "37.2"
+title = "Update Service struct in manager to store warnings"
+status = "completed"
 
 [[plan.changes.tasks]]
-id = "36.3"
-title = "Hot Reload Logic: Restart services on config change"
-status = "pending"
+id = "37.3"
+title = "Implement Port Mismatch Detection logic"
+status = "completed"
 
 [[plan.changes.tasks]]
-id = "36.4"
-title = "Debouncing: Debounce config updates"
-status = "pending"
+id = "37.4"
+title = "Display warnings in CLI"
+status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

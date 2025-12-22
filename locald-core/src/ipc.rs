@@ -75,6 +75,9 @@ pub struct ServiceStatus {
     /// The name of the constellation the service belongs to.
     #[serde(default)]
     pub constellation: Option<String>,
+    /// Any warnings associated with the service (e.g. port mismatch).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A log entry from a service.
@@ -353,6 +356,7 @@ impl ServiceStatus {
             path: None,
             workspace: None,
             constellation: None,
+            warnings: Vec::new(),
         }
     }
 }

@@ -1,0 +1,10 @@
+[phase]
+id = "37"
+name = "Port Mismatch Detection"
+rfc = "0051"
+
+[tasks]
+"37.1" = "Update ServiceStatus to include warnings"
+"37.2" = "Update Service struct in manager to store warnings"
+"37.3" = "Implement Port Mismatch Detection logic"
+"37.4" = "Display warnings in CLI"

@@ -2,22 +2,22 @@
 # Task List
 
 [[tasks]]
-id = "First Step::36.1"
-title = "Fix Manual Restart: Reload config from disk"
-status = "pending"
+id = "First Step::37.1"
+title = "Update ServiceStatus to include warnings"
+status = "completed"
 
 [[tasks]]
-id = "First Step::36.2"
-title = "Project Config Watcher: Watch locald.toml files"
-status = "pending"
+id = "First Step::37.2"
+title = "Update Service struct in manager to store warnings"
+status = "completed"
 
 [[tasks]]
-id = "First Step::36.3"
-title = "Hot Reload Logic: Restart services on config change"
-status = "pending"
+id = "First Step::37.3"
+title = "Implement Port Mismatch Detection logic"
+status = "completed"
 
 [[tasks]]
-id = "First Step::36.4"
-title = "Debouncing: Debounce config updates"
-status = "pending"
+id = "First Step::37.4"
+title = "Display warnings in CLI"
+status = "completed"
 
