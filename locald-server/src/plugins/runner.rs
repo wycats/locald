@@ -86,7 +86,7 @@ impl PluginRunner {
         // WASI is intentionally minimal for Phase 29: WASI-only, with no preopened dirs by default.
         // We wire WASI in so plugin authors can use standard tooling, but we don't enable the broader
         // WASI cloud ecosystem (http/sockets/etc.) unless explicitly added later.
-        let (wasi, table) = wasi_context()?;
+        let (wasi, table) = wasi_context();
         let mut store = Store::new(&self.engine, HostState { wasi, table });
         // A conservative fuel budget for plan transforms. This is not yet a contract; it's a safety rail.
         store.set_fuel(10_000_000)?;
@@ -137,12 +137,12 @@ impl WasiView for HostState {
     }
 }
 
-fn wasi_context() -> Result<(WasiCtx, ResourceTable)> {
+fn wasi_context() -> (WasiCtx, ResourceTable) {
     let table = ResourceTable::new();
 
     // Intentionally minimal: no inherit_env/args, no preopened dirs, no stdio.
     // Plugins are expected to return structured diagnostics instead of printing.
     let wasi = WasiCtxBuilder::new().build();
 
-    Ok((wasi, table))
+    (wasi, table)
 }

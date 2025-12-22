@@ -30,6 +30,7 @@ impl HealthMonitor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_check(
         &self,
         name: String,
@@ -93,7 +94,7 @@ impl HealthMonitor {
                             crate::manager::ServiceRuntime::Controller(_) => {
                                 // Still running
                             }
-                            _ => break, // Service stopped
+                            crate::manager::ServiceRuntime::None => break, // Service stopped
                         }
                     } else {
                         break; // Service removed
@@ -110,7 +111,7 @@ impl HealthMonitor {
 
                             let ports_str = sorted_ports
                                 .iter()
-                                .map(|p| p.to_string())
+                                .map(std::string::ToString::to_string)
                                 .collect::<Vec<_>>()
                                 .join(", ");
 
@@ -221,9 +222,11 @@ impl HealthMonitor {
         let (changed, snapshot_info) = {
             let mut services = self.services.lock().await;
             if let Some(service) = services.get_mut(name) {
-                if service.warnings != warnings {
+                if service.warnings == warnings {
+                    (false, None)
+                } else {
                     info!("Service {} warnings changed: {:?}", name, warnings);
-                    service.warnings = warnings.clone();
+                    service.warnings.clone_from(&warnings);
 
                     let proxy_ports = { *self.proxy_ports.lock().await };
 
@@ -254,12 +257,10 @@ impl HealthMonitor {
                             service.config.project.workspace.clone(),
                             service.config.project.constellation.clone(),
                             service.warnings.clone(),
-                            service.health_status.clone(),
-                            service.health_source.clone(),
+                            service.health_status,
+                            service.health_source,
                         )),
                     )
-                } else {
-                    (false, None)
                 }
             } else {
                 (false, None)

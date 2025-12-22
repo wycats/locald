@@ -382,6 +382,8 @@ mod tests {
             project: ProjectConfig {
                 name: "test-project".to_string(),
                 domain: None,
+                workspace: None,
+                constellation: None,
             },
             services: HashMap::from([("web".to_string(), service_config)]),
         };

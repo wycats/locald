@@ -27,6 +27,7 @@ pub struct ExecController {
     // Runtime state
     child: Option<StdMutex<Box<dyn Child + Send>>>,
     pty_master: Option<StdMutex<Box<dyn MasterPty + Send>>>,
+    pty_writer: Option<StdMutex<Box<dyn std::io::Write + Send>>>,
     container_id: Option<String>,
     cgroup_path: Option<String>,
     port: Option<u16>,
@@ -67,6 +68,7 @@ impl ExecController {
             project_root,
             child: None,
             pty_master: None,
+            pty_writer: None,
             container_id: None,
             cgroup_path: None,
             port,
@@ -204,8 +206,11 @@ impl ServiceController for ExecController {
                 )?
             };
 
+        let writer = master.take_writer()?;
+
         self.child = Some(StdMutex::new(child));
         self.pty_master = Some(StdMutex::new(master));
+        self.pty_writer = Some(StdMutex::new(writer));
         self.container_id = Some(container_id);
         self.pty_tx = Some(pty_tx);
 
@@ -289,25 +294,16 @@ impl ServiceController for ExecController {
         }
 
         self.pty_master = None;
+        self.pty_writer = None;
         self.container_id = None;
 
         Ok(())
     }
 
     async fn write_stdin(&self, data: &[u8]) -> Result<()> {
-        if let Some(master) = &self.pty_master {
-            let master = master.lock().unwrap();
-            // Duplicate FD to avoid closing the original when File drops
-            // portable-pty 0.9 MasterPty doesn't implement Write directly
-            // It seems as_raw_fd returns Option<RawFd> in this version/trait
-            let fd = master
-                .as_raw_fd()
-                .expect("MasterPty should have a valid FD");
-            // SAFETY: The fd is valid as long as we hold the lock on master
-            let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-            let owned_fd = nix::unistd::dup(borrowed_fd)?;
-            let mut file = std::fs::File::from(owned_fd);
-            file.write_all(data)?;
+        if let Some(writer) = &self.pty_writer {
+            let mut writer = writer.lock().unwrap();
+            writer.write_all(data)?;
         }
         Ok(())
     }
@@ -371,7 +367,9 @@ impl ServiceController for ExecController {
     }
 
     fn subscribe_pty(&self) -> Option<broadcast::Receiver<Vec<u8>>> {
-        self.pty_tx.as_ref().map(|tx| tx.subscribe())
+        self.pty_tx
+            .as_ref()
+            .map(tokio::sync::broadcast::Sender::subscribe)
     }
 
     fn snapshot(&self) -> serde_json::Value {

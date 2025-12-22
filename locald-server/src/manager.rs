@@ -826,7 +826,7 @@ impl ProcessManager {
                             }
                             // Received another event, loop again (reset timeout)
                         }
-                        _ = timeout => {
+                        () = timeout => {
                             // Timeout expired, trigger reload
                             info!("Reloading config for {:?}", path_clone);
                             if let Err(e) = manager.apply_config(path_clone.clone(), None, false).await {

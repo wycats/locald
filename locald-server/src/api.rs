@@ -9,7 +9,6 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, stream::Stream};
 use hyper::StatusCode;
-use locald_core::service::ServiceController;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -99,7 +98,11 @@ async fn handle_pty_socket(socket: WebSocket, name: String, pm: Arc<ProcessManag
                     let controller = controller.lock().await;
                     let _ = controller.write_stdin(&data).await;
                 }
-                _ => {}
+                axum::extract::ws::Message::Ping(_)
+                | axum::extract::ws::Message::Pong(_)
+                | axum::extract::ws::Message::Close(_) => {
+                    break;
+                }
             }
         }
     });

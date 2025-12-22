@@ -41,7 +41,7 @@ pub fn validate_plan(plan: &Plan, caps: &HostCapabilities) -> std::result::Resul
         ));
     }
 
-    let granted: HashSet<&str> = caps.granted.iter().map(|s| s.as_str()).collect();
+    let granted: HashSet<&str> = caps.granted.iter().map(String::as_str).collect();
     for cap in &plan.requested_capabilities {
         if !granted.contains(cap.as_str()) {
             errors.push(format!(
@@ -183,13 +183,13 @@ fn apply_step(config: &mut LocaldConfig, step: &Step) -> std::result::Result<(),
         Op::DeclareService(op) => apply_declare_service(config, op),
         Op::AllocatePort(op) => {
             // For now, locald already allocates ports as needed.
-            if !config.services.contains_key(&op.name) {
+            if config.services.contains_key(&op.name) {
+                Ok(())
+            } else {
                 Err(diagnostics_error(format!(
                     "allocate-port references unknown service '{}'",
                     op.name
                 )))
-            } else {
-                Ok(())
             }
         }
         Op::OciPull(_) => Err(diagnostics_error(
@@ -375,7 +375,15 @@ fn eval_expr_lit(expr: &Expr) -> Option<Value> {
 fn as_text(v: &Value) -> Option<&str> {
     match v {
         Value::Text(s) => Some(s.as_str()),
-        _ => None,
+        Value::Null
+        | Value::Boolean(_)
+        | Value::Signed(_)
+        | Value::Unsigned(_)
+        | Value::Float(_)
+        | Value::Bytes(_)
+        | Value::Path(_)
+        | Value::Url(_)
+        | Value::Datetime(_) => None,
     }
 }
 
@@ -383,7 +391,14 @@ fn as_u16(v: &Value) -> Option<u16> {
     match v {
         Value::Unsigned(n) => u16::try_from(*n).ok(),
         Value::Signed(n) => u16::try_from(*n).ok(),
-        _ => None,
+        Value::Null
+        | Value::Boolean(_)
+        | Value::Text(_)
+        | Value::Float(_)
+        | Value::Bytes(_)
+        | Value::Path(_)
+        | Value::Url(_)
+        | Value::Datetime(_) => None,
     }
 }
 
