@@ -1,0 +1,29 @@
+{
+  "name": "redis-capability-denied",
+  "input": {
+    "workspace_context": {
+      "workspace_id": "demo",
+      "root": "<redacted>"
+    },
+    "host_capabilities": {
+      "supported_ir_versions": [1],
+      "granted": []
+    },
+    "service_spec": {
+      "name": "redis",
+      "kind": "redis",
+      "depends_on": [],
+      "config": {
+        "image": "redis:7"
+      }
+    }
+  },
+  "expect": {
+    "type": "error",
+    "error": {
+      "kind": "capability_denied",
+      "missing": ["oci_pull"],
+      "message": "Plan requested capability oci_pull but it was not granted"
+    }
+  }
+}
