@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use wasmtime::{component::Component, component::Linker, Config, Engine, Store};
-use wasmtime_wasi::{add_to_linker_sync, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView, add_to_linker_sync};
 
 // Generated bindings for the WIT contract.
 //
@@ -15,6 +15,11 @@ mod bindings {
 }
 
 pub use bindings::locald::plugins::types::{Diagnostics, Plan, Step};
+
+pub use bindings::locald::plugins::types::{
+    AllocatePortOp, DeclareServiceOp, Expr, Op, OutputRef, Selector, Value,
+    WorkspaceContext as WitWorkspaceContext,
+};
 
 pub type PlanResult = std::result::Result<Plan, Diagnostics>;
 
@@ -62,9 +67,19 @@ impl PluginRunner {
         Ok(Self { engine })
     }
 
-    pub fn apply(&self, component_path: &Path, ctx: WorkspaceContext, caps: HostCapabilities, spec: ServiceSpec) -> Result<PlanResult> {
-        let component = Component::from_file(&self.engine, component_path)
-            .with_context(|| format!("failed to load plugin component {}", component_path.display()))?;
+    pub fn apply(
+        &self,
+        component_path: &Path,
+        ctx: WorkspaceContext,
+        caps: HostCapabilities,
+        spec: ServiceSpec,
+    ) -> Result<PlanResult> {
+        let component = Component::from_file(&self.engine, component_path).with_context(|| {
+            format!(
+                "failed to load plugin component {}",
+                component_path.display()
+            )
+        })?;
 
         let mut linker = Linker::new(&self.engine);
 
