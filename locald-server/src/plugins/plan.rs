@@ -6,7 +6,7 @@ use locald_core::config::{
     PostgresServiceConfig, ServiceConfig, SiteServiceConfig, TypedServiceConfig,
     WorkerServiceConfig,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanApplyError {
@@ -92,47 +92,7 @@ pub fn validate_plan(plan: &Plan, caps: &HostCapabilities) -> std::result::Resul
 }
 
 fn validate_acyclic(plan: &Plan) -> Result<(), String> {
-    let mut indegree: HashMap<&str, usize> = HashMap::new();
-    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
-
-    for step in &plan.steps {
-        indegree.insert(step.id.as_str(), 0);
-        edges.insert(step.id.as_str(), Vec::new());
-    }
-
-    for step in &plan.steps {
-        for need in &step.needs {
-            let to = step.id.as_str();
-            let from = need.as_str();
-            edges.get_mut(from).unwrap().push(to);
-            *indegree.get_mut(to).unwrap() += 1;
-        }
-    }
-
-    let mut q = VecDeque::new();
-    for (id, deg) in &indegree {
-        if *deg == 0 {
-            q.push_back(*id);
-        }
-    }
-
-    let mut seen = 0usize;
-    while let Some(id) = q.pop_front() {
-        seen += 1;
-        for succ in edges.get(id).unwrap() {
-            let d = indegree.get_mut(succ).unwrap();
-            *d -= 1;
-            if *d == 0 {
-                q.push_back(*succ);
-            }
-        }
-    }
-
-    if seen == indegree.len() {
-        Ok(())
-    } else {
-        Err("plan step graph contains a cycle".to_string())
-    }
+    topo_order(plan).map(|_| ())
 }
 
 /// Apply a validated plan into a mutable `LocaldConfig`.
@@ -166,38 +126,47 @@ pub fn apply_plan_to_config(
 }
 
 fn topo_order(plan: &Plan) -> Result<Vec<String>, String> {
-    let mut indegree: HashMap<&str, usize> = HashMap::new();
-    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    // Deterministic Kahn topological sort.
+    // - Lexicographic tie-break for ready nodes.
+    // - Deterministic successor traversal order.
+    let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
+    let mut edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for step in &plan.steps {
-        indegree.insert(step.id.as_str(), 0);
-        edges.insert(step.id.as_str(), Vec::new());
+        indegree.insert(step.id.clone(), 0);
+        edges.insert(step.id.clone(), Vec::new());
     }
 
     for step in &plan.steps {
         for need in &step.needs {
-            let to = step.id.as_str();
-            let from = need.as_str();
-            edges.get_mut(from).unwrap().push(to);
-            *indegree.get_mut(to).unwrap() += 1;
+            let to = step.id.clone();
+            let from = need.clone();
+            edges.get_mut(&from).unwrap().push(to);
+            *indegree.get_mut(&step.id).unwrap() += 1;
         }
     }
 
-    let mut q = VecDeque::new();
+    for succs in edges.values_mut() {
+        succs.sort();
+    }
+
+    let mut ready: BTreeSet<String> = BTreeSet::new();
     for (id, deg) in &indegree {
         if *deg == 0 {
-            q.push_back(*id);
+            ready.insert(id.clone());
         }
     }
 
     let mut out = Vec::with_capacity(plan.steps.len());
-    while let Some(id) = q.pop_front() {
-        out.push(id.to_string());
-        for succ in edges.get(id).unwrap() {
+    while let Some(id) = ready.iter().next().cloned() {
+        ready.remove(&id);
+        out.push(id.clone());
+
+        for succ in edges.get(&id).unwrap() {
             let d = indegree.get_mut(succ).unwrap();
             *d -= 1;
             if *d == 0 {
-                q.push_back(*succ);
+                ready.insert(succ.clone());
             }
         }
     }
