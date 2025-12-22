@@ -757,7 +757,7 @@ status = "completed"
 [[epochs.phases]]
 id = "28"
 title = "Interactive Terminal & Theming"
-status = "active"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "28.1"
