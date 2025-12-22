@@ -2,22 +2,27 @@
 # Task List
 
 [[tasks]]
-id = "First Step::37.1"
-title = "Update ServiceStatus to include warnings"
+id = "First Step::28.1"
+title = "Implement PTY support in locald-server"
 status = "completed"
 
 [[tasks]]
-id = "First Step::37.2"
-title = "Update Service struct in manager to store warnings"
+id = "First Step::28.2"
+title = "Expose PTY via WebSocket in locald-server"
 status = "completed"
 
 [[tasks]]
-id = "First Step::37.3"
-title = "Implement Port Mismatch Detection logic"
+id = "First Step::28.3"
+title = "Integrate xterm.js in locald-dashboard"
 status = "completed"
 
 [[tasks]]
-id = "First Step::37.4"
-title = "Display warnings in CLI"
+id = "First Step::28.4"
+title = "Implement Theming (Light/Dark mode) in locald-dashboard"
+status = "completed"
+
+[[tasks]]
+id = "First Step::28.5"
+title = "Implement Command Palette in locald-dashboard"
 status = "completed"
 

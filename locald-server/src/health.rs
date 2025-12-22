@@ -107,19 +107,19 @@ impl HealthMonitor {
                             // Sort ports for consistent message
                             let mut sorted_ports = ports.clone();
                             sorted_ports.sort_unstable();
-                            
+
                             let ports_str = sorted_ports
                                 .iter()
                                 .map(|p| p.to_string())
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                                
+
                             warnings.push(format!(
                                 "Service is listening on port(s) {} but configured for {}. Update locald.toml or the service configuration.",
                                 ports_str, expected_port
                             ));
                         }
-                        
+
                         monitor.update_warnings(&name, warnings).await;
                     }
                     Err(e) => {

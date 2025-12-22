@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "37"
-title = "Port Mismatch Detection"
-rfcs = ["0051"]
+id = "28"
+title = "Interactive Terminal & Theming"
+rfcs = []
 
 [plan]
 [[plan.changes]]
@@ -15,23 +15,28 @@ files = []
 tests = []
 
 [[plan.changes.tasks]]
-id = "37.1"
-title = "Update ServiceStatus to include warnings"
+id = "28.1"
+title = "Implement PTY support in locald-server"
 status = "completed"
 
 [[plan.changes.tasks]]
-id = "37.2"
-title = "Update Service struct in manager to store warnings"
+id = "28.2"
+title = "Expose PTY via WebSocket in locald-server"
 status = "completed"
 
 [[plan.changes.tasks]]
-id = "37.3"
-title = "Implement Port Mismatch Detection logic"
+id = "28.3"
+title = "Integrate xterm.js in locald-dashboard"
 status = "completed"
 
 [[plan.changes.tasks]]
-id = "37.4"
-title = "Display warnings in CLI"
+id = "28.4"
+title = "Implement Theming (Light/Dark mode) in locald-dashboard"
+status = "completed"
+
+[[plan.changes.tasks]]
+id = "28.5"
+title = "Implement Command Palette in locald-dashboard"
 status = "completed"
 
 [verification]

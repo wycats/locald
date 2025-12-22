@@ -47,3 +47,18 @@ Implemented RFC 0026 merging rules for service fields:
 - Updated ConfigLoader to load and merge upstream configs into project config.
 - Updated service provenance report to track source of each field across layers.
 - Added unit test verifying cascading behavior."""
+
+[[entries]]
+type = "feat"
+description = "Implemented PTY support and WebSocket endpoint in locald-server"
+details = "Added ServiceController::write_stdin/resize_pty/subscribe_pty. Implemented in ExecController using portable-pty. Added /services/:name/pty WebSocket endpoint."
+
+[[entries]]
+type = "feat"
+description = "Integrated xterm.js for interactive terminal support."
+details = "Added InteractiveTerminal.svelte for PTY interaction. Updated InspectorDrawer.svelte to include a toggle for the terminal view. Created theme.ts for centralized terminal theming and updated Terminal.svelte to use it."
+
+[[entries]]
+type = "feat"
+description = "Implemented Command Palette in locald-dashboard."
+details = "Added CommandPalette.svelte component with keyboard shortcut (Cmd+K/Ctrl+K). Integrated it into the main layout. Supports global commands (Restart All, Stop All) and service-specific commands (Start, Stop, Restart)."

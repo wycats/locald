@@ -736,7 +736,7 @@ status = "completed"
 [[epochs.phases]]
 id = "37"
 title = "Port Mismatch Detection"
-status = "active"
+status = "completed"
 rfcs = ["0051"]
 
 [[epochs.phases.tasks]]
@@ -757,7 +757,7 @@ status = "completed"
 [[epochs.phases]]
 id = "28"
 title = "Interactive Terminal & Theming"
-status = "pending"
+status = "active"
 
 [[epochs.phases.tasks]]
 id = "28.1"

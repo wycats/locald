@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { X, ExternalLink } from 'lucide-svelte';
+	import { X, ExternalLink, Terminal as TerminalIcon, FileText } from 'lucide-svelte';
 	import { getServiceInspect } from '$lib/api';
 	import Terminal from './Terminal.svelte';
+	import InteractiveTerminal from './InteractiveTerminal.svelte';
 
 	interface Props {
 		serviceName: string | null;
@@ -13,6 +14,7 @@
 	let info: Record<string, unknown> | null = $state(null);
 	let loading = $state(false);
 	let error: string | null = $state(null);
+	let viewMode: 'logs' | 'terminal' = $state('logs');
 
 	$effect(() => {
 		if (serviceName) {
@@ -61,7 +63,25 @@
 					</div>
 				{/if}
 			</div>
-			<button onclick={onClose} aria-label="Close"><X size={20} /></button>
+			<div class="header-controls">
+				<div class="view-toggle">
+					<button
+						class:active={viewMode === 'logs'}
+						onclick={() => (viewMode = 'logs')}
+						title="Logs"
+					>
+						<FileText size={16} />
+					</button>
+					<button
+						class:active={viewMode === 'terminal'}
+						onclick={() => (viewMode = 'terminal')}
+						title="Terminal"
+					>
+						<TerminalIcon size={16} />
+					</button>
+				</div>
+				<button onclick={onClose} aria-label="Close"><X size={20} /></button>
+			</div>
 		</div>
 
 		<div class="content">
@@ -72,7 +92,11 @@
 			{:else if info}
 				<div class="terminal-section">
 					<div class="terminal-wrapper">
-						<Terminal filter={serviceName} />
+						{#if viewMode === 'logs'}
+							<Terminal filter={serviceName} />
+						{:else}
+							<InteractiveTerminal serviceName={serviceName} />
+						{/if}
 					</div>
 				</div>
 			{/if}
@@ -106,6 +130,40 @@
 		display: flex;
 		align-items: center;
 		gap: 16px;
+	}
+
+	.header-controls {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+	}
+
+	.view-toggle {
+		display: flex;
+		background: #333;
+		border-radius: 4px;
+		padding: 2px;
+	}
+
+	.view-toggle button {
+		padding: 4px 8px;
+		border-radius: 2px;
+		color: #999;
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+	}
+
+	.view-toggle button:hover {
+		color: #fff;
+		background: #3d3d3d;
+	}
+
+	.view-toggle button.active {
+		background: #444;
+		color: #fff;
 	}
 
 	.header h2 {

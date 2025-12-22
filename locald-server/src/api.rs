@@ -7,8 +7,10 @@ use axum::{
     },
     routing::{get, post},
 };
-use futures_util::stream::Stream;
+use futures_util::{SinkExt, StreamExt, stream::Stream};
 use hyper::StatusCode;
+use locald_core::service::ServiceController;
+use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -26,8 +28,86 @@ pub fn router(pm: ProcessManager) -> Router {
         .route("/services/:name/stop", post(handle_service_stop))
         .route("/services/:name/restart", post(handle_service_restart))
         .route("/services/:name/reset", post(handle_service_reset))
+        .route("/services/:name/pty", get(handle_pty_ws))
         .route("/services/:name", get(handle_service_inspect))
         .with_state(Arc::new(pm))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum PtyRequest {
+    Input { data: String },
+    Resize { rows: u16, cols: u16 },
+}
+
+async fn handle_pty_ws(
+    ws: WebSocketUpgrade,
+    Path(name): Path<String>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_pty_socket(socket, name, pm))
+}
+
+async fn handle_pty_socket(socket: WebSocket, name: String, pm: Arc<ProcessManager>) {
+    let controller = match pm.get_service_controller(&name).await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let (mut sender, mut receiver) = socket.split();
+
+    // Subscribe to PTY output
+    let mut pty_rx = {
+        let c = controller.lock().await;
+        match c.subscribe_pty() {
+            Some(rx) => rx,
+            None => return, // Service doesn't support PTY
+        }
+    };
+
+    // Task to forward PTY output to WebSocket
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(data) = pty_rx.recv().await {
+            if sender
+                .send(axum::extract::ws::Message::Binary(data))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Task to forward WebSocket input to PTY
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                axum::extract::ws::Message::Text(text) => {
+                    if let Ok(req) = serde_json::from_str::<PtyRequest>(&text) {
+                        let controller = controller.lock().await;
+                        match req {
+                            PtyRequest::Input { data } => {
+                                let _ = controller.write_stdin(data.as_bytes()).await;
+                            }
+                            PtyRequest::Resize { rows, cols } => {
+                                let _ = controller.resize_pty(rows, cols).await;
+                            }
+                        }
+                    }
+                }
+                axum::extract::ws::Message::Binary(data) => {
+                     let controller = controller.lock().await;
+                     let _ = controller.write_stdin(&data).await;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
 }
 
 async fn handle_state(State(pm): State<Arc<ProcessManager>>) -> impl IntoResponse {

@@ -1,10 +1,34 @@
 [phase]
-id = "37"
-name = "Port Mismatch Detection"
-rfc = "0051"
+id = "28"
+name = "Interactive Terminal & Theming"
+goal = "Elevate the Dashboard to an active controller with Power User features."
 
-[tasks]
-"37.1" = "Update ServiceStatus to include warnings"
-"37.2" = "Update Service struct in manager to store warnings"
-"37.3" = "Implement Port Mismatch Detection logic"
-"37.4" = "Display warnings in CLI"
+[[steps]]
+id = "28.1"
+name = "Implement PTY support in locald-server"
+description = "Add PTY capabilities to the ProcessManager to allow interactive sessions."
+files = ["locald-server/src/manager.rs", "locald-server/Cargo.toml"]
+
+[[steps]]
+id = "28.2"
+name = "Expose PTY via WebSocket in locald-server"
+description = "Create a WebSocket endpoint that connects to the PTY of a running service."
+files = ["locald-server/src/server.rs", "locald-server/src/ipc.rs"]
+
+[[steps]]
+id = "28.3"
+name = "Integrate xterm.js in locald-dashboard"
+description = "Add xterm.js to the dashboard and connect it to the WebSocket endpoint."
+files = ["locald-dashboard/package.json", "locald-dashboard/src/lib/components/Terminal.svelte"]
+
+[[steps]]
+id = "28.4"
+name = "Implement Theming (Light/Dark mode) in locald-dashboard"
+description = "Add theme switching logic and UI."
+files = ["locald-dashboard/src/routes/+layout.svelte", "locald-dashboard/src/app.css"]
+
+[[steps]]
+id = "28.5"
+name = "Implement Command Palette in locald-dashboard"
+description = "Add a command palette for quick actions."
+files = ["locald-dashboard/src/lib/components/CommandPalette.svelte"]

@@ -10,8 +10,9 @@ use locald_core::service::{
 };
 use locald_core::state::{HealthStatus, ServiceState};
 use nix::sys::signal::Signal;
-use portable_pty::{Child, MasterPty};
+use portable_pty::{Child, MasterPty, PtySize};
 use std::fmt;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -30,6 +31,7 @@ pub struct ExecController {
     cgroup_path: Option<String>,
     port: Option<u16>,
     log_tx: broadcast::Sender<LogEntry>,
+    pty_tx: Option<broadcast::Sender<Vec<u8>>>,
     bundle_dir: Option<PathBuf>,
     env: std::collections::HashMap<String, String>,
     system: StdMutex<System>,
@@ -69,6 +71,7 @@ impl ExecController {
             cgroup_path: None,
             port,
             log_tx,
+            pty_tx: None,
             bundle_dir: None,
             env,
             system: StdMutex::new(System::new()),
@@ -166,7 +169,7 @@ impl ServiceController for ExecController {
     }
 
     async fn start(&mut self) -> Result<()> {
-        let (child, master, container_id, mut log_rx) = if let Some(bundle_dir) = &self.bundle_dir {
+        let (child, master, container_id, mut log_rx, pty_tx) = if let Some(bundle_dir) = &self.bundle_dir {
             self.runtime
                 .start_container_process(self.id.clone(), bundle_dir)?
         } else {
@@ -204,6 +207,7 @@ impl ServiceController for ExecController {
         self.child = Some(StdMutex::new(child));
         self.pty_master = Some(StdMutex::new(master));
         self.container_id = Some(container_id);
+        self.pty_tx = Some(pty_tx);
 
         // Spawn log forwarder
         let log_tx = self.log_tx.clone();
@@ -290,6 +294,35 @@ impl ServiceController for ExecController {
         Ok(())
     }
 
+    async fn write_stdin(&self, data: &[u8]) -> Result<()> {
+        if let Some(master) = &self.pty_master {
+            let master = master.lock().unwrap();
+            // Duplicate FD to avoid closing the original when File drops
+            // portable-pty 0.9 MasterPty doesn't implement Write directly
+            // It seems as_raw_fd returns Option<RawFd> in this version/trait
+            let fd = master.as_raw_fd().expect("MasterPty should have a valid FD");
+            // SAFETY: The fd is valid as long as we hold the lock on master
+            let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let owned_fd = nix::unistd::dup(borrowed_fd)?;
+            let mut file = std::fs::File::from(owned_fd);
+            file.write_all(data)?;
+        }
+        Ok(())
+    }
+
+    async fn resize_pty(&self, rows: u16, cols: u16) -> Result<()> {
+        if let Some(master) = &self.pty_master {
+            let master = master.lock().unwrap();
+            master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+        }
+        Ok(())
+    }
+
     async fn read_state(&self) -> RuntimeState {
         let (is_running, pid) = self.child.as_ref().map_or((false, None), |child_mutex| {
             child_mutex.lock().map_or((false, None), |mut child| {
@@ -333,6 +366,10 @@ impl ServiceController for ExecController {
 
     async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
         Ok(())
+    }
+
+    fn subscribe_pty(&self) -> Option<broadcast::Receiver<Vec<u8>>> {
+        self.pty_tx.as_ref().map(|tx| tx.subscribe())
     }
 
     fn snapshot(&self) -> serde_json::Value {

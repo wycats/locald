@@ -259,6 +259,19 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
+    pub async fn get_service_controller(
+        &self,
+        name: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<dyn ServiceController>>> {
+        let services = self.services.lock().await;
+        if let Some(service) = services.get(name) {
+            if let ServiceRuntime::Controller(c) = &service.runtime_state {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
     /// Create a new `ProcessManager`.
     ///
     /// # Arguments
@@ -828,32 +841,28 @@ impl ProcessManager {
 
         let handle = tokio::runtime::Handle::current();
 
-        let watcher_res =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        if event.kind.is_modify() || event.kind.is_create() {
-                            let relevant = event
-                                .paths
-                                .iter()
-                                .any(|p| {
-                                    p.ends_with("locald.toml")
-                                        || p.ends_with("Procfile")
-                                        || p.ends_with(".env")
-                                });
+        let watcher_res = notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| match res {
+                Ok(event) => {
+                    if event.kind.is_modify() || event.kind.is_create() {
+                        let relevant = event.paths.iter().any(|p| {
+                            p.ends_with("locald.toml")
+                                || p.ends_with("Procfile")
+                                || p.ends_with(".env")
+                        });
 
-                            if relevant {
-                                info!("Config changed: {:?}", event.paths);
-                                let tx = tx.clone();
-                                handle.spawn(async move {
-                                    let _ = tx.send(()).await;
-                                });
-                            }
+                        if relevant {
+                            info!("Config changed: {:?}", event.paths);
+                            let tx = tx.clone();
+                            handle.spawn(async move {
+                                let _ = tx.send(()).await;
+                            });
                         }
                     }
-                    Err(e) => error!("Watch error: {e}"),
                 }
-            });
+                Err(e) => error!("Watch error: {e}"),
+            },
+        );
 
         match watcher_res {
             Ok(mut watcher) => {
