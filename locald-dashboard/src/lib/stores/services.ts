@@ -80,7 +80,13 @@ export const services = createServicesStore();
 export const projects = derived(services, ($services) => {
 	const groups: Record<string, ServiceStatus[]> = {};
 	for (const service of $services) {
-		let groupName = service.workspace || service.constellation;
+		let groupName: string | null = null;
+
+		if (service.workspace && service.constellation) {
+			groupName = `${service.workspace}/${service.constellation}`;
+		} else {
+			groupName = service.workspace || service.constellation;
+		}
 
 		if (!groupName) {
 			// Assuming format "project:service"
