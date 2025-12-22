@@ -79,12 +79,13 @@ impl ProcessRuntime {
                         while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                             let line_bytes: Vec<u8> = buffer.drain(0..=pos).collect();
                             let line_len = line_bytes.len();
-                            let line_content = if line_len > 0 && line_bytes[line_len - 1] == b'\n' {
+                            let line_content = if line_len > 0 && line_bytes[line_len - 1] == b'\n'
+                            {
                                 &line_bytes[..line_len - 1]
                             } else {
                                 &line_bytes[..]
                             };
-                            
+
                             let line = String::from_utf8_lossy(line_content).to_string();
 
                             let timestamp = SystemTime::now()

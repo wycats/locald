@@ -96,8 +96,8 @@ async fn handle_pty_socket(socket: WebSocket, name: String, pm: Arc<ProcessManag
                     }
                 }
                 axum::extract::ws::Message::Binary(data) => {
-                     let controller = controller.lock().await;
-                     let _ = controller.write_stdin(&data).await;
+                    let controller = controller.lock().await;
+                    let _ = controller.write_stdin(&data).await;
                 }
                 _ => {}
             }

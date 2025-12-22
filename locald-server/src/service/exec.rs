@@ -169,40 +169,40 @@ impl ServiceController for ExecController {
     }
 
     async fn start(&mut self) -> Result<()> {
-        let (child, master, container_id, mut log_rx, pty_tx) = if let Some(bundle_dir) = &self.bundle_dir {
-            self.runtime
-                .start_container_process(self.id.clone(), bundle_dir)?
-        } else {
-            let (command, workdir) = match &self.config {
-                ServiceConfig::Typed(TypedServiceConfig::Exec(c)) | ServiceConfig::Legacy(c) => {
-                    (c.command.clone(), c.workdir.clone())
-                }
-                ServiceConfig::Typed(TypedServiceConfig::Worker(c)) => {
-                    (Some(c.command.clone()), c.workdir.clone())
-                }
-                ServiceConfig::Typed(
-                    TypedServiceConfig::Container(_)
-                    | TypedServiceConfig::Postgres(_)
-                    | TypedServiceConfig::Site(_),
-                ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
+        let (child, master, container_id, mut log_rx, pty_tx) =
+            if let Some(bundle_dir) = &self.bundle_dir {
+                self.runtime
+                    .start_container_process(self.id.clone(), bundle_dir)?
+            } else {
+                let (command, workdir) = match &self.config {
+                    ServiceConfig::Typed(TypedServiceConfig::Exec(c))
+                    | ServiceConfig::Legacy(c) => (c.command.clone(), c.workdir.clone()),
+                    ServiceConfig::Typed(TypedServiceConfig::Worker(c)) => {
+                        (Some(c.command.clone()), c.workdir.clone())
+                    }
+                    ServiceConfig::Typed(
+                        TypedServiceConfig::Container(_)
+                        | TypedServiceConfig::Postgres(_)
+                        | TypedServiceConfig::Site(_),
+                    ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
+                };
+
+                let service_path = workdir.map_or_else(
+                    || self.project_root.clone(),
+                    |wd| self.project_root.join(wd),
+                );
+
+                let env = self.resolve_env();
+
+                let cmd_str = command.ok_or_else(|| anyhow::anyhow!("Command is required"))?;
+                self.runtime.start_host_process(
+                    self.id.clone(),
+                    &service_path,
+                    &cmd_str,
+                    &env,
+                    self.port,
+                )?
             };
-
-            let service_path = workdir.map_or_else(
-                || self.project_root.clone(),
-                |wd| self.project_root.join(wd),
-            );
-
-            let env = self.resolve_env();
-
-            let cmd_str = command.ok_or_else(|| anyhow::anyhow!("Command is required"))?;
-            self.runtime.start_host_process(
-                self.id.clone(),
-                &service_path,
-                &cmd_str,
-                &env,
-                self.port,
-            )?
-        };
 
         self.child = Some(StdMutex::new(child));
         self.pty_master = Some(StdMutex::new(master));
@@ -300,7 +300,9 @@ impl ServiceController for ExecController {
             // Duplicate FD to avoid closing the original when File drops
             // portable-pty 0.9 MasterPty doesn't implement Write directly
             // It seems as_raw_fd returns Option<RawFd> in this version/trait
-            let fd = master.as_raw_fd().expect("MasterPty should have a valid FD");
+            let fd = master
+                .as_raw_fd()
+                .expect("MasterPty should have a valid FD");
             // SAFETY: The fd is valid as long as we hold the lock on master
             let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
             let owned_fd = nix::unistd::dup(borrowed_fd)?;
