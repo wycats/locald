@@ -777,7 +777,7 @@ status = "pending"
 [[epochs.phases]]
 id = "29"
 title = "Extensibility & Plugins"
-status = "pending"
+status = "active"
 rfcs = ["0028"]
 
 [[epochs.phases.tasks]]

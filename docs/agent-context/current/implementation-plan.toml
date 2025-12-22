@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "28"
-title = "Interactive Terminal & Theming"
-rfcs = []
+id = "29"
+title = "Extensibility & Plugins"
+rfcs = ["0028"]
 
 [plan]
 [[plan.changes]]
@@ -15,29 +15,19 @@ files = []
 tests = []
 
 [[plan.changes.tasks]]
-id = "28.1"
-title = "Implement PTY support in locald-server"
-status = "completed"
+id = "29.1"
+title = "Plugin Mechanism: Formal system for custom services"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "28.2"
-title = "Expose PTY via WebSocket in locald-server"
-status = "completed"
+id = "29.2"
+title = "Packaging: Support locald package command"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "28.3"
-title = "Integrate xterm.js in locald-dashboard"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "28.4"
-title = "Implement Theming (Light/Dark mode) in locald-dashboard"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "28.5"
-title = "Implement Command Palette in locald-dashboard"
-status = "completed"
+id = "29.3"
+title = "Distributions: Allow flavored binaries/configs"
+status = "pending"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
