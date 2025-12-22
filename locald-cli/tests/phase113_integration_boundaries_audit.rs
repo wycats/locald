@@ -52,7 +52,7 @@ fn phase113_doctor_recommends_admin_setup_without_sudo_and_suggests_up_next() {
     let output = cmd.output().expect("failed to run locald doctor");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !(stdout.contains(" Fix:") || stdout.contains(" Fixes:")) {
+    if !stdout.contains("Suggested next steps:") {
         return;
     }
 

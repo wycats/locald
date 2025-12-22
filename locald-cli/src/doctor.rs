@@ -237,12 +237,9 @@ fn render_human_plain(report: &DoctorReport, verbose: bool) {
 
         if !report.fixes.is_empty() || !extra_command_lists.is_empty() {
             println!();
+            println!("{} Suggested next steps:", style::PACKAGE);
+
             let fix_group_count = report.fixes.len() + extra_command_lists.len();
-            if fix_group_count == 1 {
-                println!("{} Fix:", style::PACKAGE);
-            } else {
-                println!("{} Fixes:", style::PACKAGE);
-            }
 
             for fix in &report.fixes {
                 if fix_group_count == 1 {
@@ -275,7 +272,6 @@ fn render_human_plain(report: &DoctorReport, verbose: bool) {
                 }
             }
 
-            // After the actionable Fix block, summarize any missing optional integrations.
             if !optional_rollup.unavailable.is_empty() {
                 println!("{} Optional missing (non-blocking):", style::WARN);
                 for item in &optional_rollup.unavailable {

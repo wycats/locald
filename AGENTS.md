@@ -79,6 +79,10 @@ These protocols are derived from the Mental Model. Follow them to ensure consist
   - **ALWAYS** use the `exo` CLI to modify them.
 - **AI Context**: Use `exo ai context` to dump the project state and `exo ai prompt` to retrieve prompts.
 
+### Protocol: Shell Safety
+
+- **No backticks in commit messages**: Never include backticks in commit messages. Backticks can trigger shell command substitution in copy/paste workflows and may execute commands unexpectedly.
+
 ---
 
 ## Reference: File Structure
