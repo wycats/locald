@@ -2,12 +2,22 @@
 # Task List
 
 [[tasks]]
-id = "First Step::27.1.1"
-title = "Dashboard: Group services by Constellation/Workspace"
+id = "First Step::36.1"
+title = "Fix Manual Restart: Reload config from disk"
 status = "pending"
 
 [[tasks]]
-id = "First Step::27.2.1"
-title = "Evaluate splitting defaults.services from services"
+id = "First Step::36.2"
+title = "Project Config Watcher: Watch locald.toml files"
+status = "pending"
+
+[[tasks]]
+id = "First Step::36.3"
+title = "Hot Reload Logic: Restart services on config change"
+status = "pending"
+
+[[tasks]]
+id = "First Step::36.4"
+title = "Debouncing: Debounce config updates"
 status = "pending"
 

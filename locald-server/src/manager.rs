@@ -214,6 +214,7 @@ pub(crate) struct Service {
     pub config: LocaldConfig,
     #[allow(clippy::struct_field_names)]
     pub service_config: ServiceConfig,
+    pub resolved_env: HashMap<String, String>,
     pub runtime_state: ServiceRuntime,
     pub sticky_port: Option<u16>,
     pub path: PathBuf,
@@ -784,8 +785,41 @@ impl ProcessManager {
             }
         }
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
         let manager = self.clone();
         let path_clone = path.clone();
+
+        // Spawn debouncer task
+        tokio::spawn(async move {
+            loop {
+                // Wait for first event
+                if rx.recv().await.is_none() {
+                    break;
+                }
+
+                // Debounce loop
+                loop {
+                    let timeout = tokio::time::sleep(std::time::Duration::from_millis(500));
+                    tokio::select! {
+                        res = rx.recv() => {
+                            if res.is_none() {
+                                return;
+                            }
+                            // Received another event, loop again (reset timeout)
+                        }
+                        _ = timeout => {
+                            // Timeout expired, trigger reload
+                            info!("Reloading config for {:?}", path_clone);
+                            if let Err(e) = manager.apply_config(path_clone.clone(), None, false).await {
+                                error!("Failed to reload config: {e}");
+                            }
+                            break; // Break inner loop, go back to waiting for first event
+                        }
+                    }
+                }
+            }
+        });
+
         let handle = tokio::runtime::Handle::current();
 
         let watcher_res =
@@ -796,18 +830,17 @@ impl ProcessManager {
                             let relevant = event
                                 .paths
                                 .iter()
-                                .any(|p| p.ends_with("locald.toml") || p.ends_with("Procfile"));
+                                .any(|p| {
+                                    p.ends_with("locald.toml")
+                                        || p.ends_with("Procfile")
+                                        || p.ends_with(".env")
+                                });
 
                             if relevant {
                                 info!("Config changed: {:?}", event.paths);
-                                let manager = manager.clone();
-                                let path = path_clone.clone();
+                                let tx = tx.clone();
                                 handle.spawn(async move {
-                                    // Debounce?
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    if let Err(e) = manager.apply_config(path, None, false).await {
-                                        error!("Failed to reload config: {e}");
-                                    }
+                                    let _ = tx.send(()).await;
                                 });
                             }
                         }
@@ -907,6 +940,19 @@ impl ProcessManager {
             let name = format!("{}:{}", config.project.name, service_name);
             active_services.insert(name.clone());
 
+            let mut combined_env = dot_env_vars.clone();
+            for (k, v) in service_config.env() {
+                combined_env.insert(k.clone(), v.clone());
+            }
+
+            let manager = self.clone();
+            let lookup = move |service_name: String, field: String| {
+                let manager = manager.clone();
+                async move { manager.get_service_field(&service_name, &field).await }
+            };
+
+            let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
+
             // Check if already running and config matches
             {
                 let mut services = self.services.lock().await;
@@ -921,7 +967,9 @@ impl ProcessManager {
                     };
 
                     if is_running {
-                        if &service.service_config == service_config {
+                        if &service.service_config == service_config
+                            && service.resolved_env == resolved_env
+                        {
                             info!("Service {name} is already running and up to date");
                             if let Some(tx) = &event_tx {
                                 let _ = tx
@@ -997,19 +1045,6 @@ impl ProcessManager {
                     .await;
             }
 
-            let mut combined_env = dot_env_vars.clone();
-            for (k, v) in service_config.env() {
-                combined_env.insert(k.clone(), v.clone());
-            }
-
-            let manager = self.clone();
-            let lookup = move |service_name: String, field: String| {
-                let manager = manager.clone();
-                async move { manager.get_service_field(&service_name, &field).await }
-            };
-
-            let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
-
             let mut handled = false;
             for factory in &self.factories {
                 if factory.can_handle(service_config) {
@@ -1042,6 +1077,7 @@ impl ProcessManager {
                             Service {
                                 config: config.clone(),
                                 service_config: service_config.clone(),
+                                resolved_env: resolved_env.clone(),
                                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                                 sticky_port: port,
                                 path: path.clone(),

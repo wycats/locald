@@ -679,7 +679,7 @@ status = "complete"
 [[epochs.phases]]
 id = "27"
 title = "Workspace & Constellations"
-status = "active"
+status = "completed"
 rfcs = ["0026"]
 
 [[epochs.phases.tasks]]
@@ -710,28 +710,28 @@ status = "completed"
 [[epochs.phases]]
 id = "36"
 title = "Hot Reloading & Configuration Watcher"
-status = "pending"
+status = "active"
 rfcs = ["0050"]
 
 [[epochs.phases.tasks]]
 id = "36.1"
 label = "Fix Manual Restart: Ensure `locald restart` reloads config from disk."
-status = "pending"
+status = "in-progress"
 
 [[epochs.phases.tasks]]
 id = "36.2"
 label = "Project Config Watcher: Implement a watcher for registered project `locald.toml` files."
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "36.3"
 label = "Hot Reload Logic: Wire up the watcher to the service restart logic."
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "36.4"
 label = "Debouncing: Add debouncing to the watcher."
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "37"

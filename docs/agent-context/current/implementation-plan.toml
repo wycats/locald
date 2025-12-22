@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "27"
-title = "Workspace & Constellations"
-rfcs = ["0026"]
+id = "36"
+title = "Hot Reloading & Configuration Watcher"
+rfcs = ["0050"]
 
 [plan]
 [[plan.changes]]
@@ -15,13 +15,23 @@ files = []
 tests = []
 
 [[plan.changes.tasks]]
-id = "27.1.1"
-title = "Dashboard: Group services by Constellation/Workspace"
+id = "36.1"
+title = "Fix Manual Restart: Reload config from disk"
 status = "pending"
 
 [[plan.changes.tasks]]
-id = "27.2.1"
-title = "Evaluate splitting defaults.services from services"
+id = "36.2"
+title = "Project Config Watcher: Watch locald.toml files"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "36.3"
+title = "Hot Reload Logic: Restart services on config change"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "36.4"
+title = "Debouncing: Debounce config updates"
 status = "pending"
 
 [verification]
