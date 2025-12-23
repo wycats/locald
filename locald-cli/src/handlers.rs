@@ -5,11 +5,11 @@ use std::collections::HashSet;
 
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    PluginCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
 use crate::{
-    build, client, container, debug, doctor, history, init, monitor, run, service, style, trust,
-    try_cmd, utils,
+    build, client, container, debug, doctor, history, init, monitor, plugin, run, service, style,
+    trust, try_cmd, utils,
 };
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -864,6 +864,59 @@ pub fn run(cli: Cli) -> Result<()> {
             } => {
                 utils::ensure_daemon_running()?;
                 container::run(image.clone(), command.clone(), *interactive, *detached)?;
+            }
+        },
+
+        Commands::Plugin { command } => match command {
+            PluginCommands::Install {
+                source,
+                name,
+                project,
+            } => {
+                if let Err(e) = plugin::install(source, name.clone(), *project) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            PluginCommands::Inspect {
+                plugin: plugin_arg,
+                kind,
+                name,
+                depends_on,
+                config,
+                grant,
+            } => {
+                if let Err(e) = plugin::inspect(
+                    plugin_arg,
+                    kind,
+                    name.as_deref(),
+                    depends_on.as_deref(),
+                    config,
+                    grant,
+                ) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            PluginCommands::Validate {
+                plugin: plugin_arg,
+                kind,
+                name,
+                depends_on,
+                config,
+                grant,
+            } => {
+                if let Err(e) = plugin::validate(
+                    plugin_arg,
+                    kind,
+                    name.as_deref(),
+                    depends_on.as_deref(),
+                    config,
+                    grant,
+                ) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
         },
         Commands::Serve {

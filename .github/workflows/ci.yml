@@ -336,6 +336,15 @@ jobs:
         if: ${{ github.event_name != 'schedule' && steps.gate.outputs.run != 'true' }}
         run: echo "No Rust changes; skipping tests."
 
+      - name: Disk usage (pre)
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          du -sh ~/.cache/locald/oci-layout 2>/dev/null || true
+          du -sh target/llvm-cov-target 2>/dev/null || true
+
       - name: Install Rust
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: dtolnay/rust-toolchain@stable
@@ -407,7 +416,7 @@ jobs:
             cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Cache OCI layout blobs
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+        if: ${{ github.event_name == 'schedule' }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/locald/oci-layout
@@ -490,6 +499,9 @@ jobs:
 
           # Generate the report without re-running tests.
           cargo llvm-cov --no-run --lcov --output-path lcov.info
+
+          du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
+          rm -rf "$CARGO_TARGET_DIR"
 
       - name: Upload coverage to Codecov
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
