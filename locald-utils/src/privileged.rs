@@ -781,6 +781,7 @@ fn shim_self_check(shim_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::{Mutex, OnceLock};
 
     fn failing_problem(id: &str, severity: Severity, fix: Option<FixKey>) -> Problem {
         Problem {
@@ -792,6 +793,34 @@ mod tests {
             remediation: vec![],
             evidence: vec![],
             fix,
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[allow(unsafe_code)]
+    fn set_env<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+        // `std::env::set_var` is `unsafe` on some toolchains/editions.
+        // These tests serialize env access via `env_lock()`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn remove_env<K: AsRef<std::ffi::OsStr>>(key: K) {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn restore_env(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => set_env(key, v),
+            None => remove_env(key),
         }
     }
 
@@ -880,6 +909,76 @@ mod tests {
         assert_eq!(roundtrip.strategy.cgroup_root, report.strategy.cgroup_root);
         assert_eq!(roundtrip.mode, report.mode);
         assert_eq!(roundtrip.problems.len(), 1);
+    }
+
+    #[test]
+    fn docker_integration_tcp_host_is_treated_as_configured() {
+        let _guard = env_lock().lock().unwrap();
+
+        let prev = std::env::var("DOCKER_HOST").ok();
+        set_env("DOCKER_HOST", "tcp://127.0.0.1:2375");
+
+        let mut problems = Vec::new();
+        check_docker_integration(
+            &AcquireConfig {
+                verbose: true,
+                ..AcquireConfig::daemon_default()
+            },
+            &mut problems,
+        );
+        assert!(problems.is_empty());
+
+        restore_env("DOCKER_HOST", prev);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_integration_unix_socket_present_no_problem() {
+        use std::os::unix::net::UnixListener;
+
+        let _guard = env_lock().lock().unwrap();
+
+        let prev_docker_host = std::env::var("DOCKER_HOST").ok();
+        let prev_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        let tmp = std::env::temp_dir().join(format!("locald-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        // Reduce the chance of accidentally finding a real daemon socket via env paths.
+        set_env("XDG_RUNTIME_DIR", &tmp);
+        set_env("HOME", &tmp);
+
+        let sock_path = tmp.join("docker.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind unix socket");
+
+        set_env(
+            "DOCKER_HOST",
+            format!("unix://{}", sock_path.to_string_lossy()),
+        );
+
+        let mut problems = Vec::new();
+        check_docker_integration(
+            &AcquireConfig {
+                verbose: true,
+                ..AcquireConfig::daemon_default()
+            },
+            &mut problems,
+        );
+        assert!(problems.is_empty());
+
+        restore_env("DOCKER_HOST", prev_docker_host);
+        restore_env("XDG_RUNTIME_DIR", prev_runtime);
+        restore_env("HOME", prev_home);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kvm_integration_is_quiet_when_not_verbose() {
+        let mut problems = Vec::new();
+        check_kvm_integration(&AcquireConfig::daemon_default(), &mut problems);
+        assert!(problems.is_empty());
     }
 
     fn arb_fix_key() -> impl Strategy<Value = FixKey> {
