@@ -108,9 +108,7 @@ fn plugin_install_project_downloads_from_http_url() {
 
     let mut cmd = locald();
     cmd.current_dir(root.path());
-    cmd.args(["plugin", "install"])
-        .arg(&url)
-        .arg("--project");
+    cmd.args(["plugin", "install"]).arg(&url).arg("--project");
 
     cmd.assert().success().stdout(contains("installed"));
 
