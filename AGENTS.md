@@ -98,4 +98,4 @@ These protocols are derived from the Mental Model. Follow them to ensure consist
 
 # Project Mission
 
-Unknown Mission
+`locald` treats the local machine as a first-class platform: a daemon-first development environment where “clone → locald up” feels coherent (stable domains, managed services, built-in observability).

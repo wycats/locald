@@ -17,6 +17,8 @@ This crate is designed to be invoked by the `locald` binary (from `locald-cli`).
 - **Runtime Integration**:
   - Uses `locald-shim` for privileged operations (e.g. privileged port binding via FD passing).
   - Uses the “fat shim” container path (bundle-based execution) for container workloads.
+- **Plugins**: Hosts WASM component plugins (detect/apply) that can generate and validate service plans.
+- **Embedded UI Assets**: Serves embedded dashboard/docs assets when built with UI enabled; otherwise returns helpful fallback pages.
 
 ## How It’s Run
 

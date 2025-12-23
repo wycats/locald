@@ -1,38 +1,25 @@
-# sv
+# locald-dashboard
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+The `locald` dashboard web UI.
 
-## Creating a project
+This package is built with Svelte (via SvelteKit tooling) + Vite. In this repository, the dashboard is typically served by `locald-server` (embedded at build time for distribution builds).
 
-If you're seeing this, you've probably already done this step. Congrats!
+## Develop
 
-```sh
-# create a new project in the current directory
-npx sv create
-
-# create a new project in my-app
-npx sv create my-app
+```bash
+pnpm install
+pnpm dev
 ```
 
-## Developing
+## Build
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+```bash
+pnpm build
 ```
 
-## Building
+## Repository integration
 
-To create a production version of your app:
+In this repo, dashboard assets are embedded into `locald-server` when building with the default UI features.
 
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+- Build assets for embedding: `./scripts/build-assets.sh`
+- When building without embedded UI assets, `locald-server` serves a small fallback page instead.
