@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 
 use locald_server::plugins::{HostCapabilities, PluginRunner, ServiceSpec, WorkspaceContext};
 
+/// Install a plugin from a local path or URL.
+///
+/// - If `project` is true, installs into the current project's `.local/plugins` directory.
+/// - Otherwise installs into the user-local data directory (`$XDG_DATA_HOME`, falling back to the platform default).
+/// - If `name` is provided, it is sanitized and used as the destination filename.
+/// - Supported sources: local filesystem paths, `file://...` URLs, and `http(s)://...` URLs.
 pub fn install(source: &str, name: Option<String>, project: bool) -> Result<()> {
     let dest_dir = if project {
         project_plugins_dir()?
@@ -88,6 +94,9 @@ pub fn inspect(
     }
 }
 
+/// Validate the plan produced by a plugin.
+///
+/// Exits with an error if the plugin returns diagnostics or if the produced plan is invalid.
 pub fn validate(
     plugin: &str,
     kind: &str,
@@ -265,8 +274,29 @@ fn sanitize_filename(name: &str) -> String {
         return "plugin.wasm".to_string();
     }
 
-    // Keep it minimal: avoid path separators.
-    trimmed.replace(['/', '\\', '\u{0000}'], "-")
+    // Avoid path separators and NUL.
+    let replaced = trimmed.replace(['/', '\\', '\u{0000}'], "-");
+
+    // Avoid "." / ".." and hidden-file style names.
+    let candidate = replaced
+        .trim_matches(|c: char| c == '.' || c.is_whitespace())
+        .to_string();
+
+    if candidate.is_empty() || candidate == "." || candidate == ".." {
+        return "plugin.wasm".to_string();
+    }
+
+    // Keep a conservative set of filename characters; normalize the rest.
+    candidate
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn parse_depends_on(depends_on: Option<&str>) -> Vec<String> {
@@ -335,4 +365,29 @@ fn detect_workspace_identity() -> Result<(String, String)> {
         .unwrap_or_else(|| "workspace".to_string());
 
     Ok((workspace_id, root_str))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_filename, url_filename};
+
+    #[test]
+    fn url_filename_strips_query_and_fragment() {
+        assert_eq!(
+            url_filename("https://example.test/path/plugin.component.wasm?x=y#frag").as_deref(),
+            Some("plugin.component.wasm")
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_dot_and_dotdot() {
+        assert_eq!(sanitize_filename("."), "plugin.wasm");
+        assert_eq!(sanitize_filename(".."), "plugin.wasm");
+    }
+
+    #[test]
+    fn sanitize_filename_normalizes_path_separators_and_weird_chars() {
+        assert_eq!(sanitize_filename("foo/bar.wasm"), "foo-bar.wasm");
+        assert_eq!(sanitize_filename("  .secret\\name?  "), "secret-name-");
+    }
 }
