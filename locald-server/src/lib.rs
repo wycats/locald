@@ -88,6 +88,8 @@ pub mod logging;
 #[doc(hidden)]
 pub mod manager;
 #[doc(hidden)]
+pub mod plugins;
+#[doc(hidden)]
 // pub mod notify; // Moved to locald-utils
 #[doc(hidden)]
 pub mod proxy;
@@ -101,6 +103,7 @@ pub mod shim_client;
 pub mod state;
 #[doc(hidden)]
 pub mod static_server;
+#[doc(hidden)]
 #[doc(hidden)]
 pub mod toolbar;
 

@@ -193,7 +193,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
@@ -221,6 +220,19 @@ jobs:
       - name: Setup sccache
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Enable sccache wrapper (if available)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v sccache >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "sccache not available; continuing without compiler cache"
+          fi
 
       - name: Verify CLI surface manifest is up to date
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -281,7 +293,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
@@ -325,6 +336,15 @@ jobs:
         if: ${{ github.event_name != 'schedule' && steps.gate.outputs.run != 'true' }}
         run: echo "No Rust changes; skipping tests."
 
+      - name: Disk usage (pre)
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          du -sh ~/.cache/locald/oci-layout 2>/dev/null || true
+          du -sh target/llvm-cov-target 2>/dev/null || true
+
       - name: Install Rust
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: dtolnay/rust-toolchain@stable
@@ -340,6 +360,19 @@ jobs:
       - name: Setup sccache
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Enable sccache wrapper (if available)
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v sccache >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "sccache not available; continuing without compiler cache"
+          fi
 
       - name: Setup Node.js
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
@@ -383,7 +416,7 @@ jobs:
             cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Cache OCI layout blobs
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+        if: ${{ github.event_name == 'schedule' }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/locald/oci-layout
@@ -466,6 +499,9 @@ jobs:
 
           # Generate the report without re-running tests.
           cargo llvm-cov --no-run --lcov --output-path lcov.info
+
+          du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
+          rm -rf "$CARGO_TARGET_DIR"
 
       - name: Upload coverage to Codecov
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}

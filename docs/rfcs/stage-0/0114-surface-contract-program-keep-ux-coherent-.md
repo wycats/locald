@@ -104,7 +104,7 @@ These criteria define “done” for the scheduled phases in §6. They are inten
 - No new dashboard capabilities are introduced as part of this phase; changes are vocabulary/labeling/information architecture cleanup only.
 
 ### 8.4 Phase 113 — Integration Boundaries Audit
-- A stable/experimental matrix exists for integrations (e.g. Docker availability, CNB/buildpacks, VMM/OCI), including:
+- A stable/experimental matrix exists for integrations (e.g. OCI+shim/libcontainer readiness, CNB/buildpacks, VMM/KVM), including:
   - what happens when the integration is missing
   - what error/warning the user sees
   - the documented remediation path

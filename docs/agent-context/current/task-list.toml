@@ -2,17 +2,17 @@
 # Task List
 
 [[tasks]]
-id = "113.1"
-title = "Audit optional integrations + failure modes"
-status = "completed"
+id = "First Step::29.1"
+title = "Plugin Mechanism: Formal system for custom services"
+status = "pending"
 
 [[tasks]]
-id = "113.2"
-title = "Document stable/experimental matrix"
-status = "completed"
+id = "First Step::29.2"
+title = "Packaging: Support locald package command"
+status = "pending"
 
 [[tasks]]
-id = "113.3"
-title = "Ensure doctor surfaces integration availability"
-status = "completed"
+id = "First Step::29.3"
+title = "Distributions: Allow flavored binaries/configs"
+status = "pending"
 

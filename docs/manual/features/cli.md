@@ -16,19 +16,15 @@ It displays a dynamic progress UI that shows the status of builds and service st
 
 If a step fails, the UI will persist the error details for debugging.
 
-### `locald down`
-
-Stops all running services and the daemon.
-
 ## Ad-Hoc Execution
 
 ### `locald try`
 
-Run a command in a temporary, isolated environment. This is useful for trying out tools or running one-off scripts without installing them globally.
+Run an ad-hoc host command with a dynamically assigned `$PORT` injected into the environment. This is useful for quick experiments before you have a `locald.toml` (or when you don’t want to add a service).
 
 ```bash
-# Run a python script without installing python
-locald try python:3.9 python my_script.py
+# Run a simple HTTP server on an available port
+locald try python3 -m http.server $PORT
 ```
 
 ### `locald run`

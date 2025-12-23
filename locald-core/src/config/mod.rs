@@ -1,6 +1,12 @@
 pub mod global;
 pub use global::GlobalConfig;
 
+pub mod env_provenance;
+pub use env_provenance::{
+    EnvLayer, EnvLayerKind, EnvLayerSource, ResolvedEnv, ResolvedEnvVar, merge_env_layers,
+    overlay_env,
+};
+
 // FLAG: The `loader` module contains side effects (file I/O, env vars).
 // It has been removed from this pure crate.
 // pub mod loader;
@@ -44,6 +50,12 @@ pub struct ProjectConfig {
     /// The domain to serve the project on. Defaults to `{name}.localhost`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// The name of the workspace the project belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The name of the constellation the project belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constellation: Option<String>,
 }
 
 /// Configuration for a single service.
@@ -370,6 +382,8 @@ mod tests {
             project: ProjectConfig {
                 name: "test-project".to_string(),
                 domain: None,
+                workspace: None,
+                constellation: None,
             },
             services: HashMap::from([("web".to_string(), service_config)]),
         };
@@ -444,6 +458,8 @@ impl Default for ProjectConfig {
         Self {
             name: "default".to_string(),
             domain: None,
+            workspace: None,
+            constellation: None,
         }
     }
 }

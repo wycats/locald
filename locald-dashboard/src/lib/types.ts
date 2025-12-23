@@ -8,6 +8,9 @@ export interface ServiceStatus {
 	health_status: string;
 	health_source: string;
 	path: string | null;
+	workspace: string | null;
+	constellation: string | null;
+	warnings: string[];
 	metrics?: ServiceMetrics;
 	cpu_history?: number[];
 }

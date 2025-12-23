@@ -5,6 +5,7 @@
 	import type { FitAddon } from '@xterm/addon-fit';
 	import type { LogEntry } from '$lib/types';
 	import { logs, latestLog, stream } from '$lib/stores/logs';
+	import { terminalTheme } from '$lib/theme';
 	import { get } from 'svelte/store';
 
 	let terminalContainer: HTMLDivElement;
@@ -79,10 +80,7 @@
 
 			terminal = new Terminal({
 				cursorBlink: false,
-				theme: {
-					background: '#09090b',
-					foreground: '#d4d4d8'
-				},
+				theme: terminalTheme,
 				fontFamily: 'JetBrains Mono, Menlo, Monaco, "Courier New", monospace',
 				fontSize: 13,
 				convertEol: true,

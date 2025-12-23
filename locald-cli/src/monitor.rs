@@ -10,7 +10,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use std::{io, time::Duration};
+use std::{fmt::Write as FmtWrite, io, time::Duration};
 
 pub fn run() -> Result<()> {
     // Setup terminal
@@ -57,12 +57,18 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 .iter()
                 .map(|s| {
                     let status_style = match s.status {
-                        ServiceState::Running => Style::default().fg(Color::Green),
+                        ServiceState::Running => {
+                            if s.warnings.is_empty() {
+                                Style::default().fg(Color::Green)
+                            } else {
+                                Style::default().fg(Color::Yellow)
+                            }
+                        }
                         ServiceState::Stopped => Style::default().fg(Color::Red),
                         ServiceState::Building => Style::default().fg(Color::Blue),
                     };
 
-                    let content = format!(
+                    let mut content = format!(
                         "{:<20} [{}] PID: {:<6} Port: {:<5} URL: {}",
                         s.name,
                         s.status,
@@ -70,6 +76,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                         s.port.map_or_else(|| "-".into(), |p| p.to_string()),
                         s.url.as_deref().unwrap_or("-")
                     );
+
+                    if !s.warnings.is_empty() {
+                        let _ = write!(content, " WARNING: {}", s.warnings.join(", "));
+                    }
+
                     ListItem::new(content).style(status_style)
                 })
                 .collect();

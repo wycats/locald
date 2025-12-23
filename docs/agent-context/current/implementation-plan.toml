@@ -2,38 +2,56 @@
 # Implementation Plan
 
 [phase]
-id = "113"
-title = "Integration Boundaries Audit"
-rfcs = ["0112", "0114"]
+id = "29"
+title = "Extensibility & Plugins"
+rfcs = ["0028"]
 
 [plan]
-
 [[plan.changes]]
-name = "Audit optional integrations + failure modes"
-type = "chore"
-details = "Inventory optional integrations (Docker, CNB/buildpacks, VMM/OCI, etc) and document: detection, missing-dependency behavior, and what user-facing error/warning appears."
-files = []
-tests = []
-satisfies = ["113.1"]
-no_test_reason = "Audit + documentation step"
-
-[[plan.changes]]
-name = "Document stable/experimental integration matrix"
-type = "docs"
-details = "Produce a stable/experimental matrix for integrations (what’s supported, what happens when missing, remediation paths) and align docs with current behavior."
-files = []
-tests = []
-satisfies = ["113.2"]
-no_test_reason = "Documentation change"
-
-[[plan.changes]]
-name = "Ensure doctor surfaces integration availability"
+name = "First Step"
 type = "feat"
-details = "Ensure locald doctor reports integration availability/severity consistent with the matrix (warn vs critical), so users can self-diagnose missing optional dependencies."
+details = "Description"
 files = []
 tests = []
-satisfies = ["113.3"]
-no_test_reason = "May require code changes; tests will be added once we identify the right integration-detection seams, otherwise validated via phase verification + doctor output checks."
+
+[[plan.changes.tasks]]
+id = "29.1"
+title = "Plugin Mechanism: Formal system for custom services"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "29.2"
+title = "Packaging: Support locald package command"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "29.3"
+title = "Distributions: Allow flavored binaries/configs"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "29.1.1"
+title = "Specify plugin contract + fixtures"
+status = "completed"
+notes = "Tie down the minimal host<->plugin contract for Phase 29.1 (RFC 0129): WIT surface, canonical normalization rules, and golden fixtures (JSON is debug-only)."
+
+[[plan.changes.tasks]]
+id = "29.1.2"
+title = "Run WASM component (WASI-only)"
+status = "completed"
+notes = "Implement the host-side runner for WASM components with a minimal capability set (default WASI-only) plus explicit cache/state dirs as needed; no Docker assumptions."
+
+[[plan.changes.tasks]]
+id = "29.1.3"
+title = "ServicePlan IR + apply/merge"
+status = "pending"
+notes = "Introduce the minimal ServicePlan DAG IR and integrate it into the config/service graph pipeline: plugin produces a plan; host applies it to materialize services/controllers."
+
+[[plan.changes.tasks]]
+id = "29.1.4"
+title = "Example plugin + e2e verification"
+status = "pending"
+notes = "Add a small example plugin + an automated verification path (fixtures + at least one e2e test) to prove discovery → execution → plan application works."
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

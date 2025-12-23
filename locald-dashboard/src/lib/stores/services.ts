@@ -76,18 +76,28 @@ function createServicesStore() {
 
 export const services = createServicesStore();
 
-// Derived store for grouping by project
+// Derived store for grouping by project/workspace
 export const projects = derived(services, ($services) => {
 	const groups: Record<string, ServiceStatus[]> = {};
 	for (const service of $services) {
-		// Assuming format "project:service"
-		const parts = service.name.split(':');
-		const projectName = parts.length > 1 ? parts[0] : 'default';
+		let groupName: string | null = null;
 
-		if (!groups[projectName]) {
-			groups[projectName] = [];
+		if (service.workspace && service.constellation) {
+			groupName = `${service.workspace}/${service.constellation}`;
+		} else {
+			groupName = service.workspace || service.constellation;
 		}
-		groups[projectName].push(service);
+
+		if (!groupName) {
+			// Assuming format "project:service"
+			const parts = service.name.split(':');
+			groupName = parts.length > 1 ? parts[0] : 'default';
+		}
+
+		if (!groups[groupName]) {
+			groups[groupName] = [];
+		}
+		groups[groupName].push(service);
 	}
 	return Object.entries(groups).map(([name, services]) => ({
 		name,

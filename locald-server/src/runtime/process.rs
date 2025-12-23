@@ -7,10 +7,9 @@ use locald_oci::{oci_layout, runtime_spec};
 use nix::sys::signal::Signal;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::HashMap;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 type ProcessHandle = (
@@ -18,6 +17,7 @@ type ProcessHandle = (
     Box<dyn MasterPty + Send>,
     String,
     mpsc::Receiver<LogEntry>,
+    broadcast::Sender<Vec<u8>>,
 );
 
 #[derive(Clone, Debug)]
@@ -58,34 +58,58 @@ impl ProcessRuntime {
     fn spawn_log_streamer(
         reader: Box<dyn std::io::Read + Send>,
         service_name: String,
-    ) -> mpsc::Receiver<LogEntry> {
+    ) -> (mpsc::Receiver<LogEntry>, broadcast::Sender<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(100);
+        let (pty_tx, _) = broadcast::channel(100);
+        let pty_tx_clone = pty_tx.clone();
 
         std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(reader);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let timestamp = i64::try_from(timestamp).unwrap_or(i64::MAX);
+            let mut reader = reader;
+            let mut buffer = Vec::new();
+            let mut buf = [0u8; 4096];
 
-                    let entry = LogEntry {
-                        timestamp,
-                        service: service_name.clone(),
-                        stream: LogStream::Stdout,
-                        message: line,
-                    };
-                    if tx.blocking_send(entry).is_err() {
-                        break;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = buf[0..n].to_vec();
+                        let _ = pty_tx_clone.send(data.clone());
+
+                        buffer.extend_from_slice(&data);
+                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = buffer.drain(0..=pos).collect();
+                            let line_len = line_bytes.len();
+                            let line_content = if line_len > 0 && line_bytes[line_len - 1] == b'\n'
+                            {
+                                &line_bytes[..line_len - 1]
+                            } else {
+                                &line_bytes[..]
+                            };
+
+                            let line = String::from_utf8_lossy(line_content).to_string();
+
+                            let timestamp = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let timestamp = i64::try_from(timestamp).unwrap_or(i64::MAX);
+
+                            let entry = LogEntry {
+                                timestamp,
+                                service: service_name.clone(),
+                                stream: LogStream::Stdout,
+                                message: line,
+                            };
+                            if tx.blocking_send(entry).is_err() {
+                                return;
+                            }
+                        }
                     }
-                } else {
-                    break;
+                    Err(_) => break,
                 }
             }
         });
-        rx
+        (rx, pty_tx)
     }
 
     fn spawn_bundle_process(name: String, bundle_dir: &Path) -> Result<ProcessHandle> {
@@ -114,10 +138,10 @@ impl ProcessRuntime {
             .try_clone_reader()
             .context("Failed to clone PTY reader")?;
 
-        let rx = Self::spawn_log_streamer(reader, name);
+        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name);
         let master = pair.master;
 
-        Ok((child, master, container_id, rx))
+        Ok((child, master, container_id, rx, pty_tx))
     }
 
     pub fn start_host_process(
@@ -160,13 +184,13 @@ impl ProcessRuntime {
             .try_clone_reader()
             .context("Failed to clone PTY reader")?;
 
-        let rx = Self::spawn_log_streamer(reader, name);
+        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name);
         let master = pair.master;
 
         // Generate a pseudo-container ID for tracking
         let container_id = format!("host-{}", uuid::Uuid::new_v4());
 
-        Ok((child, master, container_id, rx))
+        Ok((child, master, container_id, rx, pty_tx))
     }
 
     #[allow(clippy::too_many_arguments)]
