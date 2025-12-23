@@ -2,6 +2,10 @@
 
 This document describes the core architecture of `locald`, including the daemon lifecycle, IPC, and process supervision.
 
+## Related architecture docs
+
+- [Plugins](plugins.md): WASM component plugins (detect/apply), plan validation, and CLI tooling.
+
 ## 1. Daemon + CLI Split
 
 The system is composed of two logical components (implemented today as a single `locald` binary):
