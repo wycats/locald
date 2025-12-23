@@ -53,7 +53,9 @@ workdir = "./frontend"
 
 #### `container`
 
-Runs a service using a Docker container. This is preferred over `exec` for containerized services.
+Runs a service from an OCI image (pulled from a Docker/OCI registry) using locald’s embedded runtime via `locald-shim`.
+
+This **does not require a Docker daemon**. (The older `exec` + `image` path is deprecated and uses the legacy Docker integration.) See [Integrations](/reference/integrations) for the full matrix.
 
 | Key              | Type    | Required | Description                                                                |
 | :--------------- | :------ | :------- | :------------------------------------------------------------------------- |

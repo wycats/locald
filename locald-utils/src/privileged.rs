@@ -516,6 +516,14 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         }
     }
 
+    // Optional integrations
+    //
+    // These checks must never block privileged acquisition. They exist to surface
+    // integration availability (warn vs critical) in a way that's consistent with
+    // the documented integration matrix.
+    check_docker_integration(&config, &mut problems);
+    check_kvm_integration(&config, &mut problems);
+
     let fixes = consolidate_fixes(&problems);
 
     Ok(DoctorReport {
@@ -524,6 +532,152 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
         problems,
         fixes,
     })
+}
+
+fn check_docker_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        fn is_socket(path: &Path) -> bool {
+            std::fs::metadata(path)
+                .ok()
+                .is_some_and(|m| m.file_type().is_socket())
+        }
+
+        let mut checked: Vec<String> = Vec::new();
+
+        let docker_host = std::env::var("DOCKER_HOST").ok();
+        if let Some(host) = &docker_host {
+            // If DOCKER_HOST points at a unix socket, prefer checking that specific path.
+            if let Some(rest) = host.strip_prefix("unix://") {
+                if !rest.is_empty() {
+                    let p = PathBuf::from(rest);
+                    checked.push(p.display().to_string());
+                    if is_socket(&p) {
+                        return;
+                    }
+                }
+            } else {
+                // Non-unix DOCKER_HOST (tcp/ssh). We can't reliably probe connectivity here
+                // without introducing network calls; treat as configured.
+                return;
+            }
+        }
+
+        // Common defaults.
+        let mut candidates: Vec<PathBuf> = vec![
+            PathBuf::from("/var/run/docker.sock"),
+            PathBuf::from("/run/docker.sock"),
+        ];
+
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            let xdg = PathBuf::from(xdg);
+            candidates.push(xdg.join("docker.sock"));
+            candidates.push(xdg.join("podman/podman.sock"));
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+        }
+
+        for c in candidates {
+            checked.push(c.display().to_string());
+            if is_socket(&c) {
+                return;
+            }
+        }
+
+        problems.push(Problem {
+            id: "integration.docker".to_string(),
+            severity: Severity::Warning,
+            status: Status::Fail,
+            summary: "Docker API socket not found (legacy Docker-based services will be unavailable)"
+                .to_string(),
+            details: Some(
+                "locald can run OCI containers without Docker, but legacy Docker integration requires a reachable Docker-compatible API socket."
+                    .to_string(),
+            ),
+            remediation: vec![
+                "Start Docker (or a Docker-compatible daemon)".to_string(),
+                "If needed, set DOCKER_HOST=unix:///path/to/docker.sock".to_string(),
+            ],
+            evidence: if config.verbose {
+                let mut ev = Vec::new();
+                if let Some(h) = docker_host {
+                    ev.push(EvidenceItem {
+                        key: "docker.host".to_string(),
+                        value: h,
+                    });
+                }
+                ev.push(EvidenceItem {
+                    key: "docker.checked_sockets".to_string(),
+                    value: checked.join(", "),
+                });
+                ev
+            } else {
+                vec![]
+            },
+            fix: None,
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (config, problems);
+    }
+}
+
+fn check_kvm_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>) {
+    // Keep this behind verbose to avoid adding noisy, optional platform details to the
+    // default doctor output.
+    if !config.verbose {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let kvm = Path::new("/dev/kvm");
+        match std::fs::OpenOptions::new().read(true).write(true).open(kvm) {
+            Ok(_f) => {
+                // available
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                problems.push(Problem {
+                    id: "integration.kvm".to_string(),
+                    severity: Severity::Info,
+                    status: Status::Skip,
+                    summary: "KVM is not available (/dev/kvm missing); VMM features disabled"
+                        .to_string(),
+                    details: Some(
+                        "This is expected on many machines and CI runners. locald does not require KVM unless you opt into VMM-based workflows."
+                            .to_string(),
+                    ),
+                    remediation: vec![
+                        "Enable hardware virtualization in BIOS/UEFI".to_string(),
+                        "Install/load KVM modules and ensure /dev/kvm exists".to_string(),
+                    ],
+                    evidence: vec![],
+                    fix: None,
+                });
+            }
+            Err(e) => {
+                problems.push(Problem {
+                    id: "integration.kvm".to_string(),
+                    severity: Severity::Warning,
+                    status: Status::Fail,
+                    summary: "KVM is present but not usable; VMM features may fail".to_string(),
+                    details: Some(e.to_string()),
+                    remediation: vec![
+                        "Ensure your user can access /dev/kvm (often: add to the kvm group, then log out/in)"
+                            .to_string(),
+                    ],
+                    evidence: vec![],
+                    fix: None,
+                });
+            }
+        }
+    }
 }
 
 fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
@@ -627,6 +781,7 @@ fn shim_self_check(shim_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::{Mutex, OnceLock};
 
     fn failing_problem(id: &str, severity: Severity, fix: Option<FixKey>) -> Problem {
         Problem {
@@ -638,6 +793,34 @@ mod tests {
             remediation: vec![],
             evidence: vec![],
             fix,
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[allow(unsafe_code)]
+    fn set_env<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+        // `std::env::set_var` is `unsafe` on some toolchains/editions.
+        // These tests serialize env access via `env_lock()`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn remove_env<K: AsRef<std::ffi::OsStr>>(key: K) {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn restore_env(key: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => set_env(key, v),
+            None => remove_env(key),
         }
     }
 
@@ -726,6 +909,76 @@ mod tests {
         assert_eq!(roundtrip.strategy.cgroup_root, report.strategy.cgroup_root);
         assert_eq!(roundtrip.mode, report.mode);
         assert_eq!(roundtrip.problems.len(), 1);
+    }
+
+    #[test]
+    fn docker_integration_tcp_host_is_treated_as_configured() {
+        let _guard = env_lock().lock().unwrap();
+
+        let prev = std::env::var("DOCKER_HOST").ok();
+        set_env("DOCKER_HOST", "tcp://127.0.0.1:2375");
+
+        let mut problems = Vec::new();
+        check_docker_integration(
+            &AcquireConfig {
+                verbose: true,
+                ..AcquireConfig::daemon_default()
+            },
+            &mut problems,
+        );
+        assert!(problems.is_empty());
+
+        restore_env("DOCKER_HOST", prev);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_integration_unix_socket_present_no_problem() {
+        use std::os::unix::net::UnixListener;
+
+        let _guard = env_lock().lock().unwrap();
+
+        let prev_docker_host = std::env::var("DOCKER_HOST").ok();
+        let prev_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        let tmp = std::env::temp_dir().join(format!("locald-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        // Reduce the chance of accidentally finding a real daemon socket via env paths.
+        set_env("XDG_RUNTIME_DIR", &tmp);
+        set_env("HOME", &tmp);
+
+        let sock_path = tmp.join("docker.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind unix socket");
+
+        set_env(
+            "DOCKER_HOST",
+            format!("unix://{}", sock_path.to_string_lossy()),
+        );
+
+        let mut problems = Vec::new();
+        check_docker_integration(
+            &AcquireConfig {
+                verbose: true,
+                ..AcquireConfig::daemon_default()
+            },
+            &mut problems,
+        );
+        assert!(problems.is_empty());
+
+        restore_env("DOCKER_HOST", prev_docker_host);
+        restore_env("XDG_RUNTIME_DIR", prev_runtime);
+        restore_env("HOME", prev_home);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kvm_integration_is_quiet_when_not_verbose() {
+        let mut problems = Vec::new();
+        check_kvm_integration(&AcquireConfig::daemon_default(), &mut problems);
+        assert!(problems.is_empty());
     }
 
     fn arb_fix_key() -> impl Strategy<Value = FixKey> {

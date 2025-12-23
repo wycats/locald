@@ -32,7 +32,7 @@ fi
 # Inline tests count if they appear in the diff.
 DIFF_RS="$(git diff -U0 "$BASE_SHA".."$HEAD_SHA" -- '*.rs' || true)"
 
-if echo "$DIFF_RS" | grep -Eq '^[+-].*#\[[^\]]*test[^\]]*\]'; then
+if echo "$DIFF_RS" | grep -Eq '^[+-].*#\[[^]]*test[^]]*\]'; then
   echo "[tripwire] Inline test attribute delta detected (ok)."
   exit 0
 fi

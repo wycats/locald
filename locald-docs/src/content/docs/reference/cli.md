@@ -70,6 +70,8 @@ Typical output includes:
 - Whether cgroup v2 is available and the locald cgroup root is established
 - Suggested next steps (usually `sudo locald admin setup`)
 
+`locald doctor` may also surface **integration availability** (for example, whether a legacy Docker daemon integration is reachable). For details, see [Integrations](/reference/integrations).
+
 Exit code:
 
 - `0` when critical checks pass
