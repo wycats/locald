@@ -3,6 +3,9 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 fn locald() -> Command {
     let bin = assert_cmd::cargo::cargo_bin!("locald");
@@ -63,6 +66,70 @@ fn plugin_install_project_sanitizes_name() {
         "expected {} to exist",
         installed.display()
     );
+}
+
+#[test]
+fn plugin_install_project_downloads_from_http_url() {
+    let root = tempfile::tempdir().expect("tempdir");
+
+    // Serve a single HTTP response from a local ephemeral port.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let payload = b"not-a-real-wasm-from-http".to_vec();
+    let payload_len = payload.len();
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+
+        // Read until end-of-headers. We don't need to parse the request.
+        let mut req = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {payload_len}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(headers.as_bytes()).expect("write headers");
+        stream.write_all(&payload).expect("write body");
+        stream.flush().ok();
+    });
+
+    let url = format!("http://{addr}/redis.component.wasm");
+
+    let mut cmd = locald();
+    cmd.current_dir(root.path());
+    cmd.args(["plugin", "install"])
+        .arg(&url)
+        .arg("--project");
+
+    cmd.assert().success().stdout(contains("installed"));
+
+    let installed = root
+        .path()
+        .join(".local")
+        .join("plugins")
+        .join("redis.component.wasm");
+
+    assert!(
+        installed.exists(),
+        "expected {} to exist",
+        installed.display()
+    );
+
+    let got = fs::read(&installed).expect("read installed");
+    assert_eq!(got, b"not-a-real-wasm-from-http");
+
+    handle.join().expect("server thread");
 }
 
 #[test]
