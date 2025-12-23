@@ -2736,6 +2736,7 @@ dependencies = [
  "predicates",
  "ratatui",
  "rcgen",
+ "reqwest",
  "rexpect",
  "serde",
  "serde_json",

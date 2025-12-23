@@ -41,6 +41,7 @@ mod hints;
 mod history;
 mod init;
 mod monitor;
+mod plugin;
 mod progress;
 mod run;
 mod service;

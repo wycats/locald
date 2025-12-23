@@ -154,6 +154,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: ContainerCommands,
     },
+
+    /// Manage WASM plugins
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
     /// Serve a directory via HTTP
     Serve {
         /// Path to the directory to serve (default: current directory)
@@ -172,6 +178,75 @@ pub enum Commands {
     Surface {
         #[command(subcommand)]
         command: SurfaceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PluginCommands {
+    /// Install a plugin from a local path or URL
+    Install {
+        /// Local path or URL to a WASM component
+        source: String,
+
+        /// Optional installed name (defaults to the source filename)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Install into the current project's .local/plugins directory
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Inspect a plugin by running detect/apply and printing a normalized debug JSON plan
+    Inspect {
+        /// Plugin name (resolved from plugin dirs) or a path to a WASM component
+        plugin: String,
+
+        /// Service kind to present to the plugin
+        #[arg(long)]
+        kind: String,
+
+        /// Service name to present to the plugin (defaults to kind)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Dependencies (comma-separated)
+        #[arg(long)]
+        depends_on: Option<String>,
+
+        /// Service config entries (repeatable): --config key=value
+        #[arg(long, value_name = "key=value")]
+        config: Vec<String>,
+
+        /// Grant capabilities (repeatable): --grant `oci_pull`
+        #[arg(long)]
+        grant: Vec<String>,
+    },
+
+    /// Validate the plan produced by a plugin (non-zero on errors)
+    Validate {
+        /// Plugin name (resolved from plugin dirs) or a path to a WASM component
+        plugin: String,
+
+        /// Service kind to present to the plugin
+        #[arg(long)]
+        kind: String,
+
+        /// Service name to present to the plugin (defaults to kind)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Dependencies (comma-separated)
+        #[arg(long)]
+        depends_on: Option<String>,
+
+        /// Service config entries (repeatable): --config key=value
+        #[arg(long, value_name = "key=value")]
+        config: Vec<String>,
+
+        /// Grant capabilities (repeatable): --grant `oci_pull`
+        #[arg(long)]
+        grant: Vec<String>,
     },
 }
 

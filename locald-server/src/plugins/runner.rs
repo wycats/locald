@@ -17,8 +17,8 @@ mod bindings {
 pub use bindings::locald::plugins::types::{Diagnostics, Plan, Step};
 
 pub use bindings::locald::plugins::types::{
-    AllocatePortOp, DeclareServiceOp, Expr, Op, OutputRef, Selector, Value,
-    WorkspaceContext as WitWorkspaceContext,
+    AllocatePortOp, DeclareServiceOp, Expr, OciPullOp, Op, OutputRef, RenderTemplateOp, Selector,
+    Value, WorkspaceContext as WitWorkspaceContext, WriteFileOp,
 };
 
 pub type PlanResult = std::result::Result<Plan, Diagnostics>;
@@ -117,6 +117,50 @@ impl PluginRunner {
             .locald_plugins_plugin()
             .call_apply(&mut store, &wit_ctx, &wit_caps, &wit_spec)
             .context("plugin.apply failed")?;
+
+        Ok(result)
+    }
+
+    pub fn detect(
+        &self,
+        component_path: &Path,
+        ctx: WorkspaceContext,
+        spec: ServiceSpec,
+    ) -> Result<Option<String>> {
+        let component = Component::from_file(&self.engine, component_path).with_context(|| {
+            format!(
+                "failed to load plugin component {}",
+                component_path.display()
+            )
+        })?;
+
+        let mut linker = Linker::new(&self.engine);
+
+        let (wasi, table) = wasi_context();
+        let mut store = Store::new(&self.engine, HostState { wasi, table });
+        store.set_fuel(10_000_000)?;
+
+        add_to_linker_sync(&mut linker)?;
+
+        let plugin = bindings::LocaldPlugin::instantiate(&mut store, &component, &linker)
+            .context("failed to instantiate locald-plugin component")?;
+
+        let wit_ctx = bindings::locald::plugins::types::WorkspaceContext {
+            workspace_id: ctx.workspace_id,
+            root: ctx.root,
+        };
+
+        let wit_spec = bindings::locald::plugins::types::ServiceSpec {
+            name: spec.name,
+            kind: spec.kind,
+            depends_on: spec.depends_on,
+            config: spec.config,
+        };
+
+        let result = plugin
+            .locald_plugins_plugin()
+            .call_detect(&mut store, &wit_ctx, &wit_spec)
+            .context("plugin.detect failed")?;
 
         Ok(result)
     }
