@@ -1,5 +1,5 @@
 use anyhow::Result;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 pub fn run(sh: &Shell) -> Result<()> {
     if cmd!(sh, "cargo llvm-cov --version").quiet().run().is_err() {

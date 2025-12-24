@@ -1,5 +1,5 @@
 use anyhow::Result;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 pub fn run(sh: &Shell) -> Result<()> {
     println!("🔧 Running Universal Fix...");

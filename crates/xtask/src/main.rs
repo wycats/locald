@@ -5,19 +5,19 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use xshell::Shell;
 
-mod docs;
 mod assets;
-mod e2e;
 mod check;
-mod verify;
 mod ci;
-mod sandbox;
-mod dev;
 mod coverage;
+mod deps;
+mod dev;
+mod docs;
+mod e2e;
 mod fast;
 mod fix;
-mod deps;
+mod sandbox;
 mod util;
+mod verify;
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -214,5 +214,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-
-

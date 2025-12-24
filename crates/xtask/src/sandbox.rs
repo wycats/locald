@@ -1,5 +1,5 @@
 use anyhow::Result;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 pub fn run(sh: &Shell, sandbox: String, args: Vec<String>) -> Result<()> {
     println!("📦 Building locald...");

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 pub fn build(sh: &Shell, args: Vec<String>) -> Result<()> {
     setup_env(sh)?;

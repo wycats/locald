@@ -1,5 +1,5 @@
 use anyhow::Result;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 pub fn server(sh: &Shell) -> Result<()> {
     println!("📦 Building locald...");

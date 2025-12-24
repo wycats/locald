@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sysinfo::Pid;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 use crate::{check, docs, util};
 
@@ -430,7 +430,9 @@ pub fn exec(sh: &Shell) -> Result<()> {
             println!("SUCCESS: Logs received from ExecController");
             Ok(())
         } else {
-            Err(anyhow::anyhow!("FAILURE: Logs NOT received from ExecController"))
+            Err(anyhow::anyhow!(
+                "FAILURE: Logs NOT received from ExecController"
+            ))
         }
     })();
 

@@ -198,8 +198,7 @@ fn verify_docs_cli(sh: &Shell) -> Result<()> {
         return Ok(());
     }
 
-    let manifest: Manifest =
-        serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+    let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
     let root = manifest.root;
 
     // Build global index
@@ -509,4 +508,46 @@ fn strip_comment(line: &str) -> String {
         }
     }
     line.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shlex_handles_quotes_and_escapes() {
+        assert_eq!(
+            shlex("locald run web echo 'hello world'"),
+            vec![
+                "locald".to_string(),
+                "run".to_string(),
+                "web".to_string(),
+                "echo".to_string(),
+                "hello world".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            shlex("echo \\\"hi\\\""),
+            vec!["echo".to_string(), "\"hi\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn strip_comment_ignores_hash_inside_quotes() {
+        assert_eq!(
+            strip_comment("echo '#not-a-comment' # comment"),
+            "echo '#not-a-comment'"
+        );
+        assert_eq!(
+            strip_comment("echo \"#not-a-comment\" # comment"),
+            "echo \"#not-a-comment\""
+        );
+    }
+
+    #[test]
+    fn strip_prompt_removes_dollar_prefix() {
+        assert_eq!(strip_prompt("$ locald ping"), "locald ping");
+        assert_eq!(strip_prompt("locald ping"), "locald ping");
+    }
 }

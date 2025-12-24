@@ -1,5 +1,5 @@
 use anyhow::Result;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 pub fn update(sh: &Shell) -> Result<()> {
     println!("Updating deps...");

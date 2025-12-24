@@ -30,13 +30,11 @@ where
     system
         .processes()
         .iter()
-        .filter_map(|(pid, proc)| {
-            if predicate(proc) {
-                Some(*pid)
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(pid, proc)| {
+                if predicate(proc) { Some(*pid) } else { None }
+            },
+        )
         .collect()
 }
 
