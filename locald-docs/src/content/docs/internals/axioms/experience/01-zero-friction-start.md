@@ -2,6 +2,7 @@
 title: "Axiom 1: Decentralized Configuration (In-Repo)"
 ---
 
+
 **The source of truth for a project's configuration lives in the project's repository (e.g., `locald.toml`), not in a central registry.**
 
 ## Rationale
@@ -28,3 +29,4 @@ To truly achieve "Zero Friction", configuration must be optional where reasonabl
 - **Command**: Defaults to `Procfile` entry or Buildpack metadata.
 
 This allows a user to simply run `locald up` in a fresh repo and get a working environment with valid URLs (`http://my-repo.localhost`) without creating a config file.
+

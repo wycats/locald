@@ -2,6 +2,7 @@
 title: "Axiom 12: The Source of Truth"
 ---
 
+
 **"We discover, we don't invent."**
 
 `locald` is a guest in the user's workspace. We derive our configuration and behavior from the existing artifacts in the project. We respect the decisions made by the user and the tools they use.
@@ -38,3 +39,4 @@ We strictly distinguish between **Configuration** (what the user wants) and **St
 - **Configuration**: Lives in the repository (Git). Immutable during a run.
 - **State**: Lives in `.locald/` or memory. Ephemeral.
 - **No Bleed**: We never store configuration in state files. We never rely on state to determine the desired configuration.
+

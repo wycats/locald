@@ -2,6 +2,7 @@
 title: "User Personas"
 ---
 
+
 To ensure `locald` serves its users effectively, we design features and documentation with specific personas in mind. These personas represent the primary archetypes of our user base.
 
 ## 1. The App Builder ("Regular Joe")
@@ -80,3 +81,4 @@ To ensure `locald` serves its users effectively, we design features and document
   - RFCs detailing implementation strategies.
   - References to external specs.
   - Compliance testing plans.
+

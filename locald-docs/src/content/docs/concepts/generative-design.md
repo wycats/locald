@@ -2,6 +2,7 @@
 title: "Generative Design & The Agent Lexicon"
 ---
 
+
 This document defines the meta-framework we use to build `locald`. It is not just about *what* we build, but *how* we think about the system to ensure it remains coherent, navigable, and scalable for both humans and AI agents.
 
 ## 1. The Core Philosophy: Generative vs. Descriptive
@@ -73,3 +74,4 @@ When evaluating a design or documentation:
 3.  **Canon**: Is it written down?
 4.  **Rooted**: Can I find it from the root?
 5.  **Distilled**: Is it concise?
+

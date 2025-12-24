@@ -2,6 +2,7 @@
 title: "Axiom 14: Precise Abstractions"
 ---
 
+
 ## The Principle
 
 We leverage the Rust ecosystem to avoid reinventing the wheel, but we **never compromise our architecture to fit a mismatched abstraction**.
@@ -25,3 +26,4 @@ We need to create a cgroup hierarchy.
 
 - **Option A (Mismatched)**: Use a high-level `systemd-manager` crate. It might force us to create full `.service` files for every process, introducing DBus latency and "package manager" complexity.
 - **Option B (Precise)**: Use the "Anchor" strategy. We use the standard file system APIs (mkdir) inside a delegated subtree. We only touch systemd _once_ (via a raw config file write) to establish the delegation. This uses the _primitive_ (Delegation) without the _abstraction_ (Unit Management).
+

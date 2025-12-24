@@ -14,7 +14,7 @@ History of completed phases and key changes.
 
 - **Runtime**: Removed remaining `runc` execution paths; container execution now goes through `locald-shim bundle run --bundle <PATH> --id <ID>`.
 - **Docs/Coherence**: Updated manual + crate READMEs to prefer `bundle run` and to label the legacy `locald-shim bundle <bundle-path>` form as back-compat.
-- **Verification**: `scripts/agent/verify-phase.sh` passes (build, clippy, dashboard check, IPC verification).
+- **Verification**: `cargo xtask verify phase` passes (build, clippy, dashboard check, IPC verification).
 - **Lint Hygiene (transition work)**: Fixed clippy failures surfaced by verification (doc hygiene/logging, blocking vs async process spawning in examples, removed unnecessary `async` wrappers).
 
 ## Phase 99e: Luminosity & State (2025-12-13)
@@ -26,7 +26,7 @@ History of completed phases and key changes.
 - **Dashboard**: Improved contrast, active toolbar state, and hover affordances.
 - **VMM (Bonus)**: Cleaned up `locald-vmm` VirtIO/MMIO/boot code to satisfy strict `clippy -D warnings` (docs, readable literals, `must_use`, and safer error propagation).
 - **Roadmap (Bonus)**: Added Phase 102 and created RFC 0102 to capture the VMM reactor + networking direction.
-- **Verification**: `scripts/agent/verify-phase.sh` passes.
+- **Verification**: `cargo xtask verify phase` passes.
 
 ## Phase 99: Demo Setup & Polish (2025-12-12)
 

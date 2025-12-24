@@ -8,7 +8,7 @@
     "start": "pnpm sync-axioms && pnpm sync-manifesto && astro dev",
     "build": "pnpm sync-axioms && pnpm sync-manifesto && astro build",
     "sync-axioms": "node ./scripts/sync-axioms.mjs",
-    "sync-manifesto": "./scripts/sync-manifesto.sh",
+    "sync-manifesto": "node ./scripts/sync-manifesto.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },

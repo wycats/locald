@@ -31,9 +31,9 @@ cargo test
 
 ## Project Structure
 
-- `locald-cli/`: The main binary (contains both CLI and Server).
-- `locald-server/`: The daemon library/module (internal).
-- `locald-core/`: Shared library (types, config, IPC).
+- `crates/locald-cli/`: The main binary (contains both CLI and Server).
+- `crates/locald-server/`: The daemon library/module (internal).
+- `crates/locald-core/`: Shared library (types, config, IPC).
 - `locald-docs/`: This documentation site (Astro Starlight).
 - `examples/`: Example projects for testing.
 
@@ -61,4 +61,4 @@ In this repository, the built docs site is embedded into the `locald` binary (be
 If you change documentation as part of a feature, verify both:
 
 - `pnpm -C locald-docs build`
-- `./scripts/agent/check-docs.sh`
+- `cargo xtask verify docs`

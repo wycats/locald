@@ -2,6 +2,7 @@
 title: "Axiom 4: Process Ownership"
 ---
 
+
 **`locald` owns the child processes. It is a process manager, not just a proxy.**
 
 ## Rationale
@@ -19,3 +20,4 @@ To provide a "Heroku-like" or "Vercel-like" local experience, we need control ov
   5.  **Parallelism**: During daemon shutdown or updates, all services are signaled in parallel to minimize wait time.
 - **Environment Injection**: `locald` is responsible for constructing the environment for the child process (injecting `PORT`, `DATABASE_URL`, etc.).
 - **Zombie Reaping**: As a parent process, `locald` must properly wait on and reap child processes to avoid zombies.
+

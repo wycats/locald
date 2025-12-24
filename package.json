@@ -3,8 +3,17 @@
   "private": true,
   "packageManager": "pnpm@10.25.0",
   "scripts": {
-    "build:assets": "./scripts/build-assets.sh",
-    "test:e2e": "./scripts/test-dashboard-e2e.sh"
+    "build:assets": "cargo xtask assets build",
+    "test:e2e": "cargo xtask e2e dashboard",
+    "dashboard:dev": "pnpm --filter locald-dashboard dev",
+    "dashboard:build": "pnpm --filter locald-dashboard build",
+    "dashboard:test": "pnpm --filter locald-dashboard test",
+    "dashboard:check": "pnpm --filter locald-dashboard check",
+    "dashboard:lint": "pnpm --filter locald-dashboard lint",
+    "docs:dev": "pnpm --filter locald-docs dev",
+    "docs:build": "pnpm --filter locald-docs build",
+    "dashboard-e2e:test": "pnpm --filter locald-dashboard-e2e test",
+    "dashboard-e2e:ui": "pnpm --filter locald-dashboard-e2e test:ui"
   },
   "devDependencies": {
     "lefthook": "^1.0.0"

@@ -2,6 +2,7 @@
 title: "Workflow Axioms"
 ---
 
+
 These principles guide _how_ we build `locald`, ensuring a high-velocity, high-quality development process.
 
 ## 1. Shift-Left Validation (Local First)
@@ -40,3 +41,4 @@ The development environment must be robust, self-correcting, and honest.
 - **The "Universal Fix"**: If CI complains, `scripts/fix` must silence it. This script is the single entry point for all automated remediation (Rust `clippy`, Prettier, ESLint). A developer should never need to memorize which tool fixes which file type.
 - **Single Source of Truth**: Build configurations (e.g., `lefthook.yml`) must not duplicate logic defined in scripts. If a script determines where files go, the CI config must derive from that reality, not hardcode a fragile copy.
 - **Full-Stack Rigor**: We do not lower standards for non-Rust code. The dashboard and scripts are mission-critical engineering artifacts. They require strict typing, comprehensive linting, and zero warnings. "It's just a frontend" is not an excuse for `any`.
+

@@ -2,6 +2,7 @@
 title: "Axiom 11: The Platform is Self-Hosting"
 ---
 
+
 **`locald` is not just a process runner; it is a platform that provides its own operational interfaces as built-in services.**
 
 ## The Concept
@@ -43,3 +44,4 @@ To support the development of `locald` _using_ `locald`, these built-in services
 ### 4. Fallback Safety
 
 If the overriding service stops or crashes, the platform should gracefully fall back to the built-in version (or at least not crash the daemon). The "Meta-Service" layer must be robust.
+

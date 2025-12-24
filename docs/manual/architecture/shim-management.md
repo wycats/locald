@@ -39,7 +39,7 @@ To simplify installation and updates, the `locald-shim` binary is **embedded** d
 
 ### How it Works
 
-1.  **Build Time**: `locald-cli/build.rs` compiles `locald-shim` in release mode and passes its path to the compiler. The `locald` binary includes these bytes via `include_bytes!`.
+1.  **Build Time**: `crates/locald-cli/build.rs` compiles `crates/locald-shim` in release mode and passes its path to the compiler. The `locald` binary includes these bytes via `include_bytes!`.
 2.  **Installation**: When a user runs `sudo locald admin setup`:
     - It extracts the embedded shim binary to the same directory as the `locald` executable (e.g., `~/.cargo/bin/locald-shim`).
     - It sets the necessary permissions (`chown root:root`, `chmod 4755`).

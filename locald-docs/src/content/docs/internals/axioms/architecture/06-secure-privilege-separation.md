@@ -2,6 +2,7 @@
 title: "Axiom 8: Secure Privilege Separation"
 ---
 
+
 `locald` often requires privileged operations (binding ports < 1024, inspecting other users' processes), but running the entire daemon as root is a security risk.
 
 ## Principles
@@ -16,3 +17,4 @@ title: "Axiom 8: Secure Privilege Separation"
     - This prevents infinite recursion loops where the shim calls `locald`, which then tries to call the shim again.
 5.  **Transparent Escalation**: The CLI should detect when privileges are needed and automatically re-execute via the shim, providing a seamless user experience without requiring manual `sudo` invocation for every command.
 6.  **Strict Discovery**: The shim must be located relative to the `locald` executable (sibling). Environment variable overrides (like `LOCALD_SHIM_PATH`) are strictly forbidden to prevent configuration drift and security bypasses. The only way to "fix" a shim issue is to run `admin setup` (which `locald` may attempt automatically in interactive sessions).
+

@@ -2,6 +2,7 @@
 title: "Axiom: The Dashboard is a Living Workspace"
 ---
 
+
 **The Dashboard is not a passive report; it is an active, living workspace where development happens.**
 
 It transcends the traditional "admin panel" or "log viewer" to become a primary tool for understanding and manipulating the development environment. It respects the user's attention, reflects their mental model, and exposes the reality of the system without magic.
@@ -40,3 +41,4 @@ The daemon thinks in PIDs, sockets, and file descriptors. The user thinks in Pro
 - **URLs over Ports**: Users want to open `http://localhost:3000`, not know that PID 12345 is listening on 0.0.0.0:3000.
 - **Relationships over Lists**: Show how services connect. If Service A depends on Service B, visualize that link.
 - **Human-Readable Status**: "Waiting for Database" is better than "Exit Code 1".
+

@@ -6,8 +6,8 @@ This is currently exposed as tooling via the CLI and is implemented in the daemo
 
 ## Where it lives
 
-- **Host runtime / IR / validation**: `locald-server/src/plugins/`
-- **CLI commands**: `locald-cli/src/plugin.rs` and `locald-cli/src/cli.rs`
+- **Host runtime / IR / validation**: `crates/locald-server/src/plugins/`
+- **CLI commands**: `crates/locald-cli/src/plugin.rs` and `crates/locald-cli/src/cli.rs`
 
 ## Plugin lifecycle
 

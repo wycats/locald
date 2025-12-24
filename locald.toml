@@ -9,7 +9,7 @@ type = "site"
 path = "docs"
 
 [services.docs-dev]
-command = "./scripts/sync-manifesto.sh && pnpm astro dev --port $PORT"
+command = "node ./scripts/sync-manifesto.mjs && pnpm astro dev --port $PORT"
 workdir = "locald-docs"
 
 [services.dashboard]

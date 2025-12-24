@@ -49,8 +49,8 @@ if [ -z "$REAL_PID" ]; then
 fi
 
 # Force a rebuild with a new timestamp
-echo "Touching locald-core/src/lib.rs to force version bump..."
-touch locald-core/src/lib.rs
+echo "Touching crates/locald-core/src/lib.rs to force version bump..."
+touch crates/locald-core/src/lib.rs
 sleep 1 # Ensure timestamp difference
 
 echo "Building locald (v2)..."

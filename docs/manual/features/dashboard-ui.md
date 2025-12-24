@@ -7,8 +7,8 @@ The `locald` dashboard provides a web-based interface for monitoring and control
 - The dashboard is served at `http://locald.localhost/`.
 - The docs are served at `http://docs.localhost/`.
 - By default, `locald` embeds prebuilt dashboard + docs assets into the binary (Cargo feature: `ui`).
-- The embed pipeline is enforced at build time: if assets are missing or stale, `locald-server/build.rs` runs `pnpm build` for `locald-dashboard` and `locald-docs` and fails loudly if it cannot produce the assets.
-- Assets are embedded from Cargo’s build output directory (`OUT_DIR`); they are not committed under `locald-server/src/assets`.
+- The embed pipeline is enforced at build time: if assets are missing or stale, `crates/locald-server/build.rs` runs `pnpm build` for `locald-dashboard` and `locald-docs` and fails loudly if it cannot produce the assets.
+- Assets are embedded from Cargo’s build output directory (`OUT_DIR`); they are not committed under `crates/locald-server/src/assets`.
 - To build a headless binary (no embedded UI, no Node/pnpm requirement), build with `--no-default-features`. UI routes return a clear "compiled without UI" response.
 
 ## The Rack (Sidebar)

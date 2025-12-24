@@ -18,16 +18,16 @@ pre-commit:
       run: pnpm check
     build-assets:
       glob: "locald-dashboard/**/*.{js,ts,svelte,html,css,json}"
-      run: ./scripts/build-assets.sh && git add locald-server/src/assets
+      run: cargo xtask assets build && git add crates/locald-server/src/assets
     sync-manifesto:
       glob: "docs/design/**/*.md"
-      run: ./locald-docs/scripts/sync-manifesto.sh && git add locald-docs/src/content/docs/concepts locald-docs/src/content/docs/internals
+      run: node ./locald-docs/scripts/sync-manifesto.mjs && git add locald-docs/src/content/docs/concepts locald-docs/src/content/docs/internals
 
 pre-push:
   parallel: true
   commands:
     rust-checks:
-      run: ./scripts/ci-rust-checks-local.sh
+      run: cargo xtask check
     docs-build:
       root: locald-docs
       run: CI=true pnpm install && pnpm build

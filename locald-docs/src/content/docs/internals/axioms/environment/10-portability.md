@@ -2,6 +2,7 @@
 title: "Axiom 7: Cross-Platform Portability"
 ---
 
+
 `locald` is designed to be a universal tool for developers, regardless of their operating system.
 
 ## Principles
@@ -21,3 +22,4 @@ title: "Axiom 7: Cross-Platform Portability"
   - probe and report the missing capability precisely,
   - fail with an actionable remediation (“enable X and reboot”), and
   - degrade gracefully without breaking unrelated workflows.
+

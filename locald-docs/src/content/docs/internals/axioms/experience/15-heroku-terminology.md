@@ -2,6 +2,7 @@
 title: "Axiom 15: Heroku Terminology (When It Fits)"
 ---
 
+
 **When an established Heroku term precisely answers a front-door question, we adopt it rather than inventing new vocabulary.**
 
 ## Rationale
@@ -19,3 +20,4 @@ Using an existing term is not “copying Heroku”; it is naming discipline:
 - Prefer **one canonical spelling** for front-door verbs/nouns.
 - When a Heroku term conflicts with current implementation, treat that as a product decision (rename vs keep) rather than letting drift persist.
 - Example: `run` (one-off “admin actions”) vs `exec` (attach for debugging) should stay distinct.
+

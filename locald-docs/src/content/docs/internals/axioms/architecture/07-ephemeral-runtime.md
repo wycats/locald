@@ -2,6 +2,7 @@
 title: "Axiom 7: Ephemeral Runtime, Persistent Context"
 ---
 
+
 ## The Principle
 
 **The runtime state of a service is ephemeral, but the context surrounding it is persistent.**
@@ -19,3 +20,4 @@ title: "Axiom 7: Ephemeral Runtime, Persistent Context"
 - **Log Retention**: Logs are stored on disk and are accessible even when the service is down.
 - **Status History**: The dashboard displays not just the current state, but recent exit codes and restart counts.
 - **Configuration Stability**: Changes to configuration are applied gracefully, preserving the identity of the service even as its definition evolves.
+

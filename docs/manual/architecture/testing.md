@@ -38,7 +38,7 @@ Guidelines:
 ### 2. End-to-End (E2E) Tests (`locald-e2e`)
 
 - **Scope**: The full `locald` binary and CLI.
-- **Location**: `locald-e2e/` crate.
+- **Location**: `e2e/rust/locald-e2e/` crate.
 - **Dependencies**: Real binary, Real OS (Sandboxed).
 - **Goal**: Verify the binary boots, binds ports, handles commands, and manages processes correctly in a real environment.
 - **Sandboxing**: Uses `--sandbox <NAME>` to isolate the test environment (filesystem, sockets) from the user's actual configuration.
@@ -46,7 +46,7 @@ Guidelines:
 ### 3. Dashboard E2E Tests (`locald-dashboard-e2e`)
 
 - **Scope**: The Web Dashboard (Frontend) + Real Backend.
-- **Location**: `locald-dashboard-e2e/` (Playwright).
+- **Location**: `e2e/node/locald-dashboard-e2e/` (Playwright).
 - **Goal**: Verify the "Glass Box" nature of the dashboard—that the UI accurately reflects and controls the backend state.
 
 #### The "Glass Box" Strategy (RFC 0083)
