@@ -7064,9 +7064,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "filetime",
  "regex",
  "serde",
  "serde_json",
+ "sysinfo",
  "walkdir",
  "xshell",
 ]
