@@ -35,7 +35,11 @@ pub fn watch(
 
     println!("Watching run ID: {}", run_id);
     let interval = interval.to_string();
-    cmd!(sh, "gh run watch {run_id} --interval {interval}").run()?;
+    cmd!(
+        sh,
+        "gh run watch {run_id} --interval {interval} --fail-fast"
+    )
+    .run()?;
     Ok(())
 }
 
@@ -100,7 +104,9 @@ pub fn tripwire(sh: &Shell, base: String) -> Result<()> {
     }
 
     // Check for inline tests in diff
-    let diff_rs = cmd!(sh, "git diff -U0 {base_sha}..{head_sha} -- *.rs").read()?;
+    // NOTE: `-- *.rs` only matches files at the repo root. Use a glob pathspec to include
+    // Rust files anywhere in the repo.
+    let diff_rs = cmd!(sh, "git diff -U0 {base_sha}..{head_sha} -- :(glob)**/*.rs").read()?;
 
     let has_inline_tests = diff_rs.lines().any(|line| {
         if !line.starts_with('+') && !line.starts_with('-') {
