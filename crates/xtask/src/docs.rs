@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::OnceLock;
 use xshell::Shell;
 
 // --- Documentation Verification ---
@@ -41,7 +42,7 @@ pub fn verify_docs(sh: &Shell) -> Result<()> {
         for entry in std::fs::read_dir(rfc_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "md") {
+            if path.extension().is_some_and(|ext| ext == "md") {
                 let content = std::fs::read_to_string(&path)?;
                 if content.lines().any(|l| l.starts_with("stage: 2")) {
                     active_rfcs += 1;
@@ -279,6 +280,10 @@ fn extract_locald_invocations(content: &str) -> Vec<Invocation> {
     let mut in_fence = false;
     let mut fence_lang = String::new();
 
+    static ENV_ASSIGNMENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let env_assignment_re = ENV_ASSIGNMENT_RE
+        .get_or_init(|| regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
+
     for (i, line) in content.lines().enumerate() {
         let line_trim = line.trim();
         if line_trim.starts_with("```") {
@@ -315,10 +320,7 @@ fn extract_locald_invocations(content: &str) -> Vec<Invocation> {
 
         // Skip env vars
         while !tokens.is_empty() && tokens[0].contains('=') && !tokens[0].starts_with('-') {
-            if regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=")
-                .unwrap()
-                .is_match(&tokens[0])
-            {
+            if env_assignment_re.is_match(&tokens[0]) {
                 tokens.remove(0);
             } else {
                 break;

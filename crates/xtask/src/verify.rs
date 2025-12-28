@@ -201,9 +201,7 @@ pub fn update(sh: &Shell) -> Result<()> {
         ));
     } else {
         println!(
-            "Success: Server PID changed ({} -> {}). Auto-restart worked.",
-            format!("{:?}", real_pid),
-            format!("{:?}", new_pid)
+            "Success: Server PID changed ({real_pid:?} -> {new_pid:?}). Auto-restart worked."
         );
     }
 
