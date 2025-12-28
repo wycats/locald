@@ -37,7 +37,7 @@ pub fn watch(
     let interval = interval.to_string();
     cmd!(
         sh,
-        "gh run watch {run_id} --interval {interval} --fail-fast"
+        "gh run watch {run_id} --interval {interval} --exit-status"
     )
     .run()?;
     Ok(())
