@@ -1,6 +1,7 @@
 ---
 title: "Modes of Collaboration"
 ---
+
 <!-- agent-template start -->
 
 
@@ -114,3 +115,4 @@ Instead of rigid "personas", we operate in different **Modes** depending on the 
 - **Persona Alignment**: Is this feature for the "App Builder" or the "System Tweaker"? Don't mix them.
 **Key Documents**: `docs/design/personas.md`, `docs/design/axioms/experience/`.
 <!-- agent-template end -->
+

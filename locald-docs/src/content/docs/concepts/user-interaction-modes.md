@@ -2,6 +2,7 @@
 title: "Interaction Modes & Personas"
 ---
 
+
 `locald` operates in several distinct modes depending on how the user interacts with it. Each mode corresponds to a specific **Persona** or mindset.
 
 ## 1. Daemon Mode (The System)
@@ -41,3 +42,4 @@ This provides a real-time view of the system.
   - **Web UI**: `http://locald.localhost`. A browser-based dashboard.
 - **Features**: Streaming logs, process status, start/stop controls.
 - **Constraint**: Both interfaces consume the same API/Event Stream from the Daemon (Axiom 5).
+

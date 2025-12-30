@@ -2,3 +2,4 @@
 locald = "run --bin locald --"
 server = "run --bin locald -- server start"
 install-locald = "install --path locald-cli --locked"
+xtask = "run --package xtask --"

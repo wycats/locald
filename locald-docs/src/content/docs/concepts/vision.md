@@ -2,6 +2,7 @@
 title: "Vision: Local Development as a Platform"
 ---
 
+
 **"Treat the local machine as a first-class platform."**
 
 `locald` bridges the gap between the **immediacy** of local coding and the **rigor** of cloud deployment. It provides a structured, robust, and interactive environment where services are not just processes, but managed citizens of a cohesive workspace.
@@ -29,3 +30,4 @@ The dashboard is not a passive monitor; it is an active **Workspace**. It persis
 ## Relationship to Axioms
 
 This vision is realized through our [Design Axioms](axioms.md), which define the specific architectural and experience constraints we accept to achieve this goal.
+

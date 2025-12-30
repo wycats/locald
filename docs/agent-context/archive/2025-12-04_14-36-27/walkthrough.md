@@ -21,7 +21,7 @@ Ensure that `locald` serves the actual SvelteKit dashboard and Starlight documen
 
 ### 3. Documentation Configuration
 
-- Updated `locald-docs/scripts/sync-manifesto.sh` to inject YAML frontmatter (title) into synced design documents, ensuring they build correctly with Starlight's content collections.
+- Updated `locald-docs/scripts/sync-manifesto.mjs` to inject YAML frontmatter (title) into synced design documents, ensuring they build correctly with Starlight's content collections.
 
 ### 4. Server Routing
 

@@ -2,6 +2,7 @@
 title: "Axiom 13: The Development Loop"
 ---
 
+
 **The Build is Isolated; The Runtime is Interactive.**
 
 To satisfy [Axiom 1: Zero-Friction Start](../experience/01-zero-friction-start.md) and [Axiom 7: Ephemeral Runtime](../architecture/07-ephemeral-runtime.md), `locald` distinguishes between the **Construction** of a service and its **Execution**.
@@ -39,3 +40,4 @@ This distinction is critical for non-Linux platforms (macOS/Lima, Windows/WSL).
 This duality creates a conflict: The **Run Phase** needs the _source_ from the Host, but the _dependencies_ (e.g., `node_modules`) from the Build (which are Linux-native).
 
 `locald` resolves this by overlaying the build artifacts onto the bind-mounted workspace. (See [RFC 0059](../../rfcs/0059-live-bind-mounts.md)).
+

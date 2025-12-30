@@ -2,6 +2,7 @@
 title: "Axiom: Respectful & Relevant Output"
 ---
 
+
 **Output is a User Interface.** It is not a debug log. It must be relevant to the user's domain, respectful of their attention, and persistent enough to be useful after the fact.
 
 ## 1. The Filter: Relevance is Relative
@@ -49,3 +50,4 @@ When an unexpected failure occurs that cannot be mapped to a domain-specific err
 ### The Fallback
 
 If—and only if—writing to the crash log fails (e.g., disk full, permission denied), the system must fallback to dumping the raw information to `stderr`. This is the "Nuclear Option" and is the only acceptable time to break the "Respectful" rule, as losing the error data entirely is worse.
+

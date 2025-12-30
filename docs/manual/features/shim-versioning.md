@@ -13,7 +13,7 @@ Because `locald-shim` is owned by root (setuid), it cannot be updated by the reg
 `locald` implements a strict version handshake:
 
 1.  **Shim Self-Reporting**: The `locald-shim` binary handles a `--shim-version` flag that prints its own version (defined in its `Cargo.toml`) and exits immediately without delegating to the daemon.
-2.  **Build-Time Embedding**: The `locald` CLI embeds the expected shim version at build time (by reading `locald-shim/Cargo.toml`).
+2.  **Build-Time Embedding**: The `locald` CLI embeds the expected shim version at build time (by reading `crates/locald-shim/Cargo.toml`).
 3.  **Runtime Verification**: When `locald` starts up and prepares to use privileged features, it executes `locald-shim --shim-version` and compares the output against the expected version.
 4.  **Strict Enforcement**: If the versions do not match, `locald` aborts the operation and instructs the user to run `sudo locald admin setup` to update the shim.
 

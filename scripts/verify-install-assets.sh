@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verifies that a fresh `cargo install --path locald-cli` results in a `locald`
+# Verifies that a fresh `cargo install --path crates/locald-cli` results in a `locald`
 # binary that serves the embedded dashboard and docs.
 #
 # This check intentionally builds in a temporary git worktree with
@@ -51,7 +51,15 @@ git -C "$REPO_ROOT" worktree add --detach "$WT_DIR" HEAD >/dev/null
 # you're actually testing (including untracked files).
 if [ -n "$(git -C "$REPO_ROOT" status --porcelain=v1)" ]; then
   echo "==> Syncing local working tree into worktree"
-  tar -C "$REPO_ROOT" --exclude=.git -cf - . | tar -C "$WT_DIR" -xf -
+  tar -C "$REPO_ROOT" --exclude=.git \
+    --exclude=**/node_modules \
+    --exclude=**/target \
+    --exclude=**/dist \
+    --exclude=**/build \
+    --exclude=**/.svelte-kit \
+    --exclude=**/.turbo \
+    --exclude=**/.next \
+    -cf - . | tar -C "$WT_DIR" -xf -
 fi
 
 # Ensure we aren't accidentally reusing prebuilt assets.
@@ -59,8 +67,8 @@ rm -rf "$WT_DIR/locald-dashboard/build" "$WT_DIR/locald-docs/dist"
 
 echo "==> Installing locald into temporary prefix"
 # --force to avoid interactive prompts if it already exists.
-# Use the worktree paths so locald-server/build.rs sees ../locald-dashboard and ../locald-docs.
-cargo install --path "$WT_DIR/locald-cli" --locked --root "$INSTALL_ROOT" --force >/dev/null
+# Use the worktree paths so locald-server/build.rs can locate locald-dashboard and locald-docs.
+cargo install --path "$WT_DIR/crates/locald-cli" --locked --root "$INSTALL_ROOT" --force >/dev/null
 
 LOCALD_BIN="$INSTALL_ROOT/bin/locald"
 

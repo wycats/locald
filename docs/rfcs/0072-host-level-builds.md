@@ -20,7 +20,7 @@ Currently, `locald` supports two modes of operation:
 However, many local workflows require a "pre-flight" build step that runs on the host before the main service starts. Examples include:
 
 - Compiling assets (Webpack/Vite).
-- Syncing documentation (our own `sync-manifesto.sh`).
+- Syncing documentation (our own `sync-manifesto.mjs`).
 - Database migrations (sometimes).
 
 Users currently have to chain these in the `command` (e.g., `command = "npm run build && npm start"`), which has downsides:
@@ -36,7 +36,7 @@ You can now specify a build command directly in the `build` field:
 ```toml
 [services.docs]
 # Run this ONCE before starting the service
-build = "./scripts/sync-manifesto.sh"
+build = "node ./locald-docs/scripts/sync-manifesto.mjs"
 command = "pnpm astro dev"
 ```
 

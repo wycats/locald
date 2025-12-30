@@ -2,6 +2,7 @@
 title: "Axiom 10: Structured Service Hierarchy"
 ---
 
+
 **Services are not isolated entities; they exist within a context.**
 
 The system must understand and represent the hierarchy of **System > Constellation > Project > Service**. It should prioritize user content while keeping system utilities accessible but distinct.
@@ -13,3 +14,4 @@ The system must understand and represent the hierarchy of **System > Constellati
 - **Inheritance**: Configuration should cascade down the hierarchy (Global -> Constellation -> Project).
 - **Resource Scoping**: Resources (like databases) can be scoped to any level of the hierarchy (Project, Constellation, Global) and attached to multiple services.
 - **Navigation**: The UI must reflect this nesting to reduce cognitive load.
+

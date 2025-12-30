@@ -2,6 +2,7 @@
 title: "Design Axioms"
 ---
 
+
 These are the fundamental principles that guide the development of `locald`, realizing the [Vision](vision.md).
 
 The numeric labels used inside individual axiom documents are historical; treat the axiom titles as the canonical index.
@@ -36,3 +37,4 @@ The numeric labels used inside individual axiom documents are historical; treat 
 - [Vision](vision.md)
 - [Dashboard Ergonomics](dashboard-ergonomics.md)
 - [Advanced Proxying](advanced-proxying.md)
+

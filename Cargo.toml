@@ -1,17 +1,18 @@
 [workspace]
 members = [
-    "locald-server",
-    "locald-cli",
-    "locald-core",
-    "locald-shim",
-    "locald-builder",
-    "locald-e2e",
+    "crates/locald-server",
+    "crates/locald-cli",
+    "crates/locald-core",
+    "crates/locald-shim",
+    "crates/locald-builder",
+    "e2e/rust/locald-e2e",
     "examples/cnb-test/rust-extractor",
     "examples/oci-example",
-    "locald-utils",
-    "locald-oci",
-    "cnb-client",
-    "locald-vmm",
+    "crates/locald-utils",
+    "crates/locald-oci",
+    "crates/cnb-client",
+    "crates/locald-vmm",
+    "crates/xtask",
     "tools/fetch-kernel",
 ]
 resolver = "3"

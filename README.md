@@ -8,14 +8,14 @@ Contributing guide: see `CONTRIBUTING.md`.
 
 ## Start here
 
-- **CLI (user entrypoint):** `locald-cli/`
-- **Daemon / orchestration:** `locald-server/`
-- **Core config + types:** `locald-core/`
-- **Privileged shim (setuid root):** `locald-shim/` (security-critical)
-- **Utilities:** `locald-utils/`
+- **CLI (user entrypoint):** `crates/locald-cli/`
+- **Daemon / orchestration:** `crates/locald-server/`
+- **Core config + types:** `crates/locald-core/`
+- **Privileged shim (setuid root):** `crates/locald-shim/` (security-critical)
+- **Utilities:** `crates/locald-utils/`
 - **Dashboard (Svelte):** `locald-dashboard/`
 - **Docs site:** `locald-docs/`
-- **E2E harness:** `locald-e2e/`
+- **E2E harness:** `e2e/rust/locald-e2e/`
 
 Design/architecture references:
 

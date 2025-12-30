@@ -2,6 +2,7 @@
 title: "Axiom 3: Managed Ports & DNS"
 ---
 
+
 **The user should never have to manually manage ports or `/etc/hosts` for local development.**
 
 ## Rationale
@@ -14,3 +15,4 @@ title: "Axiom 3: Managed Ports & DNS"
 - **Reverse Proxy**: `locald` runs a reverse proxy (likely on port 80/443) that maps `domain.localhost` -> `localhost:ASSIGNED_PORT`.
 - **DNS/Hosts**: `locald` ensures that `*.localhost` (or specific domains) resolve to `127.0.0.1` by managing a delimited block in `/etc/hosts`.
 - **Privilege**: Binding to port 80/443 requires privilege. We use `setcap cap_net_bind_service=+ep` on the `locald-server` binary (applied via `locald admin setup`) to allow this without running the entire daemon as root.
+

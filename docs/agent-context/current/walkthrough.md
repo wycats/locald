@@ -54,7 +54,7 @@
 
 1. **Objective**: Run the repository verification script and fix any drift or lint failures discovered during the transition.
 2. **Output**:
-   - ✅ `scripts/agent/verify-phase.sh` passes (build, clippy, dashboard check, IPC verification).
+   - ✅ `cargo xtask verify phase` passes (build, clippy, dashboard check, IPC verification).
    - ✅ Documentation command surfaces updated to consistently prefer `locald-shim bundle run --bundle <PATH> --id <ID>` (legacy form noted only as back-compat).
    - ✅ Clippy cleanup to keep the verification pipeline green:
      - `locald-utils/src/shim.rs`: doc hygiene + logging; allowlisted the intentionally blocking `sudo` calls.

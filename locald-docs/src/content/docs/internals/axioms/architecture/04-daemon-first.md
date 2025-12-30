@@ -2,6 +2,7 @@
 title: "Axiom 2: Daemon-First Architecture"
 ---
 
+
 **The core logic runs as a background daemon (`locald-server`).**
 
 ## Rationale
@@ -19,3 +20,4 @@ Development processes (servers, databases, watchers) need to persist beyond the 
 
 - **Self-Daemonization**: The `locald-server` binary is responsible for daemonizing itself (forking, detaching, PID file management). It does not rely on the CLI or shell operators (`&`) for background execution.
 - **Idempotency**: The server checks for its own existence (via socket or PID file) on startup to prevent duplicate instances.
+
