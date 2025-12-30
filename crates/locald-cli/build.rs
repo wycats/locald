@@ -61,6 +61,16 @@ fn main() {
 
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
 
+    // Determine channel from features
+    let channel = if env::var("CARGO_FEATURE_CHANNEL_NIGHTLY").is_ok() {
+        "nightly"
+    } else if env::var("CARGO_FEATURE_CHANNEL_BETA").is_ok() {
+        "beta"
+    } else {
+        "stable"
+    };
+    println!("cargo:rustc-env=LOCALD_CHANNEL={channel}");
+
     // Generate timestamp
     let now = std::time::SystemTime::now();
     let since_the_epoch = now
@@ -68,14 +78,14 @@ fn main() {
         .expect("Time went backwards");
     let timestamp = since_the_epoch.as_secs();
 
-    // We can't easily format date without chrono in build-dependencies,
-    // so let's just use the unix timestamp for uniqueness.
-    // Or we can try to parse it.
-    // Actually, let's just use the unix timestamp. It's simple and monotonic.
-    // Format: 0.1.0-1733182200
-
-    let full_version = format!("{version}-{timestamp}");
-    // let full_version = version;
+    // Build version string with channel suffix for non-stable
+    // Format: 0.1.0 (stable), 0.1.0-beta, 0.1.0-nightly.1735567200
+    let full_version = match channel {
+        "stable" => version.clone(),
+        "beta" => format!("{version}-beta"),
+        "nightly" => format!("{version}-nightly.{timestamp}"),
+        _ => version.clone(),
+    };
 
     println!("cargo:rustc-env=LOCALD_BUILD_VERSION={full_version}");
 }

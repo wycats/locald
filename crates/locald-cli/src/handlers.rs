@@ -5,18 +5,27 @@ use std::collections::HashSet;
 
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    PluginCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
+#[cfg(feature = "experimental-plugins")]
+use crate::cli::PluginCommands;
+#[cfg(feature = "experimental-cnb")]
+use crate::build;
 use crate::{
-    build, client, container, debug, doctor, history, init, monitor, plugin, run, service, style,
+    client, debug, doctor, history, init, monitor, run, service, style,
     trust, try_cmd, utils,
 };
+#[cfg(feature = "experimental-containers")]
+use crate::container;
+#[cfg(feature = "experimental-plugins")]
+use crate::plugin;
 
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Commands::Init => {
             init::run()?;
         }
+        #[cfg(feature = "experimental-cnb")]
         Commands::Build {
             path,
             builder,
@@ -855,6 +864,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        #[cfg(feature = "experimental-containers")]
         Commands::Container { command } => match command {
             crate::cli::ContainerCommands::Run {
                 image,
@@ -867,6 +877,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         },
 
+        #[cfg(feature = "experimental-plugins")]
         Commands::Plugin { command } => match command {
             PluginCommands::Install {
                 source,

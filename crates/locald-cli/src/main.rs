@@ -29,9 +29,12 @@
 use anyhow::Result;
 use clap::Parser;
 
+#[cfg(feature = "experimental-cnb")]
 mod build;
+mod channel;
 mod cli;
 mod client;
+#[cfg(feature = "experimental-containers")]
 mod container;
 mod crash;
 mod debug;
@@ -41,6 +44,7 @@ mod hints;
 mod history;
 mod init;
 mod monitor;
+#[cfg(feature = "experimental-plugins")]
 mod plugin;
 mod progress;
 mod run;

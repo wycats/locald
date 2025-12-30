@@ -5,10 +5,38 @@ edition.workspace = true
 
 [features]
 # Default builds include the embedded dashboard + docs UI.
-default = ["ui"]
+default = ["ui", "channel-stable"]
 
 # Builds locald with embedded UI assets (delegates to locald-server).
 ui = ["locald-server/ui"]
+
+# =============================================================================
+# CHANNEL FEATURES
+# =============================================================================
+# See workspace Cargo.toml for channel documentation.
+
+# Stable channel (default)
+channel-stable = []
+
+# Beta channel: features graduating to stable
+channel-beta = ["channel-stable"]
+
+# Nightly channel: includes all experimental features
+channel-nightly = [
+    "channel-beta",
+    "experimental-plugins",
+    "experimental-vmm",
+    "experimental-cnb",
+    "experimental-containers",
+]
+
+# -----------------------------------------------------------------------------
+# Experimental feature flags
+# -----------------------------------------------------------------------------
+experimental-plugins = []    # WASM plugin system (locald plugin ...)
+experimental-vmm = []        # Virtual machine monitor
+experimental-cnb = []        # Cloud Native Buildpacks (locald build)
+experimental-containers = [] # OCI container execution (locald container ...)
 
 [[bin]]
 name = "locald"

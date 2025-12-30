@@ -1,7 +1,43 @@
 use clap::{Parser, Subcommand};
+use std::sync::LazyLock;
+
+/// The long version string, computed once at startup.
+static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}\nChannel: {}\nFeatures: {}",
+        env!("LOCALD_BUILD_VERSION"),
+        env!("LOCALD_CHANNEL"),
+        enabled_features().join(", ")
+    )
+});
+
+/// Returns a list of enabled experimental features.
+fn enabled_features() -> Vec<&'static str> {
+    let mut features = vec![];
+
+    #[cfg(feature = "experimental-plugins")]
+    features.push("plugins");
+
+    #[cfg(feature = "experimental-vmm")]
+    features.push("vmm");
+
+    #[cfg(feature = "experimental-cnb")]
+    features.push("cnb");
+
+    #[cfg(feature = "experimental-containers")]
+    features.push("containers");
+
+    if features.is_empty() {
+        features.push("none (stable)");
+    }
+
+    features
+}
 
 #[derive(Parser)]
 #[command(name = "locald")]
+#[command(version = env!("LOCALD_BUILD_VERSION"))]
+#[command(long_version = LONG_VERSION.as_str())]
 #[command(about = "Local development proxy and process manager", long_about = None)]
 pub struct Cli {
     /// Run in a sandbox environment
@@ -16,7 +52,8 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize a new locald project
     Init,
-    /// Build a project using Cloud Native Buildpacks
+    /// Build a project using Cloud Native Buildpacks (nightly only)
+    #[cfg(feature = "experimental-cnb")]
     Build {
         /// Path to the project (default: current directory)
         #[arg(default_value = ".")]
@@ -149,13 +186,15 @@ pub enum Commands {
         #[command(subcommand)]
         command: RegistryCommands,
     },
-    /// Container management commands
+    /// Container management commands (nightly only)
+    #[cfg(feature = "experimental-containers")]
     Container {
         #[command(subcommand)]
         command: ContainerCommands,
     },
 
-    /// Manage WASM plugins
+    /// Manage WASM plugins (nightly only)
+    #[cfg(feature = "experimental-plugins")]
     Plugin {
         #[command(subcommand)]
         command: PluginCommands,
@@ -181,6 +220,7 @@ pub enum Commands {
     },
 }
 
+#[cfg(feature = "experimental-plugins")]
 #[derive(Subcommand)]
 pub enum PluginCommands {
     /// Install a plugin from a local path or URL
@@ -257,6 +297,7 @@ pub enum SurfaceCommands {
     CliManifest,
 }
 
+#[cfg(feature = "experimental-containers")]
 #[derive(Subcommand)]
 pub enum ContainerCommands {
     /// Run an ephemeral container
