@@ -200,9 +200,7 @@ pub fn update(sh: &Shell) -> Result<()> {
             "Error: Server PID did not change. Auto-restart failed."
         ));
     } else {
-        println!(
-            "Success: Server PID changed ({real_pid:?} -> {new_pid:?}). Auto-restart worked."
-        );
+        println!("Success: Server PID changed ({real_pid:?} -> {new_pid:?}). Auto-restart worked.");
     }
 
     println!("Cleaning up...");

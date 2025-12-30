@@ -281,8 +281,8 @@ fn extract_locald_invocations(content: &str) -> Vec<Invocation> {
     let mut fence_lang = String::new();
 
     static ENV_ASSIGNMENT_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let env_assignment_re = ENV_ASSIGNMENT_RE
-        .get_or_init(|| regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
+    let env_assignment_re =
+        ENV_ASSIGNMENT_RE.get_or_init(|| regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
 
     for (i, line) in content.lines().enumerate() {
         let line_trim = line.trim();
