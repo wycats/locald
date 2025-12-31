@@ -25,10 +25,21 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      only_macos: ${{ steps.only-macos.outputs.only_macos }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Check for only-ci=macos keyword
+        id: only-macos
+        run: |
+          if git log -1 --format='%B' | grep -qF '[only-ci=macos]'; then
+            echo "only_macos=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Detected [only-ci=macos] keyword - running only macOS build"
+          else
+            echo "only_macos=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Classify changes
         id: filter
@@ -51,7 +62,8 @@ jobs:
 
   mainline-health:
     name: Mainline Health
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -85,7 +97,8 @@ jobs:
 
   tests-tripwire:
     name: Tripwire (Tests for Rust changes)
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +110,7 @@ jobs:
 
   web-build:
     name: Web Build (Dashboard + Docs)
-    if: ${{ github.event_name != 'schedule' }}
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
     needs: [changes]
     runs-on: ubuntu-latest
     steps:
@@ -156,7 +169,7 @@ jobs:
 
   rust-fmt:
     name: Rust Format
-    if: ${{ github.event_name != 'schedule' }}
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
     needs: [changes]
     runs-on: ubuntu-latest
     steps:
@@ -188,7 +201,7 @@ jobs:
 
   rust-clippy:
     name: Rust Clippy
-    if: ${{ github.event_name != 'schedule' }}
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
     needs: [changes]
     runs-on: ubuntu-latest
     env:
@@ -357,6 +370,8 @@ jobs:
 
   rust-tests-coverage:
     name: Rust Tests + Coverage
+    if: ${{ needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"

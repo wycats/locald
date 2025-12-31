@@ -2769,7 +2769,6 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "ca_injector",
- "caps",
  "chrono",
  "clap",
  "cliclack",
