@@ -83,7 +83,7 @@ pub fn version_string() -> String {
 
 /// Returns a short version string (just the version number with channel suffix).
 #[must_use]
-pub fn short_version() -> &'static str {
+pub const fn short_version() -> &'static str {
     BUILD_VERSION
 }
 

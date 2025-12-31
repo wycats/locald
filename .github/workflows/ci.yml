@@ -288,6 +288,69 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: cargo clippy --workspace -- -D warnings
 
+  # ==========================================================================
+  # M2.0: macOS Build Verification (Tier 1)
+  # ==========================================================================
+  # This job verifies locald compiles and runs basic smoke tests on macOS.
+  # It gates on Rust changes to optimize the 10x cost of macOS runners.
+  # See: .private/MAP_AUDIT.md Phase M2 for the full macOS testing strategy.
+  # ==========================================================================
+  macos-build:
+    name: macOS Build
+    if: ${{ github.event_name != 'schedule' }}
+    needs: [changes]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate
+        id: gate
+        run: echo "run=${{ needs.changes.outputs.rust }}" >> "$GITHUB_OUTPUT"
+
+      - name: No Rust changes
+        if: ${{ steps.gate.outputs.run != 'true' }}
+        run: echo "No Rust changes; skipping macOS build."
+
+      - name: Install Rust
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-macos-
+
+      - name: Build locald (excluding Linux-only crates)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          # Build the main CLI binary (excludes locald-shim which is Linux-only)
+          cargo build --release --bin locald
+
+      - name: Smoke test - version
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          ./target/release/locald --version
+          ./target/release/locald -V
+
+      - name: Smoke test - help
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: ./target/release/locald --help
+
+      - name: Run unit tests (macOS-compatible crates only)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          # Run tests excluding Linux-only crates
+          cargo test --lib --bin locald \
+            --exclude locald-shim \
+            --exclude locald-vmm \
+            --exclude locald-e2e
+
   rust-tests-coverage:
     name: Rust Tests + Coverage
     runs-on: ubuntu-latest
