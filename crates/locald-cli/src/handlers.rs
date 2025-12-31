@@ -435,8 +435,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Admin { command } => {
             match command {
                 AdminCommands::Setup => {
-                    const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
-
                     #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
                         use crossterm::tty::IsTty;
@@ -478,6 +476,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
                     #[cfg(target_os = "linux")]
                     {
+                        const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
                         cliclack::intro("locald admin setup")?;
 
                         let exe_path = std::env::current_exe()?;

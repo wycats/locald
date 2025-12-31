@@ -16,14 +16,19 @@ fn main() {
     println!("cargo:rerun-if-changed=../locald-builder/src");
     println!("cargo:rerun-if-changed=../locald-core/src");
 
-    // Build locald-shim on Linux
-    #[cfg(target_os = "linux")]
-    {
+    // Build locald-shim only when targeting Linux
+    // We use CARGO_CFG_TARGET_OS to check the target (not host) OS.
+    // This allows cross-compilation from non-Linux hosts.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "linux" {
         println!("cargo:rerun-if-changed=../locald-shim/src");
         println!("cargo:rerun-if-changed=../locald-shim/Cargo.toml");
 
         let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
         let shim_dir = PathBuf::from("../locald-shim");
+        let target = env::var("TARGET").expect("TARGET not set");
+        let host = env::var("HOST").expect("HOST not set");
+        let is_cross_compiling = target != host;
 
         // Extract version from locald-shim/Cargo.toml
         let shim_toml_path = shim_dir.join("Cargo.toml");
@@ -38,21 +43,33 @@ fn main() {
 
         println!("cargo:rustc-env=LOCALD_EXPECTED_SHIM_VERSION={shim_version}");
 
-        // We build the shim in release mode to keep it small
-        let status = Command::new("cargo")
-            .arg("build")
+        // Build the shim in release mode to keep it small.
+        // For cross-compilation, pass --target.
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
             .arg("--release")
             .arg("--manifest-path")
             .arg(shim_dir.join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(out_dir.join("shim-target"))
-            .status()
-            .expect("Failed to build locald-shim");
+            .arg(out_dir.join("shim-target"));
 
+        if is_cross_compiling {
+            cmd.arg("--target").arg(&target);
+        }
+
+        let status = cmd.status().expect("Failed to build locald-shim");
         assert!(status.success(), "Failed to build locald-shim");
 
-        // The binary will be in out_dir/shim-target/release/locald-shim
-        let shim_bin = out_dir.join("shim-target/release/locald-shim");
+        // The binary path differs based on whether we're cross-compiling
+        let shim_bin = if is_cross_compiling {
+            out_dir
+                .join("shim-target")
+                .join(&target)
+                .join("release")
+                .join("locald-shim")
+        } else {
+            out_dir.join("shim-target/release/locald-shim")
+        };
         println!(
             "cargo:rustc-env=LOCALD_EMBEDDED_SHIM_PATH={}",
             shim_bin.display()
