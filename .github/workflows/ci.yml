@@ -330,7 +330,9 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
           # Build the main CLI binary (excludes locald-shim which is Linux-only)
-          cargo build --release --bin locald
+          # Use --no-default-features to disable embedded UI (avoids pnpm dependency)
+          # Re-enable channel-stable for proper feature gating
+          cargo build --release --bin locald --no-default-features --features channel-stable
 
       - name: Smoke test - version
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -346,7 +348,9 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
           # Run tests excluding Linux-only crates
+          # Use --no-default-features to disable embedded UI (avoids pnpm dependency)
           cargo test --lib --bin locald \
+            --no-default-features --features channel-stable \
             --exclude locald-shim \
             --exclude locald-vmm \
             --exclude locald-e2e
