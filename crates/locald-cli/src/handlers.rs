@@ -3,22 +3,21 @@ use crossterm::style::Stylize;
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use std::collections::HashSet;
 
+#[cfg(feature = "experimental-cnb")]
+use crate::build;
+#[cfg(feature = "experimental-plugins")]
+use crate::cli::PluginCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
     RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
-};
-#[cfg(feature = "experimental-plugins")]
-use crate::cli::PluginCommands;
-#[cfg(feature = "experimental-cnb")]
-use crate::build;
-use crate::{
-    client, debug, doctor, history, init, monitor, run, service, style,
-    trust, try_cmd, utils,
 };
 #[cfg(feature = "experimental-containers")]
 use crate::container;
 #[cfg(feature = "experimental-plugins")]
 use crate::plugin;
+use crate::{
+    client, debug, doctor, history, init, monitor, run, service, style, trust, try_cmd, utils,
+};
 
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {

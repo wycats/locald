@@ -80,11 +80,16 @@ fn main() {
 
     // Build version string with channel suffix for non-stable
     // Format: 0.1.0 (stable), 0.1.0-beta, 0.1.0-nightly.1735567200
+    //
+    // Note: Due to Cargo's feature unification, building with `--features channel-nightly`
+    // will enable all three channel features (nightly depends on beta depends on stable).
+    // The if-else chain in channel detection above handles this correctly by checking
+    // nightly first, then beta, then stable.
     let full_version = match channel {
-        "stable" => version.clone(),
         "beta" => format!("{version}-beta"),
         "nightly" => format!("{version}-nightly.{timestamp}"),
-        _ => version.clone(),
+        // "stable" and any unexpected value use the base version
+        _ => version,
     };
 
     println!("cargo:rustc-env=LOCALD_BUILD_VERSION={full_version}");

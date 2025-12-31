@@ -18,7 +18,11 @@ ui = ["locald-server/ui"]
 # Stable channel (default)
 channel-stable = []
 
-# Beta channel: features graduating to stable
+# Beta channel: features graduating to stable.
+# NOTE: At present, beta intentionally mirrors channel-stable and does not
+#       enable additional experimental features. This placeholder exists so
+#       that features can be promoted from nightly to beta in future releases
+#       without changing existing stable behavior.
 channel-beta = ["channel-stable"]
 
 # Nightly channel: includes all experimental features
@@ -34,7 +38,7 @@ channel-nightly = [
 # Experimental feature flags
 # -----------------------------------------------------------------------------
 experimental-plugins = []    # WASM plugin system (locald plugin ...)
-experimental-vmm = []        # Virtual machine monitor
+experimental-vmm = []        # Placeholder for planned VMM support; no functionality yet
 experimental-cnb = []        # Cloud Native Buildpacks (locald build)
 experimental-containers = [] # OCI container execution (locald container ...)
 
