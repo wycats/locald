@@ -1,3 +1,4 @@
+use crate::channel::{BUILD_CHANNEL, BUILD_VERSION};
 use clap::{Parser, Subcommand};
 use std::sync::LazyLock;
 
@@ -5,8 +6,8 @@ use std::sync::LazyLock;
 static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{}\nChannel: {}\nFeatures: {}",
-        env!("LOCALD_BUILD_VERSION"),
-        env!("LOCALD_CHANNEL"),
+        BUILD_VERSION,
+        BUILD_CHANNEL,
         enabled_features().join(", ")
     )
 });
@@ -36,7 +37,7 @@ fn enabled_features() -> Vec<&'static str> {
 
 #[derive(Parser)]
 #[command(name = "locald")]
-#[command(version = env!("LOCALD_BUILD_VERSION"))]
+#[command(version = BUILD_VERSION)]
 #[command(long_version = LONG_VERSION.as_str())]
 #[command(about = "Local development proxy and process manager", long_about = None)]
 pub struct Cli {
