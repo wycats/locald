@@ -9,7 +9,10 @@ use std::thread;
 
 fn locald() -> Command {
     let bin = assert_cmd::cargo::cargo_bin!("locald");
-    Command::new(bin)
+    let mut cmd = Command::new(bin);
+    // Skip shim verification in tests (we're testing CLI logic, not privileged setup)
+    cmd.env("LOCALD_SKIP_SHIM_CHECK", "1");
+    cmd
 }
 
 #[test]
