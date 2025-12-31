@@ -363,6 +363,7 @@ jobs:
           # Run tests excluding Linux-only crates
           # Use --no-default-features to disable embedded UI (avoids pnpm dependency)
           cargo test --lib --bin locald \
+            --workspace \
             --no-default-features --features channel-stable \
             --exclude locald-shim \
             --exclude locald-vmm \
