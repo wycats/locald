@@ -1,0 +1,1988 @@
+{
+  "schema_version": 1,
+  "root": {
+    "name": "locald",
+    "aliases": [],
+    "hidden": false,
+    "args": [
+      {
+        "long": "help",
+        "short": "h",
+        "aliases": [],
+        "global": false,
+        "hidden": false,
+        "positional": false
+      },
+      {
+        "long": "sandbox",
+        "short": null,
+        "aliases": [],
+        "global": true,
+        "hidden": false,
+        "positional": false
+      },
+      {
+        "long": "version",
+        "short": "V",
+        "aliases": [],
+        "global": false,
+        "hidden": false,
+        "positional": false
+      }
+    ],
+    "subcommands": [
+      {
+        "name": "__surface",
+        "aliases": [],
+        "hidden": true,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "cli-manifest",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "cli-manifest",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "add",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "name",
+            "short": "n",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "port",
+            "short": "p",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "admin",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "setup",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "sync-hosts",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "setup",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "sync-hosts",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "ai",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "context",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "context",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "schema",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "schema",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "config",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "show",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "show",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "provenance",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "dashboard",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "debug",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "port",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "port",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "doctor",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "json",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "verbose",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "help",
+        "aliases": [],
+        "hidden": false,
+        "args": [],
+        "subcommands": [
+          {
+            "name": "__surface",
+            "aliases": [],
+            "hidden": true,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "cli-manifest",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "add",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "admin",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "setup",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "sync-hosts",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "ai",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "context",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "schema",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "config",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "show",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "dashboard",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "debug",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "port",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "doctor",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "init",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "logs",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "monitor",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "ping",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "registry",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "clean",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "list",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "pin",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "unpin",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "restart",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "run",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "serve",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "server",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "restart",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "shutdown",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "start",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "service",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "add",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": [
+                  {
+                    "name": "container",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "exec",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "postgres",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "site",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  }
+                ]
+              },
+              {
+                "name": "reset",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "status",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "stop",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "trust",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "try",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "up",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "init",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "logs",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "follow",
+            "short": "f",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "monitor",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "ping",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "registry",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "clean",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "clean",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "list",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "pin",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "unpin",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "list",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "pin",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "unpin",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "restart",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "run",
+        "aliases": [
+          "exec"
+        ],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "serve",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "bind",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "port",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "server",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "restart",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "shutdown",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "start",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "restart",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "shutdown",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "start",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "service",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "add",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": [
+              {
+                "name": "container",
+                "aliases": [],
+                "hidden": false,
+                "args": [
+                  {
+                    "long": "command",
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "container-port",
+                    "short": "c",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "help",
+                    "short": "h",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "name",
+                    "short": "n",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": null,
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": true
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "exec",
+                "aliases": [],
+                "hidden": false,
+                "args": [
+                  {
+                    "long": "help",
+                    "short": "h",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "name",
+                    "short": "n",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "port",
+                    "short": "p",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": null,
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": true
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": [
+                  {
+                    "name": "container",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "exec",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "help",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "postgres",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "site",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  }
+                ]
+              },
+              {
+                "name": "postgres",
+                "aliases": [],
+                "hidden": false,
+                "args": [
+                  {
+                    "long": "help",
+                    "short": "h",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "version",
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": null,
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": true
+                  }
+                ],
+                "subcommands": []
+              },
+              {
+                "name": "site",
+                "aliases": [],
+                "hidden": false,
+                "args": [
+                  {
+                    "long": "build",
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "help",
+                    "short": "h",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "name",
+                    "short": "n",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "port",
+                    "short": "p",
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": null,
+                    "short": null,
+                    "aliases": [],
+                    "global": false,
+                    "hidden": false,
+                    "positional": true
+                  }
+                ],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "add",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": [
+                  {
+                    "name": "container",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "exec",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "postgres",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "site",
+                    "aliases": [],
+                    "hidden": false,
+                    "args": [],
+                    "subcommands": []
+                  }
+                ]
+              },
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "reset",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "reset",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      },
+      {
+        "name": "status",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "stop",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "trust",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "try",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "up",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "verbose",
+            "short": "v",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      }
+    ]
+  }
+}
