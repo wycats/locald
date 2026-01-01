@@ -48,12 +48,18 @@ pub fn admin_setup_command_for_current_exe() -> String {
 }
 
 /// Check if the current platform supports privileged operations via shim.
+/// This is Linux-only since macOS doesn't use the shim for privileged ops.
+///
+/// Reserved for future use in shim-related error messages.
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub const fn platform_supports_shim() -> bool {
-    cfg!(target_os = "linux")
+    true
 }
 
 /// Get platform-appropriate advice for privileged port access.
+///
+/// Reserved for future use in port binding error messages.
 #[allow(dead_code)]
 pub const fn privileged_port_advice() -> &'static str {
     #[cfg(target_os = "macos")]

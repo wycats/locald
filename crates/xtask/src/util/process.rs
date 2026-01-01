@@ -4,8 +4,7 @@ use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
 #[derive(Clone, Copy, Debug)]
 pub enum KillStrategy {
     TermThenKill,
-    #[allow(dead_code)]
-    Kill,
+    _Kill,
 }
 
 pub fn cmd_any_contains(proc: &sysinfo::Process, needle: &str) -> bool {
@@ -52,7 +51,7 @@ pub fn kill_pids(pids: &[Pid], strategy: KillStrategy) -> Result<()> {
                 KillStrategy::TermThenKill => {
                     let _ = proc.kill_with(Signal::Term);
                 }
-                KillStrategy::Kill => {
+                KillStrategy::_Kill => {
                     let _ = proc.kill_with(Signal::Kill);
                 }
             }

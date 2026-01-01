@@ -19,7 +19,6 @@ mod boot;
 /// A KVM-based Virtual Machine implementation for Linux.
 #[derive(Debug)]
 pub struct VirtualMachine {
-    #[allow(dead_code)]
     kvm: Kvm,
     vm_fd: kvm_ioctls::VmFd,
     guest_mem: Option<GuestMemoryMmap>,
