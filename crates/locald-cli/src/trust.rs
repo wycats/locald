@@ -106,6 +106,29 @@ fn generate_ca(cert_path: &std::path::Path, key_path: &std::path::Path) -> Resul
 }
 
 fn install_ca(cert_path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        install_ca_linux(cert_path)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        install_ca_macos(cert_path)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!(
+            "Certificate trust installation is not yet supported on this platform. \
+             Please manually install {} into your system trust store.",
+            cert_path.display()
+        );
+    }
+}
+
+/// Install CA certificate on Linux using `ca_injector` or system tools.
+#[cfg(target_os = "linux")]
+fn install_ca_linux(cert_path: &std::path::Path) -> Result<()> {
     let path_str = cert_path.to_str().context("Invalid path string")?;
 
     if let Err(e) = ca_injector::install_ca(path_str) {
@@ -118,16 +141,48 @@ fn install_ca(cert_path: &std::path::Path) -> Result<()> {
 
         // Some platforms (or minimal installs) may not be recognized by ca_injector.
         // Provide a Linux fallback using common trust-store tools.
-        #[cfg(target_os = "linux")]
-        {
-            if msg.contains("cannot find binary path") {
-                return install_ca_linux_fallback(cert_path)
-                    .with_context(|| format!("ca_injector failed: {msg}"));
-            }
+        if msg.contains("cannot find binary path") {
+            return install_ca_linux_fallback(cert_path)
+                .with_context(|| format!("ca_injector failed: {msg}"));
         }
 
         return Err(e).context("Failed to install CA certificate");
     }
+    Ok(())
+}
+
+/// Install CA certificate on macOS using the security-framework crate.
+///
+/// This uses the native Keychain API to add the certificate to the System
+/// Keychain with admin trust settings, making it trusted for SSL.
+#[cfg(target_os = "macos")]
+fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
+    use security_framework::certificate::SecCertificate;
+    use security_framework::trust_settings::{Domain, TrustSettings};
+
+    // Read the PEM certificate
+    let pem_data = std::fs::read(cert_path)
+        .with_context(|| format!("Failed to read certificate from {}", cert_path.display()))?;
+
+    // Parse PEM to get DER data
+    let pem = pem::parse(&pem_data).context("Failed to parse PEM certificate")?;
+
+    // Create SecCertificate from DER data
+    let certificate = SecCertificate::from_der(pem.contents())
+        .context("Failed to create SecCertificate from DER data")?;
+
+    // Add to admin trust settings (requires root/admin privileges)
+    // Domain::Admin is the system-wide trust store
+    let trust_settings = TrustSettings::new(Domain::Admin);
+
+    // Set trust settings for SSL - this makes the cert trusted for all purposes
+    trust_settings
+        .set_trust_settings_always(&certificate)
+        .context(
+            "Failed to add certificate to Keychain. \
+             Please run `locald admin setup` to configure HTTPS trust.",
+        )?;
+
     Ok(())
 }
 

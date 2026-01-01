@@ -1,13 +1,28 @@
+// =============================================================================
+// LOCALD-SHIM: Cross-Platform Privileged Helper
+// =============================================================================
+//
+// The shim works on both Linux and macOS using the same architecture:
+// - SCM_RIGHTS for FD passing over Unix domain sockets
+// - Setuid bit for privilege elevation
+//
+// Container-related commands (bundle, cgroup) are compile-time gated to Linux.
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use listeners::get_all;
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use nix::unistd::{Gid, Uid};
 use std::env;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf as StdPathBuf;
 use std::path::{Path, PathBuf};
+
+// Linux-only imports
+#[cfg(target_os = "linux")]
+use listeners::get_all;
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{Signal, kill};
+#[cfg(target_os = "linux")]
+use nix::unistd::Pid;
 
 // Constants for prctl
 // const PR_CAP_AMBIENT: i32 = 47;
@@ -29,7 +44,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Execute an OCI bundle.
+    /// Execute an OCI bundle. (Linux only - requires libcontainer)
+    #[cfg(target_os = "linux")]
     Bundle {
         #[command(subcommand)]
         command: BundleCommand,
@@ -51,12 +67,14 @@ enum Commands {
     },
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Subcommand)]
 enum BundleCommand {
     /// Run a bundle as the container init process.
     Run(BundleRunArgs),
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Args)]
 struct BundleRunArgs {
     /// Path to OCI bundle directory.
@@ -85,7 +103,8 @@ enum AdminCommand {
     /// Recursively remove a locald-managed directory.
     Cleanup(AdminCleanupArgs),
 
-    /// Cgroup v2 operations.
+    /// Cgroup v2 operations. (Linux only)
+    #[cfg(target_os = "linux")]
     Cgroup {
         #[command(subcommand)]
         command: AdminCgroupCommand,
@@ -99,6 +118,8 @@ enum AdminCommand {
 }
 
 fn invoking_user_home_dir() -> Result<StdPathBuf> {
+    // On both Linux and macOS, we use the real UID (not effective) to find the
+    // invoking user's home directory, since the shim runs as setuid root.
     let uid = nix::unistd::getuid();
     let user = nix::unistd::User::from_uid(uid)
         .context("failed to look up invoking user")?
@@ -168,6 +189,24 @@ fn admin_trust() -> Result<i32> {
     let certs_dir = certs_dir_for_user_home(&home);
     let ca_cert_path = ensure_root_ca(&certs_dir)?;
 
+    // Platform-specific trust store installation
+    #[cfg(target_os = "linux")]
+    {
+        install_ca_linux(&ca_cert_path)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        install_ca_macos(&ca_cert_path)?;
+    }
+
+    println!("Installed locald Root CA from {}", ca_cert_path.display());
+    Ok(0)
+}
+
+/// Install CA certificate on Linux using ca_injector with fallback.
+#[cfg(target_os = "linux")]
+fn install_ca_linux(ca_cert_path: &Path) -> Result<()> {
     let ca_str = ca_cert_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("invalid CA path"))?;
@@ -176,24 +215,106 @@ fn admin_trust() -> Result<i32> {
         let msg = e.to_string();
 
         // Fallback to common Linux trust-store tools.
-        // In practice, ca_injector can fail with generic messages on some distros.
-        #[cfg(target_os = "linux")]
-        {
-            if let Err(fallback_err) = install_ca_linux_fallback(&ca_cert_path) {
-                return Err(fallback_err)
-                    .context("failed to install CA into system trust store")
-                    .with_context(|| format!("ca_injector error: {msg}"));
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            return Err(e).context("failed to install CA into system trust store");
+        if let Err(fallback_err) = install_ca_linux_fallback(ca_cert_path) {
+            return Err(fallback_err)
+                .context("failed to install CA into system trust store")
+                .with_context(|| format!("ca_injector error: {msg}"));
         }
     }
 
-    println!("Installed locald Root CA from {}", ca_cert_path.display());
-    Ok(0)
+    Ok(())
+}
+
+/// Install CA certificate on macOS using the security-framework crate.
+///
+/// This uses the native Keychain API to add the certificate to the System
+/// Keychain with admin trust settings, making it trusted for SSL.
+#[cfg(target_os = "macos")]
+fn install_ca_macos(ca_cert_path: &Path) -> Result<()> {
+    use security_framework::certificate::SecCertificate;
+    use security_framework::trust_settings::{Domain, TrustSettings};
+
+    // Read the PEM certificate and convert to DER
+    let pem_data = std::fs::read_to_string(ca_cert_path)
+        .with_context(|| format!("Failed to read certificate from {}", ca_cert_path.display()))?;
+
+    let der_data = pem_to_der(&pem_data).context("Failed to parse PEM certificate")?;
+
+    // Create SecCertificate from DER data
+    let certificate = SecCertificate::from_der(&der_data)
+        .context("Failed to create SecCertificate from DER data")?;
+
+    // Add to admin trust settings (requires root/admin privileges)
+    // Domain::Admin is the system-wide trust store
+    let trust_settings = TrustSettings::new(Domain::Admin);
+
+    // Set trust settings for SSL - this makes the cert trusted for all purposes
+    trust_settings
+        .set_trust_settings_always(&certificate)
+        .context("Failed to add certificate to Keychain")?;
+
+    Ok(())
+}
+
+/// Convert PEM-encoded certificate to DER format.
+#[cfg(target_os = "macos")]
+fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
+    // Find the base64 content between BEGIN and END markers
+    let start_marker = "-----BEGIN CERTIFICATE-----";
+    let end_marker = "-----END CERTIFICATE-----";
+
+    let start = pem
+        .find(start_marker)
+        .context("PEM missing BEGIN CERTIFICATE marker")?
+        + start_marker.len();
+    let end = pem
+        .find(end_marker)
+        .context("PEM missing END CERTIFICATE marker")?;
+
+    let base64_content: String = pem[start..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    // Simple base64 decode without external crate
+    base64_decode(&base64_content)
+}
+
+/// Minimal base64 decoder (no external crate needed for this simple use case).
+#[cfg(target_os = "macos")]
+fn base64_decode(input: &str) -> Result<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    fn decode_char(c: u8) -> Option<u8> {
+        if c == b'=' {
+            return Some(0);
+        }
+        ALPHABET.iter().position(|&x| x == c).map(|p| p as u8)
+    }
+
+    let bytes: Vec<u8> = input.bytes().collect();
+    let mut output = Vec::with_capacity(bytes.len() * 3 / 4);
+
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 4 {
+            anyhow::bail!("Invalid base64 padding");
+        }
+
+        let a = decode_char(chunk[0]).context("Invalid base64 character")?;
+        let b = decode_char(chunk[1]).context("Invalid base64 character")?;
+        let c = decode_char(chunk[2]).context("Invalid base64 character")?;
+        let d = decode_char(chunk[3]).context("Invalid base64 character")?;
+
+        output.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            output.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            output.push((c << 6) | d);
+        }
+    }
+
+    Ok(output)
 }
 
 #[cfg(target_os = "linux")]
@@ -249,6 +370,7 @@ struct AdminCleanupArgs {
     path: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Subcommand)]
 enum AdminCgroupCommand {
     /// Establish the locald cgroup root (systemd Anchor or direct Driver).
@@ -258,6 +380,7 @@ enum AdminCgroupCommand {
     Kill(AdminCgroupKillArgs),
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Args)]
 struct AdminCgroupKillArgs {
     /// Absolute cgroupsPath (as used by OCI linux.cgroupsPath), e.g.
@@ -269,14 +392,20 @@ struct AdminCgroupKillArgs {
 #[derive(Debug, Subcommand)]
 enum DebugCommand {
     /// Show processes listening on a port (requires root for full visibility).
+    #[cfg(target_os = "linux")]
     Port(DebugPortArgs),
+
+    /// Print shim capabilities and platform info.
+    Info,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Args)]
 struct DebugPortArgs {
     port: u16,
 }
 
+#[cfg(target_os = "linux")]
 fn run_bundle(bundle_path: &Path, container_id: &str) -> Result<i32> {
     let canonical_bundle_path = bundle_path
         .canonicalize()
@@ -360,6 +489,7 @@ fn run_bundle(bundle_path: &Path, container_id: &str) -> Result<i32> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn check_port(port: u16) -> Result<()> {
     println!("Checking port {}...", port);
 
@@ -391,6 +521,13 @@ fn check_port(port: u16) -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// LINUX-ONLY: Cgroup and systemd support
+// =============================================================================
+// These functions use Linux-specific APIs (cgroups, /proc, systemd) and are
+// not available on macOS. Container support on macOS will use Lima (future).
+
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)]
 fn is_systemd_present() -> bool {
     // A common failure mode in CI/containers is that systemd-related files exist on disk,
@@ -409,6 +546,7 @@ fn is_systemd_present() -> bool {
     buf.trim() == "systemd"
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_cgroup2_mount() -> Result<()> {
     // Heuristic: cgroup v2 exposes these files at the mount root.
     let root = Path::new("/sys/fs/cgroup");
@@ -420,16 +558,19 @@ fn ensure_cgroup2_mount() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)]
 fn write_file(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("Failed to write {}", path.display()))
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)]
 fn read_to_string(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
 }
 
+#[cfg(target_os = "linux")]
 fn enable_controllers(parent: &Path) -> Result<()> {
     let controllers_path = parent.join("cgroup.controllers");
     let subtree_control_path = parent.join("cgroup.subtree_control");
@@ -449,6 +590,7 @@ fn enable_controllers(parent: &Path) -> Result<()> {
     write_file(&subtree_control_path, &value)
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)]
 fn cgroup_setup_systemd() -> Result<()> {
     // Write /etc/systemd/system/locald.slice
@@ -498,6 +640,7 @@ fn cgroup_setup_driver() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn cgroup_setup() -> Result<()> {
     if is_systemd_present() {
         cgroup_setup_systemd()?;
@@ -515,6 +658,7 @@ fn cgroup_setup() -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn validate_locald_cgroup_path(path: &str) -> Result<()> {
     if !path.starts_with('/') {
         anyhow::bail!("cgroup path must be absolute (start with /)");
@@ -533,12 +677,14 @@ fn validate_locald_cgroup_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn cgroup_mount_path(cgroups_path: &str) -> Result<PathBuf> {
     validate_locald_cgroup_path(cgroups_path)?;
     let rel = cgroups_path.trim_start_matches('/');
     Ok(Path::new("/sys/fs/cgroup").join(rel))
 }
 
+#[cfg(target_os = "linux")]
 fn collect_cgroup_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if !root.exists() {
@@ -558,6 +704,7 @@ fn collect_cgroup_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+#[cfg(target_os = "linux")]
 fn kill_all_pids_in_dir(dir: &Path) -> Result<()> {
     let procs_path = dir.join("cgroup.procs");
     if !procs_path.exists() {
@@ -590,6 +737,7 @@ fn kill_all_pids_in_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
     ensure_cgroup2_mount()?;
     let dir = cgroup_mount_path(cgroups_path)?;
@@ -711,6 +859,7 @@ fn main() -> Result<()> {
     }
 
     match command {
+        #[cfg(target_os = "linux")]
         Commands::Bundle {
             command: BundleCommand::Run(args),
         } => {
@@ -720,6 +869,7 @@ fn main() -> Result<()> {
         Commands::Bind(args) => {
             // Case: Bind - Run as root
             // Bind a privileged port and pass the FD to locald via Unix socket.
+            // This works on both Linux and macOS using SCM_RIGHTS.
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", args.port))
                 .with_context(|| format!("Failed to bind to port {}", args.port))?;
 
@@ -748,6 +898,7 @@ fn main() -> Result<()> {
         Commands::Admin {
             command: AdminCommand::SyncHosts(args),
         } => {
+            // Works on both Linux and macOS - /etc/hosts is the same path.
             update_hosts_file(&args.domains)?;
             Ok(())
         }
@@ -760,12 +911,26 @@ fn main() -> Result<()> {
             //
             // Keep this intentionally conservative: it should not create long-lived state.
 
-            // If cgroup v2 is available, ensure we can at least read the controller list.
-            let root = Path::new("/sys/fs/cgroup");
-            let controllers = root.join("cgroup.controllers");
-            if controllers.exists() {
-                let _ = read_to_string(&controllers)
-                    .context("Failed to read /sys/fs/cgroup/cgroup.controllers")?;
+            // Platform-specific self-check
+            #[cfg(target_os = "linux")]
+            #[allow(clippy::disallowed_methods)]
+            // Blocking I/O is fine in this synchronous CLI
+            {
+                // If cgroup v2 is available, ensure we can at least read the controller list.
+                let root = Path::new("/sys/fs/cgroup");
+                let controllers = root.join("cgroup.controllers");
+                if controllers.exists() {
+                    std::fs::read_to_string(&controllers)
+                        .context("Failed to read /sys/fs/cgroup/cgroup.controllers")?;
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            #[allow(clippy::disallowed_methods)]
+            // Blocking I/O is fine in this synchronous CLI
+            {
+                // On macOS, verify we can read /etc/hosts as a basic privilege check.
+                std::fs::read_to_string("/etc/hosts").context("Failed to read /etc/hosts")?;
             }
 
             Ok(())
@@ -793,6 +958,7 @@ fn main() -> Result<()> {
             std::fs::remove_dir_all(path).context("Failed to remove directory")?;
             Ok(())
         }
+        #[cfg(target_os = "linux")]
         Commands::Admin {
             command:
                 AdminCommand::Cgroup {
@@ -802,6 +968,7 @@ fn main() -> Result<()> {
             cgroup_setup()?;
             Ok(())
         }
+        #[cfg(target_os = "linux")]
         Commands::Admin {
             command:
                 AdminCommand::Cgroup {
@@ -811,10 +978,25 @@ fn main() -> Result<()> {
             cgroup_kill_and_prune(&args.path)?;
             Ok(())
         }
+        #[cfg(target_os = "linux")]
         Commands::Debug {
             command: DebugCommand::Port(args),
         } => {
             check_port(args.port)?;
+            Ok(())
+        }
+        Commands::Debug {
+            command: DebugCommand::Info,
+        } => {
+            println!("locald-shim version: {}", env!("CARGO_PKG_VERSION"));
+            println!("Platform: {}", std::env::consts::OS);
+            println!("Architecture: {}", std::env::consts::ARCH);
+
+            #[cfg(target_os = "linux")]
+            println!("Container support: yes (libcontainer)");
+            #[cfg(target_os = "macos")]
+            println!("Container support: no (use Lima for containers)");
+
             Ok(())
         }
     }

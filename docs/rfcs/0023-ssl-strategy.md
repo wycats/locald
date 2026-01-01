@@ -22,7 +22,7 @@ We need HTTPS for `.localhost` (Secure Context). We want to avoid external depen
 
 ### Terminology
 
-- **Pure Rust**: No C dependencies or external binaries.
+- **Pure Rust**: No C dependencies or external binaries for cert generation/serving.
 
 ### User Experience (UX)
 
@@ -34,7 +34,32 @@ We need HTTPS for `.localhost` (Secure Context). We want to avoid external depen
 
 ### Implementation Details
 
-`rcgen` for generation. `rustls` for serving.
+- **Generation**: `rcgen` for certificate generation.
+- **Serving**: `rustls` for TLS termination.
+- **Trust Installation (Platform-Specific)**:
+  - **Linux**: Copy cert to `/usr/local/share/ca-certificates/`, run `update-ca-certificates`
+  - **macOS**: Use `security-framework` crate for native Keychain API access. Specifically, `TrustSettings::set_trust_settings_always()` to mark the root CA as trusted.
+
+### macOS Certificate Trust
+
+**Implementation Decision**: Use the `security-framework` crate instead of shelling to the `security` CLI.
+
+```rust
+#[cfg(target_os = "macos")]
+fn trust_root_ca(cert: &Certificate) -> Result<()> {
+    use security_framework::trust_settings::{TrustSettings, Domain};
+    use security_framework::certificate::SecCertificate;
+    
+    let sec_cert = SecCertificate::from_der(cert.to_der()?)?;
+    TrustSettings::set_trust_settings_always(&sec_cert, Domain::Admin)?;
+    Ok(())
+}
+```
+
+**Rationale**:
+- **Type Safety**: Native API returns structured errors
+- **Reliability**: No shell escaping or output parsing
+- **Consistency**: Matches Rust ecosystem patterns (cf. `native-tls`)
 
 ## 4. Drawbacks
 

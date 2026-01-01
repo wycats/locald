@@ -6,6 +6,27 @@ History of completed phases and key changes.
 
 <!-- agent-template end -->
 
+## M2.2: macOS Platform Support - Planning (2025-12-31)
+
+**Goal**: Document requirements for `locald up` to work on macOS for exec services (native processes).
+
+**Work Completed**:
+
+- **RFC 0104**: Updated with comprehensive M2.2 requirements.
+  - **P0 (Must Work)**: Daemon startup, exec service spawn, HTTP/HTTPS proxy, dashboard, log streaming, health checks, CLI commands, managed Postgres, project registry.
+  - **P1 (Graceful Degradation)**: `/etc/hosts` automation (warn + manual sudo), `locald doctor` (macOS-specific), HTTPS cert trust (Keychain APIs).
+  - **Linux-Only Exclusions**: `locald admin setup`, cgroup cleanup, container services, privileged ports.
+- **MAP_AUDIT.md**: Marked M2.2 as "🚧 IN PROGRESS" with detailed requirements breakdown.
+- **decisions.md**: Added Decision 069 documenting the progressive enhancement strategy.
+- **Code Locations Identified**:
+  - `locald-server/src/manager.rs` - Skip shim for hosts sync
+  - `locald-utils/src/shim.rs` - Return None on macOS
+  - `locald-utils/src/privileged.rs` - macOS doctor checks
+  - `locald-cli/src/handlers.rs` - Error on `admin setup`
+  - `locald-utils/src/process.rs` - Process group cleanup
+
+**Status**: Planning complete. Implementation ready to begin.
+
 ## Phase 97: Libcontainer Shim (Fat Shim) (2025-12-13)
 
 **Goal**: Remove the external `runc` dependency by executing OCI bundles via an embedded `libcontainer` runtime inside the privileged `locald-shim`.

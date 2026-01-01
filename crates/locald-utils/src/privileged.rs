@@ -541,27 +541,105 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
 /// Collect a host readiness report (non-Linux stub).
 ///
 /// On non-Linux platforms, locald has limited functionality.
-/// This stub returns a report indicating the platform is not fully supported.
+/// This provides a macOS-friendly report that explains what works and what doesn't.
 #[cfg(not(target_os = "linux"))]
 pub fn collect_report(_config: AcquireConfig<'_>) -> Result<DoctorReport> {
+    let mut problems = Vec::new();
+
+    // Platform info (informational, not a problem)
+    problems.push(Problem {
+        id: "platform.macos".to_string(),
+        severity: Severity::Info,
+        status: Status::Pass,
+        summary: "Running on macOS - exec services work natively".to_string(),
+        details: Some(
+            "locald supports exec services (shell commands), managed Postgres, \
+             and the HTTP/HTTPS proxy on macOS without additional setup."
+                .to_string(),
+        ),
+        remediation: vec![],
+        evidence: vec![EvidenceItem {
+            key: "platform".to_string(),
+            value: std::env::consts::OS.to_string(),
+        }],
+        fix: None,
+    });
+
+    // /etc/hosts automation unavailable
+    problems.push(Problem {
+        id: "shim.unavailable".to_string(),
+        severity: Severity::Warning,
+        status: Status::Skip,
+        summary: "/etc/hosts automation requires manual setup on macOS".to_string(),
+        details: Some(
+            "The locald-shim (automatic /etc/hosts management) is Linux-only. \
+             On macOS, you can manually edit /etc/hosts or use dnsmasq for wildcard \
+             .localhost resolution."
+                .to_string(),
+        ),
+        remediation: vec![
+            "Manual: sudo sh -c 'echo \"127.0.0.1 project.localhost\" >> /etc/hosts'".to_string(),
+            "Or install dnsmasq: brew install dnsmasq".to_string(),
+        ],
+        evidence: vec![],
+        fix: None,
+    });
+
+    // Cgroups unavailable (but we use process groups)
+    problems.push(Problem {
+        id: "cgroups.unavailable".to_string(),
+        severity: Severity::Info,
+        status: Status::Skip,
+        summary: "Process cleanup uses process groups (cgroups unavailable)".to_string(),
+        details: Some(
+            "On macOS, locald uses POSIX process groups for cleanup instead of Linux cgroups. \
+             This works for most use cases."
+                .to_string(),
+        ),
+        remediation: vec![],
+        evidence: vec![],
+        fix: None,
+    });
+
+    // Privileged ports info
+    problems.push(Problem {
+        id: "ports.privileged".to_string(),
+        severity: Severity::Info,
+        status: Status::Pass,
+        summary: "Use high ports (8080, 8443) on macOS - proxy routes traffic".to_string(),
+        details: Some(
+            "Binding to ports <1024 requires root on macOS. The locald proxy can route \
+             traffic from any domain to your service regardless of which port it uses."
+                .to_string(),
+        ),
+        remediation: vec![],
+        evidence: vec![],
+        fix: None,
+    });
+
+    // Container services info
+    problems.push(Problem {
+        id: "containers.unavailable".to_string(),
+        severity: Severity::Warning,
+        status: Status::Skip,
+        summary: "Container services require Lima VM (coming soon)".to_string(),
+        details: Some(
+            "Linux container services are not yet available on macOS. \
+             A future release will add Lima VM support for container workloads."
+                .to_string(),
+        ),
+        remediation: vec![],
+        evidence: vec![],
+        fix: None,
+    });
+
     Ok(DoctorReport {
         strategy: StrategyReport {
             cgroup_root: CgroupStrategyKind::Direct,
-            why: "non-Linux platform (cgroups not available)".to_string(),
+            why: "macOS platform (using process groups for cleanup)".to_string(),
         },
         mode: CleanupMode::Degraded,
-        problems: vec![Problem {
-            id: "platform.unsupported".to_string(),
-            severity: Severity::Warning,
-            status: Status::Skip,
-            summary: "locald privileged features require Linux".to_string(),
-            details: Some(
-                "cgroups, shim, and privileged process management are Linux-only".to_string(),
-            ),
-            remediation: vec![],
-            evidence: vec![],
-            fix: None,
-        }],
+        problems,
         fixes: vec![],
     })
 }

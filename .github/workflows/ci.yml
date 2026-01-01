@@ -1,5 +1,19 @@
 name: CI
 
+# ==============================================================================
+# CI TESTING POLICY
+# ==============================================================================
+# macOS is a first-class platform. Do NOT disable features or skip tests on
+# macOS just for implementation convenience (e.g., avoiding dependency setup).
+#
+# Platform-specific exclusions are ONLY acceptable when:
+#   1. The feature is genuinely impossible on that platform (e.g., Linux
+#      containers on macOS require a VM - locald-shim, locald-vmm)
+#   2. The exclusion is documented with a clear technical rationale
+#
+# If a feature should work on macOS, it MUST be tested on macOS.
+# ==============================================================================
+
 on:
   push:
     branches: ["main"]
@@ -339,13 +353,65 @@ jobs:
           restore-keys: |
             cargo-macos-
 
+      # -------------------------------------------------------------------------
+      # Install pnpm for building embedded UI assets
+      # NOTE: We intentionally install pnpm here rather than skipping UI tests.
+      # macOS is a first-class platform and the dashboard must work on macOS.
+      # See CI TESTING POLICY at the top of this file.
+      # -------------------------------------------------------------------------
+      - name: Setup Node.js
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+
+      - name: Install pnpm
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-macos-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-macos-
+
+      - name: Build embedded UI assets
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -C locald-dashboard install --frozen-lockfile
+          pnpm -C locald-dashboard build
+          pnpm -C locald-docs install --frozen-lockfile
+          pnpm -C locald-docs build
+
       - name: Build locald (excluding Linux-only crates)
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
-          # Build the main CLI binary (excludes locald-shim which is Linux-only)
-          # Use --no-default-features to disable embedded UI (avoids pnpm dependency)
-          # Re-enable channel-stable for proper feature gating
-          cargo build --release --bin locald --no-default-features --features channel-stable
+          # Build the main CLI binary with all default features including embedded UI.
+          # locald-shim now compiles on macOS with Linux-only features (libcontainer,
+          # cgroups) gated at compile time via #[cfg(target_os = "linux")].
+          cargo build --release --bin locald --features channel-stable
+
+      - name: Build locald-shim (macOS cross-platform support)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          # The shim now builds on macOS with container-related commands gated.
+          # Core functionality (port binding, hosts file, cert trust) works natively.
+          cargo build --release -p locald-shim
 
       - name: Smoke test - version
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -360,12 +426,14 @@ jobs:
       - name: Run unit tests (macOS-compatible crates only)
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
-          # Run tests excluding Linux-only crates
-          # Use --no-default-features to disable embedded UI (avoids pnpm dependency)
+          # Run tests with all default features (including embedded UI).
+          # locald-shim now compiles on macOS with platform-gated features.
+          # Excluded crates are genuinely Linux-only:
+          #   - locald-vmm: Linux KVM/microVM support
+          #   - locald-e2e: Integration tests requiring full Linux container stack
           cargo test --lib --bin locald \
             --workspace \
-            --no-default-features --features channel-stable \
-            --exclude locald-shim \
+            --features channel-stable \
             --exclude locald-vmm \
             --exclude locald-e2e
 

@@ -48,7 +48,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-ca_injector = "0.1.2"
 chrono = "0.4.38"
 clap = { version = "4.5.53", features = ["derive"] }
 cliclack = "0.3.7"
@@ -78,6 +77,19 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.9.8"
 tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
+
+# =============================================================================
+# PLATFORM-SPECIFIC DEPENDENCIES
+# =============================================================================
+
+# Linux: ca_injector for system trust store (update-ca-certificates, etc.)
+[target.'cfg(target_os = "linux")'.dependencies]
+ca_injector = "0.1.2"
+
+# macOS: security-framework for native Keychain API
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.2"
+pem = "3.0"
 
 # =============================================================================
 # BINSTALL METADATA

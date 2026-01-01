@@ -25,6 +25,7 @@ This avoids granting extra privileges (capabilities) to the main `locald` binary
 - **Capabilities**: Linux capabilities (fine-grained privileges).
 - **cap_net_bind_service**: The capability to bind to privileged ports.
 - **Shim**: `locald-shim`, a small setuid-root helper for privileged operations.
+- **SCM_RIGHTS**: POSIX mechanism for passing file descriptors over Unix domain sockets.
 
 ### User Experience (UX)
 
@@ -32,14 +33,31 @@ Users run `sudo locald admin setup` once to install and configure `locald-shim` 
 
 After setup, the daemon can request privileged ports by invoking the shim as-needed.
 
+### Cross-Platform Support
+
+**Implementation Decision**: The shim-based approach works on both Linux and macOS.
+
+| Platform | Setuid Support | FD Passing | Status     |
+| -------- | -------------- | ---------- | ---------- |
+| Linux    | ✅ Native      | SCM_RIGHTS | ✅ Working |
+| macOS    | ✅ Native      | SCM_RIGHTS | ✅ Working |
+
+Both platforms support:
+- Setuid binaries with the same semantics
+- Unix domain sockets with `SCM_RIGHTS` for file descriptor passing
+- The same `locald-shim bind <port>` command interface
+
+This provides **full UX parity** for privileged port binding across platforms.
+
 ### Architecture
 
 N/A
 
 ### Implementation Details
 
-- `locald-shim bind <port>` binds the privileged port and passes the FD back to the daemon (e.g. via `SCM_RIGHTS`).
+- `locald-shim bind <port>` binds the privileged port and passes the FD back to the daemon via `SCM_RIGHTS` over a Unix domain socket.
 - The daemon uses the received listener for the proxy and remains an unprivileged process.
+- The same mechanism works on both Linux and macOS (POSIX-standard).
 
 ## 4. Drawbacks
 

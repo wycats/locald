@@ -45,18 +45,38 @@ On Linux, `locald` is already running on the target kernel.
   - _Benefit_: Zero external dependencies (no `runc` binary needed).
   - _Benefit_: "Safe Mode" for untrusted workloads.
 
-### 3.3 macOS: The "Embedded Lima" Path
+### 3.3 macOS: Hybrid Native + Lima Approach
 
-macOS cannot run Linux binaries (ELF) natively. We need a Linux kernel.
+**Implementation Decision**: macOS support is split into two tiers:
 
-- **Tool Selection**: **Lima** (Linux Machines). It is open-source, lightweight, and supports macOS native virtualization (`vz` framework) and file sharing (`virtiofs`).
+#### Tier 1: Native Exec Services (No Lima Required)
+
+Most developer workflows don't require containers. These features work natively on macOS:
+
+| Feature                  | Implementation              | Lima Required |
+| ------------------------ | --------------------------- | ------------- |
+| Process supervision      | `fork()`/`exec()` (POSIX)   | No            |
+| HTTP/HTTPS proxy         | Axum + rustls               | No            |
+| Privileged ports (80/443)| Setuid shim + SCM_RIGHTS    | No            |
+| `/etc/hosts` automation  | Setuid shim                 | No            |
+| HTTPS cert trust         | `security-framework` crate  | No            |
+| Managed Postgres         | `postgresql_embedded`       | No            |
+| Dashboard                | Embedded assets             | No            |
+
+**Key Insight**: The setuid shim architecture works on macOS using the same SCM_RIGHTS pattern as Linux. No Lima overhead for core functionality.
+
+#### Tier 2: Container Services (Lima Required)
+
+For workloads requiring Linux containers:
+
+- **Tool Selection**: **Lima** (Linux Machines). Open-source, lightweight, supports macOS native virtualization (`vz` framework) and file sharing (`virtiofs`).
 - **Management**:
   - `locald` will _not_ ask the user to `brew install lima`.
   - `locald` will download a pinned version of the `lima` binary to `~/.local/share/locald/tools/`.
   - `locald` will initialize a dedicated VM (e.g., `locald-vm`).
 - **Execution**:
-  - When a command requires Linux (e.g., `locald build`), `locald` proxies the command into the VM via `lima shell`.
-  - We may eventually run a `locald-agent` inside the VM to handle complex orchestration.
+  - When a command requires Linux containers (e.g., `locald build` with CNB), `locald` proxies the command into the VM.
+  - Container-related shim commands are compile-time gated with `#[cfg(target_os = "linux")]`.
 
 ### 3.4 Windows: The WSL2 Path
 

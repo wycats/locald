@@ -576,9 +576,95 @@ pub fn run(cli: Cli) -> Result<()> {
                         println!("Next: run `locald up`.");
                     }
 
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(target_os = "macos")]
                     {
-                        anyhow::bail!("Admin setup is only supported on Linux.");
+                        // macOS: The shim now works! It handles privileged ports, hosts, and certs.
+                        // Container-related features (cgroups, libcontainer) are not available.
+                        const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
+
+                        // Auto-elevate if not root
+                        if !nix::unistd::geteuid().is_root() {
+                            use crossterm::tty::IsTty;
+                            use std::process::Command;
+
+                            if !std::io::stdin().is_tty() {
+                                anyhow::bail!(
+                                    "This command requires root privileges. Re-run with `sudo locald admin setup`."
+                                );
+                            }
+
+                            let exe_path = std::env::current_exe()
+                                .context("Failed to resolve current executable path")?;
+
+                            let mut args = std::env::args_os();
+                            let _ = args.next();
+
+                            use std::os::unix::process::CommandExt;
+                            let err = Command::new("sudo")
+                                .arg("--")
+                                .arg(&exe_path)
+                                .args(args)
+                                .exec();
+                            anyhow::bail!("Failed to exec sudo for admin setup: {err}");
+                        }
+
+                        cliclack::intro("locald admin setup (macOS)")?;
+
+                        let exe_path = std::env::current_exe()?;
+                        let exe_dir = exe_path.parent().context("Failed to get exe directory")?;
+                        let shim_path = exe_dir.join("locald-shim");
+
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Installing privileged helper...");
+                            locald_utils::shim::install(&shim_path, SHIM_BYTES)?;
+                            s.stop("Privileged helper installed");
+                        }
+
+                        // Configure HTTPS Root CA + Keychain trust
+                        let mut trust_installed = false;
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Configuring HTTPS trust (Keychain)...");
+                            match crate::trust::install_root_ca_into_trust_store() {
+                                Ok(()) => {
+                                    trust_installed = true;
+                                    s.stop("HTTPS trust configured (Keychain)");
+                                }
+                                Err(_e) => {
+                                    s.stop("HTTPS trust not configured");
+                                }
+                            }
+                        }
+
+                        if !trust_installed {
+                            println!(
+                                "{} HTTPS trust was not installed (optional). If your browser warns, re-run `locald admin setup`.",
+                                style::WARN
+                            );
+                        }
+
+                        // Note: No cgroup setup on macOS (Linux-only feature)
+                        println!(
+                            "{} Note: Container isolation uses process groups on macOS (cgroups are Linux-only).",
+                            style::INFO
+                        );
+
+                        cliclack::outro("Setup complete")?;
+                        println!("The shim enables:");
+                        println!("  • Privileged ports (80/443) via FD passing");
+                        println!("  • /etc/hosts automation for *.localhost domains");
+                        println!("  • HTTPS certificates trusted in Keychain");
+                        println!();
+                        println!("Not available on macOS:");
+                        println!("  • Container services (coming via Lima in a future release)");
+                        println!();
+                        println!("Next: run `locald up`.");
+                    }
+
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    {
+                        anyhow::bail!("`locald admin setup` is only available on Linux and macOS.");
                     }
 
                     // Note: We don't setcap on locald anymore, because the shim handles it.
@@ -586,59 +672,70 @@ pub fn run(cli: Cli) -> Result<()> {
                     // That's fine, the shim is the intended way for privileged ops.
                 }
                 AdminCommands::SyncHosts => {
-                    // Fetch services
-                    let IpcResponse::Status(services) = client::send_request(&IpcRequest::Status)?
-                    else {
-                        anyhow::bail!("Failed to get status from daemon");
-                    };
-
-                    let domains: HashSet<String> =
-                        services.into_iter().filter_map(|s| s.domain).collect();
-
-                    let mut domain_list: Vec<String> = domains.into_iter().collect();
-                    domain_list.sort();
-
-                    #[cfg(unix)]
-                    if !nix::unistd::geteuid().is_root() {
-                        // Check if we are already running under shim
-                        if std::env::var("LOCALD_SHIM_ACTIVE").is_ok() {
-                            anyhow::bail!(
-                                "Failed to elevate privileges via shim (still not root)."
-                            );
-                        }
-
-                        // Try to escalate via shim
-                        if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
-                            // Exec shim
-                            use std::os::unix::process::CommandExt;
-                            let err = std::process::Command::new(&shim_path)
-                                .arg("admin")
-                                .arg("sync-hosts")
-                                .args(&domain_list)
-                                .exec();
-                            eprintln!("Failed to exec shim: {err}");
-                        }
-
+                    // macOS now has shim support!
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    {
                         anyhow::bail!(
-                            "This command requires root privileges. Please run with sudo or ensure locald-shim is configured."
+                            "`locald admin sync-hosts` is only available on Linux and macOS."
                         );
                     }
 
-                    println!("Syncing {} domains to hosts file...", domain_list.len());
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    {
+                        // Fetch services
+                        let IpcResponse::Status(services) =
+                            client::send_request(&IpcRequest::Status)?
+                        else {
+                            anyhow::bail!("Failed to get status from daemon");
+                        };
 
-                    let hosts = HostsFileSection::new();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
+                        let domains: HashSet<String> =
+                            services.into_iter().filter_map(|s| s.domain).collect();
 
-                    let content = rt
-                        .block_on(hosts.read())
-                        .context("Failed to read hosts file")?;
-                    let new_content = hosts.update_content(&content, &domain_list);
-                    rt.block_on(hosts.write(&new_content))
-                        .context("Failed to write hosts file")?;
+                        let mut domain_list: Vec<String> = domains.into_iter().collect();
+                        domain_list.sort();
 
-                    println!("Hosts file updated.");
+                        if !nix::unistd::geteuid().is_root() {
+                            // Check if we are already running under shim
+                            if std::env::var("LOCALD_SHIM_ACTIVE").is_ok() {
+                                anyhow::bail!(
+                                    "Failed to elevate privileges via shim (still not root)."
+                                );
+                            }
+
+                            // Try to escalate via shim
+                            if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
+                                // Exec shim
+                                use std::os::unix::process::CommandExt;
+                                let err = std::process::Command::new(&shim_path)
+                                    .arg("admin")
+                                    .arg("sync-hosts")
+                                    .args(&domain_list)
+                                    .exec();
+                                eprintln!("Failed to exec shim: {err}");
+                            }
+
+                            anyhow::bail!(
+                                "This command requires root privileges. Please run with sudo or ensure locald-shim is configured."
+                            );
+                        }
+
+                        println!("Syncing {} domains to hosts file...", domain_list.len());
+
+                        let hosts = HostsFileSection::new();
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+
+                        let content = rt
+                            .block_on(hosts.read())
+                            .context("Failed to read hosts file")?;
+                        let new_content = hosts.update_content(&content, &domain_list);
+                        rt.block_on(hosts.write(&new_content))
+                            .context("Failed to write hosts file")?;
+
+                        println!("Hosts file updated.");
+                    }
                 }
             }
         }

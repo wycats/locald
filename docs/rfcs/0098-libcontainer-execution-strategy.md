@@ -67,6 +67,33 @@ The `locald-shim` binary will link against the `libcontainer` crate (from the Yo
 
 We will use the `libcontainer` crate, which is the core logic behind [Youki](https://github.com/containers/youki), a Rust-based OCI runtime.
 
+### Platform Gating
+
+**Implementation Decision**: Container-related code is gated at compile time using `#[cfg(target_os = "linux")]`.
+
+```rust
+// In locald-shim/src/commands/container.rs
+#[cfg(target_os = "linux")]
+pub mod container {
+    use libcontainer::container::Container;
+    // ... libcontainer integration
+}
+
+#[cfg(not(target_os = "linux"))]
+pub mod container {
+    pub fn run_container(_: &Path) -> Result<(), Error> {
+        Err(Error::UnsupportedPlatform(
+            "Container execution requires Linux. Use Lima for macOS container support."
+        ))
+    }
+}
+```
+
+**Rationale**:
+- **Single Binary**: No separate "macOS edition" of `locald-shim`
+- **Clear Errors**: Compile-time errors if Linux-only code is accidentally used
+- **Future Path**: Lima integration (RFC 0047) will provide macOS container support alongside the native Linux path
+
 ### Dependency Management
 
 To maintain the "Self-Contained" axiom, `locald-shim` must not depend on dynamic system libraries that might be missing on the user's host (e.g., `libseccomp.so`).

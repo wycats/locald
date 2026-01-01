@@ -51,8 +51,25 @@ The `locald admin setup` command is updated to extract this embedded binary:
 - **Atomic Updates**: Updating `locald` (via `cargo install`) implicitly updates the "payload" for the shim.
 - **Simplified UX**: The user only needs to run `sudo locald admin setup` to apply the update. No need to find or build the shim separately.
 - **Guaranteed Compatibility**: The embedded shim is built from the same source tree commit as the CLI.
+- **Cross-Platform**: The same embedding mechanism works on both Linux and macOS.
 
-### 3.4 Upgrade Lifecycle & Versioning
+### 3.4 Platform Support
+
+**Implementation Decision**: The embedded shim works on both Linux and macOS.
+
+| Platform | Shim Binary     | Installation Path                       | Permissions    |
+| -------- | --------------- | --------------------------------------- | -------------- |
+| Linux    | ELF x86_64      | `~/.local/share/locald/bin/locald-shim` | `root:root 4755` |
+| macOS    | Mach-O arm64    | `~/.local/share/locald/bin/locald-shim` | `root:wheel 4755` |
+
+**Build Process**:
+- On Linux CI: Build produces Linux ELF shim, embedded in Linux CLI
+- On macOS CI: Build produces macOS Mach-O shim, embedded in macOS CLI
+- Cross-compilation is not required; each platform builds its own shim
+
+**Container Features**: Linux-only container commands (libcontainer, cgroups) are compile-time gated using `#[cfg(target_os = "linux")]`. The macOS shim binary simply doesn't include this code.
+
+### 3.5 Upgrade Lifecycle & Versioning
 
 This design works in tandem with **RFC 0045 (Shim Versioning)** to minimize the need for `sudo`.
 

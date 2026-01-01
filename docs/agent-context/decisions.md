@@ -358,3 +358,31 @@
 - Container execution no longer requires `runc` to be installed.
 - The setuid shim is larger and has a larger security surface area; keep dependencies updated and continue to minimize shim responsibilities (caller generates bundle, shim executes it).
   **Status**: Accepted.
+
+## 069. macOS Platform Support: Progressive Enhancement (RFC 0104)
+
+**Context**: macOS represents ~50% of the developer market. The original approach (RFC 0047, RFC 0061) proposed Lima VMs for all execution, but this adds complexity, latency, and friction for the "Clone & Go" promise.
+
+**Decision**: Adopt a **progressive enhancement** approach for macOS support.
+
+**M2.2 (Current)**: Native exec services work without virtualization.
+
+- Daemon startup, process management, HTTP/HTTPS proxy, dashboard, log streaming, health checks all work natively on macOS.
+- Graceful degradation for Linux-only features (`/etc/hosts` automation, cgroups, privileged ports).
+- `locald admin setup` errors with "not supported on macOS".
+- Container services error with "requires Lima (not yet implemented)".
+
+**M2.1 (Future)**: Lima integration for container workloads.
+
+- Download/manage Lima binary automatically.
+- Proxy container commands through Lima VM.
+- Port forwarding from VM to host.
+
+**Consequences**:
+
+- Most developers can use `locald` on macOS immediately (exec services cover 80%+ of use cases).
+- Container users must wait for M2.1 or use Docker Desktop.
+- Code requires `#[cfg(target_os)]` guards in shim-related paths.
+- Process cleanup uses process groups on macOS instead of cgroups (less reliable but functional).
+
+**Status**: Accepted (M2.2 in progress).

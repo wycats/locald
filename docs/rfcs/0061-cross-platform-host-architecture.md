@@ -39,11 +39,17 @@ This matrix tracks the specific primitives `locald` requires and how they are im
 
 #### A. Process Execution (The "Shim")
 
-*Requirement*: Execute a binary (CNB Lifecycle, Service) in a Linux environment.
+*Requirement*: Execute a binary (service process, build tool) and bind privileged ports.
 
--   **Linux**: `fork` / `exec` directly on the host.
--   **macOS**: `locald` spawns a `lima` command (or connects to the Lima socket) to execute the binary inside the VM.
+-   **Linux**: `fork` / `exec` directly on the host. Setuid shim for privileged operations.
+-   **macOS**: Same as Linux. `fork` / `exec` for processes. **Setuid shim works natively** using SCM_RIGHTS for FD passing (POSIX-standard).
 -   **Windows**: `locald` (running in Windows) spawns a `wsl.exe` command, or `locald` runs *inside* WSL2 directly (Recommended).
+
+*Requirement*: Execute Linux containers (OCI/CNB).
+
+-   **Linux**: `libcontainer` via setuid shim. Compile-time enabled with `#[cfg(target_os = "linux")]`.
+-   **macOS**: `locald` spawns a `lima` command to execute containers inside the VM. Container shim commands are compile-time gated.
+-   **Windows**: Containers run inside WSL2.
 
 #### B. Filesystem: Source Code Access
 
@@ -81,7 +87,32 @@ This matrix tracks the specific primitives `locald` requires and how they are im
 
 ### 3.3. Platform-Specific Implementation Plans
 
-#### macOS: The "Embedded Lima" Strategy
+#### macOS: Hybrid Native + Lima Strategy
+
+**Implementation Decision**: macOS support is split into native exec services and Lima-based container services.
+
+**Native Features (No Lima)**:
+
+The following features work natively on macOS using POSIX-standard mechanisms:
+
+| Feature                  | Mechanism                          | Shared with Linux |
+| ------------------------ | ---------------------------------- | ----------------- |
+| Process supervision      | `fork()`/`exec()`                  | ✅ Yes            |
+| Privileged ports         | Setuid shim + SCM_RIGHTS           | ✅ Yes            |
+| `/etc/hosts` automation  | Setuid shim                        | ✅ Yes            |
+| HTTPS cert trust         | `security-framework` crate         | ❌ Platform-specific |
+| IPC                      | Unix domain sockets                | ✅ Yes            |
+
+**Key Insight**: The setuid shim architecture works identically on macOS. File descriptor passing via `SCM_RIGHTS` over Unix domain sockets is POSIX-standard.
+
+**Lima Features (Container Workloads)**:
+
+For workloads requiring Linux containers (CNB builds, container services):
+
+- **Tool**: Lima with `vz` framework (native macOS virtualization)
+- **File Sharing**: VirtioFS mounts host directories into the VM
+- **Compile-Time Gating**: Container commands in `locald-shim` use `#[cfg(target_os = "linux")]`
+- **Runtime Detection**: `locald` checks platform and spawns Lima when containers are needed
 
 **Why not native Rust yet?**
 While crates like `virt-fwk` exist to bind to Apple's `Virtualization.framework`, they are currently immature compared to the Go ecosystem (Lima/Colima).

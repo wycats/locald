@@ -3,26 +3,59 @@ name = "locald-shim"
 version = "0.2.2"
 edition.workspace = true
 
+# =============================================================================
+# CROSS-PLATFORM DEPENDENCIES
+# =============================================================================
+# The shim works on both Linux and macOS using the same architecture:
+# - SCM_RIGHTS for FD passing over Unix domain sockets
+# - Setuid bit for privilege elevation
+# Container-related commands are compile-time gated to Linux-only.
+
 [dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive", "std"], default-features = false }
+libc = "0.2.178"
+
+# nix is used on both platforms for:
+# - Unix domain sockets with SCM_RIGHTS (FD passing)
+# - User/group ID queries
+# - Signal handling
+# Some features (sched, mount) are Linux-only but the crate handles this gracefully.
 nix = { version = "0.30.1", features = [
   "user",
-  "sched",
   "process",
   "signal",
   "socket",
   "uio",
   "fs",
+  "sched",
   "mount",
 ] }
+
+# rcgen for CA certificate generation (cross-platform)
+rcgen = "0.14.5"
+
+# =============================================================================
+# MACOS-ONLY DEPENDENCIES
+# =============================================================================
+[target.'cfg(target_os = "macos")'.dependencies]
+# Native Keychain API for certificate trust (replaces ca_injector)
+security-framework = "3.2"
+
+# =============================================================================
+# LINUX-ONLY DEPENDENCIES
+# =============================================================================
+# These crates use Linux-specific syscalls (namespaces, capabilities, cgroups)
+# and cannot compile on other platforms. Container-related shim commands are
+# compile-time gated with #[cfg(target_os = "linux")].
+
+[target.'cfg(target_os = "linux")'.dependencies]
 caps = "0.5.5"
-anyhow = "1.0"
-clap = { version = "4", features = ["derive", "std"], default-features = false }
-libc = "0.2.178"
 listeners = "0.3.0"
 signal-hook = "0.3.18"
 libcontainer = { version = "0.5.7", default-features = false, features = [
   "v2",
   "systemd",
 ] }
+# ca_injector for Linux trust store (update-ca-certificates, etc.)
 ca_injector = "0.1.2"
-rcgen = "0.14.5"

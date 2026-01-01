@@ -106,12 +106,45 @@ A common request is for the shim to update itself (e.g., `locald-shim admin upda
 2.  **No Root of Trust**: Since `locald` is often built from source by the user, there is no central signing authority to verify the new binary against.
 3.  **Sudo as Trust Anchor**: Requiring `sudo` for updates ensures that the user explicitly authorizes the new code to run as root, maintaining the security boundary.
 
-## 4. Implementation Status
+## 4. Platform Support
+
+### 4.1 Cross-Platform Core (Linux + macOS)
+
+The shim's core privileged operations work identically on Linux and macOS:
+
+| Operation         | Mechanism                    | Platform Support |
+| ----------------- | ---------------------------- | ---------------- |
+| `bind`            | SCM_RIGHTS over Unix socket  | Linux, macOS     |
+| `admin sync-hosts`| Native file write            | Linux, macOS     |
+| `version`         | String output                | Linux, macOS     |
+
+**Why this works**: Unix domain sockets with `SCM_RIGHTS` ancillary data for file descriptor passing are POSIX-standard. The setuid bit semantics are identical on both platforms.
+
+### 4.2 Linux-Only Commands (Compile-Time Gated)
+
+Container-related commands are gated at compile time using `#[cfg(target_os = "linux")]`:
+
+| Operation         | Mechanism                    | Gating                          |
+| ----------------- | ---------------------------- | ------------------------------- |
+| `runc`            | libcontainer (embedded)      | `#[cfg(target_os = "linux")]`   |
+| `admin cleanup`   | Cgroup-aware directory rm    | `#[cfg(target_os = "linux")]`   |
+| Cgroup management | Linux kernel cgroups v2      | `#[cfg(target_os = "linux")]`   |
+
+**Future**: macOS container support will use Lima VMs. The shim may gain a `lima` command or delegate to a Lima-based runtime.
+
+### 4.3 macOS-Specific Notes
+
+- **Installation Path**: Same as Linux (`~/.local/share/locald/bin/locald-shim`)
+- **Permissions**: Same as Linux (`root:wheel` ownership, `4755` mode)
+- **Privilege Escalation**: macOS requires the user to authenticate via Touch ID or password when `sudo` is invoked
+- **Certificate Trust**: Uses `security-framework` crate (native Keychain API), not CLI
+
+## 5. Implementation Status
 
 This architecture is currently implemented and active in the codebase.
 
 - **Source**: `locald-shim/` crate.
-- **Usage**: `locald-server` uses it for port binding. `locald-builder` uses it for `runc` execution.
+- **Usage**: `locald-server` uses it for port binding. `locald-builder` uses it for container execution (Linux only).
 
 ## 5. Future Work
 

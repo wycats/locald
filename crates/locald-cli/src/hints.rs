@@ -20,16 +20,52 @@ fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Returns the appropriate admin setup command for the current executable.
+///
+/// On macOS, this returns a message indicating the command is not available
+/// since `locald admin setup` is a Linux-only feature.
 pub fn admin_setup_command_for_current_exe() -> String {
-    let Ok(current_exe) = std::env::current_exe() else {
-        return "locald admin setup".to_string();
-    };
-
-    if let Some(locald_on_path) = find_in_path("locald") {
-        if paths_refer_to_same_file(&locald_on_path, &current_exe) {
-            return "locald admin setup".to_string();
-        }
+    // On macOS, admin setup is not available
+    #[cfg(target_os = "macos")]
+    {
+        return "locald admin setup (Linux only - not needed on macOS)".to_string();
     }
 
-    format!("{} admin setup", current_exe.display())
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return "locald admin setup".to_string();
+        };
+
+        if let Some(locald_on_path) = find_in_path("locald") {
+            if paths_refer_to_same_file(&locald_on_path, &current_exe) {
+                return "locald admin setup".to_string();
+            }
+        }
+
+        format!("{} admin setup", current_exe.display())
+    }
+}
+
+/// Check if the current platform supports privileged operations via shim.
+#[allow(dead_code)]
+pub const fn platform_supports_shim() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Get platform-appropriate advice for privileged port access.
+#[allow(dead_code)]
+pub const fn privileged_port_advice() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "On macOS, binding to ports below 1024 requires root.\n\
+         Consider using high ports (e.g., 8080, 8443) instead.\n\
+         The locald proxy will route traffic to your service regardless of the port."
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "On Linux, run `locald admin setup` to enable privileged port binding\n\
+         via the setuid helper, or use high ports (e.g., 8080, 8443)."
+    }
 }

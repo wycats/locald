@@ -30,6 +30,31 @@ This lack of structure causes two critical issues:
 
 We will implement a strict, hierarchical Cgroup v2 structure managed by `locald`.
 
+### Platform Scope
+
+**Implementation Decision**: Cgroup management is gated at compile time using `#[cfg(target_os = "linux")]`.
+
+Cgroups are a Linux kernel feature with no macOS equivalent. On macOS:
+- Process cleanup uses process groups (`killpg`) instead of cgroup freezer
+- Resource limits are not enforced (acceptable for local development)
+- Container isolation is deferred to Lima (RFC 0047)
+
+```rust
+#[cfg(target_os = "linux")]
+pub fn kill_service_tree(cgroup_path: &Path) -> Result<()> {
+    // Write "1" to cgroup.kill for atomic process tree termination
+    std::fs::write(cgroup_path.join("cgroup.kill"), "1")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn kill_service_tree(pgid: i32) -> Result<()> {
+    // Use process groups as fallback (less reliable but functional)
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    Ok(())
+}
+```
+
 ### Runtime Strategy: No More `runc`
 
 Upon completion of this RFC, `locald` will exclusively use the embedded `libcontainer` library (via `locald-shim`) for container execution.
