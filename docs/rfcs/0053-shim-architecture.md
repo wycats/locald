@@ -112,11 +112,11 @@ A common request is for the shim to update itself (e.g., `locald-shim admin upda
 
 The shim's core privileged operations work identically on Linux and macOS:
 
-| Operation         | Mechanism                    | Platform Support |
-| ----------------- | ---------------------------- | ---------------- |
-| `bind`            | SCM_RIGHTS over Unix socket  | Linux, macOS     |
-| `admin sync-hosts`| Native file write            | Linux, macOS     |
-| `version`         | String output                | Linux, macOS     |
+| Operation          | Mechanism                   | Platform Support |
+| ------------------ | --------------------------- | ---------------- |
+| `bind`             | SCM_RIGHTS over Unix socket | Linux, macOS     |
+| `admin sync-hosts` | Native file write           | Linux, macOS     |
+| `version`          | String output               | Linux, macOS     |
 
 **Why this works**: Unix domain sockets with `SCM_RIGHTS` ancillary data for file descriptor passing are POSIX-standard. The setuid bit semantics are identical on both platforms.
 
@@ -124,11 +124,11 @@ The shim's core privileged operations work identically on Linux and macOS:
 
 Container-related commands are gated at compile time using `#[cfg(target_os = "linux")]`:
 
-| Operation         | Mechanism                    | Gating                          |
-| ----------------- | ---------------------------- | ------------------------------- |
-| `runc`            | libcontainer (embedded)      | `#[cfg(target_os = "linux")]`   |
-| `admin cleanup`   | Cgroup-aware directory rm    | `#[cfg(target_os = "linux")]`   |
-| Cgroup management | Linux kernel cgroups v2      | `#[cfg(target_os = "linux")]`   |
+| Operation         | Mechanism                 | Gating                        |
+| ----------------- | ------------------------- | ----------------------------- |
+| `runc`            | libcontainer (embedded)   | `#[cfg(target_os = "linux")]` |
+| `admin cleanup`   | Cgroup-aware directory rm | `#[cfg(target_os = "linux")]` |
+| Cgroup management | Linux kernel cgroups v2   | `#[cfg(target_os = "linux")]` |
 
 **Future**: macOS container support will use Lima VMs. The shim may gain a `lima` command or delegate to a Lima-based runtime.
 

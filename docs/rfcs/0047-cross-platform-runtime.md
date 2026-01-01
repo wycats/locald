@@ -53,15 +53,15 @@ On Linux, `locald` is already running on the target kernel.
 
 Most developer workflows don't require containers. These features work natively on macOS:
 
-| Feature                  | Implementation              | Lima Required |
-| ------------------------ | --------------------------- | ------------- |
-| Process supervision      | `fork()`/`exec()` (POSIX)   | No            |
-| HTTP/HTTPS proxy         | Axum + rustls               | No            |
-| Privileged ports (80/443)| Setuid shim + SCM_RIGHTS    | No            |
-| `/etc/hosts` automation  | Setuid shim                 | No            |
-| HTTPS cert trust         | `security-framework` crate  | No            |
-| Managed Postgres         | `postgresql_embedded`       | No            |
-| Dashboard                | Embedded assets             | No            |
+| Feature                   | Implementation             | Lima Required |
+| ------------------------- | -------------------------- | ------------- |
+| Process supervision       | `fork()`/`exec()` (POSIX)  | No            |
+| HTTP/HTTPS proxy          | Axum + rustls              | No            |
+| Privileged ports (80/443) | Setuid shim + SCM_RIGHTS   | No            |
+| `/etc/hosts` automation   | Setuid shim                | No            |
+| HTTPS cert trust          | `security-framework` crate | No            |
+| Managed Postgres          | `postgresql_embedded`      | No            |
+| Dashboard                 | Embedded assets            | No            |
 
 **Key Insight**: The setuid shim architecture works on macOS using the same SCM_RIGHTS pattern as Linux. No Lima overhead for core functionality.
 

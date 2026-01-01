@@ -57,12 +57,13 @@ The `locald admin setup` command is updated to extract this embedded binary:
 
 **Implementation Decision**: The embedded shim works on both Linux and macOS.
 
-| Platform | Shim Binary     | Installation Path                       | Permissions    |
-| -------- | --------------- | --------------------------------------- | -------------- |
-| Linux    | ELF x86_64      | `~/.local/share/locald/bin/locald-shim` | `root:root 4755` |
-| macOS    | Mach-O arm64    | `~/.local/share/locald/bin/locald-shim` | `root:wheel 4755` |
+| Platform | Shim Binary  | Installation Path                       | Permissions       |
+| -------- | ------------ | --------------------------------------- | ----------------- |
+| Linux    | ELF x86_64   | `~/.local/share/locald/bin/locald-shim` | `root:root 4755`  |
+| macOS    | Mach-O arm64 | `~/.local/share/locald/bin/locald-shim` | `root:wheel 4755` |
 
 **Build Process**:
+
 - On Linux CI: Build produces Linux ELF shim, embedded in Linux CLI
 - On macOS CI: Build produces macOS Mach-O shim, embedded in macOS CLI
 - Cross-compilation is not required; each platform builds its own shim

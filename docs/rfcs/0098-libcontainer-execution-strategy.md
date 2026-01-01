@@ -90,6 +90,7 @@ pub mod container {
 ```
 
 **Rationale**:
+
 - **Single Binary**: No separate "macOS edition" of `locald-shim`
 - **Clear Errors**: Compile-time errors if Linux-only code is accidentally used
 - **Future Path**: Lima integration (RFC 0047) will provide macOS container support alongside the native Linux path

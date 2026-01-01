@@ -43,6 +43,7 @@ After setup, the daemon can request privileged ports by invoking the shim as-nee
 | macOS    | ✅ Native      | SCM_RIGHTS | ✅ Working |
 
 Both platforms support:
+
 - Setuid binaries with the same semantics
 - Unix domain sockets with `SCM_RIGHTS` for file descriptor passing
 - The same `locald-shim bind <port>` command interface

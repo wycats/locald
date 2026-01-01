@@ -49,7 +49,7 @@ We need HTTPS for `.localhost` (Secure Context). We want to avoid external depen
 fn trust_root_ca(cert: &Certificate) -> Result<()> {
     use security_framework::trust_settings::{TrustSettings, Domain};
     use security_framework::certificate::SecCertificate;
-    
+
     let sec_cert = SecCertificate::from_der(cert.to_der()?)?;
     TrustSettings::set_trust_settings_always(&sec_cert, Domain::Admin)?;
     Ok(())
@@ -57,6 +57,7 @@ fn trust_root_ca(cert: &Certificate) -> Result<()> {
 ```
 
 **Rationale**:
+
 - **Type Safety**: Native API returns structured errors
 - **Reliability**: No shell escaping or output parsing
 - **Consistency**: Matches Rust ecosystem patterns (cf. `native-tls`)

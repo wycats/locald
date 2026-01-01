@@ -35,6 +35,7 @@ We will implement a strict, hierarchical Cgroup v2 structure managed by `locald`
 **Implementation Decision**: Cgroup management is gated at compile time using `#[cfg(target_os = "linux")]`.
 
 Cgroups are a Linux kernel feature with no macOS equivalent. On macOS:
+
 - Process cleanup uses process groups (`killpg`) instead of cgroup freezer
 - Resource limits are not enforced (acceptable for local development)
 - Container isolation is deferred to Lima (RFC 0047)
@@ -128,30 +129,26 @@ This RFC is considered complete when:
 
 1. **Root ownership is established**
 
-
-    - `locald admin setup` (via the shim) establishes either:
-      - Systemd Anchor: `/sys/fs/cgroup/locald.slice` exists and is delegated, or
-      - Driver fallback: `/sys/fs/cgroup/locald` exists and has controllers enabled for nesting.
+   - `locald admin setup` (via the shim) establishes either:
+     - Systemd Anchor: `/sys/fs/cgroup/locald.slice` exists and is delegated, or
+     - Driver fallback: `/sys/fs/cgroup/locald` exists and has controllers enabled for nesting.
 
 2. **Deterministic hierarchy is applied at runtime**
 
-
-    - Every shim-run service is placed in a leaf cgroup at:
-      - Systemd: `/locald.slice/locald-<sandbox>.slice/service-<name>.scope`, or
-      - Driver: `/locald/locald-<sandbox>/service-<name>`.
-    - `<sandbox>` and `<name>` are sanitized into safe cgroup path components (e.g. `:` and other delimiters map to `-`; `..` and empty components are not permitted).
-    - The computed absolute path is written to `linux.cgroupsPath` in the OCI bundle `config.json`.
+   - Every shim-run service is placed in a leaf cgroup at:
+     - Systemd: `/locald.slice/locald-<sandbox>.slice/service-<name>.scope`, or
+     - Driver: `/locald/locald-<sandbox>/service-<name>`.
+   - `<sandbox>` and `<name>` are sanitized into safe cgroup path components (e.g. `:` and other delimiters map to `-`; `..` and empty components are not permitted).
+   - The computed absolute path is written to `linux.cgroupsPath` in the OCI bundle `config.json`.
 
 3. **Stop/restart guarantees cleanup**
 
-
-    - `locald stop` and `locald restart` use cgroup-level kill semantics after a grace period.
-    - No leaked subprocesses remain after stop/restart, including double-fork cases.
+   - `locald stop` and `locald restart` use cgroup-level kill semantics after a grace period.
+   - No leaked subprocesses remain after stop/restart, including double-fork cases.
 
 4. **Verification is documented**
 
-
-    - Manual verification instructions exist (e.g. using `systemd-cgls` or filesystem inspection under `/sys/fs/cgroup`).
+   - Manual verification instructions exist (e.g. using `systemd-cgls` or filesystem inspection under `/sys/fs/cgroup`).
 
 ## Consequences
 

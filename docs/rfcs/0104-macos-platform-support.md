@@ -71,26 +71,27 @@ support for exec services, then add Lima for container workloads.
 - **Setuid Bit**: macOS supports setuid binaries with the same semantics as Linux.
 - **Result**: Clean UX parity for privileged port binding (80/443) across platforms.
 
-| Feature                  | Linux                      | macOS                         | Behavior                                        |
-| ------------------------ | -------------------------- | ----------------------------- | ----------------------------------------------- |
-| Privileged ports (<1024) | Via `locald-shim` (setuid) | Via `locald-shim` (setuid)    | Same pattern: FD passing over Unix socket       |
-| `/etc/hosts` automation  | Via `locald-shim` (setuid) | Via `locald-shim` (setuid)    | Same pattern: shim writes to `/etc/hosts`       |
-| `locald doctor`          | Full system check          | macOS-specific checks         | Check shim, check Keychain trust                |
-| HTTPS cert trust         | `update-ca-certificates`   | `security-framework` crate    | Native Keychain API (not CLI)                   |
+| Feature                  | Linux                      | macOS                      | Behavior                                  |
+| ------------------------ | -------------------------- | -------------------------- | ----------------------------------------- |
+| Privileged ports (<1024) | Via `locald-shim` (setuid) | Via `locald-shim` (setuid) | Same pattern: FD passing over Unix socket |
+| `/etc/hosts` automation  | Via `locald-shim` (setuid) | Via `locald-shim` (setuid) | Same pattern: shim writes to `/etc/hosts` |
+| `locald doctor`          | Full system check          | macOS-specific checks      | Check shim, check Keychain trust          |
+| HTTPS cert trust         | `update-ca-certificates`   | `security-framework` crate | Native Keychain API (not CLI)             |
 
 #### 2.3 Compile-Time Gated Features (Linux-Only)
 
 **Implementation Decision**: Container-related shim commands are gated at **compile time** using Rust `#[cfg(target_os = "linux")]` attributes. This is NOT a separate binary—it's the same `locald-shim` with conditional compilation.
 
-| Feature                           | Gating Strategy                        | macOS Path                          |
-| --------------------------------- | -------------------------------------- | ----------------------------------- |
-| `locald admin setup`              | Available on macOS                     | Installs setuid shim (same as Linux)|
-| Cgroup resource cleanup           | `#[cfg(target_os = "linux")]`         | Use process groups (SIGKILL)        |
-| Container services (libcontainer) | `#[cfg(target_os = "linux")]`         | Lima integration (future M2.1)      |
-| Namespace creation                | `#[cfg(target_os = "linux")]`         | Lima integration (future M2.1)      |
-| VMM (locald-vmm)                  | `#[cfg(target_os = "linux")]` (KVM)   | Hypervisor.framework (future)       |
+| Feature                           | Gating Strategy                     | macOS Path                           |
+| --------------------------------- | ----------------------------------- | ------------------------------------ |
+| `locald admin setup`              | Available on macOS                  | Installs setuid shim (same as Linux) |
+| Cgroup resource cleanup           | `#[cfg(target_os = "linux")]`       | Use process groups (SIGKILL)         |
+| Container services (libcontainer) | `#[cfg(target_os = "linux")]`       | Lima integration (future M2.1)       |
+| Namespace creation                | `#[cfg(target_os = "linux")]`       | Lima integration (future M2.1)       |
+| VMM (locald-vmm)                  | `#[cfg(target_os = "linux")]` (KVM) | Hypervisor.framework (future)        |
 
 **Rationale for Compile-Time Gating**:
+
 - Single binary distribution (no "macOS edition" vs "Linux edition")
 - Clear compile errors if Linux-only code is accidentally used on macOS
 - Future Lima support can be added alongside native Linux paths
@@ -150,12 +151,12 @@ Files requiring `#[cfg(target_os)]` guards for **container features only**:
 
 Files that work **identically on both platforms**:
 
-| File                                     | Behavior                                            |
-| ---------------------------------------- | --------------------------------------------------- |
-| `locald-shim/src/commands/bind.rs`       | SCM_RIGHTS FD passing (POSIX)                       |
-| `locald-shim/src/commands/hosts.rs`      | `/etc/hosts` modification                           |
-| `locald-cli/src/handlers.rs:admin_setup` | Shim installation (works on macOS)                  |
-| `locald-utils/src/shim.rs`               | Shim discovery (same path on both platforms)        |
+| File                                     | Behavior                                     |
+| ---------------------------------------- | -------------------------------------------- |
+| `locald-shim/src/commands/bind.rs`       | SCM_RIGHTS FD passing (POSIX)                |
+| `locald-shim/src/commands/hosts.rs`      | `/etc/hosts` modification                    |
+| `locald-cli/src/handlers.rs:admin_setup` | Shim installation (works on macOS)           |
+| `locald-utils/src/shim.rs`               | Shim discovery (same path on both platforms) |
 
 ##### 2.4.3 Process Cleanup Without Cgroups
 
@@ -215,25 +216,27 @@ pub fn trust_certificate(cert: &Certificate) -> Result<()> {
         use security_framework::certificate::SecCertificate;
 
         let sec_cert = SecCertificate::from_der(cert.to_der()?)?;
-        
+
         // TrustSettings::set_trust_settings_always() marks the cert as
         // trusted for all purposes (SSL, code signing, etc.)
         TrustSettings::set_trust_settings_always(
             &sec_cert,
             Domain::Admin,  // Requires admin privileges (via shim)
         )?;
-        
+
         Ok(())
     }
 }
 ```
 
 **Why `security-framework` over CLI**:
+
 - **Type safety**: Native API returns structured errors, not exit codes
 - **Reliability**: No shell escaping, path quoting, or output parsing issues
 - **Idiomatic**: Follows Rust ecosystem patterns (cf. `native-tls` crate)
 - **Testability**: Can mock the API in tests; CLI mocking is fragile
-```
+
+````
 
 #### 2.5 Testing Strategy
 
@@ -268,7 +271,7 @@ macos-integration:
         sleep 5
         curl -f http://localhost:8080 || exit 1
         ./locald stop
-```
+````
 
 ### Phase 3: M2.1 — Container Services via Lima (Future)
 
@@ -297,13 +300,13 @@ macos-integration:
 
 **Update**: The setuid shim architecture works on macOS with full UX parity for core features:
 
-| Feature               | Linux                 | macOS                 | Status      |
-| --------------------- | --------------------- | --------------------- | ----------- |
-| Privileged ports      | ✅ via shim           | ✅ via shim           | **Parity**  |
-| `/etc/hosts`          | ✅ via shim           | ✅ via shim           | **Parity**  |
-| HTTPS cert trust      | ✅ system store       | ✅ Keychain API       | **Parity**  |
-| Cgroup management     | ✅ via shim           | ❌ N/A                | Linux-only  |
-| Container isolation   | ✅ via libcontainer   | ❌ N/A (Lima future)  | Linux-only  |
+| Feature             | Linux               | macOS                | Status     |
+| ------------------- | ------------------- | -------------------- | ---------- |
+| Privileged ports    | ✅ via shim         | ✅ via shim          | **Parity** |
+| `/etc/hosts`        | ✅ via shim         | ✅ via shim          | **Parity** |
+| HTTPS cert trust    | ✅ system store     | ✅ Keychain API      | **Parity** |
+| Cgroup management   | ✅ via shim         | ❌ N/A               | Linux-only |
+| Container isolation | ✅ via libcontainer | ❌ N/A (Lima future) | Linux-only |
 
 **Key Insight**: The core shim operations (FD passing via `SCM_RIGHTS`, setuid execution) are POSIX-standard and work identically on both platforms. Only Linux-specific kernel features (cgroups, namespaces) require platform gating.
 
@@ -368,11 +371,11 @@ Files with existing macOS-specific code:
 
 Files requiring M2.2 changes:
 
-| File                                  | Change Required                                     |
-| ------------------------------------- | --------------------------------------------------- |
-| `locald-shim/src/commands/container.rs` | `#[cfg(target_os = "linux")]` for libcontainer    |
-| `locald-shim/src/commands/cgroup.rs`  | `#[cfg(target_os = "linux")]` for cgroup ops       |
-| `locald-utils/src/cert.rs`            | Add `security-framework` for macOS Keychain API    |
-| `locald-utils/src/privileged.rs`      | macOS doctor checks (skip cgroup checks)           |
+| File                                     | Change Required                                 |
+| ---------------------------------------- | ----------------------------------------------- |
+| `locald-shim/src/commands/container.rs`  | `#[cfg(target_os = "linux")]` for libcontainer  |
+| `locald-shim/src/commands/cgroup.rs`     | `#[cfg(target_os = "linux")]` for cgroup ops    |
+| `locald-utils/src/cert.rs`               | Add `security-framework` for macOS Keychain API |
+| `locald-utils/src/privileged.rs`         | macOS doctor checks (skip cgroup checks)        |
 | `locald-server/src/runtime/container.rs` | Gate container services on Linux                |
-| `Cargo.toml` (locald-utils)           | Add `security-framework` as macOS dependency       |
+| `Cargo.toml` (locald-utils)              | Add `security-framework` as macOS dependency    |

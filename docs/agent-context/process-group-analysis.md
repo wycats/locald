@@ -19,6 +19,7 @@ After thorough analysis of the codebase, **process group handling is NOT a high-
 Processes are spawned via `portable-pty` crate, which uses platform-native PTY implementations:
 
 **File**: [crates/locald-server/src/runtime/process.rs#L46-L56](crates/locald-server/src/runtime/process.rs#L46-L56)
+
 ```rust
 fn create_pty() -> Result<portable_pty::PtyPair> {
     let pty_system = NativePtySystem::default();
@@ -27,6 +28,7 @@ fn create_pty() -> Result<portable_pty::PtyPair> {
 ```
 
 When `portable-pty` spawns a command on Unix systems (Linux and macOS), it:
+
 1. Calls `libc::openpty()` to create master/slave PTY pair
 2. Uses `setsid()` in the child's `pre_exec` hook to make it a **session leader**
 3. Sets the PTY as the controlling terminal via `TIOCSCTTY`
@@ -37,6 +39,7 @@ When `portable-pty` spawns a command on Unix systems (Linux and macOS), it:
 ### 1.2 Process Group Signal Delivery
 
 **File**: [crates/locald-utils/src/process.rs#L20-L49](crates/locald-utils/src/process.rs#L20-L49)
+
 ```rust
 pub async fn terminate_gracefully(child: &mut Box<dyn Child + Send>, name: &str, signal: Signal) {
     let pid = child.process_id().unwrap();
@@ -66,6 +69,7 @@ The code uses **negative PID** with `nix::sys::signal::kill()`, which is the POS
 For container workloads, the shim forwards signals to the container init process:
 
 **File**: [crates/locald-shim/src/main.rs#L300-L316](crates/locald-shim/src/main.rs#L300-L316)
+
 ```rust
 let mut signals = signal_hook::iterator::Signals::new([
     SIGTERM, SIGINT, SIGQUIT, SIGHUP,
@@ -84,22 +88,24 @@ std::thread::spawn(move || {
 
 ### 2.1 APIs Used
 
-| API | Linux | macOS | Cross-Platform? |
-|-----|-------|-------|-----------------|
-| `nix::sys::signal::kill()` | ✅ | ✅ | Yes |
-| `kill(negative_pid)` for PGID | ✅ | ✅ | Yes (POSIX) |
-| `portable_pty::NativePtySystem` | ✅ | ✅ | Yes |
-| `libc::setsid()` | ✅ | ✅ | Yes (POSIX) |
-| `libc::waitpid()` | ✅ | ✅ | Yes (POSIX) |
+| API                             | Linux | macOS | Cross-Platform? |
+| ------------------------------- | ----- | ----- | --------------- |
+| `nix::sys::signal::kill()`      | ✅    | ✅    | Yes             |
+| `kill(negative_pid)` for PGID   | ✅    | ✅    | Yes (POSIX)     |
+| `portable_pty::NativePtySystem` | ✅    | ✅    | Yes             |
+| `libc::setsid()`                | ✅    | ✅    | Yes (POSIX)     |
+| `libc::waitpid()`               | ✅    | ✅    | Yes (POSIX)     |
 
 ### 2.2 `nix` Crate Platform Support
 
 The `nix` crate (v0.30.1) fully supports macOS for all functions we use:
+
 - `kill()`, `killpg()` - Available on all Unix platforms
 - `Signal` enum - Compatible across platforms
 - `Pid` type - Works identically
 
 **Feature flags used** ([crates/locald-utils/Cargo.toml#L10-L15](crates/locald-utils/Cargo.toml#L10-L15)):
+
 ```toml
 nix = { version = "0.30.1", features = [
   "process", "signal", "socket", "user", "fs",
@@ -111,6 +117,7 @@ All these features are available on macOS.
 ### 2.3 `portable-pty` Platform Behavior
 
 The `portable-pty` crate (from wezterm) has identical behavior on Linux and macOS:
+
 - Both use `libc::openpty()` to create PTYs
 - Both call `setsid()` to create a new session
 - Both set `TIOCSCTTY` for controlling terminal
@@ -118,14 +125,15 @@ The `portable-pty` crate (from wezterm) has identical behavior on Linux and macO
 
 ### 2.4 Semantic Differences
 
-| Behavior | Linux | macOS | Impact |
-|----------|-------|-------|--------|
-| `setsid()` | Creates new session & PGID | Same | None |
-| `kill(-pgid)` | Signals all procs in group | Same | None |
-| Orphan process adoption | PID 1 (systemd/init) | launchd | See notes |
-| Process groups in PTY | PGID = session leader | Same | None |
+| Behavior                | Linux                      | macOS   | Impact    |
+| ----------------------- | -------------------------- | ------- | --------- |
+| `setsid()`              | Creates new session & PGID | Same    | None      |
+| `kill(-pgid)`           | Signals all procs in group | Same    | None      |
+| Orphan process adoption | PID 1 (systemd/init)       | launchd | See notes |
+| Process groups in PTY   | PGID = session leader      | Same    | None      |
 
 **Orphan Handling**: When a parent process dies, orphaned children are re-parented to PID 1 (init/systemd on Linux, launchd on macOS). This is a slight semantic difference, but:
+
 - Our code doesn't rely on this behavior
 - We signal the entire process group, so children get signals before becoming orphans
 
@@ -135,25 +143,26 @@ The `portable-pty` crate (from wezterm) has identical behavior on Linux and macO
 
 ### 3.1 What Works Identically
 
-| Feature | Risk | Notes |
-|---------|------|-------|
-| Session creation via `setsid()` | ✅ None | POSIX standard |
-| Signal delivery to process groups | ✅ None | POSIX standard |
-| PTY-based process spawning | ✅ None | wezterm uses this on macOS |
-| Graceful shutdown with timeout | ✅ None | Pure Rust/POSIX logic |
-| SIGTERM → SIGKILL escalation | ✅ None | Works identically |
+| Feature                           | Risk    | Notes                      |
+| --------------------------------- | ------- | -------------------------- |
+| Session creation via `setsid()`   | ✅ None | POSIX standard             |
+| Signal delivery to process groups | ✅ None | POSIX standard             |
+| PTY-based process spawning        | ✅ None | wezterm uses this on macOS |
+| Graceful shutdown with timeout    | ✅ None | Pure Rust/POSIX logic      |
+| SIGTERM → SIGKILL escalation      | ✅ None | Works identically          |
 
 ### 3.2 Linux-Only Features
 
-| Feature | Current Status | macOS Impact |
-|---------|----------------|--------------|
-| Cgroup cleanup | `#[cfg(target_os = "linux")]` | Compile-time gated |
-| Notify socket (`sd_notify`) | Linux-only code path | Already handles non-Linux |
-| `locald-shim` container execution | Uses `libcontainer` (Linux) | VM isolation solves this |
+| Feature                           | Current Status                | macOS Impact              |
+| --------------------------------- | ----------------------------- | ------------------------- |
+| Cgroup cleanup                    | `#[cfg(target_os = "linux")]` | Compile-time gated        |
+| Notify socket (`sd_notify`)       | Linux-only code path          | Already handles non-Linux |
+| `locald-shim` container execution | Uses `libcontainer` (Linux)   | VM isolation solves this  |
 
 ### 3.3 Architectural Caveat
 
 Per **RFC 0061**, macOS execution uses an **Embedded Lima VM**. This means:
+
 - The `locald` CLI runs on macOS (native binary)
 - The `locald-server` daemon runs **inside the Linux VM**
 - All process spawning happens in Linux context
@@ -170,6 +179,7 @@ Per **RFC 0061**, macOS execution uses an **Embedded Lima VM**. This means:
 If future architecture changes run `locald-server` natively on macOS:
 
 1. **`setsid` command in CLI** ([crates/locald-cli/src/utils.rs#L58](crates/locald-cli/src/utils.rs#L58))
+
    - macOS **does not have** the `setsid` command by default
    - Fallback code already exists and works
 
@@ -181,7 +191,8 @@ If future architecture changes run `locald-server` natively on macOS:
 
 1. **Child ignores SIGTERM**: Current 5-second timeout then SIGKILL handles this correctly on both platforms.
 
-2. **Process forks additional children**: 
+2. **Process forks additional children**:
+
    - If children are in same process group (normal case): signals reach them
    - If children call `setsid()`: they escape the group, but this is rare in web apps
    - On Linux, cgroup cleanup catches escapees
@@ -205,6 +216,7 @@ The current implementation is sound. The `nix` crate and `portable-pty` handle p
 If we ever want to run `locald-server` directly on macOS (not in VM):
 
 1. **Replace `setsid` command usage**
+
    ```rust
    // Instead of shelling out to `setsid`
    #[cfg(unix)]
@@ -212,6 +224,7 @@ If we ever want to run `locald-server` directly on macOS (not in VM):
    ```
 
 2. **Add macOS-specific leak detection**
+
    - Use `sysctl` or `ps` to find orphaned locald processes
    - Track by environment variable marker (e.g., `LOCALD_SERVICE=project:service`)
 
@@ -223,13 +236,13 @@ If we ever want to run `locald-server` directly on macOS (not in VM):
 
 **Current E2E tests are sufficient** for the Lima-based macOS architecture. If native macOS becomes a goal:
 
-| Test Case | Current Coverage | macOS Native |
-|-----------|------------------|--------------|
-| Basic start/stop | ✅ `daemon_lifecycle.rs` | Same |
-| Service with child processes | ⚠️ Implicit only | Add explicit test |
-| Service ignores SIGTERM | ⚠️ `signal-test` example | Promote to E2E |
-| Daemon restart recovery | ⚠️ Manual testing | Add E2E test |
-| Multiple services shutdown | ✅ Implicit | Same |
+| Test Case                    | Current Coverage         | macOS Native      |
+| ---------------------------- | ------------------------ | ----------------- |
+| Basic start/stop             | ✅ `daemon_lifecycle.rs` | Same              |
+| Service with child processes | ⚠️ Implicit only         | Add explicit test |
+| Service ignores SIGTERM      | ⚠️ `signal-test` example | Promote to E2E    |
+| Daemon restart recovery      | ⚠️ Manual testing        | Add E2E test      |
+| Multiple services shutdown   | ✅ Implicit              | Same              |
 
 ---
 
@@ -243,11 +256,11 @@ If future plans include running `locald-server` natively on macOS, minimal chang
 
 ### Summary Table
 
-| Concern | Risk Level | Action |
-|---------|-----------|--------|
-| `kill(-pgid)` semantics | 🟢 None | No change |
-| PTY session creation | 🟢 None | No change |
-| Graceful shutdown | 🟢 None | No change |
-| Cgroup cleanup | 🟢 None | Already gated |
-| Orphan process escape | 🟡 Low | Monitor if native macOS planned |
-| `setsid` command | 🟡 Low | Fallback exists |
+| Concern                 | Risk Level | Action                          |
+| ----------------------- | ---------- | ------------------------------- |
+| `kill(-pgid)` semantics | 🟢 None    | No change                       |
+| PTY session creation    | 🟢 None    | No change                       |
+| Graceful shutdown       | 🟢 None    | No change                       |
+| Cgroup cleanup          | 🟢 None    | Already gated                   |
+| Orphan process escape   | 🟡 Low     | Monitor if native macOS planned |
+| `setsid` command        | 🟡 Low     | Fallback exists                 |
