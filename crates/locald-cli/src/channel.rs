@@ -12,8 +12,10 @@
 
 /// The release channel this binary was built for.
 ///
-/// This enum is part of the public API for runtime channel detection.
-/// Used by tests and intended for future feature-gating UI.
+/// This enum and its associated methods form part of the public API
+/// for runtime channel detection and feature gating. It is used by
+/// tests and by production code (for example, when reporting or
+/// inspecting the current build channel).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
