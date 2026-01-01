@@ -881,6 +881,7 @@ mod tests {
         assert!(report.has_critical_failures());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn consolidate_fixes_dedupes_and_orders() {
         let problems = vec![
@@ -949,6 +950,7 @@ mod tests {
         assert_eq!(roundtrip.problems.len(), 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn docker_integration_tcp_host_is_treated_as_configured() {
         let _guard = env_lock().lock().unwrap();
@@ -969,7 +971,7 @@ mod tests {
         restore_env("DOCKER_HOST", prev);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn docker_integration_unix_socket_present_no_problem() {
         use std::os::unix::net::UnixListener;
@@ -1012,6 +1014,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn kvm_integration_is_quiet_when_not_verbose() {
         let mut problems = Vec::new();
@@ -1118,6 +1121,7 @@ mod tests {
             })
     }
 
+    #[cfg(target_os = "linux")]
     proptest! {
         #[test]
         fn consolidate_fixes_is_deduped_and_prioritized(keys in proptest::collection::vec(arb_fix_key(), 0..30)) {
