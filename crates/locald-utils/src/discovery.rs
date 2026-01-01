@@ -8,8 +8,7 @@ use tracing::debug;
 struct TcpEntry {
     local_port: u16,
     inode: u64,
-    #[allow(dead_code)]
-    state: u8,
+    _state: u8,
 }
 
 async fn parse_tcp_file(path: &Path) -> Result<Vec<TcpEntry>> {
@@ -42,7 +41,7 @@ async fn parse_tcp_file(path: &Path) -> Result<Vec<TcpEntry>> {
         entries.push(TcpEntry {
             local_port,
             inode,
-            state,
+            _state: state,
         });
     }
 
@@ -143,4 +142,22 @@ pub async fn find_listening_ports(pid: u32) -> Result<Vec<u16>> {
     }
 
     Ok(ports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_entry_construction() {
+        // Verify TcpEntry can be constructed with the underscore-prefixed field.
+        // The _state field is parsed from /proc/net/tcp but not used after filtering.
+        let entry = TcpEntry {
+            local_port: 8080,
+            inode: 12345,
+            _state: 0x0A, // LISTEN state
+        };
+        assert_eq!(entry.local_port, 8080);
+        assert_eq!(entry.inode, 12345);
+    }
 }

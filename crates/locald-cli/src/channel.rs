@@ -8,10 +8,15 @@
 //!
 //! The channel is determined at compile time via Cargo features.
 
-// These are utility APIs for future use (e.g., runtime channel checks, telemetry).
-#![allow(dead_code)]
+// Channel detection utilities are used for version output and feature gating.
 
 /// The release channel this binary was built for.
+///
+/// This enum and its associated methods form part of the public API
+/// for runtime channel detection and feature gating. It is used by
+/// tests and by production code (for example, when reporting or
+/// inspecting the current build channel).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// Stable release channel. Only battle-tested features.
@@ -22,6 +27,7 @@ pub enum Channel {
     Nightly,
 }
 
+#[allow(dead_code)]
 impl Channel {
     /// Returns the channel this binary was compiled with.
     #[must_use]
@@ -76,12 +82,14 @@ pub const BUILD_CHANNEL: &str = env!("LOCALD_CHANNEL");
 /// - `locald 0.1.0 (stable)`
 /// - `locald 0.1.0-beta (beta)`
 /// - `locald 0.1.0-nightly.1735567200 (nightly)`
+#[allow(dead_code)]
 #[must_use]
 pub fn version_string() -> String {
     format!("locald {} ({})", BUILD_VERSION, BUILD_CHANNEL)
 }
 
 /// Returns a short version string (just the version number with channel suffix).
+#[allow(dead_code)]
 #[must_use]
 pub const fn short_version() -> &'static str {
     BUILD_VERSION

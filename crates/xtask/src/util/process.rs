@@ -4,6 +4,8 @@ use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
 #[derive(Clone, Copy, Debug)]
 pub enum KillStrategy {
     TermThenKill,
+    /// Kill immediately with SIGKILL (no graceful termination).
+    /// Reserved for cases where SIGTERM is insufficient.
     #[allow(dead_code)]
     Kill,
 }
