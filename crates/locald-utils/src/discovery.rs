@@ -8,8 +8,7 @@ use tracing::debug;
 struct TcpEntry {
     local_port: u16,
     inode: u64,
-    #[allow(dead_code)]
-    state: u8,
+    _state: u8,
 }
 
 async fn parse_tcp_file(path: &Path) -> Result<Vec<TcpEntry>> {
@@ -42,7 +41,7 @@ async fn parse_tcp_file(path: &Path) -> Result<Vec<TcpEntry>> {
         entries.push(TcpEntry {
             local_port,
             inode,
-            state,
+            _state: state,
         });
     }
 
