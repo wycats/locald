@@ -2,6 +2,23 @@
 
 Thanks for contributing!
 
+## CI Testing Policy
+
+**macOS is a first-class platform.** When modifying CI workflows:
+
+- **DO NOT** disable features or skip tests on macOS just for implementation convenience (e.g., avoiding dependency setup like pnpm).
+- **DO** set up the full build environment on each platform so we test what we ship.
+
+Platform-specific exclusions are only acceptable when the feature is **genuinely impossible** on that platform:
+
+| Exclusion | Rationale |
+|-----------|-----------|
+| `locald-shim` | Uses Linux namespaces, cgroups, and capabilities (OCI containers) |
+| `locald-vmm` | Uses Linux KVM for microVM support |
+| `locald-e2e` | Integration tests requiring the full Linux container stack |
+
+If a feature should work on macOS, it must be tested on macOS. See `.github/workflows/ci.yml` for the full policy comment.
+
 ## Commit signature policy
 
 This repository requires **verified signatures** on commits that land in `main`.
