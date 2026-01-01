@@ -6,11 +6,14 @@
 #![allow(missing_docs)]
 
 use crate::cert;
+#[cfg(target_os = "linux")]
 use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
 use crate::shim;
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use nix::unistd::User;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -217,6 +220,7 @@ impl Privileged {
 /// # Errors
 ///
 /// Returns an error if required host probes fail unexpectedly.
+#[cfg(target_os = "linux")]
 pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
     let mut problems: Vec<Problem> = Vec::new();
 
@@ -534,6 +538,35 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
     })
 }
 
+/// Collect a host readiness report (non-Linux stub).
+///
+/// On non-Linux platforms, locald has limited functionality.
+/// This stub returns a report indicating the platform is not fully supported.
+#[cfg(not(target_os = "linux"))]
+pub fn collect_report(_config: AcquireConfig<'_>) -> Result<DoctorReport> {
+    Ok(DoctorReport {
+        strategy: StrategyReport {
+            cgroup_root: CgroupStrategyKind::Direct,
+            why: "non-Linux platform (cgroups not available)".to_string(),
+        },
+        mode: CleanupMode::Degraded,
+        problems: vec![Problem {
+            id: "platform.unsupported".to_string(),
+            severity: Severity::Warning,
+            status: Status::Skip,
+            summary: "locald privileged features require Linux".to_string(),
+            details: Some(
+                "cgroups, shim, and privileged process management are Linux-only".to_string(),
+            ),
+            remediation: vec![],
+            evidence: vec![],
+            fix: None,
+        }],
+        fixes: vec![],
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn check_docker_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>) {
     #[cfg(unix)]
     {
@@ -628,6 +661,7 @@ fn check_docker_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Probl
     }
 }
 
+#[cfg(target_os = "linux")]
 fn check_kvm_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>) {
     // Keep this behind verbose to avoid adding noisy, optional platform details to the
     // default doctor output.
@@ -680,6 +714,7 @@ fn check_kvm_integration(config: &AcquireConfig<'_>, problems: &mut Vec<Problem>
     }
 }
 
+#[cfg(target_os = "linux")]
 fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
     use std::collections::BTreeSet;
 
@@ -728,6 +763,7 @@ fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn detect_strategy() -> (CgroupRootStrategy, String) {
     let mut comm = String::new();
     if let Ok(mut file) = std::fs::File::open("/proc/1/comm") {
@@ -745,6 +781,7 @@ fn detect_strategy() -> (CgroupRootStrategy, String) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn shim_version(shim_path: &Path) -> Result<String> {
     #[allow(clippy::disallowed_methods)]
     let output = std::process::Command::new(shim_path)
@@ -761,6 +798,7 @@ fn shim_version(shim_path: &Path) -> Result<String> {
     Ok(version)
 }
 
+#[cfg(target_os = "linux")]
 fn shim_self_check(shim_path: &Path) -> Result<()> {
     #[allow(clippy::disallowed_methods)]
     let status = std::process::Command::new(shim_path)
@@ -843,6 +881,7 @@ mod tests {
         assert!(report.has_critical_failures());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn consolidate_fixes_dedupes_and_orders() {
         let problems = vec![
@@ -911,6 +950,7 @@ mod tests {
         assert_eq!(roundtrip.problems.len(), 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn docker_integration_tcp_host_is_treated_as_configured() {
         let _guard = env_lock().lock().unwrap();
@@ -931,7 +971,7 @@ mod tests {
         restore_env("DOCKER_HOST", prev);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn docker_integration_unix_socket_present_no_problem() {
         use std::os::unix::net::UnixListener;
@@ -974,6 +1014,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn kvm_integration_is_quiet_when_not_verbose() {
         let mut problems = Vec::new();
@@ -1080,6 +1121,7 @@ mod tests {
             })
     }
 
+    #[cfg(target_os = "linux")]
     proptest! {
         #[test]
         fn consolidate_fixes_is_deduped_and_prioritized(keys in proptest::collection::vec(arb_fix_key(), 0..30)) {

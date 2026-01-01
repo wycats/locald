@@ -65,6 +65,22 @@ unused_async = "allow"
 match_bool = "allow"
 single_match_else = "allow"
 
+# =============================================================================
+# CHANNEL SYSTEM
+# =============================================================================
+# locald uses a channel-based release model (like Rust/Chrome):
+#
+#   stable  - Default. Only battle-tested features.
+#   beta    - Features graduating to stable in the next release.
+#   nightly - Includes experimental features (plugins, vmm, cnb, etc.)
+#
+# Build with: cargo build -p locald-cli --features channel-nightly
+#
+# Features are defined in each crate (e.g., crates/locald-cli/Cargo.toml).
+# Cargo does not support workspace-level features, so each crate must define
+# its own feature flags with consistent naming conventions.
+# =============================================================================
+
 # Build performance defaults
 #
 # Cargo enables incremental compilation for `dev` by default, but we make it

@@ -242,27 +242,37 @@ async fn async_main(
         .unwrap_or_else(|| PathBuf::from(".locald"));
     let container_manager = std::sync::Arc::new(crate::container::ContainerManager::new(&data_dir));
 
-    // Notify Server
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(100);
-    // We need to handle potential failure binding the socket
-    let notify_server = match locald_utils::notify::NotifyServer::new(notify_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to bind notify socket: {e}");
-            return Err(e);
-        }
-    };
+    // Notify Server (Linux only - uses Unix datagram sockets with peer credentials)
+    #[cfg(target_os = "linux")]
+    {
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(100);
+        // We need to handle potential failure binding the socket
+        let notify_server = match locald_utils::notify::NotifyServer::new(notify_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to bind notify socket: {e}");
+                return Err(e);
+            }
+        };
 
-    tokio::spawn(async move {
-        notify_server.run(notify_tx).await;
-    });
+        tokio::spawn(async move {
+            notify_server.run(notify_tx).await;
+        });
 
-    let manager_clone = manager.clone();
-    tokio::spawn(async move {
-        while let Some((pid, _msg)) = notify_rx.recv().await {
-            manager_clone.handle_notify(pid).await;
-        }
-    });
+        let manager_clone = manager.clone();
+        tokio::spawn(async move {
+            while let Some((pid, _msg)) = notify_rx.recv().await {
+                manager_clone.handle_notify(pid).await;
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // On non-Linux platforms, the notify server is not available.
+        // Services will still work but won't receive systemd-style notifications.
+        tracing::debug!("Notify server not available on this platform");
+        let _ = notify_path; // suppress unused warning
+    }
 
     // Restore state
     let manager_restore = manager.clone();

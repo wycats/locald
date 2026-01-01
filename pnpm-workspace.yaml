@@ -1,12 +1,16 @@
 packages:
-  - "locald-dashboard"
-  - "locald-docs"
-  - "examples/**"
-  # Future-proofing for the planned repo layout refactor
-  - "e2e/**"
+  - locald-dashboard
+  - locald-docs
+  - examples/**
+  - e2e/**
+  - '!**/node_modules/**'
+  - '!**/build/**'
+  - '!**/dist/**'
+  - '!**/target/**'
 
-  # Common excludes
-  - "!**/node_modules/**"
-  - "!**/build/**"
-  - "!**/dist/**"
-  - "!**/target/**"
+ignoredBuiltDependencies:
+  - esbuild
+  - sharp
+
+onlyBuiltDependencies:
+  - lefthook

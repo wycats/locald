@@ -1,5 +1,19 @@
 name: CI
 
+# ==============================================================================
+# CI TESTING POLICY
+# ==============================================================================
+# macOS is a first-class platform. Do NOT disable features or skip tests on
+# macOS just for implementation convenience (e.g., avoiding dependency setup).
+#
+# Platform-specific exclusions are ONLY acceptable when:
+#   1. The feature is genuinely impossible on that platform (e.g., Linux
+#      containers on macOS require a VM - locald-shim, locald-vmm)
+#   2. The exclusion is documented with a clear technical rationale
+#
+# If a feature should work on macOS, it MUST be tested on macOS.
+# ==============================================================================
+
 on:
   push:
     branches: ["main"]
@@ -25,10 +39,21 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      only_macos: ${{ steps.only-macos.outputs.only_macos }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Check for only-ci=macos keyword
+        id: only-macos
+        run: |
+          if git log -1 --format='%B' | grep -qF '[only-ci=macos]'; then
+            echo "only_macos=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Detected [only-ci=macos] keyword - running only macOS build"
+          else
+            echo "only_macos=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Classify changes
         id: filter
@@ -51,7 +76,8 @@ jobs:
 
   mainline-health:
     name: Mainline Health
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -85,7 +111,8 @@ jobs:
 
   tests-tripwire:
     name: Tripwire (Tests for Rust changes)
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +124,7 @@ jobs:
 
   web-build:
     name: Web Build (Dashboard + Docs)
-    if: ${{ github.event_name != 'schedule' }}
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
     needs: [changes]
     runs-on: ubuntu-latest
     steps:
@@ -156,7 +183,7 @@ jobs:
 
   rust-fmt:
     name: Rust Format
-    if: ${{ github.event_name != 'schedule' }}
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
     needs: [changes]
     runs-on: ubuntu-latest
     steps:
@@ -188,7 +215,7 @@ jobs:
 
   rust-clippy:
     name: Rust Clippy
-    if: ${{ github.event_name != 'schedule' }}
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
     needs: [changes]
     runs-on: ubuntu-latest
     env:
@@ -288,8 +315,127 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: cargo clippy --workspace -- -D warnings
 
+  # ==========================================================================
+  # M2.0: macOS Build Verification (Tier 1)
+  # ==========================================================================
+  # This job verifies locald compiles and runs basic smoke tests on macOS.
+  # It gates on Rust changes to optimize the 10x cost of macOS runners.
+  # See: .private/MAP_AUDIT.md Phase M2 for the full macOS testing strategy.
+  # ==========================================================================
+  macos-build:
+    name: macOS Build
+    if: ${{ github.event_name != 'schedule' }}
+    needs: [changes]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate
+        id: gate
+        run: echo "run=${{ needs.changes.outputs.rust }}" >> "$GITHUB_OUTPUT"
+
+      - name: No Rust changes
+        if: ${{ steps.gate.outputs.run != 'true' }}
+        run: echo "No Rust changes; skipping macOS build."
+
+      - name: Install Rust
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-macos-
+
+      # -------------------------------------------------------------------------
+      # Install pnpm for building embedded UI assets
+      # NOTE: We intentionally install pnpm here rather than skipping UI tests.
+      # macOS is a first-class platform and the dashboard must work on macOS.
+      # See CI TESTING POLICY at the top of this file.
+      # -------------------------------------------------------------------------
+      - name: Setup Node.js
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+
+      - name: Install pnpm
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-macos-${{ hashFiles('locald-dashboard/pnpm-lock.yaml', 'locald-docs/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-macos-
+
+      - name: Build embedded UI assets
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -C locald-dashboard install --frozen-lockfile
+          pnpm -C locald-dashboard build
+          pnpm -C locald-docs install --frozen-lockfile
+          pnpm -C locald-docs build
+
+      - name: Build locald (excluding Linux-only crates)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          # Build the main CLI binary with all default features including embedded UI.
+          # Only Linux-specific crates are excluded (locald-shim uses Linux namespaces/cgroups).
+          # The target-gated dependencies in locald-shim/Cargo.toml prevent caps/libcontainer
+          # from being compiled on macOS.
+          cargo build --release --bin locald --features channel-stable
+
+      - name: Smoke test - version
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          ./target/release/locald --version
+          ./target/release/locald -V
+
+      - name: Smoke test - help
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: ./target/release/locald --help
+
+      - name: Run unit tests (macOS-compatible crates only)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          # Run tests with all default features (including embedded UI).
+          # Excluded crates are genuinely Linux-only:
+          #   - locald-shim: Uses Linux namespaces, cgroups, capabilities
+          #   - locald-vmm: Linux KVM/microVM support
+          #   - locald-e2e: Integration tests requiring full Linux container stack
+          cargo test --lib --bin locald \
+            --workspace \
+            --features channel-stable \
+            --exclude locald-shim \
+            --exclude locald-vmm \
+            --exclude locald-e2e
+
   rust-tests-coverage:
     name: Rust Tests + Coverage
+    if: ${{ needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"

@@ -33,13 +33,22 @@ impl Drop for DoctorThemeGuard {
 }
 
 pub fn run(json: bool, verbose: bool) -> Result<i32> {
-    const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
-    let expected_version = option_env!("LOCALD_EXPECTED_SHIM_VERSION");
+    #[cfg(target_os = "linux")]
+    let (shim_bytes, expected_version): (Option<&[u8]>, Option<&str>) = {
+        const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
+        (
+            Some(SHIM_BYTES),
+            option_env!("LOCALD_EXPECTED_SHIM_VERSION"),
+        )
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let (shim_bytes, expected_version): (Option<&[u8]>, Option<&str>) = (None, None);
 
     let report = locald_utils::privileged::collect_report(AcquireConfig {
         verbose,
         expected_shim_version: expected_version,
-        expected_shim_bytes: Some(SHIM_BYTES),
+        expected_shim_bytes: shim_bytes,
     })?;
 
     if json {

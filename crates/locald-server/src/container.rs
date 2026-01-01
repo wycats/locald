@@ -76,8 +76,11 @@ impl ContainerManager {
                 workdir: None,
             }));
 
+        #[cfg(target_os = "linux")]
         let cgroup_path =
             locald_utils::cgroup::maybe_cgroup_path_for_leaf(&format!("adhoc-{container_id}"));
+        #[cfg(not(target_os = "linux"))]
+        let cgroup_path: Option<String> = None;
 
         let spec = generate_from_service(
             &service_config,

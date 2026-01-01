@@ -9,6 +9,9 @@ locald-docs/node_modules/
 locald-docs/dist/
 locald-server/src/assets/docs/
 
+# Private files (not for public repo)
+.private/
+
 .locald/
 buildpacks/
 layers/

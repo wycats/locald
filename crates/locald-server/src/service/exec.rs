@@ -93,7 +93,10 @@ impl ServiceController for ExecController {
 
     async fn prepare(&mut self) -> Result<()> {
         // Phase 99: only set cgroupsPath once the cgroup root exists (admin setup).
-        self.cgroup_path = locald_utils::cgroup::maybe_cgroup_path_for_service(&self.id);
+        #[cfg(target_os = "linux")]
+        {
+            self.cgroup_path = locald_utils::cgroup::maybe_cgroup_path_for_service(&self.id);
+        }
 
         match &self.config {
             ServiceConfig::Typed(TypedServiceConfig::Exec(c)) | ServiceConfig::Legacy(c) => {

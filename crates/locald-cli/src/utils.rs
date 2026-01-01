@@ -145,14 +145,107 @@ fn try_auto_fix_shim() -> bool {
     }
 }
 
+/// Offer interactive first-run setup when no shim is installed.
+/// Returns true if setup was completed successfully.
+#[cfg(target_os = "linux")]
+fn offer_first_run_setup() -> bool {
+    use dialoguer::Confirm;
+    use std::io::IsTerminal;
+
+    // Only offer interactive setup if stdin is a TTY
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{} locald-shim is not installed.", style::CROSS);
+        eprintln!();
+        eprintln!("Run: sudo locald admin setup");
+        eprintln!();
+        eprintln!("Or use the install script:");
+        eprintln!(
+            "  curl -fsSL https://raw.githubusercontent.com/wycats/locald/main/install.sh | sh"
+        );
+        std::process::exit(1);
+    }
+
+    eprintln!();
+    eprintln!("{}  Welcome to locald!", style::ROCKET);
+    eprintln!();
+    eprintln!("locald requires a one-time privileged setup to:");
+    eprintln!(
+        "  {} Install the process supervisor (locald-shim)",
+        style::DOT
+    );
+    eprintln!("  {} Configure cgroups for process isolation", style::DOT);
+    eprintln!("  {} Set up HTTPS certificates (optional)", style::DOT);
+    eprintln!();
+
+    let run_setup = Confirm::new()
+        .with_prompt("Run `sudo locald admin setup` now?")
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+
+    if run_setup {
+        let exe_path = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to get executable path: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let status = std::process::Command::new("sudo")
+            .arg("--")
+            .arg(&exe_path)
+            .arg("admin")
+            .arg("setup")
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                eprintln!();
+                eprintln!(
+                    "{} Setup complete! Continuing with your command...",
+                    style::CHECK
+                );
+                eprintln!();
+                true // Continue with original command
+            }
+            Ok(s) => {
+                eprintln!("Setup failed with exit code: {:?}", s.code());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to run setup: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!();
+        eprintln!("Setup skipped. Run manually when ready:");
+        eprintln!("  sudo locald admin setup");
+        eprintln!();
+        // Exit because we can't proceed without shim
+        std::process::exit(0);
+    }
+}
+
 pub fn verify_shim() {
     #[cfg(target_os = "linux")]
     {
+        // Skip shim verification in sandbox mode (used for testing)
+        if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
+            return;
+        }
+
+        // Skip shim verification when explicitly disabled (for testing)
+        if std::env::var("LOCALD_SKIP_SHIM_CHECK").is_ok() {
+            return;
+        }
+
         // Only check if we are NOT already running under the shim
         if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
-            if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
-                #[cfg(debug_assertions)]
-                {
+            match locald_utils::shim::find_privileged() {
+                Ok(Some(shim_path)) => {
+                    // Shim exists, verify integrity
                     const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
                     match locald_utils::shim::verify_integrity(&shim_path, SHIM_BYTES) {
                         Ok(true) => {
@@ -173,37 +266,19 @@ pub fn verify_shim() {
                         }
                         Err(e) => {
                             eprintln!("{} Failed to verify locald-shim: {}", style::CROSS, e);
-                            // If we can't verify, it's safer to exit.
                             std::process::exit(1);
                         }
                     }
                 }
-
-                #[cfg(not(debug_assertions))]
-                {
-                    const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
-                    match locald_utils::shim::verify_integrity(&shim_path, SHIM_BYTES) {
-                        Ok(true) => {
-                            // Shim is up to date
-                        }
-                        Ok(false) => {
-                            eprintln!("{} locald-shim is outdated or modified.", style::CROSS);
-
-                            if try_auto_fix_shim() {
-                                return;
-                            }
-
-                            eprintln!(
-                                "Run: `{}`",
-                                crate::hints::admin_setup_command_for_current_exe()
-                            );
-                            std::process::exit(1);
-                        }
-                        Err(e) => {
-                            eprintln!("{} Failed to verify shim: {}", style::CROSS, e);
-                            std::process::exit(1);
-                        }
-                    }
+                Ok(None) => {
+                    // No shim found - this is first run!
+                    // Offer interactive setup if in a TTY
+                    offer_first_run_setup();
+                    // If offer_first_run_setup returns, setup was successful
+                }
+                Err(e) => {
+                    eprintln!("{} Failed to check for locald-shim: {}", style::CROSS, e);
+                    std::process::exit(1);
                 }
             }
         }

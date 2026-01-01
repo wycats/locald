@@ -20,6 +20,14 @@
         "global": true,
         "hidden": false,
         "positional": false
+      },
+      {
+        "long": "version",
+        "short": "V",
+        "aliases": [],
+        "global": false,
+        "hidden": false,
+        "positional": false
       }
     ],
     "subcommands": [
@@ -347,62 +355,6 @@
         ]
       },
       {
-        "name": "build",
-        "aliases": [],
-        "hidden": false,
-        "args": [
-          {
-            "long": "builder",
-            "short": null,
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": "buildpack",
-            "short": "b",
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": "help",
-            "short": "h",
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": "sandbox",
-            "short": null,
-            "aliases": [],
-            "global": true,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": "verbose",
-            "short": "v",
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": null,
-            "short": null,
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": true
-          }
-        ],
-        "subcommands": []
-      },
-      {
         "name": "config",
         "aliases": [],
         "hidden": false,
@@ -475,109 +427,6 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
-              }
-            ],
-            "subcommands": []
-          }
-        ]
-      },
-      {
-        "name": "container",
-        "aliases": [],
-        "hidden": false,
-        "args": [
-          {
-            "long": "help",
-            "short": "h",
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": "sandbox",
-            "short": null,
-            "aliases": [],
-            "global": true,
-            "hidden": false,
-            "positional": false
-          }
-        ],
-        "subcommands": [
-          {
-            "name": "help",
-            "aliases": [],
-            "hidden": false,
-            "args": [],
-            "subcommands": [
-              {
-                "name": "help",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              },
-              {
-                "name": "run",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              }
-            ]
-          },
-          {
-            "name": "run",
-            "aliases": [],
-            "hidden": false,
-            "args": [
-              {
-                "long": "detached",
-                "short": "d",
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "help",
-                "short": "h",
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "interactive",
-                "short": "i",
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "sandbox",
-                "short": null,
-                "aliases": [],
-                "global": true,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": null,
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": true
-              },
-              {
-                "long": null,
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": true
               }
             ],
             "subcommands": []
@@ -800,13 +649,6 @@
             ]
           },
           {
-            "name": "build",
-            "aliases": [],
-            "hidden": false,
-            "args": [],
-            "subcommands": []
-          },
-          {
             "name": "config",
             "aliases": [],
             "hidden": false,
@@ -814,21 +656,6 @@
             "subcommands": [
               {
                 "name": "show",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              }
-            ]
-          },
-          {
-            "name": "container",
-            "aliases": [],
-            "hidden": false,
-            "args": [],
-            "subcommands": [
-              {
-                "name": "run",
                 "aliases": [],
                 "hidden": false,
                 "args": [],
@@ -899,35 +726,6 @@
             "hidden": false,
             "args": [],
             "subcommands": []
-          },
-          {
-            "name": "plugin",
-            "aliases": [],
-            "hidden": false,
-            "args": [],
-            "subcommands": [
-              {
-                "name": "inspect",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              },
-              {
-                "name": "install",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              },
-              {
-                "name": "validate",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              }
-            ]
           },
           {
             "name": "registry",
@@ -1214,259 +1012,6 @@
           }
         ],
         "subcommands": []
-      },
-      {
-        "name": "plugin",
-        "aliases": [],
-        "hidden": false,
-        "args": [
-          {
-            "long": "help",
-            "short": "h",
-            "aliases": [],
-            "global": false,
-            "hidden": false,
-            "positional": false
-          },
-          {
-            "long": "sandbox",
-            "short": null,
-            "aliases": [],
-            "global": true,
-            "hidden": false,
-            "positional": false
-          }
-        ],
-        "subcommands": [
-          {
-            "name": "help",
-            "aliases": [],
-            "hidden": false,
-            "args": [],
-            "subcommands": [
-              {
-                "name": "help",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              },
-              {
-                "name": "inspect",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              },
-              {
-                "name": "install",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              },
-              {
-                "name": "validate",
-                "aliases": [],
-                "hidden": false,
-                "args": [],
-                "subcommands": []
-              }
-            ]
-          },
-          {
-            "name": "inspect",
-            "aliases": [],
-            "hidden": false,
-            "args": [
-              {
-                "long": "config",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "depends-on",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "grant",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "help",
-                "short": "h",
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "kind",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "name",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "sandbox",
-                "short": null,
-                "aliases": [],
-                "global": true,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": null,
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": true
-              }
-            ],
-            "subcommands": []
-          },
-          {
-            "name": "install",
-            "aliases": [],
-            "hidden": false,
-            "args": [
-              {
-                "long": "help",
-                "short": "h",
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "name",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "project",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "sandbox",
-                "short": null,
-                "aliases": [],
-                "global": true,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": null,
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": true
-              }
-            ],
-            "subcommands": []
-          },
-          {
-            "name": "validate",
-            "aliases": [],
-            "hidden": false,
-            "args": [
-              {
-                "long": "config",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "depends-on",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "grant",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "help",
-                "short": "h",
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "kind",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "name",
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": "sandbox",
-                "short": null,
-                "aliases": [],
-                "global": true,
-                "hidden": false,
-                "positional": false
-              },
-              {
-                "long": null,
-                "short": null,
-                "aliases": [],
-                "global": false,
-                "hidden": false,
-                "positional": true
-              }
-            ],
-            "subcommands": []
-          }
-        ]
       },
       {
         "name": "registry",

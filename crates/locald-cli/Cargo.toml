@@ -5,10 +5,42 @@ edition.workspace = true
 
 [features]
 # Default builds include the embedded dashboard + docs UI.
-default = ["ui"]
+default = ["ui", "channel-stable"]
 
 # Builds locald with embedded UI assets (delegates to locald-server).
 ui = ["locald-server/ui"]
+
+# =============================================================================
+# CHANNEL FEATURES
+# =============================================================================
+# See workspace Cargo.toml for channel documentation.
+
+# Stable channel (default)
+channel-stable = []
+
+# Beta channel: features graduating to stable.
+# NOTE: At present, beta intentionally mirrors channel-stable and does not
+#       enable additional experimental features. This placeholder exists so
+#       that features can be promoted from nightly to beta in future releases
+#       without changing existing stable behavior.
+channel-beta = ["channel-stable"]
+
+# Nightly channel: includes all experimental features
+channel-nightly = [
+    "channel-beta",
+    "experimental-plugins",
+    "experimental-vmm",
+    "experimental-cnb",
+    "experimental-containers",
+]
+
+# -----------------------------------------------------------------------------
+# Experimental feature flags
+# -----------------------------------------------------------------------------
+experimental-plugins = []    # WASM plugin system (locald plugin ...)
+experimental-vmm = []        # Placeholder for planned VMM support; no functionality yet
+experimental-cnb = []        # Cloud Native Buildpacks (locald build)
+experimental-containers = [] # OCI container execution (locald container ...)
 
 [[bin]]
 name = "locald"
@@ -17,7 +49,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.100"
 ca_injector = "0.1.2"
-caps = "0.5.6"
 chrono = "0.4.38"
 clap = { version = "4.5.53", features = ["derive"] }
 cliclack = "0.3.7"
@@ -47,6 +78,21 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.9.8"
 tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
+
+# =============================================================================
+# BINSTALL METADATA
+# =============================================================================
+# Enables `cargo binstall locald` to download pre-built binaries from GitHub Releases.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/locald-{ target }{ archive-suffix }"
+bin-dir = "locald{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/locald-linux-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/locald-linux-aarch64.tar.gz"
 
 [lints]
 workspace = true

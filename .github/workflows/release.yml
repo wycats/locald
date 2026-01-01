@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # ==========================================================================
+  # Build Linux binaries (x86_64 and ARM64)
+  # ==========================================================================
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact_name: locald-linux-x86_64
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            artifact_name: locald-linux-aarch64
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (ARM64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ matrix.target }}-
+
+      - name: Build locald
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --bin locald --target ${{ matrix.target }}
+
+      - name: Build locald-shim
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --bin locald-shim --target ${{ matrix.target }}
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/locald dist/
+          cp target/${{ matrix.target }}/release/locald-shim dist/
+          tar -czvf ${{ matrix.artifact_name }}.tar.gz -C dist locald locald-shim
+          sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+
+      - name: Smoke test (native only)
+        if: ${{ !matrix.cross }}
+        run: |
+          ./dist/locald --version
+          ./dist/locald --help
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.tar.gz.sha256
+
+  # ==========================================================================
+  # Create GitHub Release
+  # ==========================================================================
+  create-release:
+    name: Create Release
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          # Flatten all artifacts into release directory
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release/ \;
+          # Generate combined checksum file
+          cd release
+          cat *.sha256 > SHA256SUMS.txt
+          ls -la
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: locald ${{ github.ref_name }}
+          body: |
+            ## Installation
+
+            ### Quick install (Linux)
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            ### Using cargo-binstall
+            ```bash
+            cargo binstall locald
+            ```
+
+            ### Manual download
+            Download the appropriate binary for your platform below, extract, and run:
+            ```bash
+            tar -xzf locald-linux-x86_64.tar.gz
+            sudo install -m 755 locald /usr/local/bin/
+            sudo install -m 4755 locald-shim /usr/local/bin/
+            # Or run: sudo locald admin setup
+            ```
+
+            ## Checksums
+            SHA256 checksums are available in `SHA256SUMS.txt` and as individual `.sha256` files.
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

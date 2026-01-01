@@ -3,13 +3,20 @@ use crossterm::style::Stylize;
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use std::collections::HashSet;
 
+#[cfg(feature = "experimental-cnb")]
+use crate::build;
+#[cfg(feature = "experimental-plugins")]
+use crate::cli::PluginCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    PluginCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
+#[cfg(feature = "experimental-containers")]
+use crate::container;
+#[cfg(feature = "experimental-plugins")]
+use crate::plugin;
 use crate::{
-    build, client, container, debug, doctor, history, init, monitor, plugin, run, service, style,
-    trust, try_cmd, utils,
+    client, debug, doctor, history, init, monitor, run, service, style, trust, try_cmd, utils,
 };
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -17,6 +24,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Init => {
             init::run()?;
         }
+        #[cfg(feature = "experimental-cnb")]
         Commands::Build {
             path,
             builder,
@@ -427,8 +435,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Admin { command } => {
             match command {
                 AdminCommands::Setup => {
-                    const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
-
                     #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
                         use crossterm::tty::IsTty;
@@ -470,6 +476,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
                     #[cfg(target_os = "linux")]
                     {
+                        const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
                         cliclack::intro("locald admin setup")?;
 
                         let exe_path = std::env::current_exe()?;
@@ -855,6 +862,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        #[cfg(feature = "experimental-containers")]
         Commands::Container { command } => match command {
             crate::cli::ContainerCommands::Run {
                 image,
@@ -867,6 +875,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         },
 
+        #[cfg(feature = "experimental-plugins")]
         Commands::Plugin { command } => match command {
             PluginCommands::Install {
                 source,
