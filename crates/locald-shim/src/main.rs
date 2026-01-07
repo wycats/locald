@@ -1,3 +1,6 @@
+mod daemon;
+mod protocol;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use listeners::get_all;
@@ -29,6 +32,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run the shim daemon (listens on ~/.locald/shim.sock).
+    Serve(ServeArgs),
+
     /// Execute an OCI bundle.
     Bundle {
         #[command(subcommand)]
@@ -49,6 +55,18 @@ enum Commands {
         #[command(subcommand)]
         command: DebugCommand,
     },
+}
+
+/// Arguments for the `serve` subcommand.
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Run in foreground (don't daemonize).
+    #[arg(long, short = 'f')]
+    foreground: bool,
+
+    /// Idle timeout in seconds before the daemon shuts down (default: 300).
+    #[arg(long, default_value = "300")]
+    idle_timeout: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -420,6 +438,63 @@ fn ensure_cgroup2_mount() -> Result<()> {
     Ok(())
 }
 
+fn looks_like_systemctl_connectivity_failure(stderr: &str) -> bool {
+    // What we see in Toolbx/Distrobox/containers when PID 1 is systemd (host) but the
+    // container doesn't have access to systemd's private socket / D-Bus transport.
+    let s = stderr.to_lowercase();
+    s.contains("failed to connect to system scope bus")
+        || s.contains("failed to connect to bus")
+        || s.contains("no such file or directory")
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    meta.is_file() && (meta.permissions().mode() & 0o111) != 0
+}
+
+fn command_exists(name: &str) -> bool {
+    if name.contains('/') {
+        return is_executable(Path::new(name));
+    }
+
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn host_exec_hint() -> Option<String> {
+    let mut hints = Vec::new();
+
+    if command_exists("distrobox-host-exec") {
+        hints.push("distrobox-host-exec".to_string());
+    }
+
+    // flatpak-spawn is available in Flatpak sandboxes, but can also work in other environments
+    // if the org.freedesktop.Flatpak D-Bus interface is available.
+    if command_exists("flatpak-spawn") {
+        hints.push("flatpak-spawn --host".to_string());
+    }
+
+    if hints.is_empty() {
+        None
+    } else {
+        Some(hints.join(" or "))
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 fn write_file(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("Failed to write {}", path.display()))
@@ -457,24 +532,34 @@ fn cgroup_setup_systemd() -> Result<()> {
     write_file(unit_path, unit)?;
 
     // Reload systemd so the slice exists.
-    let status = std::process::Command::new("systemctl")
+    let output = std::process::Command::new("systemctl")
         .arg("daemon-reload")
-        .status()
+        .output()
         .context("Failed to execute systemctl daemon-reload")?;
 
-    if !status.success() {
-        anyhow::bail!("systemctl daemon-reload failed: {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "systemctl daemon-reload failed: {}\nstderr: {}",
+            output.status,
+            stderr.trim()
+        );
     }
 
     // Ensure the slice is actually realized in the cgroup tree.
-    let status = std::process::Command::new("systemctl")
+    let output = std::process::Command::new("systemctl")
         .arg("start")
         .arg("locald.slice")
-        .status()
+        .output()
         .context("Failed to execute systemctl start locald.slice")?;
 
-    if !status.success() {
-        anyhow::bail!("systemctl start locald.slice failed: {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "systemctl start locald.slice failed: {}\nstderr: {}",
+            output.status,
+            stderr.trim()
+        );
     }
 
     Ok(())
@@ -500,16 +585,52 @@ fn cgroup_setup_driver() -> Result<()> {
 
 fn cgroup_setup() -> Result<()> {
     if is_systemd_present() {
-        cgroup_setup_systemd()?;
+        match cgroup_setup_systemd() {
+            Ok(()) => {
+                // Best-effort check: locald.slice should now exist.
+                let slice = Path::new("/sys/fs/cgroup/locald.slice");
+                if !slice.exists() {
+                    // If systemd didn't materialize the slice inside this environment,
+                    // fall back to the direct driver setup.
+                    cgroup_setup_driver()
+                        .context("systemd setup completed but locald.slice did not appear")?;
+                }
+                Ok(())
+            }
+            Err(systemd_err) => {
+                // systemd may be PID 1 (host) but systemctl is unusable inside this environment.
+                // Try direct setup; if that fails, return a combined, actionable error.
+                let hint = host_exec_hint();
+                let sysmsg = systemd_err.to_string();
 
-        // Best-effort check: locald.slice should now exist.
-        let slice = Path::new("/sys/fs/cgroup/locald.slice");
-        if !slice.exists() {
-            anyhow::bail!(
-                "systemd is present but /sys/fs/cgroup/locald.slice did not appear after setup"
-            );
+                match cgroup_setup_driver() {
+                    Ok(()) => Ok(()),
+                    Err(driver_err) => {
+                        let mut ctx = String::from(
+                            "systemd is PID 1 but systemctl appears unusable in this environment; falling back to direct cgroup setup also failed",
+                        );
+
+                        if looks_like_systemctl_connectivity_failure(&sysmsg) {
+                            ctx.push_str(
+                                ". This is common inside Toolbx/Distrobox/containers where systemd sockets are not available.",
+                            );
+                        }
+
+                        if let Some(h) = hint {
+                            ctx.push_str(&format!(
+                                " You may need to run `locald admin setup` on the host or use {h} to run host commands.",
+                            ));
+                        } else {
+                            ctx.push_str(" You may need to run `locald admin setup` on the host.");
+                        }
+
+                        Err(driver_err)
+                            .with_context(|| ctx)
+                            .with_context(|| format!("systemd setup error was: {sysmsg}"))
+                    }
+                }
+            }
         }
-        Ok(())
     } else {
         cgroup_setup_driver()
     }
@@ -711,6 +832,16 @@ fn main() -> Result<()> {
     }
 
     match command {
+        Commands::Serve(args) => {
+            // Run the shim daemon
+            let config = daemon::DaemonConfig {
+                foreground: args.foreground,
+                idle_timeout: std::time::Duration::from_secs(args.idle_timeout),
+                ..Default::default()
+            };
+            daemon::serve(config)?;
+            Ok(())
+        }
         Commands::Bundle {
             command: BundleCommand::Run(args),
         } => {
