@@ -4,7 +4,7 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 /// Find the locald-shim binary and ensure it has the correct permissions.
 ///
@@ -293,4 +293,120 @@ pub fn ensure_permissions_with_sudo(shim_path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub fn ensure_permissions_with_sudo(_shim_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// The standard directory where polkit policy files are installed.
+pub const POLKIT_ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
+
+/// The name of the locald polkit policy file.
+pub const POLKIT_POLICY_FILENAME: &str = "dev.locald.policy";
+
+/// Check if polkit is available on the system.
+///
+/// This checks:
+/// 1. The polkit actions directory exists
+/// 2. The `pkexec` command is available in PATH
+#[cfg(unix)]
+pub fn is_polkit_available() -> bool {
+    use std::path::Path;
+
+    // Check if polkit actions directory exists
+    if !Path::new(POLKIT_ACTIONS_DIR).is_dir() {
+        return false;
+    }
+
+    // Check if pkexec is available
+    is_command_available("pkexec")
+}
+
+/// Check if a command is available in PATH.
+#[cfg(unix)]
+fn is_command_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.exists() && candidate.is_file() {
+            // Check if executable
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                use std::os::unix::fs::PermissionsExt;
+                if (meta.permissions().mode() & 0o111) != 0 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(not(unix))]
+pub fn is_polkit_available() -> bool {
+    false
+}
+
+/// Install the polkit policy file to enable GUI-based privilege escalation.
+///
+/// This copies the policy file to `/usr/share/polkit-1/actions/` which allows
+/// users to use `pkexec locald shim serve` for a graphical authentication dialog
+/// instead of requiring `sudo` in the terminal.
+///
+/// # Requirements
+///
+/// - Must be run as root
+/// - Polkit must be installed on the system
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The polkit actions directory doesn't exist (polkit not installed)
+/// - Writing the policy file fails
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // Synchronous I/O is appropriate during admin setup
+pub fn install_polkit_policy(policy_bytes: &[u8]) -> Result<()> {
+    use std::path::Path;
+
+    let actions_dir = Path::new(POLKIT_ACTIONS_DIR);
+
+    if !actions_dir.is_dir() {
+        anyhow::bail!(
+            "Polkit actions directory not found at {POLKIT_ACTIONS_DIR}. Is polkit installed?"
+        );
+    }
+
+    let policy_path = actions_dir.join(POLKIT_POLICY_FILENAME);
+
+    // Write the policy file
+    std::fs::write(&policy_path, policy_bytes)
+        .with_context(|| format!("Failed to write polkit policy to {}", policy_path.display()))?;
+
+    // Set appropriate permissions (644 - readable by all, writable by root)
+    let perms = std::fs::Permissions::from_mode(0o644);
+    std::fs::set_permissions(&policy_path, perms)
+        .with_context(|| format!("Failed to set permissions on {}", policy_path.display()))?;
+
+    info!("Installed polkit policy to {}", policy_path.display());
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn install_polkit_policy(_policy_bytes: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+/// Check if the polkit policy is already installed.
+#[cfg(unix)]
+pub fn is_polkit_policy_installed() -> bool {
+    use std::path::Path;
+
+    let policy_path = Path::new(POLKIT_ACTIONS_DIR).join(POLKIT_POLICY_FILENAME);
+    policy_path.exists()
+}
+
+#[cfg(not(unix))]
+pub fn is_polkit_policy_installed() -> bool {
+    false
 }

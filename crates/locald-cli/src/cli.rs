@@ -427,9 +427,18 @@ pub enum ServerCommands {
 #[derive(Subcommand)]
 pub enum AdminCommands {
     /// Setup locald permissions (requires sudo)
-    Setup,
+    Setup(AdminSetupArgs),
     /// Sync hosts file with running services (requires sudo)
     SyncHosts,
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+pub struct AdminSetupArgs {
+    /// Attempt to run setup on the host when running inside a container (eg Toolbx/Distrobox).
+    ///
+    /// This is useful when cgroup setup cannot be performed from inside the container.
+    #[arg(long)]
+    pub host: bool,
 }
 
 #[derive(Subcommand)]

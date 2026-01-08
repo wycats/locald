@@ -434,15 +434,140 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Commands::Admin { command } => {
             match command {
-                AdminCommands::Setup => {
+                // `args` is used only on Linux; suppress warning on other platforms.
+                #[allow(unused_variables)]
+                AdminCommands::Setup(args) => {
+                    #[cfg(all(unix, target_os = "linux"))]
+                    if args.host {
+                        // `--host` is intended for containerized environments (Toolbx/Distrobox)
+                        // where privileged setup must run on the host OS.
+                        #[cfg(target_os = "linux")]
+                        {
+                            use anyhow::Context;
+
+                            fn is_executable(path: &std::path::Path) -> bool {
+                                use std::os::unix::fs::PermissionsExt;
+                                let Ok(meta) = std::fs::metadata(path) else {
+                                    return false;
+                                };
+                                meta.is_file() && (meta.permissions().mode() & 0o111) != 0
+                            }
+
+                            fn command_exists(name: &str) -> bool {
+                                if name.contains('/') {
+                                    return is_executable(std::path::Path::new(name));
+                                }
+
+                                let Some(path) = std::env::var_os("PATH") else {
+                                    return false;
+                                };
+
+                                for dir in std::env::split_paths(&path) {
+                                    let candidate = dir.join(name);
+                                    if is_executable(&candidate) {
+                                        return true;
+                                    }
+                                }
+
+                                false
+                            }
+
+                            fn is_probably_container() -> bool {
+                                if std::env::var("container").is_ok() {
+                                    return true;
+                                }
+                                if std::env::var("TOOLBOX_PATH").is_ok()
+                                    || std::env::var("TOOLBOX_CONTAINER").is_ok()
+                                {
+                                    return true;
+                                }
+                                std::path::Path::new("/run/.containerenv").exists()
+                                    || std::path::Path::new("/.dockerenv").exists()
+                            }
+
+                            // If this doesn't look like a container, just proceed with local setup.
+                            if is_probably_container() {
+                                let exe_path = std::env::current_exe()
+                                    .context("Failed to resolve current executable path")?;
+
+                                // Try Flatpak host exec first (common on immutable desktops).
+                                if command_exists("flatpak-spawn") {
+                                    let status = std::process::Command::new("flatpak-spawn")
+                                        .arg("--host")
+                                        .arg("sudo")
+                                        .arg("--")
+                                        .arg(&exe_path)
+                                        .arg("admin")
+                                        .arg("setup")
+                                        .status()
+                                        .context("Failed to execute flatpak-spawn --host")?;
+
+                                    if status.success() {
+                                        return Ok(());
+                                    }
+
+                                    // Fall back to calling `locald` on the host PATH (useful when
+                                    // the current binary path is not visible on the host).
+                                    let status = std::process::Command::new("flatpak-spawn")
+                                        .arg("--host")
+                                        .arg("sudo")
+                                        .arg("--")
+                                        .arg("locald")
+                                        .arg("admin")
+                                        .arg("setup")
+                                        .status()
+                                        .context("Failed to execute flatpak-spawn --host")?;
+
+                                    if status.success() {
+                                        return Ok(());
+                                    }
+                                }
+
+                                // Distrobox provides an explicit host-exec helper.
+                                if command_exists("distrobox-host-exec") {
+                                    let status = std::process::Command::new("distrobox-host-exec")
+                                        .arg("sudo")
+                                        .arg("--")
+                                        .arg(&exe_path)
+                                        .arg("admin")
+                                        .arg("setup")
+                                        .status()
+                                        .context("Failed to execute distrobox-host-exec")?;
+
+                                    if status.success() {
+                                        return Ok(());
+                                    }
+
+                                    // Same fallback as above: run the host's `locald` if available.
+                                    let status = std::process::Command::new("distrobox-host-exec")
+                                        .arg("sudo")
+                                        .arg("--")
+                                        .arg("locald")
+                                        .arg("admin")
+                                        .arg("setup")
+                                        .status()
+                                        .context("Failed to execute distrobox-host-exec")?;
+
+                                    if status.success() {
+                                        return Ok(());
+                                    }
+                                }
+
+                                anyhow::bail!(
+                                    "Host setup requested but no host-exec mechanism succeeded.\n\nTry running `sudo locald admin setup` on the host OS. If you're in Toolbx/Distrobox, ensure the host can see your `locald` binary (your home directory is usually shared). Otherwise, install `locald` on the host PATH.\n\nIf available, you can also run setup via `flatpak-spawn --host` or `distrobox-host-exec`."
+                                );
+                            }
+                        }
+                    }
+
                     #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
                         use crossterm::tty::IsTty;
                         use std::process::Command;
 
                         // `admin setup` fundamentally requires root, but we can be friendly here:
-                        // when run from a TTY, re-exec ourselves via `sudo` so the user doesn't
-                        // have to remember to type it.
+                        // when run from a TTY, re-exec ourselves via `pkexec` (for GUI auth) or
+                        // `sudo` (fallback) so the user doesn't have to remember to type it.
                         if !std::io::stdin().is_tty() {
                             anyhow::bail!(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`."
@@ -452,16 +577,32 @@ pub fn run(cli: Cli) -> Result<()> {
                         let exe_path = std::env::current_exe()
                             .context("Failed to resolve current executable path")?;
 
-                        let mut args = std::env::args_os();
-                        let _ = args.next();
+                        let args: Vec<_> = std::env::args_os().skip(1).collect();
 
                         #[cfg(unix)]
                         {
                             use std::os::unix::process::CommandExt;
+
+                            // Prefer pkexec when polkit is available (provides GUI auth dialog).
+                            // Fall back to sudo if pkexec is not available.
+                            if locald_utils::shim::is_polkit_available() {
+                                eprintln!(
+                                    "{} Using polkit for privilege escalation (GUI auth dialog)...",
+                                    style::INFO
+                                );
+                                let err = Command::new("pkexec").arg(&exe_path).args(&args).exec();
+                                // pkexec failed, fall back to sudo
+                                eprintln!(
+                                    "{} pkexec failed ({err}), falling back to sudo...",
+                                    style::WARN
+                                );
+                            }
+
+                            // Fall back to sudo
                             let err = Command::new("sudo")
                                 .arg("--")
                                 .arg(&exe_path)
-                                .args(args)
+                                .args(&args)
                                 .exec();
                             anyhow::bail!("Failed to exec sudo for admin setup: {err}");
                         }
@@ -477,6 +618,43 @@ pub fn run(cli: Cli) -> Result<()> {
                     #[cfg(target_os = "linux")]
                     {
                         const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
+
+                        // Helper functions must be declared before any statements (clippy::items_after_statements)
+                        fn is_executable(path: &std::path::Path) -> bool {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let Ok(meta) = std::fs::metadata(path) else {
+                                    return false;
+                                };
+                                meta.is_file() && (meta.permissions().mode() & 0o111) != 0
+                            }
+
+                            #[cfg(not(unix))]
+                            {
+                                path.is_file()
+                            }
+                        }
+
+                        fn command_exists(name: &str) -> bool {
+                            if name.contains('/') {
+                                return is_executable(std::path::Path::new(name));
+                            }
+
+                            let Some(path) = std::env::var_os("PATH") else {
+                                return false;
+                            };
+
+                            for dir in std::env::split_paths(&path) {
+                                let candidate = dir.join(name);
+                                if is_executable(&candidate) {
+                                    return true;
+                                }
+                            }
+
+                            false
+                        }
+
                         cliclack::intro("locald admin setup")?;
 
                         let exe_path = std::env::current_exe()?;
@@ -488,6 +666,30 @@ pub fn run(cli: Cli) -> Result<()> {
                             s.start("Installing privileged helper...");
                             locald_utils::shim::install(&shim_path, SHIM_BYTES)?;
                             s.stop("Privileged helper installed");
+                        }
+
+                        // Install polkit policy for GUI privilege escalation (optional).
+                        // This enables `pkexec locald shim serve` to show a graphical auth dialog.
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Installing polkit policy (optional)...");
+
+                            if locald_utils::shim::is_polkit_available() {
+                                const POLKIT_POLICY_BYTES: &[u8] =
+                                    include_bytes!("../../../assets/dev.locald.policy");
+
+                                match locald_utils::shim::install_polkit_policy(POLKIT_POLICY_BYTES)
+                                {
+                                    Ok(()) => {
+                                        s.stop("Polkit policy installed");
+                                    }
+                                    Err(e) => {
+                                        s.stop(format!("Polkit policy not installed: {e}"));
+                                    }
+                                }
+                            } else {
+                                s.stop("Polkit not available (skipped)");
+                            }
                         }
 
                         // Best-effort: configure HTTPS Root CA + system trust during admin setup.
@@ -517,17 +719,41 @@ pub fn run(cli: Cli) -> Result<()> {
                         {
                             let s = cliclack::spinner();
                             s.start("Configuring cgroup root...");
-                            let status = std::process::Command::new(&shim_path)
+                            let output = std::process::Command::new(&shim_path)
                                 .arg("admin")
                                 .arg("cgroup")
                                 .arg("setup")
-                                .status()
+                                .output()
                                 .context("Failed to run locald-shim admin cgroup setup")?;
 
-                            if !status.success() {
+                            if !output.status.success() {
                                 s.error("Cgroup setup failed");
+
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                if !stderr.trim().is_empty() {
+                                    eprintln!("{stderr}");
+                                }
+
+                                let mut remediation = String::new();
+                                let stderr_lc = stderr.to_lowercase();
+                                if stderr_lc.contains("permission denied")
+                                    && stderr_lc.contains("/sys/fs/cgroup")
+                                {
+                                    remediation.push_str("\n\nThis looks like a containerized environment where cgroup v2 is mounted read-only. `locald admin setup` must be run on the host OS.");
+
+                                    // Suggest common host-exec mechanisms when present.
+                                    // We only print hints here; we intentionally do not auto-reexec.
+                                    if command_exists("flatpak-spawn") {
+                                        remediation.push_str("\nIf available, you can run: flatpak-spawn --host sudo -- locald admin setup");
+                                    }
+                                    if command_exists("distrobox-host-exec") {
+                                        remediation.push_str("\nIf available, you can run: distrobox-host-exec sudo -- locald admin setup");
+                                    }
+                                }
+
                                 anyhow::bail!(
-                                    "locald-shim admin cgroup setup failed with status: {status}"
+                                    "locald-shim admin cgroup setup failed with status: {}{remediation}",
+                                    output.status
                                 );
                             }
                             s.stop("Cgroup root configured");
@@ -544,6 +770,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 verbose: false,
                                 expected_shim_version: expected_version,
                                 expected_shim_bytes: Some(SHIM_BYTES),
+                                allow_socket: true,
                             })?;
 
                             if report.has_critical_failures() {

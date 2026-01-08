@@ -1,5 +1,5 @@
 pub mod global;
-pub use global::GlobalConfig;
+pub use global::{ContainerConfig, GlobalConfig};
 
 pub mod env_provenance;
 pub use env_provenance::{

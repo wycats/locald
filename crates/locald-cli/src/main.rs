@@ -79,7 +79,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
     if !matches!(
         cli.command,
         cli::Commands::Admin {
-            command: cli::AdminCommands::Setup
+            command: cli::AdminCommands::Setup(_)
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
     ) {

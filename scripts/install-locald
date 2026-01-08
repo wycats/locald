@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Install locald CLI to the appropriate location.
+#
+# In XDG environments (detected by ~/.local/bin existing or XDG_DATA_HOME being set),
+# installs to ~/.local/bin. Otherwise, uses cargo's default (~/.cargo/bin).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Detect XDG environment
+is_xdg_env() {
+    # If XDG_DATA_HOME is set, assume XDG
+    [[ -n "${XDG_DATA_HOME:-}" ]] && return 0
+
+    # If ~/.local/bin exists and is in PATH, assume XDG
+    if [[ -d "$HOME/.local/bin" ]]; then
+        case ":$PATH:" in
+            *":$HOME/.local/bin:"*) return 0 ;;
+        esac
+    fi
+
+    return 1
+}
+
+INSTALL_ARGS=(install --path "$REPO_ROOT/crates/locald-cli" --locked)
+
+if is_xdg_env; then
+    echo "Detected XDG environment; installing to ~/.local/bin"
+    INSTALL_ARGS+=(--root "$HOME/.local")
+else
+    echo "Using default cargo install location (~/.cargo/bin)"
+fi
+
+# Pass through any extra args (e.g., --force)
+INSTALL_ARGS+=("$@")
+
+exec cargo "${INSTALL_ARGS[@]}"

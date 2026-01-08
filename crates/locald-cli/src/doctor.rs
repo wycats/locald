@@ -49,6 +49,7 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         verbose,
         expected_shim_version: expected_version,
         expected_shim_bytes: shim_bytes,
+        allow_socket: true,
     })?;
 
     if json {

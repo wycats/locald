@@ -2925,12 +2925,16 @@ dependencies = [
  "ca_injector",
  "caps",
  "clap",
+ "daemonize",
  "libc",
  "libcontainer",
  "listeners",
  "nix 0.30.1",
  "rcgen",
+ "serde",
+ "serde_json",
  "signal-hook",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

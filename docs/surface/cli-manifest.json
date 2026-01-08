@@ -216,6 +216,14 @@
                 "positional": false
               },
               {
+                "long": "host",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": "sandbox",
                 "short": null,
                 "aliases": [],

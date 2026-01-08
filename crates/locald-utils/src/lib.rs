@@ -28,3 +28,6 @@ pub mod process;
 pub mod project;
 /// Shim management utilities.
 pub mod shim;
+/// Shim daemon client for socket-based privilege delegation.
+#[cfg(target_os = "linux")]
+pub mod shim_client;
