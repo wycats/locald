@@ -385,7 +385,12 @@ fn offer_first_run_setup() -> bool {
     if !std::io::stdin().is_terminal() {
         eprintln!("{} locald-shim is not installed.", style::CROSS);
         eprintln!();
-        eprintln!("Run: sudo locald admin setup");
+        if locald_utils::shim::is_polkit_available() {
+            eprintln!("Run: pkexec locald admin setup  (GUI auth dialog)");
+            eprintln!("  or: sudo locald admin setup");
+        } else {
+            eprintln!("Run: sudo locald admin setup");
+        }
         eprintln!();
         eprintln!("Or use the install script:");
         eprintln!(
@@ -406,8 +411,14 @@ fn offer_first_run_setup() -> bool {
     eprintln!("  {} Set up HTTPS certificates (optional)", style::DOT);
     eprintln!();
 
+    // Check if polkit is available for privilege escalation.
+    // This provides a GUI auth dialog instead of requiring terminal sudo.
+    let use_pkexec = locald_utils::shim::is_polkit_available();
+
     let setup_prompt = if should_attempt_host_setup() {
         "Run `locald admin setup --host` now?"
+    } else if use_pkexec {
+        "Run `pkexec locald admin setup` now? (GUI auth dialog)"
     } else {
         "Run `sudo locald admin setup` now?"
     };
@@ -437,6 +448,34 @@ fn offer_first_run_setup() -> bool {
                 .arg("setup")
                 .arg("--host")
                 .status()
+        } else if use_pkexec {
+            // Use pkexec for GUI-based privilege escalation
+            eprintln!(
+                "{} Using polkit for privilege escalation (GUI auth dialog)...",
+                style::INFO
+            );
+            let pkexec_result = std::process::Command::new("pkexec")
+                .arg(&exe_path)
+                .arg("admin")
+                .arg("setup")
+                .status();
+
+            // If pkexec fails (e.g., user cancelled dialog), try sudo as fallback
+            match &pkexec_result {
+                Ok(s) if s.success() => pkexec_result,
+                _ => {
+                    eprintln!(
+                        "{} pkexec failed or was cancelled, falling back to sudo...",
+                        style::WARN
+                    );
+                    std::process::Command::new("sudo")
+                        .arg("--")
+                        .arg(&exe_path)
+                        .arg("admin")
+                        .arg("setup")
+                        .status()
+                }
+            }
         } else {
             std::process::Command::new("sudo")
                 .arg("--")
@@ -468,7 +507,12 @@ fn offer_first_run_setup() -> bool {
     } else {
         eprintln!();
         eprintln!("Setup skipped. Run manually when ready:");
-        eprintln!("  sudo locald admin setup");
+        if use_pkexec {
+            eprintln!("  pkexec locald admin setup  (GUI auth dialog)");
+            eprintln!("  or: sudo locald admin setup");
+        } else {
+            eprintln!("  sudo locald admin setup");
+        }
         eprintln!();
         // Exit because we can't proceed without shim
         std::process::exit(0);

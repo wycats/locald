@@ -564,8 +564,8 @@ pub fn run(cli: Cli) -> Result<()> {
                         use std::process::Command;
 
                         // `admin setup` fundamentally requires root, but we can be friendly here:
-                        // when run from a TTY, re-exec ourselves via `sudo` so the user doesn't
-                        // have to remember to type it.
+                        // when run from a TTY, re-exec ourselves via `pkexec` (for GUI auth) or
+                        // `sudo` (fallback) so the user doesn't have to remember to type it.
                         if !std::io::stdin().is_tty() {
                             anyhow::bail!(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`."
@@ -575,16 +575,32 @@ pub fn run(cli: Cli) -> Result<()> {
                         let exe_path = std::env::current_exe()
                             .context("Failed to resolve current executable path")?;
 
-                        let mut args = std::env::args_os();
-                        let _ = args.next();
+                        let args: Vec<_> = std::env::args_os().skip(1).collect();
 
                         #[cfg(unix)]
                         {
                             use std::os::unix::process::CommandExt;
+
+                            // Prefer pkexec when polkit is available (provides GUI auth dialog).
+                            // Fall back to sudo if pkexec is not available.
+                            if locald_utils::shim::is_polkit_available() {
+                                eprintln!(
+                                    "{} Using polkit for privilege escalation (GUI auth dialog)...",
+                                    style::INFO
+                                );
+                                let err = Command::new("pkexec").arg(&exe_path).args(&args).exec();
+                                // pkexec failed, fall back to sudo
+                                eprintln!(
+                                    "{} pkexec failed ({err}), falling back to sudo...",
+                                    style::WARN
+                                );
+                            }
+
+                            // Fall back to sudo
                             let err = Command::new("sudo")
                                 .arg("--")
                                 .arg(&exe_path)
-                                .args(args)
+                                .args(&args)
                                 .exec();
                             anyhow::bail!("Failed to exec sudo for admin setup: {err}");
                         }
@@ -648,6 +664,30 @@ pub fn run(cli: Cli) -> Result<()> {
                             s.start("Installing privileged helper...");
                             locald_utils::shim::install(&shim_path, SHIM_BYTES)?;
                             s.stop("Privileged helper installed");
+                        }
+
+                        // Install polkit policy for GUI privilege escalation (optional).
+                        // This enables `pkexec locald shim serve` to show a graphical auth dialog.
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Installing polkit policy (optional)...");
+
+                            if locald_utils::shim::is_polkit_available() {
+                                const POLKIT_POLICY_BYTES: &[u8] =
+                                    include_bytes!("../../../assets/dev.locald.policy");
+
+                                match locald_utils::shim::install_polkit_policy(POLKIT_POLICY_BYTES)
+                                {
+                                    Ok(()) => {
+                                        s.stop("Polkit policy installed");
+                                    }
+                                    Err(e) => {
+                                        s.stop(format!("Polkit policy not installed: {e}"));
+                                    }
+                                }
+                            } else {
+                                s.stop("Polkit not available (skipped)");
+                            }
                         }
 
                         // Best-effort: configure HTTPS Root CA + system trust during admin setup.
