@@ -109,6 +109,7 @@ pub fn ensure_daemon_running() -> Result<()> {
     anyhow::bail!("Timed out waiting for locald to start")
 }
 
+#[cfg(target_os = "linux")]
 fn try_auto_fix_shim() -> bool {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {

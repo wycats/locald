@@ -434,6 +434,8 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Commands::Admin { command } => {
             match command {
+                // `args` is used only on Linux; suppress warning on other platforms.
+                #[allow(unused_variables)]
                 AdminCommands::Setup(args) => {
                     #[cfg(all(unix, target_os = "linux"))]
                     if args.host {
