@@ -768,6 +768,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 verbose: false,
                                 expected_shim_version: expected_version,
                                 expected_shim_bytes: Some(SHIM_BYTES),
+                                allow_socket: true,
                             })?;
 
                             if report.has_critical_failures() {
