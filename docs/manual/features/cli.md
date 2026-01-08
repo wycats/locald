@@ -37,3 +37,65 @@ locald run web -- rails db:migrate
 ```
 
 Note: This runs the command _locally_ on your machine (as a host process), but with the environment configuration of the service.
+
+## Diagnostics
+
+### `locald doctor`
+
+Diagnose host readiness for running `locald` and print actionable fixes.
+
+```bash
+# Human-readable output
+locald doctor
+
+# Machine-readable JSON (for CI)
+locald doctor --json
+
+# Verbose mode with extra details
+locald doctor --verbose
+```
+
+Checks:
+- Shim availability and permissions
+- Socket connectivity (in container environments)
+- Cgroup readiness
+
+See [locald doctor reference](doctor.md) for detailed documentation.
+
+## Administration
+
+### `locald admin setup`
+
+Install privileged components (setuid shim, cgroup root).
+
+```bash
+sudo locald admin setup
+```
+
+This command:
+1. Extracts the embedded shim binary
+2. Sets up permissions (root-owned, setuid)
+3. Configures cgroups for process isolation
+4. Installs polkit policy for GUI authentication
+
+### `locald shim serve`
+
+Start the shim daemon for container environments.
+
+```bash
+# Run in background (default)
+sudo locald shim serve
+
+# Run in foreground (for debugging)
+sudo locald shim serve --foreground
+
+# Custom socket path
+sudo locald shim serve --socket /run/user/1000/locald/shim.sock
+```
+
+The daemon:
+- Listens on `~/.locald/shim.sock`
+- Handles privileged operations (hosts sync, port binding, cgroups)
+- Auto-exits after 5 minutes idle or 1 hour max lifetime
+
+See [Container Development Environments](../development/container-environments.md) for the complete guide.
