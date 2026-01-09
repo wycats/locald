@@ -247,22 +247,177 @@ fn allocate_port_for_service(
     Ok(output)
 }
 
-fn apply_declare_service(
-    config: &mut LocaldConfig,
+/// Classify a service by its runtime type.
+fn classify_service_type(svc: &ServiceConfig) -> &str {
+    match svc {
+        ServiceConfig::Typed(TypedServiceConfig::Exec(_)) | ServiceConfig::Legacy(_) => "exec",
+        ServiceConfig::Typed(TypedServiceConfig::Worker(_)) => "worker",
+        ServiceConfig::Typed(TypedServiceConfig::Container(_)) => "container",
+        ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => "postgres",
+        ServiceConfig::Typed(TypedServiceConfig::Site(_)) => "site",
+    }
+}
+
+/// Merge common service config fields with "User Wins" priority.
+fn merge_common(existing: &mut CommonServiceConfig, plugin: &CommonServiceConfig) {
+    // Env: plugin provides base, user overrides on conflict
+    for (key, value) in &plugin.env {
+        existing
+            .env
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+
+    // Port: user wins if set
+    if existing.port.is_none() {
+        existing.port = plugin.port;
+    }
+
+    // depends_on: union of both sets
+    let mut deps_set: BTreeSet<String> = existing.depends_on.iter().cloned().collect();
+    for dep in &plugin.depends_on {
+        deps_set.insert(dep.clone());
+    }
+    existing.depends_on = deps_set.into_iter().collect();
+
+    // health_check: user wins if set
+    if existing.health_check.is_none() {
+        existing.health_check.clone_from(&plugin.health_check);
+    }
+
+    // stop_signal: user wins if set
+    if existing.stop_signal.is_none() {
+        existing.stop_signal.clone_from(&plugin.stop_signal);
+    }
+}
+
+/// Merge a plugin-generated service config into an existing user-defined service.
+///
+/// Merge strategy ("User Wins" priority):
+/// - **env**: Plugin provides base, user overrides on key conflict
+/// - **port**: User wins if set, else plugin value
+/// - **`depends_on`**: Union of both sets
+/// - **`health_check`**: User wins if set, else plugin value
+/// - **runtime type**: Must match (error if types mismatch)
+/// - **command/workdir/image**: User wins if set, else plugin value
+fn merge_plugin_service_into_config(
+    existing: &mut ServiceConfig,
     op: &DeclareServiceOp,
     outputs: &StepOutputs,
 ) -> std::result::Result<(), Diagnostics> {
-    let name = op.name.trim();
-    if name.is_empty() {
-        return Err(diagnostics_error("declare-service has an empty name"));
-    }
+    // Build the plugin service config as if declaring new
+    let plugin_svc = build_service_from_op(op, outputs)?;
 
-    if config.services.contains_key(name) {
+    // Check runtime type compatibility
+    let existing_type = classify_service_type(existing);
+    let plugin_type = classify_service_type(&plugin_svc);
+
+    if existing_type != plugin_type {
         return Err(diagnostics_error(format!(
-            "declare-service attempted to create service '{name}' but it already exists"
+            "service '{}' type conflict: user defined as '{}', plugin declares as '{}'",
+            op.name, existing_type, plugin_type
         )));
     }
 
+    // Merge based on service type
+    match (existing, plugin_svc) {
+        (
+            ServiceConfig::Typed(TypedServiceConfig::Exec(existing_exec)),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(plugin_exec)),
+        ) => {
+            merge_common(&mut existing_exec.common, &plugin_exec.common);
+            if existing_exec.command.is_none() {
+                existing_exec.command = plugin_exec.command;
+            }
+            if existing_exec.workdir.is_none() {
+                existing_exec.workdir = plugin_exec.workdir;
+            }
+            if existing_exec.image.is_none() {
+                existing_exec.image = plugin_exec.image;
+            }
+            if existing_exec.container_port.is_none() {
+                existing_exec.container_port = plugin_exec.container_port;
+            }
+        }
+        (
+            ServiceConfig::Typed(TypedServiceConfig::Worker(existing_worker)),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(plugin_worker)),
+        ) => {
+            merge_common(&mut existing_worker.common, &plugin_worker.common);
+            if existing_worker.command.is_empty() {
+                existing_worker.command = plugin_worker.command;
+            }
+            if existing_worker.workdir.is_none() {
+                existing_worker.workdir = plugin_worker.workdir;
+            }
+        }
+        (
+            ServiceConfig::Typed(TypedServiceConfig::Container(existing_container)),
+            ServiceConfig::Typed(TypedServiceConfig::Container(plugin_container)),
+        ) => {
+            merge_common(&mut existing_container.common, &plugin_container.common);
+            if existing_container.image.is_empty() {
+                existing_container.image = plugin_container.image;
+            }
+            if existing_container.command.is_none() {
+                existing_container.command = plugin_container.command;
+            }
+            if existing_container.workdir.is_none() {
+                existing_container.workdir = plugin_container.workdir;
+            }
+            if existing_container.container_port.is_none() {
+                existing_container.container_port = plugin_container.container_port;
+            }
+        }
+        (
+            ServiceConfig::Typed(TypedServiceConfig::Postgres(existing_postgres)),
+            ServiceConfig::Typed(TypedServiceConfig::Postgres(plugin_postgres)),
+        ) => {
+            merge_common(&mut existing_postgres.common, &plugin_postgres.common);
+            if existing_postgres.version.is_none() {
+                existing_postgres.version = plugin_postgres.version;
+            }
+        }
+        (
+            ServiceConfig::Typed(TypedServiceConfig::Site(existing_site)),
+            ServiceConfig::Typed(TypedServiceConfig::Site(plugin_site)),
+        ) => {
+            merge_common(&mut existing_site.common, &plugin_site.common);
+            if existing_site.path.is_empty() {
+                existing_site.path = plugin_site.path;
+            }
+            if existing_site.build.is_empty() {
+                existing_site.build = plugin_site.build;
+            }
+        }
+        (ServiceConfig::Legacy(existing_legacy), ServiceConfig::Legacy(plugin_legacy)) => {
+            merge_common(&mut existing_legacy.common, &plugin_legacy.common);
+            if existing_legacy.command.is_none() {
+                existing_legacy.command = plugin_legacy.command;
+            }
+            if existing_legacy.workdir.is_none() {
+                existing_legacy.workdir = plugin_legacy.workdir;
+            }
+        }
+        _ => {
+            // This shouldn't happen if classify_service_type is correct
+            return Err(diagnostics_error(format!(
+                "internal error: service type mismatch during merge for '{}'",
+                op.name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a service config from a [`DeclareServiceOp`].
+///
+/// This is extracted from [`apply_declare_service`] to support merging.
+fn build_service_from_op(
+    op: &DeclareServiceOp,
+    outputs: &StepOutputs,
+) -> std::result::Result<ServiceConfig, Diagnostics> {
     let mut common = CommonServiceConfig::default();
 
     let mut exec = ExecServiceConfig::default();
@@ -406,6 +561,26 @@ fn apply_declare_service(
         }
     };
 
+    Ok(svc)
+}
+
+fn apply_declare_service(
+    config: &mut LocaldConfig,
+    op: &DeclareServiceOp,
+    outputs: &StepOutputs,
+) -> std::result::Result<(), Diagnostics> {
+    let name = op.name.trim();
+    if name.is_empty() {
+        return Err(diagnostics_error("declare-service has an empty name"));
+    }
+
+    // If service already exists, merge instead of error
+    if let Some(existing) = config.services.get_mut(name) {
+        return merge_plugin_service_into_config(existing, op, outputs);
+    }
+
+    // Otherwise create new service
+    let svc = build_service_from_op(op, outputs)?;
     config.services.insert(name.to_string(), svc);
     Ok(())
 }
@@ -1072,6 +1247,225 @@ mod tests {
                 assert!(port > 1024, "Should be an ephemeral port");
             }
             ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec"),
+        }
+    }
+
+    #[test]
+    fn merges_plugin_env_into_existing_service() {
+        // User defines a service with some env vars
+        let mut cfg = base_config();
+        let mut exec = ExecServiceConfig::default();
+        exec.command = Some("npm start".to_string());
+        exec.common
+            .env
+            .insert("USER_VAR".to_string(), "user_value".to_string());
+        cfg.services.insert(
+            "web".to_string(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)),
+        );
+
+        // Plugin tries to add the same service with different env vars
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "s1".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "web".to_string(),
+                    runtime: "exec".to_string(),
+                    settings: vec![
+                        (
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo plugin".to_string())),
+                        ),
+                        (
+                            "env.PLUGIN_VAR".to_string(),
+                            Expr::Lit(Value::Text("plugin_value".to_string())),
+                        ),
+                        (
+                            "env.USER_VAR".to_string(),
+                            Expr::Lit(Value::Text("should_be_ignored".to_string())),
+                        ),
+                    ],
+                }),
+            }],
+        };
+
+        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let svc = cfg.services.get("web").unwrap();
+        match svc {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                // User's env var wins on conflict
+                assert_eq!(exec.common.env.get("USER_VAR").unwrap(), "user_value");
+                // Plugin's unique env var is added
+                assert_eq!(exec.common.env.get("PLUGIN_VAR").unwrap(), "plugin_value");
+                // User's command wins
+                assert_eq!(exec.command.as_deref(), Some("npm start"));
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec service"),
+        }
+    }
+
+    #[test]
+    fn user_port_wins_over_plugin() {
+        let mut cfg = base_config();
+        let mut exec = ExecServiceConfig::default();
+        exec.command = Some("npm start".to_string());
+        exec.common.port = Some(4000);
+        cfg.services.insert(
+            "web".to_string(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)),
+        );
+
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "s1".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "web".to_string(),
+                    runtime: "exec".to_string(),
+                    settings: vec![
+                        (
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo".to_string())),
+                        ),
+                        ("port".to_string(), Expr::Lit(Value::Unsigned(3000))),
+                    ],
+                }),
+            }],
+        };
+
+        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let svc = cfg.services.get("web").unwrap();
+        match svc {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                // User's port wins
+                assert_eq!(exec.common.port, Some(4000));
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec service"),
+        }
+    }
+
+    #[test]
+    fn unions_dependencies() {
+        let mut cfg = base_config();
+        let mut exec = ExecServiceConfig::default();
+        exec.command = Some("npm start".to_string());
+        exec.common.depends_on = vec!["db".to_string()];
+        cfg.services.insert(
+            "web".to_string(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)),
+        );
+
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "s1".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "web".to_string(),
+                    runtime: "exec".to_string(),
+                    settings: vec![(
+                        "command".to_string(),
+                        Expr::Lit(Value::Text("echo".to_string())),
+                    )],
+                }),
+            }],
+        };
+
+        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let svc = cfg.services.get("web").unwrap();
+        match svc {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                // User's dependency is preserved
+                assert!(exec.common.depends_on.contains(&"db".to_string()));
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec service"),
+        }
+    }
+
+    #[test]
+    fn rejects_runtime_type_mismatch() {
+        // User defines an exec service
+        let mut cfg = base_config();
+        let mut exec = ExecServiceConfig::default();
+        exec.command = Some("npm start".to_string());
+        cfg.services.insert(
+            "web".to_string(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)),
+        );
+
+        // Plugin tries to declare it as postgres
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "s1".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "web".to_string(),
+                    runtime: "postgres".to_string(),
+                    settings: vec![],
+                }),
+            }],
+        };
+
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("type conflict")));
+    }
+
+    #[test]
+    fn user_env_wins_on_conflict() {
+        let mut cfg = base_config();
+        let mut exec = ExecServiceConfig::default();
+        exec.command = Some("npm start".to_string());
+        exec.common
+            .env
+            .insert("KEY".to_string(), "user_value".to_string());
+        cfg.services.insert(
+            "web".to_string(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)),
+        );
+
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "s1".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "web".to_string(),
+                    runtime: "exec".to_string(),
+                    settings: vec![
+                        (
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo".to_string())),
+                        ),
+                        (
+                            "env.KEY".to_string(),
+                            Expr::Lit(Value::Text("plugin_value".to_string())),
+                        ),
+                    ],
+                }),
+            }],
+        };
+
+        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let svc = cfg.services.get("web").unwrap();
+        match svc {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                // User's value should win
+                assert_eq!(exec.common.env.get("KEY").unwrap(), "user_value");
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec service"),
         }
     }
 }
