@@ -3,12 +3,14 @@ use std::path::Path;
 
 use serde_json::json;
 
+pub mod discovery;
 pub mod plan;
 pub mod runner;
 
+pub use discovery::{default_capabilities, discover_plugins, user_plugins_dir};
 pub use runner::{HostCapabilities, PluginApplyError, PluginRunner, ServiceSpec, WorkspaceContext};
 
-pub use plan::{apply_plan_to_config, validate_plan};
+pub use plan::{StepOutputs, apply_plan_to_config, validate_plan};
 
 #[must_use]
 pub fn normalized_plan_debug_json(plan: &runner::Plan) -> serde_json::Value {
@@ -104,6 +106,16 @@ pub fn normalized_plan_debug_json(plan: &runner::Plan) -> serde_json::Value {
     })
 }
 
+/// Convenience API for one-shot plugin apply.
+pub fn apply_plugin(
+    component_path: &Path,
+    ctx: WorkspaceContext,
+    caps: HostCapabilities,
+    spec: ServiceSpec,
+) -> Result<runner::PlanResult> {
+    PluginRunner::new()?.apply(component_path, ctx, caps, spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalized_plan_debug_json;
@@ -186,14 +198,4 @@ mod tests {
 
         assert_eq!(got, expected);
     }
-}
-
-/// Convenience API for one-shot plugin apply.
-pub fn apply_plugin(
-    component_path: &Path,
-    ctx: WorkspaceContext,
-    caps: HostCapabilities,
-    spec: ServiceSpec,
-) -> Result<runner::PlanResult> {
-    PluginRunner::new()?.apply(component_path, ctx, caps, spec)
 }

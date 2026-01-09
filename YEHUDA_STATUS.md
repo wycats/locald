@@ -8,14 +8,14 @@
 
 RFC 0130 (Host Shim Daemon for Container Development Environments) has been **fully implemented** across 5 phases:
 
-| Phase   | Commit    | Summary                                                                           |
-| ------- | --------- | --------------------------------------------------------------------------------- |
-| Phase 1 | `51de366` | Socket-based Shim Daemon - Unix socket server in `locald-shim`                    |
-| Phase 2 | `6176e80` | Host-Exec Configuration - `[container]` config with `host_exec` template          |
-| Phase 3 | `f4048f0` | Polkit Integration - GUI privilege escalation via `pkexec`                        |
-| Phase 4 | `8d4b9e7` | Container Auto-Start - Socket-first strategy in `PrivilegedCapability::acquire()` |
-| Phase 5 | `718255a` | Documentation and Polish - Container guide, doctor reference                      |
-| Manifest | `7e1887d` | CLI surface manifest update for `--host` flag                                    |
+| Phase    | Commit    | Summary                                                                           |
+| -------- | --------- | --------------------------------------------------------------------------------- |
+| Phase 1  | `51de366` | Socket-based Shim Daemon - Unix socket server in `locald-shim`                    |
+| Phase 2  | `6176e80` | Host-Exec Configuration - `[container]` config with `host_exec` template          |
+| Phase 3  | `f4048f0` | Polkit Integration - GUI privilege escalation via `pkexec`                        |
+| Phase 4  | `8d4b9e7` | Container Auto-Start - Socket-first strategy in `PrivilegedCapability::acquire()` |
+| Phase 5  | `718255a` | Documentation and Polish - Container guide, doctor reference                      |
+| Manifest | `7e1887d` | CLI surface manifest update for `--host` flag                                     |
 
 ### Key Files Created/Modified
 
@@ -84,10 +84,13 @@ Tasks remaining:
 Per the RFC process, promotion to Stage 3 (Candidate) requires:
 
 ### ✅ Implementation Complete
+
 All 5 phases implemented and committed.
 
 ### ✅ Manual Updated
+
 Documentation updated in `docs/manual/`:
+
 - [container-environments.md](docs/manual/development/container-environments.md) - Full container guide
 - [doctor.md](docs/manual/features/doctor.md) - Doctor command reference
 - [shim-management.md](docs/manual/architecture/shim-management.md) - Socket modes
@@ -96,16 +99,19 @@ Documentation updated in `docs/manual/`:
 ### ⚠️ Items to Verify Before Approval
 
 1. **End-to-end test on actual Toolbx**:
+
    - [ ] Install locald on host with `sudo locald admin setup`
    - [ ] Enter Toolbx container
    - [ ] Run `locald up` and verify socket connection
    - [ ] Check that services start and domains resolve
 
 2. **Polkit dialog verification**:
+
    - [ ] Verify `pkexec locald shim serve` shows GUI dialog (not terminal prompt)
    - [ ] Verify polkit policy is installed to `/usr/share/polkit-1/actions/`
 
 3. **Missing features from RFC** (deferred, not blocking):
+
    - `locald shim install-service` (systemd user service) - NOT IMPLEMENTED
    - NFS fallback to `/run/user/$UID/` - NOT IMPLEMENTED
    - Daemon idle timeout and max lifetime - implemented but may need tuning
