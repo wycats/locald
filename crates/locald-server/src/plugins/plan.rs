@@ -1,5 +1,6 @@
 use crate::plugins::runner::{
-    AllocatePortOp, DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, Plan, Step, Value,
+    AllocatePortOp, DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, OutputRef, Plan,
+    Selector, Step, Value,
 };
 use locald_core::config::{
     CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, LocaldConfig,
@@ -128,7 +129,7 @@ pub fn apply_plan_to_config(
             .find(|s| s.id == step_id)
             .ok_or_else(|| diagnostics_error("internal error: missing step during apply"))?;
 
-        let step_output = apply_step(config, step)?;
+        let step_output = apply_step(config, step, &outputs)?;
         if !step_output.is_empty() {
             outputs.insert(step.id.clone(), step_output);
         }
@@ -193,10 +194,11 @@ fn topo_order(plan: &Plan) -> Result<Vec<String>, String> {
 fn apply_step(
     config: &mut LocaldConfig,
     step: &Step,
+    outputs: &StepOutputs,
 ) -> std::result::Result<BTreeMap<String, Value>, Diagnostics> {
     match &step.op {
         Op::DeclareService(op) => {
-            apply_declare_service(config, op)?;
+            apply_declare_service(config, op, outputs)?;
             Ok(BTreeMap::new()) // No outputs from declare-service
         }
         Op::AllocatePort(op) => allocate_port_for_service(config, op),
@@ -248,6 +250,7 @@ fn allocate_port_for_service(
 fn apply_declare_service(
     config: &mut LocaldConfig,
     op: &DeclareServiceOp,
+    outputs: &StepOutputs,
 ) -> std::result::Result<(), Diagnostics> {
     let name = op.name.trim();
     if name.is_empty() {
@@ -277,9 +280,9 @@ fn apply_declare_service(
 
     // Parse settings.
     for (key, expr) in &op.settings {
-        let v = eval_expr_lit(expr).ok_or_else(|| {
+        let v = eval_expr(expr, outputs).map_err(|e| {
             diagnostics_error(format!(
-                "unsupported expression for setting '{key}': only literal values are supported"
+                "failed to evaluate expression for setting '{key}': {e}"
             ))
         })?;
 
@@ -289,10 +292,11 @@ fn apply_declare_service(
             if env_key.is_empty() {
                 return Err(diagnostics_error("env.* setting has empty key"));
             }
-            let text = as_text(&v).ok_or_else(|| {
-                diagnostics_error(format!("env.{env_key} must be a text literal"))
+            // Allow text or unsigned (for port references)
+            let text = value_to_string(&v).ok_or_else(|| {
+                diagnostics_error(format!("env.{env_key} must be a text or unsigned integer"))
             })?;
-            common.env.insert(env_key.to_string(), text.to_string());
+            common.env.insert(env_key.to_string(), text);
             continue;
         }
 
@@ -406,11 +410,61 @@ fn apply_declare_service(
     Ok(())
 }
 
-fn eval_expr_lit(expr: &Expr) -> Option<Value> {
+/// Evaluate an expression, resolving references to step outputs.
+fn eval_expr(expr: &Expr, outputs: &StepOutputs) -> Result<Value, String> {
     match expr {
-        Expr::Lit(v) => Some(v.clone()),
-        Expr::Get(_) => None,
+        Expr::Lit(v) => Ok(v.clone()),
+        Expr::Get(output_ref) => resolve_output_ref(output_ref, outputs),
     }
+}
+
+/// Resolve an output reference by looking up the step output and traversing the path.
+fn resolve_output_ref(output_ref: &OutputRef, outputs: &StepOutputs) -> Result<Value, String> {
+    // Step 1: Find the step's output map
+    let step_output = outputs
+        .get(&output_ref.step_id)
+        .ok_or_else(|| format!("reference to unknown step '{}'", output_ref.step_id))?;
+
+    // Step 2: Validate path is not empty
+    if output_ref.path.is_empty() {
+        return Err("output reference must have at least one selector".to_string());
+    }
+
+    // Step 3: Traverse the path
+    // For Phase 29, we only support a single field selector on flat maps
+    let mut current_value: Option<&Value> = None;
+
+    for (idx, selector) in output_ref.path.iter().enumerate() {
+        match selector {
+            Selector::Field(field_name) => {
+                if idx == 0 {
+                    // First selector: look up in step output map
+                    current_value = Some(step_output.get(field_name).ok_or_else(|| {
+                        format!(
+                            "step '{}' has no output field '{}'",
+                            output_ref.step_id, field_name
+                        )
+                    })?);
+                } else {
+                    // Subsequent selectors: would need nested object support
+                    // For Phase 29, we only have flat maps
+                    return Err(format!(
+                        "nested field access not supported (step '{}', path index {})",
+                        output_ref.step_id, idx
+                    ));
+                }
+            }
+            Selector::Index(_) => {
+                // Arrays not yet in Value enum
+                return Err(format!(
+                    "index selector not supported (step '{}', path index {})",
+                    output_ref.step_id, idx
+                ));
+            }
+        }
+    }
+
+    Ok(current_value.unwrap().clone())
 }
 
 fn as_text(v: &Value) -> Option<&str> {
@@ -443,11 +497,28 @@ fn as_u16(v: &Value) -> Option<u16> {
     }
 }
 
+/// Convert a Value to a string representation (for env vars).
+/// Supports text (as-is) and unsigned integers (converted to decimal).
+fn value_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::Text(s) => Some(s.clone()),
+        Value::Unsigned(n) => Some(n.to_string()),
+        Value::Signed(n) => Some(n.to_string()),
+        Value::Boolean(b) => Some(b.to_string()),
+        Value::Null
+        | Value::Float(_)
+        | Value::Bytes(_)
+        | Value::Path(_)
+        | Value::Url(_)
+        | Value::Datetime(_) => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
-    use crate::plugins::runner::AllocatePortOp;
+    use crate::plugins::runner::{AllocatePortOp, OutputRef, Selector};
 
     fn caps() -> HostCapabilities {
         HostCapabilities {
@@ -683,5 +754,324 @@ mod tests {
         let mut cfg = base_config();
         let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("unknown service")));
+    }
+
+    // $ref resolution tests
+
+    #[test]
+    fn resolves_port_reference_in_env_var() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![
+                Step {
+                    id: "declare_db".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "postgres".to_string(),
+                        runtime: "postgres".to_string(),
+                        settings: vec![],
+                    }),
+                },
+                Step {
+                    id: "alloc_port".to_string(),
+                    needs: vec!["declare_db".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "postgres".to_string(),
+                    }),
+                },
+                Step {
+                    id: "declare_app".to_string(),
+                    needs: vec!["alloc_port".to_string()],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "app".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![
+                            (
+                                "command".to_string(),
+                                Expr::Lit(Value::Text("npm start".to_string())),
+                            ),
+                            (
+                                "env.DATABASE_PORT".to_string(),
+                                Expr::Get(OutputRef {
+                                    step_id: "alloc_port".to_string(),
+                                    path: vec![Selector::Field("port".to_string())],
+                                }),
+                            ),
+                        ],
+                    }),
+                },
+            ],
+        };
+
+        let mut cfg = base_config();
+        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let app_svc = cfg.services.get("app").expect("app service created");
+        match app_svc {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                let db_port_env = exec
+                    .common
+                    .env
+                    .get("DATABASE_PORT")
+                    .expect("DATABASE_PORT env var set");
+
+                // Should be the port allocated for postgres (as string)
+                let allocated_port = outputs
+                    .get("alloc_port")
+                    .and_then(|o| o.get("port"))
+                    .and_then(|v| match v {
+                        Value::Unsigned(p) => Some(*p),
+                        _ => None,
+                    })
+                    .expect("port should be allocated");
+
+                assert_eq!(db_port_env, &allocated_port.to_string());
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => {
+                panic!("expected exec service")
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_reference_to_missing_step() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "declare_app".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "app".to_string(),
+                    runtime: "exec".to_string(),
+                    settings: vec![
+                        (
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo".to_string())),
+                        ),
+                        (
+                            "port".to_string(),
+                            Expr::Get(OutputRef {
+                                step_id: "nonexistent".to_string(),
+                                path: vec![Selector::Field("port".to_string())],
+                            }),
+                        ),
+                    ],
+                }),
+            }],
+        };
+
+        let mut cfg = base_config();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("unknown step")));
+    }
+
+    #[test]
+    fn rejects_reference_to_missing_field() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![
+                Step {
+                    id: "svc".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "svc".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![(
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo".to_string())),
+                        )],
+                    }),
+                },
+                Step {
+                    id: "alloc_port".to_string(),
+                    needs: vec!["svc".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "svc".to_string(),
+                    }),
+                },
+                Step {
+                    id: "use_it".to_string(),
+                    needs: vec!["alloc_port".to_string()],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "app".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![
+                            (
+                                "command".to_string(),
+                                Expr::Lit(Value::Text("echo".to_string())),
+                            ),
+                            (
+                                "port".to_string(),
+                                Expr::Get(OutputRef {
+                                    step_id: "alloc_port".to_string(),
+                                    path: vec![Selector::Field("nonexistent".to_string())],
+                                }),
+                            ),
+                        ],
+                    }),
+                },
+            ],
+        };
+
+        let mut cfg = base_config();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("no output field")));
+    }
+
+    #[test]
+    fn handles_multiple_references_in_one_service() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![
+                Step {
+                    id: "declare_db".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "db".to_string(),
+                        runtime: "postgres".to_string(),
+                        settings: vec![],
+                    }),
+                },
+                Step {
+                    id: "declare_redis".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "redis".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![(
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("redis-server".to_string())),
+                        )],
+                    }),
+                },
+                Step {
+                    id: "port_db".to_string(),
+                    needs: vec!["declare_db".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "db".to_string(),
+                    }),
+                },
+                Step {
+                    id: "port_redis".to_string(),
+                    needs: vec!["declare_redis".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "redis".to_string(),
+                    }),
+                },
+                Step {
+                    id: "declare_app".to_string(),
+                    needs: vec!["port_db".to_string(), "port_redis".to_string()],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "app".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![
+                            (
+                                "command".to_string(),
+                                Expr::Lit(Value::Text("node app.js".to_string())),
+                            ),
+                            (
+                                "env.DB_PORT".to_string(),
+                                Expr::Get(OutputRef {
+                                    step_id: "port_db".to_string(),
+                                    path: vec![Selector::Field("port".to_string())],
+                                }),
+                            ),
+                            (
+                                "env.REDIS_PORT".to_string(),
+                                Expr::Get(OutputRef {
+                                    step_id: "port_redis".to_string(),
+                                    path: vec![Selector::Field("port".to_string())],
+                                }),
+                            ),
+                        ],
+                    }),
+                },
+            ],
+        };
+
+        let mut cfg = base_config();
+        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let app = cfg.services.get("app").expect("app service");
+        match app {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                assert!(exec.common.env.contains_key("DB_PORT"));
+                assert!(exec.common.env.contains_key("REDIS_PORT"));
+
+                // Verify they're different ports
+                let db_port = &exec.common.env["DB_PORT"];
+                let redis_port = &exec.common.env["REDIS_PORT"];
+                assert_ne!(db_port, redis_port, "Ports should be different");
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec"),
+        }
+    }
+
+    #[test]
+    fn uses_port_reference_for_service_port() {
+        // Port is stored as Value::Unsigned and should work for the port setting
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![
+                Step {
+                    id: "svc".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "svc".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![(
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo".to_string())),
+                        )],
+                    }),
+                },
+                Step {
+                    id: "port".to_string(),
+                    needs: vec!["svc".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "svc".to_string(),
+                    }),
+                },
+                Step {
+                    id: "app".to_string(),
+                    needs: vec!["port".to_string()],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "app".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![
+                            (
+                                "command".to_string(),
+                                Expr::Lit(Value::Text("node app.js".to_string())),
+                            ),
+                            (
+                                "port".to_string(),
+                                Expr::Get(OutputRef {
+                                    step_id: "port".to_string(),
+                                    path: vec![Selector::Field("port".to_string())],
+                                }),
+                            ),
+                        ],
+                    }),
+                },
+            ],
+        };
+
+        let mut cfg = base_config();
+        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        let app = cfg.services.get("app").expect("app service");
+        match app {
+            ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+                assert!(exec.common.port.is_some());
+                let port = exec.common.port.unwrap();
+                assert!(port > 1024, "Should be an ephemeral port");
+            }
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => panic!("expected exec"),
+        }
     }
 }
