@@ -8,7 +8,7 @@ pub mod runner;
 
 pub use runner::{HostCapabilities, PluginApplyError, PluginRunner, ServiceSpec, WorkspaceContext};
 
-pub use plan::{apply_plan_to_config, validate_plan};
+pub use plan::{StepOutputs, apply_plan_to_config, validate_plan};
 
 #[must_use]
 pub fn normalized_plan_debug_json(plan: &runner::Plan) -> serde_json::Value {

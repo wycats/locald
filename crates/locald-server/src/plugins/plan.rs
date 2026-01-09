@@ -1,5 +1,5 @@
 use crate::plugins::runner::{
-    DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, Plan, Step, Value,
+    AllocatePortOp, DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, Plan, Step, Value,
 };
 use locald_core::config::{
     CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, LocaldConfig,
@@ -7,6 +7,10 @@ use locald_core::config::{
     WorkerServiceConfig,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+/// Step outputs: `step_id` -> `field_name` -> value.
+/// Accumulated during plan execution so later steps can reference earlier outputs.
+pub type StepOutputs = BTreeMap<String, BTreeMap<String, Value>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanApplyError {
@@ -99,17 +103,22 @@ fn validate_acyclic(plan: &Plan) -> Result<(), String> {
 ///
 /// For Phase 29.1.3, we support:
 /// - `declare-service`: adds a new service to the config (fails if it already exists)
-/// - `allocate-port`: no-op, but validates referenced service exists
+/// - `allocate-port`: allocates a port and produces output `{ "port": <u16> }`
 ///
 /// Other ops are rejected.
+///
+/// Returns accumulated step outputs for use in expression resolution.
 pub fn apply_plan_to_config(
     config: &mut LocaldConfig,
     plan: &Plan,
     caps: &HostCapabilities,
-) -> std::result::Result<(), Diagnostics> {
+) -> std::result::Result<StepOutputs, Diagnostics> {
     validate_plan(plan, caps)?;
 
-    // Apply steps in topological order for future-proofing.
+    // Track outputs from executed steps.
+    let mut outputs = StepOutputs::new();
+
+    // Apply steps in topological order.
     let order = topo_order(plan).map_err(diagnostics_error)?;
 
     for step_id in order {
@@ -119,10 +128,13 @@ pub fn apply_plan_to_config(
             .find(|s| s.id == step_id)
             .ok_or_else(|| diagnostics_error("internal error: missing step during apply"))?;
 
-        apply_step(config, step)?;
+        let step_output = apply_step(config, step)?;
+        if !step_output.is_empty() {
+            outputs.insert(step.id.clone(), step_output);
+        }
     }
 
-    Ok(())
+    Ok(outputs)
 }
 
 fn topo_order(plan: &Plan) -> Result<Vec<String>, String> {
@@ -178,20 +190,16 @@ fn topo_order(plan: &Plan) -> Result<Vec<String>, String> {
     }
 }
 
-fn apply_step(config: &mut LocaldConfig, step: &Step) -> std::result::Result<(), Diagnostics> {
+fn apply_step(
+    config: &mut LocaldConfig,
+    step: &Step,
+) -> std::result::Result<BTreeMap<String, Value>, Diagnostics> {
     match &step.op {
-        Op::DeclareService(op) => apply_declare_service(config, op),
-        Op::AllocatePort(op) => {
-            // For now, locald already allocates ports as needed.
-            if config.services.contains_key(&op.name) {
-                Ok(())
-            } else {
-                Err(diagnostics_error(format!(
-                    "allocate-port references unknown service '{}'",
-                    op.name
-                )))
-            }
+        Op::DeclareService(op) => {
+            apply_declare_service(config, op)?;
+            Ok(BTreeMap::new()) // No outputs from declare-service
         }
+        Op::AllocatePort(op) => allocate_port_for_service(config, op),
         Op::OciPull(_) => Err(diagnostics_error(
             "unsupported op 'oci-pull' (not implemented in Phase 29.1.3)".to_string(),
         )),
@@ -202,6 +210,39 @@ fn apply_step(config: &mut LocaldConfig, step: &Step) -> std::result::Result<(),
             "unsupported op 'write-file' (not implemented in Phase 29.1.3)".to_string(),
         )),
     }
+}
+
+/// Allocate a port for a service.
+///
+/// Returns outputs: `{ "port": Value::Unsigned(<allocated_port>) }`
+fn allocate_port_for_service(
+    config: &LocaldConfig,
+    op: &AllocatePortOp,
+) -> std::result::Result<BTreeMap<String, Value>, Diagnostics> {
+    // Verify service exists
+    if !config.services.contains_key(&op.name) {
+        return Err(diagnostics_error(format!(
+            "allocate-port references unknown service '{}'",
+            op.name
+        )));
+    }
+
+    // Allocate a free port by binding to port 0 and letting the OS choose.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+        diagnostics_error(format!("failed to allocate port for '{}': {}", op.name, e))
+    })?;
+
+    let port = listener
+        .local_addr()
+        .map_err(|e| diagnostics_error(format!("failed to get local address: {}", e)))?
+        .port();
+
+    drop(listener); // Release the port for the service to use
+
+    // Return port as output
+    let mut output = BTreeMap::new();
+    output.insert("port".to_string(), Value::Unsigned(u64::from(port)));
+    Ok(output)
 }
 
 fn apply_declare_service(
@@ -403,6 +444,7 @@ fn as_u16(v: &Value) -> Option<u16> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
     use crate::plugins::runner::AllocatePortOp;
@@ -463,7 +505,10 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        // declare-service produces no outputs
+        assert!(outputs.is_empty());
 
         let svc = cfg.services.get("web").expect("service inserted");
         match svc {
@@ -471,11 +516,172 @@ mod tests {
                 assert_eq!(exec.command.as_deref(), Some("npm start"));
                 assert_eq!(exec.common.port, Some(3000));
                 assert_eq!(
-                    exec.common.env.get("NODE_ENV").map(|s| s.as_str()),
+                    exec.common.env.get("NODE_ENV").map(String::as_str),
                     Some("development")
                 );
             }
-            other => panic!("unexpected service config: {other:?}"),
+            ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => {
+                panic!("unexpected service config type")
+            }
         }
+    }
+
+    #[test]
+    fn allocate_port_produces_output() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![
+                Step {
+                    id: "declare".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "web".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![(
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("npm start".to_string())),
+                        )],
+                    }),
+                },
+                Step {
+                    id: "allocate".to_string(),
+                    needs: vec!["declare".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "web".to_string(),
+                    }),
+                },
+            ],
+        };
+
+        let mut cfg = base_config();
+        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        // Verify port was allocated
+        assert!(outputs.contains_key("allocate"));
+        let allocate_output = outputs.get("allocate").unwrap();
+        assert!(allocate_output.contains_key("port"));
+
+        // Verify it's a valid port number
+        match allocate_output.get("port").unwrap() {
+            Value::Unsigned(port) => {
+                assert!(*port > 1024, "Should be an ephemeral port");
+                assert!(*port < 65536, "Should be a valid port");
+            }
+            Value::Null
+            | Value::Boolean(_)
+            | Value::Text(_)
+            | Value::Signed(_)
+            | Value::Float(_)
+            | Value::Bytes(_)
+            | Value::Path(_)
+            | Value::Url(_)
+            | Value::Datetime(_) => {
+                panic!("Port output should be an unsigned integer");
+            }
+        }
+    }
+
+    #[test]
+    fn step_outputs_tracking_multiple_ports() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![
+                Step {
+                    id: "s1".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "svc1".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![(
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo hi".to_string())),
+                        )],
+                    }),
+                },
+                Step {
+                    id: "s2".to_string(),
+                    needs: vec![],
+                    op: Op::DeclareService(DeclareServiceOp {
+                        name: "svc2".to_string(),
+                        runtime: "exec".to_string(),
+                        settings: vec![(
+                            "command".to_string(),
+                            Expr::Lit(Value::Text("echo bye".to_string())),
+                        )],
+                    }),
+                },
+                Step {
+                    id: "port1".to_string(),
+                    needs: vec!["s1".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "svc1".to_string(),
+                    }),
+                },
+                Step {
+                    id: "port2".to_string(),
+                    needs: vec!["s2".to_string()],
+                    op: Op::AllocatePort(AllocatePortOp {
+                        name: "svc2".to_string(),
+                    }),
+                },
+            ],
+        };
+
+        let mut cfg = base_config();
+        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+
+        // Should have outputs for both port allocations
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains_key("port1"));
+        assert!(outputs.contains_key("port2"));
+
+        // Both should have different ports
+        let port1 = match outputs.get("port1").unwrap().get("port").unwrap() {
+            Value::Unsigned(p) => *p,
+            Value::Null
+            | Value::Boolean(_)
+            | Value::Text(_)
+            | Value::Signed(_)
+            | Value::Float(_)
+            | Value::Bytes(_)
+            | Value::Path(_)
+            | Value::Url(_)
+            | Value::Datetime(_) => panic!("Expected unsigned port for port1"),
+        };
+        let port2 = match outputs.get("port2").unwrap().get("port").unwrap() {
+            Value::Unsigned(p) => *p,
+            Value::Null
+            | Value::Boolean(_)
+            | Value::Text(_)
+            | Value::Signed(_)
+            | Value::Float(_)
+            | Value::Bytes(_)
+            | Value::Path(_)
+            | Value::Url(_)
+            | Value::Datetime(_) => panic!("Expected unsigned port for port2"),
+        };
+
+        assert_ne!(port1, port2, "Ports should be different");
+    }
+
+    #[test]
+    fn allocate_port_rejects_unknown_service() {
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "allocate".to_string(),
+                needs: vec![],
+                op: Op::AllocatePort(AllocatePortOp {
+                    name: "nonexistent".to_string(),
+                }),
+            }],
+        };
+
+        let mut cfg = base_config();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("unknown service")));
     }
 }
