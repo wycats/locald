@@ -2,6 +2,7 @@
 #![allow(clippy::option_if_let_else)]
 use crate::config_loader::ConfigLoader;
 use crate::health::HealthMonitor;
+use crate::plugins;
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
@@ -913,7 +914,13 @@ impl ProcessManager {
                 .await;
         }
 
-        let (config, dot_env_vars) = ConfigLoader::load_project_config(&path).await?;
+        let (mut config, dot_env_vars) = ConfigLoader::load_project_config(&path).await?;
+
+        // Apply plugins to configuration
+        // Plugin discovery and application failures are logged but do not fail startup
+        if let Err(e) = plugins::apply_plugins_to_config(&mut config, &path) {
+            warn!("Plugin processing failed: {}", e);
+        }
 
         if let Some(tx) = &event_tx {
             let _ = tx
