@@ -34,7 +34,7 @@ name = "Fix Polkit Policy Installation"
 priority = "critical"
 complexity = "small"
 hours = "2-3"
-status = "not-started"
+status = "complete"
 
 description = """
 The polkit policy installation is failing because:
@@ -45,21 +45,16 @@ The polkit policy installation is failing because:
 Root cause: The polkit installation code runs outside the privileged block.
 """
 
-files = ["crates/locald-cli/src/admin.rs", "assets/dev.locald.policy"]
+files = ["crates/locald-shim/src/main.rs", "crates/locald-cli/src/handlers.rs"]
 
-implementation = """
-Option A (Recommended): Move polkit installation INTO the shim binary
-- Add `--install-policy` flag to `locald-shim install`
-- Shim already runs as root, can write to system dirs
-- Single privileged execution handles everything
+implemented = """
+Added InstallPolkit variant to AdminCommand enum in locald-shim.
+Implemented handler that embeds policy via include_bytes! and writes to
+/usr/share/polkit-1/actions/dev.locald.policy with proper permissions.
+Updated handlers.rs to call `locald-shim admin install-polkit` instead of
+directly calling install_polkit_policy().
 
-Option B: Use separate pkexec call for polkit
-- Run `pkexec install -m 644 policy.txt /usr/share/polkit-1/actions/dev.locald.policy`
-- Requires second auth dialog (poor UX)
-
-Option C: Embed policy installation in shim install routine
-- The shim's install() function already runs privileged
-- Just add the policy file copy there
+Commit: bd91d0a
 """
 
 test = """
@@ -74,40 +69,35 @@ name = "Wire Up Privileged Operation Handlers"
 priority = "critical"
 complexity = "medium"
 hours = "3-4"
-status = "not-started"
+status = "complete"
 
 description = """
-The shim daemon handlers are placeholders that ACK requests but don't execute:
-```rust
-ShimRequest::HostsSync { entries } => {
-    let _ = entries; // TODO: Actually sync hosts file
-    eprintln!("HostsSync: would sync {} entries", entries.len());
-    ShimResponse::ok_empty()
-}
-```
+The shim daemon handlers are placeholders that ACK requests but don't execute.
 
 Need to wire these to actual implementations.
 """
 
-files = ["crates/locald-shim/src/daemon.rs"]
+files = ["crates/locald-shim/src/daemon.rs", "crates/locald-shim/src/main.rs"]
 
-implementation = """
-Replace stub handlers with calls to existing functions:
+implemented = """
+Made functions pub(crate) in main.rs:
+- cgroup_setup() - Auto-detect strategy
+- cgroup_setup_systemd() - Explicit systemd strategy
+- cgroup_setup_driver() - Direct cgroup v2 manipulation
+- cgroup_kill_and_prune() - Kill processes and remove cgroup
+- update_hosts_file() - Sync /etc/hosts entries
 
-1. HostsSync -> Call hosts file update logic (locald-core hosts module)
-2. CgroupSetup -> Call do_cgroup_setup() from shim
-3. CgroupKill -> Call do_kill() from shim  
-4. CaTrust -> Call cert trust logic
-5. BindPort -> Implement SCM_RIGHTS FD passing
+Wired handlers in daemon.rs:
+- HostsSync -> Extracts hostnames from entries, calls update_hosts_file()
+- CgroupSetup -> Matches strategy (Auto/Systemd/Direct), calls appropriate fn
+- CgroupKill -> Calls cgroup_kill_and_prune() with path
 
-The operations already exist - just need to call them from handlers.
-"""
+Remaining stubs (not critical for MVP):
+- BindPrivilegedPort (needs SCM_RIGHTS fd passing)
+- TrustInstall (needs architectural work for PEM flow)
+- RefreshPrivileges (needs definition)
 
-test = """
-1. Start daemon on host: `locald shim serve --foreground`
-2. In container, run: `locald up` on a test project
-3. Verify hosts file updated with service domains
-4. Verify cgroups created for services
+Commit: 53542ab
 """
 
 [[tasks]]
@@ -116,7 +106,7 @@ name = "Implement Auto-Start from Container"
 priority = "critical"
 complexity = "large"
 hours = "5-6"
-status = "not-started"
+status = "complete"
 
 description = """
 When locald runs in a container and socket connection fails:
@@ -125,31 +115,29 @@ When locald runs in a container and socket connection fails:
 """
 
 files = [
+  "crates/locald-utils/src/container.rs",
   "crates/locald-utils/src/privileged.rs",
-  "crates/locald-utils/src/container.rs",  # New file
+  "crates/locald-utils/src/lib.rs",
 ]
 
-implementation = """
-1. Create container.rs with start_host_shim():
-   - Check for user-configured host_exec template
-   - Auto-detect: try flatpak-spawn, then distrobox-host-exec
-   - Execute: `flatpak-spawn --host pkexec locald shim serve`
+implemented = """
+Created new container.rs module with:
+- is_probably_container(): Detects Toolbx, Distrobox, Docker via env vars and marker files
+- ContainerConfig: Supports user-configured host_exec template
+- start_host_shim(): Auto-start chain (user template -> flatpak-spawn -> distrobox-host-exec)
 
-2. Modify privileged.rs acquire():
-   - After socket failure, if in container:
-   - Call start_host_shim()
-   - Wait up to 5 seconds for socket to appear
-   - Retry connection
-   - If still fails, return actionable error
-
-3. Config integration:
-   - Load GlobalConfig to get [container].host_exec template
-   - Pass through call chain or use separate function
+Modified privileged.rs acquire():
+- Removed duplicate is_probably_container() function (now in container module)
+- Added auto-start logic on socket connection failure when in container:
+  1. Calls container::start_host_shim()
+  2. Retries connection every 500ms for up to DAEMON_START_TIMEOUT (5 seconds)
+  3. Returns success if connection established after auto-start
+  4. Falls back to error with remediation if auto-start fails
 """
 
 test = """
 1. Kill any running shim daemon on host
-2. In container: `locald up`
+2. In container: locald up
 3. Verify GUI password dialog appears on host
 4. Verify daemon starts and socket created
 5. Verify locald proceeds successfully

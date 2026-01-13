@@ -16,6 +16,8 @@
 use crate::cert;
 #[cfg(target_os = "linux")]
 use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
+#[cfg(target_os = "linux")]
+use crate::container::{self, ContainerConfig};
 use crate::shim;
 #[cfg(target_os = "linux")]
 use crate::shim_client::{self, ShimClient};
@@ -197,29 +199,12 @@ pub struct Privileged {
 #[cfg(target_os = "linux")]
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Check if we're probably running inside a container (Toolbx, Distrobox, Docker, etc.).
-#[cfg(target_os = "linux")]
-fn is_probably_container() -> bool {
-    // Common container markers.
-    if std::env::var("container").is_ok() {
-        return true;
-    }
-
-    // Toolbx markers.
-    if std::env::var("TOOLBOX_PATH").is_ok() || std::env::var("TOOLBOX_CONTAINER").is_ok() {
-        return true;
-    }
-
-    std::path::Path::new("/run/.containerenv").exists()
-        || std::path::Path::new("/.dockerenv").exists()
-}
-
 impl Privileged {
     /// Acquire a capability for privileged effects.
     ///
     /// This implements the socket-first strategy from RFC 0130 Phase 4:
     /// 1. Try to connect to `~/.locald/shim.sock` (if `allow_socket` is true)
-    /// 2. If socket doesn't exist but in container, return error with instructions
+    /// 2. If socket doesn't exist but in container, try to auto-start daemon on host
     /// 3. Fall back to setuid binary if socket not available and not in container
     ///
     /// # Errors
@@ -238,8 +223,41 @@ impl Privileged {
                 }
                 Err(e) => {
                     debug!("Socket connection failed: {e}");
-                    // If we're in a container, we can't fall back to setuid
-                    if is_probably_container() {
+                    // If we're in a container, try to auto-start the daemon
+                    if container::is_probably_container() {
+                        debug!("Container detected, attempting to auto-start host shim daemon");
+
+                        match container::start_host_shim(&ContainerConfig::default()) {
+                            Ok(()) => {
+                                info!("Successfully requested host shim daemon start");
+                                // Wait for daemon to start with retry
+                                let retry_interval = Duration::from_millis(500);
+                                let max_attempts = (DAEMON_START_TIMEOUT.as_millis()
+                                    / retry_interval.as_millis())
+                                    as u32;
+
+                                for attempt in 1..=max_attempts {
+                                    #[allow(clippy::disallowed_methods)]
+                                    // Sync sleep is intentional here
+                                    std::thread::sleep(retry_interval);
+                                    debug!(
+                                        "Retry attempt {attempt}/{max_attempts}: checking for socket..."
+                                    );
+
+                                    if let Ok(mode) = try_socket_connection() {
+                                        info!("Connected to shim daemon after auto-start");
+                                        let report = create_socket_mode_report();
+                                        return Ok(Self { mode, report });
+                                    }
+                                }
+                                debug!("Socket still not available after auto-start attempts");
+                            }
+                            Err(auto_start_err) => {
+                                debug!("Failed to auto-start host shim: {auto_start_err}");
+                            }
+                        }
+
+                        // Auto-start failed or timed out, return error
                         return Err(NotReady {
                             report: create_container_no_socket_report(&e),
                         });
