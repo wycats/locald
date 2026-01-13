@@ -520,6 +520,22 @@ fn offer_first_run_setup() -> bool {
     }
 }
 
+/// Show a warning that we're running in degraded mode inside a container.
+fn show_container_degraded_warning() {
+    eprintln!(
+        "{} locald-shim is not available as a privileged helper in this container.",
+        style::WARN
+    );
+    eprintln!(
+        "{} Continuing without privileged features (hosts sync, cgroup isolation, privileged ports).",
+        style::WARN
+    );
+    eprintln!(
+        "{} For full setup, run `sudo locald admin setup` on the host OS.",
+        style::WARN
+    );
+}
+
 pub fn verify_shim() {
     #[cfg(target_os = "linux")]
     {
@@ -535,6 +551,66 @@ pub fn verify_shim() {
 
         // Only check if we are NOT already running under the shim
         if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
+            // In container environments, prefer socket-based daemon over setuid shim.
+            // The setuid shim often can't work across container boundaries.
+            if is_probably_container() {
+                // Try to connect to existing socket daemon
+                if let Ok(socket_path) = locald_utils::ipc::socket_path() {
+                    if socket_path.exists() {
+                        // Socket exists, assume daemon is running - we're good
+                        return;
+                    }
+                }
+
+                // Socket doesn't exist, try to auto-start the host daemon
+                use locald_utils::container::{ContainerConfig, start_host_shim};
+                eprintln!("{} Attempting to start shim daemon on host...", style::INFO);
+
+                match start_host_shim(&ContainerConfig::default()) {
+                    Ok(()) => {
+                        // Wait for socket to appear
+                        let socket_path = match locald_utils::ipc::socket_path() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // Can't determine socket path, show degraded warning
+                                show_container_degraded_warning();
+                                return;
+                            }
+                        };
+
+                        for attempt in 1..=10 {
+                            #[allow(clippy::disallowed_methods)]
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if socket_path.exists() {
+                                eprintln!(
+                                    "{} Host shim daemon started successfully.",
+                                    style::CHECK
+                                );
+                                return;
+                            }
+                            if attempt == 5 {
+                                eprintln!(
+                                    "{} Still waiting for host daemon to start...",
+                                    style::INFO
+                                );
+                            }
+                        }
+                        // Timeout waiting for socket
+                        eprintln!(
+                            "{} Host daemon started but socket not available yet.",
+                            style::WARN
+                        );
+                        show_container_degraded_warning();
+                    }
+                    Err(e) => {
+                        eprintln!("{} Failed to auto-start host daemon: {}", style::WARN, e);
+                        show_container_degraded_warning();
+                    }
+                }
+                return;
+            }
+
+            // Non-container path: check for setuid shim
             match locald_utils::shim::find_privileged() {
                 Ok(Some(shim_path)) => {
                     // Shim exists, verify integrity
@@ -563,29 +639,8 @@ pub fn verify_shim() {
                     }
                 }
                 Ok(None) => {
-                    // No privileged shim found.
-                    // In container environments (Toolbx/Distrobox/etc), a host-installed setuid
-                    // shim often cannot be validated or used from inside the container due to
-                    // user namespace / mount semantics.
-                    // In that case, don't block the user with repeated setup prompts; continue
-                    // without privileged features.
-                    if is_probably_container() {
-                        eprintln!(
-                            "{} locald-shim is not available as a privileged helper in this container.",
-                            style::WARN
-                        );
-                        eprintln!(
-                            "{} Continuing without privileged features (hosts sync, cgroup isolation, privileged ports).",
-                            style::WARN
-                        );
-                        eprintln!(
-                            "{} For full setup, run `sudo locald admin setup` on the host OS.",
-                            style::WARN
-                        );
-                        return;
-                    }
-
-                    // Non-container: this is first run. Offer interactive setup if in a TTY.
+                    // No privileged shim found on non-container host.
+                    // This is first run. Offer interactive setup if in a TTY.
                     offer_first_run_setup();
                     // If offer_first_run_setup returns, setup was successful.
                 }
