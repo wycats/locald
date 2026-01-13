@@ -445,23 +445,45 @@ impl ShimDaemon {
             ShimRequest::Ping => ShimResponse::pong(&self.daemon_version),
 
             ShimRequest::HostsSync { entries } => {
-                // Placeholder: just acknowledge
-                let _ = entries; // TODO: Actually sync hosts file
-                eprintln!("HostsSync: would sync {} entries", entries.len());
-                ShimResponse::ok_empty()
+                // Extract hostnames from entries - the update_hosts_file function
+                // hardcodes 127.0.0.1, so we just pass the hostnames.
+                let domains: Vec<String> = entries.into_iter().map(|e| e.hostname).collect();
+                eprintln!("HostsSync: syncing {} entries", domains.len());
+                match crate::update_hosts_file(&domains) {
+                    Ok(()) => ShimResponse::ok_empty(),
+                    Err(e) => {
+                        eprintln!("HostsSync failed: {e:#}");
+                        ShimResponse::error(ErrorCode::OperationFailed, e.to_string())
+                    }
+                }
             }
 
             ShimRequest::CgroupSetup { strategy } => {
-                // Placeholder: just acknowledge
-                let _ = strategy;
+                use crate::protocol::CgroupStrategy;
                 eprintln!("CgroupSetup: strategy = {strategy:?}");
-                ShimResponse::ok_empty()
+                let result = match strategy {
+                    CgroupStrategy::Auto => crate::cgroup_setup(),
+                    CgroupStrategy::Systemd => crate::cgroup_setup_systemd(),
+                    CgroupStrategy::Direct => crate::cgroup_setup_driver(),
+                };
+                match result {
+                    Ok(()) => ShimResponse::ok_empty(),
+                    Err(e) => {
+                        eprintln!("CgroupSetup failed: {e:#}");
+                        ShimResponse::error(ErrorCode::OperationFailed, e.to_string())
+                    }
+                }
             }
 
             ShimRequest::CgroupKill { path } => {
-                // Placeholder: just acknowledge
                 eprintln!("CgroupKill: path = {path}");
-                ShimResponse::ok_empty()
+                match crate::cgroup_kill_and_prune(&path) {
+                    Ok(()) => ShimResponse::ok_empty(),
+                    Err(e) => {
+                        eprintln!("CgroupKill failed: {e:#}");
+                        ShimResponse::error(ErrorCode::OperationFailed, e.to_string())
+                    }
+                }
             }
 
             ShimRequest::BindPrivilegedPort { port } => {

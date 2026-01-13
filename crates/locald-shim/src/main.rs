@@ -530,7 +530,7 @@ fn enable_controllers(parent: &Path) -> Result<()> {
 }
 
 #[allow(clippy::disallowed_methods)]
-fn cgroup_setup_systemd() -> Result<()> {
+pub(crate) fn cgroup_setup_systemd() -> Result<()> {
     // Write /etc/systemd/system/locald.slice
     let unit_path = Path::new("/etc/systemd/system/locald.slice");
     let unit = "[Unit]\nDescription=Locald Container Runtime Root\n\n[Slice]\nDelegate=yes\n";
@@ -570,7 +570,7 @@ fn cgroup_setup_systemd() -> Result<()> {
     Ok(())
 }
 
-fn cgroup_setup_driver() -> Result<()> {
+pub(crate) fn cgroup_setup_driver() -> Result<()> {
     ensure_cgroup2_mount()?;
     let root = Path::new("/sys/fs/cgroup");
 
@@ -588,7 +588,7 @@ fn cgroup_setup_driver() -> Result<()> {
     Ok(())
 }
 
-fn cgroup_setup() -> Result<()> {
+pub(crate) fn cgroup_setup() -> Result<()> {
     if is_systemd_present() {
         match cgroup_setup_systemd() {
             Ok(()) => {
@@ -716,7 +716,7 @@ fn kill_all_pids_in_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
+pub(crate) fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
     ensure_cgroup2_mount()?;
     let dir = cgroup_mount_path(cgroups_path)?;
 
@@ -750,7 +750,7 @@ fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
 use std::fmt::Write;
 
 #[allow(clippy::disallowed_methods)]
-fn update_hosts_file(domains: &[String]) -> Result<()> {
+pub(crate) fn update_hosts_file(domains: &[String]) -> Result<()> {
     let path = if cfg!(windows) {
         std::path::PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
     } else {
