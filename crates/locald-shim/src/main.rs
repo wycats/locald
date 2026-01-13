@@ -114,6 +114,11 @@ enum AdminCommand {
     /// This runs with privileges and uses the *invoking user's* home directory
     /// (real uid) for CA material at ~/.locald/certs.
     Trust,
+
+    /// Install polkit policy for GUI-based privilege escalation.
+    ///
+    /// This must run as root to write to /usr/share/polkit-1/actions/.
+    InstallPolkit,
 }
 
 fn invoking_user_home_dir() -> Result<StdPathBuf> {
@@ -906,6 +911,46 @@ fn main() -> Result<()> {
         } => {
             let code = admin_trust()?;
             std::process::exit(code);
+        }
+        Commands::Admin {
+            command: AdminCommand::InstallPolkit,
+        } => {
+            // Sync I/O is appropriate for one-shot admin commands
+            #[allow(clippy::disallowed_methods)]
+            fn install_polkit_policy_sync() -> anyhow::Result<()> {
+                use std::os::unix::fs::PermissionsExt;
+
+                // Polkit policy content embedded at compile time
+                const POLKIT_POLICY_BYTES: &[u8] =
+                    include_bytes!("../../../assets/dev.locald.policy");
+                const POLKIT_ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
+                const POLKIT_POLICY_FILENAME: &str = "dev.locald.policy";
+
+                let actions_dir = std::path::Path::new(POLKIT_ACTIONS_DIR);
+                if !actions_dir.is_dir() {
+                    anyhow::bail!(
+                        "Polkit actions directory not found at {POLKIT_ACTIONS_DIR}. Is polkit installed?"
+                    );
+                }
+
+                let policy_path = actions_dir.join(POLKIT_POLICY_FILENAME);
+
+                // Write the policy file
+                std::fs::write(&policy_path, POLKIT_POLICY_BYTES).with_context(|| {
+                    format!("Failed to write polkit policy to {}", policy_path.display())
+                })?;
+
+                // Set appropriate permissions (644 - readable by all, writable by root)
+                let perms = std::fs::Permissions::from_mode(0o644);
+                std::fs::set_permissions(&policy_path, perms).with_context(|| {
+                    format!("Failed to set permissions on {}", policy_path.display())
+                })?;
+
+                eprintln!("Installed polkit policy to {}", policy_path.display());
+                Ok(())
+            }
+
+            install_polkit_policy_sync()
         }
         Commands::Admin {
             command: AdminCommand::Cleanup(args),

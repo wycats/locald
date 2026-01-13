@@ -670,22 +670,26 @@ pub fn run(cli: Cli) -> Result<()> {
 
                         // Install polkit policy for GUI privilege escalation (optional).
                         // This enables `pkexec locald shim serve` to show a graphical auth dialog.
+                        // Note: We delegate to the shim binary so the write runs in a known-privileged context.
                         {
                             let s = cliclack::spinner();
                             s.start("Installing polkit policy (optional)...");
 
                             if locald_utils::shim::is_polkit_available() {
-                                const POLKIT_POLICY_BYTES: &[u8] =
-                                    include_bytes!("../../../assets/dev.locald.policy");
+                                let output = std::process::Command::new(&shim_path)
+                                    .arg("admin")
+                                    .arg("install-polkit")
+                                    .output()
+                                    .context("Failed to run locald-shim admin install-polkit")?;
 
-                                match locald_utils::shim::install_polkit_policy(POLKIT_POLICY_BYTES)
-                                {
-                                    Ok(()) => {
-                                        s.stop("Polkit policy installed");
-                                    }
-                                    Err(e) => {
-                                        s.stop(format!("Polkit policy not installed: {e}"));
-                                    }
+                                if output.status.success() {
+                                    s.stop("Polkit policy installed");
+                                } else {
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    s.stop(format!(
+                                        "Polkit policy not installed: {}",
+                                        stderr.trim()
+                                    ));
                                 }
                             } else {
                                 s.stop("Polkit not available (skipped)");
