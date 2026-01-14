@@ -111,19 +111,47 @@ User runs: locald up (inside container)
 │ existing    │  │                                          │
 │ shim,       │  │ 1. Use configured host_exec template     │
 │ proceed     │  │ 2. Auto-detect: flatpak-spawn, host-exec │
-│             │  │ 3. Fail with actionable message          │
+│             │  │ 3. Offer interactive setup (if TTY)      │
+│             │  │ 4. ERROR with actionable message         │
 └─────────────┘  └─────────────────┬────────────────────────┘
                                    │
                                    ▼
                  ┌─────────────────────────────────────────┐
-                 │ If all fail, print:                     │
+                 │ If all fail, ERROR (not warn):          │
                  │                                         │
-                 │ "Could not start host shim daemon.      │
-                 │  Please run on your host:               │
-                 │    sudo locald shim serve               │
+                 │ "✗ locald requires privileged helper    │
+                 │    access.                              │
                  │                                         │
-                 │  Or configure host_exec in config.toml" │
+                 │  To fix:                                │
+                 │    Container: flatpak-spawn --host      │
+                 │               pkexec locald shim serve  │
+                 │    Direct:    sudo locald admin setup   │
+                 │                                         │
+                 │  To test without privileges:            │
+                 │    locald --sandbox test up             │
+                 │                                         │
+                 │  For diagnosis: locald doctor"          │
+                 │                                         │
+                 │ EXIT CODE: 1 (not continue)             │
                  └─────────────────────────────────────────┘
+```
+
+### Error-Not-Warning Policy
+
+**Critical design decision**: When privileged helper access is unavailable, `locald` **errors and exits** rather than continuing with a warning.
+
+**Rationale**:
+
+- Most core features (hosts sync, cgroup isolation, privileged ports) require the shim
+- Silent degradation leads to confusing "why doesn't X work?" experiences
+- Users deserve a clear signal that setup is incomplete
+- The sandbox mode (see RFC 0037) provides an explicit opt-in for unprivileged testing
+
+**The only way to run without privileges is sandbox mode**:
+
+```bash
+# This will work without any privileged setup
+locald --sandbox test up
 ```
 
 ### Manual Setup Options

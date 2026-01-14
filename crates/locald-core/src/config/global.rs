@@ -38,21 +38,16 @@ pub struct ContainerConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ServerConfig {
     /// Whether to attempt binding to privileged ports (80/443).
-    /// If true, failure to bind these ports will result in an error unless `fallback_ports` is also true.
+    /// If true, failure to bind these ports will result in an error.
+    /// Use sandbox mode (`locald --sandbox test up`) for unprivileged testing.
     #[serde(default = "default_true")]
     pub privileged_ports: bool,
-
-    /// Whether to fallback to unprivileged ports (8080/8443) if privileged ports fail.
-    /// Defaults to true to ensure it works out of the box.
-    #[serde(default = "default_true")]
-    pub fallback_ports: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             privileged_ports: true,
-            fallback_ports: true,
         }
     }
 }

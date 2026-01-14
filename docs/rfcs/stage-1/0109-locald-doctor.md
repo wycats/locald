@@ -41,7 +41,7 @@ When these prerequisites are missing, users often see confusing partial failures
 
 - Provide a single, obvious entry point to validate a `locald` installation.
 - Make “no privileged shim available” a first-class, top-priority diagnosis.
-- Report whether cgroup-based cleanup is enabled or the system is in degraded (PID-only) mode.
+- Report whether all prerequisites are met (ready) or setup is required.
 - Print actionable “do this next” commands.
 - Support machine-readable output for CI / bug reports.
 
@@ -125,8 +125,10 @@ Checks:
 
 Doctor should also clearly state whether `locald` will run in:
 
-- **Enabled mode**: cgroup-based cleanup is available; stop/restart can reliably kill process trees.
-- **Degraded mode**: cgroup-based cleanup is not available; stop/restart will fall back to PID-based behavior which may not reliably kill leaked subprocess trees.
+- **Ready**: All prerequisites are met; `locald up` will work fully.
+- **Setup Required**: One or more prerequisites are missing; `locald up` will error until fixed.
+
+Note: There is no "degraded mode" where `locald` continues with reduced functionality. If setup is incomplete, `locald up` errors with actionable guidance. The only way to run without privileges is sandbox mode (`locald --sandbox test up`).
 
 If this fails, doctor should recommend:
 
@@ -164,7 +166,10 @@ Proposed shape:
 Recommended additions:
 
 - `strategy`: `{ "cgroup_root": "systemd" | "direct", "why": "..." }`
-- `mode`: `enabled | degraded`
+- `status`: `ready | setup_required`
+- `sandbox_mode`: boolean (if running in sandbox, note this explicitly)
+
+Note: There is no "degraded" status. If prerequisites are missing, `locald up` will error (not warn). Users can use `locald --sandbox test up` for unprivileged testing.
 
 Note: the structured model and fix consolidation should be shared with privileged capability acquisition (see RFC 0110) so doctor and privileged operations cannot drift.
 

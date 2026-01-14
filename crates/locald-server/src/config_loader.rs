@@ -97,18 +97,12 @@ impl ConfigLoader {
         // Sandbox override
         if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
             config.server.privileged_ports = false;
-            config.server.fallback_ports = true;
         }
 
         // Warn on deprecated env vars
         if std::env::var("LOCALD_PRIVILEGED_PORTS").is_ok() {
             warn!(
                 "WARNING: LOCALD_PRIVILEGED_PORTS is deprecated and will be ignored. Use locald.toml or sandbox mode."
-            );
-        }
-        if std::env::var("LOCALD_FALLBACK_PORTS").is_ok() {
-            warn!(
-                "WARNING: LOCALD_FALLBACK_PORTS is deprecated and will be ignored. Use locald.toml or sandbox mode."
             );
         }
 
@@ -126,15 +120,6 @@ impl ConfigLoader {
                     // We assume if the file exists, the value *might* come from there.
                     // To be precise, we'd need to check if the key is actually in the file.
                     // For now, let's say Global if file exists, else Default.
-                    Provenance::Global(self.global_path.clone())
-                } else {
-                    Provenance::Default
-                }
-            }
-            "server.fallback_ports" => {
-                if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
-                    Provenance::EnvVar("LOCALD_SANDBOX_ACTIVE".to_string())
-                } else if self.global_path.exists() {
                     Provenance::Global(self.global_path.clone())
                 } else {
                     Provenance::Default

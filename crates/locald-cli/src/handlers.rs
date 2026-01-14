@@ -914,11 +914,6 @@ pub fn run(cli: Cli) -> Result<()> {
                         loader.global.server.privileged_ports,
                         loader.explain_global("server.privileged_ports")
                     );
-                    println!(
-                        "fallback_ports = {}  (from {})",
-                        loader.global.server.fallback_ports,
-                        loader.explain_global("server.fallback_ports")
-                    );
 
                     if let Ok(report) = rt.block_on(loader.load_service_provenance_report(&cwd)) {
                         for (service_name, service) in report.services {

@@ -520,20 +520,27 @@ fn offer_first_run_setup() -> bool {
     }
 }
 
-/// Show a warning that we're running in degraded mode inside a container.
-fn show_container_degraded_warning() {
+/// Show error that privileged helper access is required and exit.
+/// This is NOT a warning - we do not continue without privileges.
+fn show_privilege_required_error() -> ! {
+    eprintln!();
+    eprintln!("{} locald requires privileged helper access.", style::CROSS);
+    eprintln!();
+    eprintln!("This is needed for: hosts file sync, cgroup isolation, privileged ports.");
+    eprintln!();
+    eprintln!("To fix:");
     eprintln!(
-        "{} locald-shim is not available as a privileged helper in this container.",
-        style::WARN
+        "  {} Container: flatpak-spawn --host pkexec locald shim serve",
+        style::DOT
     );
-    eprintln!(
-        "{} Continuing without privileged features (hosts sync, cgroup isolation, privileged ports).",
-        style::WARN
-    );
-    eprintln!(
-        "{} For full setup, run `sudo locald admin setup` on the host OS.",
-        style::WARN
-    );
+    eprintln!("  {} Direct:    sudo locald admin setup", style::DOT);
+    eprintln!();
+    eprintln!("To test without privileges, use sandbox mode:");
+    eprintln!("  locald --sandbox test up");
+    eprintln!();
+    eprintln!("For diagnosis: locald doctor");
+    eprintln!();
+    std::process::exit(1);
 }
 
 pub fn verify_shim() {
@@ -554,6 +561,8 @@ pub fn verify_shim() {
             // In container environments, prefer socket-based daemon over setuid shim.
             // The setuid shim often can't work across container boundaries.
             if is_probably_container() {
+                use locald_utils::container::{ContainerConfig, start_host_shim};
+
                 // Try to connect to existing socket daemon
                 if let Ok(socket_path) = locald_utils::ipc::socket_path() {
                     if socket_path.exists() {
@@ -563,19 +572,14 @@ pub fn verify_shim() {
                 }
 
                 // Socket doesn't exist, try to auto-start the host daemon
-                use locald_utils::container::{ContainerConfig, start_host_shim};
                 eprintln!("{} Attempting to start shim daemon on host...", style::INFO);
 
                 match start_host_shim(&ContainerConfig::default()) {
                     Ok(()) => {
                         // Wait for socket to appear
-                        let socket_path = match locald_utils::ipc::socket_path() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                // Can't determine socket path, show degraded warning
-                                show_container_degraded_warning();
-                                return;
-                            }
+                        let Ok(socket_path) = locald_utils::ipc::socket_path() else {
+                            // Can't determine socket path - fatal error
+                            show_privilege_required_error();
                         };
 
                         for attempt in 1..=10 {
@@ -595,16 +599,19 @@ pub fn verify_shim() {
                                 );
                             }
                         }
-                        // Timeout waiting for socket
+                        // Timeout waiting for socket - fatal error
                         eprintln!(
-                            "{} Host daemon started but socket not available yet.",
-                            style::WARN
+                            "{} Host daemon started but socket not available.",
+                            style::CROSS
                         );
-                        show_container_degraded_warning();
+                        show_privilege_required_error();
                     }
                     Err(e) => {
                         eprintln!("{} Failed to auto-start host daemon: {}", style::WARN, e);
-                        show_container_degraded_warning();
+                        // Offer interactive setup like non-container path
+                        if !offer_first_run_setup() {
+                            show_privilege_required_error();
+                        }
                     }
                 }
                 return;

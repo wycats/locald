@@ -85,10 +85,9 @@ impl HostSyncer for DefaultHostSyncer {
         let shim_path = match locald_utils::shim::find_privileged()? {
             Some(path) => path,
             None => {
-                warn!(
-                    "Skipping hosts auto-sync: locald-shim is not installed or not setuid root. Run sudo locald admin setup to configure it."
+                anyhow::bail!(
+                    "locald-shim is not installed or not setuid root. Run `sudo locald admin setup` to configure it."
                 );
-                return Ok(());
             }
         };
 
