@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use locald_core::plugin::manifest::PackageManifest;
 use locald_server::plugins::{HostCapabilities, PluginRunner, ServiceSpec, WorkspaceContext};
 
 /// Install a plugin from a local path or URL.
@@ -252,6 +253,249 @@ fn install_from_url(url: &str, dest_dir: &Path, name: Option<String>) -> Result<
     std::fs::write(&dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
 
     println!("installed {}", dest.display());
+    Ok(())
+}
+
+/// Create a distributable plugin package (.locald-package).
+///
+/// Bundles a manifest.toml, WASM component, and optional assets into a gzip-compressed tar archive.
+pub fn create(
+    source: &Path,
+    output: Option<&Path>,
+    manifest_name: Option<&Path>,
+    dry_run: bool,
+    force: bool,
+    verbose: bool,
+) -> Result<()> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::fs::File;
+    use std::io::Read;
+    use tar::Builder;
+
+    // === Phase 1: Manifest Validation ===
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Error: Source directory '{}' not found", source.display()))?;
+
+    let manifest_path = source.join(manifest_name.unwrap_or(Path::new("manifest.toml")));
+    let manifest_content = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Error: manifest.toml not found in '{}'", source.display()))?;
+
+    let manifest = PackageManifest::parse(&manifest_content)
+        .map_err(|e| anyhow::anyhow!("Error: Invalid manifest: {e}"))?;
+
+    println!(
+        "✓ Validated manifest ({} v{})",
+        manifest.package.name, manifest.package.version
+    );
+
+    // === Phase 2: WASM Verification ===
+    let component_path = source.join(&manifest.plugin.component);
+    if !component_path.exists() {
+        anyhow::bail!(
+            "Error: Plugin component '{}' specified in manifest not found",
+            manifest.plugin.component
+        );
+    }
+
+    let component_bytes = std::fs::read(&component_path)
+        .with_context(|| format!("failed to read {}", component_path.display()))?;
+
+    // Check WASM magic bytes: \0asm = [0x00, 0x61, 0x73, 0x6D]
+    const WASM_MAGIC: &[u8] = &[0x00, 0x61, 0x73, 0x6D];
+    if component_bytes.len() < 4 || &component_bytes[0..4] != WASM_MAGIC {
+        anyhow::bail!(
+            "Error: '{}' is not a valid WASM file (invalid magic bytes)",
+            manifest.plugin.component
+        );
+    }
+
+    let component_size = component_bytes.len();
+    println!(
+        "✓ Verified WASM component ({}, {} KB)",
+        manifest.plugin.component,
+        component_size / 1024
+    );
+
+    // === Phase 3: Asset Collection ===
+    let assets_dir = source.join("assets");
+    let mut asset_files: Vec<PathBuf> = Vec::new();
+    let mut assets_size: usize = 0;
+
+    if assets_dir.exists() && assets_dir.is_dir() {
+        collect_assets(&assets_dir, &assets_dir, &mut asset_files)?;
+        for asset_path in &asset_files {
+            let full_path = assets_dir.join(asset_path);
+            assets_size += std::fs::metadata(&full_path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
+        }
+        println!(
+            "✓ Collected {} asset files ({} KB)",
+            asset_files.len(),
+            assets_size / 1024
+        );
+    }
+
+    // Determine output path
+    let output_path = output.map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "{}-{}.locald-package",
+            manifest.package.name, manifest.package.version
+        ))
+    });
+
+    // === Dry Run: Just print what would happen ===
+    if dry_run {
+        println!("\nWould create package from {}", source.display());
+        println!(
+            "\n  Manifest: {} v{}",
+            manifest.package.name, manifest.package.version
+        );
+        println!(
+            "  Component: {} ({} KB)",
+            manifest.plugin.component,
+            component_size / 1024
+        );
+        if !asset_files.is_empty() {
+            println!(
+                "  Assets: {} files ({} KB)",
+                asset_files.len(),
+                assets_size / 1024
+            );
+        }
+        println!("\n  Would write: {}", output_path.display());
+        return Ok(());
+    }
+
+    // Check if output exists
+    if output_path.exists() && !force {
+        anyhow::bail!(
+            "Error: Output file already exists: {} (use --force to overwrite)",
+            output_path.display()
+        );
+    }
+
+    // === Phase 4: Archive Creation ===
+    // Create temp file in same directory for atomic write
+    let temp_path = output_path.with_extension("locald-package.tmp");
+
+    {
+        let file = File::create(&temp_path).with_context(|| {
+            format!(
+                "Error: Cannot write to output path: {}",
+                temp_path.display()
+            )
+        })?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut archive = Builder::new(encoder);
+
+        // Add manifest.toml
+        let mut header = tar::Header::new_gnu();
+        let manifest_bytes = manifest_content.as_bytes();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "manifest.toml", manifest_bytes)
+            .context("failed to add manifest.toml to archive")?;
+        if verbose {
+            println!("  + manifest.toml");
+        }
+
+        // Add component
+        let mut header = tar::Header::new_gnu();
+        header.set_size(component_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                &manifest.plugin.component,
+                component_bytes.as_slice(),
+            )
+            .context("failed to add component to archive")?;
+        if verbose {
+            println!("  + {}", manifest.plugin.component);
+        }
+
+        // Add assets
+        for asset_rel in &asset_files {
+            let full_path = assets_dir.join(asset_rel);
+            let archive_path = Path::new("assets").join(asset_rel);
+
+            let mut file = File::open(&full_path)
+                .with_context(|| format!("failed to open asset {}", full_path.display()))?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, &archive_path, contents.as_slice())
+                .with_context(|| format!("failed to add {} to archive", archive_path.display()))?;
+            if verbose {
+                println!("  + {}", archive_path.display());
+            }
+        }
+
+        // Finish archive
+        let encoder = archive.into_inner().context("failed to finalize archive")?;
+        encoder.finish().context("failed to compress archive")?;
+    }
+
+    // Atomic rename
+    std::fs::rename(&temp_path, &output_path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            temp_path.display(),
+            output_path.display()
+        )
+    })?;
+
+    // Get final size
+    let final_size = std::fs::metadata(&output_path)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+
+    println!("✓ Created archive (compressed: {} KB)", final_size / 1024);
+    println!("\n→ Package created: {}", output_path.display());
+    println!("\n  Install with:");
+    println!("    locald plugin install {}", output_path.display());
+
+    Ok(())
+}
+
+/// Recursively collect asset files, validating no path traversal.
+fn collect_assets(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read assets directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Security: reject any path containing ".."
+        for component in path.components() {
+            if let std::path::Component::ParentDir = component {
+                anyhow::bail!(
+                    "Error: Asset path contains '..' which is not allowed: {}",
+                    path.display()
+                );
+            }
+        }
+
+        if path.is_dir() {
+            collect_assets(base, &path, out)?;
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(base)
+                .with_context(|| format!("failed to get relative path for {}", path.display()))?;
+            out.push(rel.to_path_buf());
+        }
+    }
     Ok(())
 }
 

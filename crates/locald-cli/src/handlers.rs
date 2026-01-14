@@ -1153,6 +1153,26 @@ pub fn run(cli: Cli) -> Result<()> {
                     std::process::exit(1);
                 }
             }
+            PluginCommands::Create {
+                source,
+                output,
+                manifest,
+                dry_run,
+                force,
+                verbose,
+            } => {
+                if let Err(e) = plugin::create(
+                    source,
+                    output.as_deref(),
+                    manifest.as_deref(),
+                    *dry_run,
+                    *force,
+                    *verbose,
+                ) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         },
         Commands::Serve {
             path,

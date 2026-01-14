@@ -289,6 +289,33 @@ pub enum PluginCommands {
         #[arg(long)]
         grant: Vec<String>,
     },
+
+    /// Create a distributable plugin package (.locald-package)
+    Create {
+        /// Source directory containing manifest.toml [default: .]
+        #[arg(default_value = ".")]
+        source: std::path::PathBuf,
+
+        /// Output package path [default: {name}-{version}.locald-package]
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Manifest file path relative to source [default: manifest.toml]
+        #[arg(short, long)]
+        manifest: Option<std::path::PathBuf>,
+
+        /// Show what would be packaged without creating archive
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite existing output file
+        #[arg(long)]
+        force: bool,
+
+        /// Show detailed packaging steps
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[derive(Subcommand)]
