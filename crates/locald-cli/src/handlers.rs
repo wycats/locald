@@ -1107,8 +1107,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 source,
                 name,
                 project,
+                user,
+                force,
             } => {
-                if let Err(e) = plugin::install(source, name.clone(), *project) {
+                if let Err(e) = plugin::install(source, name.clone(), *project, *user, *force) {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }

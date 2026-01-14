@@ -226,16 +226,24 @@ pub enum Commands {
 pub enum PluginCommands {
     /// Install a plugin from a local path or URL
     Install {
-        /// Local path or URL to a WASM component
+        /// Local path or URL to a WASM component or .locald-package
         source: String,
 
-        /// Optional installed name (defaults to the source filename)
+        /// Optional installed name (only for raw .wasm; packages use manifest name)
         #[arg(long)]
         name: Option<String>,
 
-        /// Install into the current project's .local/plugins directory
+        /// Install into the current project's .locald/plugins directory
         #[arg(long)]
         project: bool,
+
+        /// Install into user-local plugins directory ($XDG_DATA_HOME/locald/plugins/)
+        #[arg(long)]
+        user: bool,
+
+        /// Overwrite existing plugin with same name
+        #[arg(long)]
+        force: bool,
     },
 
     /// Inspect a plugin by running detect/apply and printing a normalized debug JSON plan

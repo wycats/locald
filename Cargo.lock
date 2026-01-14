@@ -2794,6 +2794,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rexpect",
+ "semver",
  "serde",
  "serde_json",
  "shlex",

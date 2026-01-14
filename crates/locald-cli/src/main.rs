@@ -76,7 +76,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
     }
 
     // Skip verification for admin setup, as it's used to fix the shim
-    // Also skip for plugin commands that don't need daemon (create)
+    // Also skip for plugin commands that don't need daemon (create, install)
     #[cfg(feature = "experimental-plugins")]
     let skip_verify = matches!(
         cli.command,
@@ -86,6 +86,9 @@ fn run_main(cli: cli::Cli) -> Result<()> {
             | cli::Commands::Surface { .. }
             | cli::Commands::Plugin {
                 command: cli::PluginCommands::Create { .. }
+            }
+            | cli::Commands::Plugin {
+                command: cli::PluginCommands::Install { .. }
             }
     );
     #[cfg(not(feature = "experimental-plugins"))]

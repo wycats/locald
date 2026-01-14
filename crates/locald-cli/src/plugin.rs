@@ -4,32 +4,330 @@ use std::path::{Path, PathBuf};
 use locald_core::plugin::manifest::PackageManifest;
 use locald_server::plugins::{HostCapabilities, PluginRunner, ServiceSpec, WorkspaceContext};
 
+/// Current locald version for compatibility checking.
+const LOCALD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Supported IR versions by this host.
+const SUPPORTED_IR_VERSIONS: &[i32] = &[1];
+
 /// Install a plugin from a local path or URL.
 ///
 /// - If `project` is true, installs into the current project's `.locald/plugins` directory.
-/// - Otherwise installs into the user-local data directory (`$XDG_DATA_HOME`, falling back to the platform default).
-/// - If `name` is provided, it is sanitized and used as the destination filename.
-/// - Supported sources: local filesystem paths, `file://...` URLs, and `http(s)://...` URLs.
-pub fn install(source: &str, name: Option<String>, project: bool) -> Result<()> {
-    let dest_dir = if project {
-        project_plugins_dir()?
-    } else {
+/// - If `user` is true, installs into `$XDG_DATA_HOME/locald/plugins/`.
+/// - If neither, defaults to project scope.
+/// - Auto-detects `.locald-package` archives vs raw `.wasm` files.
+/// - If `force` is true, overwrites existing plugins.
+pub fn install(
+    source: &str,
+    name: Option<String>,
+    _project: bool,
+    user: bool,
+    force: bool,
+) -> Result<()> {
+    // Determine destination directory
+    let dest_dir = if user {
         user_plugins_dir()
+    } else {
+        // Default to project scope (even if --project not specified)
+        project_plugins_dir()?
     };
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("failed to create plugin dir {}", dest_dir.display()))?;
 
     let source = source.trim();
 
+    // Detect package format
+    let is_package = is_package_source(source);
+
+    if is_package {
+        install_package(source, &dest_dir, force)
+    } else {
+        install_raw_wasm(source, &dest_dir, name, force)
+    }
+}
+
+/// Check if source looks like a .locald-package
+fn is_package_source(source: &str) -> bool {
+    source.ends_with(".locald-package")
+}
+
+/// Install a raw .wasm file
+fn install_raw_wasm(
+    source: &str,
+    dest_dir: &Path,
+    name: Option<String>,
+    force: bool,
+) -> Result<()> {
     if let Some(path) = file_url_to_path(source) {
-        return install_from_path(&path, &dest_dir, name);
+        return install_wasm_from_path(&path, dest_dir, name, force);
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
-        return install_from_url(source, &dest_dir, name);
+        return install_wasm_from_url(source, dest_dir, name, force);
     }
 
-    install_from_path(Path::new(source), &dest_dir, name)
+    install_wasm_from_path(Path::new(source), dest_dir, name, force)
+}
+
+/// Install a .locald-package archive
+fn install_package(source: &str, dest_dir: &Path, force: bool) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    println!("→ Extracting package...");
+
+    // Get package bytes
+    let package_bytes = if let Some(path) = file_url_to_path(source) {
+        std::fs::read(&path)
+            .with_context(|| format!("Error: Package not found: '{}'", path.display()))?
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        // Security warning for remote URLs
+        eprintln!("⚠ Warning: Installing unsigned package from remote URL.");
+        eprintln!("  Packages can request capabilities that affect your system.");
+        eprintln!("  Only install packages from sources you trust.");
+
+        // For now, continue without prompt (would need dialoguer for interactive)
+        let response = reqwest::blocking::get(source)
+            .with_context(|| format!("failed to download {source}"))?
+            .error_for_status()
+            .with_context(|| format!("download failed for {source}"))?;
+        response.bytes()?.to_vec()
+    } else {
+        let path = Path::new(source);
+        std::fs::read(path)
+            .with_context(|| format!("Error: Package not found: '{}'", path.display()))?
+    };
+
+    // Create temp directory for extraction
+    let temp_dir = dest_dir.join(".tmp-install");
+    if temp_dir.exists() {
+        std::fs::remove_dir_all(&temp_dir)?;
+    }
+    std::fs::create_dir_all(&temp_dir)?;
+
+    // Extract archive
+    let decoder = GzDecoder::new(package_bytes.as_slice());
+    let mut archive = Archive::new(decoder);
+
+    // Track extracted files
+    let mut manifest_content: Option<String> = None;
+    let mut component_path: Option<PathBuf> = None;
+    let mut asset_files: Vec<PathBuf> = Vec::new();
+
+    for entry in archive
+        .entries()
+        .context("Error: Invalid .locald-package archive")?
+    {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+
+        // Security: validate no path traversal
+        for component in path.components() {
+            if let std::path::Component::ParentDir = component {
+                std::fs::remove_dir_all(&temp_dir).ok();
+                anyhow::bail!("Error: Archive contains path traversal attack");
+            }
+        }
+
+        let dest = temp_dir.join(&path);
+
+        // Create parent directories
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Read content
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content)?;
+
+        // Track special files
+        if path.as_os_str() == "manifest.toml" {
+            manifest_content = Some(
+                String::from_utf8(content.clone()).context("manifest.toml is not valid UTF-8")?,
+            );
+        } else if path.extension().map(|e| e == "wasm").unwrap_or(false) {
+            component_path = Some(dest.clone());
+        } else if path.starts_with("assets/") {
+            asset_files.push(path.clone());
+        }
+
+        std::fs::write(&dest, content)?;
+    }
+
+    // === Phase 2: Manifest Validation ===
+    let manifest_content =
+        manifest_content.ok_or_else(|| anyhow::anyhow!("Error: Package missing manifest.toml"))?;
+
+    let manifest = PackageManifest::parse(&manifest_content)
+        .map_err(|e| anyhow::anyhow!("Error: Invalid manifest: {e}"))?;
+
+    // === Phase 3: Compatibility Checking ===
+    println!("→ Checking compatibility...");
+
+    // Check locald version
+    if let Some(ref min_version) = manifest.compatibility.locald_min {
+        let current: semver::Version = LOCALD_VERSION
+            .parse()
+            .unwrap_or_else(|_| semver::Version::new(0, 1, 0));
+        let required: semver::Version = min_version
+            .parse()
+            .context("Error: Invalid locald_min version in manifest")?;
+
+        if current >= required {
+            println!(
+                "   ✓ locald version {} meets minimum {}",
+                LOCALD_VERSION, min_version
+            );
+        } else {
+            std::fs::remove_dir_all(&temp_dir).ok();
+            anyhow::bail!(
+                "Error: Package requires locald >= {}, current is {}",
+                min_version,
+                LOCALD_VERSION
+            );
+        }
+    }
+
+    // Check IR version
+    let ir_version = manifest.compatibility.ir_version;
+    if SUPPORTED_IR_VERSIONS.contains(&ir_version) {
+        println!("   ✓ IR version {} supported", ir_version);
+    } else {
+        std::fs::remove_dir_all(&temp_dir).ok();
+        anyhow::bail!(
+            "Error: Package uses IR version {}, supported: {:?}",
+            ir_version,
+            SUPPORTED_IR_VERSIONS
+        );
+    }
+
+    // === Phase 4: Capability Warning ===
+    for cap in &manifest.capabilities.required {
+        println!(
+            "   ⚠ Requires capability: {} (will be requested at runtime)",
+            cap
+        );
+    }
+
+    // === Phase 5: Installation ===
+    let final_wasm = dest_dir.join(format!("{}.wasm", manifest.package.name));
+
+    // Check if already exists
+    if final_wasm.exists() && !force {
+        std::fs::remove_dir_all(&temp_dir).ok();
+        anyhow::bail!(
+            "Error: Plugin '{}' already installed (use --force to overwrite)",
+            manifest.package.name
+        );
+    }
+
+    // Copy component
+    if let Some(ref comp_path) = component_path {
+        println!("→ Installing to {}", final_wasm.display());
+        std::fs::copy(comp_path, &final_wasm)
+            .with_context(|| format!("failed to copy component to {}", final_wasm.display()))?;
+    } else {
+        std::fs::remove_dir_all(&temp_dir).ok();
+        anyhow::bail!("Error: Package missing WASM component");
+    }
+
+    // Copy assets if present
+    if !asset_files.is_empty() {
+        let assets_dest = dest_dir.join("assets").join(&manifest.package.name);
+        std::fs::create_dir_all(&assets_dest)?;
+
+        for asset_rel in &asset_files {
+            // asset_rel is like "assets/templates/foo.txt", we want just "templates/foo.txt"
+            let inner_path = asset_rel.strip_prefix("assets/").unwrap_or(asset_rel);
+            let src = temp_dir.join(asset_rel);
+            let dst = assets_dest.join(inner_path);
+
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dst)?;
+        }
+        println!("   ✓ Installed {} asset files", asset_files.len());
+    }
+
+    // Cleanup
+    std::fs::remove_dir_all(&temp_dir).ok();
+
+    println!("→ Done.");
+    Ok(())
+}
+
+fn install_wasm_from_path(
+    source: &Path,
+    dest_dir: &Path,
+    name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    if !source.exists() {
+        anyhow::bail!("source path does not exist: {}", source.display());
+    }
+
+    let filename = if let Some(name) = name {
+        sanitize_filename(&name)
+    } else {
+        source
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .context("could not determine filename from source path; pass --name")?
+    };
+
+    let dest = dest_dir.join(&filename);
+
+    if dest.exists() && !force {
+        anyhow::bail!(
+            "Plugin '{}' already installed (use --force to overwrite)",
+            filename
+        );
+    }
+
+    std::fs::copy(source, &dest)
+        .with_context(|| format!("failed to copy {} -> {}", source.display(), dest.display()))?;
+
+    println!("installed {}", dest.display());
+    Ok(())
+}
+
+fn install_wasm_from_url(
+    url: &str,
+    dest_dir: &Path,
+    name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let filename = if let Some(name) = name {
+        sanitize_filename(&name)
+    } else {
+        url_filename(url).context("could not determine filename from URL; pass --name")?
+    };
+
+    let dest = dest_dir.join(&filename);
+
+    if dest.exists() && !force {
+        anyhow::bail!(
+            "Plugin '{}' already installed (use --force to overwrite)",
+            filename
+        );
+    }
+
+    let response = reqwest::blocking::get(url)
+        .with_context(|| format!("failed to download {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download failed for {url}"))?;
+
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("failed reading response body from {url}"))?;
+
+    std::fs::write(&dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
+
+    println!("installed {}", dest.display());
+    Ok(())
 }
 
 pub fn inspect(
@@ -207,53 +505,6 @@ fn file_url_to_path(source: &str) -> Option<PathBuf> {
         return Some(PathBuf::from(rest));
     }
     None
-}
-
-fn install_from_path(source: &Path, dest_dir: &Path, name: Option<String>) -> Result<()> {
-    if !source.exists() {
-        anyhow::bail!("source path does not exist: {}", source.display());
-    }
-
-    let filename = if let Some(name) = name {
-        sanitize_filename(&name)
-    } else {
-        source
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-            .context("could not determine filename from source path; pass --name")?
-    };
-
-    let dest = dest_dir.join(filename);
-    std::fs::copy(source, &dest)
-        .with_context(|| format!("failed to copy {} -> {}", source.display(), dest.display()))?;
-
-    println!("installed {}", dest.display());
-    Ok(())
-}
-
-fn install_from_url(url: &str, dest_dir: &Path, name: Option<String>) -> Result<()> {
-    let filename = if let Some(name) = name {
-        sanitize_filename(&name)
-    } else {
-        url_filename(url).context("could not determine filename from URL; pass --name")?
-    };
-
-    let dest = dest_dir.join(filename);
-
-    let response = reqwest::blocking::get(url)
-        .with_context(|| format!("failed to download {url}"))?
-        .error_for_status()
-        .with_context(|| format!("download failed for {url}"))?;
-
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("failed reading response body from {url}"))?;
-
-    std::fs::write(&dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
-
-    println!("installed {}", dest.display());
-    Ok(())
 }
 
 /// Create a distributable plugin package (.locald-package).
