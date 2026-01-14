@@ -1272,7 +1272,7 @@ aliases = ["29.3"]
 [[epochs.phases.tasks]]
 id = "29.2.1"
 label = "Package Format: Define .locald-package archive format (WASM + config + metadata)"
-status = "pending"
+status = "complete"
 
 [[epochs.phases.tasks]]
 id = "29.2.2"

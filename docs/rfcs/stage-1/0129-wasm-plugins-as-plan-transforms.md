@@ -508,20 +508,95 @@ Continue? [y/N]
 
 #### 3.13.6 Package Creation
 
-`locald package create` bundles a plugin into a distributable package:
+`locald package create` bundles a plugin into a distributable package.
+
+##### CLI Interface
 
 ```
-$ locald package create ./my-plugin --output my-plugin-1.0.0.locald-package
+locald package create [SOURCE] [OPTIONS]
+
+Arguments:
+  [SOURCE]  Source directory containing manifest.toml [default: .]
+
+Options:
+  -o, --output <FILE>     Output package path [default: {name}-{version}.locald-package]
+  -m, --manifest <FILE>   Manifest file path relative to SOURCE [default: manifest.toml]
+      --dry-run           Show what would be packaged without creating archive
+      --force             Overwrite existing output file
+  -v, --verbose           Show detailed packaging steps
 ```
 
-**Required inputs**:
-- `manifest.toml` in the source directory
-- `plugin.wasm` (or path specified in manifest)
+##### Validation Pipeline
 
-**Validation during creation**:
-- Manifest schema validation
-- WASM component format verification
-- Service kind validation (plugin must handle declared kinds)
+Package creation performs validation in four phases:
+
+**Phase 1 - Manifest Validation**:
+1. Read and parse `manifest.toml` using `PackageManifest::from_toml()`
+2. Validate schema (name regex, semver format, IR version)
+3. Verify `plugin.component` file exists at expected path
+
+**Phase 2 - WASM Verification**:
+1. Read component file bytes
+2. Verify WASM magic bytes (`\0asm` = `[0x00, 0x61, 0x73, 0x6D]`)
+3. Optionally verify WASM component structure (deferred to runtime for MVP)
+
+**Phase 3 - Asset Collection**:
+1. If `assets/` directory exists, recursively collect all files
+2. Validate no path traversal escapes (no `..` segments)
+3. Preserve directory structure within `assets/`
+
+**Phase 4 - Archive Creation**:
+1. Create tar archive with entries: `manifest.toml`, component file, `assets/**`
+2. Gzip compress the archive
+3. Write atomically (temp file + rename) to output path
+
+##### Error Handling
+
+| Scenario | Error Message |
+|----------|---------------|
+| Source path not found | `Error: Source directory '{path}' not found` |
+| Manifest not found | `Error: manifest.toml not found in '{path}'` |
+| Manifest parse error | `Error: Invalid manifest: {parse_error}` |
+| Component not found | `Error: Plugin component '{name}' specified in manifest not found` |
+| Invalid WASM format | `Error: '{name}' is not a valid WASM file (invalid magic bytes)` |
+| Output exists | `Error: Output file already exists: {path} (use --force to overwrite)` |
+| Write permission | `Error: Cannot write to output path: {path}` |
+
+##### Output Format
+
+**Success output**:
+```
+Creating package from ./my-plugin
+
+✓ Validated manifest (redis-plugin v1.0.0)
+✓ Verified WASM component (plugin.wasm, 234 KB)
+✓ Collected 5 asset files (12 KB)
+✓ Created archive (compressed: 189 KB)
+
+→ Package created: redis-plugin-1.0.0.locald-package
+
+  Install with:
+    locald plugin install redis-plugin-1.0.0.locald-package
+```
+
+**Dry-run output**:
+```
+Would create package from ./my-plugin
+
+  Manifest: redis-plugin v1.0.0
+  Component: plugin.wasm (234 KB)
+  Assets: 5 files (12 KB)
+  
+  Would write: redis-plugin-1.0.0.locald-package
+```
+
+##### Default Conventions
+
+- **Output filename**: `{package.name}-{package.version}.locald-package`
+- **Output directory**: Current working directory
+- **Manifest location**: `{SOURCE}/manifest.toml`
+- **Component location**: `{SOURCE}/{plugin.component}`
+- **Asset location**: `{SOURCE}/assets/` (if present)
 
 ## 4. Implementation Plan (Stage 2)
 
