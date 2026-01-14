@@ -208,5 +208,3 @@ Testing notes:
 
 - Should `locald doctor` support an explicit `--fix` mode in the future?
 - Should we expand checks to include deeper kernel/runtime prerequisites for `libcontainer` (namespaces, mount options), or keep the scope intentionally narrow?
-
-

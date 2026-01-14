@@ -560,6 +560,7 @@ pub fn verify_shim() {
         if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
             // In container environments, prefer socket-based daemon over setuid shim.
             // The setuid shim often can't work across container boundaries.
+            #[allow(clippy::items_after_statements)]
             if is_probably_container() {
                 use locald_utils::container::{ContainerConfig, start_host_shim};
 
