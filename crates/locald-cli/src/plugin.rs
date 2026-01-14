@@ -5,7 +5,7 @@ use locald_server::plugins::{HostCapabilities, PluginRunner, ServiceSpec, Worksp
 
 /// Install a plugin from a local path or URL.
 ///
-/// - If `project` is true, installs into the current project's `.local/plugins` directory.
+/// - If `project` is true, installs into the current project's `.locald/plugins` directory.
 /// - Otherwise installs into the user-local data directory (`$XDG_DATA_HOME`, falling back to the platform default).
 /// - If `name` is provided, it is sanitized and used as the destination filename.
 /// - Supported sources: local filesystem paths, `file://...` URLs, and `http(s)://...` URLs.
@@ -157,7 +157,7 @@ fn user_plugins_dir() -> PathBuf {
 }
 
 fn project_plugins_dir() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(".local").join("plugins"))
+    Ok(std::env::current_dir()?.join(".locald").join("plugins"))
 }
 
 fn resolve_plugin(plugin: &str) -> Result<PathBuf> {

@@ -32,7 +32,7 @@ fn plugin_install_project_copies_file_to_local_plugins_dir() {
 
     let installed = root
         .path()
-        .join(".local")
+        .join(".locald")
         .join("plugins")
         .join("redis.component.wasm");
 
@@ -60,7 +60,7 @@ fn plugin_install_project_sanitizes_name() {
 
     let installed = root
         .path()
-        .join(".local")
+        .join(".locald")
         .join("plugins")
         .join("foo-bar.wasm");
 
@@ -117,7 +117,7 @@ fn plugin_install_project_downloads_from_http_url() {
 
     let installed = root
         .path()
-        .join(".local")
+        .join(".locald")
         .join("plugins")
         .join("redis.component.wasm");
 
