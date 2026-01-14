@@ -14,6 +14,8 @@ use std::path::Path;
 use std::process::Command;
 use tracing::{info, warn};
 
+use crate::shim::{SHIM_SERVE_PKEXEC, SHIM_SERVE_SUDO};
+
 /// Check if we're probably running inside a container.
 ///
 /// This is a heuristic check that looks for common container indicators.
@@ -53,7 +55,7 @@ pub struct ContainerConfig {
 /// Returns an error if no host-exec mechanism is available or if all
 /// available mechanisms fail to start the daemon.
 pub fn start_host_shim(config: &ContainerConfig) -> Result<()> {
-    let shim_command = "pkexec locald shim serve";
+    let shim_command = SHIM_SERVE_PKEXEC;
 
     // Try user-configured template first
     if let Some(template) = &config.host_exec {
@@ -95,7 +97,7 @@ pub fn start_host_shim(config: &ContainerConfig) -> Result<()> {
         "No host-exec mechanism available. \
          Tried flatpak-spawn and distrobox-host-exec but neither succeeded.\n\n\
          You can manually start the daemon on the host with:\n  \
-         sudo locald shim serve\n\n\
+         {SHIM_SERVE_SUDO}\n\n\
          Or configure a custom host_exec template in ~/.config/locald/config.toml:\n  \
          [container]\n  \
          host_exec = \"your-command {{command}}\""

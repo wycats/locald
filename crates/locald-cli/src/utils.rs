@@ -193,8 +193,8 @@ fn command_exists(name: &str) -> bool {
 ///
 /// # Example
 /// ```ignore
-/// let result = substitute_host_exec_template("flatpak-spawn --host {command}", "pkexec locald shim serve");
-/// assert_eq!(result, "flatpak-spawn --host pkexec locald shim serve");
+/// let result = substitute_host_exec_template("flatpak-spawn --host {command}", "pkexec locald-shim serve");
+/// assert_eq!(result, "flatpak-spawn --host pkexec locald-shim serve");
 /// ```
 #[allow(dead_code)] // Used in Phase 4 of RFC 0130
 #[allow(clippy::literal_string_with_formatting_args)] // {command} is a template placeholder, not a format arg
@@ -216,7 +216,7 @@ pub fn substitute_host_exec_template(template: &str, command: &str) -> String {
 pub fn start_host_shim(config: &locald_core::config::ContainerConfig) -> anyhow::Result<()> {
     use anyhow::anyhow;
 
-    const SHIM_COMMAND: &str = "pkexec locald shim serve";
+    const SHIM_COMMAND: &str = "pkexec locald-shim serve";
 
     // 1. Check for user-configured host_exec template
     if let Some(template) = &config.host_exec {
@@ -227,7 +227,7 @@ pub fn start_host_shim(config: &locald_core::config::ContainerConfig) -> anyhow:
     // 2. Auto-detect available mechanisms
     if command_exists("flatpak-spawn") {
         return std::process::Command::new("flatpak-spawn")
-            .args(["--host", "pkexec", "locald", "shim", "serve"])
+            .args(["--host", "pkexec", "locald-shim", "serve"])
             .status()
             .map_err(|e| anyhow!("Failed to run flatpak-spawn: {}", e))
             .and_then(|status| {
@@ -244,7 +244,7 @@ pub fn start_host_shim(config: &locald_core::config::ContainerConfig) -> anyhow:
 
     if command_exists("distrobox-host-exec") {
         return std::process::Command::new("distrobox-host-exec")
-            .args(["pkexec", "locald", "shim", "serve"])
+            .args(["pkexec", "locald-shim", "serve"])
             .status()
             .map_err(|e| anyhow!("Failed to run distrobox-host-exec: {}", e))
             .and_then(|status| {
@@ -263,7 +263,7 @@ pub fn start_host_shim(config: &locald_core::config::ContainerConfig) -> anyhow:
     Err(anyhow!(
         "Could not start host shim daemon.\n\n\
          Please run on your host:\n\
-           sudo locald shim serve\n\n\
+           sudo locald-shim serve\n\n\
          Or configure host_exec in ~/.config/locald/config.toml:\n\
            [container]\n\
            host_exec = \"your-host-exec-command {{command}}\""
@@ -530,7 +530,7 @@ fn show_privilege_required_error() -> ! {
     eprintln!();
     eprintln!("To fix:");
     eprintln!(
-        "  {} Container: flatpak-spawn --host pkexec locald shim serve",
+        "  {} Container: flatpak-spawn --host pkexec locald-shim serve",
         style::DOT
     );
     eprintln!("  {} Direct:    sudo locald admin setup", style::DOT);
@@ -669,31 +669,31 @@ mod tests {
     fn test_substitute_host_exec_template_basic() {
         let result = substitute_host_exec_template(
             "flatpak-spawn --host {command}",
-            "pkexec locald shim serve",
+            "pkexec locald-shim serve",
         );
-        assert_eq!(result, "flatpak-spawn --host pkexec locald shim serve");
+        assert_eq!(result, "flatpak-spawn --host pkexec locald-shim serve");
     }
 
     #[test]
     fn test_substitute_host_exec_template_distrobox() {
         let result = substitute_host_exec_template(
             "distrobox-host-exec {command}",
-            "pkexec locald shim serve",
+            "pkexec locald-shim serve",
         );
-        assert_eq!(result, "distrobox-host-exec pkexec locald shim serve");
+        assert_eq!(result, "distrobox-host-exec pkexec locald-shim serve");
     }
 
     #[test]
     fn test_substitute_host_exec_template_ssh() {
         let result =
-            substitute_host_exec_template("ssh myhost {command}", "pkexec locald shim serve");
-        assert_eq!(result, "ssh myhost pkexec locald shim serve");
+            substitute_host_exec_template("ssh myhost {command}", "pkexec locald-shim serve");
+        assert_eq!(result, "ssh myhost pkexec locald-shim serve");
     }
 
     #[test]
     fn test_substitute_host_exec_template_no_placeholder() {
         // If template doesn't contain {command}, the command is not inserted
-        let result = substitute_host_exec_template("echo hello", "pkexec locald shim serve");
+        let result = substitute_host_exec_template("echo hello", "pkexec locald-shim serve");
         assert_eq!(result, "echo hello");
     }
 
@@ -714,11 +714,11 @@ mod tests {
     fn test_substitute_host_exec_template_command_with_spaces() {
         let result = substitute_host_exec_template(
             "flatpak-spawn --host {command}",
-            "pkexec locald shim serve --foreground",
+            "pkexec locald-shim serve --foreground",
         );
         assert_eq!(
             result,
-            "flatpak-spawn --host pkexec locald shim serve --foreground"
+            "flatpak-spawn --host pkexec locald-shim serve --foreground"
         );
     }
 

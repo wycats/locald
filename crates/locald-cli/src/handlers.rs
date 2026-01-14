@@ -669,7 +669,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
 
                         // Install polkit policy for GUI privilege escalation (optional).
-                        // This enables `pkexec locald shim serve` to show a graphical auth dialog.
+                        // This enables `pkexec locald-shim serve` to show a graphical auth dialog.
                         // Note: We delegate to the shim binary so the write runs in a known-privileged context.
                         {
                             let s = cliclack::spinner();

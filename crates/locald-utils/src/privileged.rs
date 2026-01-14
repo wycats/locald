@@ -475,8 +475,8 @@ fn create_container_no_socket_report(socket_error: &anyhow::Error) -> DoctorRepo
                  the host shim daemon must be running."
             )),
             remediation: vec![
-                "On the host, run: sudo locald shim serve".to_string(),
-                "Or run: flatpak-spawn --host pkexec locald shim serve".to_string(),
+                format!("On the host, run: {}", shim::SHIM_SERVE_SUDO),
+                format!("Or run: flatpak-spawn --host {}", shim::SHIM_SERVE_PKEXEC),
             ],
             evidence: vec![
                 EvidenceItem {
@@ -495,9 +495,9 @@ fn create_container_no_socket_report(socket_error: &anyhow::Error) -> DoctorRepo
             key: FixKey::RunAdminSetup,
             summary: "Start the host shim daemon".to_string(),
             commands: vec![
-                "sudo locald shim serve".to_string(),
+                shim::SHIM_SERVE_SUDO.to_string(),
                 "# Or from inside container:".to_string(),
-                "flatpak-spawn --host pkexec locald shim serve".to_string(),
+                format!("flatpak-spawn --host {}", shim::SHIM_SERVE_PKEXEC),
             ],
         }],
     }
