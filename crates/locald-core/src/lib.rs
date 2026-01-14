@@ -81,6 +81,12 @@ pub mod resolver;
 #[doc(inline)]
 pub use resolver::ServiceResolver;
 pub mod buildpack;
+pub mod plugin;
+#[doc(inline)]
+pub use plugin::{
+    CapabilityRequirements, Compatibility, ManifestError, PackageManifest, PackageMetadata,
+    PluginSpec,
+};
 pub mod service;
 #[doc(inline)]
 pub use service::{
