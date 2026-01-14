@@ -458,7 +458,7 @@ optional = ["cache_dir"]                # Capabilities plugin can use if granted
 **Compatibility checking** occurs at install time:
 
 ```
-$ locald package install redis-plugin-1.0.0.locald-package
+$ locald plugin install redis-plugin-1.0.0.locald-package
 → Checking compatibility...
    ✓ locald version 0.2.1 meets minimum 0.2.0
    ✓ IR version 1 supported
@@ -493,7 +493,7 @@ $ locald package install redis-plugin-1.0.0.locald-package
 **Phase 29.2 scope**: Packages are **unsigned**. Installation implies trust.
 
 ```
-$ locald package install https://example.com/plugin.locald-package
+$ locald plugin install https://example.com/plugin.locald-package
 ⚠ Warning: Installing unsigned package from remote URL.
   Packages can request capabilities that affect your system.
   Only install packages from sources you trust.
@@ -597,6 +597,98 @@ Would create package from ./my-plugin
 - **Manifest location**: `{SOURCE}/manifest.toml`
 - **Component location**: `{SOURCE}/{plugin.component}`
 - **Asset location**: `{SOURCE}/assets/` (if present)
+
+#### 3.13.7 Package Installation
+
+`locald plugin install` handles both raw `.wasm` files and `.locald-package` archives via auto-detection.
+
+##### CLI Interface
+
+```
+locald plugin install <SOURCE> [OPTIONS]
+
+Arguments:
+  <SOURCE>  Local path, file:// URL, or http(s):// URL to .wasm or .locald-package
+
+Options:
+  --name <NAME>     Installed name (only for raw .wasm; packages use manifest name)
+  --project         Install to project scope (.locald/plugins/) [default]
+  --user            Install to user scope ($XDG_DATA_HOME/locald/plugins/)
+  --force           Overwrite existing plugin with same name
+```
+
+##### Format Detection
+
+The install command auto-detects the format:
+
+1. If source ends with `.locald-package`, treat as package archive
+2. If source is a gzip file (magic bytes `1f 8b`), attempt to parse as package
+3. Otherwise, treat as raw `.wasm` file
+
+##### Package Installation Pipeline
+
+**Phase 1 - Extraction**:
+1. Create temp directory in target location
+2. Extract gzip-compressed tar archive
+3. Validate archive structure (must contain `manifest.toml`)
+
+**Phase 2 - Manifest Validation**:
+1. Parse `manifest.toml` using `PackageManifest::parse()`
+2. Validate all fields per section 3.13.2
+
+**Phase 3 - Compatibility Checking**:
+1. If `compatibility.locald_min` is set, compare against current locald version
+2. If `compatibility.ir_version` is set, verify it's in host's supported versions (currently `[1]`)
+3. Fail installation if incompatible
+
+**Phase 4 - Capability Warning**:
+1. List `capabilities.required` with warning symbol
+2. List `capabilities.optional` as informational
+
+**Phase 5 - Installation**:
+1. Copy component to `{target}/{package.name}.wasm`
+2. If `assets/` exists, copy to `{target}/assets/{package.name}/`
+3. Remove temp directory
+
+##### Error Handling
+
+| Scenario | Error Message |
+|----------|---------------|
+| Source not found | `Error: Package not found: '{path}'` |
+| Invalid archive | `Error: '{path}' is not a valid .locald-package archive` |
+| Missing manifest | `Error: Package missing manifest.toml` |
+| Invalid manifest | `Error: Invalid manifest: {parse_error}` |
+| Version mismatch | `Error: Package requires locald >= {min}, current is {current}` |
+| IR incompatible | `Error: Package uses IR version {v}, supported: {list}` |
+| Already exists | `Error: Plugin '{name}' already installed (use --force to overwrite)` |
+
+##### Output Format
+
+**Success output**:
+```
+→ Extracting package...
+→ Checking compatibility...
+   ✓ locald version 0.2.1 meets minimum 0.2.0
+   ✓ IR version 1 supported
+   ⚠ Requires capability: oci_pull (will be requested at runtime)
+→ Installing to .locald/plugins/redis-plugin.wasm
+→ Done.
+```
+
+**Security warning (remote URLs)**:
+```
+⚠ Warning: Installing unsigned package from remote URL.
+  Packages can request capabilities that affect your system.
+  Only install packages from sources you trust.
+Continue? [y/N]
+```
+
+##### Idempotent Installation
+
+If a package with the same name and version is already installed, the command succeeds with a message:
+```
+✓ redis-plugin v1.0.0 already installed
+```
 
 ## 4. Implementation Plan (Stage 2)
 

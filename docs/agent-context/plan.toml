@@ -3,7 +3,7 @@ surgical_strikes = []
 [[epochs]]
 id = "E1"
 title = "MVP (The Walking Skeleton)"
-status = "complete"
+status = "pending"
 ulid = "01KEX4X98Z21REQTTN4K04KW5Q"
 slug = "E1"
 aliases = ["E1"]
@@ -187,7 +187,7 @@ aliases = ["5.3"]
 [[epochs]]
 id = "E2"
 title = "Refinement & Robustness"
-status = "complete"
+status = "pending"
 ulid = "01KEX4X98ZQD9KPREXXEM6143F"
 slug = "E2"
 aliases = ["E2"]
@@ -411,7 +411,7 @@ aliases = ["11.4"]
 [[epochs]]
 id = "E3"
 title = "Hybrid Development & Advanced Features"
-status = "pending"
+status = "active"
 ulid = "01KEX4X98Z0RDREF382K6Q4MY4"
 slug = "E3"
 aliases = ["E3"]
@@ -1277,7 +1277,7 @@ status = "complete"
 [[epochs.phases.tasks]]
 id = "29.2.2"
 label = "Package Create: Implement `locald package create` to bundle plugins + config"
-status = "pending"
+status = "complete"
 
 [[epochs.phases.tasks]]
 id = "29.2.3"
@@ -2677,7 +2677,7 @@ aliases = ["99.5"]
 [[epochs]]
 id = "E6"
 title = "User-Facing Surface Coherence"
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZVQB7MEDVKS5ACEGR"
 slug = "E6"
 aliases = ["E6"]
