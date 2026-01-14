@@ -1,0 +1,17 @@
+[package]
+name = "redis-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Example locald plugin providing Redis service"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.36", features = ["macros"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
