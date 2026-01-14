@@ -60,7 +60,7 @@ Commit: bd91d0a
 test = """
 1. Run `locald admin setup` on fresh system
 2. Verify /usr/share/polkit-1/actions/dev.locald.policy exists
-3. Verify `pkexec locald shim serve` shows GUI auth dialog
+3. Verify `pkexec locald-shim serve` shows GUI auth dialog
 """
 
 [[tasks]]
@@ -190,7 +190,7 @@ files = [
 implementation = """
 1. Add shim_socket to DaemonConfig
 2. Modify socket_path() to check config first
-3. Add --socket CLI arg to `locald shim serve`
+3. Add --socket CLI arg to `locald-shim serve`
 4. Pass through ShimClient connection
 """
 
@@ -257,7 +257,7 @@ Manual testing checklist for MVP validation.
 
 host_tests = [
   "`locald admin setup` installs shim AND polkit policy",
-  "`pkexec locald shim serve` shows GUI auth dialog",
+  "`pkexec locald-shim serve` shows GUI auth dialog",
   "Socket created at ~/.locald/shim.sock with mode 0600",
   "PID file written to ~/.locald/shim.pid",
   "Daemon logs show request handling",

@@ -45,7 +45,7 @@ The critical requirement from RFC 0130:
 This is now possible:
 
 1. **On host**: `sudo locald admin setup` (installs shim + polkit policy)
-2. **On host**: `locald shim serve` (starts daemon, or it auto-starts)
+2. **On host**: `locald-shim serve` (starts daemon, or it auto-starts)
 3. **In Toolbx**: `locald up` connects to host socket automatically
 
 ## Pending Actions for Next Session
@@ -107,7 +107,7 @@ Documentation updated in `docs/manual/`:
 
 2. **Polkit dialog verification**:
 
-   - [ ] Verify `pkexec locald shim serve` shows GUI dialog (not terminal prompt)
+   - [ ] Verify `pkexec locald-shim serve` shows GUI dialog (not terminal prompt)
    - [ ] Verify polkit policy is installed to `/usr/share/polkit-1/actions/`
 
 3. **Missing features from RFC** (deferred, not blocking):
