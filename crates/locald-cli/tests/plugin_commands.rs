@@ -172,7 +172,8 @@ fn plugin_install_user_uses_xdg_data_home() {
     let mut cmd = locald();
     cmd.current_dir(root.path());
     cmd.env("XDG_DATA_HOME", &xdg_data);
-    cmd.args(["plugin", "install"]).arg(source.as_os_str());
+    cmd.args(["plugin", "install", "--user"])
+        .arg(source.as_os_str());
 
     cmd.assert().success();
 

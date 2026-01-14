@@ -1256,7 +1256,7 @@ aliases = ["29.1"]
 [[epochs.phases.tasks]]
 id = "29.2"
 label = "Packaging: Support `locald package /path/to/customizations` to create distributable bundles."
-status = "pending"
+status = "complete"
 ulid = "01KEX4X98ZHY91RZMG0BDHNAZ0"
 slug = "29.2"
 aliases = ["29.2"]
@@ -1282,12 +1282,12 @@ status = "complete"
 [[epochs.phases.tasks]]
 id = "29.2.3"
 label = "Package Install: Implement `locald package install` to unpack and register packages"
-status = "pending"
+status = "complete"
 
 [[epochs.phases.tasks]]
 id = "29.2.4"
 label = "Package Docs: Document packaging workflow for plugin authors"
-status = "pending"
+status = "complete"
 
 [[epochs.phases.tasks]]
 id = "29.3.1"
