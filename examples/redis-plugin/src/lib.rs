@@ -12,8 +12,8 @@ wit_bindgen::generate!({
 
 use exports::locald::plugins::plugin::Guest;
 use locald::plugins::types::{
-    AllocatePortOp, DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, Plan,
-    ServiceSpec, Step, Value, WorkspaceContext,
+    AllocatePortOp, DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, Plan, ServiceSpec,
+    Step, Value, WorkspaceContext,
 };
 
 struct Component;

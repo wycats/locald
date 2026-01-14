@@ -6,7 +6,7 @@
 //! - Plan Application: Plugin-generated plans materialize into services
 //!
 //! Note: These tests require the redis-plugin example to be built first:
-//!   cd examples/redis-plugin && cargo build --release --target wasm32-wasip1
+//!   cd examples/redis-plugin && cargo component build --release
 
 use std::fs;
 use std::path::PathBuf;
@@ -80,7 +80,7 @@ fn redis_plugin_inspect_shows_plan_structure() {
     let bin = assert_cmd::cargo::cargo_bin!("locald");
     let mut cmd = Command::new(bin);
     cmd.current_dir(root.path());
-    cmd.env("LOCALD_SKIP_SHIM_CHECK", "1");
+    cmd.env("LOCALD_SANDBOX_ACTIVE", "1");
     cmd.args(["plugin", "inspect", "redis", "--kind", "redis"]);
 
     let output = cmd.assert().success();
@@ -121,7 +121,7 @@ fn redis_plugin_generates_valid_plan() {
     let bin = assert_cmd::cargo::cargo_bin!("locald");
     let mut cmd = Command::new(bin);
     cmd.current_dir(root.path());
-    cmd.env("LOCALD_SKIP_SHIM_CHECK", "1");
+    cmd.env("LOCALD_SANDBOX_ACTIVE", "1");
     cmd.args(["plugin", "validate", "redis", "--kind", "redis"]);
 
     // Validate should succeed for a well-formed plugin
