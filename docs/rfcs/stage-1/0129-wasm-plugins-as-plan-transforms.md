@@ -391,15 +391,165 @@ Phase 29 dogfood uses `runtime = "container"`. The long-term Redis strategy is e
 - Site / Web service
   - Exercises ports/env/health checks and end-to-end UI/status/logs.
 
+### 3.13 Package Format (`.locald-package`)
+
+This section defines the distributable package format for plugins (Phase 29.2).
+
+#### 3.13.1 Archive Structure
+
+A `.locald-package` file is a **gzip-compressed tar archive** with the following internal structure:
+
+```
+redis-plugin-1.0.0.locald-package
+├── manifest.toml          # Package metadata (required)
+├── plugin.wasm            # WASM component (required)
+└── assets/                # Optional bundled assets
+    ├── templates/
+    └── config/
+```
+
+**Rationale**: tar.gz is universally supported, aligns with the Kano-QFD recommendation, and enables single-file distribution.
+
+#### 3.13.2 Manifest Schema (`manifest.toml`)
+
+```toml
+[package]
+name = "redis-plugin"                    # Required: lowercase alphanumeric + hyphens
+version = "1.0.0"                        # Required: semver
+description = "Redis service support"   # Optional: human-readable description
+license = "MIT"                          # Optional: SPDX license identifier
+repository = "https://github.com/..."   # Optional: source repository URL
+authors = ["Name <email>"]              # Optional: list of authors
+
+[plugin]
+component = "plugin.wasm"               # Required: path to WASM component within archive
+service_kinds = ["redis"]               # Required: service kinds this plugin handles
+
+[compatibility]
+locald_min = "0.2.0"                    # Optional: minimum locald version
+ir_version = 1                          # Required: IR version the plugin produces
+
+[capabilities]
+required = ["oci_pull"]                 # Capabilities plugin requires to function
+optional = ["cache_dir"]                # Capabilities plugin can use if granted
+```
+
+##### Field Semantics
+
+- **`package.name`**: Unique identifier. Must match regex `^[a-z][a-z0-9-]*$`. Maximum 64 characters.
+- **`package.version`**: Semantic versioning (MAJOR.MINOR.PATCH). Breaking changes require MAJOR bump.
+- **`plugin.service_kinds`**: List of service kinds this plugin can handle during `detect`. Used for matching and documentation.
+- **`compatibility.locald_min`**: If present, `locald package install` will reject if current version is lower.
+- **`compatibility.ir_version`**: Must be in host's `supported_ir_versions`. Installation fails if incompatible.
+- **`capabilities.required`**: Plugin will not function without these. Install warns; runtime rejects if not grantable.
+- **`capabilities.optional`**: Plugin works without these but may have reduced functionality.
+
+#### 3.13.3 Versioning and Compatibility
+
+**Package versioning** follows semver independently of IR version:
+
+| Package Change | Version Bump |
+|----------------|--------------|
+| New service kind supported | MINOR |
+| Bug fix in plan generation | PATCH |
+| Breaking change to behavior | MAJOR |
+| IR version bump required | MAJOR (if breaking) |
+
+**Compatibility checking** occurs at install time:
+
+```
+$ locald package install redis-plugin-1.0.0.locald-package
+→ Checking compatibility...
+   ✓ locald version 0.2.1 meets minimum 0.2.0
+   ✓ IR version 1 supported
+   ⚠ Requires capability: oci_pull (will be requested at runtime)
+→ Installing to .locald/plugins/redis-plugin.wasm
+→ Done.
+```
+
+#### 3.13.4 Installation and Discovery
+
+**Installation targets**:
+
+| Scope | Flag | Target Directory |
+|-------|------|------------------|
+| Project | `--project` (default) | `.locald/plugins/` |
+| User | `--user` | `$XDG_DATA_HOME/locald/plugins/` |
+
+**Installation process**:
+
+1. Extract archive to temp directory
+2. Parse and validate `manifest.toml`
+3. Check compatibility (locald version, IR version)
+4. Warn about required capabilities
+5. Copy `plugin.wasm` to target directory (renamed to `{package.name}.wasm`)
+6. Copy `assets/` to `{target}/assets/{package.name}/` if present
+7. Clean up temp directory
+
+**Discovery** remains unchanged: host scans `.locald/plugins/*.wasm` and `$XDG_DATA_HOME/locald/plugins/*.wasm`.
+
+#### 3.13.5 Security Considerations
+
+**Phase 29.2 scope**: Packages are **unsigned**. Installation implies trust.
+
+```
+$ locald package install https://example.com/plugin.locald-package
+⚠ Warning: Installing unsigned package from remote URL.
+  Packages can request capabilities that affect your system.
+  Only install packages from sources you trust.
+Continue? [y/N]
+```
+
+**Future considerations** (not in Phase 29.2):
+
+- Optional GPG detached signatures (`manifest.toml.sig`)
+- Sigstore integration for keyless signing
+- Package registry with verified publishers
+
+#### 3.13.6 Package Creation
+
+`locald package create` bundles a plugin into a distributable package:
+
+```
+$ locald package create ./my-plugin --output my-plugin-1.0.0.locald-package
+```
+
+**Required inputs**:
+- `manifest.toml` in the source directory
+- `plugin.wasm` (or path specified in manifest)
+
+**Validation during creation**:
+- Manifest schema validation
+- WASM component format verification
+- Service kind validation (plugin must handle declared kinds)
+
 ## 4. Implementation Plan (Stage 2)
 
-- [ ] Define initial WIT package + generate bindings.
-- [ ] Implement plugin discovery/loading.
-- [ ] Implement plan validation + deterministic topo sort.
-- [ ] Implement minimal op set.
-- [ ] Add `locald plugin inspect/validate`.
-- [ ] Create example `redis` plugin.
-- [ ] Add conformance fixture suite for host.
+### Phase 29.1 (Plugin Mechanism) ✅
+
+- [x] Define initial WIT package + generate bindings.
+- [x] Implement plugin discovery/loading.
+- [x] Implement plan validation + deterministic topo sort.
+- [x] Implement minimal op set.
+- [x] Add `locald plugin inspect/validate`.
+- [x] Create example `redis` plugin.
+- [x] Add conformance fixture suite for host.
+
+### Phase 29.2 (Packaging)
+
+- [ ] Define `manifest.toml` schema and parser.
+- [ ] Implement `locald package create` command.
+- [ ] Implement `locald package install` command.
+- [ ] Add compatibility checking (locald version, IR version).
+- [ ] Add capability warning at install time.
+- [ ] Update redis-plugin example with manifest.
+- [ ] Document packaging workflow for plugin authors.
+
+### Phase 29.3 (Distributions)
+
+- [ ] Define distribution manifest format.
+- [ ] Implement `locald init --from-package`.
+- [ ] Support remote package references in `locald.toml`.
 
 ## 5. Context Updates (Stage 3)
 
