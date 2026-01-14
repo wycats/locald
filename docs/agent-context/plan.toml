@@ -1248,7 +1248,7 @@ aliases = ["29"]
 [[epochs.phases.tasks]]
 id = "29.1"
 label = "Plugin Mechanism: Formal system for custom services (e.g., `locald.localhost` as a plugin)."
-status = "pending"
+status = "complete"
 ulid = "01KEX4X98ZE7CB0P3ZT5F0744J"
 slug = "29.1"
 aliases = ["29.1"]
@@ -1268,6 +1268,46 @@ status = "pending"
 ulid = "01KEX4X98ZWKJYSWM0Y46P591D"
 slug = "29.3"
 aliases = ["29.3"]
+
+[[epochs.phases.tasks]]
+id = "29.2.1"
+label = "Package Format: Define .locald-package archive format (WASM + config + metadata)"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.2.2"
+label = "Package Create: Implement `locald package create` to bundle plugins + config"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.2.3"
+label = "Package Install: Implement `locald package install` to unpack and register packages"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.2.4"
+label = "Package Docs: Document packaging workflow for plugin authors"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.1"
+label = "Distribution Format: Define flavored distribution manifest (bundled plugins + config presets)"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.2"
+label = "Init from Distribution: Implement `locald init --from-package` for team onboarding"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.3"
+label = "Plugin Registry: Support remote package references in locald.toml"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.4"
+label = "Example Distribution: Create example redis-plugin distribution for dogfooding"
+status = "pending"
 
 [[epochs.phases]]
 id = "30"
