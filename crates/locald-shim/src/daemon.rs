@@ -41,7 +41,27 @@ pub const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Get the socket directory path (~/.locald).
+///
+/// When running under pkexec or sudo, this uses the invoking user's home
+/// directory (via PKEXEC_UID or SUDO_UID), not root's home.
 fn socket_dir() -> Result<PathBuf> {
+    // When running under pkexec, PKEXEC_UID contains the original user's UID
+    if let Ok(uid_str) = std::env::var("PKEXEC_UID")
+        && let Ok(uid) = uid_str.parse::<u32>()
+        && let Ok(Some(user)) = nix::unistd::User::from_uid(Uid::from_raw(uid))
+    {
+        return Ok(user.dir.join(".locald"));
+    }
+
+    // When running under sudo, SUDO_UID contains the original user's UID
+    if let Ok(uid_str) = std::env::var("SUDO_UID")
+        && let Ok(uid) = uid_str.parse::<u32>()
+        && let Ok(Some(user)) = nix::unistd::User::from_uid(Uid::from_raw(uid))
+    {
+        return Ok(user.dir.join(".locald"));
+    }
+
+    // Fallback to HOME (works when not running under sudo/pkexec)
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
     Ok(PathBuf::from(home).join(".locald"))
 }

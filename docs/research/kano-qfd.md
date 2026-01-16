@@ -18,50 +18,50 @@ locald has matured from a process manager into a comprehensive local development
 
 ### Legend
 
-| Category | Description | Impact on Satisfaction |
-|----------|-------------|----------------------|
-| **Must-Be** | Expected features; absence causes dissatisfaction | Prevents failure |
-| **One-Dimensional** | Linear relationship: more = better | Drives adoption |
-| **Attractive** | Delighters; unexpected features that create loyalty | Creates advocates |
-| **Indifferent** | No impact on satisfaction | Low priority |
-| **Reverse** | Features some users actively dislike | Avoid or make optional |
+| Category            | Description                                         | Impact on Satisfaction |
+| ------------------- | --------------------------------------------------- | ---------------------- |
+| **Must-Be**         | Expected features; absence causes dissatisfaction   | Prevents failure       |
+| **One-Dimensional** | Linear relationship: more = better                  | Drives adoption        |
+| **Attractive**      | Delighters; unexpected features that create loyalty | Creates advocates      |
+| **Indifferent**     | No impact on satisfaction                           | Low priority           |
+| **Reverse**         | Features some users actively dislike                | Avoid or make optional |
 
 ### Feature Matrix
 
-| Feature | Category | Status | Notes |
-|---------|----------|--------|-------|
-| **Core Runtime** | | | |
-| `locald up` (start services) | Must-Be | ✅ Complete | Foundational |
-| Process supervision | Must-Be | ✅ Complete | Restarts, signals |
-| `*.localhost` routing | Must-Be | ✅ Complete | Semantic DNS |
-| Dynamic port allocation | Must-Be | ✅ Complete | No manual ports |
-| Log streaming | Must-Be | ✅ Complete | CLI + Dashboard |
-| **Configuration** | | | |
-| `locald.toml` per-project | Must-Be | ✅ Complete | Source of truth |
-| Cascading config | One-Dimensional | ✅ Complete | Global → Project |
-| Environment injection | One-Dimensional | ✅ Complete | DATABASE_URL etc. |
-| **Developer Experience** | | | |
-| Web dashboard | One-Dimensional | ✅ Complete | Svelte 5 + xterm.js |
-| `locald try` (ad-hoc) | Attractive | ✅ Complete | Experiment safely |
-| `locald doctor` | Attractive | ✅ Complete | Self-diagnosis |
-| Hot reload on config change | Attractive | ✅ Complete | Auto-restart |
-| **Builtin Services** | | | |
-| Postgres (embedded) | One-Dimensional | ✅ Complete | Zero-config DB |
-| Docker containers | One-Dimensional | ✅ Complete | `image:` config |
-| **Security** | | | |
-| Privilege separation (shim) | Must-Be | ✅ Complete | Least privilege |
-| Sandbox mode | Attractive | ✅ Complete | CI-friendly |
-| **Extensibility** | | | |
-| Plugin mechanism (WASM) | Attractive | ✅ Complete | **Phase 29.1** |
-| `locald package` | Attractive | 🔲 Pending | **Phase 29.2** |
-| Flavored distributions | Attractive | 🔲 Pending | **Phase 29.3** |
-| **Installation** | | | |
-| Single binary | Must-Be | ✅ Complete | Ship one file |
-| `locald selfupgrade` | One-Dimensional | 🔲 Pending | Phase 30 |
-| Auto-updates | Indifferent | 🔲 Pending | Optional |
-| **Advanced** | | | |
-| VMM (microVMs) | Attractive | 🔲 Pending | Phase 102 |
-| Interactive PTY (web) | Indifferent | 🔲 Pending | Nice-to-have |
+| Feature                      | Category        | Status      | Notes               |
+| ---------------------------- | --------------- | ----------- | ------------------- |
+| **Core Runtime**             |                 |             |                     |
+| `locald up` (start services) | Must-Be         | ✅ Complete | Foundational        |
+| Process supervision          | Must-Be         | ✅ Complete | Restarts, signals   |
+| `*.localhost` routing        | Must-Be         | ✅ Complete | Semantic DNS        |
+| Dynamic port allocation      | Must-Be         | ✅ Complete | No manual ports     |
+| Log streaming                | Must-Be         | ✅ Complete | CLI + Dashboard     |
+| **Configuration**            |                 |             |                     |
+| `locald.toml` per-project    | Must-Be         | ✅ Complete | Source of truth     |
+| Cascading config             | One-Dimensional | ✅ Complete | Global → Project    |
+| Environment injection        | One-Dimensional | ✅ Complete | DATABASE_URL etc.   |
+| **Developer Experience**     |                 |             |                     |
+| Web dashboard                | One-Dimensional | ✅ Complete | Svelte 5 + xterm.js |
+| `locald try` (ad-hoc)        | Attractive      | ✅ Complete | Experiment safely   |
+| `locald doctor`              | Attractive      | ✅ Complete | Self-diagnosis      |
+| Hot reload on config change  | Attractive      | ✅ Complete | Auto-restart        |
+| **Builtin Services**         |                 |             |                     |
+| Postgres (embedded)          | One-Dimensional | ✅ Complete | Zero-config DB      |
+| Docker containers            | One-Dimensional | ✅ Complete | `image:` config     |
+| **Security**                 |                 |             |                     |
+| Privilege separation (shim)  | Must-Be         | ✅ Complete | Least privilege     |
+| Sandbox mode                 | Attractive      | ✅ Complete | CI-friendly         |
+| **Extensibility**            |                 |             |                     |
+| Plugin mechanism (WASM)      | Attractive      | ✅ Complete | **Phase 29.1**      |
+| `locald package`             | Attractive      | 🔲 Pending  | **Phase 29.2**      |
+| Flavored distributions       | Attractive      | 🔲 Pending  | **Phase 29.3**      |
+| **Installation**             |                 |             |                     |
+| Single binary                | Must-Be         | ✅ Complete | Ship one file       |
+| `locald selfupgrade`         | One-Dimensional | 🔲 Pending  | Phase 30            |
+| Auto-updates                 | Indifferent     | 🔲 Pending  | Optional            |
+| **Advanced**                 |                 |             |                     |
+| VMM (microVMs)               | Attractive      | 🔲 Pending  | Phase 102           |
+| Interactive PTY (web)        | Indifferent     | 🔲 Pending  | Nice-to-have        |
 
 ---
 
@@ -69,22 +69,22 @@ locald has matured from a process manager into a comprehensive local development
 
 ### Customer Needs → Technical Requirements
 
-| Customer Need | Plugin Runtime | Package Format | Distribution Channel | Self-Update |
-|--------------|:--------------:|:--------------:|:--------------------:|:-----------:|
-| "My team uses our own services" | ★★★★★ | ★★★★★ | ★★★★☆ | ☆☆☆☆☆ |
-| "I want to share my setup" | ★★☆☆☆ | ★★★★★ | ★★★★★ | ☆☆☆☆☆ |
-| "It should just work" | ★★★☆☆ | ★★★★★ | ★★★★★ | ★★★★☆ |
-| "Stay up to date easily" | ☆☆☆☆☆ | ☆☆☆☆☆ | ★★★☆☆ | ★★★★★ |
-| "Extend without forking" | ★★★★★ | ★★★★☆ | ★★★☆☆ | ☆☆☆☆☆ |
+| Customer Need                   | Plugin Runtime | Package Format | Distribution Channel | Self-Update |
+| ------------------------------- | :------------: | :------------: | :------------------: | :---------: |
+| "My team uses our own services" |     ★★★★★      |     ★★★★★      |        ★★★★☆         |    ☆☆☆☆☆    |
+| "I want to share my setup"      |     ★★☆☆☆      |     ★★★★★      |        ★★★★★         |    ☆☆☆☆☆    |
+| "It should just work"           |     ★★★☆☆      |     ★★★★★      |        ★★★★★         |    ★★★★☆    |
+| "Stay up to date easily"        |     ☆☆☆☆☆      |     ☆☆☆☆☆      |        ★★★☆☆         |    ★★★★★    |
+| "Extend without forking"        |     ★★★★★      |     ★★★★☆      |        ★★★☆☆         |    ☆☆☆☆☆    |
 
 ### Priority Scores
 
 | Technical Requirement | Priority Score | Implementation Phase |
-|----------------------|:--------------:|:-------------------:|
-| Plugin Runtime (WASM) | ★★★★★ | ✅ 29.1 Complete |
-| Package Format | ★★★★★ | 🎯 29.2 (Next) |
-| Distribution Bundles | ★★★★☆ | 29.3 |
-| Self-Upgrade | ★★★☆☆ | 30 |
+| --------------------- | :------------: | :------------------: |
+| Plugin Runtime (WASM) |     ★★★★★      |   ✅ 29.1 Complete   |
+| Package Format        |     ★★★★★      |    🎯 29.2 (Next)    |
+| Distribution Bundles  |     ★★★★☆      |         29.3         |
+| Self-Upgrade          |     ★★★☆☆      |          30          |
 
 ---
 
@@ -92,7 +92,7 @@ locald has matured from a process manager into a comprehensive local development
 
 ### Immediate Priority: Phase 29.2 (Packaging)
 
-**Rationale**: The plugin mechanism only delivers value when plugins can be *shared*. Phase 29.2 is the keystone:
+**Rationale**: The plugin mechanism only delivers value when plugins can be _shared_. Phase 29.2 is the keystone:
 
 ```
 Plugin (29.1) → Package (29.2) → Distribution (29.3)
@@ -101,6 +101,7 @@ Plugin (29.1) → Package (29.2) → Distribution (29.3)
 ```
 
 **Scope for 29.2**:
+
 1. Define `.locald-package` archive format (WASM + config + metadata)
 2. Implement `locald package /path` to bundle plugins + locald.toml
 3. Implement `locald package install <archive>` to unpack and register
@@ -124,11 +125,11 @@ Per Kano, VMM features are **Attractive** but not yet demanded by the core user 
 
 ## 4. Risk Analysis
 
-| Risk | Mitigation |
-|------|------------|
+| Risk                   | Mitigation                                    |
+| ---------------------- | --------------------------------------------- |
 | Package format lock-in | Use standard formats (tar.gz + TOML manifest) |
-| Plugin API instability | Mark as `experimental` until 30.x |
-| Team adoption friction | Provide `locald init --from-package` |
+| Plugin API instability | Mark as `experimental` until 30.x             |
+| Team adoption friction | Provide `locald init --from-package`          |
 
 ---
 

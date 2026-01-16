@@ -116,41 +116,41 @@ locald plugin install https://example.com/plugins/redis-1.0.0.locald-package
 
 ### `[package]` Section
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Package name. Must match `^[a-z][a-z0-9-]*$`, max 64 chars |
-| `version` | Yes | Semantic version (MAJOR.MINOR.PATCH) |
-| `description` | No | Human-readable description |
-| `license` | No | SPDX license identifier |
-| `repository` | No | Source repository URL |
-| `authors` | No | List of author strings |
+| Field         | Required | Description                                                |
+| ------------- | -------- | ---------------------------------------------------------- |
+| `name`        | Yes      | Package name. Must match `^[a-z][a-z0-9-]*$`, max 64 chars |
+| `version`     | Yes      | Semantic version (MAJOR.MINOR.PATCH)                       |
+| `description` | No       | Human-readable description                                 |
+| `license`     | No       | SPDX license identifier                                    |
+| `repository`  | No       | Source repository URL                                      |
+| `authors`     | No       | List of author strings                                     |
 
 ### `[plugin]` Section
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `component` | Yes | Path to WASM file within package |
-| `service_kinds` | Yes | List of service kinds this plugin handles |
+| Field           | Required | Description                               |
+| --------------- | -------- | ----------------------------------------- |
+| `component`     | Yes      | Path to WASM file within package          |
+| `service_kinds` | Yes      | List of service kinds this plugin handles |
 
 ### `[compatibility]` Section
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `locald_min` | No | Minimum locald version (semver). Install fails if current < min |
-| `ir_version` | Yes | IR version the plugin produces. Must be supported by host |
+| Field        | Required | Description                                                     |
+| ------------ | -------- | --------------------------------------------------------------- |
+| `locald_min` | No       | Minimum locald version (semver). Install fails if current < min |
+| `ir_version` | Yes      | IR version the plugin produces. Must be supported by host       |
 
 ### `[capabilities]` Section
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `required` | No | Capabilities the plugin requires to function |
-| `optional` | No | Capabilities the plugin can use if granted |
+| Field      | Required | Description                                  |
+| ---------- | -------- | -------------------------------------------- |
+| `required` | No       | Capabilities the plugin requires to function |
+| `optional` | No       | Capabilities the plugin can use if granted   |
 
 ## Available Capabilities
 
-| Capability | Description |
-|------------|-------------|
-| `oci_pull` | Pull OCI container images |
+| Capability  | Description                      |
+| ----------- | -------------------------------- |
+| `oci_pull`  | Pull OCI container images        |
 | `cache_dir` | Access to shared cache directory |
 
 ## Version Compatibility
@@ -159,12 +159,12 @@ locald plugin install https://example.com/plugins/redis-1.0.0.locald-package
 
 Follow semver conventions:
 
-| Change | Version Bump |
-|--------|--------------|
-| Bug fix in plan generation | PATCH (0.0.x) |
-| New service kind supported | MINOR (0.x.0) |
-| Breaking behavior change | MAJOR (x.0.0) |
-| IR version bump required | MAJOR (if breaking) |
+| Change                     | Version Bump        |
+| -------------------------- | ------------------- |
+| Bug fix in plan generation | PATCH (0.0.x)       |
+| New service kind supported | MINOR (0.x.0)       |
+| Breaking behavior change   | MAJOR (x.0.0)       |
+| IR version bump required   | MAJOR (if breaking) |
 
 ### IR Version Compatibility
 
@@ -188,6 +188,7 @@ The `ir_version` field declares which Plan IR version the plugin produces. Curre
 ### "Invalid package name"
 
 Package names must:
+
 - Start with a lowercase letter
 - Contain only lowercase letters, numbers, and hyphens
 - Be 64 characters or less
@@ -215,4 +216,4 @@ locald plugin create ./my-plugin --verbose
 ## See Also
 
 - [RFC 0129: WASM Plugins as Plan Transforms](../rfcs/stage-1/0129-wasm-plugins-as-plan-transforms.md)
-- [Plugin Development Guide](plugin-development.md) *(coming soon)*
+- [Plugin Development Guide](plugin-development.md) _(coming soon)_

@@ -3,14 +3,11 @@ title: WASM Plugins as Plan Transforms
 stage: 1
 feature: Extensibility
 exo:
-    tool: exo rfc create
-    protocol: 1
+  tool: exo rfc create
+  protocol: 1
 ---
 
-
 # RFC 0129: WASM Plugins as Plan Transforms
-
-
 
 ## 1. Summary
 
@@ -179,12 +176,12 @@ Expected normalized plan debug JSON (illustrative):
     {
       "id": "port",
       "needs": [],
-      "op": {"allocate_port": {"name": "redis"}}
+      "op": { "allocate_port": { "name": "redis" } }
     },
     {
       "id": "pull",
       "needs": [],
-      "op": {"oci_pull": {"image": "redis:7"}}
+      "op": { "oci_pull": { "image": "redis:7" } }
     },
     {
       "id": "service",
@@ -194,8 +191,11 @@ Expected normalized plan debug JSON (illustrative):
           "name": "redis",
           "runtime": "container",
           "settings": [
-            ["image", {"lit": {"string": "redis:7"}}],
-            ["port", {"get": {"step_id": "port", "path": [{"field": "port"}]}}]
+            ["image", { "lit": { "string": "redis:7" } }],
+            [
+              "port",
+              { "get": { "step_id": "port", "path": [{ "field": "port" }] } }
+            ]
           ]
         }
       }
@@ -364,7 +364,6 @@ interface plugin {
 world locald-plugin { export plugin; }
 ```
 
-
 ### 3.10.1 WIT Constraints (Implementation Notes)
 
 During initial host implementation we learned a few WIT/Component Model constraints that are important for plugin authors and for keeping the contract stable:
@@ -448,12 +447,12 @@ optional = ["cache_dir"]                # Capabilities plugin can use if granted
 
 **Package versioning** follows semver independently of IR version:
 
-| Package Change | Version Bump |
-|----------------|--------------|
-| New service kind supported | MINOR |
-| Bug fix in plan generation | PATCH |
-| Breaking change to behavior | MAJOR |
-| IR version bump required | MAJOR (if breaking) |
+| Package Change              | Version Bump        |
+| --------------------------- | ------------------- |
+| New service kind supported  | MINOR               |
+| Bug fix in plan generation  | PATCH               |
+| Breaking change to behavior | MAJOR               |
+| IR version bump required    | MAJOR (if breaking) |
 
 **Compatibility checking** occurs at install time:
 
@@ -471,10 +470,10 @@ $ locald plugin install redis-plugin-1.0.0.locald-package
 
 **Installation targets**:
 
-| Scope | Flag | Target Directory |
-|-------|------|------------------|
-| Project | `--project` (default) | `.locald/plugins/` |
-| User | `--user` | `$XDG_DATA_HOME/locald/plugins/` |
+| Scope   | Flag                  | Target Directory                 |
+| ------- | --------------------- | -------------------------------- |
+| Project | `--project` (default) | `.locald/plugins/`               |
+| User    | `--user`              | `$XDG_DATA_HOME/locald/plugins/` |
 
 **Installation process**:
 
@@ -531,40 +530,45 @@ Options:
 Package creation performs validation in four phases:
 
 **Phase 1 - Manifest Validation**:
+
 1. Read and parse `manifest.toml` using `PackageManifest::from_toml()`
 2. Validate schema (name regex, semver format, IR version)
 3. Verify `plugin.component` file exists at expected path
 
 **Phase 2 - WASM Verification**:
+
 1. Read component file bytes
 2. Verify WASM magic bytes (`\0asm` = `[0x00, 0x61, 0x73, 0x6D]`)
 3. Optionally verify WASM component structure (deferred to runtime for MVP)
 
 **Phase 3 - Asset Collection**:
+
 1. If `assets/` directory exists, recursively collect all files
 2. Validate no path traversal escapes (no `..` segments)
 3. Preserve directory structure within `assets/`
 
 **Phase 4 - Archive Creation**:
+
 1. Create tar archive with entries: `manifest.toml`, component file, `assets/**`
 2. Gzip compress the archive
 3. Write atomically (temp file + rename) to output path
 
 ##### Error Handling
 
-| Scenario | Error Message |
-|----------|---------------|
-| Source path not found | `Error: Source directory '{path}' not found` |
-| Manifest not found | `Error: manifest.toml not found in '{path}'` |
-| Manifest parse error | `Error: Invalid manifest: {parse_error}` |
-| Component not found | `Error: Plugin component '{name}' specified in manifest not found` |
-| Invalid WASM format | `Error: '{name}' is not a valid WASM file (invalid magic bytes)` |
-| Output exists | `Error: Output file already exists: {path} (use --force to overwrite)` |
-| Write permission | `Error: Cannot write to output path: {path}` |
+| Scenario              | Error Message                                                          |
+| --------------------- | ---------------------------------------------------------------------- |
+| Source path not found | `Error: Source directory '{path}' not found`                           |
+| Manifest not found    | `Error: manifest.toml not found in '{path}'`                           |
+| Manifest parse error  | `Error: Invalid manifest: {parse_error}`                               |
+| Component not found   | `Error: Plugin component '{name}' specified in manifest not found`     |
+| Invalid WASM format   | `Error: '{name}' is not a valid WASM file (invalid magic bytes)`       |
+| Output exists         | `Error: Output file already exists: {path} (use --force to overwrite)` |
+| Write permission      | `Error: Cannot write to output path: {path}`                           |
 
 ##### Output Format
 
 **Success output**:
+
 ```
 Creating package from ./my-plugin
 
@@ -580,13 +584,14 @@ Creating package from ./my-plugin
 ```
 
 **Dry-run output**:
+
 ```
 Would create package from ./my-plugin
 
   Manifest: redis-plugin v1.0.0
   Component: plugin.wasm (234 KB)
   Assets: 5 files (12 KB)
-  
+
   Would write: redis-plugin-1.0.0.locald-package
 ```
 
@@ -628,43 +633,49 @@ The install command auto-detects the format:
 ##### Package Installation Pipeline
 
 **Phase 1 - Extraction**:
+
 1. Create temp directory in target location
 2. Extract gzip-compressed tar archive
 3. Validate archive structure (must contain `manifest.toml`)
 
 **Phase 2 - Manifest Validation**:
+
 1. Parse `manifest.toml` using `PackageManifest::parse()`
 2. Validate all fields per section 3.13.2
 
 **Phase 3 - Compatibility Checking**:
+
 1. If `compatibility.locald_min` is set, compare against current locald version
 2. If `compatibility.ir_version` is set, verify it's in host's supported versions (currently `[1]`)
 3. Fail installation if incompatible
 
 **Phase 4 - Capability Warning**:
+
 1. List `capabilities.required` with warning symbol
 2. List `capabilities.optional` as informational
 
 **Phase 5 - Installation**:
+
 1. Copy component to `{target}/{package.name}.wasm`
 2. If `assets/` exists, copy to `{target}/assets/{package.name}/`
 3. Remove temp directory
 
 ##### Error Handling
 
-| Scenario | Error Message |
-|----------|---------------|
-| Source not found | `Error: Package not found: '{path}'` |
-| Invalid archive | `Error: '{path}' is not a valid .locald-package archive` |
-| Missing manifest | `Error: Package missing manifest.toml` |
-| Invalid manifest | `Error: Invalid manifest: {parse_error}` |
-| Version mismatch | `Error: Package requires locald >= {min}, current is {current}` |
-| IR incompatible | `Error: Package uses IR version {v}, supported: {list}` |
-| Already exists | `Error: Plugin '{name}' already installed (use --force to overwrite)` |
+| Scenario         | Error Message                                                         |
+| ---------------- | --------------------------------------------------------------------- |
+| Source not found | `Error: Package not found: '{path}'`                                  |
+| Invalid archive  | `Error: '{path}' is not a valid .locald-package archive`              |
+| Missing manifest | `Error: Package missing manifest.toml`                                |
+| Invalid manifest | `Error: Invalid manifest: {parse_error}`                              |
+| Version mismatch | `Error: Package requires locald >= {min}, current is {current}`       |
+| IR incompatible  | `Error: Package uses IR version {v}, supported: {list}`               |
+| Already exists   | `Error: Plugin '{name}' already installed (use --force to overwrite)` |
 
 ##### Output Format
 
 **Success output**:
+
 ```
 → Extracting package...
 → Checking compatibility...
@@ -676,6 +687,7 @@ The install command auto-detects the format:
 ```
 
 **Security warning (remote URLs)**:
+
 ```
 ⚠ Warning: Installing unsigned package from remote URL.
   Packages can request capabilities that affect your system.
@@ -686,6 +698,7 @@ Continue? [y/N]
 ##### Idempotent Installation
 
 If a package with the same name and version is already installed, the command succeeds with a message:
+
 ```
 ✓ redis-plugin v1.0.0 already installed
 ```

@@ -926,6 +926,20 @@ fn main() -> Result<()> {
                 const POLKIT_ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
                 const POLKIT_POLICY_FILENAME: &str = "dev.locald.policy";
 
+                // Alternative location for immutable distros (Bazzite, Silverblue, etc.)
+                const POLKIT_RULES_DIR: &str = "/etc/polkit-1/rules.d";
+                const POLKIT_RULES_FILENAME: &str = "50-dev.locald.rules";
+
+                // JavaScript rules file for immutable distros
+                const POLKIT_RULES_CONTENT: &str = r#"// locald polkit rules - allows locald-shim to run with admin auth
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/usr/local/bin/locald-shim") {
+        return polkit.Result.AUTH_ADMIN_KEEP;
+    }
+});
+"#;
+
                 let actions_dir = std::path::Path::new(POLKIT_ACTIONS_DIR);
                 if !actions_dir.is_dir() {
                     anyhow::bail!(
@@ -935,19 +949,51 @@ fn main() -> Result<()> {
 
                 let policy_path = actions_dir.join(POLKIT_POLICY_FILENAME);
 
-                // Write the policy file
-                std::fs::write(&policy_path, POLKIT_POLICY_BYTES).with_context(|| {
-                    format!("Failed to write polkit policy to {}", policy_path.display())
-                })?;
+                // Try to write the policy file
+                match std::fs::write(&policy_path, POLKIT_POLICY_BYTES) {
+                    Ok(()) => {
+                        // Set appropriate permissions (644 - readable by all, writable by root)
+                        let perms = std::fs::Permissions::from_mode(0o644);
+                        std::fs::set_permissions(&policy_path, perms).with_context(|| {
+                            format!("Failed to set permissions on {}", policy_path.display())
+                        })?;
+                        eprintln!("Installed polkit policy to {}", policy_path.display());
+                        Ok(())
+                    }
+                    Err(e) if e.raw_os_error() == Some(30) => {
+                        // EROFS (30) = Read-only file system - common on immutable distros
+                        // Fall back to /etc/polkit-1/rules.d/ which is typically writable
+                        let rules_dir = std::path::Path::new(POLKIT_RULES_DIR);
+                        if !rules_dir.is_dir() {
+                            anyhow::bail!(
+                                "Cannot install polkit policy: {} is read-only and {} not found.\n\
+                                 This is common on immutable distros (Bazzite, Silverblue, etc.).\n\
+                                 You can manually run: sudo locald-shim serve",
+                                POLKIT_ACTIONS_DIR,
+                                POLKIT_RULES_DIR
+                            );
+                        }
 
-                // Set appropriate permissions (644 - readable by all, writable by root)
-                let perms = std::fs::Permissions::from_mode(0o644);
-                std::fs::set_permissions(&policy_path, perms).with_context(|| {
-                    format!("Failed to set permissions on {}", policy_path.display())
-                })?;
+                        let rules_path = rules_dir.join(POLKIT_RULES_FILENAME);
+                        std::fs::write(&rules_path, POLKIT_RULES_CONTENT).with_context(|| {
+                            format!("Failed to write polkit rules to {}", rules_path.display())
+                        })?;
 
-                eprintln!("Installed polkit policy to {}", policy_path.display());
-                Ok(())
+                        let perms = std::fs::Permissions::from_mode(0o644);
+                        std::fs::set_permissions(&rules_path, perms).with_context(|| {
+                            format!("Failed to set permissions on {}", rules_path.display())
+                        })?;
+
+                        eprintln!(
+                            "Installed polkit rules to {} (immutable distro fallback)",
+                            rules_path.display()
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(e).with_context(|| {
+                        format!("Failed to write polkit policy to {}", policy_path.display())
+                    }),
+                }
             }
 
             install_polkit_policy_sync()

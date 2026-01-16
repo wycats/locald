@@ -564,10 +564,12 @@ pub fn verify_shim() {
             if is_probably_container() {
                 use locald_utils::container::{ContainerConfig, start_host_shim};
 
-                // Try to connect to existing socket daemon
-                if let Ok(socket_path) = locald_utils::ipc::socket_path() {
-                    if socket_path.exists() {
-                        // Socket exists, assume daemon is running - we're good
+                // Try to connect to existing shim socket daemon
+                // NOTE: This is shim_client::socket_path() -> ~/.locald/shim.sock
+                // NOT ipc::socket_path() -> /tmp/locald.sock (the server socket)
+                if let Ok(shim_socket) = locald_utils::shim_client::socket_path() {
+                    if shim_socket.exists() {
+                        // Shim socket exists, assume daemon is running - we're good
                         return;
                     }
                 }
@@ -577,8 +579,8 @@ pub fn verify_shim() {
 
                 match start_host_shim(&ContainerConfig::default()) {
                     Ok(()) => {
-                        // Wait for socket to appear
-                        let Ok(socket_path) = locald_utils::ipc::socket_path() else {
+                        // Wait for shim socket to appear
+                        let Ok(shim_socket) = locald_utils::shim_client::socket_path() else {
                             // Can't determine socket path - fatal error
                             show_privilege_required_error();
                         };
@@ -586,7 +588,7 @@ pub fn verify_shim() {
                         for attempt in 1..=10 {
                             #[allow(clippy::disallowed_methods)]
                             std::thread::sleep(std::time::Duration::from_millis(500));
-                            if socket_path.exists() {
+                            if shim_socket.exists() {
                                 eprintln!(
                                     "{} Host shim daemon started successfully.",
                                     style::CHECK

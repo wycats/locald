@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::shim::{SHIM_SERVE_PKEXEC, SHIM_SERVE_SUDO};
 
@@ -55,18 +55,28 @@ pub struct ContainerConfig {
 /// Returns an error if no host-exec mechanism is available or if all
 /// available mechanisms fail to start the daemon.
 pub fn start_host_shim(config: &ContainerConfig) -> Result<()> {
-    let shim_command = SHIM_SERVE_PKEXEC;
+    // In shared-home containers (Toolbx, Distrobox), the shim binary built
+    // alongside locald is visible from the host. Use that path if available.
+    let shim_command = if let Ok(Some(shim_path)) = crate::shim::find() {
+        // Found sibling shim - use absolute path (works because home is shared)
+        let abs_path = shim_path.display();
+        debug!("Using sibling shim at: {abs_path}");
+        format!("pkexec {abs_path} serve")
+    } else {
+        // Fall back to assuming locald-shim is in PATH on host
+        SHIM_SERVE_PKEXEC.to_string()
+    };
 
     // Try user-configured template first
     if let Some(template) = &config.host_exec {
-        let full_command = substitute_template(template, shim_command);
+        let full_command = substitute_template(template, &shim_command);
         info!("Starting host shim using configured template: {full_command}");
         return run_shell_command(&full_command);
     }
 
     // Auto-detect: try flatpak-spawn first (Toolbx)
     if command_exists("flatpak-spawn") {
-        info!("Starting host shim via flatpak-spawn");
+        info!("Starting host shim via flatpak-spawn: {shim_command}");
         let status = Command::new("flatpak-spawn")
             .arg("--host")
             .args(shim_command.split_whitespace())
@@ -81,7 +91,7 @@ pub fn start_host_shim(config: &ContainerConfig) -> Result<()> {
 
     // Try distrobox-host-exec
     if command_exists("distrobox-host-exec") {
-        info!("Starting host shim via distrobox-host-exec");
+        info!("Starting host shim via distrobox-host-exec: {shim_command}");
         let status = Command::new("distrobox-host-exec")
             .args(shim_command.split_whitespace())
             .status()
