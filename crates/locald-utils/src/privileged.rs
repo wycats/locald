@@ -224,10 +224,10 @@ impl Privileged {
                 Err(e) => {
                     debug!("Socket connection failed: {e}");
                     // If we're in a container, try to auto-start the daemon
-                    if container::is_probably_container() {
+                    if container::blocking::is_probably_container() {
                         debug!("Container detected, attempting to auto-start host shim daemon");
 
-                        match container::start_host_shim(&ContainerConfig::default()) {
+                        match container::blocking::start_host_shim(&ContainerConfig::default()) {
                             Ok(()) => {
                                 info!("Successfully requested host shim daemon start");
                                 // Wait for daemon to start with retry

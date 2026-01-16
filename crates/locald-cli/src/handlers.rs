@@ -444,110 +444,34 @@ pub fn run(cli: Cli) -> Result<()> {
                         #[cfg(target_os = "linux")]
                         {
                             use anyhow::Context;
-
-                            fn is_executable(path: &std::path::Path) -> bool {
-                                use std::os::unix::fs::PermissionsExt;
-                                let Ok(meta) = std::fs::metadata(path) else {
-                                    return false;
-                                };
-                                meta.is_file() && (meta.permissions().mode() & 0o111) != 0
-                            }
-
-                            fn command_exists(name: &str) -> bool {
-                                if name.contains('/') {
-                                    return is_executable(std::path::Path::new(name));
-                                }
-
-                                let Some(path) = std::env::var_os("PATH") else {
-                                    return false;
-                                };
-
-                                for dir in std::env::split_paths(&path) {
-                                    let candidate = dir.join(name);
-                                    if is_executable(&candidate) {
-                                        return true;
-                                    }
-                                }
-
-                                false
-                            }
-
-                            fn is_probably_container() -> bool {
-                                if std::env::var("container").is_ok() {
-                                    return true;
-                                }
-                                if std::env::var("TOOLBOX_PATH").is_ok()
-                                    || std::env::var("TOOLBOX_CONTAINER").is_ok()
-                                {
-                                    return true;
-                                }
-                                std::path::Path::new("/run/.containerenv").exists()
-                                    || std::path::Path::new("/.dockerenv").exists()
-                            }
+                            use locald_utils::container::blocking::{
+                                is_probably_container, run_on_host,
+                            };
 
                             // If this doesn't look like a container, just proceed with local setup.
                             if is_probably_container() {
                                 let exe_path = std::env::current_exe()
                                     .context("Failed to resolve current executable path")?;
 
-                                // Try Flatpak host exec first (common on immutable desktops).
-                                if command_exists("flatpak-spawn") {
-                                    let status = std::process::Command::new("flatpak-spawn")
-                                        .arg("--host")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg(&exe_path)
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute flatpak-spawn --host")?;
-
-                                    if status.success() {
-                                        return Ok(());
-                                    }
-
-                                    // Fall back to calling `locald` on the host PATH (useful when
-                                    // the current binary path is not visible on the host).
-                                    let status = std::process::Command::new("flatpak-spawn")
-                                        .arg("--host")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg("locald")
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute flatpak-spawn --host")?;
-
+                                // Try running with the current exe path first.
+                                let result = run_on_host(&[
+                                    "sudo",
+                                    "--",
+                                    exe_path.to_str().unwrap_or("locald"),
+                                    "admin",
+                                    "setup",
+                                ]);
+                                if let Ok(status) = result {
                                     if status.success() {
                                         return Ok(());
                                     }
                                 }
 
-                                // Distrobox provides an explicit host-exec helper.
-                                if command_exists("distrobox-host-exec") {
-                                    let status = std::process::Command::new("distrobox-host-exec")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg(&exe_path)
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute distrobox-host-exec")?;
-
-                                    if status.success() {
-                                        return Ok(());
-                                    }
-
-                                    // Same fallback as above: run the host's `locald` if available.
-                                    let status = std::process::Command::new("distrobox-host-exec")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg("locald")
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute distrobox-host-exec")?;
-
+                                // Fall back to calling `locald` on the host PATH (useful when
+                                // the current binary path is not visible on the host).
+                                let result =
+                                    run_on_host(&["sudo", "--", "locald", "admin", "setup"]);
+                                if let Ok(status) = result {
                                     if status.success() {
                                         return Ok(());
                                     }
