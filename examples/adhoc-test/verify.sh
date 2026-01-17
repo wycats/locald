@@ -15,7 +15,6 @@ rm -rf ~/.local/share/locald/sandboxes/$SANDBOX_NAME
 mkdir -p ~/.local/share/locald/sandboxes/$SANDBOX_NAME/config/locald
 echo '[server]
 privileged_ports = false
-fallback_ports = true
 ' > ~/.local/share/locald/sandboxes/$SANDBOX_NAME/config/locald/config.toml
 
 # Start server in background

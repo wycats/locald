@@ -78,19 +78,19 @@ This command:
 3. Configures cgroups for process isolation
 4. Installs polkit policy for GUI authentication
 
-### `locald shim serve`
+### `locald-shim serve`
 
 Start the shim daemon for container environments.
 
 ```bash
 # Run in background (default)
-sudo locald shim serve
+sudo locald-shim serve
 
 # Run in foreground (for debugging)
-sudo locald shim serve --foreground
+sudo locald-shim serve --foreground
 
 # Custom socket path
-sudo locald shim serve --socket /run/user/1000/locald/shim.sock
+sudo locald-shim serve --socket /run/user/1000/locald/shim.sock
 ```
 
 The daemon:

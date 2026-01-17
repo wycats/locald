@@ -41,7 +41,27 @@ pub const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Get the socket directory path (~/.locald).
+///
+/// When running under pkexec or sudo, this uses the invoking user's home
+/// directory (via PKEXEC_UID or SUDO_UID), not root's home.
 fn socket_dir() -> Result<PathBuf> {
+    // When running under pkexec, PKEXEC_UID contains the original user's UID
+    if let Ok(uid_str) = std::env::var("PKEXEC_UID")
+        && let Ok(uid) = uid_str.parse::<u32>()
+        && let Ok(Some(user)) = nix::unistd::User::from_uid(Uid::from_raw(uid))
+    {
+        return Ok(user.dir.join(".locald"));
+    }
+
+    // When running under sudo, SUDO_UID contains the original user's UID
+    if let Ok(uid_str) = std::env::var("SUDO_UID")
+        && let Ok(uid) = uid_str.parse::<u32>()
+        && let Ok(Some(user)) = nix::unistd::User::from_uid(Uid::from_raw(uid))
+    {
+        return Ok(user.dir.join(".locald"));
+    }
+
+    // Fallback to HOME (works when not running under sudo/pkexec)
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
     Ok(PathBuf::from(home).join(".locald"))
 }
@@ -445,23 +465,45 @@ impl ShimDaemon {
             ShimRequest::Ping => ShimResponse::pong(&self.daemon_version),
 
             ShimRequest::HostsSync { entries } => {
-                // Placeholder: just acknowledge
-                let _ = entries; // TODO: Actually sync hosts file
-                eprintln!("HostsSync: would sync {} entries", entries.len());
-                ShimResponse::ok_empty()
+                // Extract hostnames from entries - the update_hosts_file function
+                // hardcodes 127.0.0.1, so we just pass the hostnames.
+                let domains: Vec<String> = entries.into_iter().map(|e| e.hostname).collect();
+                eprintln!("HostsSync: syncing {} entries", domains.len());
+                match crate::update_hosts_file(&domains) {
+                    Ok(()) => ShimResponse::ok_empty(),
+                    Err(e) => {
+                        eprintln!("HostsSync failed: {e:#}");
+                        ShimResponse::error(ErrorCode::OperationFailed, e.to_string())
+                    }
+                }
             }
 
             ShimRequest::CgroupSetup { strategy } => {
-                // Placeholder: just acknowledge
-                let _ = strategy;
+                use crate::protocol::CgroupStrategy;
                 eprintln!("CgroupSetup: strategy = {strategy:?}");
-                ShimResponse::ok_empty()
+                let result = match strategy {
+                    CgroupStrategy::Auto => crate::cgroup_setup(),
+                    CgroupStrategy::Systemd => crate::cgroup_setup_systemd(),
+                    CgroupStrategy::Direct => crate::cgroup_setup_driver(),
+                };
+                match result {
+                    Ok(()) => ShimResponse::ok_empty(),
+                    Err(e) => {
+                        eprintln!("CgroupSetup failed: {e:#}");
+                        ShimResponse::error(ErrorCode::OperationFailed, e.to_string())
+                    }
+                }
             }
 
             ShimRequest::CgroupKill { path } => {
-                // Placeholder: just acknowledge
                 eprintln!("CgroupKill: path = {path}");
-                ShimResponse::ok_empty()
+                match crate::cgroup_kill_and_prune(&path) {
+                    Ok(()) => ShimResponse::ok_empty(),
+                    Err(e) => {
+                        eprintln!("CgroupKill failed: {e:#}");
+                        ShimResponse::error(ErrorCode::OperationFailed, e.to_string())
+                    }
+                }
             }
 
             ShimRequest::BindPrivilegedPort { port } => {

@@ -444,110 +444,34 @@ pub fn run(cli: Cli) -> Result<()> {
                         #[cfg(target_os = "linux")]
                         {
                             use anyhow::Context;
-
-                            fn is_executable(path: &std::path::Path) -> bool {
-                                use std::os::unix::fs::PermissionsExt;
-                                let Ok(meta) = std::fs::metadata(path) else {
-                                    return false;
-                                };
-                                meta.is_file() && (meta.permissions().mode() & 0o111) != 0
-                            }
-
-                            fn command_exists(name: &str) -> bool {
-                                if name.contains('/') {
-                                    return is_executable(std::path::Path::new(name));
-                                }
-
-                                let Some(path) = std::env::var_os("PATH") else {
-                                    return false;
-                                };
-
-                                for dir in std::env::split_paths(&path) {
-                                    let candidate = dir.join(name);
-                                    if is_executable(&candidate) {
-                                        return true;
-                                    }
-                                }
-
-                                false
-                            }
-
-                            fn is_probably_container() -> bool {
-                                if std::env::var("container").is_ok() {
-                                    return true;
-                                }
-                                if std::env::var("TOOLBOX_PATH").is_ok()
-                                    || std::env::var("TOOLBOX_CONTAINER").is_ok()
-                                {
-                                    return true;
-                                }
-                                std::path::Path::new("/run/.containerenv").exists()
-                                    || std::path::Path::new("/.dockerenv").exists()
-                            }
+                            use locald_utils::container::blocking::{
+                                is_probably_container, run_on_host,
+                            };
 
                             // If this doesn't look like a container, just proceed with local setup.
                             if is_probably_container() {
                                 let exe_path = std::env::current_exe()
                                     .context("Failed to resolve current executable path")?;
 
-                                // Try Flatpak host exec first (common on immutable desktops).
-                                if command_exists("flatpak-spawn") {
-                                    let status = std::process::Command::new("flatpak-spawn")
-                                        .arg("--host")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg(&exe_path)
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute flatpak-spawn --host")?;
-
-                                    if status.success() {
-                                        return Ok(());
-                                    }
-
-                                    // Fall back to calling `locald` on the host PATH (useful when
-                                    // the current binary path is not visible on the host).
-                                    let status = std::process::Command::new("flatpak-spawn")
-                                        .arg("--host")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg("locald")
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute flatpak-spawn --host")?;
-
+                                // Try running with the current exe path first.
+                                let result = run_on_host(&[
+                                    "sudo",
+                                    "--",
+                                    exe_path.to_str().unwrap_or("locald"),
+                                    "admin",
+                                    "setup",
+                                ]);
+                                if let Ok(status) = result {
                                     if status.success() {
                                         return Ok(());
                                     }
                                 }
 
-                                // Distrobox provides an explicit host-exec helper.
-                                if command_exists("distrobox-host-exec") {
-                                    let status = std::process::Command::new("distrobox-host-exec")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg(&exe_path)
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute distrobox-host-exec")?;
-
-                                    if status.success() {
-                                        return Ok(());
-                                    }
-
-                                    // Same fallback as above: run the host's `locald` if available.
-                                    let status = std::process::Command::new("distrobox-host-exec")
-                                        .arg("sudo")
-                                        .arg("--")
-                                        .arg("locald")
-                                        .arg("admin")
-                                        .arg("setup")
-                                        .status()
-                                        .context("Failed to execute distrobox-host-exec")?;
-
+                                // Fall back to calling `locald` on the host PATH (useful when
+                                // the current binary path is not visible on the host).
+                                let result =
+                                    run_on_host(&["sudo", "--", "locald", "admin", "setup"]);
+                                if let Ok(status) = result {
                                     if status.success() {
                                         return Ok(());
                                     }
@@ -669,23 +593,27 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
 
                         // Install polkit policy for GUI privilege escalation (optional).
-                        // This enables `pkexec locald shim serve` to show a graphical auth dialog.
+                        // This enables `pkexec locald-shim serve` to show a graphical auth dialog.
+                        // Note: We delegate to the shim binary so the write runs in a known-privileged context.
                         {
                             let s = cliclack::spinner();
                             s.start("Installing polkit policy (optional)...");
 
                             if locald_utils::shim::is_polkit_available() {
-                                const POLKIT_POLICY_BYTES: &[u8] =
-                                    include_bytes!("../../../assets/dev.locald.policy");
+                                let output = std::process::Command::new(&shim_path)
+                                    .arg("admin")
+                                    .arg("install-polkit")
+                                    .output()
+                                    .context("Failed to run locald-shim admin install-polkit")?;
 
-                                match locald_utils::shim::install_polkit_policy(POLKIT_POLICY_BYTES)
-                                {
-                                    Ok(()) => {
-                                        s.stop("Polkit policy installed");
-                                    }
-                                    Err(e) => {
-                                        s.stop(format!("Polkit policy not installed: {e}"));
-                                    }
+                                if output.status.success() {
+                                    s.stop("Polkit policy installed");
+                                } else {
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    s.stop(format!(
+                                        "Polkit policy not installed: {}",
+                                        stderr.trim()
+                                    ));
                                 }
                             } else {
                                 s.stop("Polkit not available (skipped)");
@@ -910,11 +838,6 @@ pub fn run(cli: Cli) -> Result<()> {
                         loader.global.server.privileged_ports,
                         loader.explain_global("server.privileged_ports")
                     );
-                    println!(
-                        "fallback_ports = {}  (from {})",
-                        loader.global.server.fallback_ports,
-                        loader.explain_global("server.fallback_ports")
-                    );
 
                     if let Ok(report) = rt.block_on(loader.load_service_provenance_report(&cwd)) {
                         for (service_name, service) in report.services {
@@ -1108,8 +1031,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 source,
                 name,
                 project,
+                user,
+                force,
             } => {
-                if let Err(e) = plugin::install(source, name.clone(), *project) {
+                if let Err(e) = plugin::install(source, name.clone(), *project, *user, *force) {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
@@ -1151,6 +1076,26 @@ pub fn run(cli: Cli) -> Result<()> {
                     grant,
                 ) {
                     eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            PluginCommands::Create {
+                source,
+                output,
+                manifest,
+                dry_run,
+                force,
+                verbose,
+            } => {
+                if let Err(e) = plugin::create(
+                    source,
+                    output.as_deref(),
+                    manifest.as_deref(),
+                    *dry_run,
+                    *force,
+                    *verbose,
+                ) {
+                    eprintln!("{e}");
                     std::process::exit(1);
                 }
             }

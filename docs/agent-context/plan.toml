@@ -3,796 +3,1310 @@ surgical_strikes = []
 [[epochs]]
 id = "E1"
 title = "MVP (The Walking Skeleton)"
-status = "complete"
+status = "pending"
+ulid = "01KEX4X98Z21REQTTN4K04KW5Q"
+slug = "E1"
+aliases = ["E1"]
 
 [[epochs.phases]]
 id = "1"
 title = "Scaffolding & Daemon Basics"
 status = "complete"
+ulid = "01KEX4X98Z5WZTBQYEQXW724NH"
+slug = "1"
+aliases = ["1"]
 
 [[epochs.phases.tasks]]
 id = "1.1"
 label = "Initialize Rust workspace with `locald-server`, `locald-cli`, `locald-core`."
 status = "complete"
+ulid = "01KEX4X98ZR67JTC4HFGZRGAS6"
+slug = "1.1"
+aliases = ["1.1"]
 
 [[epochs.phases.tasks]]
 id = "1.2"
 label = "Implement basic Daemon loop (tokio)."
 status = "complete"
+ulid = "01KEX4X98ZGW39KJB64TGE9DZ0"
+slug = "1.2"
+aliases = ["1.2"]
 
 [[epochs.phases.tasks]]
 id = "1.3"
 label = "Implement IPC (Unix Socket) for CLI-Daemon communication."
 status = "complete"
+ulid = "01KEX4X98Z9081B9HC7QHY144R"
+slug = "1.3"
+aliases = ["1.3"]
 
 [[epochs.phases.tasks]]
 id = "1.4"
 label = "Create `locald.toml` configuration struct."
 status = "complete"
+ulid = "01KEX4X98ZBF7HPCW2B69GW599"
+slug = "1.4"
+aliases = ["1.4"]
 
 [[epochs.phases]]
 id = "2"
 title = "Process Management (The Supervisor)"
 status = "complete"
+ulid = "01KEX4X98ZE7GV4YE5FK5MPRRY"
+slug = "2"
+aliases = ["2"]
 
 [[epochs.phases.tasks]]
 id = "2.1"
 label = "Implement Process Manager (spawn, stop, restart)."
 status = "complete"
+ulid = "01KEX4X98ZZGCG8GFEGP4V307N"
+slug = "2.1"
+aliases = ["2.1"]
 
 [[epochs.phases.tasks]]
 id = "2.2"
 label = "Capture stdout/stderr."
 status = "complete"
+ulid = "01KEX4X98ZR0AD9BE9BH4R3N9B"
+slug = "2.2"
+aliases = ["2.2"]
 
 [[epochs.phases.tasks]]
 id = "2.3"
 label = "Handle environment variables (PORT assignment)."
 status = "complete"
+ulid = "01KEX4X98ZGT4XV23RWSGHBCQ2"
+slug = "2.3"
+aliases = ["2.3"]
 
 [[epochs.phases]]
 id = "3"
 title = "Documentation & Design Refinement"
 status = "complete"
+ulid = "01KEX4X98Z09HQDJY9KB763KEM"
+slug = "3"
+aliases = ["3"]
 
 [[epochs.phases.tasks]]
 id = "3.1"
 label = "Firm up Interaction Modes & Personas."
 status = "complete"
+ulid = "01KEX4X98ZFKEGE4SCVFN5PHH7"
+slug = "3.1"
+aliases = ["3.1"]
 
 [[epochs.phases.tasks]]
 id = "3.2"
 label = "Fresh Eyes review of Axioms & Implementation."
 status = "complete"
+ulid = "01KEX4X98Z8GY6HGC0T1DB8YSG"
+slug = "3.2"
+aliases = ["3.2"]
 
 [[epochs.phases.tasks]]
 id = "3.3"
 label = "Set up Astro Starlight project."
 status = "complete"
+ulid = "01KEX4X98ZC1PVEPSK46KFWGEJ"
+slug = "3.3"
+aliases = ["3.3"]
 
 [[epochs.phases.tasks]]
 id = "3.4"
 label = "Document existing features."
 status = "complete"
+ulid = "01KEX4X98Z3XBWQG4QFSAEGM6T"
+slug = "3.4"
+aliases = ["3.4"]
 
 [[epochs.phases]]
 id = "4"
 title = "Local DNS & Routing"
 status = "complete"
+ulid = "01KEX4X98ZJ4DP357JMQY3MMNQ"
+slug = "4"
+aliases = ["4"]
 
 [[epochs.phases.tasks]]
 id = "4.1"
 label = "Implement `hostsfile` integration to manage `/etc/hosts`."
 status = "complete"
+ulid = "01KEX4X98ZY10DVDNVK3GKATK0"
+slug = "4.1"
+aliases = ["4.1"]
 
 [[epochs.phases.tasks]]
 id = "4.2"
 label = "Implement basic HTTP proxy (Hyper/Axum) in the daemon."
 status = "complete"
+ulid = "01KEX4X98ZHQ3BXMZJ9FQM9KSA"
+slug = "4.2"
+aliases = ["4.2"]
 
 [[epochs.phases.tasks]]
 id = "4.3"
 label = "Route requests based on Host header."
 status = "complete"
+ulid = "01KEX4X98ZK418R2E3Y4DJ3PWN"
+slug = "4.3"
+aliases = ["4.3"]
 
 [[epochs.phases]]
 id = "5"
 title = "Web UI & TUI Basics"
 status = "complete"
+ulid = "01KEX4X98Z4WDREY1BVXPMP1QC"
+slug = "5"
+aliases = ["5"]
 
 [[epochs.phases.tasks]]
 id = "5.1"
 label = "Serve a basic Web UI from the daemon."
 status = "complete"
+ulid = "01KEX4X98ZNDCRA8731Q9KRXRZ"
+slug = "5.1"
+aliases = ["5.1"]
 
 [[epochs.phases.tasks]]
 id = "5.2"
 label = "Implement WebSocket for log streaming."
 status = "complete"
+ulid = "01KEX4X98ZK4WM40VS5XBSPMBR"
+slug = "5.2"
+aliases = ["5.2"]
 
 [[epochs.phases.tasks]]
 id = "5.3"
 label = "Add `locald logs` command to CLI."
 status = "complete"
+ulid = "01KEX4X98ZQHVNYTTREZNX02KB"
+slug = "5.3"
+aliases = ["5.3"]
 
 [[epochs]]
 id = "E2"
 title = "Refinement & Robustness"
-status = "complete"
+status = "pending"
+ulid = "01KEX4X98ZQD9KPREXXEM6143F"
+slug = "E2"
+aliases = ["E2"]
 
 [[epochs.phases]]
 id = "6"
 title = "Persona & Axiom Update"
 status = "complete"
+ulid = "01KEX4X98ZF2EDY1NJWFZ2JQVE"
+slug = "6"
+aliases = ["6"]
 
 [[epochs.phases.tasks]]
 id = "6.1"
 label = "Review `docs/design/axioms.md`."
 status = "complete"
+ulid = "01KEX4X98ZZ8A0JD5CF6YA96CX"
+slug = "6.1"
+aliases = ["6.1"]
 
 [[epochs.phases.tasks]]
 id = "6.2"
 label = "Review `docs/design/modes.md`."
 status = "complete"
+ulid = "01KEX4X98ZC2A6AVBJ0HVDY5Y0"
+slug = "6.2"
+aliases = ["6.2"]
 
 [[epochs.phases.tasks]]
 id = "6.3"
 label = "Ensure alignment between code and philosophy."
 status = "complete"
+ulid = "01KEX4X98ZWGHY09E5G0DCJA86"
+slug = "6.3"
+aliases = ["6.3"]
 
 [[epochs.phases]]
 id = "7"
 title = "Persistence & State Recovery"
 status = "complete"
+ulid = "01KEX4X98Z5Z1KW46TET0MN7KD"
+slug = "7"
+aliases = ["7"]
 
 [[epochs.phases.tasks]]
 id = "7.1"
 label = "Define a state file format (JSON/TOML)."
 status = "complete"
+ulid = "01KEX4X98Z87WHKQZW5XSWRQMP"
+slug = "7.1"
+aliases = ["7.1"]
 
 [[epochs.phases.tasks]]
 id = "7.2"
 label = "Implement state saving on change/shutdown."
 status = "complete"
+ulid = "01KEX4X98ZAMDV5X8SS5FH4NBZ"
+slug = "7.2"
+aliases = ["7.2"]
 
 [[epochs.phases.tasks]]
 id = "7.3"
 label = "Implement state loading on startup."
 status = "complete"
+ulid = "01KEX4X98Z3P56M8KQ3RZGRK27"
+slug = "7.3"
+aliases = ["7.3"]
 
 [[epochs.phases.tasks]]
 id = "7.4"
 label = 'Handle "zombie" processes (processes that are still running but the daemon forgot about them, or vice versa).'
 status = "complete"
+ulid = "01KEX4X98Z56DRP3ZZ1HMK7J25"
+slug = "7.4"
+aliases = ["7.4"]
 
 [[epochs.phases]]
 id = "8"
 title = "Documentation Overhaul"
 status = "complete"
+ulid = "01KEX4X98ZM0NC2CFMZ4NJ6NAK"
+slug = "8"
+aliases = ["8"]
 
 [[epochs.phases.tasks]]
 id = "8.1"
 label = "Create `docs/design/personas.md`."
 status = "complete"
+ulid = "01KEX4X98Z0Z6S7A4XXG4RNM7X"
+slug = "8.1"
+aliases = ["8.1"]
 
 [[epochs.phases.tasks]]
 id = "8.2"
 label = "Review and restructure existing documentation."
 status = "complete"
+ulid = "01KEX4X98Z81KNWDCZ4MGN6837"
+slug = "8.2"
+aliases = ["8.2"]
 
 [[epochs.phases.tasks]]
 id = "8.3"
 label = 'Create "How-to" guides for "Regular Joe".'
 status = "complete"
+ulid = "01KEX4X98ZB5YQXFJA88Z5FDJ7"
+slug = "8.3"
+aliases = ["8.3"]
 
 [[epochs.phases.tasks]]
 id = "8.4"
 label = 'Create Reference docs for "Power User".'
 status = "complete"
+ulid = "01KEX4X98Z2168XJEZYV058NSB"
+slug = "8.4"
+aliases = ["8.4"]
 
 [[epochs.phases.tasks]]
 id = "8.5"
 label = 'Create Architecture docs for "Contributor".'
 status = "complete"
+ulid = "01KEX4X98ZSXBKPJD287RE2ZK0"
+slug = "8.5"
+aliases = ["8.5"]
 
 [[epochs.phases]]
 id = "9"
 title = "CLI Ergonomics & Interactive Mode"
 status = "complete"
+ulid = "01KEX4X98ZXJ5CB22NNR5B8D5H"
+slug = "9"
+aliases = ["9"]
 
 [[epochs.phases.tasks]]
 id = "9.1"
 label = "Better error messages and help text."
 status = "complete"
+ulid = "01KEX4X98ZNAKGGTRDJENMD85S"
+slug = "9.1"
+aliases = ["9.1"]
 
 [[epochs.phases.tasks]]
 id = "9.2"
 label = "Interactive `locald init` to create `locald.toml`."
 status = "complete"
+ulid = "01KEX4X98Z29STB6ZKZTNAVB97"
+slug = "9.2"
+aliases = ["9.2"]
 
 [[epochs.phases.tasks]]
 id = "9.3"
 label = "`locald monitor` (TUI) using `ratatui`?"
 status = "complete"
+ulid = "01KEX4X98ZBPACGGMND06Z6WYX"
+slug = "9.3"
+aliases = ["9.3"]
 
 [[epochs.phases]]
 id = "10"
 title = "Multi-Service Dependencies"
 status = "complete"
+ulid = "01KEX4X98ZDN6ZPE11A7EXG1F9"
+slug = "10"
+aliases = ["10"]
 
 [[epochs.phases.tasks]]
 id = "10.1"
 label = "Support `depends_on` in `locald.toml`."
 status = "complete"
+ulid = "01KEX4X98ZV7CYA886AAQ4HYV4"
+slug = "10.1"
+aliases = ["10.1"]
 
 [[epochs.phases.tasks]]
 id = "10.2"
 label = "Topological sort for startup order."
 status = "complete"
+ulid = "01KEX4X98Z09D8Y3AHARSH5V19"
+slug = "10.2"
+aliases = ["10.2"]
 
 [[epochs.phases]]
 id = "11"
 title = "Documentation & Persona Alignment"
 status = "complete"
+ulid = "01KEX4X98ZT5S3RG89WRK6E70G"
+slug = "11"
+aliases = ["11"]
 
 [[epochs.phases.tasks]]
 id = "11.1"
 label = "Fresh Eyes review of existing docs."
 status = "complete"
+ulid = "01KEX4X98ZFPACZDHWYAXEY8Z6"
+slug = "11.1"
+aliases = ["11.1"]
 
 [[epochs.phases.tasks]]
 id = "11.2"
 label = 'Flesh out "App Builder" guides (Getting Started, Common Patterns).'
 status = "complete"
+ulid = "01KEX4X98Z9NNQMBW68Q8A27QJ"
+slug = "11.2"
+aliases = ["11.2"]
 
 [[epochs.phases.tasks]]
 id = "11.3"
 label = 'Flesh out "Power User" reference (Configuration, CLI).'
 status = "complete"
+ulid = "01KEX4X98Z20GKAXSCH6T97W0V"
+slug = "11.3"
+aliases = ["11.3"]
 
 [[epochs.phases.tasks]]
 id = "11.4"
 label = 'Flesh out "Contributor" docs (Architecture, Dev Setup).'
 status = "complete"
+ulid = "01KEX4X98ZD0DX9QZ0XV957N2A"
+slug = "11.4"
+aliases = ["11.4"]
 
 [[epochs]]
 id = "E3"
 title = "Hybrid Development & Advanced Features"
-status = "pending"
+status = "active"
+ulid = "01KEX4X98Z0RDREF382K6Q4MY4"
+slug = "E3"
+aliases = ["E3"]
 
 [[epochs.phases]]
 id = "12"
 title = "Docker Integration"
 status = "complete"
+ulid = "01KEX4X98Z3Y9VY0S6J1704SYS"
+slug = "12"
+aliases = ["12"]
 
 [[epochs.phases.tasks]]
 id = "12.1"
 label = "Support `image` in `locald.toml`."
 status = "complete"
+ulid = "01KEX4X98Z2PZ0J9EXT6CV2GDW"
+slug = "12.1"
+aliases = ["12.1"]
 
 [[epochs.phases.tasks]]
 id = "12.2"
 label = "Manage Docker container lifecycle (run/stop)."
 status = "complete"
+ulid = "01KEX4X98Z22B8GPXQRAXJ5VD3"
+slug = "12.2"
+aliases = ["12.2"]
 
 [[epochs.phases.tasks]]
 id = "12.3"
 label = "Unified logging for containers."
 status = "complete"
+ulid = "01KEX4X98ZRDDXDFT0GPVX7E1P"
+slug = "12.3"
+aliases = ["12.3"]
 
 [[epochs.phases]]
 id = "13"
 title = "Smart Health Checks"
 status = "complete"
+ulid = "01KEX4X98ZT8SSGVZWFAGQMDB0"
+slug = "13"
+aliases = ["13"]
 
 [[epochs.phases.tasks]]
 id = "13.1"
 label = "Implement `sd_notify` listener for local processes."
 status = "complete"
+ulid = "01KEX4X98ZSG00HYH4RY4XTY5E"
+slug = "13.1"
+aliases = ["13.1"]
 
 [[epochs.phases.tasks]]
 id = "13.2"
 label = "Integrate Docker native health checks."
 status = "complete"
+ulid = "01KEX4X98ZY54PQPVYC769EDAJ"
+slug = "13.2"
+aliases = ["13.2"]
 
 [[epochs.phases.tasks]]
 id = "13.3"
 label = "Implement TCP port probing as a fallback."
 status = "complete"
+ulid = "01KEX4X98Z0GE4YABQ7459DY1R"
+slug = "13.3"
+aliases = ["13.3"]
 
 [[epochs.phases.tasks]]
 id = "13.4"
 label = "Update `depends_on` logic to wait for health."
 status = "complete"
+ulid = "01KEX4X98ZHGKCWCBRWFX3ST2S"
+slug = "13.4"
+aliases = ["13.4"]
 
 [[epochs.phases.tasks]]
 id = "13.5"
 label = "Expose health source/status in UI/CLI."
 status = "complete"
+ulid = "01KEX4X98Z6PGZ169W01R9DKX0"
+slug = "13.5"
+aliases = ["13.5"]
 
 [[epochs.phases]]
 id = "14"
 title = "Dogfooding & Polish"
 status = "complete"
+ulid = "01KEX4X98ZYY4MNBMKQWZBY3Y8"
+slug = "14"
+aliases = ["14"]
 
 [[epochs.phases.tasks]]
 id = "14.1"
 label = '"Papercut" pass on CLI output (formatting, colors, clarity).'
 status = "complete"
+ulid = "01KEX4X98ZEGMBGA8E58GK04JT"
+slug = "14.1"
+aliases = ["14.1"]
 
 [[epochs.phases.tasks]]
 id = "14.2"
 label = 'Verify "Zero-Config" flows work as expected in real scenarios.'
 status = "complete"
+ulid = "01KEX4X98ZDG4DDF24THR7AXGC"
+slug = "14.2"
+aliases = ["14.2"]
 
 [[epochs.phases.tasks]]
 id = "14.3"
 label = "Improve error handling for common misconfigurations."
 status = "complete"
+ulid = "01KEX4X98Z9AWEREQFGGWVP0BS"
+slug = "14.3"
+aliases = ["14.3"]
 
 [[epochs.phases.tasks]]
 id = "14.4"
 label = 'Validate the "Happy Path" for a new user.'
 status = "complete"
+ulid = "01KEX4X98ZY559WHJAP7SNPTAZ"
+slug = "14.4"
+aliases = ["14.4"]
 
 [[epochs.phases]]
 id = "15"
 title = "Zero-Config SSL & Single Binary"
 status = "complete"
+ulid = "01KEX4X98Z9D72YA5B967PCZ01"
+slug = "15"
+aliases = ["15"]
 
 [[epochs.phases.tasks]]
 id = "15.1"
 label = "Merge Binaries: Refactor `locald-server` into a library and integrate it into `locald` CLI."
 status = "complete"
+ulid = "01KEX4X98ZQEQ5FJAYEX2W9ZT5"
+slug = "15.1"
+aliases = ["15.1"]
 
 [[epochs.phases.tasks]]
 id = "15.2"
 label = 'CLI Workflow: Implement `locald run` (with "add on exit" prompt) and `locald shutdown`.'
 status = "complete"
+ulid = "01KEX4X98ZAA1J9E1RQETF8DGV"
+slug = "15.2"
+aliases = ["15.2"]
 
 [[epochs.phases.tasks]]
 id = "15.3"
 label = 'SSL Stack: Implement "Pure Rust" CA generation (`rcgen`) and trust store injection (`ca_injector`).'
 status = "complete"
+ulid = "01KEX4X98ZHJK70XNGWNDET1NF"
+slug = "15.3"
+aliases = ["15.3"]
 
 [[epochs.phases.tasks]]
 id = "15.4"
 label = "On-the-fly Signing: Implement `ResolvesServerCert` in `rustls` to sign certificates dynamically."
 status = "complete"
+ulid = "01KEX4X98ZV3GVH3JRTZ07QA7M"
+slug = "15.4"
+aliases = ["15.4"]
 
 [[epochs.phases.tasks]]
 id = "15.5"
 label = "Default Domain: Switch default domain from `.local` to `.localhost`."
 status = "complete"
+ulid = "01KEX4X98Z76SKDJSH215MSPVC"
+slug = "15.5"
+aliases = ["15.5"]
 
 [[epochs.phases.tasks]]
 id = "15.6"
 label = "Verification: Verify `.localhost` domain support in browsers."
 status = "complete"
+ulid = "01KEX4X98ZT13HT60PSPRMH2MK"
+slug = "15.6"
+aliases = ["15.6"]
 
 [[epochs.phases]]
 id = "16"
 title = "WebSocket Support"
 status = "completed"
+ulid = "01KEX4X98ZRRAHNZ7R4MN3Q97Y"
+slug = "16"
+aliases = ["16"]
 
 [[epochs.phases.tasks]]
 id = "16.1"
 label = "Upgrade Handling: Implement WebSocket upgrade handling in `locald-server` proxy (handle `Connection: Upgrade` and `Upgrade: websocket` headers)."
 status = "completed"
+ulid = "01KEX4X98ZMCDYW8WXYWV1N3GP"
+slug = "16.1"
+aliases = ["16.1"]
 
 [[epochs.phases.tasks]]
 id = "16.2"
 label = "Connection Bridging: Implement bidirectional copying of data between the upgraded client connection and the backend service."
 status = "completed"
+ulid = "01KEX4X98ZAK6Y2SQW0DD6GHA2"
+slug = "16.2"
+aliases = ["16.2"]
 
 [[epochs.phases.tasks]]
 id = "16.3"
 label = "Verification: Verify with a WebSocket-heavy example app (e.g., a chat app or Vite HMR)."
 status = "completed"
+ulid = "01KEX4X98ZGTKZ8BBZ84CXR7E6"
+slug = "16.3"
+aliases = ["16.3"]
 
 [[epochs.phases]]
 id = "17"
 title = "Linting & Code Quality"
 status = "complete"
+ulid = "01KEX4X98ZN9R1X2KY2PZWHEZV"
+slug = "17"
+aliases = ["17"]
 
 [[epochs.phases.tasks]]
 id = "17.1"
 label = "Configure Clippy: Add a `clippy.toml` or configure workspace-level lints for stricter checking (e.g., `warn` on `clippy::pedantic` but allow subjective ones)."
 status = "complete"
+ulid = "01KEX4X98ZSES5Y1BA6W5HC34B"
+slug = "17.1"
+aliases = ["17.1"]
 
 [[epochs.phases.tasks]]
 id = "17.2"
 label = "Fix Lints: Address existing lint warnings across the codebase."
 status = "complete"
+ulid = "01KEX4X98Z82ES7KNYJNQQ2HPZ"
+slug = "17.2"
+aliases = ["17.2"]
 
 [[epochs.phases.tasks]]
 id = "17.3"
 label = "CI Enforcement: Ensure CI fails on lint warnings."
 status = "complete"
+ulid = "01KEX4X98Z44AXJMQQTD20FARJ"
+slug = "17.3"
+aliases = ["17.3"]
 
 [[epochs.phases]]
 id = "18"
 title = "Documentation Fresh Eyes"
 status = "complete"
+ulid = "01KEX4X98ZGD0QQ9HX0RACB1HW"
+slug = "18"
+aliases = ["18"]
 
 [[epochs.phases.tasks]]
 id = "18.1"
 label = "Review: Walk through all documentation pages."
 status = "complete"
+ulid = "01KEX4X98Z7950W7NPCMQAP5ED"
+slug = "18.1"
+aliases = ["18.1"]
 
 [[epochs.phases.tasks]]
 id = "18.2"
 label = "Update: Fix outdated references (e.g., `.local` -> `.localhost`, `locald-server` binary references)."
 status = "complete"
+ulid = "01KEX4X98ZTN5Y6AMMFSK8NDPP"
+slug = "18.2"
+aliases = ["18.2"]
 
 [[epochs.phases.tasks]]
 id = "18.3"
 label = 'Polish: Ensure the "Try -> Save -> Run" workflow is well-documented.'
 status = "complete"
+ulid = "01KEX4X98ZPXY8TZY0CK97QZ9V"
+slug = "18.3"
+aliases = ["18.3"]
 
 [[epochs.phases.tasks]]
 id = "18.4"
 label = "Architecture: Document the graceful shutdown protocol (SIGTERM -> Timeout -> SIGKILL) in the Contributor/Architecture section."
 status = "complete"
+ulid = "01KEX4X98Z8SXH5HXSX9SEAZVA"
+slug = "18.4"
+aliases = ["18.4"]
 
 [[epochs.phases]]
 id = "19"
 title = "Self-Hosted Documentation"
 status = "complete"
+ulid = "01KEX4X98ZHGNFPERT9SHQGPE4"
+slug = "19"
+aliases = ["19"]
 
 [[epochs.phases.tasks]]
 id = "19.1"
 label = "Embedded Assets: Used `rust-embed` to compile the static documentation site into the `locald` binary."
 status = "complete"
+ulid = "01KEX4X98ZCHRD0C7SHBVBGB18"
+slug = "19.1"
+aliases = ["19.1"]
 
 [[epochs.phases.tasks]]
 id = "19.2"
 label = "Build Automation: Added a `build.rs` script to `locald-server` to automatically copy build artifacts from `locald-docs`."
 status = "complete"
+ulid = "01KEX4X98Z5AWG4QE955AX871T"
+slug = "19.2"
+aliases = ["19.2"]
 
 [[epochs.phases.tasks]]
 id = "19.3"
 label = "Internal Routing: Updated the internal proxy to route `docs.localhost` requests to the embedded assets."
 status = "complete"
+ulid = "01KEX4X98Z7JCR83HGAFN8HV8S"
+slug = "19.3"
+aliases = ["19.3"]
 
 [[epochs.phases.tasks]]
 id = "19.4"
 label = "Verification: Verified that `http://docs.localhost:8081` serves the documentation correctly."
 status = "complete"
+ulid = "01KEX4X98Z2WS43644Y5PTW3TX"
+slug = "19.4"
+aliases = ["19.4"]
 
 [[epochs.phases]]
 id = "20"
 title = "Builtin Services"
 status = "complete"
+ulid = "01KEX4X98ZTXMNM8MNHJZE4ZSJ"
+slug = "20"
+aliases = ["20"]
 
 [[epochs.phases.tasks]]
 id = "20.1"
 label = "Integration: Integrate `postgresql_embedded` to download/run Postgres binaries."
 status = "complete"
+ulid = "01KEX4X98Z6NF8V80A9VTT7BAJ"
+slug = "20.1"
+aliases = ["20.1"]
 
 [[epochs.phases.tasks]]
 id = "20.2"
 label = 'Service Types: Implement "builtin" service type in `locald.toml`.'
 status = "complete"
+ulid = "01KEX4X98ZAFEWKT5GVXWF1HMR"
+slug = "20.2"
+aliases = ["20.2"]
 
 [[epochs.phases.tasks]]
 id = "20.3"
 label = "Zero-Config: Auto-assign ports, generate passwords, and manage data volumes."
 status = "complete"
+ulid = "01KEX4X98ZDNS91G9VTWVSCPFP"
+slug = "20.3"
+aliases = ["20.3"]
 
 [[epochs.phases.tasks]]
 id = "20.4"
 label = "Injection: Inject connection strings (e.g., `DATABASE_URL`) into dependent services."
 status = "complete"
+ulid = "01KEX4X98ZS9E76KDFP73J7EA9"
+slug = "20.4"
+aliases = ["20.4"]
 
 [[epochs.phases]]
 id = "21"
 title = "UX Improvements (Web & CLI)"
 status = "complete"
+ulid = "01KEX4X98ZB6TF5G1Y1F8VAPQC"
+slug = "21"
+aliases = ["21"]
 
 [[epochs.phases.tasks]]
 id = "21.1"
 label = "Brainstorming: Discuss ideas and flesh out the plan for UX improvements."
 status = "complete"
+ulid = "01KEX4X98ZZHEDR4TNXW40TK3Y"
+slug = "21.1"
+aliases = ["21.1"]
 
 [[epochs.phases.tasks]]
 id = "21.2"
 label = "Backend: Switch to `portable-pty` for true terminal emulation (colors, progress bars)."
 status = "complete"
+ulid = "01KEX4X98ZPJ5HRJV5ECRZB02A"
+slug = "21.2"
+aliases = ["21.2"]
 
 [[epochs.phases.tasks]]
 id = "21.3"
 label = "Web UI: Rebuild dashboard with Svelte 5 + `xterm.js` for a robust, terminal-like experience."
 status = "complete"
+ulid = "01KEX4X98ZXKJG9G8T36QVYAT3"
+slug = "21.3"
+aliases = ["21.3"]
 
 [[epochs.phases.tasks]]
 id = "21.4"
 label = "Service Controls: Add Start/Stop/Restart/Reset buttons to the dashboard."
 status = "complete"
+ulid = "01KEX4X98ZMNXFPC7F3BBKPYF3"
+slug = "21.4"
+aliases = ["21.4"]
 
 [[epochs.phases.tasks]]
 id = "21.5"
 label = "CLI Tables: Improve `locald status` output for narrow terminals (consider `nu-table` or similar)."
 status = "complete"
+ulid = "01KEX4X98ZZMB68Q8J5CN14NFG"
+slug = "21.5"
+aliases = ["21.5"]
 
 [[epochs.phases.tasks]]
 id = "21.6"
 label = "AI Usability: Implement `locald ai context` and `locald ai schema` for LLM integration."
 status = "complete"
+ulid = "01KEX4X98ZD3SD94YNBGSN35V8"
+slug = "21.6"
+aliases = ["21.6"]
 
 [[epochs.phases.tasks]]
 id = "21.7"
 label = "Dashboard Alias: Add `locald.localhost` as an alias for the dashboard (Already implemented)."
 status = "complete"
+ulid = "01KEX4X98Z4924AQHK8WE7A66E"
+slug = "21.7"
+aliases = ["21.7"]
 
 [[epochs.phases.tasks]]
 id = "21.8"
 label = "Polish: Ensure the UI is responsive and accessible."
 status = "complete"
+ulid = "01KEX4X98Z5ZWYQ9H0Y56BC5XE"
+slug = "21.8"
+aliases = ["21.8"]
 
 [[epochs.phases.tasks]]
 id = "21.9"
 label = "Environment Clarity: Show configuration sources in UI/CLI to help debug environment issues."
 status = "complete"
+ulid = "01KEX4X98ZHP0WQZZMYSR6H9T5"
+slug = "21.9"
+aliases = ["21.9"]
 
 [[epochs.phases.tasks]]
 id = "21.10"
 label = "Config Watcher: Auto-restart daemon on global config change."
 status = "complete"
+ulid = "01KEX4X98ZEB4057NST8FQ88MZ"
+slug = "21.10"
+aliases = ["21.10"]
 
 [[epochs.phases.tasks]]
 id = "21.11"
 label = "Testability: Ensure Web UI is testable (data-testid) and document how to test apps running under locald."
 status = "complete"
+ulid = "01KEX4X98ZFPKN20WKR1JG8NYN"
+slug = "21.11"
+aliases = ["21.11"]
 
 [[epochs.phases.tasks]]
 id = "21.12"
 label = "Security: Implement `locald-shim` for secure privilege separation."
 status = "complete"
+ulid = "01KEX4X98ZM47RS42T4KV72NTZ"
+slug = "21.12"
+aliases = ["21.12"]
 
 [[epochs.phases]]
 id = "22"
 title = "Fresh Eyes Review & Documentation Update"
 status = "complete"
+ulid = "01KEX4X98Z2C8EF0HASZ4E9XCK"
+slug = "22"
+aliases = ["22"]
 
 [[epochs.phases.tasks]]
 id = "22.1"
 label = 'Review: Conduct a "Fresh Eyes" review of the CLI, Dashboard, and Documentation.'
 status = "complete"
+ulid = "01KEX4X98ZT2JFNHY7XY0HDSJB"
+slug = "22.1"
+aliases = ["22.1"]
 
 [[epochs.phases.tasks]]
 id = "22.2"
 label = "Docs Update: Update `locald-docs` to reflect Phase 20 (Builtin Services) and Phase 21 (UX Improvements)."
 status = "complete"
+ulid = "01KEX4X98Z032TK5BRAHDT5C32"
+slug = "22.2"
+aliases = ["22.2"]
 
 [[epochs.phases.tasks]]
 id = "22.3"
 label = "CLI Help: Review and update CLI help text and error messages."
 status = "complete"
+ulid = "01KEX4X98ZSH7SQ0SKK0PMDX5N"
+slug = "22.3"
+aliases = ["22.3"]
 
 [[epochs.phases.tasks]]
 id = "22.4"
 label = "Dashboard Polish: Address any lingering UI/UX issues found during review."
 status = "complete"
+ulid = "01KEX4X98ZW7B1TEZKXTJ3EYBE"
+slug = "22.4"
+aliases = ["22.4"]
 
 [[epochs.phases.tasks]]
 id = "22.5"
 label = "Axioms: Review and update `docs/design/axioms.md` if necessary."
 status = "complete"
+ulid = "01KEX4X98ZE9HE42EWBZT26H7J"
+slug = "22.5"
+aliases = ["22.5"]
 
 [[epochs.phases]]
 id = "23"
 title = "Advanced Service Configuration"
 status = "complete"
+ulid = "01KEX4X98Z8XAWCHB8EB43XWT0"
+slug = "23"
+aliases = ["23"]
 
 [[epochs.phases.tasks]]
 id = "23.1"
 label = 'Service Types: Support `type = "worker"` for non-network services (skip port assignment/probes).'
 status = "complete"
+ulid = "01KEX4X98ZDV5JTRANAE5CXP0K"
+slug = "23.1"
+aliases = ["23.1"]
 
 [[epochs.phases.tasks]]
 id = "23.2"
 label = "Procfile Support: Parse `Procfile` for drop-in compatibility; auto-generate config if missing."
 status = "complete"
+ulid = "01KEX4X98ZKDWB1JD0AEQDP7TW"
+slug = "23.2"
+aliases = ["23.2"]
 
 [[epochs.phases.tasks]]
 id = "23.3"
 label = "Port Discovery: Auto-detect ports for services that ignore `$PORT` (scan `/proc/net/tcp` or `lsof`)."
 status = "complete"
+ulid = "01KEX4X98ZSE26MHYE5XX4A2D0"
+slug = "23.3"
+aliases = ["23.3"]
 
 [[epochs.phases.tasks]]
 id = "23.4"
 label = "Advanced Health Checks: Add HTTP probe and Command execution health checks (e.g., `check_command` for DB readiness)."
 status = "complete"
+ulid = "01KEX4X98ZQC2XF8KJXE1CD709"
+slug = "23.4"
+aliases = ["23.4"]
 
 [[epochs.phases.tasks]]
 id = "23.5"
 label = "Foreman Parity: Support `.env` file loading, signal handling customization, and concurrency control."
 status = "complete"
+ulid = "01KEX4X98ZTPG7ZDYWYE3XKM6T"
+slug = "23.5"
+aliases = ["23.5"]
 
 [[epochs.phases]]
 id = "24"
 title = "Dashboard Ergonomics & Navigation"
 status = "complete"
+ulid = "01KEX4X98ZR79Q9BH4DBGZHVQ4"
+slug = "24"
+aliases = ["24"]
 
 [[epochs.phases.tasks]]
 id = "24.1"
 label = 'Global Controls: "Restart All", "Stop All", and Connection Status.'
 status = "complete"
+ulid = "01KEX4X98Z9CWR9297R6ZP588T"
+slug = "24.1"
+aliases = ["24.1"]
 
 [[epochs.phases.tasks]]
 id = "24.2"
 label = 'Event Stream: Structured "All Services" view with sanitized logs and lifecycle events.'
 status = "complete"
+ulid = "01KEX4X98ZBT4FZ3APDE2ZK7MH"
+slug = "24.2"
+aliases = ["24.2"]
 
 [[epochs.phases.tasks]]
 id = "24.3"
 label = "Deep Linking: Update URL on service selection (`?service=name`)."
 status = "complete"
+ulid = "01KEX4X98ZMVPHK13AC4VWZ0EB"
+slug = "24.3"
+aliases = ["24.3"]
 
 [[epochs.phases.tasks]]
 id = "24.4"
 label = "Visual Polish: Traffic light indicators, clickable links, refined layout."
 status = "complete"
+ulid = "01KEX4X98ZEHERGKJMD0ESJ1DC"
+slug = "24.4"
+aliases = ["24.4"]
 
 [[epochs.phases]]
 id = "25"
 title = "Roadmap & Design Organization"
 status = "complete"
+ulid = "01KEX4X98Z5EJHG6499T92SY68"
+slug = "25"
+aliases = ["25"]
 
 [[epochs.phases.tasks]]
 id = "25.1"
 label = "Inventory: Audit all files in `docs/design`."
 status = "complete"
+ulid = "01KEX4X98Z0HV4K3Q5TRFD36T8"
+slug = "25.1"
+aliases = ["25.1"]
 
 [[epochs.phases.tasks]]
 id = "25.2"
 label = "Prioritization: Discuss and rank features/phases with the user."
 status = "complete"
+ulid = "01KEX4X98ZYYZSQH5PJ0WT3TFF"
+slug = "25.2"
+aliases = ["25.2"]
 
 [[epochs.phases.tasks]]
 id = "25.3"
 label = "Restructure: Organize design docs into a folder structure that mirrors the roadmap (e.g., `docs/design/epoch-3-hybrid/`)."
 status = "complete"
+ulid = "01KEX4X98Z7CMCZ9X0M7QG5JT3"
+slug = "25.3"
+aliases = ["25.3"]
 
 [[epochs.phases.tasks]]
 id = "25.4"
 label = "Plan Update: Update `plan-outline.md` to reflect the agreed priorities."
 status = "complete"
+ulid = "01KEX4X98Z3DRAYMC6ESCAA18X"
+slug = "25.4"
+aliases = ["25.4"]
 
 [[epochs.phases]]
 id = "26"
 title = "Configuration & Registry"
 status = "complete"
 rfcs = ["0026"]
+ulid = "01KEX4X98Z93JNQD91YHGFKYTG"
+slug = "26"
+aliases = ["26"]
 
 [[epochs.phases.tasks]]
 id = "26.1"
 label = "Global Config: Implement `~/.config/locald/config.toml`."
 status = "complete"
+ulid = "01KEX4X98Z4FA0SDW0NKWJGDGE"
+slug = "26.1"
+aliases = ["26.1"]
 
 [[epochs.phases.tasks]]
 id = "26.2"
 label = 'Registry: Persist known projects and support "Always Up".'
 status = "complete"
+ulid = "01KEX4X98ZBGR7WT81K006X3FT"
+slug = "26.2"
+aliases = ["26.2"]
 
 [[epochs.phases]]
 id = "27"
 title = "Workspace & Constellations"
 status = "completed"
 rfcs = ["0026"]
+ulid = "01KEX4X98ZMNGWJ5TQTKE23JFP"
+slug = "27"
+aliases = ["27"]
 
 [[epochs.phases.tasks]]
 id = "27.1"
 label = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
 status = "in-progress"
+ulid = "01KEX4X98ZQTBS9W2J1GWG95KB"
+slug = "27.1"
+aliases = ["27.1"]
 
 [[epochs.phases.tasks]]
 id = "27.2"
 label = "Cascading Config: Implement config inheritance (Global -> Context -> Project)."
 status = "complete"
+ulid = "01KEX4X98ZQFFVBR2JBB9GFCBF"
+slug = "27.2"
+aliases = ["27.2"]
 
 [[epochs.phases.tasks]]
 id = "27.3"
 label = "Docs: Document 'Crisp Rules' for config merging (RFC 0026)"
 status = "complete"
+ulid = "01KEX4X98Z00TX7KJJSP24ETZN"
+slug = "27.3"
+aliases = ["27.3"]
 
 [[epochs.phases.tasks]]
 id = "27.4"
 label = "RFC Update: Evaluate 'defaults.services' vs 'services' split"
 status = "pending"
+ulid = "01KEX4X98Z2DJT2C5FT0EN3A01"
+slug = "27.4"
+aliases = ["27.4"]
 
 [[epochs.phases.tasks]]
 id = "27.1.1"
 label = "Dashboard: Group services by Constellation/Workspace"
 status = "completed"
+ulid = "01KEX4X98ZBXTRG9DW9FV5P1BH"
+slug = "27.1.1"
+aliases = ["27.1.1"]
 
 [[epochs.phases]]
 id = "36"
 title = "Hot Reloading & Configuration Watcher"
 status = "completed"
 rfcs = ["0050"]
+ulid = "01KEX4X98ZNR62EYV55ANATQHM"
+slug = "36"
+aliases = ["36"]
 
 [[epochs.phases.tasks]]
 id = "36.1"
 label = "Fix Manual Restart: Ensure `locald restart` reloads config from disk."
 status = "in-progress"
+ulid = "01KEX4X98ZF1A59D906X5TQK69"
+slug = "36.1"
+aliases = ["36.1"]
 
 [[epochs.phases.tasks]]
 id = "36.2"
 label = "Project Config Watcher: Implement a watcher for registered project `locald.toml` files."
 status = "completed"
+ulid = "01KEX4X98ZSB5BCWZ3AA0QDZNY"
+slug = "36.2"
+aliases = ["36.2"]
 
 [[epochs.phases.tasks]]
 id = "36.3"
 label = "Hot Reload Logic: Wire up the watcher to the service restart logic."
 status = "completed"
+ulid = "01KEX4X98Z3XDNS40FGDGSE53M"
+slug = "36.3"
+aliases = ["36.3"]
 
 [[epochs.phases.tasks]]
 id = "36.4"
 label = "Debouncing: Add debouncing to the watcher."
 status = "completed"
+ulid = "01KEX4X98ZNH7SGVT4QB2PGDD3"
+slug = "36.4"
+aliases = ["36.4"]
 
 [[epochs.phases]]
 id = "37"
 title = "Port Mismatch Detection"
 status = "completed"
 rfcs = ["0051"]
+ulid = "01KEX4X98ZTK7GWKRPB6HGEYTD"
+slug = "37"
+aliases = ["37"]
 
 [[epochs.phases.tasks]]
 id = "37.1"
 label = "Refactor Discovery: Move `locald-server/src/discovery.rs` to `locald-core`."
 status = "completed"
+ulid = "01KEX4X98Z6V000WY4V2K9N8VS"
+slug = "37.1"
+aliases = ["37.1"]
 
 [[epochs.phases.tasks]]
 id = "37.2"
 label = "Implement Monitor: Create a `PortMonitor` struct."
 status = "completed"
+ulid = "01KEX4X98Z0926282FB0BF6QF7"
+slug = "37.2"
+aliases = ["37.2"]
 
 [[epochs.phases.tasks]]
 id = "37.3"
 label = "Integrate into `try`: Add mismatch warnings to `locald try`."
 status = "completed"
+ulid = "01KEX4X98Z9E0005DBV8XBRJCB"
+slug = "37.3"
+aliases = ["37.3"]
 
 [[epochs.phases]]
 id = "28"
 title = "Interactive Terminal & Theming"
 status = "completed"
+ulid = "01KEX4X98Z7NWSPV0FSSWZMZPG"
+slug = "28"
+aliases = ["28"]
 
 [[epochs.phases.tasks]]
 id = "28.1"
 label = "Interactive PTY: Bidirectional terminal interaction in the browser."
 status = "pending"
+ulid = "01KEX4X98Z9XTAJC2188CBNXPD"
+slug = "28.1"
+aliases = ["28.1"]
 
 [[epochs.phases.tasks]]
 id = "28.2"
 label = "Theming: Light/Dark mode, curated themes."
 status = "pending"
+ulid = "01KEX4X98ZZMA8ZGRXBPC15RB1"
+slug = "28.2"
+aliases = ["28.2"]
 
 [[epochs.phases.tasks]]
 id = "28.3"
 label = "Command Palette: Quick actions via `Cmd+K`."
 status = "pending"
+ulid = "01KEX4X98ZR8MX02BH17GYMF54"
+slug = "28.3"
+aliases = ["28.3"]
 
 [[epochs.phases]]
 id = "29"
 title = "Extensibility & Plugins"
 status = "active"
 rfcs = ["0028"]
+ulid = "01KEX4X98ZEM25Q2TFQ6G5CP74"
+slug = "29"
+aliases = ["29"]
 
 [[epochs.phases.tasks]]
 id = "29.1"
 label = "Plugin Mechanism: Formal system for custom services (e.g., `locald.localhost` as a plugin)."
-status = "pending"
+status = "complete"
+ulid = "01KEX4X98ZE7CB0P3ZT5F0744J"
+slug = "29.1"
+aliases = ["29.1"]
 
 [[epochs.phases.tasks]]
 id = "29.2"
 label = "Packaging: Support `locald package /path/to/customizations` to create distributable bundles."
-status = "pending"
+status = "complete"
+ulid = "01KEX4X98ZHY91RZMG0BDHNAZ0"
+slug = "29.2"
+aliases = ["29.2"]
 
 [[epochs.phases.tasks]]
 id = "29.3"
 label = 'Distributions: Allow distribution of "flavored" binaries/configs without recompilation.'
+status = "pending"
+ulid = "01KEX4X98ZWKJYSWM0Y46P591D"
+slug = "29.3"
+aliases = ["29.3"]
+
+[[epochs.phases.tasks]]
+id = "29.2.1"
+label = "Package Format: Define .locald-package archive format (WASM + config + metadata)"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "29.2.2"
+label = "Package Create: Implement `locald package create` to bundle plugins + config"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "29.2.3"
+label = "Package Install: Implement `locald package install` to unpack and register packages"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "29.2.4"
+label = "Package Docs: Document packaging workflow for plugin authors"
+status = "complete"
+
+[[epochs.phases.tasks]]
+id = "29.3.1"
+label = "Distribution Format: Define flavored distribution manifest (bundled plugins + config presets)"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.2"
+label = "Init from Distribution: Implement `locald init --from-package` for team onboarding"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.3"
+label = "Plugin Registry: Support remote package references in locald.toml"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "29.3.4"
+label = "Example Distribution: Create example redis-plugin distribution for dogfooding"
 status = "pending"
 
 [[epochs.phases]]
@@ -800,254 +1314,401 @@ id = "30"
 title = "Installation & Update Experience"
 status = "pending"
 rfcs = ["0039"]
+ulid = "01KEX4X98ZR7SAXPZZSFVQ8QN8"
+slug = "30"
+aliases = ["30"]
 
 [[epochs.phases.tasks]]
 id = "30.1"
 label = "Distribution Channels: Support `cargo binstall` and GitHub Releases."
 status = "pending"
+ulid = "01KEX4X98ZWTMGR16GFJ61AE26"
+slug = "30.1"
+aliases = ["30.1"]
 
 [[epochs.phases.tasks]]
 id = "30.2"
 label = "Self-Upgrade: Implement `locald selfupgrade` to fetch/apply updates and recycle the server."
 status = "pending"
+ulid = "01KEX4X98ZPWW33CDQCZX26FWF"
+slug = "30.2"
+aliases = ["30.2"]
 
 [[epochs.phases.tasks]]
 id = "30.3"
 label = "Auto-Updates: Implement opt-in auto-updates via a lightweight HEAD check (e.g., GH Pages)."
 status = "pending"
+ulid = "01KEX4X98ZPCW2XWEFTK15FECR"
+slug = "30.3"
+aliases = ["30.3"]
 
 [[epochs.phases.tasks]]
 id = "30.4"
 label = "Secure Installation: Design a secure alternative to `curl | sh` (signatures, bootstrap binary)."
 status = "pending"
+ulid = "01KEX4X98ZQE6247CA0DRHH4RG"
+slug = "30.4"
+aliases = ["30.4"]
 
 [[epochs.phases.tasks]]
 id = "30.5"
 label = "Capability Preservation: Preserve `cap_net_bind_service` across updates (wrapper binary or systemd integration)."
 status = "pending"
+ulid = "01KEX4X98ZHWKA7EM81HHQH7HR"
+slug = "30.5"
+aliases = ["30.5"]
 
 [[epochs.phases]]
 id = "31"
 title = "Engineering Excellence"
 status = "pending"
 rfcs = ["0040"]
+ulid = "01KEX4X98Z5N0EW7CC810KDPWY"
+slug = "31"
+aliases = ["31"]
 
 [[epochs.phases.tasks]]
 id = "31.1"
 label = 'Error Handling: Implement "Human-Readable" error strategy with context and full logging to `/tmp`.'
 status = "pending"
+ulid = "01KEX4X98ZPH1F6E5SK15P3NKA"
+slug = "31.1"
+aliases = ["31.1"]
 
 [[epochs.phases.tasks]]
 id = "31.2"
 label = "Testing Strategy: Implement `trycmd` for CLI testing and `assert_cmd` for integration tests."
 status = "pending"
+ulid = "01KEX4X98ZC5DWAZ08XPGGR2KT"
+slug = "31.2"
+aliases = ["31.2"]
 
 [[epochs.phases.tasks]]
 id = "31.3"
 label = "Tested Docs: Ensure documentation code samples are tested."
 status = "pending"
+ulid = "01KEX4X98Z6N9YZ6RZGBCJSHP3"
+slug = "31.3"
+aliases = ["31.3"]
 
 [[epochs.phases.tasks]]
 id = "31.4"
 label = "RFC 0104: Codebase cleanup (front door + CI-aligned validation)"
 status = "complete"
+ulid = "01KEX4X98Z5DTR288EQEEJW9FT"
+slug = "31.4"
+aliases = ["31.4"]
 
 [[epochs.phases]]
 id = "32"
 title = "Sandbox Environments"
 status = "complete"
 rfcs = ["0031"]
+ulid = "01KEX4X98Z1BA4ZZNEG1VXXKV4"
+slug = "32"
+aliases = ["32"]
 
 [[epochs.phases.tasks]]
 id = "32.1"
 label = "Sandbox Mode: Implement `locald sandbox` command and `--sandbox` flag."
 status = "complete"
+ulid = "01KEX4X98ZSBN4WSF60KYHS7RP"
+slug = "32.1"
+aliases = ["32.1"]
 
 [[epochs.phases.tasks]]
 id = "32.2"
 label = "Isolation: Ensure sandbox instances use isolated config, data, and socket paths."
 status = "complete"
+ulid = "01KEX4X98ZAJ9C5RMZMGKQVNHT"
+slug = "32.2"
+aliases = ["32.2"]
 
 [[epochs.phases.tasks]]
 id = "32.3"
 label = "CI Integration: Document and verify usage in CI environments (GitHub Actions)."
 status = "complete"
+ulid = "01KEX4X98ZWQKC9KFXPCJXNWA7"
+slug = "32.3"
+aliases = ["32.3"]
 
 [[epochs.phases]]
 id = "33"
 title = "Ad-Hoc Execution"
 status = "complete"
 rfcs = ["0032"]
+ulid = "01KEX4X98ZGX6P1M70D096A6SM"
+slug = "33"
+aliases = ["33"]
 
 [[epochs.phases.tasks]]
 id = "33.1"
 label = "Draft Mode: Implement `locald try <command>` to experiment with commands and prompt to save."
 status = "complete"
+ulid = "01KEX4X98ZAASKEKK7RQYN4JHG"
+slug = "33.1"
+aliases = ["33.1"]
 
 [[epochs.phases.tasks]]
 id = "33.2"
 label = "Task Mode: Implement `locald run <service> <command>` to run tasks with injected environment variables."
 status = "complete"
+ulid = "01KEX4X98ZXS5RQKE76N8Y1MJQ"
+slug = "33.2"
+aliases = ["33.2"]
 
 [[epochs.phases.tasks]]
 id = "33.3"
 label = "History & Recall: Track `try` history and implement `locald add last`."
 status = "complete"
+ulid = "01KEX4X98ZQWXZ2KKS7E1XV1CM"
+slug = "33.3"
+aliases = ["33.3"]
 
 [[epochs.phases]]
 id = "35"
 title = "Shim Versioning & Upgrades"
 status = "complete"
 rfcs = ["0045"]
+ulid = "01KEX4X98ZVF47Y9AWHFK3R638"
+slug = "35"
+aliases = ["35"]
 
 [[epochs.phases.tasks]]
 id = "35.1"
 label = "Shim Self-Reporting: `locald-shim` reports its own version via `--shim-version`."
 status = "complete"
+ulid = "01KEX4X98ZPZXZ17KRQ0BHGC1W"
+slug = "35.1"
+aliases = ["35.1"]
 
 [[epochs.phases.tasks]]
 id = "35.2"
 label = "Build Integration: `locald-cli` embeds the expected shim version at build time."
 status = "complete"
+ulid = "01KEX4X98ZQ6R43EVXWY3CTPXC"
+slug = "35.2"
+aliases = ["35.2"]
 
 [[epochs.phases.tasks]]
 id = "35.3"
 label = "Runtime Verification: `locald` verifies the shim version on startup and aborts with a clear error if mismatched."
 status = "complete"
+ulid = "01KEX4X98ZD10FFDHJNECQ13SX"
+slug = "35.3"
+aliases = ["35.3"]
 
 [[epochs.phases.tasks]]
 id = "35.4"
 label = "User Notification: Instruct users to run `sudo locald admin setup` to update (or auto-fix in interactive mode)."
 status = "complete"
+ulid = "01KEX4X98Z4RMBYSD6DZ5RPZP4"
+slug = "35.4"
+aliases = ["35.4"]
 
 [[epochs.phases]]
 id = "79"
 title = "Unified Service Trait"
 status = "complete"
 rfcs = ["0079"]
+ulid = "01KEX4X98ZSPVGHT4G7X662F81"
+slug = "79"
+aliases = ["79"]
 
 [[epochs.phases.tasks]]
 id = "79.1"
 label = "Core Traits: Define `ServiceController` and `ServiceFactory` in `locald-core`."
 status = "complete"
+ulid = "01KEX4X98ZW4T1VFBM7XY0AT3Y"
+slug = "79.1"
+aliases = ["79.1"]
 
 [[epochs.phases.tasks]]
 id = "79.2"
 label = "Implementations: Implement controllers for Postgres, Exec, and Docker."
 status = "complete"
+ulid = "01KEX4X98ZX7CBQQ07E3EBNBD5"
+slug = "79.2"
+aliases = ["79.2"]
 
 [[epochs.phases.tasks]]
 id = "79.3"
 label = "Manager Refactor: Update `ProcessManager` to use the factory pattern."
 status = "complete"
+ulid = "01KEX4X98ZE8DGAJX46KMJNZYD"
+slug = "79.3"
+aliases = ["79.3"]
 
 [[epochs.phases.tasks]]
 id = "79.4"
 label = "Site Service: Implement `locald service add site` for static sites."
 status = "complete"
+ulid = "01KEX4X98ZDHBYZTNAC32CYCX4"
+slug = "79.4"
+aliases = ["79.4"]
 
 [[epochs.phases]]
 id = "81"
 title = "Dashboard Refinement"
 status = "complete"
 rfcs = ["0081"]
+ulid = "01KEX4X98Z8X9PXMXDG73ZZGYJ"
+slug = "81"
+aliases = ["81"]
 
 [[epochs.phases.tasks]]
 id = "81.1"
 label = "Frontend Architecture: Implement new Sidebar, Grid, and Inspector layouts."
 status = "complete"
+ulid = "01KEX4X98Z6M0WJD71FZACE3KY"
+slug = "81.1"
+aliases = ["81.1"]
 
 [[epochs.phases.tasks]]
 id = "81.2"
 label = "Asset Integration: Automate dashboard build and embedding in `locald` binary."
 status = "complete"
+ulid = "01KEX4X98ZXB5MYJAFJCXS9V6C"
+slug = "81.2"
+aliases = ["81.2"]
 
 [[epochs.phases.tasks]]
 id = "81.3"
 label = "Real-Time Foundation: Verify `ServiceUpdate` broadcasting (SSE) integration."
 status = "complete"
+ulid = "01KEX4X98Z2J89ZMS1ANAFDPC8"
+slug = "81.3"
+aliases = ["81.3"]
 
 [[epochs.phases.tasks]]
 id = "81.4"
 label = 'Log Interaction: Implement explicit "Copy" controls and "Smart Folding" for logs.'
 status = "complete"
+ulid = "01KEX4X98ZDF60KM10M1MHJZTD"
+slug = "81.4"
+aliases = ["81.4"]
 
 [[epochs.phases.tasks]]
 id = "81.5"
 label = 'Global Controls: Add "Restart All" and "Stop All" buttons.'
 status = "complete"
+ulid = "01KEX4X98ZXPWSFPWMK2VA3YBK"
+slug = "81.5"
+aliases = ["81.5"]
 
 [[epochs.phases.tasks]]
 id = "81.6"
 label = "Polish: Address final UI tweaks (Icon alignment, Sidebar scrolling)."
 status = "complete"
+ulid = "01KEX4X98ZTRP7XYFN7SJN5XJK"
+slug = "81.6"
+aliases = ["81.6"]
 
 [[epochs.phases]]
 id = "93"
 title = "Proxy Lazy Loading"
 status = "complete"
 rfcs = ["0093"]
+ulid = "01KEX4X98ZRVGVJ4E9MA4WN3SA"
+slug = "93"
+aliases = ["93"]
 
 [[epochs.phases.tasks]]
 id = "93.1"
 label = "RFC 0093: Create and implement."
 status = "complete"
+ulid = "01KEX4X98ZDHE1XF5ZJ80TT3GZ"
+slug = "93.1"
+aliases = ["93.1"]
 
 [[epochs.phases.tasks]]
 id = "93.2"
 label = "Implementation: Intercept HTML requests and serve loading page."
 status = "complete"
+ulid = "01KEX4X98ZAW628AQWQY48SE9K"
+slug = "93.2"
+aliases = ["93.2"]
 
 [[epochs.phases.tasks]]
 id = "93.3"
 label = "Verification: Verify with `examples/shop-frontend`."
 status = "complete"
+ulid = "01KEX4X98Z37W5T6V8XQN5J76D"
+slug = "93.3"
+aliases = ["93.3"]
 
 [[epochs.phases]]
 id = "94"
 title = "Builder Permissions & Context"
 status = "complete"
+ulid = "01KEX4X98Z1X7CYJ9W9KK11ZBR"
+slug = "94"
+aliases = ["94"]
 
 [[epochs.phases.tasks]]
 id = "94.1"
 label = "Fix: `cargo install-locald` alias."
 status = "complete"
+ulid = "01KEX4X98Z92PGRPG5ZEW7N31D"
+slug = "94.1"
+aliases = ["94.1"]
 
 [[epochs.phases.tasks]]
 id = "94.2"
 label = "Bug: Builder Permission Denied (Regression)."
 status = "complete"
+ulid = "01KEX4X98ZSC8N2EKHYA2ZJF4W"
+slug = "94.2"
+aliases = ["94.2"]
 
 [[epochs.phases.tasks]]
 id = "94.3"
 label = "Bug: Dev Loop Instability (Fork Bomb)."
 status = "complete"
+ulid = "01KEX4X98Z08HKCGCWAYGFH8QC"
+slug = "94.3"
+aliases = ["94.3"]
 
 [[epochs.phases]]
 id = "96"
 title = "Shim Architecture (Leaf Node Axiom)"
 status = "complete"
 rfcs = ["0096"]
+ulid = "01KEX4X98Z8CPZYCSCBG3FR37Z"
+slug = "96"
+aliases = ["96"]
 
 [[epochs.phases.tasks]]
 id = "96.1"
 label = 'Axiom: Define the "Leaf Node Axiom".'
 status = "complete"
+ulid = "01KEX4X98ZZ82ETRH4P36S8EMX"
+slug = "96.1"
+aliases = ["96.1"]
 
 [[epochs.phases.tasks]]
 id = "96.2"
 label = "FD Passing: Implement `bind` command in shim using `SCM_RIGHTS`."
 status = "complete"
+ulid = "01KEX4X98ZBAPM5ZHF4ZXBS2CK"
+slug = "96.2"
+aliases = ["96.2"]
 
 [[epochs.phases.tasks]]
 id = "96.3"
 label = "Refactor: Remove `server start` and recursive logic from shim."
 status = "complete"
+ulid = "01KEX4X98ZF5Z8K4QPGW7E9VFC"
+slug = "96.3"
+aliases = ["96.3"]
 
 [[epochs.phases.tasks]]
 id = "96.4"
 label = 'Compliance: Add static analysis tests to forbid `Command::new("locald")`.'
 status = "complete"
+ulid = "01KEX4X98Z7SHXNS0JSP35HKS0"
+slug = "96.4"
+aliases = ["96.4"]
 
 [[epochs.phases]]
 id = "109"
@@ -1057,612 +1718,969 @@ rfcs = [
     "0109",
     "0110",
 ]
+ulid = "01KEX4X98ZQYSM8XTSN3NW6WGV"
+slug = "109"
+aliases = ["109"]
 
 [[epochs.phases.tasks]]
 id = "109.1"
 label = "CLI: add locald doctor command"
 status = "completed"
+ulid = "01KEX4X98ZSTV6J049XV17A2B9"
+slug = "109.1"
+aliases = ["109.1"]
 
 [[epochs.phases.tasks]]
 id = "109.2"
 label = "Check: privileged shim readiness"
 status = "completed"
+ulid = "01KEX4X98Z8GG59PK60Z69EYHH"
+slug = "109.2"
+aliases = ["109.2"]
 
 [[epochs.phases.tasks]]
 id = "109.3"
 label = "Check: cgroup v2 and root readiness"
 status = "completed"
+ulid = "01KEX4X98ZR5NG9Z5DEQYYG6NB"
+slug = "109.3"
+aliases = ["109.3"]
 
 [[epochs.phases.tasks]]
 id = "109.4"
 label = "Output: actionable fix suggestions"
 status = "completed"
+ulid = "01KEX4X98ZJZX3W3VSNVGTB5QV"
+slug = "109.4"
+aliases = ["109.4"]
 
 [[epochs.phases.tasks]]
 id = "109.5"
 label = "Output: JSON and verbose modes"
 status = "completed"
+ulid = "01KEX4X98Z1AHXECHW96E98647"
+slug = "109.5"
+aliases = ["109.5"]
 
 [[epochs.phases.tasks]]
 id = "109.6"
 label = "Docs: doctor UX + examples"
 status = "completed"
+ulid = "01KEX4X98ZQP3B9NHRACV6GZPC"
+slug = "109.6"
+aliases = ["109.6"]
 
 [[epochs.phases.tasks]]
 id = "109.7"
 label = "Future: optional auto-fix mode"
 status = "pending"
+ulid = "01KEX4X98ZCWSDCZCN4YDESPSF"
+slug = "109.7"
+aliases = ["109.7"]
 
 [[epochs.phases.tasks]]
 id = "109.8"
 label = "Future: deeper runtime/kernel checks"
 status = "pending"
+ulid = "01KEX4X98ZB4GQ9CH5HACWNEZ0"
+slug = "109.8"
+aliases = ["109.8"]
 
 [[epochs]]
 id = "E4"
 title = "The Build Era"
 status = "pending"
+ulid = "01KEX4X98Z6TXH90JZ6NA24R81"
+slug = "E4"
+aliases = ["E4"]
 
 [[epochs.phases]]
 id = "34"
 title = "Cloud Native Buildpacks (CNB)"
 status = "complete"
 rfcs = ["0043"]
+ulid = "01KEX4X98Z0J6HE164Q0QRE061"
+slug = "34"
+aliases = ["34"]
 
 [[epochs.phases.tasks]]
 id = "34.1"
 label = "Research: Investigate `libcnb` and the CNB lifecycle."
 status = "complete"
+ulid = "01KEX4X98ZC86EFYWSRZBCRJG0"
+slug = "34.1"
+aliases = ["34.1"]
 
 [[epochs.phases.tasks]]
 id = "34.2"
 label = "Platform: Implement a basic CNB platform in Rust (or wrap `pack`)."
 status = "complete"
+ulid = "01KEX4X98Z79B3Y9A7FG223B6G"
+slug = "34.2"
+aliases = ["34.2"]
 
 [[epochs.phases.tasks]]
 id = "34.3"
 label = "Integration: Add `locald build` command."
 status = "complete"
+ulid = "01KEX4X98Z1CFGFF8ME54SZ2VT"
+slug = "34.3"
+aliases = ["34.3"]
 
 [[epochs.phases.tasks]]
 id = "34.4"
 label = "Environment: Parse OCI Image Config to derive default `Env` (PATH) instead of hardcoding."
 status = "complete"
+ulid = "01KEX4X98Z9PH2WRRR5WGTV5NE"
+slug = "34.4"
+aliases = ["34.4"]
 
 [[epochs.phases.tasks]]
 id = "34.5"
 label = 'Crash Protocol: Implement "Black Box" logging for panics and errors.'
 status = "complete"
+ulid = "01KEX4X98ZKGMTNDKZC0R2TJ04"
+slug = "34.5"
+aliases = ["34.5"]
 
 [[epochs.phases.tasks]]
 id = "34.6"
 label = "Source of Truth: Ensure `locald-builder` and `locald-server` respect OCI config."
 status = "complete"
+ulid = "01KEX4X98ZTHBZMW12HNS5B9GZ"
+slug = "34.6"
+aliases = ["34.6"]
 
 [[epochs.phases]]
 id = "38"
 title = "E2E Testing Infrastructure"
 status = "complete"
 rfcs = ["0063"]
+ulid = "01KEX4X98Z4N38CEB381ETFAW0"
+slug = "38"
+aliases = ["38"]
 
 [[epochs.phases.tasks]]
 id = "38.1"
 label = "Test Harness: Create a harness that builds release binaries and sets up the shim correctly."
 status = "complete"
+ulid = "01KEX4X98ZYW71THZ9EC6WBSM4"
+slug = "38.1"
+aliases = ["38.1"]
 
 [[epochs.phases.tasks]]
 id = "38.2"
 label = "E2E Suite: Implement tests for `locald up`, `locald run`, and CNB builds."
 status = "complete"
+ulid = "01KEX4X98ZTX8XJ9FXBQVRKDHR"
+slug = "38.2"
+aliases = ["38.2"]
 
 [[epochs.phases.tasks]]
 id = "38.3"
 label = "CI Integration: Run E2E tests in GitHub Actions."
 status = "complete"
+ulid = "01KEX4X98Z4N65N4MSV5MEWZ45"
+slug = "38.3"
+aliases = ["38.3"]
 
 [[epochs.phases]]
 id = "58"
 title = "Documentation-Driven Design (DDD) Audit"
 status = "pending"
 rfcs = ["0058"]
+ulid = "01KEX4X98ZJQZ50D29DKFV4DD9"
+slug = "58"
+aliases = ["58"]
 
 [[epochs.phases.tasks]]
 id = "58.1"
 label = 'Audit: Audit code using "New Hire", "Security Auditor", "Test Engineer", and "SRE" personas.'
 status = "pending"
+ulid = "01KEX4X98ZK1CQ69FA3Y9Q5ZF5"
+slug = "58.1"
+aliases = ["58.1"]
 
 [[epochs.phases.tasks]]
 id = "58.2"
 label = "Refactor: Remove friction points identified during the audit."
 status = "pending"
+ulid = "01KEX4X98ZNJ5THWZVZRXGVMRC"
+slug = "58.2"
+aliases = ["58.2"]
 
 [[epochs.phases.tasks]]
 id = "58.3"
 label = "Document: Write high-quality Rustdoc and Doctests."
 status = "pending"
+ulid = "01KEX4X98ZJ55JZVP6K6TAN2N3"
+slug = "58.3"
+aliases = ["58.3"]
 
 [[epochs.phases]]
 id = "59"
 title = "Systematic Investigation Protocol"
 status = "pending"
 rfcs = ["0066"]
+ulid = "01KEX4X98ZV337MCRG6N65WTAX"
+slug = "59"
+aliases = ["59"]
 
 [[epochs.phases.tasks]]
 id = "59.1"
 label = "Define Protocol: Create the RFC defining the 5-step investigation process."
 status = "complete"
+ulid = "01KEX4X98ZTZGKE0C6PZHSVHKY"
+slug = "59.1"
+aliases = ["59.1"]
 
 [[epochs.phases.tasks]]
 id = "59.2"
 label = "Adopt: Use this protocol to solve the `runc` namespace issue in Phase 34."
 status = "pending"
+ulid = "01KEX4X98Z41R5EDKE3ZXQSHKC"
+slug = "59.2"
+aliases = ["59.2"]
 
 [[epochs.phases]]
 id = "60"
 title = "Manual Synchronization"
 status = "pending"
+ulid = "01KEX4X98ZHEHS8DE9CPTE3S6A"
+slug = "60"
+aliases = ["60"]
 
 [[epochs.phases.tasks]]
 id = "60.1"
 label = "Audit: Compare `docs/rfcs` (Stage 3+) against `docs/manual`."
 status = "pending"
+ulid = "01KEX4X98ZWXMPCZ4AJ3NGF4KJ"
+slug = "60.1"
+aliases = ["60.1"]
 
 [[epochs.phases.tasks]]
 id = "60.2"
 label = "Update: Consolidate RFC content into the manual."
 status = "pending"
+ulid = "01KEX4X98ZM37RDJ2KZPEDYWQH"
+slug = "60.2"
+aliases = ["60.2"]
 
 [[epochs.phases.tasks]]
 id = "60.3"
 label = 'Verify: Ensure the manual is the single source of truth for "how it works now".'
 status = "pending"
+ulid = "01KEX4X98Z5HJK9DMVKJX71CKF"
+slug = "60.3"
+aliases = ["60.3"]
 
 [[epochs.phases]]
 id = "61"
 title = "Boot Feedback & Progress UI"
 status = "complete"
 rfcs = ["0062"]
+ulid = "01KEX4X98ZKNQ1507A2TTBHBSN"
+slug = "61"
+aliases = ["61"]
 
 [[epochs.phases.tasks]]
 id = "61.1"
 label = "TUI Framework: Integrate `indicatif` or similar for progress bars."
 status = "complete"
+ulid = "01KEX4X98ZJYQ7YCKZWK2XVRTW"
+slug = "61.1"
+aliases = ["61.1"]
 
 [[epochs.phases.tasks]]
 id = "61.2"
 label = 'Step Tracking: Instrument the boot process to report steps ("Building", "Starting", "Waiting").'
 status = "complete"
+ulid = "01KEX4X98ZN4SCSVQYSFMM80RZ"
+slug = "61.2"
+aliases = ["61.2"]
 
 [[epochs.phases.tasks]]
 id = "61.3"
 label = "Log Streaming: Stream logs for failing steps immediately."
 status = "complete"
+ulid = "01KEX4X98ZT91Z833Z1QJ8KBY2"
+slug = "61.3"
+aliases = ["61.3"]
 
 [[epochs.phases]]
 id = "62"
 title = "Shared Utility Crate"
 status = "complete"
 rfcs = ["0067"]
+ulid = "01KEX4X98ZG4J6P0KGNBE7SZKB"
+slug = "62"
+aliases = ["62"]
 
 [[epochs.phases.tasks]]
 id = "62.1"
 label = "Scaffold: Create `locald-utils` crate."
 status = "complete"
+ulid = "01KEX4X98ZMYE630VAZ8DPNJET"
+slug = "62.1"
+aliases = ["62.1"]
 
 [[epochs.phases.tasks]]
 id = "62.2"
 label = "Migrate: Move `fs`, `process`, `probe`, `cert`, `ipc`, `notify` modules."
 status = "complete"
+ulid = "01KEX4X98ZTZ6GTPG359WRYHP1"
+slug = "62.2"
+aliases = ["62.2"]
 
 [[epochs.phases.tasks]]
 id = "62.3"
 label = "Refactor: Update consumers (`locald-server`, `locald-cli`, `locald-builder`) to use the new crate."
 status = "complete"
+ulid = "01KEX4X98ZK9CA5YPQVVE1C9EM"
+slug = "62.3"
+aliases = ["62.3"]
 
 [[epochs.phases]]
 id = "63"
 title = "Dependency Hygiene"
 status = "complete"
 rfcs = ["0068"]
+ulid = "01KEX4X98ZGQ4P1CS71QHYXHVN"
+slug = "63"
+aliases = ["63"]
 
 [[epochs.phases.tasks]]
 id = "63.1"
 label = "Policy: Establish a dependency management policy."
 status = "complete"
+ulid = "01KEX4X98ZGAJBW53E1JZM7920"
+slug = "63.1"
+aliases = ["63.1"]
 
 [[epochs.phases.tasks]]
 id = "63.2"
 label = "Tooling: Create `scripts/update-deps.sh` to automate updates."
 status = "complete"
+ulid = "01KEX4X98Z78T22Z91R9FK59H0"
+slug = "63.2"
+aliases = ["63.2"]
 
 [[epochs.phases.tasks]]
 id = "63.3"
 label = "Protocol: Update `AGENTS.md` to enforce regular updates."
 status = "complete"
+ulid = "01KEX4X98ZM7TJWMK7KQ7YYS7W"
+slug = "63.3"
+aliases = ["63.3"]
 
 [[epochs.phases]]
 id = "64"
 title = "Host-First Execution Pivot"
 status = "complete"
 rfcs = ["0069"]
+ulid = "01KEX4X98ZXQ153BPVBWD26H2A"
+slug = "64"
+aliases = ["64"]
 
 [[epochs.phases.tasks]]
 id = "64.1"
 label = "Configuration: Update `locald.toml` schema to support optional `[service.build]`."
 status = "complete"
+ulid = "01KEX4X98ZHBHN6GBHJYQ0VWP5"
+slug = "64.1"
+aliases = ["64.1"]
 
 [[epochs.phases.tasks]]
 id = "64.2"
 label = "Runtime Split: Refactor `ProcessManager` to default to Host Runtime."
 status = "complete"
+ulid = "01KEX4X98ZY7KHR4QRTVKZEDSB"
+slug = "64.2"
+aliases = ["64.2"]
 
 [[epochs.phases.tasks]]
 id = "64.3"
 label = "Opt-In CNB: Gate existing CNB logic behind the `build` configuration."
 status = "complete"
+ulid = "01KEX4X98Z1H9PCMD2TA95BTPB"
+slug = "64.3"
+aliases = ["64.3"]
 
 [[epochs.phases.tasks]]
 id = "64.4"
 label = "Verification: Verify Host-First and CNB Opt-In behavior with examples."
 status = "complete"
+ulid = "01KEX4X98ZKMJEEVPW9EXGS8FQ"
+slug = "64.4"
+aliases = ["64.4"]
 
 [[epochs.phases]]
 id = "65"
 title = "CNB Library Extraction"
 status = "pending"
 rfcs = ["0068"]
+ulid = "01KEX4X98ZY711S8A33ANPN6BZ"
+slug = "65"
+aliases = ["65"]
 
 [[epochs.phases.tasks]]
 id = "65.1"
 label = "Scaffold: Create `cnb-client` crate."
 status = "pending"
+ulid = "01KEX4X98ZP622RXHY9PGMQ16N"
+slug = "65.1"
+aliases = ["65.1"]
 
 [[epochs.phases.tasks]]
 id = "65.2"
 label = "Migrate: Move `oci_layout` and `runtime_spec` logic."
 status = "pending"
+ulid = "01KEX4X98ZYKSPRNQCFYJEEBHX"
+slug = "65.2"
+aliases = ["65.2"]
 
 [[epochs.phases.tasks]]
 id = "65.3"
 label = "Refactor: Update `locald-builder` to use `cnb-client`."
 status = "pending"
+ulid = "01KEX4X98ZC3A18FB6KV1WPTS6"
+slug = "65.3"
+aliases = ["65.3"]
 
 [[epochs.phases]]
 id = "66"
 title = "Rust CNB Launcher (Research)"
 status = "pending"
 rfcs = ["0069"]
+ulid = "01KEX4X98ZHG2BT3SBNKC7VXCX"
+slug = "66"
+aliases = ["66"]
 
 [[epochs.phases.tasks]]
 id = "66.1"
 label = "Prototype: Create `cnb-launcher` crate and implement basic config parsing."
 status = "pending"
+ulid = "01KEX4X98ZWAEDAA87G029S149"
+slug = "66.1"
+aliases = ["66.1"]
 
 [[epochs.phases.tasks]]
 id = "66.2"
 label = "Environment: Implement env var merging logic."
 status = "pending"
+ulid = "01KEX4X98Z3A4FMS97HRBMW0CK"
+slug = "66.2"
+aliases = ["66.2"]
 
 [[epochs.phases.tasks]]
 id = "66.3"
 label = "Execution: Implement `execve` strategy."
 status = "pending"
+ulid = "01KEX4X98ZJKG9G1CS7N39X1M1"
+slug = "66.3"
+aliases = ["66.3"]
 
 [[epochs.phases]]
 id = "67"
 title = "Documentation Restructure"
 status = "complete"
+ulid = "01KEX4X98Z5K21H46WVVW9X3WZ"
+slug = "67"
+aliases = ["67"]
 
 [[epochs.phases.tasks]]
 id = "67.1"
 label = "IA Overhaul: Restructure `locald-docs` to match Personas (Guides, Reference, Internals)."
 status = "complete"
+ulid = "01KEX4X98Z7VYAJNJCJPXB7AB6"
+slug = "67.1"
+aliases = ["67.1"]
 
 [[epochs.phases.tasks]]
 id = "67.2"
 label = "Landing Page: Redesign `index.mdx` to provide clear pathways."
 status = "complete"
+ulid = "01KEX4X98Z1XW5S8R3A295SZH5"
+slug = "67.2"
+aliases = ["67.2"]
 
 [[epochs.phases.tasks]]
 id = "67.3"
 label = "Migration: Move and refine content from `docs/manual` and `docs/design`."
 status = "complete"
+ulid = "01KEX4X98ZNMJZ7366RHKRBXGH"
+slug = "67.3"
+aliases = ["67.3"]
 
 [[epochs.phases.tasks]]
 id = "67.4"
 label = 'Axiom Placement: Move Axioms/Vision to "Internals" section.'
 status = "complete"
+ulid = "01KEX4X98Z36V24W6V8SCBDVKK"
+slug = "67.4"
+aliases = ["67.4"]
 
 [[epochs.phases.tasks]]
 id = "67.5"
 label = "Refinement: Polish Reference and Internals content to match current implementation."
 status = "complete"
+ulid = "01KEX4X98Z059Q1K74V8J447TX"
+slug = "67.5"
+aliases = ["67.5"]
 
 [[epochs.phases]]
 id = "68"
 title = "Runc Container Runtime"
 status = "complete"
 rfcs = ["0075"]
+ulid = "01KEX4X98ZPX62HSG714Z38XYY"
+slug = "68"
+aliases = ["68"]
 
 [[epochs.phases.tasks]]
 id = "68.1"
 label = "OCI Crate: Extract OCI logic into `locald-oci` crate."
 status = "complete"
+ulid = "01KEX4X98ZYZE68PV6A8X2NFJK"
+slug = "68.1"
+aliases = ["68.1"]
 
 [[epochs.phases.tasks]]
 id = "68.2"
 label = "Refactor: Consolidate `start_container` and `start_cnb_container` in `locald-server`."
 status = "complete"
+ulid = "01KEX4X98ZBQDF9A1N76X4XM5M"
+slug = "68.2"
+aliases = ["68.2"]
 
 [[epochs.phases.tasks]]
 id = "68.3"
 label = "Bundle Source: Implement `BundleSource` trait in `locald-builder`."
 status = "complete"
+ulid = "01KEX4X98ZCX9M8X1S0PZXF80C"
+slug = "68.3"
+aliases = ["68.3"]
 
 [[epochs.phases.tasks]]
 id = "68.4"
 label = "Deprecate: Mark `DockerRuntime` as deprecated."
 status = "complete"
+ulid = "01KEX4X98Z5FZYENTJ277KMEDW"
+slug = "68.4"
+aliases = ["68.4"]
 
 [[epochs.phases]]
 id = "76"
 title = "Ephemeral Containers"
 status = "complete"
 rfcs = ["0076"]
+ulid = "01KEX4X98ZEK7BHB8YTBHWWKBF"
+slug = "76"
+aliases = ["76"]
 
 [[epochs.phases.tasks]]
 id = "76.1"
 label = "Spec Generation: Implement robust `OciImageConfig` -> `OciRuntimeSpec` conversion in `locald-oci`."
 status = "complete"
+ulid = "01KEX4X98ZMC8B4GNVTZT533AM"
+slug = "76.1"
+aliases = ["76.1"]
 
 [[epochs.phases.tasks]]
 id = "76.2"
 label = "Runtime Interface: Implement `locald_oci::runtime::run` wrapper."
 status = "complete"
+ulid = "01KEX4X98ZP81FZRNF1BFAHN3J"
+slug = "76.2"
+aliases = ["76.2"]
 
 [[epochs.phases.tasks]]
 id = "76.3"
 label = "Shim Integration: Update `locald-shim` to use the new runtime interface."
 status = "complete"
+ulid = "01KEX4X98ZC31Z124MBX1NMTEG"
+slug = "76.3"
+aliases = ["76.3"]
 
 [[epochs.phases.tasks]]
 id = "76.4"
 label = "Server Logic: Add `ContainerService` to `locald-server`."
 status = "complete"
+ulid = "01KEX4X98ZTG4E1QST8NFSHP13"
+slug = "76.4"
+aliases = ["76.4"]
 
 [[epochs.phases.tasks]]
 id = "76.5"
 label = "CLI Command: Add `locald run` command."
 status = "complete"
+ulid = "01KEX4X98ZJ8VE7R0QEJWKVEGW"
+slug = "76.5"
+aliases = ["76.5"]
 
 [[epochs]]
 id = "E5"
 title = "The Perfect Demo"
 status = "pending"
+ulid = "01KEX4X98ZADAXF8RJ92PFBGGF"
+slug = "E5"
+aliases = ["E5"]
 
 [[epochs.phases]]
 id = "97"
 title = "Libcontainer Shim (Fat Shim)"
 status = "complete"
 rfcs = ["0098"]
+ulid = "01KEX4X98Z9CYMR6P68E4A1C2P"
+slug = "97"
+aliases = ["97"]
 
 [[epochs.phases.tasks]]
 id = "97.1"
 label = "Refactor Shim: Update `locald-shim` to link `libcontainer` and execute OCI bundles directly."
 status = "complete"
+ulid = "01KEX4X98ZREGY7C93SGNYZ48X"
+slug = "97.1"
+aliases = ["97.1"]
 
 [[epochs.phases.tasks]]
 id = "97.2"
 label = "Update Daemon: Update `locald-server` to generate OCI bundles and invoke the new shim."
 status = "complete"
+ulid = "01KEX4X98ZHNSTVN98SGH82D9V"
+slug = "97.2"
+aliases = ["97.2"]
 
 [[epochs.phases.tasks]]
 id = "97.3"
 label = "Verify: Ensure `locald run` works reliably without external `runc`."
 status = "complete"
+ulid = "01KEX4X98ZV0VKJN2J76R4AZDG"
+slug = "97.3"
+aliases = ["97.3"]
 
 [[epochs.phases]]
 id = "98"
 title = "Postgres Port Fix"
 status = "complete"
+ulid = "01KEX4X98ZG1VM2Q1V545PDYYP"
+slug = "98"
+aliases = ["98"]
 
 [[epochs.phases.tasks]]
 id = "98.1"
 label = "Diagnosis: Confirm `PostgresFactory` hardcodes port 5432 when not specified."
 status = "complete"
+ulid = "01KEX4X98ZDPJ2YCVVNJ354NZA"
+slug = "98.1"
+aliases = ["98.1"]
 
 [[epochs.phases.tasks]]
 id = "98.2"
 label = "Fix: Update `PostgresFactory` to request a dynamic port if none is configured."
 status = "complete"
+ulid = "01KEX4X98ZTHEWGNR8NN70WCWE"
+slug = "98.2"
+aliases = ["98.2"]
 
 [[epochs.phases.tasks]]
 id = "98.3"
 label = "Verification: Verify multiple Postgres services can run simultaneously without port conflicts."
 status = "complete"
+ulid = "01KEX4X98ZS47BXYPNSQ5J0J35"
+slug = "98.3"
+aliases = ["98.3"]
 
 [[epochs.phases]]
 id = "99a"
 title = "Demo Repository Setup"
 status = "complete"
+ulid = "01KEX4X98ZE2F5M3Z8W7N4KQW4"
+slug = "99a"
+aliases = ["99a"]
 
 [[epochs.phases.tasks]]
 id = "99a.1"
 label = "Create Repos: Set up `examples/color-system` and `examples/hydra`."
 status = "complete"
+ulid = "01KEX4X98ZSXHBA6YCBVEMRW26"
+slug = "99a.1"
+aliases = ["99a.1"]
 
 [[epochs.phases.tasks]]
 id = "99a.2"
 label = "Configure: Add `locald.toml` with `exec` services (mocked with `python3 -m http.server` or similar)."
 status = "complete"
+ulid = "01KEX4X98ZR5BAEQVX13T3GWBM"
+slug = "99a.2"
+aliases = ["99a.2"]
 
 [[epochs.phases.tasks]]
 id = "99a.3"
 label = "Verify: Ensure they boot and are accessible via `*.localhost`."
 status = "complete"
+ulid = "01KEX4X98ZHZBMC2MCV3X4QMAC"
+slug = "99a.3"
+aliases = ["99a.3"]
 
 [[epochs.phases]]
 id = "99b"
 title = "Dashboard Polish"
 status = "complete"
+ulid = "01KEX4X98Z0DY640N2FCCTHH11"
+slug = "99b"
+aliases = ["99b"]
 
 [[epochs.phases.tasks]]
 id = "99b.1"
 label = "Visual Check: Verify layout, fonts, and colors match the desired aesthetic."
 status = "complete"
+ulid = "01KEX4X98Z53M84S3GATVJ5TVW"
+slug = "99b.1"
+aliases = ["99b.1"]
 
 [[epochs.phases.tasks]]
 id = "99b.2"
 label = 'Link Verification: Ensure "Open App" links use `https://` and work correctly.'
 status = "complete"
+ulid = "01KEX4X98Z1WG8EVME0ADFVS57"
+slug = "99b.2"
+aliases = ["99b.2"]
 
 [[epochs.phases.tasks]]
 id = "99b.3"
 label = "Data Accuracy: Verify service status and logs are accurate."
 status = "complete"
+ulid = "01KEX4X98ZH2JVN42Y2APS9D2Z"
+slug = "99b.3"
+aliases = ["99b.3"]
 
 [[epochs.phases.tasks]]
 id = "99b.4"
 label = 'Tiled Terminals: Implement "Deck" view with tiled terminals for pinned services.'
 status = "complete"
+ulid = "01KEX4X98ZPF1GVW6C8Y4RZP0C"
+slug = "99b.4"
+aliases = ["99b.4"]
 
 [[epochs.phases.tasks]]
 id = "99b.5"
 label = 'Visual Polish: Apply "Vercel-class" styling (Zinc scale, subtle borders, refined headers).'
 status = "complete"
+ulid = "01KEX4X98ZC2JS0YSK5NJS7VJJ"
+slug = "99b.5"
+aliases = ["99b.5"]
 
 [[epochs.phases]]
 id = "99e"
 title = "Luminosity & State"
 status = "complete"
+ulid = "01KEX4X98Z09Z9GAXE6T1Y4SMM"
+slug = "99e"
+aliases = ["99e"]
 
 [[epochs.phases.tasks]]
 id = "99e.1"
 label = "Active Toolbar: Make toolbar controls persistent and styled when active."
 status = "complete"
+ulid = "01KEX4X98Z8R19DX8GE1TNHD7A"
+slug = "99e.1"
+aliases = ["99e.1"]
 
 [[epochs.phases.tasks]]
 id = "99e.2"
 label = "Global Contrast: Brighten sidebar items, headers, badges, and timestamps."
 status = "complete"
+ulid = "01KEX4X98ZXYZ32XQV215R9KG9"
+slug = "99e.2"
+aliases = ["99e.2"]
 
 [[epochs.phases.tasks]]
 id = "99e.3"
 label = "Hover State: Enhance row hover background."
 status = "complete"
+ulid = "01KEX4X98ZMRRA60A9JPEFG9G1"
+slug = "99e.3"
+aliases = ["99e.3"]
 
 [[epochs.phases]]
 id = "100"
 title = "Meta-Hosting Verification"
 status = "complete"
+ulid = "01KEX4X98ZSH3EYR1RVZ8J4XSN"
+slug = "100"
+aliases = ["100"]
 
 [[epochs.phases.tasks]]
 id = "100.1"
 label = "Self-Host: Run `locald up` in the `dotlocal` root."
 status = "complete"
+ulid = "01KEX4X98ZDTTGEJJMVEPR82SS"
+slug = "100.1"
+aliases = ["100.1"]
 
 [[epochs.phases.tasks]]
 id = "100.2"
 label = "Conflict Check: Ensure no port conflicts with system services or other `locald` instances."
 status = "complete"
+ulid = "01KEX4X98ZFPDGE0669T57XDMY"
+slug = "100.2"
+aliases = ["100.2"]
 
 [[epochs.phases.tasks]]
 id = "100.3"
 label = "Full Stack: Verify Docs, Dashboard, and Postgres are all functional."
 status = "complete"
+ulid = "01KEX4X98Z4CCKF5ACSY4DWPJS"
+slug = "100.3"
+aliases = ["100.3"]
 
 [[epochs.phases]]
 id = "101"
 title = "System Plane & Unified Pinning"
 status = "complete"
 rfcs = ["0100"]
+ulid = "01KEX4X98ZZBRSA0992Z22WJF2"
+slug = "101"
+aliases = ["101"]
 
 [[epochs.phases.tasks]]
 id = "101.1"
 label = "RFC 0100: Create and implement."
 status = "complete"
+ulid = "01KEX4X98ZQPS6JSTQTJFBD96K"
+slug = "101.1"
+aliases = ["101.1"]
 
 [[epochs.phases.tasks]]
 id = "101.2"
 label = 'System Plane: Implement "System Normal" footer to toggle Daemon Control Center.'
 status = "complete"
+ulid = "01KEX4X98ZM71R49CWFZKXQDMS"
+slug = "101.2"
+aliases = ["101.2"]
 
 [[epochs.phases.tasks]]
 id = "101.3"
 label = 'Unified Pinning: Deprecate "Solo Mode" in favor of a single "Pin" state.'
 status = "complete"
+ulid = "01KEX4X98Z414H6SA4QSWSPD3B"
+slug = "101.3"
+aliases = ["101.3"]
 
 [[epochs.phases.tasks]]
 id = "101.4"
 label = "Daemon Logs: Broadcast `locald` internal logs to the frontend."
 status = "complete"
+ulid = "01KEX4X98Z2302ZXGCP62FSD65"
+slug = "101.4"
+aliases = ["101.4"]
 
 [[epochs.phases.tasks]]
 id = "101.5"
 label = "Dev Mode: Add `dashboard` service to `locald.toml` for meta-hosting."
 status = "complete"
+ulid = "01KEX4X98ZXFVH8WCYCP0GKHES"
+slug = "101.5"
+aliases = ["101.5"]
 
 [[epochs.phases]]
 id = "102"
 title = "VMM Maturity & Networking"
 status = "pending"
 rfcs = ["0102"]
+ulid = "01KEX4X98ZRSZ2XHQV2SCK2BGH"
+slug = "102"
+aliases = ["102"]
 
 [[epochs.phases.tasks]]
 id = "102.1"
 label = "Event Loop: Introduce a reactor model (epoll/mio/event-manager) with a VCPU thread + device I/O loop."
 status = "pending"
+ulid = "01KEX4X98ZHF0VV4WJFMZQ14G6"
+slug = "102.1"
+aliases = ["102.1"]
 
 [[epochs.phases.tasks]]
 id = "102.2"
 label = "Async I/O: Move virtio-block data path off the VCPU thread (thread pool or io_uring) and signal completion via eventfd/irq."
 status = "pending"
+ulid = "01KEX4X98ZGJR4X1YGBSZZ7S2R"
+slug = "102.2"
+aliases = ["102.2"]
 
 [[epochs.phases.tasks]]
 id = "102.3"
 label = "Virtio-Net: Add a minimal `virtio-net` device (TAP) and integrate with the reactor."
 status = "pending"
+ulid = "01KEX4X98Z70K485CR5PE77HWG"
+slug = "102.3"
+aliases = ["102.3"]
 
 [[epochs.phases.tasks]]
 id = "102.4"
 label = "Library Decision: Evaluate adopting `dbs-virtio-devices` (or similar) once the reactor exists."
 status = "pending"
+ulid = "01KEX4X98ZC8T09VQF4H1NZZ9W"
+slug = "102.4"
+aliases = ["102.4"]
 
 [[epochs.phases]]
 id = "99"
 title = "Structured Cgroup Hierarchy"
 status = "completed"
 rfcs = ["0099"]
+ulid = "01KEX4X98ZWE5W6QAYRBVX3V0K"
+slug = "99"
+aliases = ["99"]
 
 [[epochs.phases.tasks]]
 id = "99.1"
 label = "Align RFC 0099 with PID1 detection"
 status = "completed"
+ulid = "01KEX4X98ZC3J0H7YKTQHKPA2T"
+slug = "99.1"
+aliases = ["99.1"]
 
 [[epochs.phases.tasks]]
 id = "99.2"
 label = "Align manual resource-management with detection + kill semantics"
 status = "completed"
+ulid = "01KEX4X98ZM5KTAEZXK0EY4ZZN"
+slug = "99.2"
+aliases = ["99.2"]
 
 [[epochs.phases.tasks]]
 id = "99.3"
 label = "Sandbox identity for cgroups (tests)"
 status = "completed"
+ulid = "01KEX4X98ZNYMHPS6Q2XXZWRP8"
+slug = "99.3"
+aliases = ["99.3"]
 
 [[epochs.phases.tasks]]
 id = "99.4"
 label = "Docs acceptance: sanitize naming contract"
 status = "completed"
+ulid = "01KEX4X98ZFQ6XBAS9QTFD2ZA7"
+slug = "99.4"
+aliases = ["99.4"]
 
 [[epochs.phases.tasks]]
 id = "99.5"
 label = "Phase 99 verification plumbing"
 status = "completed"
+ulid = "01KEX4X98ZY7GYCPARHS9VHA9T"
+slug = "99.5"
+aliases = ["99.5"]
 
 [[epochs]]
 id = "E6"
 title = "User-Facing Surface Coherence"
-status = "pending"
+status = "completed"
+ulid = "01KEX4X98ZVQB7MEDVKS5ACEGR"
+slug = "E6"
+aliases = ["E6"]
 
 [[epochs.phases]]
 id = "110"
@@ -1672,21 +2690,33 @@ rfcs = [
     "0112",
     "0114",
 ]
+ulid = "01KEX4X98ZVQWQ7RG81F8XX0CV"
+slug = "110"
+aliases = ["110"]
 
 [[epochs.phases.tasks]]
 id = "110.1"
 label = "Define Surface Contract (verbs/nouns)"
 status = "completed"
+ulid = "01KEX4X98ZQS4XR3094JFXGFX4"
+slug = "110.1"
+aliases = ["110.1"]
 
 [[epochs.phases.tasks]]
 id = "110.2"
 label = "Define stability labels + governance"
 status = "completed"
+ulid = "01KEX4X98ZZDZ3Z99FK4V0QVB9"
+slug = "110.2"
+aliases = ["110.2"]
 
 [[epochs.phases.tasks]]
 id = "110.3"
 label = "Update docs to match contract"
 status = "completed"
+ulid = "01KEX4X98Z5218C0J1MGJZYYPK"
+slug = "110.3"
+aliases = ["110.3"]
 
 [[epochs.phases]]
 id = "111"
@@ -1696,21 +2726,33 @@ rfcs = [
     "0112",
     "0114",
 ]
+ulid = "01KEX4X98ZN4DDR2902C8SEXHE"
+slug = "111"
+aliases = ["111"]
 
 [[epochs.phases.tasks]]
 id = "111.1"
 label = "Generate CLI surface manifest"
 status = "completed"
+ulid = "01KEX4X98Z79KFWP8KY8CP03PV"
+slug = "111.1"
+aliases = ["111.1"]
 
 [[epochs.phases.tasks]]
 id = "111.2"
 label = "Docs lint against CLI manifest"
 status = "completed"
+ulid = "01KEX4X98ZR9Y5220C8HQS4HMX"
+slug = "111.2"
+aliases = ["111.2"]
 
 [[epochs.phases.tasks]]
 id = "111.3"
 label = "CI checks for drift"
 status = "completed"
+ulid = "01KEX4X98ZGENE1G67780AC1MV"
+slug = "111.3"
+aliases = ["111.3"]
 
 [[epochs.phases]]
 id = "112"
@@ -1720,21 +2762,33 @@ rfcs = [
     "0112",
     "0114",
 ]
+ulid = "01KEX4X98Z5AHRXVMB9G3C01ZM"
+slug = "112"
+aliases = ["112"]
 
 [[epochs.phases.tasks]]
 id = "112.1"
 label = "Inventory dashboard surfaced concepts"
 status = "completed"
+ulid = "01KEX4X98ZHXDJ4ZCNJGZB4SWY"
+slug = "112.1"
+aliases = ["112.1"]
 
 [[epochs.phases.tasks]]
 id = "112.2"
 label = "Align dashboard vocabulary to contract"
 status = "completed"
+ulid = "01KEX4X98ZHVQ6ER424P1BQ1QQ"
+slug = "112.2"
+aliases = ["112.2"]
 
 [[epochs.phases.tasks]]
 id = "112.3"
 label = "Validate user-visible flows"
 status = "completed"
+ulid = "01KEX4X98ZA2E0QABN5AA8DR2T"
+slug = "112.3"
+aliases = ["112.3"]
 
 [[epochs.phases]]
 id = "113"
@@ -1744,21 +2798,33 @@ rfcs = [
     "0112",
     "0114",
 ]
+ulid = "01KEX4X98Z4DYQN2VAXZGX4FHZ"
+slug = "113"
+aliases = ["113"]
 
 [[epochs.phases.tasks]]
 id = "113.1"
 label = "Audit optional integrations + failure modes"
 status = "completed"
+ulid = "01KEX4X98ZYAD9ZBXYQ9T56102"
+slug = "113.1"
+aliases = ["113.1"]
 
 [[epochs.phases.tasks]]
 id = "113.2"
 label = "Document stable/experimental matrix"
 status = "completed"
+ulid = "01KEX4X98ZWWEX240F45KEX4JN"
+slug = "113.2"
+aliases = ["113.2"]
 
 [[epochs.phases.tasks]]
 id = "113.3"
 label = "Ensure doctor surfaces integration availability"
 status = "completed"
+ulid = "01KEX4X98Z3A9BC1ZDSQA9NWDZ"
+slug = "113.3"
+aliases = ["113.3"]
 
 [[epochs.phases]]
 id = "114"
@@ -1768,18 +2834,30 @@ rfcs = [
     "0112",
     "0114",
 ]
+ulid = "01KEX4X98ZMTJYCHPC7H3F6A73"
+slug = "114"
+aliases = ["114"]
 
 [[epochs.phases.tasks]]
 id = "114.1"
 label = "Create feature readiness ledger"
 status = "completed"
+ulid = "01KEX4X98ZAAXQWG9FFQT5H21K"
+slug = "114.1"
+aliases = ["114.1"]
 
 [[epochs.phases.tasks]]
 id = "114.2"
 label = "Align docs/RFCs with stability labels"
 status = "completed"
+ulid = "01KEX4X98Z5K3ZCB54SWTD20DF"
+slug = "114.2"
+aliases = ["114.2"]
 
 [[epochs.phases.tasks]]
 id = "114.3"
 label = "Add ongoing drift-prevention checklist"
 status = "completed"
+ulid = "01KEX4X98ZTQMC2ED51Q10QE7H"
+slug = "114.3"
+aliases = ["114.3"]

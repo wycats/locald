@@ -48,11 +48,9 @@ Server behavior settings:
 
 ```toml
 [server]
-# Whether to attempt binding to privileged ports (80/443)
+# Whether to attempt binding to privileged ports (80/443).
+# If true, failure to bind will error. Use sandbox mode for unprivileged testing.
 privileged_ports = true
-
-# Whether to fallback to unprivileged ports (8080/8443) if privileged fail
-fallback_ports = true
 ```
 
 ### `[container]`

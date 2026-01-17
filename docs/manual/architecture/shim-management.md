@@ -147,7 +147,7 @@ The shim protocol is versioned. `locald` checks the version of the shim on start
 
 Runs the shim as a persistent daemon that listens on a Unix socket for privileged operation requests.
 
-- **Command**: `locald shim serve [--foreground] [--socket <path>]`
+- **Command**: `locald-shim serve [--foreground] [--socket <path>]`
 - **Socket**: `~/.locald/shim.sock` (default)
 - **Why**: Enables container environments (Toolbx, Distrobox) to delegate privileged operations to the host.
 
@@ -173,7 +173,7 @@ Runs the shim as a persistent daemon that listens on a Unix socket for privilege
 
 For container development environments (Toolbx, Distrobox), the shim daemon provides a way to delegate privileged operations to the host OS:
 
-1. **On the host**: Run `sudo locald shim serve` to start the daemon
+1. **On the host**: Run `sudo locald-shim serve` to start the daemon
 2. **In the container**: `locald up` automatically connects via socket
 
 The daemon listens on `~/.locald/shim.sock`, which is accessible from inside containers that share your home directory.

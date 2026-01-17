@@ -76,13 +76,31 @@ fn run_main(cli: cli::Cli) -> Result<()> {
     }
 
     // Skip verification for admin setup, as it's used to fix the shim
-    if !matches!(
+    // Also skip for plugin commands that don't need daemon (create, install)
+    #[cfg(feature = "experimental-plugins")]
+    let skip_verify = matches!(
         cli.command,
         cli::Commands::Admin {
             command: cli::AdminCommands::Setup(_)
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
-    ) {
+            | cli::Commands::Plugin {
+                command: cli::PluginCommands::Create { .. }
+            }
+            | cli::Commands::Plugin {
+                command: cli::PluginCommands::Install { .. }
+            }
+    );
+    #[cfg(not(feature = "experimental-plugins"))]
+    let skip_verify = matches!(
+        cli.command,
+        cli::Commands::Admin {
+            command: cli::AdminCommands::Setup(_)
+        } | cli::Commands::Doctor { .. }
+            | cli::Commands::Surface { .. }
+    );
+
+    if !skip_verify {
         utils::verify_shim();
     }
 

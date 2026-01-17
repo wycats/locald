@@ -160,152 +160,21 @@ fn looks_like_systemctl_connectivity_failure(stderr: &str) -> bool {
     s.contains("failed to connect to system scope bus") || s.contains("failed to connect to bus")
 }
 
+// Re-export blocking container functions from locald-utils for use in early-startup code
 #[cfg(target_os = "linux")]
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    meta.is_file() && (meta.permissions().mode() & 0o111) != 0
-}
+pub use locald_utils::container::blocking::{
+    command_exists, is_probably_container, start_host_shim,
+};
 
-#[cfg(target_os = "linux")]
-fn command_exists(name: &str) -> bool {
-    if name.contains('/') {
-        return is_executable(std::path::Path::new(name));
-    }
-
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return true;
-        }
-    }
-
+// For non-Linux platforms, provide stub implementations
+#[cfg(not(target_os = "linux"))]
+fn is_probably_container() -> bool {
     false
 }
 
-/// Substitute the `{command}` placeholder in a host-exec template.
-///
-/// # Example
-/// ```ignore
-/// let result = substitute_host_exec_template("flatpak-spawn --host {command}", "pkexec locald shim serve");
-/// assert_eq!(result, "flatpak-spawn --host pkexec locald shim serve");
-/// ```
-#[allow(dead_code)] // Used in Phase 4 of RFC 0130
-#[allow(clippy::literal_string_with_formatting_args)] // {command} is a template placeholder, not a format arg
-pub fn substitute_host_exec_template(template: &str, command: &str) -> String {
-    template.replace("{command}", command)
-}
-
-/// Start the host shim daemon from inside a container.
-///
-/// This function attempts to start the shim daemon on the host using one of the following
-/// methods (in order of preference):
-/// 1. User-configured `host_exec` template from config
-/// 2. Auto-detected `flatpak-spawn --host` (Toolbx/Flatpak)
-/// 3. Auto-detected `distrobox-host-exec` (Distrobox)
-///
-/// If none of these methods are available, returns an error with manual setup instructions.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // Used in Phase 4 of RFC 0130
-pub fn start_host_shim(config: &locald_core::config::ContainerConfig) -> anyhow::Result<()> {
-    use anyhow::anyhow;
-
-    const SHIM_COMMAND: &str = "pkexec locald shim serve";
-
-    // 1. Check for user-configured host_exec template
-    if let Some(template) = &config.host_exec {
-        let cmd = substitute_host_exec_template(template, SHIM_COMMAND);
-        return run_shell_command(&cmd);
-    }
-
-    // 2. Auto-detect available mechanisms
-    if command_exists("flatpak-spawn") {
-        return std::process::Command::new("flatpak-spawn")
-            .args(["--host", "pkexec", "locald", "shim", "serve"])
-            .status()
-            .map_err(|e| anyhow!("Failed to run flatpak-spawn: {}", e))
-            .and_then(|status| {
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        "flatpak-spawn exited with status: {}",
-                        status.code().unwrap_or(-1)
-                    ))
-                }
-            });
-    }
-
-    if command_exists("distrobox-host-exec") {
-        return std::process::Command::new("distrobox-host-exec")
-            .args(["pkexec", "locald", "shim", "serve"])
-            .status()
-            .map_err(|e| anyhow!("Failed to run distrobox-host-exec: {}", e))
-            .and_then(|status| {
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        "distrobox-host-exec exited with status: {}",
-                        status.code().unwrap_or(-1)
-                    ))
-                }
-            });
-    }
-
-    // 3. No mechanism available - guide user to manual setup
-    Err(anyhow!(
-        "Could not start host shim daemon.\n\n\
-         Please run on your host:\n\
-           sudo locald shim serve\n\n\
-         Or configure host_exec in ~/.config/locald/config.toml:\n\
-           [container]\n\
-           host_exec = \"your-host-exec-command {{command}}\""
-    ))
-}
-
-/// Run a shell command string.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // Used in Phase 4 of RFC 0130
-fn run_shell_command(cmd: &str) -> anyhow::Result<()> {
-    use anyhow::anyhow;
-
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .status()
-        .map_err(|e| anyhow!("Failed to run shell command: {}", e))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Shell command failed with status: {}",
-            status.code().unwrap_or(-1)
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn is_probably_container() -> bool {
-    // Common container markers.
-    if std::env::var("container").is_ok() {
-        return true;
-    }
-
-    // Toolbx markers.
-    if std::env::var("TOOLBOX_PATH").is_ok() || std::env::var("TOOLBOX_CONTAINER").is_ok() {
-        return true;
-    }
-
-    std::path::Path::new("/run/.containerenv").exists()
-        || std::path::Path::new("/.dockerenv").exists()
+#[cfg(not(target_os = "linux"))]
+fn command_exists(_name: &str) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -520,6 +389,29 @@ fn offer_first_run_setup() -> bool {
     }
 }
 
+/// Show error that privileged helper access is required and exit.
+/// This is NOT a warning - we do not continue without privileges.
+fn show_privilege_required_error() -> ! {
+    eprintln!();
+    eprintln!("{} locald requires privileged helper access.", style::CROSS);
+    eprintln!();
+    eprintln!("This is needed for: hosts file sync, cgroup isolation, privileged ports.");
+    eprintln!();
+    eprintln!("To fix:");
+    eprintln!(
+        "  {} Container: flatpak-spawn --host pkexec locald-shim serve",
+        style::DOT
+    );
+    eprintln!("  {} Direct:    sudo locald admin setup", style::DOT);
+    eprintln!();
+    eprintln!("To test without privileges, use sandbox mode:");
+    eprintln!("  locald --sandbox test up");
+    eprintln!();
+    eprintln!("For diagnosis: locald doctor");
+    eprintln!();
+    std::process::exit(1);
+}
+
 pub fn verify_shim() {
     #[cfg(target_os = "linux")]
     {
@@ -535,6 +427,69 @@ pub fn verify_shim() {
 
         // Only check if we are NOT already running under the shim
         if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
+            // In container environments, prefer socket-based daemon over setuid shim.
+            // The setuid shim often can't work across container boundaries.
+            #[allow(clippy::items_after_statements)]
+            if is_probably_container() {
+                use locald_utils::container::ContainerConfig;
+
+                // Try to connect to existing shim socket daemon
+                // NOTE: This is shim_client::socket_path() -> ~/.locald/shim.sock
+                // NOT ipc::socket_path() -> /tmp/locald.sock (the server socket)
+                if let Ok(shim_socket) = locald_utils::shim_client::socket_path() {
+                    if shim_socket.exists() {
+                        // Shim socket exists, assume daemon is running - we're good
+                        return;
+                    }
+                }
+
+                // Socket doesn't exist, try to auto-start the host daemon
+                eprintln!("{} Attempting to start shim daemon on host...", style::INFO);
+
+                match start_host_shim(&ContainerConfig::default()) {
+                    Ok(()) => {
+                        // Wait for shim socket to appear
+                        let Ok(shim_socket) = locald_utils::shim_client::socket_path() else {
+                            // Can't determine socket path - fatal error
+                            show_privilege_required_error();
+                        };
+
+                        for attempt in 1..=10 {
+                            #[allow(clippy::disallowed_methods)]
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if shim_socket.exists() {
+                                eprintln!(
+                                    "{} Host shim daemon started successfully.",
+                                    style::CHECK
+                                );
+                                return;
+                            }
+                            if attempt == 5 {
+                                eprintln!(
+                                    "{} Still waiting for host daemon to start...",
+                                    style::INFO
+                                );
+                            }
+                        }
+                        // Timeout waiting for socket - fatal error
+                        eprintln!(
+                            "{} Host daemon started but socket not available.",
+                            style::CROSS
+                        );
+                        show_privilege_required_error();
+                    }
+                    Err(e) => {
+                        eprintln!("{} Failed to auto-start host daemon: {}", style::WARN, e);
+                        // Offer interactive setup like non-container path
+                        if !offer_first_run_setup() {
+                            show_privilege_required_error();
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Non-container path: check for setuid shim
             match locald_utils::shim::find_privileged() {
                 Ok(Some(shim_path)) => {
                     // Shim exists, verify integrity
@@ -563,29 +518,8 @@ pub fn verify_shim() {
                     }
                 }
                 Ok(None) => {
-                    // No privileged shim found.
-                    // In container environments (Toolbx/Distrobox/etc), a host-installed setuid
-                    // shim often cannot be validated or used from inside the container due to
-                    // user namespace / mount semantics.
-                    // In that case, don't block the user with repeated setup prompts; continue
-                    // without privileged features.
-                    if is_probably_container() {
-                        eprintln!(
-                            "{} locald-shim is not available as a privileged helper in this container.",
-                            style::WARN
-                        );
-                        eprintln!(
-                            "{} Continuing without privileged features (hosts sync, cgroup isolation, privileged ports).",
-                            style::WARN
-                        );
-                        eprintln!(
-                            "{} For full setup, run `sudo locald admin setup` on the host OS.",
-                            style::WARN
-                        );
-                        return;
-                    }
-
-                    // Non-container: this is first run. Offer interactive setup if in a TTY.
+                    // No privileged shim found on non-container host.
+                    // This is first run. Offer interactive setup if in a TTY.
                     offer_first_run_setup();
                     // If offer_first_run_setup returns, setup was successful.
                 }
@@ -602,62 +536,8 @@ pub fn verify_shim() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_substitute_host_exec_template_basic() {
-        let result = substitute_host_exec_template(
-            "flatpak-spawn --host {command}",
-            "pkexec locald shim serve",
-        );
-        assert_eq!(result, "flatpak-spawn --host pkexec locald shim serve");
-    }
-
-    #[test]
-    fn test_substitute_host_exec_template_distrobox() {
-        let result = substitute_host_exec_template(
-            "distrobox-host-exec {command}",
-            "pkexec locald shim serve",
-        );
-        assert_eq!(result, "distrobox-host-exec pkexec locald shim serve");
-    }
-
-    #[test]
-    fn test_substitute_host_exec_template_ssh() {
-        let result =
-            substitute_host_exec_template("ssh myhost {command}", "pkexec locald shim serve");
-        assert_eq!(result, "ssh myhost pkexec locald shim serve");
-    }
-
-    #[test]
-    fn test_substitute_host_exec_template_no_placeholder() {
-        // If template doesn't contain {command}, the command is not inserted
-        let result = substitute_host_exec_template("echo hello", "pkexec locald shim serve");
-        assert_eq!(result, "echo hello");
-    }
-
-    #[test]
-    fn test_substitute_host_exec_template_multiple_placeholders() {
-        // Multiple {command} placeholders should all be replaced
-        let result = substitute_host_exec_template("echo {command} && echo {command}", "test");
-        assert_eq!(result, "echo test && echo test");
-    }
-
-    #[test]
-    fn test_substitute_host_exec_template_empty_command() {
-        let result = substitute_host_exec_template("flatpak-spawn --host {command}", "");
-        assert_eq!(result, "flatpak-spawn --host ");
-    }
-
-    #[test]
-    fn test_substitute_host_exec_template_command_with_spaces() {
-        let result = substitute_host_exec_template(
-            "flatpak-spawn --host {command}",
-            "pkexec locald shim serve --foreground",
-        );
-        assert_eq!(
-            result,
-            "flatpak-spawn --host pkexec locald shim serve --foreground"
-        );
-    }
+    // Note: Tests for host-exec template substitution are now in the host-spawn crate.
+    // The following tests document the container detection behavior for locald.
 
     /// Documents the container detection heuristics.
     /// This test validates the logic without actually checking filesystem markers.

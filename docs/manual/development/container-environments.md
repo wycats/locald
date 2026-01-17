@@ -15,7 +15,7 @@ Modern immutable/atomic Linux distributions (Fedora Silverblue, Fedora Kinoite, 
 │   locald-shim (daemon)                                                  │
 │   ├── Listens on: ~/.locald/shim.sock                                   │
 │   ├── Manages: /etc/hosts, cgroups, privileged ports, cert trust        │
-│   └── Started via: locald shim serve                                    │
+│   └── Started via: locald-shim serve                                    │
 │                                                                         │
 │   [Socket is in $HOME, shared between host and container]               │
 │                                                                         │
@@ -67,10 +67,10 @@ Before using `locald` in a container, start the shim daemon on the host:
 
 ```bash
 # Option A: Run in foreground (good for testing)
-sudo locald shim serve
+sudo locald-shim serve
 
 # Option B: Run in background
-sudo locald shim serve &
+sudo locald-shim serve &
 ```
 
 The daemon listens on `~/.locald/shim.sock` which is accessible from inside Toolbx/Distrobox containers (because they share your home directory).
@@ -191,10 +191,10 @@ The `host_exec` template uses `{command}` as a placeholder for the actual comman
 # On the host (outside container):
 
 # Foreground mode (for debugging)
-sudo locald shim serve --foreground
+sudo locald-shim serve --foreground
 
 # Background mode (default)
-sudo locald shim serve
+sudo locald-shim serve
 ```
 
 ### Checking Daemon Status
@@ -229,7 +229,7 @@ This warning appears when `locald` can't connect to the shim daemon. To fix:
 1. **Start the daemon on the host**:
    ```bash
    # On the host (outside container)
-   sudo locald shim serve
+   sudo locald-shim serve
    ```
 
 2. **Verify the socket exists**:
@@ -261,7 +261,7 @@ If the socket exists but connections fail:
 3. **Restart the daemon**:
    ```bash
    rm ~/.locald/shim.sock
-   sudo locald shim serve
+   sudo locald-shim serve
    ```
 
 ### Permission Denied on Socket
@@ -282,7 +282,7 @@ shim_socket = "/run/user/1000/locald/shim.sock"
 
 Then ensure the daemon is started with the same override:
 ```bash
-sudo locald shim serve --socket /run/user/1000/locald/shim.sock
+sudo locald-shim serve --socket /run/user/1000/locald/shim.sock
 ```
 
 ### Services Can't Bind to Port 80/443
@@ -332,7 +332,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pkexec %h/.cargo/bin/locald shim serve --foreground
+ExecStart=/usr/bin/pkexec %h/.cargo/bin/locald-shim serve --foreground
 Restart=on-failure
 
 [Install]
@@ -352,7 +352,7 @@ systemctl --user enable --now locald-shim
 sudo locald admin setup
 
 # On host: start the daemon
-sudo locald shim serve &
+sudo locald-shim serve &
 
 # Inside container: verify connectivity
 toolbox run locald doctor
