@@ -116,11 +116,264 @@ pub fn apply_plugin(
     PluginRunner::new()?.apply(component_path, ctx, caps, spec)
 }
 
+/// Apply plugins to a configuration.
+///
+/// Discovers plugins from the project and user directories, runs detect/apply
+/// for each service, and merges the resulting plans into the config.
+///
+/// # Arguments
+/// * `config` - The loaded configuration to modify
+/// * `project_root` - Path to the project root directory
+///
+/// # Returns
+/// Ok(()) if plugins were processed (even if none matched).
+///
+/// Plugin discovery and application failures are logged as warnings but do not
+/// fail the overall operation - plugins are optional enhancements.
+pub fn apply_plugins_to_config(
+    config: &mut locald_core::config::LocaldConfig,
+    project_root: &Path,
+) -> Result<()> {
+    use tracing::{debug, info, warn};
+
+    // Discover plugins
+    let plugin_paths = discover_plugins(project_root);
+
+    if plugin_paths.is_empty() {
+        debug!("No plugins discovered");
+        return Ok(());
+    }
+
+    info!("Discovered {} plugin(s)", plugin_paths.len());
+
+    // Create plugin runner
+    let runner = match PluginRunner::new() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to create plugin runner: {}", e);
+            return Ok(()); // Continue without plugins
+        }
+    };
+
+    // Get host capabilities
+    let caps = default_capabilities();
+
+    // Create workspace context
+    let workspace_id = config
+        .project
+        .workspace
+        .clone()
+        .or_else(|| config.project.constellation.clone())
+        .unwrap_or_else(|| config.project.name.clone());
+
+    let ctx = WorkspaceContext {
+        workspace_id,
+        root: project_root.to_string_lossy().to_string(),
+    };
+
+    // Process each service through each plugin
+    let service_names: Vec<String> = config.services.keys().cloned().collect();
+
+    for service_name in &service_names {
+        let service_config = &config.services[service_name];
+
+        // Build ServiceSpec for this service
+        let spec = ServiceSpec {
+            name: service_name.clone(),
+            kind: classify_service_kind(service_config),
+            depends_on: service_config.depends_on().clone(),
+            config: extract_service_config_kvs(service_config),
+        };
+
+        // Try each plugin
+        for plugin_path in &plugin_paths {
+            let plugin_name = plugin_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+
+            // Detect if plugin applies
+            let detects = match runner.detect(plugin_path, ctx.clone(), spec.clone()) {
+                Ok(Some(reason)) => {
+                    info!(
+                        "Plugin '{}' applies to service '{}': {}",
+                        plugin_name, service_name, reason
+                    );
+                    true
+                }
+                Ok(None) => {
+                    debug!(
+                        "Plugin '{}' does not apply to service '{}'",
+                        plugin_name, service_name
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "Plugin '{}' detect failed for service '{}': {}",
+                        plugin_name, service_name, e
+                    );
+                    false
+                }
+            };
+
+            if !detects {
+                continue;
+            }
+
+            // Apply plugin
+            let plan_result =
+                match runner.apply(plugin_path, ctx.clone(), caps.clone(), spec.clone()) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(
+                            "Plugin '{}' apply failed for service '{}': {}",
+                            plugin_name, service_name, e
+                        );
+                        continue;
+                    }
+                };
+
+            // Process plan result
+            let plan = match plan_result {
+                Ok(plan) => plan,
+                Err(diag) => {
+                    warn!(
+                        "Plugin '{}' returned diagnostics for service '{}': errors={:?}, warnings={:?}",
+                        plugin_name, service_name, diag.errors, diag.warnings
+                    );
+                    continue;
+                }
+            };
+
+            // Apply plan to config
+            match apply_plan_to_config(config, &plan, &caps) {
+                Ok(outputs) => {
+                    info!(
+                        "Plugin '{}' applied successfully to service '{}' ({} steps, {} outputs)",
+                        plugin_name,
+                        service_name,
+                        plan.steps.len(),
+                        outputs.len()
+                    );
+                }
+                Err(diag) => {
+                    warn!(
+                        "Failed to apply plan from plugin '{}' for service '{}': {:?}",
+                        plugin_name, service_name, diag
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Classify a service's runtime kind for plugin detection.
+fn classify_service_kind(svc: &locald_core::config::ServiceConfig) -> String {
+    use locald_core::config::{ServiceConfig, TypedServiceConfig};
+
+    match svc {
+        ServiceConfig::Typed(TypedServiceConfig::Exec(_)) | ServiceConfig::Legacy(_) => {
+            "exec".to_string()
+        }
+        ServiceConfig::Typed(TypedServiceConfig::Worker(_)) => "worker".to_string(),
+        ServiceConfig::Typed(TypedServiceConfig::Container(_)) => "container".to_string(),
+        ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => "postgres".to_string(),
+        ServiceConfig::Typed(TypedServiceConfig::Site(_)) => "site".to_string(),
+    }
+}
+
+/// Extract service config as key-value pairs for plugins.
+fn extract_service_config_kvs(
+    svc: &locald_core::config::ServiceConfig,
+) -> Vec<(String, runner::Value)> {
+    use locald_core::config::{ServiceConfig, TypedServiceConfig};
+
+    let mut kvs = Vec::new();
+
+    // Extract common config
+    let env = svc.env();
+    for (k, v) in env {
+        kvs.push((format!("env.{k}"), runner::Value::Text(v.clone())));
+    }
+
+    if let Some(port) = svc.port() {
+        kvs.push(("port".to_string(), runner::Value::Unsigned(u64::from(port))));
+    }
+
+    // Extract type-specific config
+    match svc {
+        ServiceConfig::Typed(TypedServiceConfig::Exec(exec)) => {
+            if let Some(cmd) = &exec.command {
+                kvs.push(("command".to_string(), runner::Value::Text(cmd.clone())));
+            }
+            if let Some(wd) = &exec.workdir {
+                kvs.push(("workdir".to_string(), runner::Value::Text(wd.clone())));
+            }
+            if let Some(img) = &exec.image {
+                kvs.push(("image".to_string(), runner::Value::Text(img.clone())));
+            }
+        }
+        ServiceConfig::Typed(TypedServiceConfig::Worker(worker)) => {
+            if !worker.command.is_empty() {
+                kvs.push((
+                    "command".to_string(),
+                    runner::Value::Text(worker.command.clone()),
+                ));
+            }
+            if let Some(wd) = &worker.workdir {
+                kvs.push(("workdir".to_string(), runner::Value::Text(wd.clone())));
+            }
+        }
+        ServiceConfig::Typed(TypedServiceConfig::Container(container)) => {
+            if !container.image.is_empty() {
+                kvs.push((
+                    "image".to_string(),
+                    runner::Value::Text(container.image.clone()),
+                ));
+            }
+            if let Some(cmd) = &container.command {
+                kvs.push(("command".to_string(), runner::Value::Text(cmd.clone())));
+            }
+        }
+        ServiceConfig::Typed(TypedServiceConfig::Postgres(postgres)) => {
+            if let Some(ver) = &postgres.version {
+                kvs.push(("version".to_string(), runner::Value::Text(ver.clone())));
+            }
+        }
+        ServiceConfig::Typed(TypedServiceConfig::Site(site)) => {
+            if !site.path.is_empty() {
+                kvs.push(("path".to_string(), runner::Value::Text(site.path.clone())));
+            }
+        }
+        ServiceConfig::Legacy(exec) => {
+            if let Some(cmd) = &exec.command {
+                kvs.push(("command".to_string(), runner::Value::Text(cmd.clone())));
+            }
+            if let Some(wd) = &exec.workdir {
+                kvs.push(("workdir".to_string(), runner::Value::Text(wd.clone())));
+            }
+        }
+    }
+
+    kvs
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalized_plan_debug_json;
+    use super::{
+        apply_plugins_to_config, classify_service_kind, extract_service_config_kvs, runner,
+    };
     use crate::plugins::runner::{DeclareServiceOp, Expr, Op, Plan, Selector, Step, Value};
+    use locald_core::config::{
+        CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, PostgresServiceConfig,
+        ServiceConfig, SiteServiceConfig, TypedServiceConfig, WorkerServiceConfig,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn normalized_plan_debug_json_sorts_steps_needs_and_capabilities() {
@@ -197,5 +450,303 @@ mod tests {
         });
 
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn classify_service_kind_exec() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
+            common: CommonServiceConfig::default(),
+            command: Some("npm start".to_string()),
+            image: None,
+            container_port: None,
+            workdir: None,
+            build: None,
+        }));
+
+        assert_eq!(classify_service_kind(&config), "exec");
+    }
+
+    #[test]
+    fn classify_service_kind_worker() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+            common: CommonServiceConfig::default(),
+            command: "rake jobs:work".to_string(),
+            workdir: None,
+        }));
+
+        assert_eq!(classify_service_kind(&config), "worker");
+    }
+
+    #[test]
+    fn classify_service_kind_container() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Container(ContainerServiceConfig {
+            common: CommonServiceConfig::default(),
+            image: "redis:7".to_string(),
+            command: None,
+            container_port: None,
+            workdir: None,
+        }));
+
+        assert_eq!(classify_service_kind(&config), "container");
+    }
+
+    #[test]
+    fn classify_service_kind_postgres() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Postgres(PostgresServiceConfig {
+            common: CommonServiceConfig::default(),
+            version: Some("15".to_string()),
+        }));
+
+        assert_eq!(classify_service_kind(&config), "postgres");
+    }
+
+    #[test]
+    fn classify_service_kind_site() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Site(SiteServiceConfig {
+            common: CommonServiceConfig::default(),
+            path: "./dist".to_string(),
+            build: "npm run build".to_string(),
+            name: "docs".to_string(),
+        }));
+
+        assert_eq!(classify_service_kind(&config), "site");
+    }
+
+    #[test]
+    fn classify_service_kind_legacy() {
+        let config = ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig::default(),
+            command: Some("rails server".to_string()),
+            image: None,
+            container_port: None,
+            workdir: None,
+            build: None,
+        });
+
+        assert_eq!(classify_service_kind(&config), "exec");
+    }
+
+    #[test]
+    fn extract_service_config_kvs_env_vars() {
+        let mut env = HashMap::new();
+        env.insert("NODE_ENV".to_string(), "development".to_string());
+        env.insert("DEBUG".to_string(), "true".to_string());
+
+        let config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
+            common: CommonServiceConfig {
+                env,
+                ..CommonServiceConfig::default()
+            },
+            command: Some("npm start".to_string()),
+            image: None,
+            container_port: None,
+            workdir: None,
+            build: None,
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(kvs.iter().any(|(k, v)| k == "env.NODE_ENV"
+            && matches!(v, runner::Value::Text(s) if s == "development")));
+        assert!(
+            kvs.iter().any(
+                |(k, v)| k == "env.DEBUG" && matches!(v, runner::Value::Text(s) if s == "true")
+            )
+        );
+    }
+
+    #[test]
+    fn extract_service_config_kvs_port() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
+            common: CommonServiceConfig {
+                port: Some(3000),
+                ..CommonServiceConfig::default()
+            },
+            command: Some("npm start".to_string()),
+            image: None,
+            container_port: None,
+            workdir: None,
+            build: None,
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(
+            kvs.iter()
+                .any(|(k, v)| k == "port" && matches!(v, runner::Value::Unsigned(3000)))
+        );
+    }
+
+    #[test]
+    fn extract_service_config_kvs_exec_fields() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
+            common: CommonServiceConfig::default(),
+            command: Some("npm start".to_string()),
+            workdir: Some("./app".to_string()),
+            image: Some("node:18".to_string()),
+            container_port: None,
+            build: None,
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(kvs.iter().any(
+            |(k, v)| k == "command" && matches!(v, runner::Value::Text(s) if s == "npm start")
+        ));
+        assert!(kvs.iter().any(|(k, v)| k == "workdir"
+            && matches!(v, runner::Value::Text(s) if s == "./app")));
+        assert!(kvs.iter().any(|(k, v)| k == "image"
+            && matches!(v, runner::Value::Text(s) if s == "node:18")));
+    }
+
+    #[test]
+    fn extract_service_config_kvs_worker_fields() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+            common: CommonServiceConfig::default(),
+            command: "rake jobs:work".to_string(),
+            workdir: Some("./backend".to_string()),
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(
+            kvs.iter().any(|(k, v)| k == "command"
+                && matches!(v, runner::Value::Text(s) if s == "rake jobs:work"))
+        );
+        assert!(kvs.iter().any(
+            |(k, v)| k == "workdir" && matches!(v, runner::Value::Text(s) if s == "./backend")
+        ));
+    }
+
+    #[test]
+    fn extract_service_config_kvs_container_image() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Container(ContainerServiceConfig {
+            common: CommonServiceConfig::default(),
+            image: "redis:7".to_string(),
+            command: Some("redis-server --appendonly yes".to_string()),
+            container_port: None,
+            workdir: None,
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(kvs.iter().any(|(k, v)| k == "image"
+            && matches!(v, runner::Value::Text(s) if s == "redis:7")));
+        assert!(kvs.iter().any(|(k, v)| k == "command"
+            && matches!(v, runner::Value::Text(s) if s == "redis-server --appendonly yes")));
+    }
+
+    #[test]
+    fn extract_service_config_kvs_postgres_version() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Postgres(PostgresServiceConfig {
+            common: CommonServiceConfig::default(),
+            version: Some("15".to_string()),
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(
+            kvs.iter()
+                .any(|(k, v)| k == "version" && matches!(v, runner::Value::Text(s) if s == "15"))
+        );
+    }
+
+    #[test]
+    fn extract_service_config_kvs_site_path() {
+        let config = ServiceConfig::Typed(TypedServiceConfig::Site(SiteServiceConfig {
+            common: CommonServiceConfig::default(),
+            path: "./dist".to_string(),
+            build: "npm run build".to_string(),
+            name: "docs".to_string(),
+        }));
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(
+            kvs.iter()
+                .any(|(k, v)| k == "path" && matches!(v, runner::Value::Text(s) if s == "./dist"))
+        );
+    }
+
+    #[test]
+    fn extract_service_config_kvs_legacy_fields() {
+        let config = ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig::default(),
+            command: Some("rails server".to_string()),
+            workdir: Some("./api".to_string()),
+            image: None,
+            container_port: None,
+            build: None,
+        });
+
+        let kvs = extract_service_config_kvs(&config);
+
+        assert!(
+            kvs.iter().any(|(k, v)| k == "command"
+                && matches!(v, runner::Value::Text(s) if s == "rails server"))
+        );
+        assert!(kvs.iter().any(|(k, v)| k == "workdir"
+            && matches!(v, runner::Value::Text(s) if s == "./api")));
+    }
+
+    #[test]
+    fn apply_plugins_to_config_no_plugins() {
+        use locald_core::config::{LocaldConfig, ProjectConfig};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path();
+
+        let mut config = LocaldConfig {
+            project: ProjectConfig {
+                name: "test".to_string(),
+                workspace: None,
+                constellation: None,
+                domain: None,
+            },
+            plugins: HashMap::new(),
+            services: HashMap::new(),
+        };
+
+        let result = apply_plugins_to_config(&mut config, project_root);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn apply_plugins_to_config_unchanged_when_no_match() {
+        use locald_core::config::{LocaldConfig, ProjectConfig};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let project_root = temp_dir.path();
+
+        let mut config = LocaldConfig {
+            project: ProjectConfig {
+                name: "test".to_string(),
+                workspace: None,
+                constellation: None,
+                domain: None,
+            },
+            plugins: HashMap::new(),
+            services: HashMap::new(),
+        };
+
+        config.services.insert(
+            "web".to_string(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
+                common: CommonServiceConfig::default(),
+                command: Some("npm start".to_string()),
+                image: None,
+                container_port: None,
+                workdir: None,
+                build: None,
+            })),
+        );
+
+        let original_len = config.services.len();
+
+        let result = apply_plugins_to_config(&mut config, project_root);
+        assert!(result.is_ok());
+        assert_eq!(config.services.len(), original_len);
     }
 }

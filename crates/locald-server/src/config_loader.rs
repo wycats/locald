@@ -334,7 +334,11 @@ impl ConfigLoader {
 
         // Collect all layers in order: Upstream -> Project
         let mut all_layers = upstream_configs;
-        let LocaldConfig { project, services } = project_config;
+        let LocaldConfig {
+            project,
+            plugins: _,
+            services,
+        } = project_config;
         all_layers.push((
             LayerConfig {
                 project: Some(project),
@@ -630,6 +634,7 @@ impl ConfigLoader {
                 workspace: None,
                 constellation: None,
             },
+            plugins: std::collections::HashMap::new(),
             services,
         }
     }

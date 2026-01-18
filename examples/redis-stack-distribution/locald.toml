@@ -1,0 +1,13 @@
+# Project configuration for {{project_name}}
+# Generated from redis-stack distribution
+
+[project]
+name = "{{project_name}}"
+
+# Redis service using the redis plugin
+[[services]]
+name = "redis"
+kind = "redis"
+
+[services.redis.config]
+version = "{{redis_version}}"

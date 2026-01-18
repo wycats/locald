@@ -44,6 +44,9 @@ impl std::fmt::Display for LogStream {
 ///     health_status: HealthStatus::Healthy,
 ///     health_source: HealthSource::Http,
 ///     path: None,
+///     workspace: None,
+///     constellation: None,
+///     warnings: vec![],
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

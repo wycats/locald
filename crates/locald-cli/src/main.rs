@@ -38,6 +38,8 @@ mod client;
 mod container;
 mod crash;
 mod debug;
+#[cfg(feature = "experimental-plugins")]
+mod distribution;
 mod doctor;
 mod handlers;
 mod hints;
@@ -76,13 +78,35 @@ fn run_main(cli: cli::Cli) -> Result<()> {
     }
 
     // Skip verification for admin setup, as it's used to fix the shim
-    if !matches!(
+    #[cfg(feature = "experimental-plugins")]
+    let skip_verify = matches!(
         cli.command,
         cli::Commands::Admin {
             command: cli::AdminCommands::Setup(_)
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
-    ) {
+            | cli::Commands::Init { .. }
+            | cli::Commands::Plugin {
+                command: cli::PluginCommands::Create { .. }
+            }
+            | cli::Commands::Plugin {
+                command: cli::PluginCommands::Install { .. }
+            }
+            | cli::Commands::Distribution {
+                command: cli::DistributionCommands::Create { .. }
+            }
+    );
+    #[cfg(not(feature = "experimental-plugins"))]
+    let skip_verify = matches!(
+        cli.command,
+        cli::Commands::Admin {
+            command: cli::AdminCommands::Setup(_)
+        } | cli::Commands::Doctor { .. }
+            | cli::Commands::Surface { .. }
+            | cli::Commands::Init { .. }
+    );
+
+    if !skip_verify {
         utils::verify_shim();
     }
 

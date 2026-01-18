@@ -1,0 +1,38 @@
+# Redis Stack Distribution Manifest
+# This distribution bundles Redis plugin configuration for rapid project setup.
+
+[distribution]
+name = "redis-stack"
+version = "1.0.0"
+description = "Redis development stack with optional extras"
+license = "MIT"
+authors = ["locald contributors"]
+
+[compatibility]
+# Minimum locald version required to use this distribution
+locald_min = "0.2.0"
+
+[plugins]
+# Bundled plugins are included in the packages/ directory
+# For this example, we reference an installed plugin instead
+bundled = []
+
+# Remote plugins are fetched during initialization
+# For a real distribution, you would use actual URLs like:
+# remote = ["https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"]
+#
+# This example uses no remote plugins since we don't have a public plugin registry yet.
+# Users would install the redis-plugin locally before running `locald up`.
+remote = []
+
+[scaffold]
+# Template files use {{variable}} syntax for substitution
+templates = ["README.md.template"]
+
+# Static files are copied as-is
+files = [".gitignore"]
+
+# Variables that will be prompted during initialization
+[scaffold.variables]
+project_name = { prompt = "Project name", default = "my-redis-app" }
+redis_version = { prompt = "Redis version", default = "7" }
