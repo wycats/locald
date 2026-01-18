@@ -397,6 +397,41 @@ pub enum DistributionCommands {
     },
 }
 
+#[cfg(feature = "experimental-plugins")]
+#[derive(Subcommand)]
+pub enum DistributionCommands {
+    /// Create a distributable distribution archive (.locald-distribution)
+    Create {
+        /// Source directory containing distribution.toml [default: .]
+        #[arg(default_value = ".")]
+        source: std::path::PathBuf,
+
+        /// Output distribution path [default: {name}-{version}.locald-distribution]
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Manifest file path relative to source [default: distribution.toml]
+        #[arg(short, long)]
+        manifest: Option<std::path::PathBuf>,
+
+        /// Fetch and bundle remote plugins instead of keeping as references
+        #[arg(long)]
+        include_remote: bool,
+
+        /// Show what would be packaged without creating archive
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite existing output file
+        #[arg(long)]
+        force: bool,
+
+        /// Show detailed packaging steps
+        #[arg(short, long)]
+        verbose: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum SurfaceCommands {
     /// Print a machine-readable CLI surface manifest (JSON)
