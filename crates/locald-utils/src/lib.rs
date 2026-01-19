@@ -5,6 +5,8 @@ pub mod cert;
 /// Cgroup v2 helpers (Linux only).
 #[cfg(target_os = "linux")]
 pub mod cgroup;
+/// Container detection and host execution helpers.
+pub mod container;
 /// Port discovery utilities.
 pub mod discovery;
 /// Environment variable utilities.

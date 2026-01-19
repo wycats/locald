@@ -93,7 +93,7 @@ The shim daemon socket is not available. This is common inside containers when t
 
 **Fix**:
 
-1. Start the daemon on the host: `sudo locald shim serve`
+1. Start the daemon on the host: `sudo locald-shim serve`
 2. Or configure `host_exec` in your config to enable auto-start
 
 #### `socket.connection_failed`
@@ -103,7 +103,7 @@ The socket exists but connection failed.
 **Fix**:
 
 1. Check if the daemon is running: `cat ~/.locald/shim.pid`
-2. Restart the daemon: `rm ~/.locald/shim.sock && sudo locald shim serve`
+2. Restart the daemon: `rm ~/.locald/shim.sock && sudo locald-shim serve`
 
 #### `socket.permission_denied`
 
@@ -199,7 +199,7 @@ Example output in a container without shim daemon:
 │  ✗ socket.unavailable (critical)
 │    The shim daemon socket is not available.
 │    Start the daemon on your host:
-│      sudo locald shim serve
+│      sudo locald-shim serve
 │
 └  1 critical issue found
 ```

@@ -338,24 +338,14 @@ async fn async_main(
         match proxy.bind_http(80).await {
             Ok(l) => Some(l),
             Err(e) => {
-                if !config.server.fallback_ports {
-                    error!(
-                        "Failed to bind port 80: {e}. You may need to run `sudo locald admin setup` or configure `privileged_ports = false`."
-                    );
-                    // We return error here to stop startup if privileged ports are required but failed.
-                    return Err(e);
-                }
-                warn!("Failed to bind port 80: {e}. Trying fallback...");
-                None
+                error!(
+                    "Failed to bind port 80: {e}. Run `sudo locald admin setup` or use `locald --sandbox test up`."
+                );
+                return Err(e);
             }
         }
     } else {
-        None
-    };
-
-    let listener_http = if let Some(l) = listener_http {
-        Some(l)
-    } else if config.server.fallback_ports {
+        // Sandbox mode or privileged_ports disabled: use high ports
         match proxy.bind_http(8080).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -369,8 +359,6 @@ async fn async_main(
                 }
             }
         }
-    } else {
-        None
     };
 
     if let Some(l) = listener_http {
@@ -383,35 +371,38 @@ async fn async_main(
     }
 
     // Bind HTTPS
-    let mut listener_https: Option<std::net::TcpListener> = None;
-    if let Ok(port_str) = std::env::var("LOCALD_HTTPS_PORT") {
+    let listener_https: Option<std::net::TcpListener> = if let Ok(port_str) =
+        std::env::var("LOCALD_HTTPS_PORT")
+    {
         let port = port_str.parse::<u16>().unwrap_or(8443);
         info!("Binding HTTPS to configured port: {}", port);
         match proxy.bind_https(port).await {
-            Ok(l) => listener_https = Some(l),
-            Err(e) => error!("Failed to bind configured port {}: {}", port, e),
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!("Failed to bind configured port {}: {}", port, e);
+                None
+            }
         }
     } else if config.server.privileged_ports {
         match proxy.bind_https(443).await {
-            Ok(l) => listener_https = Some(l),
+            Ok(l) => Some(l),
             Err(e) => {
-                if !config.server.fallback_ports {
-                    error!(
-                        "Failed to bind port 443: {e}. You may need to run `sudo locald admin setup` or configure `privileged_ports = false`."
-                    );
-                    return Err(e);
-                }
-                warn!("Failed to bind port 443: {e}. Trying fallback...");
+                error!(
+                    "Failed to bind port 443: {e}. Run `sudo locald admin setup` or use `locald --sandbox test up`."
+                );
+                return Err(e);
             }
         }
-    }
-
-    if listener_https.is_none() && config.server.fallback_ports {
+    } else {
+        // Sandbox mode or privileged_ports disabled: use high ports
         match proxy.bind_https(8443).await {
-            Ok(l) => listener_https = Some(l),
-            Err(e) => error!("Failed to bind port 8443: {e}. HTTPS disabled."),
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!("Failed to bind port 8443: {e}. HTTPS disabled.");
+                None
+            }
         }
-    }
+    };
 
     if let Some(l) = listener_https {
         let proxy_clone = proxy.clone();

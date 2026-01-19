@@ -5,6 +5,7 @@ members = [
     "crates/locald-core",
     "crates/locald-shim",
     "crates/locald-builder",
+    "crates/host-spawn",
     "e2e/rust/locald-e2e",
     "examples/cnb-test/rust-extractor",
     "examples/oci-example",

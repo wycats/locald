@@ -10,8 +10,8 @@ use std::thread;
 fn locald() -> Command {
     let bin = assert_cmd::cargo::cargo_bin!("locald");
     let mut cmd = Command::new(bin);
-    // Skip shim verification in tests (we're testing CLI logic, not privileged setup)
-    cmd.env("LOCALD_SKIP_SHIM_CHECK", "1");
+    // Enable sandbox mode to skip shim verification in tests
+    cmd.env("LOCALD_SANDBOX_ACTIVE", "1");
     cmd
 }
 
@@ -32,7 +32,7 @@ fn plugin_install_project_copies_file_to_local_plugins_dir() {
 
     let installed = root
         .path()
-        .join(".local")
+        .join(".locald")
         .join("plugins")
         .join("redis.component.wasm");
 
@@ -60,7 +60,7 @@ fn plugin_install_project_sanitizes_name() {
 
     let installed = root
         .path()
-        .join(".local")
+        .join(".locald")
         .join("plugins")
         .join("foo-bar.wasm");
 
@@ -117,7 +117,7 @@ fn plugin_install_project_downloads_from_http_url() {
 
     let installed = root
         .path()
-        .join(".local")
+        .join(".locald")
         .join("plugins")
         .join("redis.component.wasm");
 
@@ -172,7 +172,8 @@ fn plugin_install_user_uses_xdg_data_home() {
     let mut cmd = locald();
     cmd.current_dir(root.path());
     cmd.env("XDG_DATA_HOME", &xdg_data);
-    cmd.args(["plugin", "install"]).arg(source.as_os_str());
+    cmd.args(["plugin", "install", "--user"])
+        .arg(source.as_os_str());
 
     cmd.assert().success();
 

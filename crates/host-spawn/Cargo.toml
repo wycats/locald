@@ -1,0 +1,19 @@
+[package]
+name = "host-spawn"
+version = "0.1.0"
+edition.workspace = true
+description = "Guest-to-host command execution for containerized environments"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+bon = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["process", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

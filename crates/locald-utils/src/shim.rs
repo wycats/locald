@@ -6,6 +6,45 @@ use tracing::{debug, info, warn};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+// ============================================================================
+// Shim Command Constants
+// ============================================================================
+//
+// The shim is a SEPARATE BINARY (`locald-shim`), not a subcommand of `locald`.
+// These constants ensure consistent command references throughout the codebase.
+
+/// The name of the shim binary.
+pub const SHIM_BINARY: &str = "locald-shim";
+
+/// The shim serve command (unprivileged form).
+pub const SHIM_SERVE_CMD: &str = "locald-shim serve";
+
+/// The shim serve command with sudo prefix.
+pub const SHIM_SERVE_SUDO: &str = "sudo locald-shim serve";
+
+/// The shim serve command with pkexec prefix (for GUI auth dialogs).
+pub const SHIM_SERVE_PKEXEC: &str = "pkexec locald-shim serve";
+
+/// Build a shim serve command with the specified args (e.g., "--foreground").
+pub fn shim_serve_with_args(args: &str) -> String {
+    if args.is_empty() {
+        SHIM_SERVE_CMD.to_string()
+    } else {
+        format!("{SHIM_SERVE_CMD} {args}")
+    }
+}
+
+/// Build a sudo shim serve command with the specified args.
+pub fn shim_serve_sudo_with_args(args: &str) -> String {
+    if args.is_empty() {
+        SHIM_SERVE_SUDO.to_string()
+    } else {
+        format!("{SHIM_SERVE_SUDO} {args}")
+    }
+}
+
+// ============================================================================
+
 /// Find the locald-shim binary and ensure it has the correct permissions.
 ///
 /// This is a convenience wrapper around `find` and `ensure_permissions_with_sudo`.
@@ -350,7 +389,7 @@ pub fn is_polkit_available() -> bool {
 /// Install the polkit policy file to enable GUI-based privilege escalation.
 ///
 /// This copies the policy file to `/usr/share/polkit-1/actions/` which allows
-/// users to use `pkexec locald shim serve` for a graphical authentication dialog
+/// users to use `pkexec locald-shim serve` for a graphical authentication dialog
 /// instead of requiring `sudo` in the terminal.
 ///
 /// # Requirements

@@ -111,19 +111,47 @@ User runs: locald up (inside container)
 │ existing    │  │                                          │
 │ shim,       │  │ 1. Use configured host_exec template     │
 │ proceed     │  │ 2. Auto-detect: flatpak-spawn, host-exec │
-│             │  │ 3. Fail with actionable message          │
+│             │  │ 3. Offer interactive setup (if TTY)      │
+│             │  │ 4. ERROR with actionable message         │
 └─────────────┘  └─────────────────┬────────────────────────┘
                                    │
                                    ▼
                  ┌─────────────────────────────────────────┐
-                 │ If all fail, print:                     │
+                 │ If all fail, ERROR (not warn):          │
                  │                                         │
-                 │ "Could not start host shim daemon.      │
-                 │  Please run on your host:               │
-                 │    sudo locald shim serve               │
+                 │ "✗ locald requires privileged helper    │
+                 │    access.                              │
                  │                                         │
-                 │  Or configure host_exec in config.toml" │
+                 │  To fix:                                │
+                 │    Container: flatpak-spawn --host      │
+                 │               pkexec locald-shim serve  │
+                 │    Direct:    sudo locald admin setup   │
+                 │                                         │
+                 │  To test without privileges:            │
+                 │    locald --sandbox test up             │
+                 │                                         │
+                 │  For diagnosis: locald doctor"          │
+                 │                                         │
+                 │ EXIT CODE: 1 (not continue)             │
                  └─────────────────────────────────────────┘
+```
+
+### Error-Not-Warning Policy
+
+**Critical design decision**: When privileged helper access is unavailable, `locald` **errors and exits** rather than continuing with a warning.
+
+**Rationale**:
+
+- Most core features (hosts sync, cgroup isolation, privileged ports) require the shim
+- Silent degradation leads to confusing "why doesn't X work?" experiences
+- Users deserve a clear signal that setup is incomplete
+- The sandbox mode (see RFC 0037) provides an explicit opt-in for unprivileged testing
+
+**The only way to run without privileges is sandbox mode**:
+
+```bash
+# This will work without any privileged setup
+locald --sandbox test up
 ```
 
 ### Manual Setup Options
@@ -134,10 +162,10 @@ When auto-start isn't available, users have two choices:
 
 ```bash
 # On host (outside container)
-sudo locald shim serve
+sudo locald-shim serve
 
 # This runs in foreground; daemon exits when you Ctrl-C
-# Or background it: sudo locald shim serve &
+# Or background it: sudo locald-shim serve &
 ```
 
 **Option 2: Systemd user service**
@@ -233,7 +261,7 @@ The shim startup uses the configured `host_exec` template or auto-detection:
 fn start_host_shim(config: &Config) -> Result<()> {
     // 1. Check for user-configured host_exec template
     if let Some(template) = &config.container.host_exec {
-        let cmd = template.replace("{command}", "pkexec locald shim serve");
+        let cmd = template.replace("{command}", "pkexec locald-shim serve");
         return run_shell_command(&cmd);
     }
 
@@ -256,7 +284,7 @@ fn start_host_shim(config: &Config) -> Result<()> {
     Err(anyhow!(
         "Could not start host shim daemon.\n\n\
          Please run on your host:\n\
-           sudo locald shim serve\n\n\
+           sudo locald-shim serve\n\n\
          Or configure host_exec in ~/.config/locald/config.toml:\n\
            [container]\n\
            host_exec = \"your-host-exec-command {{command}}\""
@@ -922,10 +950,10 @@ The daemon mode implementation is divided into phases:
 
 - [ ] Create polkit policy XML file
 - [ ] Install policy to `/usr/share/polkit-1/actions/` during `admin setup`
-- [ ] Use `pkexec locald shim serve` instead of `sudo`
+- [ ] Use `pkexec locald-shim serve` instead of `sudo`
 - [ ] Handle polkit not installed (fall back to sudo with warning)
 
-**Acceptance**: Running `flatpak-spawn --host pkexec locald shim serve` shows GUI dialog.
+**Acceptance**: Running `flatpak-spawn --host pkexec locald-shim serve` shows GUI dialog.
 
 ### Phase 4: Container Auto-Start
 
@@ -980,8 +1008,8 @@ fn test_daemon_lifecycle() {
 #[test]
 fn test_host_exec_template_substitution() {
     let template = "my-host-exec {command}";
-    let result = substitute_template(template, "pkexec locald shim serve");
-    assert_eq!(result, "my-host-exec pkexec locald shim serve");
+    let result = substitute_template(template, "pkexec locald-shim serve");
+    assert_eq!(result, "my-host-exec pkexec locald-shim serve");
 }
 ```
 
@@ -993,7 +1021,7 @@ fn test_host_exec_template_substitution() {
 | Toolbx                      | `locald up` auto-detects flatpak-spawn       |
 | Distrobox                   | `locald up` auto-detects distrobox-host-exec |
 | Custom host_exec config     | `locald up` uses configured template         |
-| Manual daemon start         | `sudo locald shim serve` on host works       |
+| Manual daemon start         | `sudo locald-shim serve` on host works       |
 | Container without host-exec | Graceful error with setup instructions       |
 | NFS home directory          | Socket falls back to `/run/user/$UID/`       |
 

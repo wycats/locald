@@ -78,21 +78,9 @@ impl ProxyManager {
     pub async fn bind_http(&self, port: u16) -> anyhow::Result<TcpListener> {
         // Port 0 means "pick any free port" and does not require privileges.
         let listener = if port != 0 && port < 1024 {
-            match crate::shim_client::bind_privileged_port(port).await {
-                Ok(l) => {
-                    l.set_nonblocking(true)?;
-                    TcpListener::from_std(l)?
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to acquire privileged port {} via shim: {}. Falling back to direct bind.",
-                        port,
-                        e
-                    );
-                    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-                    TcpListener::bind(addr).await?
-                }
-            }
+            let l = crate::shim_client::bind_privileged_port(port).await?;
+            l.set_nonblocking(true)?;
+            TcpListener::from_std(l)?
         } else {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             TcpListener::bind(addr).await?
@@ -113,18 +101,7 @@ impl ProxyManager {
     pub async fn bind_https(&self, port: u16) -> anyhow::Result<std::net::TcpListener> {
         // Port 0 means "pick any free port" and does not require privileges.
         let listener = if port != 0 && port < 1024 {
-            match crate::shim_client::bind_privileged_port(port).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to acquire privileged port {} via shim: {}. Falling back to direct bind.",
-                        port,
-                        e
-                    );
-                    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-                    tokio::net::TcpListener::bind(addr).await?.into_std()?
-                }
-            }
+            crate::shim_client::bind_privileged_port(port).await?
         } else {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             tokio::net::TcpListener::bind(addr).await?.into_std()?
