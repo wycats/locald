@@ -95,7 +95,7 @@
 						{#if viewMode === 'logs'}
 							<Terminal filter={serviceName} />
 						{:else}
-							<InteractiveTerminal serviceName={serviceName} />
+							<InteractiveTerminal {serviceName} />
 						{/if}
 					</div>
 				</div>

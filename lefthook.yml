@@ -3,11 +3,11 @@ pre-commit:
   commands:
     fmt:
       glob: "*.rs"
-      run: cargo fmt --all
+      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo fmt --all
       stage_fixed: true
     clippy:
       glob: "*.rs"
-      run: cargo clippy --workspace -- -D warnings
+      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo clippy --workspace -- -D warnings
     dashboard-lint:
       root: locald-dashboard
       glob: "*.{js,ts,svelte}"
@@ -18,7 +18,7 @@ pre-commit:
       run: pnpm check
     build-assets:
       glob: "locald-dashboard/**/*.{js,ts,svelte,html,css,json}"
-      run: cargo xtask assets build && git add crates/locald-server/src/assets
+      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo xtask assets build && git add crates/locald-server/src/assets
     sync-manifesto:
       glob: "docs/design/**/*.md"
       run: node ./locald-docs/scripts/sync-manifesto.mjs && git add locald-docs/src/content/docs/concepts locald-docs/src/content/docs/internals
@@ -27,7 +27,7 @@ pre-push:
   parallel: true
   commands:
     rust-checks:
-      run: cargo xtask check
+      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo xtask check
     docs-build:
       root: locald-docs
       run: CI=true pnpm install && pnpm build
