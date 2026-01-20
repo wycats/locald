@@ -35,6 +35,15 @@ macOS users depend on seamless local domains (e.g., `myapp.localhost`) and trust
 - **Certificate trust**: install/remove locald CA in the System Keychain.
 - **Root privileges**: single `locald admin setup` flow that configures setuid shim and trust prerequisites.
 
+## Daemon Lifecycle (macOS)
+
+If `locald` is “always-on” on Linux via `systemd`, the macOS equivalent should be a `launchd` agent/daemon.
+
+For launch readiness, it’s acceptable to start the daemon on first use, but the product intent should be:
+
+- a background daemon that stays up,
+- and a clear install path for enabling it at login.
+
 ## UX Expectations
 
 - `locald doctor` reports:
@@ -49,6 +58,7 @@ macOS users depend on seamless local domains (e.g., `myapp.localhost`) and trust
 2. **Compatibility**: minimum macOS versions supported for CA trust flow?
 3. **Revocation/cleanup**: how to ensure certs/hosts entries are removed cleanly?
 4. **Automation**: can `locald admin setup` safely prompt for Keychain access?
+5. **Always-on**: do we ship a `launchd` plist (install/enable/disable) for v1?
 
 ## References
 

@@ -22,7 +22,7 @@ The dashboard is central to user trust. Today, labels and actions are inconsiste
 
 - Establish canonical terms for common actions and states.
 - Align CLI help, docs, and UI labels.
-- Enable “pin and monitor” workflows for core services.
+- Define the distinction between “keep running”, “show logs”, and “hide/stop”.
 
 ## Non-Goals
 
@@ -33,23 +33,40 @@ The dashboard is central to user trust. Today, labels and actions are inconsiste
 
 - **Workspace**: A locald project directory with a `locald.toml`.
 - **Service**: A running unit (exec/container/worker/site).
-- **Monitor**: View logs + health + status in real time.
-- **Pin**: Persist a workspace or service in the dashboard quick list.
+- **Monitor**: Dashboard action that focuses the right-hand log/status panel on a selected service.
+- **Enabled**: Present in configuration and starts automatically (default mode).
+- **Disabled**: Present in configuration but does not start automatically.
+- **Pin**: “Keep it running” (the opposite of disabled). In the default mode, pinning is redundant with “enabled” and may be unnecessary.
+- **Favorite**: Persist a workspace or service in the dashboard quick list (UI-only; does not affect runtime).
 - **Cleanup**: Remove stopped services, cache, or temp resources.
 - **Stop**: Gracefully terminate services (preserve config/state).
 - **Remove**: Delete runtime artifacts (logs, temporary volumes, caches).
 
 ## UX Expectations
 
-- “Pin” always means “persist in UI list.”
-- “Monitor” is the action for the log/health view (CLI: `locald monitor`).
+- “Pin” always means “keep it running” (runtime policy), and is the opposite of “disabled”.
+- “Favorite” always means “persist in UI list” (UI only).
+- “Monitor” is the dashboard action for the focused log/health view.
 - “Cleanup” never implies deleting source files; only runtime artifacts.
+
+## Service State Model (Draft)
+
+We need to support both of these modes, but the vocabulary must remain consistent:
+
+1. **On-by-default** (preferred): services are enabled unless explicitly disabled.
+2. **Off-by-default** (optional): everything starts disabled; users “pin” workspaces/services to keep them running.
+
+If a service is **disabled**, its domain should still resolve. Requests should return a dedicated page that:
+
+- says the service is disabled,
+- offers an “Enable” action,
+- and then transitions directly into the existing build/start log UI.
 
 ## Open Questions
 
-1. Should “monitor” be the CLI command or a synonym for “logs”?
+1. Should the CLI expose “disable/enable” explicitly (vs only in the dashboard)?
 2. Should “cleanup” be a global action or per-workspace?
-3. How should pinned items sync between CLI and dashboard?
+3. How should “enabled/disabled” policy sync between CLI and dashboard?
 
 ## References
 

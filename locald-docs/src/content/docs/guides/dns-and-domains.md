@@ -5,6 +5,8 @@ description: How to configure local domains and SSL for your services.
 
 `locald` gives every workspace a stable domain and HTTPS by default, so your local environment behaves like production.
 
+> **Platform note**: The OS that runs your browser must trust the local CA. On WSL, that usually means using a browser inside WSL (WSLg). End-to-end Windows browser support is tracked as a roadmap item.
+
 ## Configuration
 
 To enable domain access, add a `domain` field to the `[project]` section of your `locald.toml`. If omitted, it defaults to `<project-name>.localhost`.
@@ -31,6 +33,8 @@ locald trust
 ```
 
 This command (which may require `sudo`) generates a root certificate and adds it to your system's trust store (and Firefox's if installed).
+
+For the Windows/WSL story, see [Windows & WSL (Roadmap)](/roadmap/windows-and-wsl/).
 
 ## Setup
 

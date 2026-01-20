@@ -7,6 +7,7 @@ This section captures future-looking ideas. These are **not** implemented yet an
 
 ## Proposals
 
+- [Windows & WSL](/roadmap/windows-and-wsl/)
 - [Docker Integration](/roadmap/docker-integration/)
 - [Advanced Proxying](/roadmap/advanced-proxying/)
 - [Constellations & Configuration](/roadmap/constellations-and-config/)

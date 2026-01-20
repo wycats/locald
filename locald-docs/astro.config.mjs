@@ -73,6 +73,7 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: "Overview", link: "/roadmap/" },
+            { label: "Windows & WSL", link: "/roadmap/windows-and-wsl/" },
             {
               label: "Docker Integration",
               link: "/roadmap/docker-integration/",
