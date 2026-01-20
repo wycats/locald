@@ -1,5 +1,7 @@
 # Architecture: Security
 
+> **Core focus**: Security work exists to keep the default workflow safe and predictable.
+
 This document describes the security architecture of `locald`, focusing on privilege separation and capability management.
 
 ## 1. Privilege Separation (The Shim)

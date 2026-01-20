@@ -4,6 +4,8 @@ title: Shim Management
 
 # Shim Management
 
+> **Core focus**: Shim management exists to keep domains/HTTPS working for the default flow.
+
 The `locald-shim` is a critical security component that allows `locald` to perform privileged operations (like binding ports < 1024 or creating containers) without running the entire daemon as root.
 
 ## The Golden Rule
@@ -22,7 +24,6 @@ When developing `locald`, you will frequently rebuild binaries using `cargo run`
 To ensure security and consistency, `locald` uses a **strict discovery logic**:
 
 1.  **Sibling Discovery**:
-
     - Checks for `locald-shim` in the same directory as the `locald` executable.
     - **Validation**: Checks if the file is setuid root.
     - **Behavior**: If valid, uses it.
@@ -152,6 +153,7 @@ Runs the shim as a persistent daemon that listens on a Unix socket for privilege
 - **Why**: Enables container environments (Toolbx, Distrobox) to delegate privileged operations to the host.
 
 **Lifecycle**:
+
 - **Idle timeout**: 5 minutes after last client disconnects
 - **Max lifetime**: 1 hour (ensures fresh binary after updates)
 - **Graceful shutdown**: Waits for in-flight requests before exiting
@@ -162,10 +164,10 @@ Runs the shim as a persistent daemon that listens on a Unix socket for privilege
 
 `locald` supports two privilege acquisition modes:
 
-| Mode     | Use Case                        | How It Works                              |
-| -------- | ------------------------------- | ----------------------------------------- |
-| `setuid` | Host environment                | Direct execution of setuid shim binary    |
-| `socket` | Container environment           | Communication via `~/.locald/shim.sock`   |
+| Mode     | Use Case              | How It Works                            |
+| -------- | --------------------- | --------------------------------------- |
+| `setuid` | Host environment      | Direct execution of setuid shim binary  |
+| `socket` | Container environment | Communication via `~/.locald/shim.sock` |
 
 **Socket-first Strategy**: When running, `locald` first tries to connect to the socket (for container support), then falls back to the setuid binary if not in a container.
 

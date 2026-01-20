@@ -1,5 +1,7 @@
 # Research: Docker Integration
 
+> **Status**: Internal research. Not part of the core user story.
+
 ## Goal
 
 Determine the best way to interact with the Docker Daemon from `locald-server`.

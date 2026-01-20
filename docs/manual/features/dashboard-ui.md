@@ -1,5 +1,7 @@
 # Dashboard UI
 
+> **Core focus**: The dashboard should make the primary loop obvious and fast.
+
 The `locald` dashboard provides a web-based interface for monitoring and controlling services.
 
 ## Serving

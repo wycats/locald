@@ -1,5 +1,7 @@
 # Design: Builtin Services
 
+> **Core focus**: These are optional services; do not block the main workflow.
+
 **Goal**: Provide "Heroku-style" managed data services (Postgres, Redis) that work out of the box without Docker, `mise`, or manual binary management.
 
 ## The Concept
@@ -11,13 +13,11 @@ We are **not** building a generic package manager (like `mise` or `asdf`). We ar
 ## Supported Services
 
 1.  **Postgres**:
-
     - **Implementation**: Use `postgresql_embedded` (Rust crate).
     - **Behavior**: Downloads a portable Postgres binary for the current OS/Arch, initializes the data directory, and manages the process.
     - **Why**: It's the standard relational DB. `postgresql_embedded` abstracts the cross-platform binary fetching perfectly.
 
 2.  **Redis**:
-
     - **Implementation**: Download static binaries from a trusted source (or build a small wrapper crate similar to `postgresql_embedded`).
     - **Why**: The standard K/V store.
 

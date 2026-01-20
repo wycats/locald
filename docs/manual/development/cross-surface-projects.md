@@ -1,5 +1,7 @@
 # Cross-Surface Projects (UI + Docs + Automation)
 
+> **Core focus**: Cross-surface work should reinforce the primary workflow and vocabulary.
+
 Cross-surface work is any change that touches more than one of:
 
 - the dashboard UI

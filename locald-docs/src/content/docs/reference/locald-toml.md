@@ -5,6 +5,8 @@ description: Complete specification for locald.toml.
 
 The `locald.toml` file is the source of truth for your project's configuration. It uses the [TOML](https://toml.io/) format.
 
+> **Core focus**: Start with a minimal `locald.toml` and the `locald up` workflow. Advanced and experimental sections are optional.
+
 ## `[project]` Section
 
 Defines global settings for the project.
@@ -136,7 +138,7 @@ health_check = "curl -f http://localhost:$PORT/health"
 
 **Status**: Experimental / Active Development.
 
-To run your service in a container using Cloud Native Buildpacks (CNB), add a `build` section. See [Cloud Native Builds](/reference/builds) for details.
+To run your service in a container using Cloud Native Buildpacks (CNB), add a `build` section. See [Cloud Native Builds](/experimental/builds/) for details.
 
 | Key          | Type         | Default             | Description                |
 | :----------- | :----------- | :------------------ | :------------------------- |

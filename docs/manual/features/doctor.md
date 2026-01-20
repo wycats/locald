@@ -1,5 +1,7 @@
 # locald doctor
 
+> **Core focus**: `locald doctor` is the primary recovery tool for the main workflow.
+
 The `locald doctor` command diagnoses host readiness for running `locald` and prints actionable fixes.
 
 ## Usage

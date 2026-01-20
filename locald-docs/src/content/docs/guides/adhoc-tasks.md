@@ -28,6 +28,8 @@ locald run api npm run migrate
 
 ## Ephemeral Containers
 
+> **Experimental**: Ephemeral containers are available only in nightly builds. See [Ephemeral Containers (Experimental)](/experimental/ephemeral-containers/).
+
 You can run OCI containers (like Docker images) directly with `locald`, without needing a separate Docker daemon running.
 
 ```bash

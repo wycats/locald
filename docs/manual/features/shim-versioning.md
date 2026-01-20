@@ -1,5 +1,7 @@
 # Shim Versioning & Upgrades
 
+> **Core focus**: Versioning should keep domains/HTTPS reliable for the default flow.
+
 `locald` uses a privilege separation architecture where a small, root-owned binary (`locald-shim`) handles privileged operations (like binding port 80) before handing control to the unprivileged `locald` daemon.
 
 To ensure security and stability, `locald` enforces a strict version handshake with the shim.

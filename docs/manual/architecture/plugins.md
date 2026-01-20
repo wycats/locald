@@ -1,5 +1,9 @@
 # Plugins
 
+> ⚠️ **Experimental**: Plugins are experimental and available only in nightly builds. Expect changes.
+>
+> **Core focus**: Plugins are optional and not part of the primary launch workflow.
+
 `locald` supports WASM component plugins that can inspect a service specification and produce a plan (an IR) describing operations to perform (e.g. pull an OCI image, allocate a port, declare a service).
 
 This is currently exposed as tooling via the CLI and is implemented in the daemon crate.

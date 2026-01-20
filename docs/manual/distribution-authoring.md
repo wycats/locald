@@ -1,5 +1,9 @@
 # Distribution Authoring Guide
 
+> ⚠️ **Experimental**: Distributions are experimental and available only in nightly builds. Expect changes.
+>
+> **Core focus**: Distributions are optional and not part of the primary launch story.
+
 This guide explains how to create, distribute, and use locald distributions.
 
 ## What is a Distribution?

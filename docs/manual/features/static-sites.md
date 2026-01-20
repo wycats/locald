@@ -1,5 +1,7 @@
 # Static Sites
 
+> **Core focus**: Static site support should not complicate the default workflow.
+
 `locald` includes a built-in static file server optimized for local development. It can serve static assets, documentation, or simple HTML sites directly from your project directory.
 
 ## Configuration

@@ -1,5 +1,7 @@
 # Service URLs & Routing
 
+> **Core focus**: Stable domains are a core promise of the launch story.
+
 `locald` automatically assigns URLs to your services based on your `locald.toml` configuration and the service type. This ensures that your development environment mirrors production routing conventions without manual configuration.
 
 ## The Project Domain

@@ -1,5 +1,7 @@
 # Research: CNB Integration
 
+> **Status**: Internal research. Not part of the core user story.
+
 ## Goal
 
 Integrate Cloud Native Buildpacks (CNB) into `locald` to provide a zero-config build system (`locald build`).

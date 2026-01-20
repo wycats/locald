@@ -3,7 +3,7 @@ title: DNS and Domains
 description: How to configure local domains and SSL for your services.
 ---
 
-`locald` allows you to access your services via custom domains (e.g., `https://my-app.localhost`) instead of remembering port numbers.
+`locald` gives every workspace a stable domain and HTTPS by default, so your local environment behaves like production.
 
 ## Configuration
 
@@ -18,13 +18,13 @@ domain = "my-app.localhost"
 web = { command = "npm start", port = 3000 }
 ```
 
-## Zero-Config SSL
+## Zero-Config HTTPS
 
-`locald` automatically generates valid SSL certificates for any `.localhost` domain. This allows you to develop with HTTPS enabled, mirroring production environments and enabling features like Secure Cookies and Service Workers.
+`locald` automatically generates valid SSL certificates for any `.localhost` domain. This lets you develop with HTTPS on day one, enabling features like Secure Cookies and Service Workers without extra setup.
 
 ### Trusting the CA
 
-To make your browser trust these certificates, you need to install the `locald` Root CA once:
+To make your browser trust these certificates, install the `locald` Root CA once:
 
 ```bash
 locald trust
@@ -36,7 +36,7 @@ This command (which may require `sudo`) generates a root certificate and adds it
 
 ### 1. Port Binding
 
-`locald` listens on ports 80 (HTTP) and 443 (HTTPS) to route traffic.
+`locald` listens on ports 80 (HTTP) and 443 (HTTPS) to route traffic using the same network shape you’ll use in production.
 On Linux, binding these low ports requires special permissions.
 
 To allow this without running `locald` as root, run:

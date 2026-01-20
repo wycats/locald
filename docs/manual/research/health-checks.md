@@ -1,5 +1,7 @@
 # Research: Smart Health Checks
 
+> **Status**: Internal research. Not part of the core user story.
+
 ## Goal
 
 Minimize user configuration for service readiness. Users should not have to write manual health checks for standard use cases.

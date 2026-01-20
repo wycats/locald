@@ -1,5 +1,7 @@
 # Validation (CI-Aligned)
 
+> **Core focus**: Validation safeguards the core user flow and minimal setup.
+
 This repo treats **CI as the contract**. If you’re validating a change for review, prefer running the same checks CI runs.
 
 ## One command (recommended)

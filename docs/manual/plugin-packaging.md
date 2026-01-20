@@ -1,5 +1,9 @@
 # Plugin Packaging Guide
 
+> ⚠️ **Experimental**: Plugins are experimental and available only in nightly builds. Expect changes.
+>
+> **Core focus**: Packaging is optional and not required for the default launch story.
+
 This guide explains how to create, distribute, and install locald plugins using the `.locald-package` format.
 
 ## Overview

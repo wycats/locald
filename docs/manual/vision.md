@@ -2,6 +2,16 @@
 
 `locald` treats the local machine as a first-class platform.
 
+## Core Value Prop (Launch Focus)
+
+Core story:
+
+- **`locald up`** brings services online with stable `*.localhost` domains.
+- **HTTPS** works out of the box once the shim is installed.
+- **Monitor + logs** are always available via CLI and dashboard.
+
+Everything else is optional or experimental and should not distract from this core loop.
+
 In practical terms, the project aims to make "clone → `locald up`" feel as coherent as a cloud platform:
 
 - Services are managed citizens (not random ports and terminals).

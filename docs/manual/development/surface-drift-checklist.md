@@ -1,6 +1,8 @@
 # Surface Drift Prevention Checklist
 
-This checklist is the lightweight “muscle memory” for keeping the *taught surface* coherent.
+> **Core focus**: Use this to keep docs and UI aligned with the core workflow.
+
+This checklist is the lightweight “muscle memory” for keeping the _taught surface_ coherent.
 
 Use it whenever a PR changes any user-facing behavior, wording, or CLI surface.
 
