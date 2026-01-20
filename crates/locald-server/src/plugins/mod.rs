@@ -704,6 +704,7 @@ mod tests {
                 constellation: None,
                 domain: None,
             },
+            plugins: HashMap::new(),
             services: HashMap::new(),
         };
 
@@ -726,6 +727,7 @@ mod tests {
                 constellation: None,
                 domain: None,
             },
+            plugins: HashMap::new(),
             services: HashMap::new(),
         };
 

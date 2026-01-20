@@ -52,7 +52,35 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize a new locald project
-    Init,
+    Init {
+        /// Initialize from a distribution archive (local path or URL)
+        #[arg(long = "from-distribution")]
+        from_distribution: Option<String>,
+
+        /// Project name (overrides prompt/default when using --from-distribution)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Target directory (default: `./<project_name>`)
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+
+        /// Skip scaffold files (only install plugins + locald.toml)
+        #[arg(long)]
+        no_scaffold: bool,
+
+        /// Use only bundled plugins, skip remote fetches
+        #[arg(long)]
+        offline: bool,
+
+        /// Accept all defaults without prompting
+        #[arg(short, long)]
+        yes: bool,
+
+        /// Show detailed initialization steps
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Build a project using Cloud Native Buildpacks (nightly only)
     #[cfg(feature = "experimental-cnb")]
     Build {
@@ -200,6 +228,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: PluginCommands,
     },
+
+    /// Manage distributions (nightly only)
+    #[cfg(feature = "experimental-plugins")]
+    Distribution {
+        #[command(subcommand)]
+        command: DistributionCommands,
+    },
+
     /// Serve a directory via HTTP
     Serve {
         /// Path to the directory to serve (default: current directory)
@@ -311,6 +347,41 @@ pub enum PluginCommands {
         /// Manifest file path relative to source [default: manifest.toml]
         #[arg(short, long)]
         manifest: Option<std::path::PathBuf>,
+
+        /// Show what would be packaged without creating archive
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite existing output file
+        #[arg(long)]
+        force: bool,
+
+        /// Show detailed packaging steps
+        #[arg(short, long)]
+        verbose: bool,
+    },
+}
+
+#[cfg(feature = "experimental-plugins")]
+#[derive(Subcommand)]
+pub enum DistributionCommands {
+    /// Create a distributable distribution archive (.locald-distribution)
+    Create {
+        /// Source directory containing distribution.toml [default: .]
+        #[arg(default_value = ".")]
+        source: std::path::PathBuf,
+
+        /// Output distribution path [default: {name}-{version}.locald-distribution]
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Manifest file path relative to source [default: distribution.toml]
+        #[arg(short, long)]
+        manifest: Option<std::path::PathBuf>,
+
+        /// Fetch and bundle remote plugins instead of keeping as references
+        #[arg(long)]
+        include_remote: bool,
 
         /// Show what would be packaged without creating archive
         #[arg(long)]

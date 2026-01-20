@@ -26,6 +26,7 @@ fn load_or_create_config() -> Result<(std::path::PathBuf, LocaldConfig)> {
                 workspace: None,
                 constellation: None,
             },
+            plugins: HashMap::new(),
             services: HashMap::new(),
         }
     };

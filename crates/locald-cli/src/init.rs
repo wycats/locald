@@ -110,6 +110,7 @@ pub fn run() -> Result<()> {
             workspace: None,
             constellation: None,
         },
+        plugins: std::collections::HashMap::new(),
         services,
     };
 

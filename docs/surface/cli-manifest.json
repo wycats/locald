@@ -915,8 +915,40 @@
         "hidden": false,
         "args": [
           {
+            "long": "from-distribution",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "help",
             "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "name",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "no-scaffold",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "offline",
+            "short": null,
             "aliases": [],
             "global": false,
             "hidden": false,
@@ -927,6 +959,30 @@
             "short": null,
             "aliases": [],
             "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "target",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "verbose",
+            "short": "v",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "yes",
+            "short": "y",
+            "aliases": [],
+            "global": false,
             "hidden": false,
             "positional": false
           }

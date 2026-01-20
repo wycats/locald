@@ -5,23 +5,58 @@ use std::collections::HashSet;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
-#[cfg(feature = "experimental-plugins")]
-use crate::cli::PluginCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
     RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
+#[cfg(feature = "experimental-plugins")]
+use crate::cli::{DistributionCommands, PluginCommands};
 #[cfg(feature = "experimental-containers")]
 use crate::container;
-#[cfg(feature = "experimental-plugins")]
-use crate::plugin;
 use crate::{
     client, debug, doctor, history, init, monitor, run, service, style, trust, try_cmd, utils,
 };
+#[cfg(feature = "experimental-plugins")]
+use crate::{distribution, plugin};
 
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        Commands::Init => {
+        Commands::Init {
+            from_distribution,
+            name,
+            target,
+            no_scaffold,
+            offline,
+            yes,
+            verbose,
+        } => {
+            #[cfg(feature = "experimental-plugins")]
+            if let Some(source) = from_distribution {
+                if let Err(e) = distribution::init_from_distribution(
+                    source,
+                    name.as_deref(),
+                    target.as_deref(),
+                    *no_scaffold,
+                    *offline,
+                    *yes,
+                    *verbose,
+                ) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            #[cfg(not(feature = "experimental-plugins"))]
+            {
+                // Silence unused warnings when feature is disabled
+                let _ = (name, target, no_scaffold, offline, yes, verbose);
+                if from_distribution.is_some() {
+                    eprintln!(
+                        "Error: --from-distribution requires the experimental-plugins feature"
+                    );
+                    std::process::exit(1);
+                }
+            }
             init::run()?;
         }
         #[cfg(feature = "experimental-cnb")]
@@ -1100,6 +1135,33 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+
+        #[cfg(feature = "experimental-plugins")]
+        Commands::Distribution { command } => match command {
+            DistributionCommands::Create {
+                source,
+                output,
+                manifest,
+                include_remote,
+                dry_run,
+                force,
+                verbose,
+            } => {
+                if let Err(e) = distribution::create(
+                    source,
+                    output.as_deref(),
+                    manifest.as_deref(),
+                    *include_remote,
+                    *dry_run,
+                    *force,
+                    *verbose,
+                ) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        },
+
         Commands::Serve {
             path,
             port,

@@ -703,6 +703,377 @@ If a package with the same name and version is already installed, the command su
 ✓ redis-plugin v1.0.0 already installed
 ```
 
+### 3.14 Distribution Format (`.locald-distribution`)
+
+This section defines the distribution format for bundling plugins with project configuration (Phase 29.3). Distributions enable "clone → locald up" workflows for teams by packaging both plugins and opinionated project setup.
+
+#### 3.14.1 Concept: Packages vs Distributions
+
+| Concept          | Purpose                | Contains                    | Installed To          |
+| ---------------- | ---------------------- | --------------------------- | --------------------- |
+| **Package**      | Single plugin delivery | 1 WASM + assets             | Plugin directory      |
+| **Distribution** | Project bootstrap kit  | N packages + project config | New project directory |
+
+A **distribution** answers: "How do I set up a new project that uses your plugin?" It bundles:
+
+- One or more `.locald-package` files (or remote refs)
+- A starter `locald.toml` with service definitions
+- Optional project scaffolding (templates, example code)
+
+#### 3.14.2 Archive Structure
+
+A `.locald-distribution` file is a **gzip-compressed tar archive** with the following internal structure:
+
+```
+redis-stack-1.0.0.locald-distribution
+├── distribution.toml         # Distribution metadata (required)
+├── locald.toml               # Project config template (required)
+├── packages/                 # Bundled plugin packages (optional)
+│   ├── redis-plugin-1.0.0.locald-package
+│   └── postgres-plugin-2.0.0.locald-package
+└── scaffold/                 # Project scaffolding (optional)
+    ├── .gitignore
+    ├── README.md.template
+    └── docker-compose.yml
+```
+
+**Rationale**: Distributions extend the package archive format, adding project-level configuration and optional bundled packages.
+
+#### 3.14.3 Distribution Manifest (`distribution.toml`)
+
+```toml
+[distribution]
+name = "redis-stack"                        # Required: lowercase alphanumeric + hyphens
+version = "1.0.0"                           # Required: semver
+description = "Redis + Postgres dev stack"  # Optional: human-readable description
+license = "MIT"                             # Optional: SPDX license identifier
+repository = "https://github.com/..."       # Optional: source repository URL
+authors = ["Name <email>"]                  # Optional: list of authors
+
+[compatibility]
+locald_min = "0.2.0"                        # Optional: minimum locald version
+
+[plugins]
+# Bundled plugins (files in packages/ directory)
+bundled = [
+    "redis-plugin-1.0.0.locald-package",
+    "postgres-plugin-2.0.0.locald-package"
+]
+
+# Remote plugins (fetched during init)
+remote = [
+    "https://plugins.locald.dev/caddy-plugin-1.0.0.locald-package",
+    { url = "https://internal.company.com/custom-plugin.locald-package", sha256 = "abc123..." }
+]
+
+[scaffold]
+# Template files to render (support variable substitution)
+templates = ["README.md.template"]
+
+# Files to copy as-is
+files = [".gitignore", "docker-compose.yml"]
+
+# Variables available in templates
+[scaffold.variables]
+project_name = { prompt = "Project name", default = "my-project" }
+database_name = { prompt = "Database name", default = "app_development" }
+```
+
+##### Field Semantics
+
+- **`distribution.name`**: Unique identifier. Must match regex `^[a-z][a-z0-9-]*$`. Maximum 64 characters.
+- **`distribution.version`**: Semantic versioning (MAJOR.MINOR.PATCH).
+- **`compatibility.locald_min`**: If present, `locald init` rejects if current version is lower.
+- **`plugins.bundled`**: Relative paths to `.locald-package` files within `packages/` directory.
+- **`plugins.remote`**: URLs to fetch during init. Supports string URLs or objects with `url` and optional `sha256` checksum.
+- **`scaffold.templates`**: Files in `scaffold/` to process with variable substitution. Output removes `.template` suffix.
+- **`scaffold.files`**: Files in `scaffold/` to copy without modification.
+- **`scaffold.variables`**: User-prompted variables for template rendering.
+
+#### 3.14.4 Project Config Template (`locald.toml`)
+
+The `locald.toml` included in a distribution serves as the starter project configuration:
+
+```toml
+# Example: locald.toml in redis-stack distribution
+
+[project]
+name = "{{project_name}}"    # Variable substituted during init
+
+[[services]]
+name = "redis"
+kind = "redis"
+
+[[services]]
+name = "db"
+kind = "postgres"
+config.database = "{{database_name}}"
+```
+
+**Template syntax**: Variables use `{{variable_name}}` syntax, matching keys from `scaffold.variables`.
+
+#### 3.14.5 The `locald init --from-distribution` Command
+
+##### CLI Interface
+
+```
+locald init --from-distribution <SOURCE> [OPTIONS]
+
+Arguments:
+  <SOURCE>  Local path or URL to .locald-distribution
+
+Options:
+  --name <NAME>           Project name (overrides prompt/default)
+  --target <DIR>          Target directory [default: ./<project_name>]
+  --no-scaffold           Skip scaffold files (only install plugins + locald.toml)
+  --offline               Use only bundled plugins, skip remote fetches
+  --yes                   Accept all defaults without prompting
+  -v, --verbose           Show detailed initialization steps
+```
+
+##### Initialization Pipeline
+
+**Phase 1 - Distribution Extraction**:
+
+1. Download distribution (if URL) to temp directory
+2. Extract gzip-compressed tar archive
+3. Parse and validate `distribution.toml`
+
+**Phase 2 - Compatibility Check**:
+
+1. Verify locald version meets `compatibility.locald_min`
+2. Fail with actionable message if incompatible
+
+**Phase 3 - Variable Collection**:
+
+1. For each variable in `scaffold.variables`:
+   - If `--yes` flag, use default value
+   - If variable provided via CLI (e.g., `--name`), use that
+   - Otherwise, prompt user with configured prompt text
+2. Validate all required variables are set
+
+**Phase 4 - Target Directory Setup**:
+
+1. Create target directory (default: `./<project_name>`)
+2. Fail if directory exists and is non-empty (unless `--force`)
+3. Initialize as locald project
+
+**Phase 5 - Plugin Installation**:
+
+1. For each plugin in `plugins.bundled`:
+   - Extract from `packages/` and install to `.locald/plugins/`
+2. For each plugin in `plugins.remote` (unless `--offline`):
+   - Fetch from URL
+   - Verify checksum if provided
+   - Install to `.locald/plugins/`
+
+**Phase 6 - Config Generation**:
+
+1. Process `locald.toml` with collected variables
+2. Write to `{target}/locald.toml`
+
+**Phase 7 - Scaffold Generation**:
+
+1. For each file in `scaffold.templates`:
+   - Process with variable substitution
+   - Write to target (without `.template` suffix)
+2. For each file in `scaffold.files`:
+   - Copy to target preserving relative path
+
+##### Error Handling
+
+| Scenario               | Error Message                                                               |
+| ---------------------- | --------------------------------------------------------------------------- |
+| Source not found       | `Error: Distribution not found: '{path}'`                                   |
+| Invalid archive        | `Error: '{path}' is not a valid .locald-distribution archive`               |
+| Missing manifest       | `Error: Distribution missing distribution.toml`                             |
+| Version mismatch       | `Error: Distribution requires locald >= {min}, current is {current}`        |
+| Directory exists       | `Error: Target directory '{dir}' already exists (use --force to overwrite)` |
+| Remote fetch failed    | `Error: Failed to fetch remote plugin: {url} ({reason})`                    |
+| Checksum mismatch      | `Error: Checksum mismatch for {url}: expected {expected}, got {actual}`     |
+| Missing bundled plugin | `Error: Bundled plugin not found: {name}`                                   |
+
+##### Output Format
+
+**Interactive mode**:
+
+```
+Initializing from redis-stack v1.0.0
+
+? Project name: my-redis-app
+? Database name: [app_development]
+
+→ Creating project directory: ./my-redis-app
+→ Installing plugins...
+   ✓ redis-plugin v1.0.0
+   ✓ postgres-plugin v2.0.0
+   ⚡ Fetching caddy-plugin v1.0.0...
+   ✓ caddy-plugin v1.0.0
+→ Generating configuration...
+   ✓ locald.toml
+   ✓ README.md
+   ✓ .gitignore
+→ Done!
+
+  Next steps:
+    cd my-redis-app
+    locald up
+```
+
+**Non-interactive mode** (`--yes`):
+
+```
+→ Initializing from redis-stack v1.0.0 with defaults
+→ Creating project directory: ./my-project
+→ Installing 3 plugins...
+→ Generating 3 scaffold files...
+→ Done!
+```
+
+#### 3.14.6 Remote Package References in `locald.toml`
+
+Projects can reference remote plugins directly in `locald.toml`, enabling dependency resolution without pre-installation.
+
+##### Schema Extension
+
+```toml
+[project]
+name = "my-app"
+
+# Plugin sources (processed before service resolution)
+[plugins]
+# Simple URL reference
+redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+
+# URL with checksum verification
+postgres = { url = "https://plugins.locald.dev/postgres-plugin-2.0.0.locald-package", sha256 = "abc123..." }
+
+# Local path reference (useful for development)
+custom = { path = "../my-custom-plugin/target/plugin.wasm" }
+
+# Installed plugin (explicit, optional—installed plugins are discovered automatically)
+# sidekiq = { installed = "sidekiq-plugin" }
+
+[[services]]
+name = "redis"
+kind = "redis"
+
+[[services]]
+name = "db"
+kind = "postgres"
+```
+
+##### Resolution Order
+
+When `locald up` starts, plugin resolution follows this order:
+
+1. **Installed plugins**: Scan `.locald/plugins/` and user plugin directory
+2. **Path references**: Load WASM from specified local path
+3. **Remote references**: Fetch, verify, and cache remote packages
+
+##### Remote Plugin Caching
+
+Remote plugins are cached to avoid repeated downloads:
+
+- **Cache location**: `$XDG_CACHE_HOME/locald/plugins/` (typically `~/.cache/locald/plugins/`)
+- **Cache key**: URL + SHA256 (if provided) or URL hash + mtime from HTTP headers
+- **Cache invalidation**: `locald plugin cache clear` or automatic on checksum mismatch
+
+##### Security Model
+
+Remote plugin references inherit the same security model as `locald plugin install`:
+
+```
+$ locald up
+→ Fetching remote plugin: https://plugins.locald.dev/redis-plugin-1.0.0.locald-package
+⚠ Warning: First-time fetch of unsigned remote plugin.
+  Plugins can request capabilities that affect your system.
+  Only use plugins from sources you trust.
+
+  Add sha256 checksum to suppress this warning:
+    postgres = { url = "...", sha256 = "abc123..." }
+
+Continue? [y/N]
+```
+
+**Trust once, verify always**: After first approval, the plugin URL+checksum is recorded in `.locald/trust.toml`. Future fetches of the same URL with matching checksum proceed without prompting.
+
+##### Offline Mode
+
+`locald up --offline` skips remote plugin fetches and uses only cached or installed plugins:
+
+```
+$ locald up --offline
+→ Using cached plugins only
+   ✓ redis-plugin (cached)
+   ✗ postgres-plugin (not cached, skipping)
+⚠ Warning: 1 remote plugin unavailable in offline mode
+```
+
+#### 3.14.7 Distribution Creation
+
+`locald distribution create` bundles plugins and configuration into a distributable archive.
+
+##### CLI Interface
+
+```
+locald distribution create [SOURCE] [OPTIONS]
+
+Arguments:
+  [SOURCE]  Source directory containing distribution.toml [default: .]
+
+Options:
+  -o, --output <FILE>     Output path [default: {name}-{version}.locald-distribution]
+  -m, --manifest <FILE>   Manifest path relative to SOURCE [default: distribution.toml]
+      --include-remote    Fetch and bundle remote plugins instead of keeping as references
+      --dry-run           Show what would be packaged without creating archive
+      --force             Overwrite existing output file
+  -v, --verbose           Show detailed packaging steps
+```
+
+##### Validation Pipeline
+
+**Phase 1 - Manifest Validation**:
+
+1. Parse and validate `distribution.toml`
+2. Verify `locald.toml` exists
+
+**Phase 2 - Plugin Resolution**:
+
+1. For each bundled plugin: verify file exists in `packages/`
+2. For each remote plugin: validate URL format
+3. If `--include-remote`: fetch and add to `packages/`
+
+**Phase 3 - Scaffold Validation**:
+
+1. Verify all template files exist in `scaffold/`
+2. Verify all static files exist in `scaffold/`
+3. Validate template syntax (balanced `{{` and `}}`)
+
+**Phase 4 - Archive Creation**:
+
+1. Create tar archive with: `distribution.toml`, `locald.toml`, `packages/**`, `scaffold/**`
+2. Gzip compress
+3. Write atomically to output path
+
+##### Output Format
+
+```
+Creating distribution from ./redis-stack
+
+✓ Validated manifest (redis-stack v1.0.0)
+✓ Found 2 bundled plugins (1.2 MB)
+✓ Validated 2 remote plugin URLs
+✓ Processed locald.toml (2 services)
+✓ Collected 3 scaffold files
+✓ Created archive (compressed: 1.1 MB)
+
+→ Distribution created: redis-stack-1.0.0.locald-distribution
+
+  Initialize with:
+    locald init --from-distribution redis-stack-1.0.0.locald-distribution
+```
+
 ## 4. Implementation Plan (Stage 2)
 
 ### Phase 29.1 (Plugin Mechanism) ✅
@@ -715,21 +1086,27 @@ If a package with the same name and version is already installed, the command su
 - [x] Create example `redis` plugin.
 - [x] Add conformance fixture suite for host.
 
-### Phase 29.2 (Packaging)
+### Phase 29.2 (Packaging) ✅
 
-- [ ] Define `manifest.toml` schema and parser.
-- [ ] Implement `locald package create` command.
-- [ ] Implement `locald package install` command.
-- [ ] Add compatibility checking (locald version, IR version).
-- [ ] Add capability warning at install time.
-- [ ] Update redis-plugin example with manifest.
-- [ ] Document packaging workflow for plugin authors.
+- [x] Define `manifest.toml` schema and parser.
+- [x] Implement `locald package create` command.
+- [x] Implement `locald package install` command.
+- [x] Add compatibility checking (locald version, IR version).
+- [x] Add capability warning at install time.
+- [x] Update redis-plugin example with manifest.
+- [x] Document packaging workflow for plugin authors.
 
 ### Phase 29.3 (Distributions)
 
-- [ ] Define distribution manifest format.
-- [ ] Implement `locald init --from-package`.
-- [ ] Support remote package references in `locald.toml`.
+- [ ] Define `distribution.toml` schema and parser (3.14.3).
+- [ ] Implement distribution archive creation with `locald distribution create` (3.14.7).
+- [ ] Implement `locald init --from-distribution` command (3.14.5).
+- [ ] Add template variable substitution for `locald.toml` and scaffold files.
+- [ ] Extend `locald.toml` schema for `[plugins]` section with remote refs (3.14.6).
+- [ ] Implement remote plugin fetching and caching during `locald up`.
+- [ ] Add checksum verification and trust model (`.locald/trust.toml`).
+- [ ] Create example `redis-stack` distribution for dogfooding.
+- [ ] Document distribution authoring workflow.
 
 ## 5. Context Updates (Stage 3)
 

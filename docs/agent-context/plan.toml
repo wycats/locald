@@ -1256,7 +1256,7 @@ aliases = ["29.1"]
 [[epochs.phases.tasks]]
 id = "29.2"
 label = "Packaging: Support `locald package /path/to/customizations` to create distributable bundles."
-status = "complete"
+status = "completed"
 ulid = "01KEX4X98ZHY91RZMG0BDHNAZ0"
 slug = "29.2"
 aliases = ["29.2"]

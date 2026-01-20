@@ -23,6 +23,9 @@ use std::collections::HashMap;
 /// [project]
 /// name = "my-app"
 ///
+/// [plugins]
+/// redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+///
 /// [services.web]
 /// command = "npm start"
 /// ```
@@ -30,9 +33,94 @@ use std::collections::HashMap;
 pub struct LocaldConfig {
     /// Project-level configuration.
     pub project: ProjectConfig,
+    /// Plugin sources for remote or local plugins.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub plugins: HashMap<String, PluginSource>,
     /// Service definitions for the project.
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
+}
+
+/// A plugin source reference in locald.toml.
+///
+/// # Example
+/// ```toml
+/// [plugins]
+/// # Simple URL reference
+/// redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+///
+/// # URL with checksum verification
+/// postgres = { url = "https://plugins.locald.dev/postgres-plugin.locald-package", sha256 = "abc123..." }
+///
+/// # Local path reference (useful for development)
+/// custom = { path = "../my-custom-plugin/target/plugin.wasm" }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PluginSource {
+    /// Simple URL string.
+    Url(String),
+
+    /// URL with optional checksum.
+    Remote {
+        /// The URL to fetch the package from.
+        url: String,
+        /// SHA-256 checksum of the package.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+
+    /// Local path reference.
+    Path {
+        /// Path to the plugin WASM file or package.
+        path: String,
+    },
+
+    /// Reference to an installed plugin (explicit, usually auto-discovered).
+    Installed {
+        /// Name of the installed plugin.
+        installed: String,
+    },
+}
+
+impl PluginSource {
+    /// Check if this is a remote URL source.
+    pub const fn is_remote(&self) -> bool {
+        matches!(self, Self::Url(_) | Self::Remote { .. })
+    }
+
+    /// Get the URL if this is a remote source.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Url(u) => Some(u),
+            Self::Remote { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Get the checksum if present.
+    pub fn checksum(&self) -> Option<&str> {
+        match self {
+            Self::Remote { sha256, .. } => sha256.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Get the local path if this is a path source.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Path { path } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Get the installed plugin name if this is an installed source.
+    pub fn installed(&self) -> Option<&str> {
+        match self {
+            Self::Installed { installed } => Some(installed),
+            _ => None,
+        }
+    }
 }
 
 /// Configuration specific to the project identity.
@@ -385,6 +473,7 @@ mod tests {
                 workspace: None,
                 constellation: None,
             },
+            plugins: HashMap::new(),
             services: HashMap::from([("web".to_string(), service_config)]),
         };
 
@@ -450,6 +539,78 @@ health_check = "test -f ready"
         } else {
             panic!("Expected Probe config");
         }
+    }
+
+    #[test]
+    fn test_plugin_source_url() {
+        let toml = r#"
+[project]
+name = "plugin-test"
+
+[plugins]
+redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+"#;
+        let config: LocaldConfig = toml::from_str(toml).unwrap();
+        let plugin = config.plugins.get("redis").unwrap();
+
+        assert!(plugin.is_remote());
+        assert_eq!(
+            plugin.url(),
+            Some("https://plugins.locald.dev/redis-plugin-1.0.0.locald-package")
+        );
+        assert!(plugin.checksum().is_none());
+    }
+
+    #[test]
+    fn test_plugin_source_with_checksum() {
+        let toml = r#"
+[project]
+name = "plugin-test"
+
+[plugins]
+postgres = { url = "https://example.com/plugin.locald-package", sha256 = "abc123" }
+"#;
+        let config: LocaldConfig = toml::from_str(toml).unwrap();
+        let plugin = config.plugins.get("postgres").unwrap();
+
+        assert!(plugin.is_remote());
+        assert_eq!(
+            plugin.url(),
+            Some("https://example.com/plugin.locald-package")
+        );
+        assert_eq!(plugin.checksum(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_plugin_source_path() {
+        let toml = r#"
+[project]
+name = "plugin-test"
+
+[plugins]
+custom = { path = "../my-plugin/target/plugin.wasm" }
+"#;
+        let config: LocaldConfig = toml::from_str(toml).unwrap();
+        let plugin = config.plugins.get("custom").unwrap();
+
+        assert!(!plugin.is_remote());
+        assert_eq!(plugin.path(), Some("../my-plugin/target/plugin.wasm"));
+    }
+
+    #[test]
+    fn test_plugin_source_installed() {
+        let toml = r#"
+[project]
+name = "plugin-test"
+
+[plugins]
+sidekiq = { installed = "sidekiq-plugin" }
+"#;
+        let config: LocaldConfig = toml::from_str(toml).unwrap();
+        let plugin = config.plugins.get("sidekiq").unwrap();
+
+        assert!(!plugin.is_remote());
+        assert_eq!(plugin.installed(), Some("sidekiq-plugin"));
     }
 }
 

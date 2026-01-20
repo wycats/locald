@@ -1,0 +1,25 @@
+# {{project_name}}
+
+This project was created using the `redis-stack` distribution.
+
+## Getting Started
+
+1. Start the services:
+   ```bash
+   locald up
+   ```
+
+2. Your Redis instance will be available at the URL shown by locald.
+
+## Services
+
+- **redis** - Redis {{redis_version}} instance
+
+## Configuration
+
+Edit `locald.toml` to customize your services.
+
+## Learn More
+
+- [locald Documentation](https://locald.dev)
+- [Redis Documentation](https://redis.io/docs/)
