@@ -15,7 +15,7 @@ feature: Platform Support
 
 Define a Windows-side helper that complements `locald` running inside WSL2, enabling end-to-end “works in Windows browsers” experiences while keeping WSL the execution environment.
 
-This RFC is specifically about **Windows-host integration**. Self-contained WSL operation (domains + HTTPS usable *inside WSL*) is expected to work without a Windows helper.
+This RFC is specifically about **Windows-host integration**. Self-contained WSL operation (domains + HTTPS usable _inside WSL_) is expected to work without a Windows helper.
 
 ## Motivation
 

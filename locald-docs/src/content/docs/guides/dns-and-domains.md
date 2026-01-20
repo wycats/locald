@@ -74,3 +74,5 @@ https://my-app.localhost
 ```
 
 Check `locald status` to see the active URL for your services.
+
+If a service is disabled, the domain still resolves and shows a short enable page instead of a dead link.

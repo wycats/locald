@@ -7,6 +7,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use locald_core::registry::Registry;
+use locald_core::resolver::DomainResolution;
+use locald_core::state::ServiceState;
 use tower::ServiceExt; // for `oneshot`
 
 use crate::{manager::ProcessManager, proxy::ProxyManager, state::StateManager};
@@ -82,12 +84,17 @@ async fn test_docs_routing() {
 #[derive(Debug)]
 struct MockResolver {
     port: Option<u16>,
+    status: ServiceState,
 }
 
 #[async_trait::async_trait]
 impl locald_core::resolver::ServiceResolver for MockResolver {
-    async fn resolve_service_by_domain(&self, _domain: &str) -> Option<(String, u16)> {
-        self.port.map(|p| ("mock-service".to_string(), p))
+    async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
+        Some(DomainResolution {
+            name: "mock-service".to_string(),
+            port: self.port,
+            status: self.status,
+        })
     }
     async fn set_http_port(&self, _port: Option<u16>) {}
     async fn set_https_port(&self, _port: Option<u16>) {}
@@ -96,7 +103,10 @@ impl locald_core::resolver::ServiceResolver for MockResolver {
 #[tokio::test]
 async fn test_proxy_error_page() {
     // Setup with a mock resolver that returns a port where nothing is listening
-    let resolver = Arc::new(MockResolver { port: Some(12345) });
+    let resolver = Arc::new(MockResolver {
+        port: Some(12345),
+        status: ServiceState::Running,
+    });
     let proxy = ProxyManager::new(resolver, Router::new(), None);
     let app = proxy.make_app();
 
@@ -127,6 +137,28 @@ async fn test_proxy_error_page() {
 }
 
 #[tokio::test]
+async fn test_disabled_service_page() {
+    let resolver = Arc::new(MockResolver {
+        port: None,
+        status: ServiceState::Stopped,
+    });
+    let proxy = ProxyManager::new(resolver, Router::new(), None);
+    let app = proxy.make_app();
+
+    let req = Request::builder()
+        .uri("/")
+        .header("Host", "disabled.localhost")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let content_type = response.headers().get("content-type").unwrap();
+    assert_eq!(content_type, "text/html; charset=utf-8");
+}
+
+#[tokio::test]
 async fn test_proxy_connection_success() {
     // 1. Start a dummy backend server
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -141,7 +173,10 @@ async fn test_proxy_connection_success() {
     });
 
     // 2. Setup Proxy with MockResolver pointing to that port
-    let resolver = Arc::new(MockResolver { port: Some(port) });
+    let resolver = Arc::new(MockResolver {
+        port: Some(port),
+        status: ServiceState::Running,
+    });
     let proxy = ProxyManager::new(resolver, Router::new(), None);
     let app = proxy.make_app();
 

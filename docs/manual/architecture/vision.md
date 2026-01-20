@@ -14,6 +14,7 @@ This document outlines the architectural intent behind `locald` so implementatio
 
 - **Stable domains**: Each project gets a consistent `*.localhost` domain.
 - **HTTPS by default**: `locald` issues TLS certs for `.localhost` and serves on ports 80/443, so local networking mirrors production expectations.
+- **Disabled services still resolve**: the proxy returns an enable page instead of a dead link.
 
 ## 3) Observability (Logs & Status)
 

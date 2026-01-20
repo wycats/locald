@@ -19,6 +19,8 @@ domain = "shop.localhost"
 
 `locald` uses the **Service Name**, **Project Domain**, and **Service Type** to determine the URL.
 
+If a service is present in configuration but not running (disabled), the domain still resolves and returns a short enable page rather than a dead link.
+
 ### 1. The "Main" Service (Root Domain)
 
 The service named **`web`** (or a service with the same name as the project) is considered the "Main" service. It is mapped directly to the project domain.

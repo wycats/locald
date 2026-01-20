@@ -10,6 +10,17 @@
 	let pinned = $state<string[]>([]);
 
 	onMount(() => {
+		const params = new URLSearchParams(window.location.search);
+		const pinParams = params.getAll('pin');
+		const pins = pinParams
+			.flatMap((value) => value.split(','))
+			.map((value) => value.trim())
+			.filter(Boolean);
+
+		if (pins.length > 0) {
+			pinned = Array.from(new Set(pins));
+		}
+
 		services.refresh();
 		const cleanup = connectEvents();
 		return cleanup;

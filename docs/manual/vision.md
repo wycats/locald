@@ -9,6 +9,7 @@ Core story:
 - **`locald up`** brings services online with stable `*.localhost` domains.
 - **HTTPS** works out of the box once the shim is installed.
 - **Monitor + logs** are always available via CLI and dashboard.
+- **Disabled services still resolve** and show an enable page instead of a dead link.
 
 Everything else is optional or experimental and should not distract from this core loop.
 
