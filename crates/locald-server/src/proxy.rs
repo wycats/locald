@@ -205,92 +205,47 @@ async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri
     }
 }
 
-async fn handle_proxy(State(state): State<AppState>, mut req: Request) -> Response {
+async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     let host = match req.headers().get("host") {
         Some(h) => h
             .to_str()
             .unwrap_or_default()
             .split(':')
             .next()
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing Host header").into_response(),
     };
 
+    // Dev UI routing: proxy dev domains to local Vite/Astro dev servers.
+    // This allows hot reload without rebuilding the Rust binary.
+    if dev_ui_enabled() {
+        if host == "dev.locald.localhost" || host == "dev.locald.local" {
+            let port = dev_ui_port("LOCALD_DASHBOARD_DEV_PORT", 5173);
+            return proxy_to_local_port(state, req, port, "dashboard").await;
+        }
+
+        if host == "dev.docs.localhost" || host == "dev.docs.local" {
+            let port = dev_ui_port("LOCALD_DOCS_DEV_PORT", 4321);
+            return proxy_to_local_port(state, req, port, "docs").await;
+        }
+    }
+
+    let resolution = state.resolver.resolve_service_by_domain(&host).await;
+
+    // Prefer a running service for docs.localhost too (useful for docs dev mode),
+    // and fall back to embedded docs when no service claims the domain.
     if host == "docs.localhost" || host == "docs.local" {
+        if let Some(resolution) = resolution {
+            return proxy_to_domain_resolution(&state, req, &host, resolution).await;
+        }
+
         return assets::handle_docs(req.uri()).into_response();
     }
 
     // Check if there is a running service for this domain first (e.g. locald-dashboard in dev mode)
-    if let Some(resolution) = state.resolver.resolve_service_by_domain(host).await {
-        let service_name = resolution.name;
-        let port = resolution.port;
-        if port.is_none() {
-            if matches!(resolution.status, ServiceState::Building) {
-                return loading_response(&service_name);
-            }
-
-            return disabled_response(&service_name, host);
-        }
-
-        let port = port.unwrap_or_default();
-        let uri_string = format!(
-            "http://localhost:{port}{}",
-            req.uri().path_and_query().map_or("", |x| x.as_str())
-        );
-        let uri: Uri = match uri_string.parse() {
-            Ok(u) => u,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response(),
-        };
-
-        tracing::debug!("Proxying to: {}", uri);
-
-        // Check for WebSocket upgrade
-        if req
-            .headers()
-            .get(hyper::header::UPGRADE)
-            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
-        {
-            return handle_websocket_upgrade(state, req, uri).await;
-        }
-
-        let is_passthrough = req.headers().get("x-locald-passthrough").is_some();
-        let accepts_html = req
-            .headers()
-            .get(hyper::header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("text/html"))
-            .unwrap_or(false);
-
-        *req.uri_mut() = uri;
-
-        let backend_future = state.client.request(req);
-
-        if is_passthrough || !accepts_html {
-            match backend_future.await {
-                Ok(res) => return res.into_response(),
-                Err(e) => {
-                    error!("Proxy error: {e}");
-                    return error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"));
-                }
-            }
-        }
-
-        let response = tokio::select! {
-            res = backend_future => {
-                match res {
-                    Ok(res) => res.into_response(),
-                    Err(e) => {
-                        error!("Proxy error: {e}");
-                        error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
-                    }
-                }
-            }
-            () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                loading_response(&service_name)
-            }
-        };
-
-        return response;
+    if let Some(resolution) = resolution {
+        return proxy_to_domain_resolution(&state, req, &host, resolution).await;
     }
 
     // Fallback to embedded dashboard if no service claims the domain
@@ -299,6 +254,130 @@ async fn handle_proxy(State(state): State<AppState>, mut req: Request) -> Respon
     }
 
     (StatusCode::NOT_FOUND, format!("Domain {host} not found")).into_response()
+}
+
+async fn proxy_to_domain_resolution(
+    state: &AppState,
+    mut req: Request,
+    host: &str,
+    resolution: locald_core::resolver::DomainResolution,
+) -> Response {
+    let service_name = resolution.name;
+    let port = resolution.port;
+    if port.is_none() {
+        if matches!(resolution.status, ServiceState::Building) {
+            return loading_response(&service_name);
+        }
+
+        return disabled_response(&service_name, host);
+    }
+
+    let port = port.unwrap_or_default();
+    let uri_string = format!(
+        "http://localhost:{port}{}",
+        req.uri().path_and_query().map_or("", |x| x.as_str())
+    );
+    let uri: Uri = match uri_string.parse() {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response(),
+    };
+
+    tracing::debug!("Proxying to: {}", uri);
+
+    // Check for WebSocket upgrade
+    if req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return handle_websocket_upgrade(state.clone(), req, uri).await;
+    }
+
+    let is_passthrough = req.headers().get("x-locald-passthrough").is_some();
+    let accepts_html = req
+        .headers()
+        .get(hyper::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/html"))
+        .unwrap_or(false);
+
+    *req.uri_mut() = uri;
+
+    let backend_future = state.client.request(req);
+
+    if is_passthrough || !accepts_html {
+        return match backend_future.await {
+            Ok(res) => res.into_response(),
+            Err(e) => {
+                error!("Proxy error: {e}");
+                error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
+            }
+        };
+    }
+
+    tokio::select! {
+        res = backend_future => {
+            match res {
+                Ok(res) => res.into_response(),
+                Err(e) => {
+                    error!("Proxy error: {e}");
+                    error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
+                }
+            }
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+            loading_response(&service_name)
+        }
+    }
+}
+
+async fn proxy_to_local_port(
+    state: AppState,
+    mut req: Request,
+    port: u16,
+    label: &str,
+) -> Response {
+    let uri_string = format!(
+        "http://127.0.0.1:{port}{}",
+        req.uri().path_and_query().map_or("", |x| x.as_str())
+    );
+    let uri: Uri = match uri_string.parse() {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response(),
+    };
+
+    // WebSocket upgrade (needed for Vite HMR)
+    if req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return handle_websocket_upgrade(state, req, uri).await;
+    }
+
+    *req.uri_mut() = uri;
+    match state.client.request(req).await {
+        Ok(res) => res.into_response(),
+        Err(e) => error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("Dev {label} proxy failed: {e}. Is the dev server running on port {port}?"),
+        ),
+    }
+}
+
+fn dev_ui_enabled() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+
+    std::env::var("LOCALD_DEV_UI").is_ok_and(|v| v != "0" && v.to_lowercase() != "false")
+}
+
+fn dev_ui_port(var: &str, default: u16) -> u16 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(default)
 }
 
 fn error_response(status: StatusCode, message: impl std::fmt::Display) -> Response {

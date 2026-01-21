@@ -11,14 +11,11 @@ pre-commit:
     dashboard-lint:
       root: locald-dashboard
       glob: "*.{js,ts,svelte}"
-      run: pnpm lint
+      run: PATH=$HOME/.proto/shims:$PATH pnpm lint
     dashboard-check:
       root: locald-dashboard
       glob: "*.{js,ts,svelte}"
-      run: pnpm check
-    build-assets:
-      glob: "locald-dashboard/**/*.{js,ts,svelte,html,css,json}"
-      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo xtask assets build && git add crates/locald-server/src/assets
+      run: PATH=$HOME/.proto/shims:$PATH pnpm check
     sync-manifesto:
       glob: "docs/design/**/*.md"
       run: node ./locald-docs/scripts/sync-manifesto.mjs && git add locald-docs/src/content/docs/concepts locald-docs/src/content/docs/internals
@@ -30,4 +27,4 @@ pre-push:
       run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo xtask check
     docs-build:
       root: locald-docs
-      run: CI=true pnpm install && pnpm build
+      run: PATH=$HOME/.proto/shims:$PATH CI=true pnpm install && pnpm build
