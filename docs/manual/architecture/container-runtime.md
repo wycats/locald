@@ -1,5 +1,7 @@
 # Architecture: Container Runtime
 
+> **Core focus**: Container runtime support is optional and should not distract from the primary `locald up` workflow.
+
 This document describes how `locald` executes processes in isolated environments (containers) using `libcontainer` and User Namespaces.
 
 ## 1. The "Rootless" Contract

@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { Search, Play, Square, RotateCw, Trash2 } from 'lucide-svelte';
+	import { Search, Play, Square, RotateCw } from 'lucide-svelte';
+	import type { ComponentType } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { services } from '$lib/stores/services';
 	import {
@@ -19,7 +20,7 @@
 		id: string;
 		title: string;
 		action: () => void;
-		icon?: any;
+		icon?: ComponentType;
 	};
 
 	let commands = $derived.by(() => {
@@ -137,7 +138,7 @@
 				{#if filteredCommands.length === 0}
 					<div class="empty">No commands found.</div>
 				{:else}
-					{#each filteredCommands as command, i}
+					{#each filteredCommands as command, i (command.id)}
 						<button
 							class="command-item"
 							class:selected={i === selectedIndex}
@@ -188,7 +189,9 @@
 		background: #18181b; /* zinc-900 */
 		border: 1px solid #27272a; /* zinc-800 */
 		border-radius: 12px;
-		box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+		box-shadow:
+			0 20px 25px -5px rgba(0, 0, 0, 0.1),
+			0 10px 10px -5px rgba(0, 0, 0, 0.04);
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;

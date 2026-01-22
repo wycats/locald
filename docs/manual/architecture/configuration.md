@@ -1,5 +1,7 @@
 # Architecture: Configuration
 
+> **Core focus**: Configuration should keep the default workflow minimal and predictable.
+
 This document describes how `locald` manages configuration, state, and project tracking.
 
 ## 1. Configuration Hierarchy

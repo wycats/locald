@@ -4,6 +4,8 @@ title: CLI Reference
 
 `locald` provides a powerful CLI for managing your development environment.
 
+> **Core focus**: The primary workflow is `locald up` → stable domains/HTTPS → monitor/logs. Optional or experimental commands are secondary.
+
 For the canonical taught vocabulary (verbs/nouns and stability rules), see RFC 0114 “Surface Contract v1”.
 
 ## Core Commands
@@ -35,6 +37,8 @@ If a step fails, the UI will persist the error details for debugging.
 Stop a running service. If no service name is provided, stops all services defined in `locald.toml` for the current project.
 
 ### `locald server shutdown`
+
+**Internal/advanced**: Shuts down the daemon directly. Most users should not need this.
 
 Shutdown the running daemon.
 
@@ -89,7 +93,9 @@ locald doctor
 locald doctor --json
 ```
 
-## Ad-Hoc Execution
+## Advanced & Optional Workflows
+
+These commands are useful in specific situations but are not required for the core flow.
 
 ### `locald try`
 

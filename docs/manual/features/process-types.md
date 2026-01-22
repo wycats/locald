@@ -1,5 +1,7 @@
 # Process Types & Start Commands
 
+> **Core focus**: Defaults should keep `locald up` predictable.
+
 `locald` offers flexible ways to define how your application starts. It attempts to determine the correct start command automatically, but you can always override it.
 
 ## Precedence

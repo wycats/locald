@@ -7,7 +7,9 @@ dist/
 .tmp
 locald-docs/node_modules/
 locald-docs/dist/
-locald-server/src/assets/docs/
+
+# Generated UI assets (built by locald-server/build.rs)
+crates/locald-server/src/assets/
 
 # Private files (not for public repo)
 .private/

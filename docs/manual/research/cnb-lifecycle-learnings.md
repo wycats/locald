@@ -1,4 +1,6 @@
-h# Research: CNB Lifecycle & Dev Environments
+# Research: CNB Lifecycle & Dev Environments
+
+> **Status**: Internal research. Not part of the core user story.
 
 ## Overview
 

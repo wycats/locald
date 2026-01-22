@@ -1,5 +1,7 @@
 # Service URLs & Routing
 
+> **Core focus**: Stable domains are a core promise of the launch story.
+
 `locald` automatically assigns URLs to your services based on your `locald.toml` configuration and the service type. This ensures that your development environment mirrors production routing conventions without manual configuration.
 
 ## The Project Domain
@@ -16,6 +18,8 @@ domain = "shop.localhost"
 ## URL Assignment Logic
 
 `locald` uses the **Service Name**, **Project Domain**, and **Service Type** to determine the URL.
+
+If a service is present in configuration but not running (disabled), the domain still resolves and returns a short enable page rather than a dead link.
 
 ### 1. The "Main" Service (Root Domain)
 

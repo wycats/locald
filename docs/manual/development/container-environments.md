@@ -2,6 +2,8 @@
 
 `locald` is designed to "just work" in **containerized development environments** like [Toolbx](https://containertoolbx.org/) and [Distrobox](https://distrobox.it/).
 
+> **Optional Workflow**: The default launch story assumes running directly on the host. Container-based development is an advanced workflow and should not be required for the core experience.
+
 This guide covers how to set up and use `locald` when your development environment lives inside a container while your host OS provides privileged operations.
 
 ## Overview
@@ -172,14 +174,15 @@ shim_socket = "/run/user/1000/locald/shim.sock"
 
 The `host_exec` template uses `{command}` as a placeholder for the actual command to run on the host:
 
-| Environment     | Template                                    |
-| --------------- | ------------------------------------------- |
-| Toolbx          | `flatpak-spawn --host {command}` (auto-detected) |
-| Distrobox       | `distrobox-host-exec {command}` (auto-detected) |
-| SSH to host     | `ssh hostname {command}`                    |
-| Custom          | `your-host-exec-wrapper {command}`          |
+| Environment | Template                                         |
+| ----------- | ------------------------------------------------ |
+| Toolbx      | `flatpak-spawn --host {command}` (auto-detected) |
+| Distrobox   | `distrobox-host-exec {command}` (auto-detected)  |
+| SSH to host | `ssh hostname {command}`                         |
+| Custom      | `your-host-exec-wrapper {command}`               |
 
 **Auto-detection**: If `host_exec` is not set, `locald` checks for:
+
 1. `flatpak-spawn` (available in Toolbx)
 2. `distrobox-host-exec` (available in Distrobox)
 
@@ -213,10 +216,12 @@ locald doctor
 ### Stopping the Daemon
 
 The daemon automatically shuts down after:
+
 - **Idle timeout**: 5 minutes after the last client disconnects
 - **Max lifetime**: 1 hour (ensures fresh binary after updates)
 
 To stop it manually:
+
 - Send `SIGTERM` or `SIGINT` to the daemon process
 - Remove the socket file: `rm ~/.locald/shim.sock`
 
@@ -227,12 +232,14 @@ To stop it manually:
 This warning appears when `locald` can't connect to the shim daemon. To fix:
 
 1. **Start the daemon on the host**:
+
    ```bash
    # On the host (outside container)
    sudo locald-shim serve
    ```
 
 2. **Verify the socket exists**:
+
    ```bash
    ls -la ~/.locald/shim.sock
    ```
@@ -247,12 +254,14 @@ This warning appears when `locald` can't connect to the shim daemon. To fix:
 If the socket exists but connections fail:
 
 1. **Check if the daemon is running**:
+
    ```bash
    cat ~/.locald/shim.pid
    ps aux | grep locald
    ```
 
 2. **Check socket permissions**:
+
    ```bash
    ls -la ~/.locald/shim.sock
    # Should be: srw------- (mode 0600)
@@ -281,6 +290,7 @@ shim_socket = "/run/user/1000/locald/shim.sock"
 ```
 
 Then ensure the daemon is started with the same override:
+
 ```bash
 sudo locald-shim serve --socket /run/user/1000/locald/shim.sock
 ```
@@ -310,6 +320,7 @@ Toolbx and Distrobox bind-mount your home directory. If the socket isn't visible
 If `locald` can't auto-start the daemon:
 
 1. **Configure `host_exec` explicitly**:
+
    ```toml
    [container]
    host_exec = "flatpak-spawn --host {command}"
@@ -362,6 +373,7 @@ toolbox run bash -c "cd ~/Code/my-project && locald up"
 ```
 
 The `locald doctor` command reports:
+
 - Whether the socket connection is working
 - Privileged feature availability
 - Cleanup mode (enabled vs degraded)

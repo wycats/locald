@@ -4,6 +4,8 @@ title: "Vision: Local Development as a Platform"
 
 **"Treat the local machine as a first-class platform."**
 
+> **Optional background**: This page provides context and philosophy; it is not required to use the core workflow.
+
 `locald` bridges the gap between the **immediacy** of local coding and the **rigor** of cloud deployment. It provides a structured, robust, and interactive environment where services are not just processes, but managed citizens of a cohesive workspace.
 
 ## Core Philosophy

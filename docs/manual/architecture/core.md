@@ -1,5 +1,7 @@
 # Architecture: Core
 
+> **Core focus**: This describes the essentials that power `locald up`, stable domains, and observability.
+
 This document describes the core architecture of `locald`, including the daemon lifecycle, IPC, and process supervision.
 
 ## Related architecture docs

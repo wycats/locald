@@ -1,5 +1,7 @@
 # Architecture: Networking
 
+> **Core focus**: Networking supports stable `*.localhost` routing for the main workflow.
+
 This document describes how `locald` handles networking, including port assignment, proxying, and DNS.
 
 ## 1. Port Assignment

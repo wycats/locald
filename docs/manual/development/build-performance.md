@@ -1,5 +1,7 @@
 # Build Performance (Rust)
 
+> **Core focus**: Performance work should prioritize `locald up` responsiveness.
+
 This repo defaults to **incremental compilation** for development builds.
 
 ## Incremental compilation
@@ -14,7 +16,6 @@ Linking is often the slowest part of a Rust edit-compile cycle.
 Recommended options:
 
 - **mold** (fast linker):
-
   - Install `mold`.
   - Run builds with:
     - `RUSTFLAGS='-C link-arg=-fuse-ld=mold' cargo build`

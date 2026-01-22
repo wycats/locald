@@ -4,6 +4,8 @@ title: Testing Strategy
 
 # Testing Strategy
 
+> **Core focus**: Tests prioritize the primary workflow and its recovery paths.
+
 `locald` employs a multi-layered testing strategy to ensure correctness, stability, and a high-quality user experience.
 
 ## Philosophy: No Mocks, Just Fakes
@@ -54,7 +56,6 @@ Guidelines:
 We verify the dashboard by asserting on the **Backend State**, not just the UI pixels.
 
 - **Hybrid Assertion**:
-
   1.  **Action**: Click "Start" in the UI.
   2.  **UI Assertion**: Expect status badge to turn Green.
   3.  **Backend Assertion**: Run `locald status` CLI and assert the service is running.

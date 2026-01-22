@@ -7,7 +7,7 @@ This tutorial gets you from “nothing running” to a working local service wit
 
 - a free port via `$PORT`
 - a supervised process (auto-restart, logs captured)
-- a stable `*.localhost` URL
+- a stable `*.localhost` URL with HTTPS that matches production behavior
 - a dashboard at `http://locald.localhost`
 
 ## 1. Installation
@@ -20,8 +20,15 @@ cd dotlocal
 cargo install --path locald-cli
 ```
 
-Before going deeper, it’s worth knowing the core “taught model” vocabulary is intentionally small.
-See the Surface Contract (RFC 0114) for what’s **Stable** vs **Experimental**.
+Before going deeper, keep the vocabulary small: follow the core flow first.
+Advanced and experimental features are labeled in the reference docs.
+
+### Windows & WSL
+
+- **WSL**: `locald` should work inside WSL as a self-contained environment (best experience if your browser is also inside WSLg).
+- **Windows**: End-to-end Windows browser support is coming.
+
+See [Windows & WSL (Roadmap)](/roadmap/windows-and-wsl/).
 
 ## 2. The "Hello World" Moment
 
@@ -116,9 +123,9 @@ This is your **Workspace**.
 
 _Tip: You can also use `locald monitor` for a terminal-based version of this dashboard._
 
-## 6. HTTPS (optional)
+## 6. HTTPS (core)
 
-If you want HTTPS locally (with real-looking domains), `locald` can set that up too.
+HTTPS is part of the core `locald` promise: the same domain and TLS setup you expect remotely should work locally too.
 
 First, perform a **one-time system setup** to trust the local Certificate Authority:
 
@@ -140,7 +147,7 @@ web = { command = "python3 -m http.server $PORT" }
 Run `locald up` again to apply the changes.
 
 Open **[https://my-app.localhost](https://my-app.localhost)**.
-You now have a secure, domain-bound service running locally.
+You now have a secure, domain-bound service running locally with the same network expectations as production.
 
 ## 7. Next Steps
 

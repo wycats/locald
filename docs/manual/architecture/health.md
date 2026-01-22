@@ -1,5 +1,7 @@
 # Architecture: Health Checks
 
+> **Core focus**: Health checks exist to keep the primary workflow reliable and transparent.
+
 This document describes how `locald` determines if a service is ready and healthy.
 
 ## 1. Zero-Config Hierarchy

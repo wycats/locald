@@ -73,6 +73,7 @@ These protocols are derived from the Mental Model. Follow them to ensure consist
 ### Protocol: Tool Usage
 
 - **Structured IO**: When adding ideas or modifying the plan, you **MUST** use the `exo` CLI tools (`exo idea`, `exo plan`, `exo task`).
+- **No lint bypass**: Never bypass lint/test hooks (e.g., `--no-verify`) without explicitly discussing it with the user first.
 - **Read-Only TOML**: Treat `plan.toml`, `ideas.toml`, and `implementation-plan.toml` as **READ-ONLY**.
   - **DO NOT** edit these files directly with file editing tools.
   - **DO NOT** attempt to "fix" formatting or add comments manually.

@@ -1,5 +1,7 @@
 # Architecture: State Management
 
+> **Core focus**: State exists to make `locald up` reliable across restarts and failures.
+
 This document describes how `locald` manages persistent state, including project data, logs, and the global registry.
 
 ## 1. The Global State Directory
@@ -47,7 +49,7 @@ The **Registry** (`registry.json`) is the source of truth for all projects `loca
 
 ### Lifecycle
 
-- **Registration**: Occurs automatically when `locald up` or `locald start` is run in a directory.
+- **Registration**: Occurs automatically when `locald up` is run in a directory.
 - **Pruning**: Projects that are removed from disk are eventually cleaned up by the Garbage Collector (see below).
 - **Pinning**: Users can "pin" a project (`locald registry pin .`) to prevent it from being garbage collected, even if the directory is missing (e.g., on a detached drive).
 

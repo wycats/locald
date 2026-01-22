@@ -1,5 +1,7 @@
 # Research: Containerd Integration
 
+> **Status**: Internal research. Not part of the core user story.
+
 **Question**: Could we interop with `containerd` (or another container system with good Rust integration) to run containers ourselves without Docker? How crazy would that be?
 
 ## Context

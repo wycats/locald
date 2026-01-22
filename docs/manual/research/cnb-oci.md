@@ -1,5 +1,7 @@
 # Research: OCI Image Extraction for CNB
 
+> **Status**: Internal research. Not part of the core user story.
+
 ## Goal
 
 We want to implement `locald build` using Cloud Native Buildpacks. To do this without requiring a running Docker daemon for the _build_ process (or to be more lightweight), we need to:

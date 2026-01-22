@@ -2,57 +2,23 @@
 title: Execution Modes
 ---
 
-`locald` supports two primary execution modes for your services: **Host Execution** and **Container Execution**.
+`locald` runs services in two modes: **Host Execution** (default) and **Container Execution** (experimental).
 
-## 1. Host Execution (Default)
+## Host Execution (Default)
 
-In this mode, `locald` runs your application directly on your host machine as a standard process. This is the default behavior and provides the lowest friction for most development workflows.
+Host execution runs your commands directly on your machine. It’s the lowest-friction path for local development.
 
-### Characteristics
-
-- **Environment**: Inherits your user's shell environment (PATH, installed tools).
-- **Performance**: Zero overhead; runs at native speed.
-- **Tools**: Uses the tools you already have installed (`cargo`, `npm`, `python`, `go`).
-- **Networking**: Binds directly to localhost ports (managed by `locald`).
-
-### Configuration
-
-No special configuration is needed. Just define a command:
+- **Environment**: Uses your local tools (`cargo`, `npm`, `python`, `go`).
+- **Performance**: No container overhead.
+- **Networking**: Ports are assigned and injected via `$PORT`.
 
 ```toml
-[service.web]
+[services.web]
 command = "npm run dev"
 ```
 
-## 2. Container Execution (Opt-In)
+## Container Execution (Experimental)
 
-In this mode, `locald` builds your application into an OCI container using Cloud Native Buildpacks (CNB) and runs it in an isolated environment. This mimics a production-like environment (like Heroku or Kubernetes).
+Container execution and CNB builds are experimental and live in the experimental docs.
 
-### Characteristics
-
-- **Environment**: Isolated Linux environment defined by the builder image.
-- **Reproducibility**: Guarantees the same dependencies and OS versions as production.
-- **Isolation**: File system and process isolation.
-- **Overhead**: Requires building the container image (cached) and running via the embedded container runtime (via `locald-shim`).
-
-### Configuration
-
-To opt-in, add a `[service.build]` section:
-
-```toml
-[service.web]
-build = { builder = "paketobuildpacks/builder:base" }
-```
-
-See [Cloud Native Builds](./builds.md) for more details.
-
-## Choosing a Mode
-
-| Feature           | Host Execution                          | Container Execution                                    |
-| :---------------- | :-------------------------------------- | :----------------------------------------------------- |
-| **Use Case**      | Rapid iteration, debugging, simple apps | Production parity, complex dependencies, CI/CD testing |
-| **Dependencies**  | Must be installed on host               | Installed by Buildpack inside container                |
-| **Startup Speed** | Instant                                 | Slower (build + container start)                       |
-| **Isolation**     | Low (shared host)                       | High (namespaces, cgroups)                             |
-
-We recommend starting with **Host Execution** for the fastest feedback loop and switching to **Container Execution** if you need strict isolation or are debugging production-specific issues.
+- See [Experimental: Execution Modes](/experimental/execution-modes/)

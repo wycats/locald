@@ -1,5 +1,7 @@
 # Architecture: Resource Management (Cgroups)
 
+> **Core focus**: Resource management keeps the core loop fast and recoverable.
+
 This page describes the cgroup v2 structure that `locald` is implementing to ensure reliable lifecycle management and resource accounting. This structure is known as the **"Tree of Life"**.
 
 ## Current Status

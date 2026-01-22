@@ -50,7 +50,49 @@ export default defineConfig({
             { label: "Service Types", link: "/reference/service-types/" },
             { label: "Execution Modes", link: "/reference/execution-modes/" },
             { label: "Health Checks", link: "/reference/health-checks/" },
-            { label: "Builds", link: "/reference/builds/" },
+          ],
+        },
+        {
+          label: "Experimental",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/experimental/" },
+            {
+              label: "Execution Modes",
+              link: "/experimental/execution-modes/",
+            },
+            { label: "Builds", link: "/experimental/builds/" },
+            {
+              label: "Ephemeral Containers",
+              link: "/experimental/ephemeral-containers/",
+            },
+          ],
+        },
+        {
+          label: "Roadmap",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/roadmap/" },
+            { label: "Windows & WSL", link: "/roadmap/windows-and-wsl/" },
+            {
+              label: "Docker Integration",
+              link: "/roadmap/docker-integration/",
+            },
+            { label: "Advanced Proxying", link: "/roadmap/advanced-proxying/" },
+            {
+              label: "Constellations & Configuration",
+              link: "/roadmap/constellations-and-config/",
+            },
+            { label: "AI Usability", link: "/roadmap/ai-usability/" },
+            {
+              label: "Dashboard Ergonomics",
+              link: "/roadmap/dashboard-ergonomics/",
+            },
+            {
+              label: "Advanced Service Config",
+              link: "/roadmap/advanced-service-config/",
+            },
+            { label: "UX Improvements", link: "/roadmap/ux-improvements/" },
           ],
         },
         {
@@ -79,6 +121,10 @@ export default defineConfig({
             {
               label: "Architecture Overview",
               link: "/internals/architecture/",
+            },
+            {
+              label: "Architecture Vision",
+              link: "/internals/architecture/vision/",
             },
             { label: "Development Setup", link: "/internals/development/" },
             { label: "Security", link: "/internals/security/" },

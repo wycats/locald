@@ -1444,7 +1444,10 @@ impl ProcessManager {
         Ok(())
     }
 
-    pub async fn resolve_service_by_domain(&self, domain: &str) -> Option<(String, u16)> {
+    pub async fn resolve_service_by_domain(
+        &self,
+        domain: &str,
+    ) -> Option<locald_core::resolver::DomainResolution> {
         let (name, controller_to_check) = {
             let services = self.services.lock().await;
             let found = services.iter().find_map(|(name, service)| {
@@ -1465,12 +1468,21 @@ impl ProcessManager {
             }
         };
 
-        let port = match controller_to_check {
-            Ok(port) => port,
-            Err(c) => c.lock().await.read_state().await.port,
-        };
-
-        port.map(|p| (name, p))
+        match controller_to_check {
+            Ok(port) => Some(locald_core::resolver::DomainResolution {
+                name,
+                port,
+                status: locald_core::state::ServiceState::Stopped,
+            }),
+            Err(c) => {
+                let runtime = c.lock().await.read_state().await;
+                Some(locald_core::resolver::DomainResolution {
+                    name,
+                    port: runtime.port,
+                    status: runtime.status,
+                })
+            }
+        }
     }
 
     pub async fn registry_list(&self) -> Vec<locald_core::registry::ProjectEntry> {
@@ -1747,7 +1759,10 @@ impl ProcessManager {
 
 #[async_trait::async_trait]
 impl ServiceResolver for ProcessManager {
-    async fn resolve_service_by_domain(&self, domain: &str) -> Option<(String, u16)> {
+    async fn resolve_service_by_domain(
+        &self,
+        domain: &str,
+    ) -> Option<locald_core::resolver::DomainResolution> {
         self.resolve_service_by_domain(domain).await
     }
     async fn set_http_port(&self, port: Option<u16>) {
