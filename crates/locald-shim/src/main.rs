@@ -1,6 +1,3 @@
-mod daemon;
-mod protocol;
-
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use listeners::get_all;
@@ -32,9 +29,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run the shim daemon (listens on ~/.locald/shim.sock).
-    Serve(ServeArgs),
-
     /// Execute an OCI bundle.
     Bundle {
         #[command(subcommand)]
@@ -55,18 +49,6 @@ enum Commands {
         #[command(subcommand)]
         command: DebugCommand,
     },
-}
-
-/// Arguments for the `serve` subcommand.
-#[derive(Debug, Args)]
-struct ServeArgs {
-    /// Run in foreground (don't daemonize).
-    #[arg(long, short = 'f')]
-    foreground: bool,
-
-    /// Idle timeout in seconds before the daemon shuts down (default: 300).
-    #[arg(long, default_value = "300")]
-    idle_timeout: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -122,6 +104,24 @@ enum AdminCommand {
 }
 
 fn invoking_user_home_dir() -> Result<StdPathBuf> {
+    // When running via pkexec, PKEXEC_UID contains the original user's UID.
+    // When running via sudo, SUDO_USER contains the original username.
+    // Fall back to getuid() for direct invocation.
+    if let Ok(pkexec_uid) = std::env::var("PKEXEC_UID")
+        && let Ok(uid) = pkexec_uid.parse::<u32>()
+    {
+        let uid = nix::unistd::Uid::from_raw(uid);
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(uid) {
+            return Ok(user.dir);
+        }
+    }
+
+    if let Ok(sudo_user) = std::env::var("SUDO_USER")
+        && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+    {
+        return Ok(user.dir);
+    }
+
     let uid = nix::unistd::getuid();
     let user = nix::unistd::User::from_uid(uid)
         .context("failed to look up invoking user")?
@@ -133,63 +133,12 @@ fn certs_dir_for_user_home(home: &Path) -> StdPathBuf {
     home.join(".locald").join("certs")
 }
 
-fn ensure_root_ca(certs_dir: &Path) -> Result<StdPathBuf> {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-        KeyUsagePurpose,
-    };
-
-    std::fs::create_dir_all(certs_dir).context("failed to create certs dir")?;
-
-    let ca_cert_path = certs_dir.join("rootCA.pem");
-    let ca_key_path = certs_dir.join("rootCA-key.pem");
-
-    let cert_exists = ca_cert_path.exists();
-    let key_exists = ca_key_path.exists();
-    if cert_exists != key_exists {
-        anyhow::bail!(
-            "Root CA is partially configured (rootCA.pem/rootCA-key.pem mismatch); run `locald admin setup` to repair HTTPS setup"
-        );
-    }
-
-    if !cert_exists {
-        let mut params = CertificateParams::default();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "locald Development CA");
-        dn.push(DnType::OrganizationName, "locald");
-        params.distinguished_name = dn;
-        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-
-        let key_pair = KeyPair::generate()?;
-        let cert = params.self_signed(&key_pair)?;
-
-        {
-            use std::io::Write;
-
-            let mut f =
-                std::fs::File::create(&ca_cert_path).context("failed to create rootCA.pem")?;
-            f.write_all(cert.pem().as_bytes())
-                .context("failed to write rootCA.pem")?;
-        }
-
-        {
-            use std::io::Write;
-
-            let mut f =
-                std::fs::File::create(&ca_key_path).context("failed to create rootCA-key.pem")?;
-            f.write_all(key_pair.serialize_pem().as_bytes())
-                .context("failed to write rootCA-key.pem")?;
-        }
-    }
-
-    Ok(ca_cert_path)
-}
-
 fn admin_trust() -> Result<i32> {
     let home = invoking_user_home_dir()?;
     let certs_dir = certs_dir_for_user_home(&home);
-    let ca_cert_path = ensure_root_ca(&certs_dir)?;
+    let ensure = locald_utils::cert::ensure_root_ca_in_dir(&certs_dir)
+        .context("failed to ensure Root CA")?;
+    let ca_cert_path = ensure.paths.cert_path;
 
     let ca_str = ca_cert_path
         .to_str()
@@ -444,60 +393,12 @@ fn ensure_cgroup2_mount() -> Result<()> {
 }
 
 fn looks_like_systemctl_connectivity_failure(stderr: &str) -> bool {
-    // What we see in Toolbx/Distrobox/containers when PID 1 is systemd (host) but the
+    // What we see in containers when PID 1 is systemd (host) but the
     // container doesn't have access to systemd's private socket / D-Bus transport.
     let s = stderr.to_lowercase();
     s.contains("failed to connect to system scope bus")
         || s.contains("failed to connect to bus")
         || s.contains("no such file or directory")
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-
-    meta.is_file() && (meta.permissions().mode() & 0o111) != 0
-}
-
-fn command_exists(name: &str) -> bool {
-    if name.contains('/') {
-        return is_executable(Path::new(name));
-    }
-
-    let Some(path) = env::var_os("PATH") else {
-        return false;
-    };
-
-    for dir in env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn host_exec_hint() -> Option<String> {
-    let mut hints = Vec::new();
-
-    if command_exists("distrobox-host-exec") {
-        hints.push("distrobox-host-exec".to_string());
-    }
-
-    // flatpak-spawn is available in Flatpak sandboxes, but can also work in other environments
-    // if the org.freedesktop.Flatpak D-Bus interface is available.
-    if command_exists("flatpak-spawn") {
-        hints.push("flatpak-spawn --host".to_string());
-    }
-
-    if hints.is_empty() {
-        None
-    } else {
-        Some(hints.join(" or "))
-    }
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -605,7 +506,6 @@ pub(crate) fn cgroup_setup() -> Result<()> {
             Err(systemd_err) => {
                 // systemd may be PID 1 (host) but systemctl is unusable inside this environment.
                 // Try direct setup; if that fails, return a combined, actionable error.
-                let hint = host_exec_hint();
                 let sysmsg = systemd_err.to_string();
 
                 match cgroup_setup_driver() {
@@ -617,17 +517,11 @@ pub(crate) fn cgroup_setup() -> Result<()> {
 
                         if looks_like_systemctl_connectivity_failure(&sysmsg) {
                             ctx.push_str(
-                                ". This is common inside Toolbx/Distrobox/containers where systemd sockets are not available.",
+                                ". This is common inside containers where systemd sockets are not available.",
                             );
                         }
 
-                        if let Some(h) = hint {
-                            ctx.push_str(&format!(
-                                " You may need to run `locald admin setup` on the host or use {h} to run host commands.",
-                            ));
-                        } else {
-                            ctx.push_str(" You may need to run `locald admin setup` on the host.");
-                        }
+                        ctx.push_str(" You may need to run `locald admin setup` on the host.");
 
                         Err(driver_err)
                             .with_context(|| ctx)
@@ -837,16 +731,6 @@ fn main() -> Result<()> {
     }
 
     match command {
-        Commands::Serve(args) => {
-            // Run the shim daemon
-            let config = daemon::DaemonConfig {
-                foreground: args.foreground,
-                idle_timeout: std::time::Duration::from_secs(args.idle_timeout),
-                ..Default::default()
-            };
-            daemon::serve(config)?;
-            Ok(())
-        }
         Commands::Bundle {
             command: BundleCommand::Run(args),
         } => {
@@ -968,7 +852,7 @@ polkit.addRule(function(action, subject) {
                             anyhow::bail!(
                                 "Cannot install polkit policy: {} is read-only and {} not found.\n\
                                  This is common on immutable distros (Bazzite, Silverblue, etc.).\n\
-                                 You can manually run: sudo locald-shim serve",
+                                 You can manually run: sudo locald-shim admin install-polkit",
                                 POLKIT_ACTIONS_DIR,
                                 POLKIT_RULES_DIR
                             );

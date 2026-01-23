@@ -1,9 +1,5 @@
 use crate::style;
 use anyhow::{Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, IsCa, KeyPair, KeyUsagePurpose,
-};
-use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -23,15 +19,11 @@ pub fn run() -> Result<()> {
         }
     }
 
-    let certs_dir = get_certs_dir()?;
-    std::fs::create_dir_all(&certs_dir).context("Failed to create certs directory")?;
+    let ensure = locald_utils::cert::ensure_root_ca()?;
+    let ca_cert_path = ensure.paths.cert_path;
 
-    let ca_cert_path = certs_dir.join("rootCA.pem");
-    let ca_key_path = certs_dir.join("rootCA-key.pem");
-
-    if !ca_cert_path.exists() || !ca_key_path.exists() {
+    if ensure.created {
         println!("Generating new Root CA...");
-        generate_ca(&ca_cert_path, &ca_key_path)?;
         println!(
             "{} Root CA generated at {}",
             style::CHECK,
@@ -56,51 +48,8 @@ pub fn run() -> Result<()> {
 ///
 /// This function performs no user-facing printing so callers can control output.
 pub fn install_root_ca_into_trust_store() -> Result<()> {
-    let certs_dir = get_certs_dir()?;
-    std::fs::create_dir_all(&certs_dir).context("Failed to create certs directory")?;
-
-    let ca_cert_path = certs_dir.join("rootCA.pem");
-    let ca_key_path = certs_dir.join("rootCA-key.pem");
-
-    if !ca_cert_path.exists() || !ca_key_path.exists() {
-        generate_ca(&ca_cert_path, &ca_key_path)?;
-    }
-
-    install_ca(&ca_cert_path)?;
-
-    Ok(())
-}
-
-fn get_certs_dir() -> Result<PathBuf> {
-    // Under sudo we still want to write the CA into the invoking user's home directory,
-    // not /root. When not under sudo, fall back to the current user's home.
-    #[cfg(unix)]
-    {
-        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            if let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user) {
-                return Ok(user.dir.join(".locald").join("certs"));
-            }
-        }
-    }
-
-    let home = home::home_dir().context("Could not find home directory")?;
-    Ok(home.join(".locald").join("certs"))
-}
-
-fn generate_ca(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<()> {
-    let mut params = CertificateParams::default();
-    let mut dn = DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "locald Development CA");
-    dn.push(rcgen::DnType::OrganizationName, "locald");
-    params.distinguished_name = dn;
-    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-
-    std::fs::write(cert_path, cert.pem())?;
-    std::fs::write(key_path, key_pair.serialize_pem())?;
+    let ensure = locald_utils::cert::ensure_root_ca()?;
+    install_ca(&ensure.paths.cert_path)?;
 
     Ok(())
 }

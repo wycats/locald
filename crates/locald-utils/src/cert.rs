@@ -9,9 +9,108 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
+
+/// Paths to the locald Root CA certificate and key files.
+#[derive(Debug, Clone)]
+pub struct RootCaPaths {
+    /// Path to the Root CA certificate (PEM).
+    pub cert_path: PathBuf,
+    /// Path to the Root CA private key (PEM).
+    pub key_path: PathBuf,
+}
+
+/// Result of ensuring the Root CA exists on disk.
+#[derive(Debug, Clone)]
+pub struct EnsureRootCaResult {
+    /// Paths to the Root CA certificate and key.
+    pub paths: RootCaPaths,
+    /// Whether the Root CA was created by this call.
+    pub created: bool,
+}
+
+fn root_ca_params() -> CertificateParams {
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "locald Development CA");
+    dn.push(DnType::OrganizationName, "locald");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
+}
+
+fn generate_root_ca_pem() -> Result<(String, String)> {
+    let params = root_ca_params();
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// Ensure a Root CA exists in the given directory, creating it if needed.
+///
+/// Returns the CA paths and whether the CA was created during this call.
+///
+/// # Errors
+///
+/// Returns an error if the certs directory cannot be created, if the CA
+/// is partially configured, or if writing the CA files fails.
+#[allow(clippy::disallowed_methods)]
+pub fn ensure_root_ca_in_dir(certs_dir: &Path) -> Result<EnsureRootCaResult> {
+    std::fs::create_dir_all(certs_dir).context("Failed to create locald certs directory")?;
+
+    let ca_cert_path = certs_dir.join("rootCA.pem");
+    let ca_key_path = certs_dir.join("rootCA-key.pem");
+
+    let cert_exists = ca_cert_path.exists();
+    let key_exists = ca_key_path.exists();
+
+    if cert_exists != key_exists {
+        anyhow::bail!(
+            "Root CA is partially configured (rootCA.pem/rootCA-key.pem mismatch). Run `locald admin setup` to repair HTTPS setup."
+        );
+    }
+
+    if cert_exists {
+        return Ok(EnsureRootCaResult {
+            paths: RootCaPaths {
+                cert_path: ca_cert_path,
+                key_path: ca_key_path,
+            },
+            created: false,
+        });
+    }
+
+    let (cert_pem, key_pem) = generate_root_ca_pem()?;
+    std::fs::write(&ca_cert_path, cert_pem)
+        .with_context(|| format!("Failed to write {}", ca_cert_path.display()))?;
+    std::fs::write(&ca_key_path, key_pem)
+        .with_context(|| format!("Failed to write {}", ca_key_path.display()))?;
+
+    Ok(EnsureRootCaResult {
+        paths: RootCaPaths {
+            cert_path: ca_cert_path,
+            key_path: ca_key_path,
+        },
+        created: true,
+    })
+}
+
+/// Ensure a Root CA exists in the default locald certs directory.
+///
+/// Returns the CA paths and whether the CA was created during this call.
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined or if
+/// CA creation fails.
+pub fn ensure_root_ca() -> Result<EnsureRootCaResult> {
+    let certs_dir = get_certs_dir()?;
+    ensure_root_ca_in_dir(&certs_dir)
+}
 
 /// Manages TLS certificates for locald.
 ///
@@ -40,59 +139,22 @@ impl CertManager {
     /// Returns an error if the root CA files are missing or cannot be read/parsed.
     pub async fn new() -> Result<Self> {
         let certs_dir = get_certs_dir()?;
-        let ca_cert_path = certs_dir.join("rootCA.pem");
-        let ca_key_path = certs_dir.join("rootCA-key.pem");
+        let ensure = tokio::task::spawn_blocking({
+            let certs_dir = certs_dir.clone();
+            move || ensure_root_ca_in_dir(&certs_dir)
+        })
+        .await
+        .context("Root CA ensure task panicked")??;
 
-        tokio::fs::create_dir_all(&certs_dir)
-            .await
-            .context("Failed to create locald certs directory")?;
-
-        let cert_exists = ca_cert_path.exists();
-        let key_exists = ca_key_path.exists();
-
-        if cert_exists != key_exists {
-            anyhow::bail!(
-                "Root CA is partially configured (rootCA.pem/rootCA-key.pem mismatch). Run `locald admin setup` to repair HTTPS setup."
-            );
-        }
-
-        if !cert_exists && !key_exists {
-            // Generate a new CA on the fly so HTTPS can function immediately.
-            // The user can then run `locald admin setup` to install it into the system trust store.
-            let (cert_pem, key_pem) =
-                tokio::task::spawn_blocking(|| -> Result<(String, String)> {
-                    let mut params = CertificateParams::default();
-                    let mut dn = DistinguishedName::new();
-                    dn.push(DnType::CommonName, "locald Development CA");
-                    dn.push(DnType::OrganizationName, "locald");
-                    params.distinguished_name = dn;
-                    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-                    params.key_usages =
-                        vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-
-                    let key_pair = KeyPair::generate()?;
-                    let cert = params.self_signed(&key_pair)?;
-                    Ok((cert.pem(), key_pair.serialize_pem()))
-                })
-                .await
-                .context("CA generation task panicked")??;
-
-            // Write files atomically-ish (best effort). If this fails, surface the error.
-            tokio::fs::write(&ca_cert_path, cert_pem)
-                .await
-                .with_context(|| format!("Failed to write {}", ca_cert_path.display()))?;
-            tokio::fs::write(&ca_key_path, key_pem)
-                .await
-                .with_context(|| format!("Failed to write {}", ca_key_path.display()))?;
-
+        if ensure.created {
             info!(
                 "Generated locald Root CA at {} (run `locald admin setup` to install into system trust store)",
-                ca_cert_path.display()
+                ensure.paths.cert_path.display()
             );
         }
 
         // Use tokio::fs for reading the key
-        let ca_key_pem = tokio::fs::read_to_string(&ca_key_path)
+        let ca_key_pem = tokio::fs::read_to_string(&ensure.paths.key_path)
             .await
             .context("Failed to read rootCA-key.pem")?;
 
@@ -101,14 +163,8 @@ impl CertManager {
             let ca_key =
                 KeyPair::from_pem(&ca_key_pem).context("Failed to parse rootCA-key.pem")?;
 
-            // Reconstruct CA params to match `locald trust`
-            let mut ca_params = CertificateParams::default();
-            let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, "locald Development CA");
-            dn.push(DnType::OrganizationName, "locald");
-            ca_params.distinguished_name = dn;
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-            ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            // Reconstruct CA params to match the stored CA
+            let ca_params = root_ca_params();
 
             CertifiedIssuer::self_signed(ca_params, ca_key)
                 .context("Failed to create CertifiedIssuer")
@@ -193,6 +249,92 @@ impl ResolvesServerCert for CertManager {
 ///
 /// Returns an error if the user's home directory cannot be determined.
 pub fn get_certs_dir() -> Result<PathBuf> {
+    // When invoked via pkexec/sudo, prefer the invoking user's home directory rather than /root.
+    // This keeps the CA location consistent between the privileged setup path and the unprivileged
+    // daemon/server path.
+    #[cfg(unix)]
+    {
+        if let Ok(pkexec_uid) = std::env::var("PKEXEC_UID")
+            && let Ok(uid) = pkexec_uid.parse::<u32>()
+        {
+            let uid = nix::unistd::Uid::from_raw(uid);
+            if let Ok(Some(user)) = nix::unistd::User::from_uid(uid) {
+                return Ok(user.dir.join(".locald").join("certs"));
+            }
+        }
+
+        if let Ok(sudo_user) = std::env::var("SUDO_USER")
+            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+        {
+            return Ok(user.dir.join(".locald").join("certs"));
+        }
+    }
+
     let home = directories::UserDirs::new().context("Could not find home directory")?;
     Ok(home.home_dir().join(".locald").join("certs"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use temp_env::with_vars;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_temp_dir() -> PathBuf {
+        let base = std::env::temp_dir();
+        base.join(format!("locald-utils-cert-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn ensure_root_ca_creates_both_files() {
+        let dir = unique_temp_dir();
+        let ensure = ensure_root_ca_in_dir(&dir).expect("ensure_root_ca_in_dir should succeed");
+        assert!(ensure.created);
+        assert!(ensure.paths.cert_path.exists());
+        assert!(ensure.paths.key_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_root_ca_errors_on_partial_state() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rootCA.pem"), "dummy").unwrap();
+
+        let err = ensure_root_ca_in_dir(&dir).unwrap_err();
+        assert!(err.to_string().contains("partially configured"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_certs_dir_respects_pkexec_uid_and_sudo_user() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let uid = nix::unistd::getuid();
+        let user = nix::unistd::User::from_uid(uid).unwrap().unwrap();
+
+        // PKEXEC_UID
+        with_vars(
+            [
+                ("SUDO_USER", None),
+                ("PKEXEC_UID", Some(uid.as_raw().to_string())),
+            ],
+            || {
+                let dir = get_certs_dir().unwrap();
+                assert_eq!(dir, user.dir.join(".locald").join("certs"));
+            },
+        );
+
+        // SUDO_USER
+        with_vars(
+            [("PKEXEC_UID", None), ("SUDO_USER", Some(user.name.clone()))],
+            || {
+                let dir = get_certs_dir().unwrap();
+                assert_eq!(dir, user.dir.join(".locald").join("certs"));
+            },
+        );
+    }
 }
