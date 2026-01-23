@@ -128,19 +128,11 @@ fn try_auto_fix_shim() -> bool {
         return false;
     };
 
-    let status = if should_attempt_host_setup() {
-        std::process::Command::new(exe)
-            .arg("admin")
-            .arg("setup")
-            .arg("--host")
-            .status()
-    } else {
-        std::process::Command::new("sudo")
-            .arg(exe)
-            .arg("admin")
-            .arg("setup")
-            .status()
-    };
+    let status = std::process::Command::new("sudo")
+        .arg(exe)
+        .arg("admin")
+        .arg("setup")
+        .status();
 
     match status {
         Ok(s) if s.success() => {
@@ -154,94 +146,14 @@ fn try_auto_fix_shim() -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn looks_like_systemctl_connectivity_failure(stderr: &str) -> bool {
-    let s = stderr.to_lowercase();
-    s.contains("failed to connect to system scope bus") || s.contains("failed to connect to bus")
-}
-
 // Re-export blocking container functions from locald-utils for use in early-startup code
 #[cfg(target_os = "linux")]
-pub use locald_utils::container::blocking::{
-    command_exists, is_probably_container, start_host_shim,
-};
+pub use locald_utils::container::blocking::is_probably_container;
 
 // For non-Linux platforms, provide stub implementations
 #[cfg(not(target_os = "linux"))]
 fn is_probably_container() -> bool {
     false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn command_exists(_name: &str) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_mount_is_readonly() -> Option<bool> {
-    // Parse /proc/self/mountinfo and locate the mount entry for /sys/fs/cgroup.
-    // Field layout: see `man proc`.
-    let contents = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    for line in contents.lines() {
-        let mut parts = line.split_whitespace();
-        let _mount_id = parts.next()?;
-        let _parent_id = parts.next()?;
-        let _major_minor = parts.next()?;
-        let _root = parts.next()?;
-        let mount_point = parts.next()?;
-        let mount_opts = parts.next()?;
-        if mount_point == "/sys/fs/cgroup" {
-            let ro = mount_opts.split(',').any(|o| o == "ro");
-            return Some(ro);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn systemctl_can_connect() -> Option<bool> {
-    if !command_exists("systemctl") {
-        return None;
-    }
-
-    let output = std::process::Command::new("systemctl")
-        .arg("--no-pager")
-        .arg("is-system-running")
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        return Some(true);
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if looks_like_systemctl_connectivity_failure(&stderr) {
-        return Some(false);
-    }
-
-    // If systemctl ran and failed for another reason, treat it as "connectivity unknown".
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn should_attempt_host_setup() -> bool {
-    if !is_probably_container() {
-        return false;
-    }
-
-    // Only attempt host setup if we have a known host-exec mechanism available.
-    if !(command_exists("flatpak-spawn") || command_exists("distrobox-host-exec")) {
-        return false;
-    }
-
-    // Strong signal: cgroup mount is read-only.
-    if matches!(cgroup_mount_is_readonly(), Some(true)) {
-        return true;
-    }
-
-    // Secondary signal: systemctl can't connect (common when PID 1 is host systemd but
-    // container lacks the required sockets).
-    matches!(systemctl_can_connect(), Some(false))
 }
 
 /// Offer interactive first-run setup when no shim is installed.
@@ -285,9 +197,7 @@ fn offer_first_run_setup() -> bool {
     // This provides a GUI auth dialog instead of requiring terminal sudo.
     let use_pkexec = locald_utils::shim::is_polkit_available();
 
-    let setup_prompt = if should_attempt_host_setup() {
-        "Run `locald admin setup --host` now?"
-    } else if use_pkexec {
+    let setup_prompt = if use_pkexec {
         "Run `pkexec locald admin setup` now? (GUI auth dialog)"
     } else {
         "Run `sudo locald admin setup` now?"
@@ -299,115 +209,89 @@ fn offer_first_run_setup() -> bool {
         .interact()
         .unwrap_or(false);
 
-    if run_setup {
-        let exe_path = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to get executable path: {}", e);
-                std::process::exit(1);
-            }
-        };
+    if !run_setup {
+        return false;
+    }
 
-        let status = if should_attempt_host_setup() {
-            eprintln!(
-                "{} Detected container environment; attempting host setup...",
-                style::WARN
-            );
-            std::process::Command::new(&exe_path)
-                .arg("admin")
-                .arg("setup")
-                .arg("--host")
-                .status()
-        } else if use_pkexec {
-            // Use pkexec for GUI-based privilege escalation
-            eprintln!(
-                "{} Using polkit for privilege escalation (GUI auth dialog)...",
-                style::INFO
-            );
-            let pkexec_result = std::process::Command::new("pkexec")
-                .arg(&exe_path)
-                .arg("admin")
-                .arg("setup")
-                .status();
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to get executable path: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-            // If pkexec fails (e.g., user cancelled dialog), try sudo as fallback
-            match &pkexec_result {
-                Ok(s) if s.success() => pkexec_result,
-                _ => {
-                    eprintln!(
-                        "{} pkexec failed or was cancelled, falling back to sudo...",
-                        style::WARN
-                    );
-                    std::process::Command::new("sudo")
-                        .arg("--")
-                        .arg(&exe_path)
-                        .arg("admin")
-                        .arg("setup")
-                        .status()
-                }
-            }
-        } else {
-            std::process::Command::new("sudo")
-                .arg("--")
-                .arg(&exe_path)
-                .arg("admin")
-                .arg("setup")
-                .status()
-        };
+    let status = if use_pkexec {
+        // Use pkexec for GUI-based privilege escalation
+        eprintln!(
+            "{} Using polkit for privilege escalation (GUI auth dialog)...",
+            style::INFO
+        );
+        let pkexec_result = std::process::Command::new("pkexec")
+            .arg(&exe_path)
+            .arg("admin")
+            .arg("setup")
+            .status();
 
-        match status {
-            Ok(s) if s.success() => {
-                eprintln!();
+        // If pkexec fails (e.g., user cancelled dialog), try sudo as fallback
+        match &pkexec_result {
+            Ok(s) if s.success() => pkexec_result,
+            _ => {
                 eprintln!(
-                    "{} Setup complete! Continuing with your command...",
-                    style::CHECK
+                    "{} pkexec failed or was cancelled, falling back to sudo...",
+                    style::WARN
                 );
-                eprintln!();
-                true // Continue with original command
-            }
-            Ok(s) => {
-                eprintln!("Setup failed with exit code: {:?}", s.code());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Failed to run setup: {}", e);
-                std::process::exit(1);
+                std::process::Command::new("sudo")
+                    .arg("--")
+                    .arg(&exe_path)
+                    .arg("admin")
+                    .arg("setup")
+                    .status()
             }
         }
     } else {
-        eprintln!();
-        eprintln!("Setup skipped. Run manually when ready:");
-        if use_pkexec {
-            eprintln!("  pkexec locald admin setup  (GUI auth dialog)");
-            eprintln!("  or: sudo locald admin setup");
-        } else {
-            eprintln!("  sudo locald admin setup");
+        std::process::Command::new("sudo")
+            .arg("--")
+            .arg(&exe_path)
+            .arg("admin")
+            .arg("setup")
+            .status()
+    };
+
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!();
+            eprintln!(
+                "{} Setup complete! Continuing with your command...",
+                style::CHECK
+            );
+            eprintln!();
+            true // Continue with original command
         }
-        eprintln!();
-        // Exit because we can't proceed without shim
-        std::process::exit(0);
+        Ok(s) => {
+            eprintln!("Setup failed with exit code: {:?}", s.code());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to run setup: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
-/// Show error that privileged helper access is required and exit.
-/// This is NOT a warning - we do not continue without privileges.
-fn show_privilege_required_error() -> ! {
+/// Show error that locald cannot run inside containers.
+fn show_container_unsupported_error() -> ! {
     eprintln!();
-    eprintln!("{} locald requires privileged helper access.", style::CROSS);
-    eprintln!();
-    eprintln!("This is needed for: hosts file sync, cgroup isolation, privileged ports.");
-    eprintln!();
-    eprintln!("To fix:");
     eprintln!(
-        "  {} Container: flatpak-spawn --host pkexec locald-shim serve",
-        style::DOT
+        "{} locald does not support running inside containers.",
+        style::CROSS
     );
-    eprintln!("  {} Direct:    sudo locald admin setup", style::DOT);
     eprintln!();
-    eprintln!("To test without privileges, use sandbox mode:");
-    eprintln!("  locald --sandbox test up");
+    eprintln!("Please run locald on the host OS.");
     eprintln!();
-    eprintln!("For diagnosis: locald doctor");
+    eprintln!(
+        "If you need the CLI inside a container, expose the host binary into the container using your tooling."
+    );
     eprintln!();
     std::process::exit(1);
 }
@@ -427,66 +311,8 @@ pub fn verify_shim() {
 
         // Only check if we are NOT already running under the shim
         if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
-            // In container environments, prefer socket-based daemon over setuid shim.
-            // The setuid shim often can't work across container boundaries.
-            #[allow(clippy::items_after_statements)]
             if is_probably_container() {
-                use locald_utils::container::ContainerConfig;
-
-                // Try to connect to existing shim socket daemon
-                // NOTE: This is shim_client::socket_path() -> ~/.locald/shim.sock
-                // NOT ipc::socket_path() -> /tmp/locald.sock (the server socket)
-                if let Ok(shim_socket) = locald_utils::shim_client::socket_path() {
-                    if shim_socket.exists() {
-                        // Shim socket exists, assume daemon is running - we're good
-                        return;
-                    }
-                }
-
-                // Socket doesn't exist, try to auto-start the host daemon
-                eprintln!("{} Attempting to start shim daemon on host...", style::INFO);
-
-                match start_host_shim(&ContainerConfig::default()) {
-                    Ok(()) => {
-                        // Wait for shim socket to appear
-                        let Ok(shim_socket) = locald_utils::shim_client::socket_path() else {
-                            // Can't determine socket path - fatal error
-                            show_privilege_required_error();
-                        };
-
-                        for attempt in 1..=10 {
-                            #[allow(clippy::disallowed_methods)]
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            if shim_socket.exists() {
-                                eprintln!(
-                                    "{} Host shim daemon started successfully.",
-                                    style::CHECK
-                                );
-                                return;
-                            }
-                            if attempt == 5 {
-                                eprintln!(
-                                    "{} Still waiting for host daemon to start...",
-                                    style::INFO
-                                );
-                            }
-                        }
-                        // Timeout waiting for socket - fatal error
-                        eprintln!(
-                            "{} Host daemon started but socket not available.",
-                            style::CROSS
-                        );
-                        show_privilege_required_error();
-                    }
-                    Err(e) => {
-                        eprintln!("{} Failed to auto-start host daemon: {}", style::WARN, e);
-                        // Offer interactive setup like non-container path
-                        if !offer_first_run_setup() {
-                            show_privilege_required_error();
-                        }
-                    }
-                }
-                return;
+                show_container_unsupported_error();
             }
 
             // Non-container path: check for setuid shim
@@ -536,7 +362,6 @@ pub fn verify_shim() {
 mod tests {
     use super::*;
 
-    // Note: Tests for host-exec template substitution are now in the host-spawn crate.
     // The following tests document the container detection behavior for locald.
 
     /// Documents the container detection heuristics.
@@ -545,10 +370,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn container_detection_heuristics_are_documented() {
         // The function checks these signals in order:
-        // 1. $container env var (set by systemd-nspawn, podman, etc.)
-        // 2. $TOOLBOX_PATH or $TOOLBOX_CONTAINER (Toolbx-specific)
-        // 3. /run/.containerenv (Podman/Toolbx marker file)
-        // 4. /.dockerenv (Docker marker file)
+        // 1. $container env var (set by container runtimes)
+        // 2. Runtime-specific env vars used by some container runtimes
+        // 3. /run/.containerenv (common container marker file)
+        // 4. /.dockerenv (common container marker file)
 
         // We can't easily test filesystem markers in unit tests, but we can
         // verify the function exists and is callable.
@@ -556,30 +381,10 @@ mod tests {
         let _ = is_probably_container();
     }
 
-    /// Documents the expected behavior: in containers, missing shim should NOT block.
-    ///
-    /// This is the critical invariant for the Toolbx/Distrobox workflow:
-    /// - Host: `sudo locald admin setup` (installs setuid shim)
-    /// - Container: `locald up` (runs services, tolerates missing shim)
+    /// Container detection remains for friendly errors, but locald is host-only.
     #[test]
     #[cfg(target_os = "linux")]
-    fn container_workflow_is_documented() {
-        // The workflow is:
-        // 1. User installs locald on host
-        // 2. User runs `sudo locald admin setup` on host
-        //    - This installs the setuid shim
-        //    - This configures cgroups
-        // 3. User enters Toolbx/Distrobox
-        // 4. User runs `locald up`
-        //    - locald detects container environment
-        //    - locald warns about missing privileged features
-        //    - locald proceeds to run services anyway
-        //
-        // The key invariant: `locald up` must NOT prompt for setup or exit
-        // with an error when running inside a container, even if the shim
-        // appears unavailable (due to user namespace UID mapping).
-
-        // This is tested by the verify_shim() function checking is_probably_container()
-        // before offering first-run setup.
+    fn container_detection_still_exists_for_guidance() {
+        let _ = is_probably_container();
     }
 }

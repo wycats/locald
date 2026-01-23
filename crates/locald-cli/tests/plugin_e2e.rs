@@ -7,6 +7,7 @@
 //!
 //! Note: These tests require the redis-plugin example to be built first:
 //!   cd examples/redis-plugin && cargo component build --release
+#![cfg(feature = "experimental-plugins")]
 
 use std::fs;
 use std::path::PathBuf;

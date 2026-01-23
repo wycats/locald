@@ -53,6 +53,19 @@ title = "Example plugin + e2e verification"
 status = "completed"
 notes = "Add a small example plugin + an automated verification path (fixtures + at least one e2e test) to prove discovery → execution → plan application works."
 
+[[plan.changes.tasks]]
+id = "29.4"
+title = "Remove container workflow (RFC 0138)"
+status = "pending"
+
+[[plan.changes]]
+name = "Remove container workflow code"
+type = "refactor"
+details = "Remove host-spawn crate, socket client/daemon, and simplify privilege acquisition to setuid-only per RFC 0138."
+files = ["Cargo.toml", "crates/locald-utils/Cargo.toml", "crates/locald-utils/src/container.rs", "crates/locald-utils/src/shim_client.rs", "crates/locald-utils/src/privileged.rs", "crates/locald-shim/src/daemon.rs", "crates/locald-shim/src/protocol.rs", "crates/locald-core/src/config/global.rs", "crates/locald-cli/src/utils.rs"]
+tests = ["scripts/verify-phase.sh"]
+satisfies = ["29.4"]
+
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
 manual = []

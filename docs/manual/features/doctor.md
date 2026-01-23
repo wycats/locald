@@ -31,13 +31,9 @@ locald doctor --verbose
 - Does the shim version match what `locald` expects?
 - Can the shim actually perform privileged work? (smoke test)
 
-### Socket Connectivity (Critical in Container Environments)
+### Container Environments
 
-When running inside a container (Toolbx, Distrobox, Docker):
-
-- Is the shim socket available at `~/.locald/shim.sock`?
-- Can we successfully connect and communicate with the daemon?
-- Is the protocol version compatible?
+When running inside a container, `locald doctor` reports the environment as **unsupported** and provides guidance to run `locald` on the host instead.
 
 ### Cgroup Readiness (Critical for Cleanup)
 
@@ -55,12 +51,11 @@ When running inside a container (Toolbx, Distrobox, Docker):
 
 ### Privilege Mode
 
-The doctor reports which privilege mode is in use:
+The doctor reports the privilege mode in use:
 
-| Mode     | Description                                          |
-| -------- | ---------------------------------------------------- |
-| `setuid` | Using the setuid shim binary directly (host)         |
-| `socket` | Using the shim daemon socket (container environment) |
+| Mode     | Description                                  |
+| -------- | -------------------------------------------- |
+| `setuid` | Using the setuid shim binary directly (host) |
 
 ### Cleanup Mode
 
@@ -89,29 +84,11 @@ The shim version doesn't match the `locald` binary.
 
 **Fix**: Run `sudo locald admin setup` to reinstall the shim
 
-#### `socket.unavailable`
+#### `environment.container`
 
-The shim daemon socket is not available. This is common inside containers when the host daemon isn't running.
+The doctor detected a container environment. The container workflow is no longer supported.
 
-**Fix**:
-
-1. Start the daemon on the host: `sudo locald-shim serve`
-2. Or configure `host_exec` in your config to enable auto-start
-
-#### `socket.connection_failed`
-
-The socket exists but connection failed.
-
-**Fix**:
-
-1. Check if the daemon is running: `cat ~/.locald/shim.pid`
-2. Restart the daemon: `rm ~/.locald/shim.sock && sudo locald-shim serve`
-
-#### `socket.permission_denied`
-
-Connected to socket but UID validation failed.
-
-**Fix**: Ensure the daemon was started by the same user (or root on behalf of that user)
+**Fix**: Run `locald` on the host OS. If you need CLI access inside a container, expose the host binary into the container using your container tooling.
 
 #### `cgroup.v2_unavailable`
 
@@ -164,7 +141,7 @@ When using `--json`, the output follows this structure:
 
 ### Problem Object
 
-- `id`: Stable string identifier (e.g., `shim.not_found`, `socket.unavailable`)
+- `id`: Stable string identifier (e.g., `shim.not_found`, `environment.container`)
 - `severity`: `"critical"`, `"warning"`, or `"info"`
 - `status`: `"pass"`, `"fail"`, or `"skip"`
 - `summary`: One-line description
@@ -182,26 +159,19 @@ When multiple problems share the same fix (e.g., both shim issues and cgroup iss
 
 ## Container-Specific Behavior
 
-When running inside a container, `locald doctor` adapts its checks:
+When running inside a container, `locald doctor` reports the environment as unsupported and provides host-only guidance.
 
-1. **Socket-first**: Checks for socket connectivity before checking setuid shim
-2. **Container detection**: Reports that you're in a container environment
-3. **Actionable guidance**: Provides host-specific instructions
-
-Example output in a container without shim daemon:
+Example output:
 
 ```
 ┌  locald doctor
 │
-◆  Container environment detected (Toolbx)
-│
-├  Privilege Mode: unavailable
+◆  Container environment detected
 │
 ├  Problems:
-│  ✗ socket.unavailable (critical)
-│    The shim daemon socket is not available.
-│    Start the daemon on your host:
-│      sudo locald-shim serve
+│  ✗ environment.container (critical)
+│    locald does not support running inside containers.
+│    Run locald on the host OS.
 │
 └  1 critical issue found
 ```
@@ -223,5 +193,5 @@ fi
 
 ## See Also
 
-- [Container Development Environments](../development/container-environments.md) - Full container setup guide
+- [Container Development Environments](../development/container-environments.md) - Host-first guidance for containerized toolchains
 - [Shim Management](../architecture/shim-management.md) - Deep dive on the shim architecture

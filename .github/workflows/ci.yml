@@ -3,6 +3,13 @@ name: CI
 # ==============================================================================
 # CI TESTING POLICY
 # ==============================================================================
+# DUAL-FEATURE TESTING:
+# Tests run twice - once with default features (stable) and once with all
+# features (nightly). Both must pass to gate merge:
+#   - Stable: ensures experimental features don't break the default build
+#   - Nightly: ensures experimental features pass their own tests
+#
+# PLATFORM POLICY:
 # macOS is a first-class platform. Do NOT disable features or skip tests on
 # macOS just for implementation convenience (e.g., avoiding dependency setup).
 #
@@ -417,10 +424,10 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: ./target/release/locald --help
 
-      - name: Run unit tests (macOS-compatible crates only)
+      - name: Run unit tests (stable features)
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
-          # Run tests with all default features (including embedded UI).
+          # Run tests with default features (stable channel).
           # Excluded crates are genuinely Linux-only:
           #   - locald-shim: Uses Linux namespaces, cgroups, capabilities
           #   - locald-vmm: Linux KVM/microVM support
@@ -428,6 +435,18 @@ jobs:
           cargo test --lib --bin locald \
             --workspace \
             --features channel-stable \
+            --exclude locald-shim \
+            --exclude locald-vmm \
+            --exclude locald-e2e
+
+      - name: Run unit tests (all features)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          # Run tests with all features enabled (nightly channel).
+          # This ensures experimental features compile and pass tests on macOS.
+          cargo test --lib --bin locald \
+            --workspace \
+            --all-features \
             --exclude locald-shim \
             --exclude locald-vmm \
             --exclude locald-e2e
@@ -572,22 +591,57 @@ jobs:
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Run tests (PR fast lane)
+      - name: Run tests (PR fast lane - stable features)
         if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.run == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "::group::Testing with stable features (default)"
+          cargo build -p locald-cli
+          cargo build -p locald-shim
+
+          # Test with default features only (stable channel)
+          # This ensures experimental features don't break the stable build
+          cargo test --tests --workspace --exclude locald-e2e
+          echo "::endgroup::"
+
+      - name: Run tests (PR fast lane - all features)
+        if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Testing with all features (nightly channel)"
           cargo build -p locald-cli --all-features
           cargo build -p locald-shim
 
+          # Test with all features enabled (nightly channel)
+          # This ensures experimental features pass their own tests
           cargo test --tests --workspace --all-features --exclude locald-e2e
+          echo "::endgroup::"
 
       - name: Run tests and generate coverage
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
         shell: bash
         run: |
           set -euo pipefail
+
+          # =======================================================================
+          # FEATURE MATRIX TESTING
+          # =======================================================================
+          # We test with two feature configurations:
+          #   1. Default features (stable channel) - ensures stable builds work
+          #   2. All features (nightly channel) - ensures experimental features work
+          #
+          # Both must pass. Coverage is generated from the all-features run.
+          # =======================================================================
+
+          echo "::group::Testing with stable features (default)"
+          cargo build -p locald-cli
+          cargo build -p locald-shim
+          cargo test --tests --workspace --exclude locald-e2e
+          echo "::endgroup::"
 
           # Build + test in distinct steps so we can run `locald admin setup`
           # after the instrumented `locald` binary is built (to avoid
@@ -599,12 +653,14 @@ jobs:
           export CARGO_LLVM_COV_TARGET_DIR="$CARGO_TARGET_DIR"
           export CARGO_LLVM_COV_BUILD_DIR="$CARGO_TARGET_DIR"
 
+          echo "::group::Testing with all features (nightly channel) + coverage"
           cargo build -p locald-cli --all-features
           cargo build -p locald-shim
           sudo "$CARGO_TARGET_DIR/debug/locald" admin setup
 
           # Run most tests first. This may rebuild workspace binaries (including `locald-shim`).
           cargo test --tests --workspace --all-features --exclude locald-e2e
+          echo "::endgroup::"
 
           # Re-install the privileged shim right before the OCI e2e tests.
           sudo "$CARGO_TARGET_DIR/debug/locald" admin setup

@@ -5,7 +5,7 @@ pub mod cert;
 /// Cgroup v2 helpers (Linux only).
 #[cfg(target_os = "linux")]
 pub mod cgroup;
-/// Container detection and host execution helpers.
+/// Container detection helpers.
 pub mod container;
 /// Port discovery utilities.
 pub mod discovery;
@@ -30,6 +30,3 @@ pub mod process;
 pub mod project;
 /// Shim management utilities.
 pub mod shim;
-/// Shim daemon client for socket-based privilege delegation.
-#[cfg(target_os = "linux")]
-pub mod shim_client;

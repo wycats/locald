@@ -1,4 +1,5 @@
 //! Regression tests for handling symlinks during build context creation.
+#![cfg(feature = "experimental-cnb")]
 
 use std::fs;
 use std::os::unix::fs::symlink;

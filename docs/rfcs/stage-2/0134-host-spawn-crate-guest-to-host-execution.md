@@ -5,9 +5,14 @@ feature: Container Development
 exo:
     tool: exo rfc create
     protocol: 1
+superseded_by: "0138"
 ---
 
+
 # RFC 0134: Host-Spawn Crate (Guest-to-Host Execution)
+
+- **Superseded by**: RFC 0138
+
 
 **Stage**: 2 (Draft)
 **Author**: locald team

@@ -471,54 +471,7 @@ pub fn run(cli: Cli) -> Result<()> {
             match command {
                 // `args` is used only on Linux; suppress warning on other platforms.
                 #[allow(unused_variables)]
-                AdminCommands::Setup(args) => {
-                    #[cfg(all(unix, target_os = "linux"))]
-                    if args.host {
-                        // `--host` is intended for containerized environments (Toolbx/Distrobox)
-                        // where privileged setup must run on the host OS.
-                        #[cfg(target_os = "linux")]
-                        {
-                            use anyhow::Context;
-                            use locald_utils::container::blocking::{
-                                is_probably_container, run_on_host,
-                            };
-
-                            // If this doesn't look like a container, just proceed with local setup.
-                            if is_probably_container() {
-                                let exe_path = std::env::current_exe()
-                                    .context("Failed to resolve current executable path")?;
-
-                                // Try running with the current exe path first.
-                                let result = run_on_host(&[
-                                    "sudo",
-                                    "--",
-                                    exe_path.to_str().unwrap_or("locald"),
-                                    "admin",
-                                    "setup",
-                                ]);
-                                if let Ok(status) = result {
-                                    if status.success() {
-                                        return Ok(());
-                                    }
-                                }
-
-                                // Fall back to calling `locald` on the host PATH (useful when
-                                // the current binary path is not visible on the host).
-                                let result =
-                                    run_on_host(&["sudo", "--", "locald", "admin", "setup"]);
-                                if let Ok(status) = result {
-                                    if status.success() {
-                                        return Ok(());
-                                    }
-                                }
-
-                                anyhow::bail!(
-                                    "Host setup requested but no host-exec mechanism succeeded.\n\nTry running `sudo locald admin setup` on the host OS. If you're in Toolbx/Distrobox, ensure the host can see your `locald` binary (your home directory is usually shared). Otherwise, install `locald` on the host PATH.\n\nIf available, you can also run setup via `flatpak-spawn --host` or `distrobox-host-exec`."
-                                );
-                            }
-                        }
-                    }
-
+                AdminCommands::Setup => {
                     #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
                         use crossterm::tty::IsTty;
@@ -578,42 +531,6 @@ pub fn run(cli: Cli) -> Result<()> {
                     {
                         const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));
 
-                        // Helper functions must be declared before any statements (clippy::items_after_statements)
-                        fn is_executable(path: &std::path::Path) -> bool {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let Ok(meta) = std::fs::metadata(path) else {
-                                    return false;
-                                };
-                                meta.is_file() && (meta.permissions().mode() & 0o111) != 0
-                            }
-
-                            #[cfg(not(unix))]
-                            {
-                                path.is_file()
-                            }
-                        }
-
-                        fn command_exists(name: &str) -> bool {
-                            if name.contains('/') {
-                                return is_executable(std::path::Path::new(name));
-                            }
-
-                            let Some(path) = std::env::var_os("PATH") else {
-                                return false;
-                            };
-
-                            for dir in std::env::split_paths(&path) {
-                                let candidate = dir.join(name);
-                                if is_executable(&candidate) {
-                                    return true;
-                                }
-                            }
-
-                            false
-                        }
-
                         cliclack::intro("locald admin setup")?;
 
                         let exe_path = std::env::current_exe()?;
@@ -628,7 +545,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
 
                         // Install polkit policy for GUI privilege escalation (optional).
-                        // This enables `pkexec locald-shim serve` to show a graphical auth dialog.
+                        // This enables `pkexec locald admin setup` to show a graphical auth dialog.
                         // Note: We delegate to the shim binary so the write runs in a known-privileged context.
                         {
                             let s = cliclack::spinner();
@@ -703,15 +620,6 @@ pub fn run(cli: Cli) -> Result<()> {
                                     && stderr_lc.contains("/sys/fs/cgroup")
                                 {
                                     remediation.push_str("\n\nThis looks like a containerized environment where cgroup v2 is mounted read-only. `locald admin setup` must be run on the host OS.");
-
-                                    // Suggest common host-exec mechanisms when present.
-                                    // We only print hints here; we intentionally do not auto-reexec.
-                                    if command_exists("flatpak-spawn") {
-                                        remediation.push_str("\nIf available, you can run: flatpak-spawn --host sudo -- locald admin setup");
-                                    }
-                                    if command_exists("distrobox-host-exec") {
-                                        remediation.push_str("\nIf available, you can run: distrobox-host-exec sudo -- locald admin setup");
-                                    }
                                 }
 
                                 anyhow::bail!(
@@ -733,7 +641,6 @@ pub fn run(cli: Cli) -> Result<()> {
                                 verbose: false,
                                 expected_shim_version: expected_version,
                                 expected_shim_bytes: Some(SHIM_BYTES),
-                                allow_socket: true,
                             })?;
 
                             if report.has_critical_failures() {

@@ -10,7 +10,7 @@ title: Process Types & Start Commands
 
 1.  **Explicit Command**: A `command` defined in `locald.toml`.
 2.  **Procfile**: A `web` process defined in a `Procfile`.
-3.  **CNB Metadata**: The default process type defined by the Cloud Native Buildpack (CNB) image.
+3.  **CNB Metadata**: The default process type defined by Cloud Native Buildpack (CNB) metadata (when using buildpack-based builds).
 
 ## 1. Explicit Command
 
@@ -32,17 +32,17 @@ worker: npm run worker
 
 `locald` will use the command associated with the `web` process type by default.
 
-## 3. CNB Default Process (Container Mode Only)
+## 3. CNB Default Process (Buildpack Metadata)
 
-If you have opted into **Container Execution** (via `[service.build]`) and haven't defined a command or `Procfile`, `locald` will inspect the built image's metadata.
+If you are using buildpack-based builds and haven't defined a command or `Procfile`, `locald` can inspect the buildpack metadata to pick a default process.
 
 Buildpacks often detect the project type and define a default start command. For example, a Node.js buildpack might default to `node server.js` or `npm start`.
 
-`locald` reads the `io.buildpacks.build.metadata` label from the image and executes the process marked as `default` (or the `web` process if no default is marked).
+`locald` reads the `io.buildpacks.build.metadata` label and executes the process marked as `default` (or the `web` process if no default is marked).
 
 ### How it works
 
-When `locald` starts a CNB-built container without an explicit command:
+When `locald` starts a CNB-built service without an explicit command:
 
 1.  It reads the OCI image labels.
 2.  It parses the `io.buildpacks.build.metadata` JSON.

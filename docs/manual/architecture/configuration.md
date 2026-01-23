@@ -55,32 +55,8 @@ Server behavior settings:
 privileged_ports = true
 ```
 
-### `[container]`
+### Container Configuration
 
-Settings for container development environments (Toolbx, Distrobox, etc.):
+Container-specific configuration was removed with RFC 0138. `locald` runs on the host only.
 
-```toml
-[container]
-# Template for running commands on the host from inside a container.
-# {command} is replaced with the actual command to run.
-#
-# Examples:
-#   host_exec = "flatpak-spawn --host {command}"
-#   host_exec = "distrobox-host-exec {command}"
-#   host_exec = "ssh myhost {command}"
-#
-# If not set, auto-detection is attempted.
-host_exec = "flatpak-spawn --host {command}"
-
-# Override the socket path for the shim daemon.
-# Defaults to ~/.locald/shim.sock
-# Use this if your home directory is on NFS or another filesystem
-# that doesn't support Unix sockets.
-shim_socket = "/run/user/1000/locald/shim.sock"
-```
-
-**`host_exec`**: A template string for executing commands on the host from inside a container. The `{command}` placeholder is replaced with the actual command. If not set, `locald` auto-detects available mechanisms (`flatpak-spawn`, `distrobox-host-exec`).
-
-**`shim_socket`**: Override the default socket path (`~/.locald/shim.sock`). Useful when your home directory is on a network filesystem that doesn't support Unix sockets.
-
-See [Container Development Environments](../development/container-environments.md) for complete documentation.
+See [Container Development Environments](../development/container-environments.md) for the supported host-first patterns.
