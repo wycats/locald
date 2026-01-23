@@ -144,45 +144,13 @@ The shim protocol is versioned. `locald` checks the version of the shim on start
 - **Command**: `locald-shim --shim-version`
 - **Check**: If the shim version is older than what `locald` requires, `locald` will refuse to start and instruct the user to run `sudo locald admin setup` to update the shim.
 
-### 6. `serve` (Daemon Mode)
+## Privilege Acquisition
 
-Runs the shim as a persistent daemon that listens on a Unix socket for privileged operation requests.
+`locald` uses a **setuid-only** privilege model. The shim is invoked directly for specific operations, and exits immediately after completing them.
 
-- **Command**: `locald-shim serve [--foreground] [--socket <path>]`
-- **Socket**: `~/.locald/shim.sock` (default)
-- **Why**: Enables container environments (Toolbx, Distrobox) to delegate privileged operations to the host.
-
-**Lifecycle**:
-
-- **Idle timeout**: 5 minutes after last client disconnects
-- **Max lifetime**: 1 hour (ensures fresh binary after updates)
-- **Graceful shutdown**: Waits for in-flight requests before exiting
-
-**Protocol**: Length-prefixed JSON over Unix socket. See [Container Environments](../development/container-environments.md) for details.
-
-## Privilege Modes
-
-`locald` supports two privilege acquisition modes:
-
-| Mode     | Use Case              | How It Works                            |
-| -------- | --------------------- | --------------------------------------- |
-| `setuid` | Host environment      | Direct execution of setuid shim binary  |
-| `socket` | Container environment | Communication via `~/.locald/shim.sock` |
-
-**Socket-first Strategy**: When running, `locald` first tries to connect to the socket (for container support), then falls back to the setuid binary if not in a container.
-
-## Container Support
-
-For container development environments (Toolbx, Distrobox), the shim daemon provides a way to delegate privileged operations to the host OS:
-
-1. **On the host**: Run `sudo locald-shim serve` to start the daemon
-2. **In the container**: `locald up` automatically connects via socket
-
-The daemon listens on `~/.locald/shim.sock`, which is accessible from inside containers that share your home directory.
-
-See [Container Development Environments](../development/container-environments.md) for the complete guide.
+If a container environment is detected, `locald` reports an unsupported environment and instructs you to run on the host.
 
 ## See Also
 
-- [Container Development Environments](../development/container-environments.md) - How the shim daemon enables container workflows
-- [locald doctor](../features/doctor.md) - Diagnosing shim and socket issues
+- [Container Development Environments](../development/container-environments.md) - Host-first guidance for containerized toolchains
+- [locald doctor](../features/doctor.md) - Diagnosing shim and host readiness issues

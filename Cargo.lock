@@ -473,31 +473,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bon"
-version = "3.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234655ec178edd82b891e262ea7cf71f6584bcd09eff94db786be23f1821825c"
-dependencies = [
- "bon-macros",
- "rustversion",
-]
-
-[[package]]
-name = "bon-macros"
-version = "3.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89ec27229c38ed0eb3c0feee3d2c1d6a4379ae44f418a29a658890e062d8f365"
-dependencies = [
- "darling",
- "ident_case",
- "prettyplease",
- "proc-macro2",
- "quote",
- "rustversion",
- "syn",
-]
-
-[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2020,16 +1995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "host-spawn"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bon",
- "thiserror 2.0.17",
- "tokio",
-]
-
-[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2968,12 +2933,11 @@ dependencies = [
  "ca_injector",
  "caps",
  "clap",
- "daemonize",
  "libc",
  "libcontainer",
  "listeners",
+ "locald-utils",
  "nix 0.30.1",
- "rcgen",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2987,7 +2951,6 @@ dependencies = [
  "anyhow",
  "directories",
  "hex",
- "host-spawn",
  "nix 0.30.1",
  "portable-pty",
  "postgresql_embedded",
@@ -3000,6 +2963,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "temp-env",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -3843,16 +3807,6 @@ checksum = "72dd2d6d381dfb73a193c7fca536518d7caee39fc8503f74e7dc0be0531b425c"
 dependencies = [
  "predicates-core",
  "termtree",
-]
-
-[[package]]
-name = "prettyplease"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
-dependencies = [
- "proc-macro2",
- "syn",
 ]
 
 [[package]]
@@ -5416,6 +5370,15 @@ name = "target-triple"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ac9aa371f599d22256307c24a9d748c041e548cbf599f35d890f9d365361790"
+
+[[package]]
+name = "temp-env"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
+dependencies = [
+ "parking_lot 0.12.5",
+]
 
 [[package]]
 name = "tempfile"

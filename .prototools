@@ -1,2 +1,5 @@
 node = "latest"
 pnpm = "10.25.0"
+
+[settings]
+auto-install = true

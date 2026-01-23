@@ -3,13 +3,11 @@
 //! This module provides a shared, structured report used by `locald doctor` and by
 //! privileged call sites to prevent readiness drift.
 //!
-//! ## Privilege Acquisition Strategy (RFC 0130 Phase 4)
+//! ## Privilege Acquisition Strategy
 //!
-//! When acquiring privileged capabilities, the following order is used:
-//!
-//! 1. **Socket-first**: Try to connect to `~/.locald/shim.sock`
-//! 2. **Auto-start**: If socket missing but in container, try to start daemon on host
-//! 3. **Setuid fallback**: If not in container, use the setuid shim binary
+//! When acquiring privileged capabilities, locald only supports the host setuid shim.
+//! If a container environment is detected, locald returns a structured "unsupported"
+//! report with guidance to run on the host instead.
 
 #![allow(missing_docs)]
 
@@ -17,10 +15,8 @@ use crate::cert;
 #[cfg(target_os = "linux")]
 use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
 #[cfg(target_os = "linux")]
-use crate::container::{self, ContainerConfig};
+use crate::container;
 use crate::shim;
-#[cfg(target_os = "linux")]
-use crate::shim_client::{self, ShimClient};
 use anyhow::{Context, Result};
 #[cfg(target_os = "linux")]
 use nix::unistd::User;
@@ -28,10 +24,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::time::Duration;
-#[cfg(target_os = "linux")]
-use tracing::{debug, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,25 +121,11 @@ impl DoctorReport {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct AcquireConfig<'a> {
     pub verbose: bool,
     pub expected_shim_version: Option<&'a str>,
     pub expected_shim_bytes: Option<&'a [u8]>,
-    /// If true, attempt to auto-start the host shim daemon when in a container.
-    /// This requires a callback to start the daemon (provided by locald-cli).
-    pub allow_socket: bool,
-}
-
-impl Default for AcquireConfig<'_> {
-    fn default() -> Self {
-        Self {
-            verbose: false,
-            expected_shim_version: None,
-            expected_shim_bytes: None,
-            allow_socket: true,
-        }
-    }
 }
 
 impl AcquireConfig<'_> {
@@ -157,18 +135,16 @@ impl AcquireConfig<'_> {
             verbose: false,
             expected_shim_version: None,
             expected_shim_bytes: None,
-            allow_socket: true,
         }
     }
 
-    /// Create a config that only uses setuid shim (no socket).
+    /// Create a config that only uses the setuid shim.
     #[must_use]
     pub const fn setuid_only() -> Self {
         Self {
             verbose: false,
             expected_shim_version: None,
             expected_shim_bytes: None,
-            allow_socket: false,
         }
     }
 }
@@ -184,9 +160,6 @@ pub struct NotReady {
 pub enum PrivilegeMode {
     /// Use the setuid shim binary directly (host environment).
     Setuid(PathBuf),
-    /// Use the shim daemon socket (container environment).
-    #[cfg(target_os = "linux")]
-    Socket,
 }
 
 #[derive(Debug)]
@@ -195,76 +168,21 @@ pub struct Privileged {
     report: DoctorReport,
 }
 
-/// Timeout for waiting for the daemon to start.
-#[cfg(target_os = "linux")]
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
-
 impl Privileged {
     /// Acquire a capability for privileged effects.
     ///
-    /// This implements the socket-first strategy from RFC 0130 Phase 4:
-    /// 1. Try to connect to `~/.locald/shim.sock` (if `allow_socket` is true)
-    /// 2. If socket doesn't exist but in container, try to auto-start daemon on host
-    /// 3. Fall back to setuid binary if socket not available and not in container
+    /// If a container environment is detected, this returns a structured
+    /// "unsupported" report with host-only guidance.
     ///
     /// # Errors
     ///
     /// Returns `NotReady` when the host is not ready for privileged operations.
     #[cfg(target_os = "linux")]
     pub fn acquire(config: AcquireConfig<'_>) -> std::result::Result<Self, NotReady> {
-        // Strategy 1: Try socket first (if allowed)
-        if config.allow_socket {
-            match try_socket_connection() {
-                Ok(mode) => {
-                    debug!("Connected to shim daemon via socket");
-                    // Create a minimal passing report for socket mode
-                    let report = create_socket_mode_report();
-                    return Ok(Self { mode, report });
-                }
-                Err(e) => {
-                    debug!("Socket connection failed: {e}");
-                    // If we're in a container, try to auto-start the daemon
-                    if container::blocking::is_probably_container() {
-                        debug!("Container detected, attempting to auto-start host shim daemon");
-
-                        match container::blocking::start_host_shim(&ContainerConfig::default()) {
-                            Ok(()) => {
-                                info!("Successfully requested host shim daemon start");
-                                // Wait for daemon to start with retry
-                                let retry_interval = Duration::from_millis(500);
-                                let max_attempts = (DAEMON_START_TIMEOUT.as_millis()
-                                    / retry_interval.as_millis())
-                                    as u32;
-
-                                for attempt in 1..=max_attempts {
-                                    #[allow(clippy::disallowed_methods)]
-                                    // Sync sleep is intentional here
-                                    std::thread::sleep(retry_interval);
-                                    debug!(
-                                        "Retry attempt {attempt}/{max_attempts}: checking for socket..."
-                                    );
-
-                                    if let Ok(mode) = try_socket_connection() {
-                                        info!("Connected to shim daemon after auto-start");
-                                        let report = create_socket_mode_report();
-                                        return Ok(Self { mode, report });
-                                    }
-                                }
-                                debug!("Socket still not available after auto-start attempts");
-                            }
-                            Err(auto_start_err) => {
-                                debug!("Failed to auto-start host shim: {auto_start_err}");
-                            }
-                        }
-
-                        // Auto-start failed or timed out, return error
-                        return Err(NotReady {
-                            report: create_container_no_socket_report(&e),
-                        });
-                    }
-                    // Not in container, fall through to setuid
-                }
-            }
+        if container::blocking::is_probably_container() {
+            return Err(NotReady {
+                report: create_container_unsupported_report(),
+            });
         }
 
         // Strategy 2: Collect setuid report and use setuid shim
@@ -360,182 +278,58 @@ impl Privileged {
     }
 
     /// Create a tokio Command for the shim.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called in socket mode (use `shim_client()` instead).
-    #[allow(clippy::panic)]
     pub fn tokio_command(&self) -> tokio::process::Command {
-        match &self.mode {
-            PrivilegeMode::Setuid(path) => shim::tokio_command(path),
-            #[cfg(target_os = "linux")]
-            PrivilegeMode::Socket => {
-                panic!("tokio_command() not available in socket mode; use shim_client() instead")
-            }
-        }
+        let PrivilegeMode::Setuid(path) = &self.mode;
+        shim::tokio_command(path)
     }
 
     /// Create a std Command for the shim.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called in socket mode (use `shim_client()` instead).
-    #[allow(clippy::panic)]
     pub fn command(&self) -> std::process::Command {
-        match &self.mode {
-            PrivilegeMode::Setuid(path) => {
-                #[allow(clippy::disallowed_methods)]
-                let mut cmd = std::process::Command::new(path);
-                cmd.env_remove("LD_LIBRARY_PATH");
-                cmd
-            }
-            #[cfg(target_os = "linux")]
-            PrivilegeMode::Socket => {
-                panic!("command() not available in socket mode; use shim_client() instead")
-            }
-        }
-    }
-
-    /// Get a new connection to the shim daemon (socket mode only).
-    ///
-    /// Each call creates a new connection, allowing concurrent operations.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if not in socket mode or if the connection fails.
-    #[cfg(target_os = "linux")]
-    pub fn shim_client(&self) -> Result<ShimClient> {
-        match &self.mode {
-            PrivilegeMode::Socket => ShimClient::connect(),
-            PrivilegeMode::Setuid(_) => {
-                anyhow::bail!("shim_client() only available in socket mode")
-            }
-        }
-    }
-
-    /// Check if we're using socket mode.
-    #[must_use]
-    pub const fn is_socket_mode(&self) -> bool {
-        match &self.mode {
-            PrivilegeMode::Setuid(_) => false,
-            #[cfg(target_os = "linux")]
-            PrivilegeMode::Socket => true,
-        }
+        let PrivilegeMode::Setuid(path) = &self.mode;
+        #[allow(clippy::disallowed_methods)]
+        let mut cmd = std::process::Command::new(path);
+        cmd.env_remove("LD_LIBRARY_PATH");
+        cmd
     }
 }
 
-/// Try to connect to the shim daemon socket.
+/// Create a report indicating locald is running inside an unsupported container environment.
 #[cfg(target_os = "linux")]
-fn try_socket_connection() -> Result<PrivilegeMode> {
-    // Check if socket exists first (quick check)
-    if !shim_client::socket_exists() {
-        anyhow::bail!("Shim socket does not exist");
-    }
-
-    // Try to connect with a short timeout
-    let mut client = ShimClient::connect().context("Failed to connect to shim daemon")?;
-
-    // Ping to verify it's responsive
-    client.ping().context("Shim daemon ping failed")?;
-
-    Ok(PrivilegeMode::Socket)
-}
-
-/// Create a minimal passing report for socket mode.
-#[cfg(target_os = "linux")]
-fn create_socket_mode_report() -> DoctorReport {
+fn create_container_unsupported_report() -> DoctorReport {
     DoctorReport {
         strategy: StrategyReport {
             cgroup_root: CgroupStrategyKind::Direct,
-            why: "using shim daemon socket (container mode)".to_string(),
-        },
-        mode: CleanupMode::Enabled,
-        problems: vec![],
-        fixes: vec![],
-    }
-}
-
-/// Create a report indicating we're in a container but can't connect to the socket.
-#[cfg(target_os = "linux")]
-fn create_container_no_socket_report(socket_error: &anyhow::Error) -> DoctorReport {
-    DoctorReport {
-        strategy: StrategyReport {
-            cgroup_root: CgroupStrategyKind::Direct,
-            why: "container environment detected, socket not available".to_string(),
+            why: "container environment detected (host-only workflow)".to_string(),
         },
         mode: CleanupMode::Degraded,
         problems: vec![Problem {
-            id: "socket.unavailable".to_string(),
+            id: "environment.container".to_string(),
             severity: Severity::Critical,
             status: Status::Fail,
-            summary: "Cannot connect to host shim daemon from container".to_string(),
-            details: Some(format!(
-                "Socket connection failed: {socket_error}\n\n\
-                 To use locald inside a container (Toolbx, Distrobox), \
-                 the host shim daemon must be running."
-            )),
+            summary: "locald does not support running inside containers".to_string(),
+            details: Some(
+                "Run locald on the host OS. If you need the CLI inside a container, expose the host binary into the container using your container tooling.".to_string(),
+            ),
             remediation: vec![
-                format!("On the host, run: {}", shim::SHIM_SERVE_SUDO),
-                format!("Or run: flatpak-spawn --host {}", shim::SHIM_SERVE_PKEXEC),
+                "Run locald on the host OS".to_string(),
+                "If needed, expose the host binary into your container using your container tooling".to_string(),
             ],
-            evidence: vec![
-                EvidenceItem {
-                    key: "container.detected".to_string(),
-                    value: "true".to_string(),
-                },
-                EvidenceItem {
-                    key: "socket.path".to_string(),
-                    value: shim_client::socket_path()
-                        .map_or_else(|_| "unknown".to_string(), |p| p.display().to_string()),
-                },
-            ],
-            fix: Some(FixKey::RunAdminSetup),
+            evidence: vec![EvidenceItem {
+                key: "container.detected".to_string(),
+                value: "true".to_string(),
+            }],
+            fix: Some(FixKey::UnsupportedEnvironment),
         }],
         fixes: vec![FixAdvice {
-            key: FixKey::RunAdminSetup,
-            summary: "Start the host shim daemon".to_string(),
+            key: FixKey::UnsupportedEnvironment,
+            summary: "Run locald on the host OS".to_string(),
             commands: vec![
-                shim::SHIM_SERVE_SUDO.to_string(),
-                "# Or from inside container:".to_string(),
-                format!("flatpak-spawn --host {}", shim::SHIM_SERVE_PKEXEC),
+                "locald up".to_string(),
+                "# If you need CLI access inside a container:".to_string(),
+                "Expose the host locald binary into the container".to_string(),
             ],
         }],
     }
-}
-
-/// Try to connect to the shim socket, optionally auto-starting the daemon.
-///
-/// This is the main entry point for socket-based privilege acquisition when
-/// auto-start is desired. Call sites in locald-cli can use this with a
-/// start callback.
-///
-/// # Arguments
-///
-/// * `start_daemon` - A callback to start the host shim daemon if the socket
-///   doesn't exist. This should use the appropriate host-exec mechanism
-///   (flatpak-spawn, distrobox-host-exec, etc.).
-///
-/// # Errors
-///
-/// Returns an error if the connection cannot be established.
-#[cfg(target_os = "linux")]
-pub fn connect_with_auto_start<F>(start_daemon: F) -> Result<ShimClient>
-where
-    F: FnOnce() -> Result<()>,
-{
-    // First, try to connect directly
-    if let Ok(client) = ShimClient::connect() {
-        debug!("Connected to existing shim daemon");
-        return Ok(client);
-    }
-
-    // Socket doesn't exist or connection failed - try to start daemon
-    info!("Shim socket not available, attempting to start host daemon...");
-    start_daemon().context("Failed to start host shim daemon")?;
-
-    // Wait for daemon to become ready with retries
-    ShimClient::connect_with_retry(DAEMON_START_TIMEOUT)
-        .context("Failed to connect to shim daemon after starting it")
 }
 
 /// Collect a host readiness report.
@@ -545,6 +339,10 @@ where
 /// Returns an error if required host probes fail unexpectedly.
 #[cfg(target_os = "linux")]
 pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
+    if container::blocking::is_probably_container() {
+        return Ok(create_container_unsupported_report());
+    }
+
     let mut problems: Vec<Problem> = Vec::new();
 
     let (strategy, strategy_why) = detect_strategy();

@@ -2,9 +2,14 @@
 title: Host Shim Daemon for Container Development Environments
 stage: 2
 feature: Container Development
+superseded_by: "0138"
 ---
 
+
 # RFC 0130: Host Shim Daemon for Container Development Environments
+
+- **Superseded by**: RFC 0138
+
 
 **Stage**: 2 (Draft)
 **Author**: locald team

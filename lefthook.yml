@@ -3,19 +3,19 @@ pre-commit:
   commands:
     fmt:
       glob: "*.rs"
-      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo fmt --all
+      run: cargo fmt --all
       stage_fixed: true
     clippy:
       glob: "*.rs"
-      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo clippy --workspace -- -D warnings
+      run: cargo clippy --workspace -- -D warnings
     dashboard-lint:
       root: locald-dashboard
       glob: "*.{js,ts,svelte}"
-      run: PATH=$HOME/.proto/shims:$PATH pnpm lint
+      run: pnpm lint
     dashboard-check:
       root: locald-dashboard
       glob: "*.{js,ts,svelte}"
-      run: PATH=$HOME/.proto/shims:$PATH pnpm check
+      run: pnpm check
     sync-manifesto:
       glob: "docs/design/**/*.md"
       run: node ./locald-docs/scripts/sync-manifesto.mjs && git add locald-docs/src/content/docs/concepts locald-docs/src/content/docs/internals
@@ -24,7 +24,7 @@ pre-push:
   parallel: true
   commands:
     rust-checks:
-      run: PATH=$HOME/.cargo/bin:$HOME/.proto/shims:$PATH cargo xtask check
+      run: cargo xtask check
     docs-build:
-      root: locald-docs
-      run: PATH=$HOME/.proto/shims:$PATH CI=true pnpm install && pnpm build
+      root: locald-dashboard
+      run: CI=true pnpm install && pnpm build

@@ -1,4 +1,5 @@
 //! Tests for `locald plugin` subcommands.
+#![cfg(feature = "experimental-plugins")]
 
 use assert_cmd::Command;
 use predicates::str::contains;

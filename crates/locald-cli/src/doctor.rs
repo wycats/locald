@@ -49,7 +49,6 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         verbose,
         expected_shim_version: expected_version,
         expected_shim_bytes: shim_bytes,
-        allow_socket: true,
     })?;
 
     if json {
@@ -258,15 +257,19 @@ fn render_human_plain(report: &DoctorReport, verbose: bool) {
                     println!("- {}", fix.summary);
                 }
                 let mut saw_admin_setup = false;
+                let mut saw_locald_up = false;
 
                 for cmd in normalize_commands(&fix.commands) {
                     if cmd == "locald admin setup" {
                         saw_admin_setup = true;
                     }
+                    if cmd == "locald up" {
+                        saw_locald_up = true;
+                    }
                     println!("  - {}", cmd.as_str().bold());
                 }
 
-                if saw_admin_setup {
+                if saw_admin_setup || saw_locald_up {
                     println!("  - Next: run locald up.");
                 }
             }
@@ -434,15 +437,19 @@ fn render_human_cliclack(report: &DoctorReport, verbose: bool) {
             let _ = cliclack::log::info(&fix.summary);
         }
         let mut saw_admin_setup = false;
+        let mut saw_locald_up = false;
 
         for cmd in normalize_commands(&fix.commands) {
             if cmd == "locald admin setup" {
                 saw_admin_setup = true;
             }
+            if cmd == "locald up" {
+                saw_locald_up = true;
+            }
             let _ = cliclack::log::info(cmd.as_str().bold());
         }
 
-        if saw_admin_setup {
+        if saw_admin_setup || saw_locald_up {
             let _ = cliclack::log::info("Next: run locald up.");
         }
     }

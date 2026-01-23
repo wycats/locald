@@ -83,7 +83,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
     let skip_verify = matches!(
         cli.command,
         cli::Commands::Admin {
-            command: cli::AdminCommands::Setup(_)
+            command: cli::AdminCommands::Setup
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
             | cli::Commands::Init { .. }
@@ -101,7 +101,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
     let skip_verify = matches!(
         cli.command,
         cli::Commands::Admin {
-            command: cli::AdminCommands::Setup(_)
+            command: cli::AdminCommands::Setup
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
             | cli::Commands::Init { .. }
