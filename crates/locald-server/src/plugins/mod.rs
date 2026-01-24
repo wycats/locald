@@ -312,9 +312,6 @@ fn extract_service_config_kvs(
             if let Some(wd) = &exec.workdir {
                 kvs.push(("workdir".to_string(), runner::Value::Text(wd.clone())));
             }
-            if let Some(img) = &exec.image {
-                kvs.push(("image".to_string(), runner::Value::Text(img.clone())));
-            }
         }
         ServiceConfig::Typed(TypedServiceConfig::Worker(worker)) => {
             if !worker.command.is_empty() {
@@ -457,8 +454,6 @@ mod tests {
         let config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
             common: CommonServiceConfig::default(),
             command: Some("npm start".to_string()),
-            image: None,
-            container_port: None,
             workdir: None,
             build: None,
         }));
@@ -517,8 +512,6 @@ mod tests {
         let config = ServiceConfig::Legacy(ExecServiceConfig {
             common: CommonServiceConfig::default(),
             command: Some("rails server".to_string()),
-            image: None,
-            container_port: None,
             workdir: None,
             build: None,
         });
@@ -538,8 +531,6 @@ mod tests {
                 ..CommonServiceConfig::default()
             },
             command: Some("npm start".to_string()),
-            image: None,
-            container_port: None,
             workdir: None,
             build: None,
         }));
@@ -563,8 +554,6 @@ mod tests {
                 ..CommonServiceConfig::default()
             },
             command: Some("npm start".to_string()),
-            image: None,
-            container_port: None,
             workdir: None,
             build: None,
         }));
@@ -583,8 +572,6 @@ mod tests {
             common: CommonServiceConfig::default(),
             command: Some("npm start".to_string()),
             workdir: Some("./app".to_string()),
-            image: Some("node:18".to_string()),
-            container_port: None,
             build: None,
         }));
 
@@ -595,8 +582,6 @@ mod tests {
         ));
         assert!(kvs.iter().any(|(k, v)| k == "workdir"
             && matches!(v, runner::Value::Text(s) if s == "./app")));
-        assert!(kvs.iter().any(|(k, v)| k == "image"
-            && matches!(v, runner::Value::Text(s) if s == "node:18")));
     }
 
     #[test]
@@ -674,8 +659,6 @@ mod tests {
             common: CommonServiceConfig::default(),
             command: Some("rails server".to_string()),
             workdir: Some("./api".to_string()),
-            image: None,
-            container_port: None,
             build: None,
         });
 
@@ -736,8 +719,6 @@ mod tests {
             ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
                 common: CommonServiceConfig::default(),
                 command: Some("npm start".to_string()),
-                image: None,
-                container_port: None,
                 workdir: None,
                 build: None,
             })),

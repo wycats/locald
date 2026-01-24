@@ -87,8 +87,6 @@ pub fn run() -> Result<()> {
             },
             command: Some(command),
             workdir,
-            image: None,
-            container_port: None,
             build: None,
         }));
 
