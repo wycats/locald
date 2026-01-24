@@ -1,6 +1,6 @@
 ---
 title: Codebase Cleanup
-stage: 3
+stage: 2
 feature: Engineering Excellence
 ---
 
@@ -8,8 +8,30 @@ feature: Engineering Excellence
 
 ## Status
 
-- **Status**: Implemented (Stage 3)
-- **Shipped**: Merged via PR #5 (2025-12-15)
+- **Status**: Available (Stage 2)
+- **Initial Ship**: Merged via PR #5 (2025-12-15)
+- **Remaining Work**: See "Outstanding Items" section below
+
+## Outstanding Items (Stage 2 → Stage 3)
+
+The following items were identified in the 2026-01-24 audit and need completion:
+
+1. **Fix contradictory lint comment** in `crates/locald-server/src/lib.rs`:
+   - Current: `#![allow(clippy::unwrap_used)] // Force error propagation (no panics)`
+   - Problem: Comment claims "no panics" but `unwrap` can panic
+   - Fix: Update comment to accurately describe the policy
+
+2. **Remove pkill usage** in `scripts/verify-update.sh`:
+   - Line ~20 uses `pkill -f "locald --sandbox=$SANDBOX"`
+   - Should use `locald admin shutdown` or equivalent
+
+3. **Label experimental crates** in rustdoc:
+   - `locald-vmm` crate should have a crate-level doc comment marking it as experimental
+   - Example: `//! ⚠️ **Experimental**: This crate is under active development`
+
+4. **Audit unwrap/expect in production paths** (optional for Stage 3):
+   - Mechanical audit of Tier 1 (production) code paths
+   - Ensure error propagation is used instead of panics
 
 ## 1. Summary
 

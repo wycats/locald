@@ -1,6 +1,6 @@
 ---
 title: WASM Plugins as Plan Transforms
-stage: 1
+stage: 3
 feature: Extensibility
 exo:
   tool: exo rfc create

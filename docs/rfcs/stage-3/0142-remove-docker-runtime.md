@@ -59,6 +59,7 @@ The OCI/libcontainer path is now mature enough to be the sole execution strategy
 The `image` and `container_port` fields on Exec services are no longer supported. Use `type = "container"` services instead.
 
 **Before:**
+
 ```toml
 [services.redis]
 command = "redis-server"
@@ -66,6 +67,7 @@ image = "redis:7"
 ```
 
 **After:**
+
 ```toml
 [services.redis]
 type = "container"
