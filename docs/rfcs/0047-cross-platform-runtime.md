@@ -89,3 +89,23 @@ Windows Subsystem for Linux 2 (WSL2) provides a real Linux kernel.
 - **Bundling QEMU**: Too heavy and complex to manage.
 - **WASM**: Not mature enough for full buildpack/service compatibility yet.
 - **Docker Requirement**: Rejects the "Zero Dependency" goal.
+
+## Implementation Status
+
+**Current Status**: Linux-only implementation.
+
+### What's Implemented
+
+- **Linux Native Runtime**: Process-based execution with CNB lifecycle support ✓
+- **Runtime Trait**: Abstraction layer exists in `locald-core` ✓
+- **Container Execution**: Works via `locald-shim` and cgroup isolation ✓
+
+### What's NOT Implemented
+
+- **macOS (Lima)**: The embedded Lima VM approach described in this RFC is not implemented. macOS users cannot run `locald` at this time.
+- **Windows (WSL2)**: The WSL2 integration described in this RFC is not implemented. Windows users cannot run `locald` at this time.
+- **Libcontainer Integration**: The "Phase 2" libcontainer/Youki integration is not implemented.
+
+### Roadmap Note
+
+Cross-platform support remains a goal but is deferred. The current focus is on stabilizing the Linux experience before tackling VM-based virtualization for macOS.

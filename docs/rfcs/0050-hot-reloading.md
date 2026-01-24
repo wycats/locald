@@ -72,3 +72,22 @@ The `locald-server` needs to expand its file watching capabilities.
 ## 8. Future Possibilities
 
 *   **Hot Module Replacement (HMR) for Config**: If we support changing env vars without full restart (unlikely for processes, but maybe for some internal settings).
+
+## Implementation Status
+
+**Current Status**: Partially implemented.
+
+### What's Implemented
+
+- **File Watcher Infrastructure**: The `notify` crate is integrated and file watching exists
+- **Manual Restart**: `locald restart` command works
+
+### What's NOT Implemented
+
+- **Automatic Config Reload**: The watcher exists but is NOT wired to trigger automatic service restarts on `locald.toml` changes
+- **Hot Reload Logic**: The connection between file change events and the service restart machinery is not implemented
+- **Dashboard Notification**: No "Configuration changed, restarting..." notification exists
+
+### Summary
+
+The foundation (file watcher) exists, but the core feature (automatic restart on config save) is not wired up. This remains a Stage 0 strawman - the design is documented but not executed.
