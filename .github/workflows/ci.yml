@@ -83,7 +83,8 @@ jobs:
 
   mainline-health:
     name: Mainline Health
-    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' }}
+    # Skip this check for PRs labeled 'ci-fix' - they're explicitly fixing a red main
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' && !contains(github.event.pull_request.labels.*.name, 'ci-fix') }}
     needs: [changes]
     runs-on: ubuntu-latest
     permissions:
