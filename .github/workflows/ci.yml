@@ -599,7 +599,7 @@ jobs:
           key: oci-layout-${{ runner.os }}-v1
 
       - name: Install cargo-llvm-cov
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+        if: ${{ github.event_name == 'schedule' }}
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run tests (PR fast lane - stable features)
@@ -632,20 +632,52 @@ jobs:
           cargo test --tests --workspace --all-features --exclude locald-e2e
           echo "::endgroup::"
 
-      - name: Run tests and generate coverage
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+      # =========================================================================
+      # PUSH TO MAIN: Tests only (no coverage instrumentation)
+      # =========================================================================
+      # Coverage adds ~15-20 min overhead due to instrumented binaries.
+      # We run full coverage on the nightly schedule instead.
+      # This keeps the main branch CI fast (~15 min vs ~35 min).
+      # =========================================================================
+      - name: Run tests (main branch - stable features)
+        if: ${{ github.event_name == 'push' && steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Testing with stable features (default)"
+          cargo build -p locald-cli
+          cargo build -p locald-shim
+          cargo test --tests --workspace --exclude locald-e2e
+          echo "::endgroup::"
+
+      - name: Run tests (main branch - all features)
+        if: ${{ github.event_name == 'push' && steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Testing with all features (nightly channel)"
+          cargo build -p locald-cli --all-features
+          cargo build -p locald-shim
+          sudo target/debug/locald admin setup
+          cargo test --tests --workspace --all-features --exclude locald-e2e
+          sudo target/debug/locald admin setup
+          cargo test -p locald-e2e --tests --all-features
+          echo "::endgroup::"
+
+      - name: Run tests and generate coverage (nightly schedule only)
+        if: ${{ github.event_name == 'schedule' }}
         shell: bash
         run: |
           set -euo pipefail
 
           # =======================================================================
-          # WHY NO STABLE FEATURE TESTS HERE?
+          # NIGHTLY COVERAGE
           # =======================================================================
-          # PRs already test both stable and all-features configurations.
-          # By the time code reaches main, stable compatibility is validated.
-          # Running stable tests again here would add ~15 minutes of pure overhead.
-          #
-          # Coverage is generated from the all-features run only.
+          # Full coverage runs on the nightly schedule only.
+          # PRs and pushes to main run tests without coverage instrumentation.
+          # This keeps CI fast while still providing coverage data.
           # =======================================================================
 
           # =======================================================================
@@ -720,7 +752,7 @@ jobs:
           rm -rf "$CARGO_TARGET_DIR"
 
       - name: Upload coverage to Codecov
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+        if: ${{ github.event_name == 'schedule' }}
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
