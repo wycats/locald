@@ -208,15 +208,6 @@ async fn async_main(
         .map(|p| p.with_file_name("locald-notify.sock"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/locald-notify.sock"));
 
-    // Initialize dependencies
-    let docker = match bollard::Docker::connect_with_local_defaults() {
-        Ok(d) => Some(std::sync::Arc::new(d)),
-        Err(e) => {
-            warn!("Failed to connect to Docker: {e}. Docker-based services will be unavailable.");
-            None
-        }
-    };
-
     let state_manager = std::sync::Arc::new(
         crate::state::StateManager::new().context("Failed to initialize state manager")?,
     );
@@ -227,13 +218,7 @@ async fn async_main(
             .unwrap_or_default(),
     ));
 
-    let manager = ProcessManager::new(
-        notify_path.clone(),
-        docker,
-        state_manager,
-        registry,
-        Some(log_tx),
-    )?;
+    let manager = ProcessManager::new(notify_path.clone(), state_manager, registry, Some(log_tx))?;
     manager.spawn_metrics_collector();
 
     // Initialize ContainerManager

@@ -64,8 +64,6 @@ pub fn add_exec(command: String, name: Option<String>, port: Option<u16>) -> Res
         },
         command: Some(command),
         workdir: None,
-        image: None,
-        container_port: None,
         build: None,
     }));
 

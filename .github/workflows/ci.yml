@@ -83,7 +83,8 @@ jobs:
 
   mainline-health:
     name: Mainline Health
-    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' }}
+    # Skip this check for PRs labeled 'ci-fix' - they're explicitly fixing a red main
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.only_macos != 'true' && !contains(github.event.pull_request.labels.*.name, 'ci-fix') }}
     needs: [changes]
     runs-on: ubuntu-latest
     permissions:
@@ -226,7 +227,6 @@ jobs:
     needs: [changes]
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
@@ -245,28 +245,17 @@ jobs:
         with:
           components: clippy
 
+      - name: Setup Rust cache
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-${{ runner.os }}"
+
       - name: Install dependencies
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config mold
-
-      - name: Setup sccache
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: mozilla-actions/sccache-action@v0.0.9
-        continue-on-error: true
-
-      - name: Enable sccache wrapper (if available)
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "sccache not available; continuing without compiler cache"
-          fi
 
       - name: Verify CLI surface manifest is up to date
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -306,18 +295,6 @@ jobs:
           restore-keys: |
             pnpm-store-${{ runner.os }}-
 
-      - name: Cache Cargo registry
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.job }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
-
       - name: Lint with Clippy
         if: ${{ steps.gate.outputs.run == 'true' }}
         run: cargo clippy --workspace -- -D warnings
@@ -349,16 +326,11 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry
+      - name: Setup Rust cache
         if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-macos-
+          shared-key: "ci-${{ runner.os }}"
 
       # -------------------------------------------------------------------------
       # Install pnpm for building embedded UI assets
@@ -457,7 +429,6 @@ jobs:
     needs: [changes]
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
@@ -501,6 +472,16 @@ jobs:
         if: ${{ github.event_name != 'schedule' && steps.gate.outputs.run != 'true' }}
         run: echo "No Rust changes; skipping tests."
 
+      - name: Free disk space
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          # Free disk space by removing unused pre-installed tools (~18GB total)
+          sudo rm -rf /usr/local/lib/android || true  # ~10GB
+          sudo rm -rf /usr/share/dotnet || true       # ~2GB
+          sudo rm -rf /opt/hostedtoolcache || true    # ~6GB
+          docker system prune -af || true
+
       - name: Disk usage (pre)
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         shell: bash
@@ -516,28 +497,17 @@ jobs:
         with:
           components: clippy
 
+      - name: Setup Rust cache
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-${{ runner.os }}"
+
       - name: Install dependencies
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config mold
-
-      - name: Setup sccache
-        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
-        uses: mozilla-actions/sccache-action@v0.0.9
-        continue-on-error: true
-
-      - name: Enable sccache wrapper (if available)
-        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "sccache not available; continuing without compiler cache"
-          fi
 
       - name: Setup Node.js
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
@@ -568,18 +538,6 @@ jobs:
           restore-keys: |
             pnpm-store-${{ runner.os }}-
 
-      - name: Cache Cargo registry
-        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.job }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
-
       - name: Cache OCI layout blobs
         if: ${{ github.event_name == 'schedule' }}
         uses: actions/cache@v4
@@ -588,23 +546,8 @@ jobs:
           key: oci-layout-${{ runner.os }}-v1
 
       - name: Install cargo-llvm-cov
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+        if: ${{ github.event_name == 'schedule' }}
         uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Run tests (PR fast lane - stable features)
-        if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.run == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "::group::Testing with stable features (default)"
-          cargo build -p locald-cli
-          cargo build -p locald-shim
-
-          # Test with default features only (stable channel)
-          # This ensures experimental features don't break the stable build
-          cargo test --tests --workspace --exclude locald-e2e
-          echo "::endgroup::"
 
       - name: Run tests (PR fast lane - all features)
         if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.run == 'true' }}
@@ -621,21 +564,18 @@ jobs:
           cargo test --tests --workspace --all-features --exclude locald-e2e
           echo "::endgroup::"
 
-      - name: Run tests and generate coverage
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+      # =========================================================================
+      # PUSH TO MAIN: Tests only (no coverage instrumentation)
+      # =========================================================================
+      # Coverage adds ~15-20 min overhead due to instrumented binaries.
+      # We run full coverage on the nightly schedule instead.
+      # This keeps the main branch CI fast (~15 min vs ~35 min).
+      # =========================================================================
+      - name: Run tests (main branch - stable features)
+        if: ${{ github.event_name == 'push' && steps.gate.outputs.run == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # =======================================================================
-          # FEATURE MATRIX TESTING
-          # =======================================================================
-          # We test with two feature configurations:
-          #   1. Default features (stable channel) - ensures stable builds work
-          #   2. All features (nightly channel) - ensures experimental features work
-          #
-          # Both must pass. Coverage is generated from the all-features run.
-          # =======================================================================
 
           echo "::group::Testing with stable features (default)"
           cargo build -p locald-cli
@@ -643,9 +583,46 @@ jobs:
           cargo test --tests --workspace --exclude locald-e2e
           echo "::endgroup::"
 
-          # Build + test in distinct steps so we can run `locald admin setup`
-          # after the instrumented `locald` binary is built (to avoid
-          # "locald-shim is outdated" failures).
+      - name: Run tests (main branch - all features)
+        if: ${{ github.event_name == 'push' && steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Testing with all features (nightly channel)"
+          cargo build -p locald-cli --all-features
+          cargo build -p locald-shim
+          sudo target/debug/locald admin setup
+          cargo test --tests --workspace --all-features --exclude locald-e2e
+          sudo target/debug/locald admin setup
+          cargo test -p locald-e2e --tests --all-features
+          echo "::endgroup::"
+
+      - name: Run tests and generate coverage (nightly schedule only)
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # =======================================================================
+          # NIGHTLY COVERAGE
+          # =======================================================================
+          # Full coverage runs on the nightly schedule only.
+          # PRs and pushes to main run tests without coverage instrumentation.
+          # This keeps CI fast while still providing coverage data.
+          # =======================================================================
+
+          # =======================================================================
+          # MANUAL LLVM-COV ENVIRONMENT SETUP
+          # =======================================================================
+          # We manually set up the llvm-cov environment instead of using the
+          # simpler `cargo llvm-cov test` command because we need to run
+          # `sudo locald admin setup` BETWEEN the build and test phases.
+          #
+          # The admin setup installs the privileged locald-shim binary, which
+          # must happen after the instrumented binary is built but before tests
+          # run (otherwise tests fail with "locald-shim is outdated").
+          # =======================================================================
           eval "$(cargo llvm-cov show-env --export-prefix --no-cfg-coverage)"
 
           export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
@@ -700,15 +677,16 @@ jobs:
           fi
 
           # Generate the report without re-running tests.
-          cargo llvm-cov --no-run --lcov --output-path lcov.info
+          # Use --codecov format for richer region-based coverage data.
+          cargo llvm-cov --no-run --codecov --output-path codecov.json
 
           du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
           rm -rf "$CARGO_TARGET_DIR"
 
       - name: Upload coverage to Codecov
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && steps.gate.outputs.run == 'true') }}
+        if: ${{ github.event_name == 'schedule' }}
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
+          files: codecov.json
           fail_ci_if_error: false

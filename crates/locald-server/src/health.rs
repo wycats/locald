@@ -1,6 +1,3 @@
-use bollard::Docker;
-use bollard::container::InspectContainerOptions;
-use bollard::exec::CreateExecOptions;
 use locald_core::config::{HealthCheckConfig, ProbeType, ServiceConfig};
 use locald_core::state::{HealthSource, HealthStatus};
 use std::sync::Arc;
@@ -9,7 +6,6 @@ use tracing::info;
 
 #[derive(Debug)]
 pub(crate) struct HealthMonitor {
-    docker: Option<Arc<Docker>>,
     services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
     event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
@@ -17,13 +13,11 @@ pub(crate) struct HealthMonitor {
 
 impl HealthMonitor {
     pub(crate) fn new(
-        docker: Option<Arc<Docker>>,
         services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
         event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
         proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
     ) -> Self {
         Self {
-            docker,
             services,
             event_sender,
             proxy_ports,
@@ -37,8 +31,7 @@ impl HealthMonitor {
         config: &ServiceConfig,
         port: Option<u16>,
         pid: Option<u32>,
-        container_id: Option<String>,
-        has_docker_healthcheck: bool,
+        _container_id: Option<String>,
         cwd: Option<std::path::PathBuf>,
     ) {
         // Spawn port mismatch detector if we have a PID and an expected port
@@ -49,7 +42,7 @@ impl HealthMonitor {
         if let Some(hc) = config.health_check() {
             match hc {
                 HealthCheckConfig::Command(cmd) => {
-                    self.spawn_command_monitor(name, cmd.clone(), container_id, cwd);
+                    self.spawn_command_monitor(name, cmd.clone(), cwd);
                 }
                 HealthCheckConfig::Probe(probe) => match probe.kind {
                     ProbeType::Http => {
@@ -65,14 +58,10 @@ impl HealthMonitor {
                     }
                     ProbeType::Command => {
                         if let Some(cmd) = &probe.command {
-                            self.spawn_command_monitor(name, cmd.clone(), container_id, cwd);
+                            self.spawn_command_monitor(name, cmd.clone(), cwd);
                         }
                     }
                 },
-            }
-        } else if has_docker_healthcheck {
-            if let Some(cid) = container_id {
-                self.spawn_docker_monitor(name, cid);
             }
         } else if let Some(p) = port {
             self.spawn_tcp_monitor(name, p);
@@ -335,11 +324,9 @@ impl HealthMonitor {
         &self,
         name: String,
         command: String,
-        container_id: Option<String>,
         cwd: Option<std::path::PathBuf>,
     ) {
         let monitor = self.clone();
-        let docker = self.docker.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -356,45 +343,7 @@ impl HealthMonitor {
                     }
                 }
 
-                let success = if let Some(cid) = &container_id {
-                    if let Some(docker) = &docker {
-                        let config = CreateExecOptions {
-                            cmd: Some(vec!["sh", "-c", &command]),
-                            attach_stdout: Some(false),
-                            attach_stderr: Some(false),
-                            ..Default::default()
-                        };
-
-                        if let Ok(exec) = docker.create_exec(cid, config).await {
-                            if (docker.start_exec(&exec.id, None).await).is_ok() {
-                                let mut retries = 0;
-                                let mut exit_code = None;
-                                loop {
-                                    if let Ok(inspect) = docker.inspect_exec(&exec.id).await {
-                                        if inspect.running == Some(false) {
-                                            exit_code = inspect.exit_code;
-                                            break;
-                                        }
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    retries += 1;
-                                    if retries > 50 {
-                                        break;
-                                    }
-                                }
-                                exit_code == Some(0)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    locald_utils::probe::check_command(&command, cwd.as_deref()).await
-                };
+                let success = locald_utils::probe::check_command(&command, cwd.as_deref()).await;
 
                 if success {
                     monitor
@@ -404,47 +353,6 @@ impl HealthMonitor {
                 }
 
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        });
-    }
-
-    fn spawn_docker_monitor(&self, name: String, container_id: String) {
-        let monitor = self.clone();
-        let Some(docker) = self.docker.clone() else {
-            return;
-        };
-
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                match docker
-                    .inspect_container(&container_id, None::<InspectContainerOptions>)
-                    .await
-                {
-                    Ok(inspect) => {
-                        if let Some(state) = inspect.state {
-                            if let Some(health) = state.health {
-                                let status = match health.status {
-                                    Some(bollard::models::HealthStatusEnum::HEALTHY) => {
-                                        HealthStatus::Healthy
-                                    }
-                                    Some(bollard::models::HealthStatusEnum::UNHEALTHY) => {
-                                        HealthStatus::Unhealthy
-                                    }
-                                    Some(bollard::models::HealthStatusEnum::STARTING) => {
-                                        HealthStatus::Starting
-                                    }
-                                    _ => HealthStatus::Unknown,
-                                };
-
-                                monitor
-                                    .update_health(&name, status, HealthSource::Docker)
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
             }
         });
     }
@@ -518,7 +426,6 @@ impl HealthMonitor {
 impl Clone for HealthMonitor {
     fn clone(&self) -> Self {
         Self {
-            docker: self.docker.clone(),
             services: self.services.clone(),
             event_sender: self.event_sender.clone(),
             proxy_ports: self.proxy_ports.clone(),

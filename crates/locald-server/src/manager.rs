@@ -6,7 +6,6 @@ use crate::plugins;
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
-use bollard::Docker;
 use futures_util::StreamExt;
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{BootEvent, Event, LogEntry, ServiceStatus};
@@ -277,12 +276,10 @@ impl ProcessManager {
     /// # Arguments
     ///
     /// * `notify_socket_path` - Path to the Unix socket for `sd_notify` messages.
-    /// * `docker` - Docker client instance.
     /// * `state_manager` - State persistence manager.
     /// * `registry` - Project registry.
     pub fn new(
         notify_socket_path: PathBuf,
-        docker: Option<Arc<Docker>>,
         state_manager: Arc<StateManager>,
         registry: Arc<Mutex<Registry>>,
         external_log_sender: Option<broadcast::Sender<LogEntry>>,
@@ -297,24 +294,16 @@ impl ProcessManager {
         let services = Arc::new(Mutex::new(HashMap::new()));
         let proxy_ports = Arc::new(Mutex::new((None, None)));
 
-        let health_monitor = HealthMonitor::new(
-            docker.clone(),
-            services.clone(),
-            event_tx.clone(),
-            proxy_ports.clone(),
-        );
+        let health_monitor =
+            HealthMonitor::new(services.clone(), event_tx.clone(), proxy_ports.clone());
 
-        let runtime = Arc::new(Runtime::new(docker.clone(), notify_socket_path));
+        let runtime = Arc::new(Runtime::new(notify_socket_path));
 
         let factories: Vec<Arc<dyn ServiceFactory>> = vec![
             Arc::new(crate::service::postgres::PostgresFactory),
             Arc::new(crate::service::site::SiteFactory),
             Arc::new(crate::service::exec::ExecFactory::new(
                 runtime.process.clone(),
-            )),
-            #[allow(deprecated)]
-            Arc::new(crate::service::docker::DockerFactory::new(
-                crate::runtime::docker::DockerRuntime::new(docker),
             )),
         ];
 
@@ -613,9 +602,6 @@ impl ProcessManager {
                 }
             }
             if let Some(container_id) = &service_state.container_id {
-                if let Err(e) = self.runtime.docker.stop_container(container_id).await {
-                    warn!("Cleanup warning (stop_container): {:#}", e);
-                }
                 if let Err(e) = self.runtime.process.stop_shim_container(container_id) {
                     warn!("Cleanup warning (stop_shim_container): {:#}", e);
                 }
@@ -1142,7 +1128,6 @@ impl ProcessManager {
                         state.port,
                         state.pid,
                         None,
-                        false,
                         Some(path.clone()),
                     );
 
@@ -1194,7 +1179,7 @@ impl ProcessManager {
     /// Stops a specific service by name.
     ///
     /// This method:
-    /// 1. Identifies the runtime type (Process, Docker, Postgres).
+    /// 1. Identifies the runtime type (Process, Container, Postgres).
     /// 2. Sends the configured stop signal (default: SIGTERM).
     /// 3. Cleans up associated resources (containers, PTYs).
     /// 4. Persists the new state.

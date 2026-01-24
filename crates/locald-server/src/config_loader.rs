@@ -583,8 +583,6 @@ impl ConfigLoader {
                             stop_signal: None,
                         },
                         command: Some(command),
-                        image: None,
-                        container_port: None,
                         workdir: None,
                         build: None,
                     }))

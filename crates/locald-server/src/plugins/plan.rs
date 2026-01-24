@@ -332,12 +332,6 @@ fn merge_plugin_service_into_config(
             if existing_exec.workdir.is_none() {
                 existing_exec.workdir = plugin_exec.workdir;
             }
-            if existing_exec.image.is_none() {
-                existing_exec.image = plugin_exec.image;
-            }
-            if existing_exec.container_port.is_none() {
-                existing_exec.container_port = plugin_exec.container_port;
-            }
         }
         (
             ServiceConfig::Typed(TypedServiceConfig::Worker(existing_worker)),
@@ -479,14 +473,12 @@ fn build_service_from_op(
             "image" => {
                 let image =
                     as_text(&v).ok_or_else(|| diagnostics_error("image must be a text literal"))?;
-                exec.image = Some(image.to_string());
                 container.image = image.to_string();
             }
             "container_port" => {
                 let port = as_u16(&v).ok_or_else(|| {
                     diagnostics_error("container_port must be an unsigned integer <= 65535")
                 })?;
-                exec.container_port = Some(port);
                 container.container_port = Some(port);
             }
             "postgres.version" | "version" => {

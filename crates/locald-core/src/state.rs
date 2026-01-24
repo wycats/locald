@@ -27,7 +27,6 @@ impl std::fmt::Display for HealthStatus {
 pub enum HealthSource {
     #[default]
     None,
-    Docker,
     Notify,
     Tcp,
     Explicit,
@@ -39,7 +38,6 @@ impl std::fmt::Display for HealthSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => write!(f, "none"),
-            Self::Docker => write!(f, "docker"),
             Self::Notify => write!(f, "notify"),
             Self::Tcp => write!(f, "tcp"),
             Self::Explicit => write!(f, "explicit"),

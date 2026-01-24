@@ -335,15 +335,9 @@ pub struct ExecServiceConfig {
     #[serde(flatten)]
     pub common: CommonServiceConfig,
 
-    /// The command to run to start the service. Required if `image` is not set.
+    /// The command to run to start the service.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// The Docker image to run. If set, `command` is treated as arguments to the container entrypoint (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-    /// The port exposed by the container. Required if `image` is set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub container_port: Option<u16>,
     /// Working directory for the command. Defaults to the project root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
@@ -461,8 +455,6 @@ mod tests {
             },
             command: Some("echo hello".to_string()),
             workdir: None,
-            image: None,
-            container_port: None,
             build: None,
         });
 

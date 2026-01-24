@@ -434,8 +434,8 @@ impl ExecFactory {
 impl ServiceFactory for ExecFactory {
     fn can_handle(&self, config: &ServiceConfig) -> bool {
         match config {
-            ServiceConfig::Typed(TypedServiceConfig::Exec(c)) => c.image.is_none(),
-            ServiceConfig::Legacy(c) => c.image.is_none(),
+            ServiceConfig::Typed(TypedServiceConfig::Exec(_)) => true,
+            ServiceConfig::Legacy(_) => true,
             ServiceConfig::Typed(TypedServiceConfig::Worker(_)) => true,
             ServiceConfig::Typed(TypedServiceConfig::Container(_)) => true,
             ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => false,

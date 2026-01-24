@@ -3,6 +3,7 @@ name = "docker-test"
 domain = "docker.test"
 
 [services.redis]
+type = "container"
 image = "redis:alpine"
 container_port = 6379
 

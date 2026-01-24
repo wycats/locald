@@ -23,6 +23,8 @@ pre-commit:
 pre-push:
   parallel: true
   commands:
+    tripwire:
+      run: cargo xtask ci tripwire
     rust-checks:
       run: cargo xtask check
     docs-build:

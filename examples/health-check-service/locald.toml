@@ -2,6 +2,7 @@
 name = "health-check"
 
 [services.redis]
+type = "container"
 image = "redis:alpine"
 container_port = 6379
 
