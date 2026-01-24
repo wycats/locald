@@ -639,32 +639,14 @@ jobs:
           set -euo pipefail
 
           # =======================================================================
-          # FEATURE MATRIX TESTING
+          # WHY NO STABLE FEATURE TESTS HERE?
           # =======================================================================
-          # We test with two feature configurations:
-          #   1. Default features (stable channel) - ensures stable builds work
-          #   2. All features (nightly channel) - ensures experimental features work
+          # PRs already test both stable and all-features configurations.
+          # By the time code reaches main, stable compatibility is validated.
+          # Running stable tests again here would add ~15 minutes of pure overhead.
           #
-          # Both must pass. Coverage is generated from the all-features run.
+          # Coverage is generated from the all-features run only.
           # =======================================================================
-
-          echo "::group::Testing with stable features (default)"
-          cargo build -p locald-cli
-          cargo build -p locald-shim
-          cargo test --tests --workspace --exclude locald-e2e
-          echo "::endgroup::"
-
-          # =======================================================================
-          # DISK SPACE RECLAMATION
-          # =======================================================================
-          # Coverage-instrumented binaries are 2-3x larger than normal ones.
-          # Running both phases without cleanup exhausts the runner's ~23GB free.
-          # We delete the Phase 1 artifacts before starting Phase 2.
-          # =======================================================================
-          echo "::group::Cleaning up stable build artifacts"
-          du -sh target/ 2>/dev/null || true
-          rm -rf target/
-          echo "::endgroup::"
 
           # =======================================================================
           # MANUAL LLVM-COV ENVIRONMENT SETUP
