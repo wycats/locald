@@ -501,6 +501,16 @@ jobs:
         if: ${{ github.event_name != 'schedule' && steps.gate.outputs.run != 'true' }}
         run: echo "No Rust changes; skipping tests."
 
+      - name: Free disk space
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          # Free disk space by removing unused pre-installed tools (~18GB total)
+          sudo rm -rf /usr/local/lib/android || true  # ~10GB
+          sudo rm -rf /usr/share/dotnet || true       # ~2GB
+          sudo rm -rf /opt/hostedtoolcache || true    # ~6GB
+          docker system prune -af || true
+
       - name: Disk usage (pre)
         if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
         shell: bash
@@ -655,9 +665,17 @@ jobs:
           rm -rf target/
           echo "::endgroup::"
 
-          # Build + test in distinct steps so we can run `locald admin setup`
-          # after the instrumented `locald` binary is built (to avoid
-          # "locald-shim is outdated" failures).
+          # =======================================================================
+          # MANUAL LLVM-COV ENVIRONMENT SETUP
+          # =======================================================================
+          # We manually set up the llvm-cov environment instead of using the
+          # simpler `cargo llvm-cov test` command because we need to run
+          # `sudo locald admin setup` BETWEEN the build and test phases.
+          #
+          # The admin setup installs the privileged locald-shim binary, which
+          # must happen after the instrumented binary is built but before tests
+          # run (otherwise tests fail with "locald-shim is outdated").
+          # =======================================================================
           eval "$(cargo llvm-cov show-env --export-prefix --no-cfg-coverage)"
 
           export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
@@ -712,7 +730,8 @@ jobs:
           fi
 
           # Generate the report without re-running tests.
-          cargo llvm-cov --no-run --lcov --output-path lcov.info
+          # Use --codecov format for richer region-based coverage data.
+          cargo llvm-cov --no-run --codecov --output-path codecov.json
 
           du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
           rm -rf "$CARGO_TARGET_DIR"
@@ -722,5 +741,5 @@ jobs:
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
+          files: codecov.json
           fail_ci_if_error: false
