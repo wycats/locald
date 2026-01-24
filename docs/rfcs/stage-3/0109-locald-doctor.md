@@ -1,6 +1,6 @@
 ---
 title: locald doctor
-stage: 1
+stage: 3
 feature: Installation & Update Experience
 ---
 
