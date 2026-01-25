@@ -27,7 +27,7 @@ status = "pending"
 [[plan.changes.tasks]]
 id = "29.3"
 title = "Distributions: Allow flavored binaries/configs"
-status = "pending"
+status = "completed"
 
 [[plan.changes.tasks]]
 id = "29.1.1"
@@ -56,7 +56,7 @@ notes = "Add a small example plugin + an automated verification path (fixtures +
 [[plan.changes.tasks]]
 id = "29.4"
 title = "Remove container workflow (RFC 0138)"
-status = "pending"
+status = "completed"
 
 [[plan.changes]]
 name = "Remove container workflow code"

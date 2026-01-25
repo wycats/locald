@@ -1292,22 +1292,22 @@ status = "complete"
 [[epochs.phases.tasks]]
 id = "29.3.1"
 label = "Distribution Format: Define flavored distribution manifest (bundled plugins + config presets)"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "29.3.2"
 label = "Init from Distribution: Implement `locald init --from-package` for team onboarding"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "29.3.3"
 label = "Plugin Registry: Support remote package references in locald.toml"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "29.3.4"
 label = "Example Distribution: Create example redis-plugin distribution for dogfooding"
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "30"
