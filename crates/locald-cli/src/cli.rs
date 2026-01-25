@@ -149,6 +149,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: ServerCommands,
     },
+    /// Self-upgrade locald to a newer version
+    Selfupgrade {
+        /// Check for updates without installing
+        #[arg(long)]
+        check: bool,
+
+        /// Install specific version (default: latest)
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Start the daemon (if needed) and register the current project
     Up {
         /// Path to the service directory (defaults to current directory if locald.toml exists)

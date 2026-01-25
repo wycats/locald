@@ -37,11 +37,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (ARM64)
+      - name: Install cross (ARM64)
         if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -56,16 +54,18 @@ jobs:
       - name: Build locald
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cross build --release --bin locald --target ${{ matrix.target }}
+          else
+            cargo build --release --bin locald --target ${{ matrix.target }}
           fi
-          cargo build --release --bin locald --target ${{ matrix.target }}
 
       - name: Build locald-shim
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cross build --release --bin locald-shim --target ${{ matrix.target }}
+          else
+            cargo build --release --bin locald-shim --target ${{ matrix.target }}
           fi
-          cargo build --release --bin locald-shim --target ${{ matrix.target }}
 
       - name: Package binaries
         run: |

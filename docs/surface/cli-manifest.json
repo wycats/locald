@@ -778,6 +778,13 @@
             "subcommands": []
           },
           {
+            "name": "selfupgrade",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
             "name": "serve",
             "aliases": [],
             "hidden": false,
@@ -1319,6 +1326,46 @@
             "global": false,
             "hidden": false,
             "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "selfupgrade",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "check",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "version",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": []

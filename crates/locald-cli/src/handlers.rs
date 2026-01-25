@@ -14,7 +14,8 @@ use crate::cli::{DistributionCommands, PluginCommands};
 #[cfg(feature = "experimental-containers")]
 use crate::container;
 use crate::{
-    client, debug, doctor, history, init, monitor, run, service, style, trust, try_cmd, utils,
+    client, debug, doctor, history, init, monitor, run, selfupgrade, service, style, trust,
+    try_cmd, utils,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
@@ -205,6 +206,24 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("{} locald restarted successfully.", style::CHECK);
             }
         },
+        Commands::Selfupgrade { check, version } => {
+            if *check {
+                match selfupgrade::check()? {
+                    Some(latest) => {
+                        println!(
+                            "Update available: v{} (current: v{})",
+                            latest,
+                            selfupgrade::CURRENT_VERSION
+                        );
+                    }
+                    None => {
+                        println!("You are up to date (v{}).", selfupgrade::CURRENT_VERSION);
+                    }
+                }
+            } else {
+                selfupgrade::upgrade(version.as_deref())?;
+            }
+        }
         Commands::Up { path, verbose } => {
             let current_version = env!("LOCALD_BUILD_VERSION");
 

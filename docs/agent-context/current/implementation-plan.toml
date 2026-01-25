@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "29"
-title = "Extensibility & Plugins"
-rfcs = ["0028"]
+id = "30"
+title = "Installation & Update Experience"
+rfcs = ["0039"]
 
 [plan]
 [[plan.changes]]
@@ -13,58 +13,6 @@ type = "feat"
 details = "Description"
 files = []
 tests = []
-
-[[plan.changes.tasks]]
-id = "29.1"
-title = "Plugin Mechanism: Formal system for custom services"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "29.2"
-title = "Packaging: Support locald package command"
-status = "pending"
-
-[[plan.changes.tasks]]
-id = "29.3"
-title = "Distributions: Allow flavored binaries/configs"
-status = "pending"
-
-[[plan.changes.tasks]]
-id = "29.1.1"
-title = "Specify plugin contract + fixtures"
-status = "completed"
-notes = "Tie down the minimal host<->plugin contract for Phase 29.1 (RFC 0129): WIT surface, canonical normalization rules, and golden fixtures (JSON is debug-only)."
-
-[[plan.changes.tasks]]
-id = "29.1.2"
-title = "Run WASM component (WASI-only)"
-status = "completed"
-notes = "Implement the host-side runner for WASM components with a minimal capability set (default WASI-only) plus explicit cache/state dirs as needed; no Docker assumptions."
-
-[[plan.changes.tasks]]
-id = "29.1.3"
-title = "ServicePlan IR + apply/merge"
-status = "completed"
-notes = "Introduce the minimal ServicePlan DAG IR and integrate it into the config/service graph pipeline: plugin produces a plan; host applies it to materialize services/controllers."
-
-[[plan.changes.tasks]]
-id = "29.1.4"
-title = "Example plugin + e2e verification"
-status = "completed"
-notes = "Add a small example plugin + an automated verification path (fixtures + at least one e2e test) to prove discovery → execution → plan application works."
-
-[[plan.changes.tasks]]
-id = "29.4"
-title = "Remove container workflow (RFC 0138)"
-status = "pending"
-
-[[plan.changes]]
-name = "Remove container workflow code"
-type = "refactor"
-details = "Remove host-spawn crate, socket client/daemon, and simplify privilege acquisition to setuid-only per RFC 0138."
-files = ["Cargo.toml", "crates/locald-utils/Cargo.toml", "crates/locald-utils/src/container.rs", "crates/locald-utils/src/shim_client.rs", "crates/locald-utils/src/privileged.rs", "crates/locald-shim/src/daemon.rs", "crates/locald-shim/src/protocol.rs", "crates/locald-core/src/config/global.rs", "crates/locald-cli/src/utils.rs"]
-tests = ["scripts/verify-phase.sh"]
-satisfies = ["29.4"]
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

@@ -1239,7 +1239,7 @@ aliases = ["28.3"]
 [[epochs.phases]]
 id = "29"
 title = "Extensibility & Plugins"
-status = "active"
+status = "completed"
 rfcs = ["0028"]
 ulid = "01KEX4X98ZEM25Q2TFQ6G5CP74"
 slug = "29"
@@ -1292,27 +1292,27 @@ status = "complete"
 [[epochs.phases.tasks]]
 id = "29.3.1"
 label = "Distribution Format: Define flavored distribution manifest (bundled plugins + config presets)"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "29.3.2"
 label = "Init from Distribution: Implement `locald init --from-package` for team onboarding"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "29.3.3"
 label = "Plugin Registry: Support remote package references in locald.toml"
-status = "pending"
+status = "completed"
 
 [[epochs.phases.tasks]]
 id = "29.3.4"
 label = "Example Distribution: Create example redis-plugin distribution for dogfooding"
-status = "pending"
+status = "completed"
 
 [[epochs.phases]]
 id = "30"
 title = "Installation & Update Experience"
-status = "pending"
+status = "active"
 rfcs = ["0039"]
 ulid = "01KEX4X98ZR7SAXPZZSFVQ8QN8"
 slug = "30"
@@ -1321,7 +1321,7 @@ aliases = ["30"]
 [[epochs.phases.tasks]]
 id = "30.1"
 label = "Distribution Channels: Support `cargo binstall` and GitHub Releases."
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZWTMGR16GFJ61AE26"
 slug = "30.1"
 aliases = ["30.1"]
@@ -1329,7 +1329,7 @@ aliases = ["30.1"]
 [[epochs.phases.tasks]]
 id = "30.2"
 label = "Self-Upgrade: Implement `locald selfupgrade` to fetch/apply updates and recycle the server."
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZPWW33CDQCZX26FWF"
 slug = "30.2"
 aliases = ["30.2"]
@@ -1345,7 +1345,7 @@ aliases = ["30.3"]
 [[epochs.phases.tasks]]
 id = "30.4"
 label = "Secure Installation: Design a secure alternative to `curl | sh` (signatures, bootstrap binary)."
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZQE6247CA0DRHH4RG"
 slug = "30.4"
 aliases = ["30.4"]
@@ -1353,7 +1353,7 @@ aliases = ["30.4"]
 [[epochs.phases.tasks]]
 id = "30.5"
 label = "Capability Preservation: Preserve `cap_net_bind_service` across updates (wrapper binary or systemd integration)."
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZHWKA7EM81HHQH7HR"
 slug = "30.5"
 aliases = ["30.5"]
