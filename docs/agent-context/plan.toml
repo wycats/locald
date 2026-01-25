@@ -1312,7 +1312,7 @@ status = "completed"
 [[epochs.phases]]
 id = "30"
 title = "Installation & Update Experience"
-status = "active"
+status = "completed"
 rfcs = ["0039"]
 ulid = "01KEX4X98ZR7SAXPZZSFVQ8QN8"
 slug = "30"
@@ -1361,7 +1361,7 @@ aliases = ["30.5"]
 [[epochs.phases]]
 id = "31"
 title = "Engineering Excellence"
-status = "pending"
+status = "active"
 rfcs = ["0040"]
 ulid = "01KEX4X98Z5N0EW7CC810KDPWY"
 slug = "31"

@@ -1,21 +1,11 @@
+use crate::error::{CliError, CliResult};
 use crate::style;
-use anyhow::{Context, Result};
+use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::IpcRequest;
 
-pub fn handle_ipc_error(e: &anyhow::Error) {
-    let msg = e.to_string();
-    if msg.contains("locald is not running") {
-        eprintln!("Error: {msg}");
-        eprintln!("Hint: Run `locald up` to start the daemon.");
-    } else {
-        eprintln!("Error: {e}");
-    }
-    std::process::exit(1);
-}
-
 #[allow(unsafe_code)]
-pub fn setup_sandbox(name: &str) -> Result<()> {
+pub fn setup_sandbox(name: &str) -> CliResult<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let sandbox_root = std::path::PathBuf::from(home)
         .join(".local/share/locald/sandboxes")
@@ -45,7 +35,7 @@ pub fn setup_sandbox(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn spawn_daemon() -> Result<()> {
+pub fn spawn_daemon() -> CliResult<()> {
     let exe_path = std::env::current_exe()?;
 
     // Do not try to auto-repair the privileged shim here.
@@ -82,7 +72,7 @@ pub fn spawn_daemon() -> Result<()> {
     }
 }
 
-pub fn ensure_daemon_running() -> Result<()> {
+pub fn ensure_daemon_running() -> CliResult<()> {
     // Try to ping first
     match crate::client::send_request(&IpcRequest::Ping) {
         Ok(_) => return Ok(()),
@@ -106,7 +96,7 @@ pub fn ensure_daemon_running() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    anyhow::bail!("Timed out waiting for locald to start")
+    Err(CliError::message("Timed out waiting for locald to start"))
 }
 
 #[cfg(target_os = "linux")]
