@@ -9,8 +9,13 @@ pub struct GlobalConfig {
     pub updates: UpdateConfig,
 }
 
+/// Configuration for automatic update checks.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
 pub struct UpdateConfig {
+    /// Whether to check for updates when running `locald up`.
+    /// When enabled, a background check runs (at most once per 24 hours)
+    /// and displays a message if a newer version is available.
+    /// This is opt-in and disabled by default.
     #[serde(default)]
     pub auto_check: bool,
 }

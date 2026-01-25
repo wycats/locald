@@ -238,8 +238,10 @@ pub fn run(cli: Cli) -> Result<()> {
 
             let report_update = |update_rx: &Option<std::sync::mpsc::Receiver<Option<String>>>| {
                 if let Some(rx) = update_rx {
+                    // Wait up to 500ms for update check to complete. This is long enough
+                    // to catch fast responses while not noticeably delaying startup.
                     if let Ok(Some(new_version)) =
-                        rx.recv_timeout(std::time::Duration::from_millis(100))
+                        rx.recv_timeout(std::time::Duration::from_millis(500))
                     {
                         eprintln!(
                             "{} Update available: {} → {}. Run `locald selfupgrade`",

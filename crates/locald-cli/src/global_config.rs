@@ -1,8 +1,9 @@
+use directories::BaseDirs;
 use locald_core::config::GlobalConfig;
 use std::path::PathBuf;
 
 pub fn global_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("locald/config.toml"))
+    BaseDirs::new().map(|base| base.config_dir().join("locald/config.toml"))
 }
 
 pub fn load() -> GlobalConfig {

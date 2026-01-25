@@ -1,10 +1,19 @@
+//! Background update check with rate limiting.
+//!
+//! This module provides an opt-in update check that runs in the background
+//! when `locald up` is executed. The check is rate-limited to once per 24 hours
+//! and persists state to avoid redundant network requests.
+
 use anyhow::Result;
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
-pub const STATE_FILE: &str = "locald/update-state.json";
+const STATE_FILE: &str = "locald/update-state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UpdateState {
@@ -12,7 +21,7 @@ pub struct UpdateState {
 }
 
 pub fn state_file_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|dir| dir.join(STATE_FILE))
+    BaseDirs::new().map(|base| base.data_local_dir().join(STATE_FILE))
 }
 
 pub fn load_state() -> UpdateState {
@@ -20,24 +29,31 @@ pub fn load_state() -> UpdateState {
         return UpdateState::default();
     };
 
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return UpdateState::default();
-    };
-
-    serde_json::from_str(&contents).unwrap_or_default()
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
 }
 
+/// Save state atomically using write-to-temp + rename pattern.
 pub fn save_state(state: &UpdateState) -> Result<()> {
     let Some(path) = state_file_path() else {
         return Ok(());
     };
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
 
     let payload = serde_json::to_string(state)?;
-    std::fs::write(path, payload)?;
+
+    // Write to temp file then atomically rename
+    let temp_path = path.with_extension("json.tmp");
+    let mut file = fs::File::create(&temp_path)?;
+    file.write_all(payload.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temp_path, &path)?;
+
     Ok(())
 }
 
@@ -50,18 +66,38 @@ pub fn should_check(state: &UpdateState) -> bool {
     now.saturating_sub(last_check) > CHECK_INTERVAL_SECS
 }
 
+/// Spawn a background thread to check for updates.
+///
+/// This is intentionally fire-and-forget: the spawned thread is detached and
+/// will not block program termination. The callback is invoked with the result
+/// once the check completes (or `None` if skipped due to rate limiting).
+///
+/// The timestamp is only updated on successful check, so transient failures
+/// (e.g., network issues) will retry on the next run.
 pub fn spawn_update_check(callback: impl FnOnce(Option<String>) + Send + 'static) {
     std::thread::spawn(move || {
-        let mut state = load_state();
-        let mut result = None;
+        let state = load_state();
 
-        if should_check(&state) {
-            result = crate::selfupgrade::check().unwrap_or(None);
-            state.last_check_timestamp = Some(current_timestamp());
-            let _ = save_state(&state);
+        if !should_check(&state) {
+            callback(None);
+            return;
         }
 
-        callback(result);
+        // Perform the check - only update timestamp on success
+        match crate::selfupgrade::check() {
+            Ok(result) => {
+                // Successful check (even if no update available) - update timestamp
+                let new_state = UpdateState {
+                    last_check_timestamp: Some(current_timestamp()),
+                };
+                let _ = save_state(&new_state);
+                callback(result);
+            }
+            Err(_) => {
+                // Network or other error - don't update timestamp, retry next time
+                callback(None);
+            }
+        }
     });
 }
 

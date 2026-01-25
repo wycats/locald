@@ -1337,7 +1337,7 @@ aliases = ["30.2"]
 [[epochs.phases.tasks]]
 id = "30.3"
 label = "Auto-Updates: Implement opt-in auto-updates via a lightweight HEAD check (e.g., GH Pages)."
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZPCW2XWEFTK15FECR"
 slug = "30.3"
 aliases = ["30.3"]
