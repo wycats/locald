@@ -5,15 +5,15 @@
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 
-	let { pinned = $bindable([]) }: { pinned: string[] } = $props();
+	let { monitored = $bindable([]) }: { monitored: string[] } = $props();
 
-	function unpin(name: string) {
-		pinned = pinned.filter((n) => n !== name);
+	function unmonitor(name: string) {
+		monitored = monitored.filter((n) => n !== name);
 	}
 </script>
 
-<div class="deck" data-testid="deck" class:single={pinned.length === 1}>
-	{#each pinned as serviceName (serviceName)}
+<div class="deck" data-testid="deck" class:single={monitored.length === 1}>
+	{#each monitored as serviceName (serviceName)}
 		<div
 			class="terminal-card"
 			in:fly={{ y: 20, duration: 300, easing: cubicOut }}
@@ -31,12 +31,12 @@
 				</div>
 				<div class="header-right">
 					<button
-						onclick={() => unpin(serviceName)}
+						onclick={() => unmonitor(serviceName)}
 						class="action-btn"
 						aria-label="Stop monitoring"
 						title="Stop monitoring"
 					>
-						<Monitor size={14} class="pinned-icon" />
+						<Monitor size={14} class="monitor-icon" />
 					</button>
 				</div>
 			</div>
@@ -134,7 +134,7 @@
 		color: #fff;
 	}
 
-	:global(.pinned-icon) {
+	:global(.monitor-icon) {
 		fill: currentColor;
 	}
 

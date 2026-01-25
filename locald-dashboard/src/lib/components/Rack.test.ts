@@ -3,74 +3,74 @@ import { describe, it, expect } from 'vitest';
 // Mock the component logic since we can't easily mount Svelte components in this environment
 // We'll test the logic function directly.
 
-function togglePin(
+function toggleMonitor(
 	name: string,
-	pinned: string[],
+	monitored: string[],
 	solo: string | null
-): { pinned: string[]; solo: string | null } {
-	let newPinned = [...pinned];
+): { monitored: string[]; solo: string | null } {
+	let newMonitored = [...monitored];
 
-	// If we are in solo mode, and we pin something else, we should pin the solo'd item too
-	if (solo && solo !== name && !newPinned.includes(solo)) {
-		newPinned.push(solo);
+	// If we are in solo mode, and we monitor something else, we should monitor the solo'd item too
+	if (solo && solo !== name && !newMonitored.includes(solo)) {
+		newMonitored.push(solo);
 	}
 
-	if (newPinned.includes(name)) {
-		newPinned = newPinned.filter((n) => n !== name);
+	if (newMonitored.includes(name)) {
+		newMonitored = newMonitored.filter((n) => n !== name);
 	} else {
-		newPinned.push(name);
+		newMonitored.push(name);
 	}
 
-	return { pinned: newPinned, solo };
+	return { monitored: newMonitored, solo };
 }
 
-describe('togglePin logic', () => {
-	it('should toggle pin state normally', () => {
-		let state = togglePin('service-a', [], null);
-		expect(state.pinned).toEqual(['service-a']);
+describe('toggleMonitor logic', () => {
+	it('should toggle monitor state normally', () => {
+		let state = toggleMonitor('service-a', [], null);
+		expect(state.monitored).toEqual(['service-a']);
 
-		state = togglePin('service-a', ['service-a'], null);
-		expect(state.pinned).toEqual([]);
+		state = toggleMonitor('service-a', ['service-a'], null);
+		expect(state.monitored).toEqual([]);
 	});
 
-	it('should pin the solo service when pinning another service', () => {
-		// Scenario: Solo on A, Pin B. Result: A and B pinned.
-		const state = togglePin('service-b', [], 'service-a');
-		expect(state.pinned).toContain('service-a');
-		expect(state.pinned).toContain('service-b');
-		expect(state.pinned.length).toBe(2);
+	it('should monitor the solo service when monitoring another service', () => {
+		// Scenario: Solo on A, Monitor B. Result: A and B monitored.
+		const state = toggleMonitor('service-b', [], 'service-a');
+		expect(state.monitored).toContain('service-a');
+		expect(state.monitored).toContain('service-b');
+		expect(state.monitored.length).toBe(2);
 	});
 
-	it('should not duplicate solo service if already pinned', () => {
-		// Scenario: Solo on A (already pinned), Pin B. Result: A and B pinned.
-		const state = togglePin('service-b', ['service-a'], 'service-a');
-		expect(state.pinned).toContain('service-a');
-		expect(state.pinned).toContain('service-b');
-		expect(state.pinned.length).toBe(2);
+	it('should not duplicate solo service if already monitored', () => {
+		// Scenario: Solo on A (already monitored), Monitor B. Result: A and B monitored.
+		const state = toggleMonitor('service-b', ['service-a'], 'service-a');
+		expect(state.monitored).toContain('service-a');
+		expect(state.monitored).toContain('service-b');
+		expect(state.monitored.length).toBe(2);
 	});
 
-	it('should handle pinning the solo service itself', () => {
-		// Scenario: Solo on A, Pin A. Result: A pinned.
-		const state = togglePin('service-a', [], 'service-a');
-		expect(state.pinned).toEqual(['service-a']);
+	it('should handle monitoring the solo service itself', () => {
+		// Scenario: Solo on A, Monitor A. Result: A monitored.
+		const state = toggleMonitor('service-a', [], 'service-a');
+		expect(state.monitored).toEqual(['service-a']);
 	});
 
-	it('should handle unpinning the solo service itself', () => {
-		// Scenario: Solo on A, Unpin A. Result: A unpinned.
-		const state = togglePin('service-a', ['service-a'], 'service-a');
-		expect(state.pinned).toEqual([]);
+	it('should handle unmonitoring the solo service itself', () => {
+		// Scenario: Solo on A, Unmonitor A. Result: A unmonitored.
+		const state = toggleMonitor('service-a', ['service-a'], 'service-a');
+		expect(state.monitored).toEqual([]);
 	});
 });
 
-function isActive(name: string, pinned: string[], solo: string | null): boolean {
-	return solo === name || pinned.includes(name);
+function isActive(name: string, monitored: string[], solo: string | null): boolean {
+	return solo === name || monitored.includes(name);
 }
 
 describe('isActive logic', () => {
 	it('should be active if solo', () => {
 		expect(isActive('a', [], 'a')).toBe(true);
 	});
-	it('should be active if pinned', () => {
+	it('should be active if monitored', () => {
 		expect(isActive('a', ['a'], null)).toBe(true);
 	});
 	it('should be active if both', () => {

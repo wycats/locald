@@ -15,7 +15,7 @@
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
 
-	export let pinned: string[] = [];
+	export let monitored: string[] = [];
 
 	let collapsedGroups: string[] = [];
 	let activeMenu: string | null = null;
@@ -33,9 +33,9 @@
 			moveFocus(-1);
 		} else if (event.key === 'Enter' || event.key === ' ') {
 			event.preventDefault();
-			if (focused) togglePin(focused);
+			if (focused) toggleMonitor(focused);
 		} else if (event.key === 'Escape') {
-			pinned = [];
+			monitored = [];
 			activeMenu = null;
 		}
 	}
@@ -70,24 +70,24 @@
 		}, 0);
 	}
 
-	function togglePin(name: string, event?: Event) {
+	function toggleMonitor(name: string, event?: Event) {
 		if (event) event.stopPropagation();
 
-		if (pinned.includes(name)) {
-			pinned = pinned.filter((n) => n !== name);
+		if (monitored.includes(name)) {
+			monitored = monitored.filter((n) => n !== name);
 		} else {
-			pinned = [...pinned, name];
+			monitored = [...monitored, name];
 		}
 	}
 
-	function togglePinGroup(groupName: string, groupServices: ServiceStatus[]) {
+	function toggleMonitorGroup(groupName: string, groupServices: ServiceStatus[]) {
 		const serviceNames = groupServices.map((s) => s.name);
-		const allPinned = serviceNames.every((name) => pinned.includes(name));
+		const allMonitored = serviceNames.every((name) => monitored.includes(name));
 
-		if (allPinned) {
-			pinned = pinned.filter((n) => !serviceNames.includes(n));
+		if (allMonitored) {
+			monitored = monitored.filter((n) => !serviceNames.includes(n));
 		} else {
-			pinned = [...new Set([...pinned, ...serviceNames])];
+			monitored = [...new Set([...monitored, ...serviceNames])];
 		}
 	}
 
@@ -122,12 +122,12 @@
 		}
 	}
 
-	function toggleSystemPin() {
+	function toggleSystemMonitor() {
 		const name = 'locald';
-		if (pinned.includes(name)) {
-			pinned = pinned.filter((n) => n !== name);
+		if (monitored.includes(name)) {
+			monitored = monitored.filter((n) => n !== name);
 		} else {
-			pinned = [...pinned, name];
+			monitored = [...monitored, name];
 		}
 	}
 
@@ -180,7 +180,7 @@
 				<div class="group-actions">
 					<button
 						class="group-btn"
-						on:click|stopPropagation={() => togglePinGroup(project.name, project.services)}
+						on:click|stopPropagation={() => toggleMonitorGroup(project.name, project.services)}
 						title="Monitor group in Deck"
 					>
 						<Layers size={12} />
@@ -205,10 +205,10 @@
 					<div
 						id="service-{service.name}"
 						class="rack-item"
-						class:pinned={pinned.includes(service.name)}
+						class:monitored={monitored.includes(service.name)}
 						class:focused={focused === service.name}
 						class:disabled={service.status === 'stopped'}
-						on:click={() => togglePin(service.name)}
+						on:click={() => toggleMonitor(service.name)}
 					>
 						<!-- Layer 1: Content (Left Group) -->
 						<div class="item-content">
@@ -238,8 +238,8 @@
 								{#if service.status === 'running'}
 									<button
 										class="control-btn monitor-btn"
-										class:active={pinned.includes(service.name)}
-										on:click={(e) => togglePin(service.name, e)}
+										class:active={monitored.includes(service.name)}
+										on:click={(e) => toggleMonitor(service.name, e)}
 										title="Monitor in Deck"
 									>
 										<Monitor size={14} />
@@ -296,11 +296,11 @@
 
 	<div
 		class="rack-footer"
-		class:active={pinned.includes('locald')}
-		on:click={toggleSystemPin}
+		class:active={monitored.includes('locald')}
+		on:click={toggleSystemMonitor}
 		role="button"
 		tabindex="0"
-		on:keydown={(e) => e.key === 'Enter' && toggleSystemPin()}
+		on:keydown={(e) => e.key === 'Enter' && toggleSystemMonitor()}
 	>
 		<div class="status-summary">
 			<Activity size={16} />
@@ -417,17 +417,17 @@
 		--row-bg: #18181b; /* Zinc-900 (Approx match for 5% white overlay) */
 	}
 
-	.rack-item.pinned {
+	.rack-item.monitored {
 		--row-bg: #27272a; /* Zinc-800 */
 		border-left: 2px solid #fff;
 	}
 
 	.rack-item.focused {
-		/* Fallback if not pinned/hovered, but focused usually implies one of those or keyboard nav */
+		/* Fallback if not monitored/hovered, but focused usually implies one of those or keyboard nav */
 		/* Let's keep it simple and match hover for focus to ensure gradient works */
 		--row-bg: #27272a;
 	}
-	.rack-item.focused:not(.pinned) {
+	.rack-item.focused:not(.monitored) {
 		border-left: 2px solid #52525b;
 	}
 
@@ -488,8 +488,8 @@
 		color: #71717a; /* Zinc-500 */
 	}
 
-	/* State A (Pinned) & State C (Hover) -> Bright Text */
-	.rack-item.pinned .service-name,
+	/* State A (Monitored) & State C (Hover) -> Bright Text */
+	.rack-item.monitored .service-name,
 	.rack-item:hover .service-name {
 		color: #ffffff; /* White */
 	}
@@ -560,8 +560,8 @@
 		transition: opacity 0.1s;
 	}
 
-	/* State A (Pinned) & State C (Hover) -> Toolbar Visible */
-	.rack-item.pinned .item-toolbar,
+	/* State A (Monitored) & State C (Hover) -> Toolbar Visible */
+	.rack-item.monitored .item-toolbar,
 	.rack-item:hover .item-toolbar {
 		opacity: 1;
 		pointer-events: auto;

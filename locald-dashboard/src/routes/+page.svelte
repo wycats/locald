@@ -7,18 +7,18 @@
 	import Deck from '$lib/components/Deck.svelte';
 
 	// --- State ---
-	let pinned = $state<string[]>([]);
+	let monitored = $state<string[]>([]);
 
 	onMount(() => {
 		const params = new URLSearchParams(window.location.search);
-		const pinParams = params.getAll('pin');
-		const pins = pinParams
+		const monitorParams = params.getAll('monitor');
+		const monitors = monitorParams
 			.flatMap((value) => value.split(','))
 			.map((value) => value.trim())
 			.filter(Boolean);
 
-		if (pins.length > 0) {
-			pinned = Array.from(new Set(pins));
+		if (monitors.length > 0) {
+			monitored = Array.from(new Set(monitors));
 		}
 
 		services.refresh();
@@ -26,18 +26,18 @@
 		return cleanup;
 	});
 
-	let isDeckMode = $derived(pinned.length > 0);
+	let isDeckMode = $derived(monitored.length > 0);
 </script>
 
 <div class="workspace">
 	<!-- THE RACK (Sidebar) -->
-	<Rack bind:pinned />
+	<Rack bind:monitored />
 
 	<!-- MAIN VIEW -->
 	<div class="main-view">
 		{#if isDeckMode}
 			<!-- THE DECK (Tiled Terminals) -->
-			<Deck bind:pinned />
+			<Deck bind:monitored />
 		{:else}
 			<!-- THE STREAM (Unified Log) -->
 			<Stream />
