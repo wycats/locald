@@ -14,8 +14,8 @@ use crate::cli::{DistributionCommands, PluginCommands};
 #[cfg(feature = "experimental-containers")]
 use crate::container;
 use crate::{
-    client, debug, doctor, history, init, monitor, run, selfupgrade, service, style, trust,
-    try_cmd, utils,
+    client, debug, doctor, global_config, history, init, monitor, run, selfupgrade, service, style,
+    trust, try_cmd, update_check, utils,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
@@ -225,6 +225,32 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Up { path, verbose } => {
+            let config = global_config::load();
+            let update_rx = if config.updates.auto_check {
+                let (tx, rx) = std::sync::mpsc::channel();
+                update_check::spawn_update_check(move |result| {
+                    let _ = tx.send(result);
+                });
+                Some(rx)
+            } else {
+                None
+            };
+
+            let report_update = |update_rx: &Option<std::sync::mpsc::Receiver<Option<String>>>| {
+                if let Some(rx) = update_rx {
+                    if let Ok(Some(new_version)) =
+                        rx.recv_timeout(std::time::Duration::from_millis(100))
+                    {
+                        eprintln!(
+                            "{} Update available: {} → {}. Run `locald selfupgrade`",
+                            style::INFO,
+                            selfupgrade::CURRENT_VERSION,
+                            new_version
+                        );
+                    }
+                }
+            };
+
             let current_version = env!("LOCALD_BUILD_VERSION");
 
             // Check if already running and check version
@@ -303,6 +329,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!(
                     "No locald.toml found in current directory. Run `locald init` to create one."
                 );
+                report_update(&update_rx);
                 return Ok(());
             }
 
@@ -337,6 +364,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+
+            report_update(&update_rx);
         }
         Commands::Stop { name } => {
             let names = if let Some(n) = name {

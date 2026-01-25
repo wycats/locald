@@ -41,6 +41,7 @@ mod debug;
 #[cfg(feature = "experimental-plugins")]
 mod distribution;
 mod doctor;
+mod global_config;
 mod handlers;
 mod hints;
 mod history;
@@ -56,6 +57,7 @@ mod style;
 mod surface_manifest;
 mod trust;
 mod try_cmd;
+mod update_check;
 mod utils;
 
 // Force rebuild 3

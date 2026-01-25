@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 pub struct GlobalConfig {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub updates: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+pub struct UpdateConfig {
+    #[serde(default)]
+    pub auto_check: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
