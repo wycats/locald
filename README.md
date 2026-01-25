@@ -2,6 +2,29 @@
 
 `locald` is a local development platform: it runs and orchestrates your project services (processes and containers), provides stable local domains + HTTPS, and exposes a dashboard for observability.
 
+## Installation
+
+### Quick Install (Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wycats/locald/main/install.sh | sh
+```
+
+After installation, run the setup to configure privileged operations:
+
+```bash
+sudo locald admin setup
+```
+
+### Requirements
+
+- **Linux** (x86_64 or aarch64) — macOS support coming soon
+- **sudo access** for privileged setup (HTTPS certificates, port binding)
+
+### Alternative: Build from Source
+
+See the [Contributing Guide](CONTRIBUTING.md) for building from source.
+
 This repo is a Rust workspace with a small privileged helper (`locald-shim`) and several supporting packages (dashboard, docs, e2e harness).
 
 Contributing guide: see `CONTRIBUTING.md`.

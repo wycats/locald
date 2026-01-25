@@ -6,6 +6,7 @@ use crate::plugins;
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
+use directories::ProjectDirs;
 use futures_util::StreamExt;
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{BootEvent, Event, LogEntry, ServiceStatus};
@@ -258,6 +259,12 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
+    fn postgres_data_dir(name: &str) -> PathBuf {
+        ProjectDirs::from("com", "locald", "locald")
+            .map(|d| d.data_dir().join("postgres").join(name))
+            .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(name))
+    }
+
     pub async fn get_service_controller(
         &self,
         name: &str,
@@ -1278,18 +1285,18 @@ impl ProcessManager {
         // 2. Wipe data (if applicable)
         let data_dir = {
             let services = self.services.lock().await;
-            services.get(name).map(|service| {
-                let short_name = name.split(':').nth(1).unwrap_or(name);
-                // TODO: This path logic is duplicated. Should be centralized.
-                // For now, we only support resetting Postgres services which use this path.
-                // If we add other stateful services, we need a better way to know their data dir.
-                // We could store `data_dir` in the Service struct?
-                // But `Service` struct has `path` which is project root.
-                // Let's assume Postgres for now.
-                service
-                    .path
-                    .join(".locald/services/postgres")
-                    .join(short_name)
+            services.get(name).and_then(|service| {
+                if matches!(
+                    &service.service_config,
+                    ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+                ) {
+                    // TODO: This path logic is duplicated. Should be centralized.
+                    // For now, we only support resetting Postgres services which use this path.
+                    // If we add other stateful services, we need a better way to know their data dir.
+                    Some(Self::postgres_data_dir(name))
+                } else {
+                    None
+                }
             })
         };
 
@@ -1762,6 +1769,7 @@ impl ServiceResolver for ProcessManager {
 mod tests {
     use super::*;
     use locald_core::config::ProjectConfig;
+    use std::path::PathBuf;
 
     #[test]
     fn test_get_service_domain_default() {
@@ -1807,6 +1815,21 @@ mod tests {
         // Other service -> subdomain
         let domain = ProcessManager::get_service_domain("shop:api", &project_config);
         assert_eq!(domain, "api.shop.local".to_string());
+    }
+
+    #[test]
+    fn test_postgres_reset_uses_xdg_path() {
+        let name = "test-postgres";
+        let expected = ProjectDirs::from("com", "locald", "locald")
+            .map(|d| d.data_dir().join("postgres").join(name))
+            .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(name));
+
+        let actual = ProcessManager::postgres_data_dir(name);
+
+        assert_eq!(actual, expected);
+
+        let workspace_local = PathBuf::from(".locald/services/postgres").join(name);
+        assert!(!actual.ends_with(&workspace_local));
     }
 
     #[tokio::test]
