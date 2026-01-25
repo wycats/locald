@@ -396,3 +396,47 @@ Based on project differentiators and axioms, RFCs were triaged into launch prior
 | 0137 | Superseded by 0138 | Explicitly superseded |
 | 0046 | Manifesto Structure | Obsolete |
 | 0130 | Host Shim Daemon | Superseded by 0138 |
+
+
+---
+
+## Strategic Triage (2025-01-24)
+
+Based on locald's core differentiators:
+1. **"Clone → `locald up`"** - Zero-friction start
+2. **Stable Domains + HTTPS** - No port juggling
+3. **Daemon-First** - Always-on platform
+4. **Self-Hosting Platform** - Dashboard + Docs built-in
+5. **Cross-Platform** - Linux, macOS, Windows first-class
+6. **Plugin Extensibility** - WASM plugins
+7. **Docker-Free Host-First** - No Docker dependency
+
+### Launch Critical (Phase 1-2)
+
+| RFC | Title | Priority | Rationale |
+|-----|-------|----------|-----------|
+| 0104 | macOS Platform Support | P1 | Cross-platform axiom, dominant dev platform |
+| 0138 | Remove Container Workflow | P1 | Simplify, sharpen host-first differentiator |
+| 0110 | Privileged Capability | P1 | Better onboarding errors |
+| 0086 | CLI Surface Overhaul | P2 | Coherent "zero friction" CLI |
+| 0135 | Dashboard Vocabulary | P2 | Self-hosting platform UX |
+| 0103 | Docs Site Language | P2 | Onboarding experience |
+| 0039 | Installation & Updates | P2 | Frictionless install |
+
+### Near-Term Polish (Phase 3)
+
+| RFC | Title | Rationale |
+|-----|-------|-----------|
+| 0050 | Hot Reloading | Config changes should "just work" |
+| 0051 | Port Mismatch Detection | Reduce user confusion |
+| 0072 | Host-Level Builds | Better first-run experience |
+| 0085 | Workspace Support | Monorepo reality |
+
+### Withdrawn (This Session)
+
+| RFC | Title | Reason |
+|-----|-------|--------|
+| 0116 | Minimum Awesome Product | Empty stub (consider reconstructing in ideas.toml) |
+| 0137 | Superseded by 0138 | Explicitly superseded |
+| 0046 | Manifesto Structure | Likely obsolete |
+| 0130 | Host Shim Daemon | Superseded by 0138 |
