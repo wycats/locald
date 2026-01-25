@@ -1,6 +1,6 @@
 ---
 title: Property Tests as Invariant Specs (Doctor/Fix Consolidation)
-stage: 0
+stage: 2
 feature: Engineering Excellence
 ---
 

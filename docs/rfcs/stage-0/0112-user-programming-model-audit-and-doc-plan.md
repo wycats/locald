@@ -6,6 +6,8 @@ feature: Documentation / UX Coherence
 
 # User Programming Model Audit and Doc Plan
 
+> **Resolution Status:** Key vocabulary conflicts (C-007, C-008) are **RESOLVED**. See [RFC 0135](0135-dashboard-vocabulary.md) for canonical vocabulary definitions.
+
 ## 1) Summary
 
 This audit artifact is a living coherence report that aims to make the _taught model_ (docs/RFCs) match the _required model_ (what users must actually do to succeed).
@@ -135,7 +137,7 @@ This section inventories what appears true from the repository’s implementatio
 | CL-005: Registry exists and lives at `~/.local/share/locald/registry.json`.                                                                                                                                                               | docs/rfcs/0026-configuration-hierarchy.md (“Location: ~/.local/share/locald/registry.json”)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | locald-core/src/registry.rs uses `directories::ProjectDirs(...).data_local_dir().join("registry.json")`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | OK                          | Power User                                                                                                                                                                                    | Also has fallback to `./locald-registry.json` if dirs unavailable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | CL-006: CLI has registry management commands (list/clean/pin/unpin).                                                                                                                                                                      | docs/rfcs/0026-configuration-hierarchy.md (“CLI design: locald registry list/clean/pin/unpin”)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | locald-cli/src/cli.rs defines `Registry` commands; locald-core/src/registry.rs implements pin/unpin/prune.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | OK                          | Power User                                                                                                                                                                                    | `prune` name differs from RFC (uses `clean` in CLI).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | CL-007: Users can inspect config with provenance via `locald config show --provenance`.                                                                                                                                                   | docs/rfcs/0026-configuration-hierarchy.md (“CLI: locald config show --provenance”)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | locald-cli/src/handlers.rs prints global config path + `Debug` view of global config when `--provenance` is set; it does not explain per-value provenance nor show context/workspace/project layers (RFC 0026 example).                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Drift                       | Power User                                                                                                                                                                                    | Conflict Card C-004 (stop): decide whether to implement full provenance output or revise the contract/docs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| CL-008: Default routing UX is `*.localhost`.                                                                                                                                                                                              | docs/manual/vision.md (“\*.localhost routing is the default UX”); docs/rfcs/0024-default-domain-localhost.md (“Switch the default domain suffix from `.local` to `.localhost`.”)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | locald-cli/src/init.rs defaults to `{project_name}.local` (interactive prompt) which will typically be accepted as an explicit domain; locald-cli/src/service.rs default uses `{project_name}.localhost`; locald-core/src/config/mod.rs says `{name}.localhost` when domain is None.                                                                                                                                                                                                                                                                                                                                                                                               | Drift                       | App Builder                                                                                                                                                                                   | This is Conflict Card C-003 (stop).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| CL-008: Default routing UX is `*.localhost`.                                                                                                                                                                                              | docs/manual/vision.md (“\*.localhost routing is the default UX”); docs/rfcs/0024-default-domain-localhost.md (“Switch the default domain suffix from `.local` to `.localhost`.”)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | locald-cli/src/init.rs defaults to `{project_name}.local` (interactive prompt) which will typically be accepted as an explicit domain; locald-cli/src/service.rs default uses `{project_name}.localhost`; locald-core/src/config/mod.rs says `{name}.localhost` when domain is None.                                                                                                                                                                                                                                                                                                                                                                                               | Drift                       | App Builder                                                                                                                                                                                   | This is Conflict Card C-003 (stop).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | CL-009: Project mode uses `locald.toml` in the current directory as the primary config file.                                                                                                                                              | docs/design/user-interaction-modes.md; locald-cli/README.md                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | locald-cli/src/handlers.rs checks for `./locald.toml`; locald-cli/src/run.rs uses `current_dir().join("locald.toml")`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | OK                          | App Builder                                                                                                                                                                                   | Docs also mention other hierarchy files; not yet verified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | CL-010: The interaction-mode docs’ command examples match the CLI surface (`start/ui/prune`).                                                                                                                                             | docs/design/user-interaction-modes.md; locald-docs/src/content/docs/concepts/user-interaction-modes.md                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | locald-cli/src/cli.rs exposes `up/monitor/dashboard/registry clean` but not `start/ui/prune` as top-level commands.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Drift                       | All personas                                                                                                                                                                                  | C-001 resolved: docs should be updated to teach `up/monitor/registry clean`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | CL-011: The daemon starts on system boot (or user login) and is “always-on”.                                                                                                                                                              | docs/design/user-interaction-modes.md; locald-docs/src/content/docs/concepts/user-interaction-modes.md                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | No `*.service` unit in repo (search `**/*.service`); CLI spawns daemon on-demand via `setsid locald server start` (locald-cli/src/utils.rs).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Drift                       | App Builder / Operator                                                                                                                                                                        | This is Conflict Card C-002 (stop).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -236,7 +238,6 @@ Boundary violations encouraged by examples (initial):
 These are doc proposals that do **not** require resolving C-001.
 
 - **P-001: Sandbox & IPC Environment Contract**
-
   - Placement: “CLI Reference” + “Troubleshooting” + “Environment Variables”
   - Outline:
     - What `--sandbox` does
@@ -247,7 +248,6 @@ These are doc proposals that do **not** require resolving C-001.
   - Risks/tradeoffs: users might overuse sandbox and fragment state.
 
 - **P-002: Privileged Shim Lifecycle & Self-Repair Policy**
-
   - Placement: “Install/Setup” + “Troubleshooting”
   - Outline:
     - When the shim is required
@@ -258,7 +258,6 @@ These are doc proposals that do **not** require resolving C-001.
   - Risks/tradeoffs: avoid encouraging always-on sudo usage.
 
 - **P-003: Daemon bootstrap + Where logs go**
-
   - Placement: “Getting Started” + “Troubleshooting”
   - Outline:
     - When the daemon auto-starts
@@ -267,7 +266,6 @@ These are doc proposals that do **not** require resolving C-001.
   - Risks/tradeoffs: `/tmp/locald.log` may be platform-specific.
 
 - **P-004: Canonical CLI Vocabulary (start/ui/prune → up/monitor/registry clean)**
-
   - Placement: “Getting Started” + “Concepts: Interaction Modes” + “CLI Reference”
   - Outline:
     - Canonical verbs (Up/Monitor/Dashboard/Registry)
@@ -277,7 +275,6 @@ These are doc proposals that do **not** require resolving C-001.
   - Risks/tradeoffs: if aliases are later added, docs must remain explicit about deprecation.
 
 - **P-005: Daemon Lifecycle (Current Reality + Remediation Plan)**
-
   - Placement: “Concepts: Interaction Modes” + “Getting Started” + “Install/Setup”
   - Teach _now_ (current contract):
     - Daemon is typically started **on-demand** by the CLI.
@@ -291,7 +288,6 @@ These are doc proposals that do **not** require resolving C-001.
   - Key messages: “services start when you run `locald up`, and daemon autostart is currently manual.”
 
 - **P-006: CLI Taxonomy + Alias/Deprecation Policy**
-
   - Placement: “CLI Reference” + a short “Glossary” box in Getting Started.
   - Goal: remove ambiguity about whether a command acts on the **current project** (current directory / `locald.toml`) vs the **locald system plane** (daemon/registry).
   - Proposed taxonomy (teach as mental model):
@@ -305,7 +301,6 @@ These are doc proposals that do **not** require resolving C-001.
     - **UI plane**:
 
 - **P-007: Managed Services Persistence + Reset + GC Contract (Postgres)**
-
   - Placement: “Guides: Managed Services” + “Architecture: State Management” (and a short callout in Getting Started)
   - Teach _now_ (current contract):
     - Postgres persistence is **XDG-first** (C-012 resolution).
@@ -396,7 +391,6 @@ These are doc proposals that do **not** require resolving C-001.
   1. Upgrade `locald config show --provenance` to match RFC 0026’s contract (per-key provenance, all layers).
   2. Narrow the contract: rename/scope the current output to “global config dump”, and move provenance tooling to a different command/flag.
 - **Smallest question to user (one decision):**
-
   - Should `locald config show --provenance` be treated as a **hard contract** we must implement (per RFC 0026), or should we **revise the contract** and treat current output as sufficient for now?
 
 - **Resolution:** Capture the **spirit** of RFC 0026 (visibility into config layering/provenance) without treating the specific output format/examples as binding.
@@ -416,7 +410,6 @@ These are doc proposals that do **not** require resolving C-001.
   1. Change the message to: `Run \`locald up\` to launch your project.`
   2. Change the message to a slightly more guided form: `Next: run \`locald up\`. (Tip: \`locald dashboard\` opens the web UI.)`
 - **Smallest question to user (one decision):**
-
   - Should the `locald init` success message be the minimal `Run \`locald up\`…`, or the guided version that also mentions `dashboard`?
 
 - **Resolution:** Use the **slightly guided** message.
@@ -437,7 +430,6 @@ These are doc proposals that do **not** require resolving C-001.
   2. Keep `locald down` in docs but explicitly label it as “planned / not yet implemented” (preferred if we want to socialize the ideal surface early).
   3. Implement `locald down` soon and keep docs as-is.
 - **Smallest question to user (one decision):**
-
   - Should user-facing docs **remove** `locald down` until it exists, or keep it as **planned-but-not-yet**?
 
 - **Resolution:** Remove `locald down` from user-facing docs until it is implemented.
@@ -455,22 +447,18 @@ These are doc proposals that do **not** require resolving C-001.
   - App Builder: expects pinning to (re)start or preserve uptime; instead, nothing happens.
   - Power User: unclear whether “pinned” is an availability contract or just a retention/GC contract.
 - **Candidate resolutions (do not pick yet):**
-
   1. Treat pinning as **retention only** (prevents cleanup/GC), and update help text + docs to match.
   2. Upgrade pinning to also mean **autostart/keep running**, and implement the missing behavior.
 
 - **Smallest question to user (one decision):**
-
   - Should `locald registry pin` mean **retention-only** (prevents GC/cleanup), or should it mean **autostart/keep running** as well?
 
 - **Resolution:** Two-state policy.
-
   - `locald registry pin` means **retain** (“don’t clean up”) and defaults to **enabled on daemon startup** (autostart when the daemon starts).
   - `locald registry disable` (new concept/command) means **retain** but **do not boot** (no autostart).
   - Current code reality: there is only `pinned: bool` in the registry (locald-core/src/registry.rs) and `registry_pin` / `registry_unpin` only toggle that flag (locald-server/src/manager.rs). No `disabled`/`enabled` autostart state exists yet.
 
   ### Conflict Card C-008
-
   - **Conflict ID:** C-008
   - **Claim (docs/RFCs say):**
     - Some docs imply _two different_ pin concepts:
@@ -484,16 +472,13 @@ These are doc proposals that do **not** require resolving C-001.
     - App Builder: sees “pin” in UI and CLI and reasonably assumes the same behavior; gets confused when “pinning” in one place doesn’t affect the other.
     - Power User: can’t build reliable mental models or automation when the same term names different state machines.
   - **Smallest question to user (one decision):**
-
     - Should the product **reserve “pin” for registry policy** (retain + enabled/disabled-on-boot) and rename the dashboard action/state (e.g. “focus”, “deck”, “tile”), or should we keep **two different ‘pin’ meanings** and rely on docs/UI copy to distinguish them?
 
   - **Resolution:** Reserve **“pin”** for registry policy.
-
     - Dashboard UI concept should be renamed to **“monitor”** (use the monitor icon in the sidebar/inline instead of a pin icon).
     - Docs should treat dashboard “monitoring” as “focus this in the Deck/Stream”, and treat registry `pin/disable` as boot/retention policy.
 
     ### Conflict Card C-009
-
     - **Conflict ID:** C-009
     - **Claim (docs/RFCs say):**
       - RFC 0095 (Accepted) describes a Mark‑Sweep GC with:
@@ -511,7 +496,6 @@ These are doc proposals that do **not** require resolving C-001.
       1. Treat RFC 0095 as **planned**: keep it as Accepted design, but mark manual/docs as “not implemented yet” and describe only current `registry clean` behavior.
       2. Treat RFC 0095 as **current contract**: prioritize implementing TTL + heartbeat + sweep + audit soon (and then update docs to match exact behavior).
     - **Smallest question to user (one decision):**
-
       - For the User Programming Model docs _now_, should we describe GC as **planned** (document today’s `registry clean` only), or treat RFC 0095 as **current contract** (docs can assume Mark‑Sweep semantics even though code doesn’t implement it yet)?
 
     - **Resolution:** Describe Mark‑Sweep GC as **planned** (document today’s `locald registry clean` behavior only).
@@ -571,7 +555,6 @@ These are doc proposals that do **not** require resolving C-001.
   - App Builder: “reset” is expected to be a reliable DB wipe; if it deletes the wrong directory, users get surprising leftover data.
   - Power User/CI: automation around “reset between test runs” becomes flaky and hard to reason about.
 - **Smallest question to user (one decision):**
-
   - What is the canonical persistence location for managed Postgres state: **workspace-local (`.locald/...`)** or **XDG data dir (`~/.local/share/...`)**?
 
 - **Resolution:** Canonical persistence location is **XDG data dir**.
@@ -613,6 +596,8 @@ These are doc proposals that do **not** require resolving C-001.
 ## 12) Appendix: Evidence Notes
 
 ### Vocabulary normalization punch list (strict single-canon)
+
+> **Canonical Reference:** See [RFC 0135: Dashboard Vocabulary](0135-dashboard-vocabulary.md) for authoritative definitions.
 
 Canonical spellings to teach and use everywhere:
 
