@@ -50,6 +50,7 @@ mod monitor;
 mod plugin;
 mod progress;
 mod run;
+mod selfupgrade;
 mod service;
 mod style;
 mod surface_manifest;
@@ -87,6 +88,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
             | cli::Commands::Init { .. }
+            | cli::Commands::Selfupgrade { .. }
             | cli::Commands::Plugin {
                 command: cli::PluginCommands::Create { .. }
             }
@@ -105,6 +107,7 @@ fn run_main(cli: cli::Cli) -> Result<()> {
         } | cli::Commands::Doctor { .. }
             | cli::Commands::Surface { .. }
             | cli::Commands::Init { .. }
+            | cli::Commands::Selfupgrade { .. }
     );
 
     if !skip_verify {

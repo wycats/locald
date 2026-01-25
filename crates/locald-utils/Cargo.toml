@@ -17,7 +17,7 @@ nix = { version = "0.30.1", features = [
 portable-pty = "0.9.0"
 postgresql_embedded = "0.20.0"
 rcgen = "0.14.5"
-reqwest = "0.12.24"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls = { version = "0.23.35", features = ["ring"] }
 semver = "1.0.27"
 serde = { version = "1.0", features = ["derive"] }

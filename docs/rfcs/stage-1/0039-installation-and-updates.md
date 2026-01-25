@@ -20,6 +20,27 @@ feature: General
     - **Opt-In**: Must be strictly opt-in via configuration (e.g., `auto_update = true`) to respect user privacy ("no call home without consent").
     - **Onboarding**: Prompt the user to enable auto-updates during `locald admin setup`.
 
+  ### `locald selfupgrade` (Detailed Flow)
+
+  ```
+  locald selfupgrade [--check] [--version <VERSION>]
+  ```
+
+  1. Query GitHub Releases for the latest (or specified) version.
+  2. If `--check`: print the version comparison and exit.
+  3. Download the release tarball to a temp directory.
+  4. Verify the SHA256 checksum against the `.sha256` file.
+  5. If the daemon is running: call `locald shutdown` for a graceful stop.
+  6. Atomically replace the current binary (rename).
+  7. Print success.
+  8. If the shim version mismatches: print "Run `sudo locald admin setup`".
+  9. The user runs `locald up` to restart (services are restored from state).
+
+  Notes:
+  - No process adoption. Services restart fresh.
+  - State files record which projects were running.
+  - Shim upgrades are separate and require sudo.
+
 ## Secure Installation
 
 - **Goal**: Provide a secure and ergonomic alternative to `curl | sh`.

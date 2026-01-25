@@ -34,18 +34,15 @@ This ensures that the Dashboard and Docs are always perfectly synced with the bi
 
 ## 3. Self-Upgrading Lifecycle
 
-`locald` manages its own updates to ensure users are always on the latest version without breaking their running services.
+`locald` manages its own updates to keep the install current without trying to adopt running processes.
 
-### The `locald up` Protocol
-
-When a user runs `locald up` (or `locald selfupgrade` in the future):
+### The `locald up` / `locald selfupgrade` Protocol
 
 1.  **Download**: The new binary is downloaded to a temporary location.
-2.  **Replace**: The current binary on disk is replaced atomically.
-3.  **Signal**: The client sends a `SIGTERM` to the running daemon.
-4.  **Graceful Shutdown**: The daemon stops accepting new requests, waits for active connections to drain (with a timeout), and saves its state (running services, PIDs).
-5.  **Restart**: The client (or a supervisor) starts the new daemon.
-6.  **Restore**: The new daemon loads the state file and "adopts" the running processes. It does _not_ kill them. It reconnects to their stdout/stderr pipes if possible (or just monitors the PID).
+2.  **Shutdown**: If the daemon is running, call `locald shutdown` for a graceful stop (drain, persist state).
+3.  **Replace**: The current binary on disk is replaced atomically (rename).
+4.  **Restart**: The user runs `locald up` to start fresh.
+5.  **Restore**: The new daemon reads the state file and restores previous projects by restarting them.
 
 ## 4. Privilege Separation (`locald-shim`)
 

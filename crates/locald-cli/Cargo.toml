@@ -63,6 +63,7 @@ scopeguard = "1.2"
 semver = "1.0"
 sha2 = "0.10"
 tar = "0.4"
+tempfile = "3.23.0"
 textwrap = "0.16.1"
 dialoguer = "0.12.0"
 directories = "6.0.0"
@@ -76,7 +77,6 @@ locald-server = { version = "0.1.0", path = "../locald-server", default-features
 locald-utils = { version = "0.1.0", path = "../locald-utils" }
 nix = { version = "0.30.1", features = ["user"] }
 ratatui = "0.29.0"
-rcgen = "0.14.5"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "rustls-tls",
@@ -113,4 +113,3 @@ oci-spec = "0.8.3"
 predicates = "3.1.3"
 rexpect = "0.6.2"
 sqlx = "0.8.6"
-tempfile = "3.23.0"
