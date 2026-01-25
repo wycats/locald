@@ -1,6 +1,6 @@
 ---
 title: Host Shim Daemon for Container Development Environments
-stage: 2
+stage: 1
 feature: Container Development
 superseded_by: "0138"
 ---
@@ -11,7 +11,7 @@ superseded_by: "0138"
 - **Superseded by**: RFC 0138
 
 
-**Stage**: 2 (Draft)
+**Stage**: 1 (Proposal)
 **Author**: locald team
 **Created**: 2026-01-06
 **Related**: RFC 0096 (Leaf Node Axiom), RFC 0097 (Strict Discovery)
@@ -116,47 +116,19 @@ User runs: locald up (inside container)
 │ existing    │  │                                          │
 │ shim,       │  │ 1. Use configured host_exec template     │
 │ proceed     │  │ 2. Auto-detect: flatpak-spawn, host-exec │
-│             │  │ 3. Offer interactive setup (if TTY)      │
-│             │  │ 4. ERROR with actionable message         │
+│             │  │ 3. Fail with actionable message          │
 └─────────────┘  └─────────────────┬────────────────────────┘
                                    │
                                    ▼
                  ┌─────────────────────────────────────────┐
-                 │ If all fail, ERROR (not warn):          │
+                 │ If all fail, print:                     │
                  │                                         │
-                 │ "✗ locald requires privileged helper    │
-                 │    access.                              │
+                 │ "Could not start host shim daemon.      │
+                 │  Please run on your host:               │
+                 │    sudo locald-shim serve               │
                  │                                         │
-                 │  To fix:                                │
-                 │    Container: flatpak-spawn --host      │
-                 │               pkexec locald-shim serve  │
-                 │    Direct:    sudo locald admin setup   │
-                 │                                         │
-                 │  To test without privileges:            │
-                 │    locald --sandbox test up             │
-                 │                                         │
-                 │  For diagnosis: locald doctor"          │
-                 │                                         │
-                 │ EXIT CODE: 1 (not continue)             │
+                 │  Or configure host_exec in config.toml" │
                  └─────────────────────────────────────────┘
-```
-
-### Error-Not-Warning Policy
-
-**Critical design decision**: When privileged helper access is unavailable, `locald` **errors and exits** rather than continuing with a warning.
-
-**Rationale**:
-
-- Most core features (hosts sync, cgroup isolation, privileged ports) require the shim
-- Silent degradation leads to confusing "why doesn't X work?" experiences
-- Users deserve a clear signal that setup is incomplete
-- The sandbox mode (see RFC 0037) provides an explicit opt-in for unprivileged testing
-
-**The only way to run without privileges is sandbox mode**:
-
-```bash
-# This will work without any privileged setup
-locald --sandbox test up
 ```
 
 ### Manual Setup Options
@@ -923,15 +895,15 @@ The daemon mode implementation is divided into phases:
 
 ### Phase 1: Socket-based Shim Daemon
 
-**Files**: `crates/locald-shim/src/daemon.rs` (new), `crates/locald-shim/src/protocol.rs` (new)
+**Files**: `locald-shim/src/daemon.rs` (new), `locald-shim/src/protocol.rs` (new)
 
-- [ ] Add `locald-shim serve [--foreground]` command (note: shim is a separate binary)
-- [ ] Add `daemonize` and `signal-hook` dependencies to `crates/locald-shim/Cargo.toml`
-- [ ] Implement `Handshake`, `ShimRequest`, `ShimResponse` types with serde
+- [ ] Add `locald-shim serve [--foreground]` command
+- [ ] Add `daemonize` dependency to `locald-shim/Cargo.toml`
+- [ ] Implement `ShimMessage`, `ShimRequest`, `ShimResponse` types
 - [ ] Implement length-prefixed JSON wire format (read/write helpers)
 - [ ] Bind socket before fork, print path, then daemonize
 - [ ] Socket permissions: mode 0600, validate peer UID via `SO_PEERCRED`
-- [ ] Request dispatcher: route to existing shim operations (hosts, cgroup, trust)
+- [ ] Request dispatcher: route to existing shim operations
 - [ ] Lifecycle: idle timeout (5 min), max lifetime (1 hour), SIGTERM handler
 - [ ] PID file for duplicate detection
 
@@ -939,7 +911,7 @@ The daemon mode implementation is divided into phases:
 
 ### Phase 2: Host-Exec Configuration
 
-**Files**: `crates/locald-core/src/config/global.rs`, `crates/locald-cli/src/utils.rs`
+**Files**: `locald-core/src/config/global.rs`, `locald-cli/src/utils.rs`
 
 - [ ] Add `ContainerConfig` struct with `host_exec: Option<String>`
 - [ ] Add `shim_socket: Option<PathBuf>` for socket path override
@@ -951,7 +923,7 @@ The daemon mode implementation is divided into phases:
 
 ### Phase 3: Polkit Integration
 
-**Files**: `assets/dev.locald.policy` (new), `crates/locald-shim/src/install.rs`
+**Files**: `assets/dev.locald.policy` (new), `locald-shim/src/install.rs`
 
 - [ ] Create polkit policy XML file
 - [ ] Install policy to `/usr/share/polkit-1/actions/` during `admin setup`
@@ -962,7 +934,7 @@ The daemon mode implementation is divided into phases:
 
 ### Phase 4: Container Auto-Start
 
-**Files**: `crates/locald-cli/src/handlers.rs`, `crates/locald-utils/src/privileged.rs`
+**Files**: `locald-cli/src/handlers.rs`, `locald-utils/src/privileged.rs`
 
 - [ ] In `PrivilegedCapability::acquire()`: try socket first, then setuid
 - [ ] `ShimClient` struct for socket communication
