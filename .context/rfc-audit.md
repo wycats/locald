@@ -359,6 +359,7 @@ For each RFC:
 Based on project differentiators and axioms, RFCs were triaged into launch priorities.
 
 ### Core Differentiators
+
 1. "Clone → locald up" - Zero-friction start
 2. Stable Domains + HTTPS - project.localhost with auto TLS
 3. Daemon-First - Processes persist, always-on platform
@@ -369,40 +370,40 @@ Based on project differentiators and axioms, RFCs were triaged into launch prior
 
 ### Launch Critical (Phase 1-2)
 
-| RFC | Title | Rationale |
-|-----|-------|-----------|
-| 0104 | macOS Platform Support | Cross-platform is core axiom; macOS is dominant dev platform |
-| 0138 | Remove Container Workflow | Simplify codebase, sharpen host-first differentiator |
-| 0110 | Privileged Capability | Better onboarding errors for domain/TLS |
-| 0086 | CLI Surface Overhaul | Zero-friction requires coherent CLI |
-| 0135 | Dashboard Vocabulary | Self-hosting platform needs coherent UX |
-| 0039 | Installation & Updates | Clone→up requires frictionless install |
-| 0103 | Docs Site Language | Onboarding experience |
+| RFC  | Title                     | Rationale                                                    |
+| ---- | ------------------------- | ------------------------------------------------------------ |
+| 0104 | macOS Platform Support    | Cross-platform is core axiom; macOS is dominant dev platform |
+| 0138 | Remove Container Workflow | Simplify codebase, sharpen host-first differentiator         |
+| 0110 | Privileged Capability     | Better onboarding errors for domain/TLS                      |
+| 0086 | CLI Surface Overhaul      | Zero-friction requires coherent CLI                          |
+| 0135 | Dashboard Vocabulary      | Self-hosting platform needs coherent UX                      |
+| 0039 | Installation & Updates    | Clone→up requires frictionless install                       |
+| 0103 | Docs Site Language        | Onboarding experience                                        |
 
 ### Near-Term Polish (Phase 3)
 
-| RFC | Title | Rationale |
-|-----|-------|-----------|
-| 0050 | Hot Reloading | Config changes should just work |
-| 0051 | Port Mismatch Detection | Reduce first-run confusion |
-| 0072 | Host-Level Builds | Build before start |
-| 0085 | Workspace Support | Monorepo reality |
+| RFC  | Title                   | Rationale                       |
+| ---- | ----------------------- | ------------------------------- |
+| 0050 | Hot Reloading           | Config changes should just work |
+| 0051 | Port Mismatch Detection | Reduce first-run confusion      |
+| 0072 | Host-Level Builds       | Build before start              |
+| 0085 | Workspace Support       | Monorepo reality                |
 
 ### Withdrawn (This Session)
 
-| RFC | Title | Reason |
-|-----|-------|--------|
+| RFC  | Title                | Reason                                      |
+| ---- | -------------------- | ------------------------------------------- |
 | 0116 | MAP Scope Quarantine | Empty stub (contents lost, may reconstruct) |
-| 0137 | Superseded by 0138 | Explicitly superseded |
-| 0046 | Manifesto Structure | Obsolete |
-| 0130 | Host Shim Daemon | Superseded by 0138 |
-
+| 0137 | Superseded by 0138   | Explicitly superseded                       |
+| 0046 | Manifesto Structure  | Obsolete                                    |
+| 0130 | Host Shim Daemon     | Superseded by 0138                          |
 
 ---
 
 ## Strategic Triage (2025-01-24)
 
 Based on locald's core differentiators:
+
 1. **"Clone → `locald up`"** - Zero-friction start
 2. **Stable Domains + HTTPS** - No port juggling
 3. **Daemon-First** - Always-on platform
@@ -413,30 +414,35 @@ Based on locald's core differentiators:
 
 ### Launch Critical (Phase 1-2)
 
-| RFC | Title | Priority | Rationale |
-|-----|-------|----------|-----------|
-| 0104 | macOS Platform Support | P1 | Cross-platform axiom, dominant dev platform |
-| 0138 | Remove Container Workflow | P1 | Simplify, sharpen host-first differentiator |
-| 0110 | Privileged Capability | P1 | Better onboarding errors |
-| 0086 | CLI Surface Overhaul | P2 | Coherent "zero friction" CLI |
-| 0135 | Dashboard Vocabulary | P2 | Self-hosting platform UX |
-| 0103 | Docs Site Language | P2 | Onboarding experience |
-| 0039 | Installation & Updates | P2 | Frictionless install |
+| RFC  | Title                     | Priority | Rationale                                   |
+| ---- | ------------------------- | -------- | ------------------------------------------- |
+| 0104 | macOS Platform Support    | P1       | Cross-platform axiom, dominant dev platform |
+| 0138 | Remove Container Workflow | P1       | Simplify, sharpen host-first differentiator |
+| 0110 | Privileged Capability     | P1       | Better onboarding errors                    |
+| 0086 | CLI Surface Overhaul      | P2       | Coherent "zero friction" CLI                |
+| 0135 | Dashboard Vocabulary      | P2       | Self-hosting platform UX                    |
+| 0103 | Docs Site Language        | P2       | Onboarding experience                       |
+| 0039 | Installation & Updates    | P2       | Frictionless install                        |
 
 ### Near-Term Polish (Phase 3)
 
-| RFC | Title | Rationale |
-|-----|-------|-----------|
-| 0050 | Hot Reloading | Config changes should "just work" |
-| 0051 | Port Mismatch Detection | Reduce user confusion |
-| 0072 | Host-Level Builds | Better first-run experience |
-| 0085 | Workspace Support | Monorepo reality |
+| RFC  | Title                   | Rationale                         |
+| ---- | ----------------------- | --------------------------------- |
+| 0050 | Hot Reloading           | Config changes should "just work" |
+| 0051 | Port Mismatch Detection | Reduce user confusion             |
+| 0072 | Host-Level Builds       | Better first-run experience       |
+| 0085 | Workspace Support       | Monorepo reality                  |
 
 ### Withdrawn (This Session)
 
-| RFC | Title | Reason |
-|-----|-------|--------|
-| 0116 | Minimum Awesome Product | Empty stub (consider reconstructing in ideas.toml) |
-| 0137 | Superseded by 0138 | Explicitly superseded |
-| 0046 | Manifesto Structure | Likely obsolete |
-| 0130 | Host Shim Daemon | Superseded by 0138 |
+| RFC  | Title                   | Reason                                             |
+| ---- | ----------------------- | -------------------------------------------------- |
+| 0137 | Superseded by 0138      | Explicitly superseded                              |
+| 0046 | Manifesto Structure     | Likely obsolete                                    |
+| 0130 | Host Shim Daemon        | Superseded by 0138                                 |
+
+### Reconstructed (This Session)
+
+| RFC  | Title                   | Notes                                              |
+| ---- | ----------------------- | -------------------------------------------------- |
+| 0116 | Minimum Awesome Product | Reconstructed from scattered references in codebase |
