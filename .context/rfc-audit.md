@@ -435,14 +435,14 @@ Based on locald's core differentiators:
 
 ### Withdrawn (This Session)
 
-| RFC  | Title                   | Reason                                             |
-| ---- | ----------------------- | -------------------------------------------------- |
-| 0137 | Superseded by 0138      | Explicitly superseded                              |
-| 0046 | Manifesto Structure     | Likely obsolete                                    |
-| 0130 | Host Shim Daemon        | Superseded by 0138                                 |
+| RFC  | Title               | Reason                |
+| ---- | ------------------- | --------------------- |
+| 0137 | Superseded by 0138  | Explicitly superseded |
+| 0046 | Manifesto Structure | Likely obsolete       |
+| 0130 | Host Shim Daemon    | Superseded by 0138    |
 
 ### Reconstructed (This Session)
 
-| RFC  | Title                   | Notes                                              |
-| ---- | ----------------------- | -------------------------------------------------- |
+| RFC  | Title                   | Notes                                               |
+| ---- | ----------------------- | --------------------------------------------------- |
 | 0116 | Minimum Awesome Product | Reconstructed from scattered references in codebase |
