@@ -26,7 +26,6 @@
 #![allow(clippy::let_underscore_must_use)]
 #![allow(clippy::map_unwrap_or)]
 #![allow(clippy::unnecessary_debug_formatting)]
-use anyhow::Result;
 use clap::Parser;
 
 #[cfg(feature = "experimental-cnb")]
@@ -41,6 +40,7 @@ mod debug;
 #[cfg(feature = "experimental-plugins")]
 mod distribution;
 mod doctor;
+mod error;
 mod global_config;
 mod handlers;
 mod hints;
@@ -62,20 +62,32 @@ mod utils;
 
 // Force rebuild 3
 fn main() {
+    if let Err(err) = miette::set_hook(Box::new(|_| {
+        Box::new(
+            miette::MietteHandlerOpts::new()
+                .color(true)
+                .terminal_links(true)
+                .unicode(true)
+                .build(),
+        )
+    })) {
+        eprintln!("Warning: failed to install miette handler: {err}");
+    }
+
     // Install panic hook for crash reporting
     std::panic::set_hook(Box::new(|info| {
-        let err = anyhow::anyhow!("Panic: {}", info);
-        crash::handle_crash(err);
+        let report = miette::Report::msg(format!("Panic: {info}"));
+        crash::handle_crash(report);
     }));
 
     let cli = cli::Cli::parse();
 
     if let Err(e) = run_main(cli) {
-        crash::handle_crash(e);
+        crash::handle_crash(miette::Report::new(e));
     }
 }
 
-fn run_main(cli: cli::Cli) -> Result<()> {
+fn run_main(cli: cli::Cli) -> error::CliResult<()> {
     if let Some(sandbox_name) = &cli.sandbox {
         utils::setup_sandbox(sandbox_name)?;
     }

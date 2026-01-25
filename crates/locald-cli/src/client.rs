@@ -1,4 +1,3 @@
-use anyhow::Result;
 use crossterm::style::{Color, Stylize};
 use locald_core::{
     IpcRequest, IpcResponse,
@@ -7,22 +6,25 @@ use locald_core::{
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
-pub fn send_request(request: &IpcRequest) -> Result<IpcResponse> {
-    let socket_path = locald_utils::ipc::socket_path()?;
-    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "locald is not running (socket not found at {})",
-                socket_path.display()
-            )
-        } else if e.kind() == std::io::ErrorKind::ConnectionRefused {
-            anyhow::anyhow!(
-                "locald is not running (connection refused at {})",
-                socket_path.display()
-            )
-        } else {
-            anyhow::Error::new(e)
-        }
+use crate::error::{CliResult, DaemonError};
+
+pub fn send_request(request: &IpcRequest) -> CliResult<IpcResponse> {
+    let socket_path = locald_utils::ipc::socket_path().map_err(DaemonError::from)?;
+    let socket_display = socket_path.display().to_string();
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => DaemonError::NotRunning {
+            socket_path: socket_display,
+        },
+        std::io::ErrorKind::ConnectionRefused => DaemonError::ConnectionRefused {
+            socket_path: socket_display,
+        },
+        std::io::ErrorKind::PermissionDenied => DaemonError::PermissionDenied {
+            socket_path: socket_display,
+        },
+        _ => DaemonError::ConnectionFailed {
+            socket_path: socket_display,
+            source: e,
+        },
     })?;
 
     let request_bytes = serde_json::to_vec(request)?;
@@ -35,9 +37,24 @@ pub fn send_request(request: &IpcRequest) -> Result<IpcResponse> {
     Ok(response)
 }
 
-pub fn stream_logs(service: Option<String>, follow: bool) -> Result<()> {
-    let socket_path = locald_utils::ipc::socket_path()?;
-    let mut stream = UnixStream::connect(socket_path)?;
+pub fn stream_logs(service: Option<String>, follow: bool) -> CliResult<()> {
+    let socket_path = locald_utils::ipc::socket_path().map_err(DaemonError::from)?;
+    let socket_display = socket_path.display().to_string();
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => DaemonError::NotRunning {
+            socket_path: socket_display,
+        },
+        std::io::ErrorKind::ConnectionRefused => DaemonError::ConnectionRefused {
+            socket_path: socket_display,
+        },
+        std::io::ErrorKind::PermissionDenied => DaemonError::PermissionDenied {
+            socket_path: socket_display,
+        },
+        _ => DaemonError::ConnectionFailed {
+            socket_path: socket_display,
+            source: e,
+        },
+    })?;
     let mode = if follow {
         locald_core::ipc::LogMode::Follow
     } else {
@@ -78,9 +95,24 @@ pub fn stream_logs(service: Option<String>, follow: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn stream_boot_events(request: &IpcRequest) -> Result<()> {
-    let socket_path = locald_utils::ipc::socket_path()?;
-    let mut stream = UnixStream::connect(socket_path)?;
+pub fn stream_boot_events(request: &IpcRequest) -> CliResult<()> {
+    let socket_path = locald_utils::ipc::socket_path().map_err(DaemonError::from)?;
+    let socket_display = socket_path.display().to_string();
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => DaemonError::NotRunning {
+            socket_path: socket_display,
+        },
+        std::io::ErrorKind::ConnectionRefused => DaemonError::ConnectionRefused {
+            socket_path: socket_display,
+        },
+        std::io::ErrorKind::PermissionDenied => DaemonError::PermissionDenied {
+            socket_path: socket_display,
+        },
+        _ => DaemonError::ConnectionFailed {
+            socket_path: socket_display,
+            source: e,
+        },
+    })?;
     let request_bytes = serde_json::to_vec(request)?;
     stream.write_all(&request_bytes)?;
 
@@ -100,7 +132,9 @@ pub fn stream_boot_events(request: &IpcRequest) -> Result<()> {
             // It might be the final response (Ok or Error)
             match response {
                 IpcResponse::Ok => return Ok(()),
-                IpcResponse::Error(msg) => anyhow::bail!(msg),
+                IpcResponse::Error(msg) => {
+                    return Err(DaemonError::RequestFailed { message: msg }.into());
+                }
                 _ => {} // Ignore other responses?
             }
         }

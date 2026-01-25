@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use std::collections::HashSet;
@@ -13,6 +13,7 @@ use crate::cli::{
 use crate::cli::{DistributionCommands, PluginCommands};
 #[cfg(feature = "experimental-containers")]
 use crate::container;
+use crate::error::{CliError, CliResult, DaemonError};
 use crate::{
     client, debug, doctor, global_config, history, init, monitor, run, selfupgrade, service, style,
     trust, try_cmd, update_check, utils,
@@ -20,7 +21,7 @@ use crate::{
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
 
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> CliResult<()> {
     match &cli.command {
         Commands::Init {
             from_distribution,
@@ -157,7 +158,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         eprintln!("{} Failed to reset {full_name}: {msg}", style::CROSS);
                     }
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
         },
@@ -167,7 +168,7 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Commands::Ping => match client::send_request(&IpcRequest::Ping) {
             Ok(response) => println!("Received: {response:?}"),
-            Err(e) => utils::handle_ipc_error(&e),
+            Err(e) => return Err(e),
         },
         Commands::Trust => {
             trust::run()?;
@@ -181,14 +182,20 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             ServerCommands::Shutdown => match client::send_request(&IpcRequest::Shutdown) {
                 Ok(response) => println!("{response:?}"),
-                Err(e) => utils::handle_ipc_error(&e),
+                Err(e) => return Err(e),
             },
             ServerCommands::Restart => {
                 match client::send_request(&IpcRequest::Shutdown) {
                     Ok(_) => println!("Shutting down locald..."),
                     Err(e) => {
-                        if !e.to_string().contains("locald is not running") {
-                            utils::handle_ipc_error(&e);
+                        if !matches!(
+                            e,
+                            CliError::Daemon(
+                                DaemonError::NotRunning { .. }
+                                    | DaemonError::ConnectionRefused { .. }
+                            )
+                        ) {
+                            return Err(e);
                         }
                     }
                 }
@@ -280,7 +287,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
                 Err(e) => {
                     // Not running or error
-                    if e.to_string().contains("locald is not running") {
+                    if matches!(
+                        e,
+                        CliError::Daemon(
+                            DaemonError::NotRunning { .. } | DaemonError::ConnectionRefused { .. }
+                        )
+                    ) {
                         false
                     } else {
                         // Some other error, maybe restart?
@@ -354,8 +366,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             || err_str.contains("No such file or directory")
                         {
                             if attempts > 50 {
-                                utils::handle_ipc_error(&e);
-                                break;
+                                return Err(e);
                             }
                             attempts += 1;
                             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -375,9 +386,9 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 let config_path = std::env::current_dir()?.join("locald.toml");
                 if !config_path.exists() {
-                    anyhow::bail!(
-                        "No locald.toml found in current directory. Please specify a service name."
-                    );
+                    return Err(CliError::message(
+                        "No locald.toml found in current directory. Please specify a service name.",
+                    ));
                 }
                 let config_content =
                     std::fs::read_to_string(&config_path).context("Failed to read locald.toml")?;
@@ -402,7 +413,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         eprintln!("{} Failed to stop {service_name}: {msg}", style::CROSS);
                     }
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -433,7 +444,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     eprintln!("{} Failed to restart {full_name}: {msg}", style::CROSS);
                 }
                 Ok(r) => println!("Unexpected response: {r:?}"),
-                Err(e) => utils::handle_ipc_error(&e),
+                Err(e) => return Err(e),
             }
         }
         Commands::Status => {
@@ -484,7 +495,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 Ok(response) => println!("Unexpected response: {response:?}"),
-                Err(e) => utils::handle_ipc_error(&e),
+                Err(e) => return Err(e),
             }
         }
         Commands::Logs { service, follow } => {
@@ -513,9 +524,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 None
             };
 
-            if let Err(e) = client::stream_logs(service_name, *follow) {
-                utils::handle_ipc_error(&e);
-            }
+            client::stream_logs(service_name, *follow)?;
         }
         Commands::Admin { command } => {
             match command {
@@ -531,9 +540,9 @@ pub fn run(cli: Cli) -> Result<()> {
                         // when run from a TTY, re-exec ourselves via `pkexec` (for GUI auth) or
                         // `sudo` (fallback) so the user doesn't have to remember to type it.
                         if !std::io::stdin().is_tty() {
-                            anyhow::bail!(
-                                "This command requires root privileges. Re-run with `sudo locald admin setup`."
-                            );
+                            return Err(CliError::message(
+                                "This command requires root privileges. Re-run with `sudo locald admin setup`.",
+                            ));
                         }
 
                         let exe_path = std::env::current_exe()
@@ -566,14 +575,16 @@ pub fn run(cli: Cli) -> Result<()> {
                                 .arg(&exe_path)
                                 .args(&args)
                                 .exec();
-                            anyhow::bail!("Failed to exec sudo for admin setup: {err}");
+                            return Err(CliError::message(format!(
+                                "Failed to exec sudo for admin setup: {err}"
+                            )));
                         }
 
                         #[cfg(not(unix))]
                         {
-                            anyhow::bail!(
-                                "This command requires root privileges. Please run with sudo."
-                            );
+                            return Err(CliError::message(
+                                "This command requires root privileges. Please run with sudo.",
+                            ));
                         }
                     }
 
@@ -672,10 +683,10 @@ pub fn run(cli: Cli) -> Result<()> {
                                     remediation.push_str("\n\nThis looks like a containerized environment where cgroup v2 is mounted read-only. `locald admin setup` must be run on the host OS.");
                                 }
 
-                                anyhow::bail!(
+                                return Err(CliError::message(format!(
                                     "locald-shim admin cgroup setup failed with status: {}{remediation}",
                                     output.status
-                                );
+                                )));
                             }
                             s.stop("Cgroup root configured");
                         }
@@ -713,7 +724,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 }
 
                                 println!("Run `locald doctor --verbose` for details.");
-                                anyhow::bail!("Host not ready");
+                                return Err(CliError::message("Host not ready"));
                             }
 
                             s.stop("Host readiness verified");
@@ -725,7 +736,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
                     #[cfg(not(target_os = "linux"))]
                     {
-                        anyhow::bail!("Admin setup is only supported on Linux.");
+                        return Err(CliError::message("Admin setup is only supported on Linux."));
                     }
 
                     // Note: We don't setcap on locald anymore, because the shim handles it.
@@ -736,7 +747,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     // Fetch services
                     let IpcResponse::Status(services) = client::send_request(&IpcRequest::Status)?
                     else {
-                        anyhow::bail!("Failed to get status from daemon");
+                        return Err(CliError::message("Failed to get status from daemon"));
                     };
 
                     let domains: HashSet<String> =
@@ -749,9 +760,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     if !nix::unistd::geteuid().is_root() {
                         // Check if we are already running under shim
                         if std::env::var("LOCALD_SHIM_ACTIVE").is_ok() {
-                            anyhow::bail!(
-                                "Failed to elevate privileges via shim (still not root)."
-                            );
+                            return Err(CliError::message(
+                                "Failed to elevate privileges via shim (still not root).",
+                            ));
                         }
 
                         // Try to escalate via shim
@@ -766,9 +777,9 @@ pub fn run(cli: Cli) -> Result<()> {
                             eprintln!("Failed to exec shim: {err}");
                         }
 
-                        anyhow::bail!(
-                            "This command requires root privileges. Please run with sudo or ensure locald-shim is configured."
-                        );
+                        return Err(CliError::message(
+                            "This command requires root privileges. Please run with sudo or ensure locald-shim is configured.",
+                        ));
                     }
 
                     println!("Syncing {} domains to hosts file...", domain_list.len());
@@ -793,14 +804,14 @@ pub fn run(cli: Cli) -> Result<()> {
             AiCommands::Schema => match client::send_request(&IpcRequest::AiSchema) {
                 Ok(IpcResponse::AiSchema(schema)) => println!("{schema}"),
                 Ok(r) => println!("Unexpected response: {r:?}"),
-                Err(e) => utils::handle_ipc_error(&e),
+                Err(e) => return Err(e),
             },
             AiCommands::Context => {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::AiContext) {
                     Ok(IpcResponse::AiContext(context)) => println!("{context}"),
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
         },
@@ -959,7 +970,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
                     }
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
             RegistryCommands::Pin { path } => {
@@ -973,7 +984,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         eprintln!("{} Failed to pin project: {msg}", style::CROSS);
                     }
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
             RegistryCommands::Unpin { path } => {
@@ -987,7 +998,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         eprintln!("{} Failed to unpin project: {msg}", style::CROSS);
                     }
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
             RegistryCommands::Clean => {
@@ -1000,7 +1011,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         eprintln!("{} Failed to clean registry: {msg}", style::CROSS);
                     }
                     Ok(r) => println!("Unexpected response: {r:?}"),
-                    Err(e) => utils::handle_ipc_error(&e),
+                    Err(e) => return Err(e),
                 }
             }
         },
@@ -1126,10 +1137,16 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
             if !abs_path.exists() {
-                anyhow::bail!("Path does not exist: {}", abs_path.display());
+                return Err(CliError::message(format!(
+                    "Path does not exist: {}",
+                    abs_path.display()
+                )));
             }
             if !abs_path.is_dir() {
-                anyhow::bail!("Path is not a directory: {}", abs_path.display());
+                return Err(CliError::message(format!(
+                    "Path is not a directory: {}",
+                    abs_path.display()
+                )));
             }
 
             // Run the static server

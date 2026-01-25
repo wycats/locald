@@ -1,11 +1,11 @@
-use anyhow::Result;
 use crossterm::style::Stylize;
+use miette::Report;
 use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::hints;
 
-fn shim_setup_advice(err: &anyhow::Error) -> Option<String> {
+fn shim_setup_advice(err: &Report) -> Option<String> {
     // Heuristic matching: these errors commonly come from `locald_utils::shim`.
     // We want to print a clear stderr hint even when we also write a crash log.
     const NEEDS_SETUP_MARKERS: [&str; 3] = [
@@ -14,12 +14,11 @@ fn shim_setup_advice(err: &anyhow::Error) -> Option<String> {
         "Privileged locald-shim is not configured",
     ];
 
-    let matches_marker = err.chain().any(|cause| {
-        let msg = cause.to_string();
-        NEEDS_SETUP_MARKERS
-            .iter()
-            .any(|marker| msg.contains(marker))
-    });
+    let rendered = format!("{:?}", err);
+    let msg = err.to_string();
+    let matches_marker = NEEDS_SETUP_MARKERS
+        .iter()
+        .any(|marker| msg.contains(marker) || rendered.contains(marker));
 
     if !matches_marker {
         return None;
@@ -32,7 +31,7 @@ fn shim_setup_advice(err: &anyhow::Error) -> Option<String> {
     ))
 }
 
-pub fn handle_crash(err: anyhow::Error) {
+pub fn handle_crash(err: Report) {
     // 1. Capture context
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let crash_filename = format!("crash-{}.log", timestamp);
@@ -58,12 +57,16 @@ pub fn handle_crash(err: anyhow::Error) {
     // 3. Write to file
     if let Err(e) = write_crash_file(&crash_path, &report) {
         // Fallback: Nuclear Option
+        eprintln!("{:?}", err);
+        eprintln!();
         eprintln!("{}", "✖ An unexpected error occurred.".red().bold());
         eprintln!("{}", "✖ Failed to write crash log.".red());
         eprintln!("Details:\n{}", report);
         eprintln!("Original Error writing log: {}", e);
     } else {
         // Respectful Notification
+        eprintln!("{:?}", err);
+        eprintln!();
         eprintln!("{}", "✖ An unexpected error occurred.".red().bold());
         if let Some(advice) = shim_setup_advice(&err) {
             eprintln!("  {}", advice.yellow());
@@ -94,7 +97,7 @@ fn get_crash_dir() -> PathBuf {
     PathBuf::from("/tmp/locald-crashes")
 }
 
-fn write_crash_file(path: &std::path::Path, content: &str) -> Result<()> {
+fn write_crash_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
