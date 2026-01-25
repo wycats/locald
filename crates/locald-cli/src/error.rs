@@ -1,5 +1,3 @@
-#![allow(unused_assignments)]
-
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -81,34 +79,35 @@ impl ConfigError {
     }
 }
 
-#[allow(unused_assignments)]
 #[derive(Error, Debug, Diagnostic)]
 pub enum DaemonError {
     #[error("locald is not running (socket not found at {socket_path})")]
     #[diagnostic(
         code(locald::daemon::not_running),
-        help("Run `locald up` to start the daemon.")
+        help("Run `locald up` to start the daemon (socket: {socket_path}).")
     )]
     NotRunning { socket_path: String },
 
     #[error("locald is not running (connection refused at {socket_path})")]
     #[diagnostic(
         code(locald::daemon::connection_refused),
-        help("Run `locald up` to start the daemon.")
+        help("Run `locald up` to start the daemon (socket: {socket_path}).")
     )]
     ConnectionRefused { socket_path: String },
 
     #[error("Permission denied connecting to locald at {socket_path}")]
     #[diagnostic(
         code(locald::daemon::permission_denied),
-        help("Check socket permissions or run `locald admin setup`.")
+        help("Check socket permissions or run `locald admin setup` (socket: {socket_path}).")
     )]
     PermissionDenied { socket_path: String },
 
     #[error("Failed to connect to locald at {socket_path}")]
     #[diagnostic(
         code(locald::daemon::connection_failed),
-        help("Check if the daemon is running and remove stale sockets.")
+        help(
+            "Check if the daemon is running and remove stale sockets (socket: {socket_path}, error: {source})."
+        )
     )]
     ConnectionFailed {
         socket_path: String,
@@ -126,7 +125,7 @@ pub enum DaemonError {
     #[error("{message}")]
     #[diagnostic(
         code(locald::daemon::error),
-        help("Check daemon logs at /tmp/locald.log")
+        help("Check daemon logs at /tmp/locald.log (error: {message})")
     )]
     RequestFailed { message: String },
 }
@@ -136,5 +135,91 @@ impl From<locald_utils::ipc::IpcError> for DaemonError {
         match err {
             locald_utils::ipc::IpcError::SocketEnvNotAllowed => Self::SocketEnvNotAllowed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miette::Diagnostic;
+
+    #[test]
+    fn daemon_error_not_running_has_correct_code() {
+        let err = DaemonError::NotRunning {
+            socket_path: "/tmp/test.sock".to_string(),
+        };
+        assert_eq!(
+            err.code().unwrap().to_string(),
+            "locald::daemon::not_running"
+        );
+    }
+
+    #[test]
+    fn daemon_error_connection_refused_has_correct_code() {
+        let err = DaemonError::ConnectionRefused {
+            socket_path: "/tmp/test.sock".to_string(),
+        };
+        assert_eq!(
+            err.code().unwrap().to_string(),
+            "locald::daemon::connection_refused"
+        );
+    }
+
+    #[test]
+    fn daemon_error_permission_denied_has_correct_code() {
+        let err = DaemonError::PermissionDenied {
+            socket_path: "/tmp/test.sock".to_string(),
+        };
+        assert_eq!(
+            err.code().unwrap().to_string(),
+            "locald::daemon::permission_denied"
+        );
+    }
+
+    #[test]
+    fn daemon_error_socket_env_not_allowed_has_correct_code() {
+        let err = DaemonError::SocketEnvNotAllowed;
+        assert_eq!(
+            err.code().unwrap().to_string(),
+            "locald::daemon::socket_env_not_allowed"
+        );
+    }
+
+    #[test]
+    fn daemon_error_request_failed_has_correct_code() {
+        let err = DaemonError::RequestFailed {
+            message: "test error".to_string(),
+        };
+        assert_eq!(err.code().unwrap().to_string(), "locald::daemon::error");
+    }
+
+    #[test]
+    fn cli_error_message_creates_other_variant() {
+        let err = CliError::message("test message");
+        assert!(matches!(err, CliError::Other { .. }));
+        assert_eq!(err.to_string(), "test message");
+    }
+
+    #[test]
+    fn cli_error_from_anyhow_converts_to_other() {
+        let anyhow_err = anyhow::anyhow!("anyhow error");
+        let cli_err = CliError::from(anyhow_err);
+        assert!(matches!(cli_err, CliError::Other { .. }));
+    }
+
+    #[test]
+    fn daemon_error_from_ipc_error_converts_correctly() {
+        let ipc_err = locald_utils::ipc::IpcError::SocketEnvNotAllowed;
+        let daemon_err = DaemonError::from(ipc_err);
+        assert!(matches!(daemon_err, DaemonError::SocketEnvNotAllowed));
+    }
+
+    #[test]
+    fn daemon_errors_have_help_text() {
+        let err = DaemonError::NotRunning {
+            socket_path: "/tmp/test.sock".to_string(),
+        };
+        assert!(err.help().is_some());
+        assert!(err.help().unwrap().to_string().contains("locald up"));
     }
 }
