@@ -132,7 +132,9 @@ pub enum DaemonError {
 }
 
 impl From<locald_utils::ipc::IpcError> for DaemonError {
-    fn from(_err: locald_utils::ipc::IpcError) -> Self {
-        Self::SocketEnvNotAllowed
+    fn from(err: locald_utils::ipc::IpcError) -> Self {
+        match err {
+            locald_utils::ipc::IpcError::SocketEnvNotAllowed => Self::SocketEnvNotAllowed,
+        }
     }
 }
