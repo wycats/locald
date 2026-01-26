@@ -1789,7 +1789,7 @@ aliases = ["109.8"]
 [[epochs]]
 id = "E4"
 title = "The Build Era"
-status = "pending"
+status = "active"
 ulid = "01KEX4X98Z6TXH90JZ6NA24R81"
 slug = "E4"
 aliases = ["E4"]
@@ -1887,7 +1887,7 @@ aliases = ["38.3"]
 [[epochs.phases]]
 id = "58"
 title = "Documentation-Driven Design (DDD) Audit"
-status = "pending"
+status = "active"
 rfcs = ["0058"]
 ulid = "01KEX4X98ZJQZ50D29DKFV4DD9"
 slug = "58"
