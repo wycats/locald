@@ -801,11 +801,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
         }
         Commands::Ai { command } => match command {
-            AiCommands::Schema => match client::send_request(&IpcRequest::AiSchema) {
-                Ok(IpcResponse::AiSchema(schema)) => println!("{schema}"),
-                Ok(r) => println!("Unexpected response: {r:?}"),
-                Err(e) => return Err(e),
-            },
+            AiCommands::Schema => {
+                utils::ensure_daemon_running()?;
+                match client::send_request(&IpcRequest::AiSchema) {
+                    Ok(IpcResponse::AiSchema(schema)) => println!("{schema}"),
+                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Err(e) => return Err(e),
+                }
+            }
             AiCommands::Context => {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::AiContext) {
