@@ -34,7 +34,7 @@
 #![allow(clippy::let_underscore_must_use)] // Don't swallow errors with `let _`
 #![warn(clippy::await_holding_lock)] // Prevent Async Deadlocks (Critical)
 #![allow(clippy::manual_let_else)] // Enforces clean "Guard Clause" style
-#![allow(clippy::unwrap_used)] // Force error propagation (no panics)
+#![allow(clippy::unwrap_used)] // Allowed for legacy invariants while we audit and replace unwraps
 #![allow(clippy::expect_used)] // Force error propagation
 #![warn(clippy::wildcard_enum_match_arm)] // Force explicit enum matching
 #![warn(clippy::redundant_pattern_matching)] // Catch redundant matches
