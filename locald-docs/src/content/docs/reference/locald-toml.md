@@ -119,7 +119,9 @@ You can explicitly configure how `locald` determines if a service is ready.
 ```toml
 # HTTP Check
 health_check = { type = "http", path = "/healthz" }
+```
 
+```toml
 # Command Check (Shorthand)
 health_check = "curl -f http://localhost:$PORT/health"
 ```

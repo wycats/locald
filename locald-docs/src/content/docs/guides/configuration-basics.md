@@ -48,8 +48,8 @@ You often need to pass configuration or secrets to your app.
 [project]
 name = "backend-api"
 
-[services]
-api = { command = "npm start" }
+[services.api]
+command = "npm start"
 
 # Add environment variables to a specific service
 [services.api.env]
