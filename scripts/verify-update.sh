@@ -17,7 +17,7 @@ LOCALD="./target/debug/locald"
 # Ensure daemon is stopped
 echo "Stopping any existing daemon..."
 $LOCALD --sandbox=$SANDBOX server shutdown || true
-$LOCALD --sandbox=$SANDBOX down || true
+pkill -f "locald.*--sandbox=$SANDBOX" || true
 sleep 1
 
 # Start the server explicitly
