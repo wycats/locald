@@ -73,19 +73,24 @@ pub fn spawn_daemon() -> CliResult<()> {
 }
 
 pub fn ensure_daemon_running() -> CliResult<()> {
+    let sandbox_active = std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok();
     // Try to ping first
     match crate::client::send_request(&IpcRequest::Ping) {
         Ok(_) => return Ok(()),
         Err(e) => {
-            if let Ok(path) = locald_utils::ipc::socket_path() {
-                eprintln!("Ping failed on {}: {}", path.display(), e);
-            } else {
-                eprintln!("Ping failed: {}", e);
+            if !sandbox_active {
+                if let Ok(path) = locald_utils::ipc::socket_path() {
+                    eprintln!("Ping failed on {}: {}", path.display(), e);
+                } else {
+                    eprintln!("Ping failed: {}", e);
+                }
             }
         }
     }
 
-    println!("Starting locald server...");
+    if !sandbox_active {
+        println!("Starting locald server...");
+    }
     spawn_daemon()?;
 
     // Wait for it to be ready
