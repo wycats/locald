@@ -1,5 +1,10 @@
 # RFC 0075: Runc Container Runtime & Unified Execution
 
+## Status
+
+- **Status**: Obsolete (superseded by RFC 0142)
+- **Reason**: `DockerRuntime` was removed and container execution now uses the embedded OCI/libcontainer path without a standalone `runc` runtime workflow.
+
 ## Summary
 
 This RFC proposes establishing `runc` as the primary container runtime for `locald`, replacing the dependency on the Docker daemon for containerized services. It also outlines a refactoring plan to unify the execution logic for both Cloud Native Buildpacks (CNB) and generic OCI containers (`type = "container"`).

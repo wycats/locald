@@ -2,9 +2,10 @@
 
 ## Status
 
-- **Status**: Recommended
+- **Status**: Obsolete (superseded by RFC 0142)
 - **Date**: 2025-12-08
 - **Author**: GitHub Copilot
+- **Reason**: `locald` no longer executes the standalone `runc` binary; the setuid fix is no longer applicable.
 
 ## Context
 
