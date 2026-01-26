@@ -161,6 +161,8 @@ enum VerifyCommands {
     Phase,
     /// Verify documentation
     Docs,
+    /// Verify documentation samples (doctests + TOML blocks)
+    DocsSamples,
     /// Verify Exec Controller
     Exec,
 }
@@ -188,6 +190,7 @@ fn main() -> Result<()> {
             VerifyCommands::Phase33 => verify::phase33(&sh)?,
             VerifyCommands::Phase => verify::phase(&sh)?,
             VerifyCommands::Docs => verify::docs(&sh)?,
+            VerifyCommands::DocsSamples => verify::docs_samples(&sh)?,
             VerifyCommands::Exec => verify::exec(&sh)?,
         },
         Commands::Fix => fix::run(&sh)?,

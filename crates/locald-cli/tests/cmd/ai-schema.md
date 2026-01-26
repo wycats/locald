@@ -1,11 +1,11 @@
 # locald ai schema
 
-```console
+````console
 $ locald ai schema
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "LocaldConfig",
-  "description": "Root configuration for a locald project./n/n# Example/n```toml/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n```",
+  "description": "Root configuration for a locald project./n/n# Example/n```toml/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n```/n/n```rust/nuse locald_core::config::LocaldConfig;/n/nlet raw = r#/"/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n/"#;/n/nlet config: LocaldConfig = toml::from_str(raw).expect(/"valid locald config/");/nassert_eq!(config.project.name, /"my-app/");/nassert!(config.plugins.contains_key(/"redis/"));/nassert!(config.services.contains_key(/"web/"));/n```",
   "type": "object",
   "properties": {
     "plugins": {
@@ -641,4 +641,4 @@ $ locald ai schema
   }
 }
 
-```
+````

@@ -29,6 +29,26 @@ use std::collections::HashMap;
 /// [services.web]
 /// command = "npm start"
 /// ```
+///
+/// ```rust
+/// use locald_core::config::LocaldConfig;
+///
+/// let raw = r#"
+/// [project]
+/// name = "my-app"
+///
+/// [plugins]
+/// redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+///
+/// [services.web]
+/// command = "npm start"
+/// "#;
+///
+/// let config: LocaldConfig = toml::from_str(raw).expect("valid locald config");
+/// assert_eq!(config.project.name, "my-app");
+/// assert!(config.plugins.contains_key("redis"));
+/// assert!(config.services.contains_key("web"));
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct LocaldConfig {
     /// Project-level configuration.

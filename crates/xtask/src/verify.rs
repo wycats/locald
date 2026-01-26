@@ -369,6 +369,19 @@ pub fn docs(sh: &Shell) -> Result<()> {
     docs::verify_docs(sh)
 }
 
+pub fn docs_samples(sh: &Shell) -> Result<()> {
+    println!("Verifying documentation samples...");
+
+    println!("==> Running doctests");
+    cmd!(sh, "cargo test --doc --workspace").run()?;
+
+    println!("==> Validating TOML snippets");
+    cmd!(sh, "cargo test -p locald-core --test doc_toml_validation").run()?;
+
+    println!("OK: documentation samples verified");
+    Ok(())
+}
+
 pub fn phase(sh: &Shell) -> Result<()> {
     println!("Verifying Phase...");
     check::run(sh, false)?;

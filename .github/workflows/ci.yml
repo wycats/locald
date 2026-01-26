@@ -549,6 +549,16 @@ jobs:
         if: ${{ github.event_name == 'schedule' }}
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Run doctests (workspace)
+        if: ${{ github.event_name == 'schedule' || steps.gate.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::Doctests (workspace)"
+          cargo test --doc --workspace
+          echo "::endgroup::"
+
       - name: Run tests (PR fast lane - all features)
         if: ${{ github.event_name == 'pull_request' && steps.gate.outputs.run == 'true' }}
         shell: bash

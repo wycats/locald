@@ -17,32 +17,32 @@ tests = []
 [[plan.changes.tasks]]
 id = "31.3.1"
 title = "Enable doctests in CI"
-status = "pending"
+status = "completed"
 
 [[plan.changes.tasks]]
 id = "31.3.2"
 title = "Fix any failing doctests"
-status = "pending"
+status = "completed"
 
 [[plan.changes.tasks]]
 id = "31.3.3"
 title = "Add doctest for LocaldConfig parsing"
-status = "pending"
+status = "completed"
 
 [[plan.changes.tasks]]
 id = "31.3.4"
 title = "Extend trycmd for docs CLI examples"
-status = "pending"
+status = "completed"
 
 [[plan.changes.tasks]]
 id = "31.3.5"
 title = "Add TOML config example validation"
-status = "pending"
+status = "completed"
 
 [[plan.changes.tasks]]
 id = "31.3.6"
 title = "Add xtask verify docs-samples command"
-status = "pending"
+status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]
