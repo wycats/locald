@@ -4,6 +4,8 @@
 
 This document describes how `locald` executes processes in isolated environments (containers) using `libcontainer` and User Namespaces.
 
+> **Note**: `DockerRuntime` has been removed. `locald` now relies exclusively on the embedded OCI/libcontainer execution path and does not depend on a Docker daemon.
+
 ## 1. The "Rootless" Contract
 
 `locald` runs containers without requiring a root daemon (like Docker). It achieves this using **User Namespaces**.
