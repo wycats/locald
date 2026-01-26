@@ -28,6 +28,8 @@ locald monitor
 
 The monitor shows service status, recent logs, and health check state. Press `q` to exit.
 
+See RFC 0016 for historical context.
+
 ## Ad-Hoc Execution
 
 ### `locald try`
@@ -61,6 +63,8 @@ locald service reset <service>
 ```
 
 This is primarily used for managed data services (like Postgres) when you need a clean state.
+
+See RFC 0029 for historical context.
 
 ## Diagnostics
 
@@ -102,6 +106,8 @@ Gracefully shut down the running daemon.
 ### `locald server restart`
 
 Restart the daemon. The CLI may also restart the daemon automatically if it detects a version mismatch.
+
+See RFC 0044 for historical context.
 
 ## Administration
 

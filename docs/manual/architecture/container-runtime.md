@@ -85,3 +85,5 @@ This directory stores buildpack layers, including dependencies and cache.
 This directory contains the CNB Lifecycle binaries and configuration.
 
 - **Usage**: The `lifecycle` tool (which orchestrates the build) runs from here.
+
+See RFC 0142 for historical context.

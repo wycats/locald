@@ -53,3 +53,5 @@ From that root, `locald` sets per-sandbox defaults like:
 - `LOCALD_SOCKET`: `<root>/locald.sock`
 
 These overrides are scoped to the `locald` process and its children, keeping your primary environment untouched.
+
+See RFC 0037 for historical context.
