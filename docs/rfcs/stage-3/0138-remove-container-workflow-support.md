@@ -1,6 +1,6 @@
 ---
 title: Remove Container Workflow Support
-stage: 1
+stage: 3
 feature: Engineering Excellence
 exo:
     tool: exo rfc create
@@ -197,6 +197,10 @@ This RFC explicitly supports the common pattern:
 3. Optionally expose that host binary into containers for convenience (e.g. distrobox export)
 
 This avoids the fragile "host-exec" inversion (locald-in-container delegating to host via daemon/socket).
+
+## Implementation Status
+
+Implemented. The container workflow (host-spawn + shim socket delegation) has been removed, and `locald` now requires host-first execution for privileged operations.
 
 ## Deprecation Strategy
 
