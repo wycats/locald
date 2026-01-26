@@ -1,6 +1,19 @@
 #[cfg(test)]
 mod tests {
+    use crate::VmConfig;
     use std::path::PathBuf;
+
+    #[test]
+    fn vm_config_preserves_inputs() {
+        let kernel_path = PathBuf::from("kernel.img");
+        let config = VmConfig {
+            kernel_path: kernel_path.clone(),
+            memory_mb: 512,
+        };
+
+        assert_eq!(config.kernel_path, kernel_path);
+        assert_eq!(config.memory_mb, 512);
+    }
 
     #[test]
     #[ignore = "integration test downloads large VM assets; run manually with `cargo test -p locald-vmm -- --ignored`"]

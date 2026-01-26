@@ -1,5 +1,7 @@
 //! # locald-vmm
 //!
+//! ⚠️ **Experimental**: This crate is under active development and its API may change.
+//!
 //! A lightweight Virtual Machine Monitor (VMM) library for `locald`.
 //!
 //! This crate provides a unified interface for running virtual machines
