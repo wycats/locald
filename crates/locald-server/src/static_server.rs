@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     Router,
     body::Body,
@@ -11,7 +12,7 @@ use axum::{
     routing::get,
 };
 use std::fmt::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
@@ -29,6 +30,7 @@ struct AppState {
 
 pub async fn run_static_server(
     port: u16,
+    bind: &str,
     root: PathBuf,
     log_tx: broadcast::Sender<LogEntry>,
 ) -> anyhow::Result<()> {
@@ -44,7 +46,10 @@ pub async fn run_static_server(
         .layer(middleware::from_fn(inject_toolbar_middleware))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let ip: IpAddr = bind
+        .parse()
+        .with_context(|| format!("Invalid bind address: {bind}"))?;
+    let addr = SocketAddr::from((ip, port));
     info!("Static server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

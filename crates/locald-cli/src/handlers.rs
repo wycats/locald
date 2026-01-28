@@ -1133,11 +1133,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
         },
 
-        Commands::Serve {
-            path,
-            port,
-            bind: _,
-        } => {
+        Commands::Serve { path, port, bind } => {
             let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
             if !abs_path.exists() {
                 return Err(CliError::message(format!(
@@ -1160,7 +1156,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 .enable_all()
                 .build()?
                 .block_on(locald_server::static_server::run_static_server(
-                    *port, abs_path, tx,
+                    *port, bind, abs_path, tx,
                 ))?;
         }
 

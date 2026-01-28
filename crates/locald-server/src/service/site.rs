@@ -237,7 +237,9 @@ impl ServiceController for SiteService {
         let log_sender = self.log_sender.clone();
 
         let server_handle = tokio::spawn(async move {
-            if let Err(e) = static_server::run_static_server(port, path, log_sender).await {
+            if let Err(e) =
+                static_server::run_static_server(port, "127.0.0.1", path, log_sender).await
+            {
                 error!("Static server failed: {}", e);
             }
         });
