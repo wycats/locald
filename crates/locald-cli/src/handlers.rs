@@ -1,6 +1,7 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
+use serde::Serialize;
 use std::collections::HashSet;
 
 #[cfg(feature = "experimental-cnb")]
@@ -20,6 +21,30 @@ use crate::{
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
+
+#[derive(Serialize)]
+struct JsonServiceSummary {
+    name: String,
+    state: String,
+    port: Option<u16>,
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonServiceList {
+    services: Vec<JsonServiceSummary>,
+}
+
+#[derive(Serialize)]
+struct JsonServiceAction {
+    service: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct JsonServiceActions {
+    services: Vec<JsonServiceAction>,
+}
 
 pub fn run(cli: Cli) -> CliResult<()> {
     match &cli.command {
@@ -383,7 +408,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             report_update(&update_rx);
         }
-        Commands::Stop { name } => {
+        Commands::Stop { name, json } => {
             let names = if let Some(n) = name {
                 vec![n.clone()]
             } else {
@@ -405,12 +430,21 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     .collect()
             };
 
+            let mut actions = Vec::new();
+
             for service_name in names {
                 match client::send_request(&IpcRequest::Stop {
                     name: service_name.clone(),
                 }) {
                     Ok(IpcResponse::Ok) => {
-                        println!("{} Stopped service {}", style::CHECK, service_name.bold());
+                        if *json {
+                            actions.push(JsonServiceAction {
+                                service: service_name.clone(),
+                                status: "stopped".to_string(),
+                            });
+                        } else {
+                            println!("{} Stopped service {}", style::CHECK, service_name.bold());
+                        }
                     }
                     Ok(IpcResponse::Error(msg)) => {
                         return Err(CliError::message(format!(
@@ -422,8 +456,19 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     Err(e) => return Err(e),
                 }
             }
+
+            if *json {
+                if actions.len() == 1 {
+                    let json = serde_json::to_string_pretty(&actions[0])?;
+                    println!("{json}");
+                } else {
+                    let json =
+                        serde_json::to_string_pretty(&JsonServiceActions { services: actions })?;
+                    println!("{json}");
+                }
+            }
         }
-        Commands::Restart { name } => {
+        Commands::Restart { name, json } => {
             // Resolve full name if needed
             let full_name = {
                 let config_path = std::env::current_dir()?.join("locald.toml");
@@ -444,7 +489,16 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 name: full_name.clone(),
             }) {
                 Ok(IpcResponse::Ok) => {
-                    println!("{} Restarted service {}", style::CHECK, full_name.bold());
+                    if *json {
+                        let response = JsonServiceAction {
+                            service: full_name,
+                            status: "restarted".to_string(),
+                        };
+                        let json = serde_json::to_string_pretty(&response)?;
+                        println!("{json}");
+                    } else {
+                        println!("{} Restarted service {}", style::CHECK, full_name.bold());
+                    }
                 }
                 Ok(IpcResponse::Error(msg)) => {
                     return Err(CliError::message(format!(
@@ -456,11 +510,35 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 Err(e) => return Err(e),
             }
         }
-        Commands::Status => {
+        Commands::Status { json } => {
             utils::ensure_daemon_running()?;
             match client::send_request(&IpcRequest::Status) {
                 Ok(IpcResponse::Status(services)) => {
-                    if services.is_empty() {
+                    if *json {
+                        let summaries = services
+                            .into_iter()
+                            .map(|service| JsonServiceSummary {
+                                name: service.name,
+                                state: match service.status {
+                                    locald_core::state::ServiceState::Running => {
+                                        "running".to_string()
+                                    }
+                                    locald_core::state::ServiceState::Stopped => {
+                                        "stopped".to_string()
+                                    }
+                                    locald_core::state::ServiceState::Building => {
+                                        "building".to_string()
+                                    }
+                                },
+                                port: service.port,
+                                url: service.url,
+                            })
+                            .collect();
+                        let json = serde_json::to_string_pretty(&JsonServiceList {
+                            services: summaries,
+                        })?;
+                        println!("{json}");
+                    } else if services.is_empty() {
                         println!("No services running.");
                     } else {
                         // Print table
