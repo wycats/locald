@@ -55,6 +55,7 @@ List running services
 Usage: locald status [OPTIONS]
 
 Options:
+      --json               Machine-readable JSON output
       --sandbox <SANDBOX>  Run in a sandbox environment
   -h, --help               Print help
 
