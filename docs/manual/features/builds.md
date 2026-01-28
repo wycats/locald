@@ -8,6 +8,8 @@
 
 This feature is part of the **Container Execution** mode. See [Execution Modes](execution-modes.md) for a comparison with the default Host Execution.
 
+CNB builds run using `locald`'s OCI/libcontainer execution layer (not Docker).
+
 ## How it Works
 
 When you configure a service to use `build` (or run `locald build`), `locald`:
@@ -43,7 +45,7 @@ build = { builder = "paketobuildpacks/builder:base" }
 
 ## Caching
 
-`locald` leverages CNB's advanced caching mechanisms. Dependencies (like `node_modules` or Cargo crates) are cached in a separate Docker volume (or directory) and reused between builds, significantly speeding up subsequent builds.
+`locald` leverages CNB's advanced caching mechanisms. Dependencies (like `node_modules` or Cargo crates) are cached in a local, `locald`-managed cache directory and reused between builds, significantly speeding up subsequent builds.
 
 ## Rust Support
 
