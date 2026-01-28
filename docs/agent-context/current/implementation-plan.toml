@@ -52,7 +52,7 @@ status = "pending"
 [[plan.changes.tasks]]
 id = "58.8-improve-rustdoc-doctests"
 title = "58.8: Add/improve Rustdoc and doctests"
-status = "pending"
+status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

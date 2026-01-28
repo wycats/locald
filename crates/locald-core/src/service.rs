@@ -1,3 +1,9 @@
+//! Service controller traits and runtime contracts.
+//!
+//! Controllers encapsulate the lifecycle of a service and expose a stable
+//! interface for the daemon, CLI, and UI. The expected lifecycle is:
+//! `prepare` -> `start` -> `stop`, where `prepare` handles heavyweight setup
+//! (downloads, builds) and `start` is fast and idempotent.
 use crate::config::ServiceConfig;
 use crate::ipc::{LogEntry, ServiceMetrics};
 use crate::state::{HealthStatus, ServiceState};
@@ -15,6 +21,7 @@ pub struct RuntimeState {
     pub health_status: HealthStatus,
 }
 
+/// Commands supported by controllers beyond start/stop.
 #[derive(Debug, Clone)]
 pub enum ServiceCommand {
     /// Reset the service to its initial state (e.g., wipe data).
@@ -23,29 +30,34 @@ pub enum ServiceCommand {
     Custom(String, Vec<String>),
 }
 
+/// A controller manages the lifecycle and runtime I/O for a single service.
+///
+/// Implementations must honor the lifecycle contract: `prepare` does heavy work,
+/// `start` transitions to a running state, and `stop` shuts the service down.
 #[async_trait]
 pub trait ServiceController: Send + Sync + std::fmt::Debug {
     /// Unique identifier for this service instance (e.g., "postgres:15").
     fn id(&self) -> &str;
 
     /// Prepare the service for execution.
-    /// This handles heavy lifting: downloading binaries, pulling Docker images,
-    /// compiling code, or initializing data directories.
     ///
-    /// This step is distinct from `start` to allow the UI to show "Building..."
-    /// or "Downloading..." states separately from "Starting...".
+    /// This handles heavy lifting: downloading binaries, pulling Docker images,
+    /// compiling code, or initializing data directories. Keeping this separate
+    /// allows the UI to show "Building..." states independently of `start`.
     async fn prepare(&mut self) -> Result<()>;
 
     /// Start the service.
+    ///
     /// This should be fast and idempotent. It assumes `prepare` has succeeded.
     async fn start(&mut self) -> Result<()>;
 
-    /// Stop the service.
+    /// Stop the service and release resources.
     async fn stop(&mut self) -> Result<()>;
 
     /// Get the current runtime state of the service.
-    /// This returns the dynamic parts of the status (PID, Port, State).
-    /// The Manager combines this with static config (Name, Domain) to form the full `ServiceStatus`.
+    ///
+    /// This returns the dynamic parts of the status (PID, port, lifecycle state).
+    /// The manager combines this with static config to form the full status view.
     async fn read_state(&self) -> RuntimeState;
 
     /// Get a stream of logs from the service.
@@ -60,6 +72,7 @@ pub trait ServiceController: Send + Sync + std::fmt::Debug {
     fn get_metadata(&self, key: &str) -> Option<String>;
 
     /// Execute a specific command on the service.
+    ///
     /// This provides an escape hatch for capabilities like "reset", "snapshot", etc.
     /// Returns `NotSupported` if the service doesn't handle the command.
     async fn execute_command(&mut self, cmd: ServiceCommand) -> Result<()>;

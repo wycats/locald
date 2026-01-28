@@ -1,14 +1,36 @@
+//! Runtime state and health metadata for services.
+//!
+//! These enums model the high-level lifecycle and health signals reported by
+//! service controllers.
+//!
+//! # Examples
+//! ```rust
+//! use locald_core::state::{HealthStatus, ServiceState};
+//!
+//! let status = ServiceState::Stopped;
+//! let next = ServiceState::Running;
+//! assert!(status != next);
+//! assert_eq!(HealthStatus::Unknown.to_string(), "unknown");
+//! ```
 use crate::config::LocaldConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Current health of a service as observed by locald.
+///
+/// Health typically progresses from `Unknown` to `Starting`, and eventually to
+/// `Healthy` or `Unhealthy` once checks complete.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 pub enum HealthStatus {
+    /// No health information is available yet.
     #[default]
     Unknown,
+    /// Health checks have begun but are not yet conclusive.
     Starting,
+    /// The service has passed its health checks.
     Healthy,
+    /// The service failed health checks.
     Unhealthy,
 }
 
@@ -47,11 +69,18 @@ impl std::fmt::Display for HealthSource {
     }
 }
 
+/// High-level lifecycle state of a service.
+///
+/// Typical transitions are: `Stopped` -> `Building` -> `Running`, with
+/// `Running` -> `Stopped` when a service is shut down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceState {
+    /// The service process is running and should be reachable.
     Running,
+    /// The service is not currently running.
     Stopped,
+    /// The service is preparing or building before start.
     Building,
 }
 

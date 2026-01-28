@@ -1,3 +1,37 @@
+//! Project configuration schema for locald.
+//!
+//! The root config is [`LocaldConfig`], which is composed of three sections:
+//!
+//! - `[project]` for identity and naming.
+//! - `[plugins]` for plugin sources.
+//! - `[services.*]` for per-service definitions.
+//!
+//! # Examples
+//! ```toml
+//! [project]
+//! name = "my-app"
+//!
+//! [plugins]
+//! redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+//!
+//! [services.web]
+//! command = "npm start"
+//! ```
+//!
+//! ```rust
+//! use locald_core::config::LocaldConfig;
+//!
+//! let raw = r#"
+//! [project]
+//! name = "my-app"
+//!
+//! [services.web]
+//! command = "npm start"
+//! "#;
+//! let parsed: LocaldConfig = toml::from_str(raw).expect("valid config");
+//! assert_eq!(parsed.project.name, "my-app");
+//! assert!(parsed.services.contains_key("web"));
+//! ```
 pub mod global;
 pub use global::GlobalConfig;
 
@@ -18,6 +52,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// Root configuration for a locald project.
+///
+/// This is the primary entry point for parsing `locald.toml`.
 ///
 /// # Example
 /// ```toml
@@ -146,6 +182,8 @@ impl PluginSource {
 
 /// Configuration specific to the project identity.
 ///
+/// The `name` is required and influences default domains and identifiers.
+///
 /// # Example
 /// ```toml
 /// [project]
@@ -168,6 +206,9 @@ pub struct ProjectConfig {
 }
 
 /// Configuration for a single service.
+///
+/// This enum is untagged, so a service entry can be either a typed service
+/// (with a `type = "..."` field) or a legacy exec-style service config.
 ///
 /// # Example
 /// ```toml
