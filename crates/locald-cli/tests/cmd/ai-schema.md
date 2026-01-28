@@ -5,7 +5,7 @@ $ locald ai schema
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "LocaldConfig",
-  "description": "Root configuration for a locald project./n/n# Example/n```toml/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n```/n/n```rust/nuse locald_core::config::LocaldConfig;/n/nlet raw = r#/"/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n/"#;/n/nlet config: LocaldConfig = toml::from_str(raw).expect(/"valid locald config/");/nassert_eq!(config.project.name, /"my-app/");/nassert!(config.plugins.contains_key(/"redis/"));/nassert!(config.services.contains_key(/"web/"));/n```",
+  "description": "Root configuration for a locald project./n/nThis is the primary entry point for parsing `locald.toml`./n/n# Example/n```toml/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n```/n/n```rust/nuse locald_core::config::LocaldConfig;/n/nlet raw = r#/"/n[project]/nname = /"my-app/"/n/n[plugins]/nredis = /"https://plugins.locald.dev/redis-plugin-1.0.0.locald-package/"/n/n[services.web]/ncommand = /"npm start/"/n/"#;/n/nlet config: LocaldConfig = toml::from_str(raw).expect(/"valid locald config/");/nassert_eq!(config.project.name, /"my-app/");/nassert!(config.plugins.contains_key(/"redis/"));/nassert!(config.services.contains_key(/"web/"));/n```",
   "type": "object",
   "properties": {
     "plugins": {
@@ -338,7 +338,7 @@ $ locald ai schema
           "default": null
         },
         "interval": {
-          "description": "The interval between checks in seconds.",
+          "description": "The interval between checks in seconds. Defaults to 1 second.",
           "type": [
             "integer",
             "null"
@@ -356,7 +356,7 @@ $ locald ai schema
           "default": null
         },
         "timeout": {
-          "description": "The timeout for each check in seconds.",
+          "description": "The timeout for each check in seconds. Defaults to 5 seconds.",
           "type": [
             "integer",
             "null"
@@ -395,7 +395,7 @@ $ locald ai schema
       ]
     },
     "ProjectConfig": {
-      "description": "Configuration specific to the project identity./n/n# Example/n```toml/n[project]/nname = /"my-app/"/ndomain = /"myapp.local/"/n```",
+      "description": "Configuration specific to the project identity./n/nThe `name` is required and influences default domains and identifiers./n/n# Example/n```toml/n[project]/nname = /"my-app/"/ndomain = /"myapp.local/"/n```",
       "type": "object",
       "properties": {
         "constellation": {
@@ -429,7 +429,7 @@ $ locald ai schema
       ]
     },
     "ServiceConfig": {
-      "description": "Configuration for a single service./n/n# Example/n```toml/n[services.web]/ncommand = /"npm start/"/n```",
+      "description": "Configuration for a single service./n/nThis enum is untagged, so a service entry can be either a typed service/n(with a `type = /".../"` field) or a legacy exec-style service config./n/n# Example/n```toml/n[services.web]/ncommand = /"npm start/"/n```",
       "anyOf": [
         {
           "description": "A typed service configuration (e.g. Postgres, Worker).",
