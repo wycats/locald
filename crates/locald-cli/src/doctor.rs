@@ -1,10 +1,10 @@
 use crate::style;
 use anyhow::Result;
 use crossterm::style::Stylize;
-use crossterm::tty::IsTty;
 use locald_utils::privileged::{AcquireConfig, CleanupMode, DoctorReport, Severity, Status};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::IsTerminal;
 
 struct DoctorCompactTheme;
 
@@ -137,7 +137,7 @@ fn tty_remark_wrapped(text: impl AsRef<str>) {
 }
 
 fn render_human(report: &DoctorReport, verbose: bool) {
-    if std::io::stdout().is_tty() {
+    if style::colors_enabled() && std::io::stdout().is_terminal() {
         render_human_cliclack(report, verbose);
     } else {
         render_human_plain(report, verbose);

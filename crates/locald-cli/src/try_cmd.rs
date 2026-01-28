@@ -1,7 +1,7 @@
 use crate::history;
 use anyhow::{Context, Result};
-use crossterm::tty::IsTty;
 use dialoguer::Confirm;
+use std::io::IsTerminal;
 use std::process::Command;
 
 pub fn run_adhoc(command: String) -> Result<()> {
@@ -35,7 +35,7 @@ pub fn run_adhoc(command: String) -> Result<()> {
         eprintln!("Failed to save history: {e}");
     }
 
-    if std::io::stdin().is_tty() {
+    if std::io::stdin().is_terminal() {
         if Confirm::new()
             .with_prompt("Do you want to add this command to locald.toml?")
             .default(true)

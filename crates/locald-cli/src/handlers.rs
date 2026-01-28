@@ -624,13 +624,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 AdminCommands::Setup => {
                     #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
-                        use crossterm::tty::IsTty;
+                        use std::io::IsTerminal;
                         use std::process::Command;
 
                         // `admin setup` fundamentally requires root, but we can be friendly here:
                         // when run from a TTY, re-exec ourselves via `pkexec` (for GUI auth) or
                         // `sudo` (fallback) so the user doesn't have to remember to type it.
-                        if !std::io::stdin().is_tty() {
+                        if !std::io::stdin().is_terminal() {
                             return Err(CliError::message(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`.",
                             ));
