@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "58"
-title = "Documentation-Driven Design (DDD) Audit"
-rfcs = ["0058"]
+id = "59"
+title = "Systematic Investigation Protocol"
+rfcs = ["0066"]
 
 [plan]
 [[plan.changes]]
@@ -13,46 +13,6 @@ type = "feat"
 details = "Description"
 files = []
 tests = []
-
-[[plan.changes.tasks]]
-id = "58.1-audit-cli-surface"
-title = "58.1: Audit CLI surface (locald commands)"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.2-audit-config-parsing"
-title = "58.2: Audit configuration parsing (locald-core/config)"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.3-audit-service-lifecycle"
-title = "58.3: Audit service lifecycle (start/stop/restart/status)"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.4-audit-health-urls"
-title = "58.4: Audit health checks and service URLs"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.5-audit-privileged-ops"
-title = "58.5: Audit privileged operations (admin setup, trust)"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.6-audit-doctor-command"
-title = "58.6: Audit doctor command"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.7-refactor-friction-points"
-title = "58.7: Refactor identified friction points"
-status = "completed"
-
-[[plan.changes.tasks]]
-id = "58.8-improve-rustdoc-doctests"
-title = "58.8: Add/improve Rustdoc and doctests"
-status = "completed"
 
 [verification]
 automated = ["Run scripts/verify-phase.sh"]

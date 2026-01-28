@@ -1789,7 +1789,7 @@ aliases = ["109.8"]
 [[epochs]]
 id = "E4"
 title = "The Build Era"
-status = "pending"
+status = "active"
 ulid = "01KEX4X98Z6TXH90JZ6NA24R81"
 slug = "E4"
 aliases = ["E4"]
@@ -1920,7 +1920,7 @@ aliases = ["58.3"]
 [[epochs.phases]]
 id = "59"
 title = "Systematic Investigation Protocol"
-status = "pending"
+status = "active"
 rfcs = ["0066"]
 ulid = "01KEX4X98ZV337MCRG6N65WTAX"
 slug = "59"
@@ -2681,6 +2681,7 @@ status = "completed"
 ulid = "01KEX4X98ZVQB7MEDVKS5ACEGR"
 slug = "E6"
 aliases = ["E6"]
+reviewed = true
 
 [[epochs.phases]]
 id = "110"
