@@ -1,8 +1,10 @@
 # Design: Docker Integration
 
-> **Status**: Proposal. This is not yet implemented in the CLI.
+> **Status**: Withdrawn. Superseded by the OCI/libcontainer execution layer.
 >
 > **Core focus**: The default experience is host execution; container integration is future work.
+
+This proposal is retained for historical context. The DockerRuntime has been removed, and the `image` and `container_port` fields are no longer part of the service schema.
 
 ## Context
 
@@ -19,7 +21,7 @@ Currently, `locald` only supports running local commands. Users have to manually
 2.  **Unified Logs**: `locald logs` should show logs from containers too.
 3.  **Simple Config**: Avoid the need for a separate `docker-compose.yml` for simple dependencies.
 
-## Proposed Approaches
+## Historical Approaches (Withdrawn)
 
 ### Approach 1: Native Docker Support (The "Locald Way")
 
@@ -73,47 +75,6 @@ compose_service = "db"
 - Split configuration.
 - Harder to dynamically assign ports (Compose usually has fixed ports).
 
-## Recommendation: Approach 1 (Native)
+## Current Direction
 
-For the "App Builder" persona, defining a database in `locald.toml` is a magical experience. It removes the friction of learning Docker Compose syntax for simple needs.
-
-**Decision**: We will implement Approach 1, but with a **strict and minimal schema**. We will not attempt to support every Docker feature. If users need complex networking or capabilities, they should use `command = "docker-compose up ..."` instead.
-
-## Implementation Plan
-
-### 1. Schema Update
-
-We will add the following optional fields to `ServiceConfig`:
-
-- `image: Option<String>`: The Docker image to run (e.g., `postgres:15`). If present, `command` is ignored (or used as args?). _Decision: If `image` is present, `command` is optional and treated as the container command/args._
-- `container_port: Option<u16>`: The port _inside_ the container to expose. Required if we want to map a port.
-- `volumes: Option<Vec<String>>`: List of volume mounts (passed to `-v`).
-
-**Example**:
-
-```toml
-[services.db]
-image = "postgres:15"
-container_port = 5432
-env = { POSTGRES_PASSWORD = "secret" }
-volumes = ["./data:/var/lib/postgresql/data"]
-```
-
-### 2. Process Manager & Lifecycle
-
-- **Command Construction**: `docker run --rm --name locald-<project>-<service> -p <host_port>:<container_port> ... <image>`
-- **Deterministic Naming**: Containers must be named `locald-<project>-<service>` to allow for cleanup.
-- **Robust Cleanup**:
-  - On `start()`, before spawning, run `docker rm -f locald-<project>-<service>` to remove any zombie containers from previous runs.
-  - On `stop()`, the `docker` CLI process is killed. Since we use `--rm`, the container _should_ die, but we should also explicitly `docker stop` it if possible, or rely on the startup cleanup of the next run.
-
-### 3. Networking
-
-- **Host Access**: Containers often need to talk to the host (e.g., to reach another service running locally).
-  - We should investigate injecting `host.docker.internal` mapping if possible, or document how to reach the host.
-  - _Note_: On Linux, `host.docker.internal` is not always available by default. We might need `--add-host host.docker.internal:host-gateway`.
-
-### 4. Port Management
-
-- If `container_port` is specified, `locald` binds a random ephemeral port on the host (just like it does for local processes) and maps it: `-p <random_host_port>:<container_port>`.
-- The `<random_host_port>` is injected into the environment of _other_ services as `PORT_<SERVICE_NAME>`.
+Container execution is handled via `locald`'s OCI/libcontainer stack. Docker-specific schema and runtime integration are no longer planned in this form.

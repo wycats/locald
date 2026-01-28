@@ -86,7 +86,6 @@ locald doctor --verbose
 Checks:
 
 - Shim availability and permissions
-- Socket connectivity (in container environments)
 - Cgroup readiness
 
 See [locald doctor reference](doctor.md) for detailed documentation.
@@ -125,26 +124,3 @@ This command:
 2. Sets up permissions (root-owned, setuid)
 3. Configures cgroups for process isolation
 4. Installs polkit policy for GUI authentication
-
-### `locald-shim serve`
-
-Start the shim daemon for container environments.
-
-```bash
-# Run in background (default)
-sudo locald-shim serve
-
-# Run in foreground (for debugging)
-sudo locald-shim serve --foreground
-
-# Custom socket path
-sudo locald-shim serve --socket /run/user/1000/locald/shim.sock
-```
-
-The daemon:
-
-- Listens on `~/.locald/shim.sock`
-- Handles privileged operations (hosts sync, port binding, cgroups)
-- Auto-exits after 5 minutes idle or 1 hour max lifetime
-
-See [Container Development Environments](../development/container-environments.md) for the complete guide.

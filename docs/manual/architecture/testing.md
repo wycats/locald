@@ -10,7 +10,7 @@ title: Testing Strategy
 
 ## Philosophy: No Mocks, Just Fakes
 
-We adopt the "No Mocks, Just Fakes" philosophy (RFC 0082).
+We adopt the "No Mocks, Just Fakes" philosophy.
 
 - **No Mocks**: We avoid mocking libraries that hijack function calls at runtime.
 - **Fakes**: We implement "Fake" versions of core dependencies (FileSystem, Network, ProcessRunner) that behave like the real thing but run in memory.

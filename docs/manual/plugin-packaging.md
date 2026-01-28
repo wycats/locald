@@ -219,5 +219,5 @@ locald plugin create ./my-plugin --verbose
 
 ## See Also
 
-- [RFC 0129: WASM Plugins as Plan Transforms](../rfcs/stage-1/0129-wasm-plugins-as-plan-transforms.md)
+- [RFC 0129: WASM Plugins as Plan Transforms](../rfcs/stage-3/0129-wasm-plugins-as-plan-transforms.md)
 - [Plugin Development Guide](plugin-development.md) _(coming soon)_

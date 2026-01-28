@@ -8,18 +8,17 @@ This document describes how `locald` determines if a service is ready and health
 
 `locald` attempts to automatically detect the best health check strategy for a service, minimizing manual configuration. The hierarchy of checks is:
 
-1.  **Docker Native**: If the service is a Docker container, we poll the Docker API for the container's health status (defined by `HEALTHCHECK` in the Dockerfile).
-2.  **`sd_notify`**: If the service supports the systemd notification protocol, we wait for the `READY=1` signal.
-3.  **TCP Probe**: If the service has an assigned port, we attempt to connect to that port. Success implies the service is listening.
-4.  **Explicit Command**: Users can define a custom `health_check` command in `locald.toml`.
+1.  **HTTP Probe**: If the service exposes an HTTP health endpoint, `locald` checks for a successful response.
+2.  **TCP Probe**: If the service has an assigned port, we attempt to connect to that port. Success implies the service is listening.
+3.  **Explicit Command**: Users can define a custom `health_check` command in `locald.toml`.
+4.  **`sd_notify`**: If the service supports the systemd notification protocol, we wait for the `READY=1` signal.
 
-## 2. Docker Polling
+## 2. Health Check Types
 
-For Docker services, `locald` polls the `inspect_container` API endpoint.
-
-- It checks `.State.Health.Status`.
-- It waits until the status is `healthy`.
-- This avoids race conditions where the container is "running" but the application inside is still booting.
+- **HTTP Probes**: Hit a configured or auto-detected health URL and require a successful HTTP response.
+- **TCP Probes**: Attempt a TCP connection to the service port to confirm it is listening.
+- **Command Probes**: Execute a user-specified command and require a zero exit status.
+- **`sd_notify`**: Wait for `READY=1` from services that support systemd-style readiness.
 
 ## 3. Dependency Management
 
