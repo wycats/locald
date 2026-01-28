@@ -155,9 +155,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         println!("{} Reset service {}", style::CHECK, full_name.bold());
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to reset {full_name}: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to reset {full_name}: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -410,9 +413,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         println!("{} Stopped service {}", style::CHECK, service_name.bold());
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to stop {service_name}: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to stop {service_name}: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -441,9 +447,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     println!("{} Restarted service {}", style::CHECK, full_name.bold());
                 }
                 Ok(IpcResponse::Error(msg)) => {
-                    eprintln!("{} Failed to restart {full_name}: {msg}", style::CROSS);
+                    return Err(CliError::message(format!(
+                        "{} Failed to restart {full_name}: {msg}",
+                        style::CROSS
+                    )));
                 }
-                Ok(r) => println!("Unexpected response: {r:?}"),
+                Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                 Err(e) => return Err(e),
             }
         }
@@ -494,7 +503,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         }
                     }
                 }
-                Ok(response) => println!("Unexpected response: {response:?}"),
+                Ok(response) => {
+                    return Err(CliError::message(format!(
+                        "Unexpected response: {response:?}"
+                    )));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -805,7 +818,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::AiSchema) {
                     Ok(IpcResponse::AiSchema(schema)) => println!("{schema}"),
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -813,7 +826,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::AiContext) {
                     Ok(IpcResponse::AiContext(context)) => println!("{context}"),
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -972,7 +985,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -984,9 +997,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 }) {
                     Ok(IpcResponse::Ok) => println!("{} Project pinned.", style::CHECK),
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to pin project: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to pin project: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -998,9 +1014,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 }) {
                     Ok(IpcResponse::Ok) => println!("{} Project unpinned.", style::CHECK),
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to unpin project: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to unpin project: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -1011,9 +1030,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         println!("{} Removed {} non-existent projects.", style::CHECK, count);
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to clean registry: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to clean registry: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
