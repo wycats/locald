@@ -184,14 +184,26 @@ pub enum Commands {
     Stop {
         /// Name of the service to stop
         name: Option<String>,
+
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Restart a running service
     Restart {
         /// Name of the service to restart
         name: String,
+
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// List running services
-    Status,
+    Status {
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Stream logs from services
     Logs {
         /// Name of the service to stream logs for (optional)

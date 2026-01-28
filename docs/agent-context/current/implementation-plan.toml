@@ -2,9 +2,9 @@
 # Implementation Plan
 
 [phase]
-id = "31"
-title = "Engineering Excellence"
-rfcs = ["0040"]
+id = "58"
+title = "Documentation-Driven Design (DDD) Audit"
+rfcs = ["0058"]
 
 [plan]
 [[plan.changes]]
@@ -15,33 +15,43 @@ files = []
 tests = []
 
 [[plan.changes.tasks]]
-id = "31.3.1"
-title = "Enable doctests in CI"
-status = "completed"
+id = "58.1-audit-cli-surface"
+title = "58.1: Audit CLI surface (locald commands)"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "31.3.2"
-title = "Fix any failing doctests"
-status = "completed"
+id = "58.2-audit-config-parsing"
+title = "58.2: Audit configuration parsing (locald-core/config)"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "31.3.3"
-title = "Add doctest for LocaldConfig parsing"
-status = "completed"
+id = "58.3-audit-service-lifecycle"
+title = "58.3: Audit service lifecycle (start/stop/restart/status)"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "31.3.4"
-title = "Extend trycmd for docs CLI examples"
-status = "completed"
+id = "58.4-audit-health-urls"
+title = "58.4: Audit health checks and service URLs"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "31.3.5"
-title = "Add TOML config example validation"
-status = "completed"
+id = "58.5-audit-privileged-ops"
+title = "58.5: Audit privileged operations (admin setup, trust)"
+status = "pending"
 
 [[plan.changes.tasks]]
-id = "31.3.6"
-title = "Add xtask verify docs-samples command"
+id = "58.6-audit-doctor-command"
+title = "58.6: Audit doctor command"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "58.7-refactor-friction-points"
+title = "58.7: Refactor identified friction points"
+status = "pending"
+
+[[plan.changes.tasks]]
+id = "58.8-improve-rustdoc-doctests"
+title = "58.8: Add/improve Rustdoc and doctests"
 status = "completed"
 
 [verification]

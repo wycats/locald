@@ -3,6 +3,13 @@
 //! This module provides a shared, structured report used by `locald doctor` and by
 //! privileged call sites to prevent readiness drift.
 //!
+//! ## Doctor reports
+//!
+//! A [`DoctorReport`] contains a list of [`Problem`] entries describing checks that
+//! passed, failed, or were skipped. Problems are identified by stable IDs that use
+//! dot-separated namespaces (for example: `doctor.collect`, `host.shim.present`,
+//! `privileged.cgroup.root`).
+//!
 //! ## Privilege Acquisition Strategy
 //!
 //! When acquiring privileged capabilities, locald only supports the host setuid shim.
@@ -25,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Severity level for a doctor problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -33,6 +41,7 @@ pub enum Severity {
     Info,
 }
 
+/// Result status for a doctor problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -41,12 +50,14 @@ pub enum Status {
     Skip,
 }
 
+/// Key-value evidence describing a diagnostic observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceItem {
     pub key: String,
     pub value: String,
 }
 
+/// Strategy used to discover the cgroup root on Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CgroupStrategyKind {
@@ -54,12 +65,14 @@ pub enum CgroupStrategyKind {
     Direct,
 }
 
+/// Report describing how host strategy decisions were made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrategyReport {
     pub cgroup_root: CgroupStrategyKind,
     pub why: String,
 }
 
+/// Cleanup mode chosen after evaluating host readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupMode {
@@ -67,6 +80,7 @@ pub enum CleanupMode {
     Degraded,
 }
 
+/// Canonical remediation keys surfaced in doctor output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FixKey {
@@ -80,6 +94,7 @@ pub enum FixKey {
     UnsupportedEnvironment,
 }
 
+/// Guidance for remediating a failed check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixAdvice {
     pub key: FixKey,
@@ -88,6 +103,10 @@ pub struct FixAdvice {
     pub commands: Vec<String>,
 }
 
+/// A single diagnostic result reported by `locald doctor`.
+///
+/// Problem IDs are stable, dot-separated identifiers such as `doctor.collect`
+/// or `privileged.cgroup.root`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
     pub id: String,
@@ -104,6 +123,7 @@ pub struct Problem {
     pub fix: Option<FixKey>,
 }
 
+/// Aggregated doctor report for host readiness checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub strategy: StrategyReport,

@@ -62,10 +62,12 @@ mod utils;
 
 // Force rebuild 3
 fn main() {
-    if let Err(err) = miette::set_hook(Box::new(|_| {
+    let colors_enabled = style::configure_colors();
+
+    if let Err(err) = miette::set_hook(Box::new(move |_| {
         Box::new(
             miette::MietteHandlerOpts::new()
-                .color(true)
+                .color(colors_enabled)
                 .terminal_links(true)
                 .unicode(true)
                 .build(),

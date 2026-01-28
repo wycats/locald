@@ -1,3 +1,37 @@
+//! Project configuration schema for locald.
+//!
+//! The root config is [`LocaldConfig`], which is composed of three sections:
+//!
+//! - `[project]` for identity and naming.
+//! - `[plugins]` for plugin sources.
+//! - `[services.*]` for per-service definitions.
+//!
+//! # Examples
+//! ```toml
+//! [project]
+//! name = "my-app"
+//!
+//! [plugins]
+//! redis = "https://plugins.locald.dev/redis-plugin-1.0.0.locald-package"
+//!
+//! [services.web]
+//! command = "npm start"
+//! ```
+//!
+//! ```rust
+//! use locald_core::config::LocaldConfig;
+//!
+//! let raw = r#"
+//! [project]
+//! name = "my-app"
+//!
+//! [services.web]
+//! command = "npm start"
+//! "#;
+//! let parsed: LocaldConfig = toml::from_str(raw).expect("valid config");
+//! assert_eq!(parsed.project.name, "my-app");
+//! assert!(parsed.services.contains_key("web"));
+//! ```
 pub mod global;
 pub use global::GlobalConfig;
 
@@ -15,8 +49,11 @@ pub use env_provenance::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Root configuration for a locald project.
+///
+/// This is the primary entry point for parsing `locald.toml`.
 ///
 /// # Example
 /// ```toml
@@ -145,6 +182,8 @@ impl PluginSource {
 
 /// Configuration specific to the project identity.
 ///
+/// The `name` is required and influences default domains and identifiers.
+///
 /// # Example
 /// ```toml
 /// [project]
@@ -167,6 +206,9 @@ pub struct ProjectConfig {
 }
 
 /// Configuration for a single service.
+///
+/// This enum is untagged, so a service entry can be either a typed service
+/// (with a `type = "..."` field) or a legacy exec-style service config.
 ///
 /// # Example
 /// ```toml
@@ -299,6 +341,9 @@ pub enum HealthCheckConfig {
     Probe(ProbeConfig),
 }
 
+pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 1;
+pub const DEFAULT_HEALTH_CHECK_TIMEOUT_SECS: u64 = 5;
+
 /// Configuration for a health check probe.
 ///
 /// # Example
@@ -315,15 +360,25 @@ pub struct ProbeConfig {
     /// The path to check (for HTTP probes).
     #[serde(default)]
     pub path: Option<String>,
-    /// The interval between checks in seconds.
+    /// The interval between checks in seconds. Defaults to 1 second.
     #[serde(default)]
     pub interval: Option<u64>,
-    /// The timeout for each check in seconds.
+    /// The timeout for each check in seconds. Defaults to 5 seconds.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// The command to run (for Command probes).
     #[serde(default)]
     pub command: Option<String>,
+}
+
+impl ProbeConfig {
+    pub fn interval_duration(&self) -> Duration {
+        Duration::from_secs(self.interval.unwrap_or(DEFAULT_HEALTH_CHECK_INTERVAL_SECS))
+    }
+
+    pub fn timeout_duration(&self) -> Duration {
+        Duration::from_secs(self.timeout.unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS))
+    }
 }
 
 /// The type of health check probe.

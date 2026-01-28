@@ -3,13 +3,11 @@ title: Remove Container Workflow Support
 stage: 3
 feature: Engineering Excellence
 exo:
-    tool: exo rfc create
-    protocol: 1
+  tool: exo rfc create
+  protocol: 1
 ---
 
-
 # RFC 0138: Remove Container Workflow Support
-
 
 ## Summary
 
@@ -48,15 +46,15 @@ This architecture required:
 
 The container workflow adds ~2,000 lines of code:
 
-| Component | Lines |
-|-----------|-------|
-| `crates/host-spawn/` crate | ~400-600 |
-| `crates/locald-utils/src/container.rs` (host-spawn re-export + container helpers) | ~240 |
-| `crates/locald-utils/src/shim_client.rs` (socket client) | ~693 |
-| `crates/locald-utils/src/privileged.rs` (socket mode + auto-start) | ~150-250 |
-| `crates/locald-shim/src/daemon.rs` + `crates/locald-shim/src/protocol.rs` (socket daemon/protocol) | ~300-600 |
-| `crates/locald-core/src/config/global.rs` (`ContainerConfig`) | ~20-40 |
-| **Total** | **~1,800-2,400** |
+| Component                                                                                          | Lines            |
+| -------------------------------------------------------------------------------------------------- | ---------------- |
+| `crates/host-spawn/` crate                                                                         | ~400-600         |
+| `crates/locald-utils/src/container.rs` (host-spawn re-export + container helpers)                  | ~240             |
+| `crates/locald-utils/src/shim_client.rs` (socket client)                                           | ~693             |
+| `crates/locald-utils/src/privileged.rs` (socket mode + auto-start)                                 | ~150-250         |
+| `crates/locald-shim/src/daemon.rs` + `crates/locald-shim/src/protocol.rs` (socket daemon/protocol) | ~300-600         |
+| `crates/locald-core/src/config/global.rs` (`ContainerConfig`)                                      | ~20-40           |
+| **Total**                                                                                          | **~1,800-2,400** |
 
 This code:
 
@@ -73,10 +71,10 @@ This code:
 - Run the resulting binary on the host
 - Develop inside a container while locald runs on the host
 
-What *doesn't* work well is the **inverse**: running locald inside a container and having it reach out to the host for privileged operations. This requires:
+What _doesn't_ work well is the **inverse**: running locald inside a container and having it reach out to the host for privileged operations. This requires:
 
 - Precise container environment detection heuristics
-- Socket-based IPC that must work across container boundaries  
+- Socket-based IPC that must work across container boundaries
 - Auto-start coordination between two daemons
 - Platform-specific host-exec mechanisms (`flatpak-spawn`, `distrobox-host-exec`, etc.)
 
@@ -109,30 +107,30 @@ RFC 0069 already established host-first execution as the default. This RFC compl
 
 ### Files to Modify
 
-| File | Change |
-|------|--------|
-| `Cargo.toml` (workspace) | Remove `host-spawn` member |
-| `crates/locald-utils/Cargo.toml` | Remove `host-spawn` dependency |
-| `crates/locald-utils/src/lib.rs` | Remove `container` module re-export (and any socket-related exports) |
-| `crates/locald-utils/src/container.rs` | Remove host-spawn re-exports and host-exec helpers (or delete entire file) |
-| `crates/locald-utils/src/shim_client.rs` | Remove socket client (only used for container workflow) |
-| `crates/locald-utils/src/privileged.rs` | Remove socket mode and daemon auto-start path; setuid-only |
-| `crates/locald-shim/src/daemon.rs` | Remove shim daemon (socket server) implementation |
-| `crates/locald-shim/src/protocol.rs` | Remove socket protocol definitions |
-| `crates/locald-core/src/config/global.rs` | Remove `ContainerConfig` struct |
-| `crates/locald-cli/src/utils.rs` | Remove/adjust host-exec template references tied to host-spawn |
+| File                                      | Change                                                                     |
+| ----------------------------------------- | -------------------------------------------------------------------------- |
+| `Cargo.toml` (workspace)                  | Remove `host-spawn` member                                                 |
+| `crates/locald-utils/Cargo.toml`          | Remove `host-spawn` dependency                                             |
+| `crates/locald-utils/src/lib.rs`          | Remove `container` module re-export (and any socket-related exports)       |
+| `crates/locald-utils/src/container.rs`    | Remove host-spawn re-exports and host-exec helpers (or delete entire file) |
+| `crates/locald-utils/src/shim_client.rs`  | Remove socket client (only used for container workflow)                    |
+| `crates/locald-utils/src/privileged.rs`   | Remove socket mode and daemon auto-start path; setuid-only                 |
+| `crates/locald-shim/src/daemon.rs`        | Remove shim daemon (socket server) implementation                          |
+| `crates/locald-shim/src/protocol.rs`      | Remove socket protocol definitions                                         |
+| `crates/locald-core/src/config/global.rs` | Remove `ContainerConfig` struct                                            |
+| `crates/locald-cli/src/utils.rs`          | Remove/adjust host-exec template references tied to host-spawn             |
 
 ### Documentation to Remove/Update
 
-| Document | Action |
-|----------|--------|
-| `docs/manual/development/container-environments.md` | Update to remove "run locald inside containers" workflow; replace with "run on host" + export/host-usage patterns |
-| `docs/manual/features/doctor.md` | Update container-specific checks and guidance |
-| `docs/research/host-container-privilege-split.md` | Archive or update to reflect removal decision |
-| `docs/rfcs/stage-1/0130-host-shim-daemon.md` | Mark as withdrawn (see RFC Withdrawal Process) |
-| `docs/rfcs/stage-2/0130-host-shim-daemon.md` | Mark as withdrawn (see RFC Withdrawal Process) |
-| `docs/rfcs/stage-2/0134-host-spawn-crate-guest-to-host-execution.md` | Mark as withdrawn (see RFC Withdrawal Process) |
-| README and other docs | Remove container workflow references |
+| Document                                                             | Action                                                                                                            |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `docs/manual/development/container-environments.md`                  | Update to remove "run locald inside containers" workflow; replace with "run on host" + export/host-usage patterns |
+| `docs/manual/features/doctor.md`                                     | Update container-specific checks and guidance                                                                     |
+| `docs/research/host-container-privilege-split.md`                    | Archive or update to reflect removal decision                                                                     |
+| `docs/rfcs/stage-1/0130-host-shim-daemon.md`                         | Mark as withdrawn (see RFC Withdrawal Process)                                                                    |
+| `docs/rfcs/stage-2/0130-host-shim-daemon.md`                         | Mark as withdrawn (see RFC Withdrawal Process)                                                                    |
+| `docs/rfcs/stage-2/0134-host-spawn-crate-guest-to-host-execution.md` | Mark as withdrawn (see RFC Withdrawal Process)                                                                    |
+| README and other docs                                                | Remove container workflow references                                                                              |
 
 ### Simplifications Enabled
 
@@ -253,9 +251,9 @@ The `*.localhost` domains and HTTPS certificates work the same regardless of whe
 2. Simplify `Privileged::acquire()` to setuid-only
 3. Remove `PrivilegeMode::Socket` variant
 4. Update `locald doctor` to:
-    - Detect container environments (optional)
-    - Provide a clear "not supported" message
-    - Suggest host execution and/or exporting the host binary
+   - Detect container environments (optional)
+   - Provide a clear "not supported" message
+   - Suggest host execution and/or exporting the host binary
 
 ### Phase 2.5: Tests and CI
 

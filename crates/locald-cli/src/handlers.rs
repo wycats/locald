@@ -1,6 +1,7 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
+use serde::Serialize;
 use std::collections::HashSet;
 
 #[cfg(feature = "experimental-cnb")]
@@ -20,6 +21,30 @@ use crate::{
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
+
+#[derive(Serialize)]
+struct JsonServiceSummary {
+    name: String,
+    state: String,
+    port: Option<u16>,
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonServiceList {
+    services: Vec<JsonServiceSummary>,
+}
+
+#[derive(Serialize)]
+struct JsonServiceAction {
+    service: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct JsonServiceActions {
+    services: Vec<JsonServiceAction>,
+}
 
 pub fn run(cli: Cli) -> CliResult<()> {
     match &cli.command {
@@ -155,9 +180,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         println!("{} Reset service {}", style::CHECK, full_name.bold());
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to reset {full_name}: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to reset {full_name}: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -380,7 +408,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             report_update(&update_rx);
         }
-        Commands::Stop { name } => {
+        Commands::Stop { name, json } => {
             let names = if let Some(n) = name {
                 vec![n.clone()]
             } else {
@@ -402,22 +430,39 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     .collect()
             };
 
+            let mut actions = Vec::new();
+
             for service_name in names {
                 match client::send_request(&IpcRequest::Stop {
                     name: service_name.clone(),
                 }) {
                     Ok(IpcResponse::Ok) => {
-                        println!("{} Stopped service {}", style::CHECK, service_name.bold());
+                        if *json {
+                            actions.push(JsonServiceAction {
+                                service: service_name.clone(),
+                                status: "stopped".to_string(),
+                            });
+                        } else {
+                            println!("{} Stopped service {}", style::CHECK, service_name.bold());
+                        }
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to stop {service_name}: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to stop {service_name}: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
+
+            if *json {
+                let json = serde_json::to_string_pretty(&JsonServiceActions { services: actions })?;
+                println!("{json}");
+            }
         }
-        Commands::Restart { name } => {
+        Commands::Restart { name, json } => {
             // Resolve full name if needed
             let full_name = {
                 let config_path = std::env::current_dir()?.join("locald.toml");
@@ -438,20 +483,58 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 name: full_name.clone(),
             }) {
                 Ok(IpcResponse::Ok) => {
-                    println!("{} Restarted service {}", style::CHECK, full_name.bold());
+                    if *json {
+                        let response = JsonServiceActions {
+                            services: vec![JsonServiceAction {
+                                service: full_name,
+                                status: "restarted".to_string(),
+                            }],
+                        };
+                        let json = serde_json::to_string_pretty(&response)?;
+                        println!("{json}");
+                    } else {
+                        println!("{} Restarted service {}", style::CHECK, full_name.bold());
+                    }
                 }
                 Ok(IpcResponse::Error(msg)) => {
-                    eprintln!("{} Failed to restart {full_name}: {msg}", style::CROSS);
+                    return Err(CliError::message(format!(
+                        "{} Failed to restart {full_name}: {msg}",
+                        style::CROSS
+                    )));
                 }
-                Ok(r) => println!("Unexpected response: {r:?}"),
+                Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                 Err(e) => return Err(e),
             }
         }
-        Commands::Status => {
+        Commands::Status { json } => {
             utils::ensure_daemon_running()?;
             match client::send_request(&IpcRequest::Status) {
                 Ok(IpcResponse::Status(services)) => {
-                    if services.is_empty() {
+                    if *json {
+                        let summaries = services
+                            .into_iter()
+                            .map(|service| JsonServiceSummary {
+                                name: service.name,
+                                state: match service.status {
+                                    locald_core::state::ServiceState::Running => {
+                                        "running".to_string()
+                                    }
+                                    locald_core::state::ServiceState::Stopped => {
+                                        "stopped".to_string()
+                                    }
+                                    locald_core::state::ServiceState::Building => {
+                                        "building".to_string()
+                                    }
+                                },
+                                port: service.port,
+                                url: service.url,
+                            })
+                            .collect();
+                        let json = serde_json::to_string_pretty(&JsonServiceList {
+                            services: summaries,
+                        })?;
+                        println!("{json}");
+                    } else if services.is_empty() {
                         println!("No services running.");
                     } else {
                         // Print table
@@ -494,7 +577,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         }
                     }
                 }
-                Ok(response) => println!("Unexpected response: {response:?}"),
+                Ok(response) => {
+                    return Err(CliError::message(format!(
+                        "Unexpected response: {response:?}"
+                    )));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -533,13 +620,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 AdminCommands::Setup => {
                     #[cfg(all(unix, target_os = "linux"))]
                     if !nix::unistd::geteuid().is_root() {
-                        use crossterm::tty::IsTty;
+                        use std::io::IsTerminal;
                         use std::process::Command;
 
                         // `admin setup` fundamentally requires root, but we can be friendly here:
                         // when run from a TTY, re-exec ourselves via `pkexec` (for GUI auth) or
                         // `sudo` (fallback) so the user doesn't have to remember to type it.
-                        if !std::io::stdin().is_tty() {
+                        if !std::io::stdin().is_terminal() {
                             return Err(CliError::message(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`.",
                             ));
@@ -805,7 +892,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::AiSchema) {
                     Ok(IpcResponse::AiSchema(schema)) => println!("{schema}"),
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -813,7 +900,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::AiContext) {
                     Ok(IpcResponse::AiContext(context)) => println!("{context}"),
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -972,7 +1059,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -984,9 +1071,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 }) {
                     Ok(IpcResponse::Ok) => println!("{} Project pinned.", style::CHECK),
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to pin project: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to pin project: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -998,9 +1088,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 }) {
                     Ok(IpcResponse::Ok) => println!("{} Project unpinned.", style::CHECK),
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to unpin project: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to unpin project: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -1011,9 +1104,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         println!("{} Removed {} non-existent projects.", style::CHECK, count);
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        eprintln!("{} Failed to clean registry: {msg}", style::CROSS);
+                        return Err(CliError::message(format!(
+                            "{} Failed to clean registry: {msg}",
+                            style::CROSS
+                        )));
                     }
-                    Ok(r) => println!("Unexpected response: {r:?}"),
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
@@ -1133,11 +1229,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
         },
 
-        Commands::Serve {
-            path,
-            port,
-            bind: _,
-        } => {
+        Commands::Serve { path, port, bind } => {
             let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
             if !abs_path.exists() {
                 return Err(CliError::message(format!(
@@ -1160,7 +1252,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 .enable_all()
                 .build()?
                 .block_on(locald_server::static_server::run_static_server(
-                    *port, abs_path, tx,
+                    *port, bind, abs_path, tx,
                 ))?;
         }
 

@@ -1270,6 +1270,14 @@
             "positional": false
           },
           {
+            "long": "json",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "sandbox",
             "short": null,
             "aliases": [],
@@ -1948,6 +1956,14 @@
             "positional": false
           },
           {
+            "long": "json",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "sandbox",
             "short": null,
             "aliases": [],
@@ -1966,6 +1982,14 @@
           {
             "long": "help",
             "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "json",
+            "short": null,
             "aliases": [],
             "global": false,
             "hidden": false,

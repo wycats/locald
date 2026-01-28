@@ -1,6 +1,10 @@
-use locald_core::config::{HealthCheckConfig, ProbeType, ServiceConfig};
+use locald_core::config::{
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_TIMEOUT_SECS, HealthCheckConfig,
+    ProbeType, ServiceConfig,
+};
 use locald_core::state::{HealthSource, HealthStatus};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -34,37 +38,46 @@ impl HealthMonitor {
         _container_id: Option<String>,
         cwd: Option<std::path::PathBuf>,
     ) {
+        let default_interval = Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
+        let default_timeout = Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS);
+
         // Spawn port mismatch detector if we have a PID and an expected port
         if let (Some(pid), Some(expected_port)) = (pid, port) {
             self.spawn_port_mismatch_monitor(name.clone(), pid, expected_port);
         }
 
         if let Some(hc) = config.health_check() {
+            let (interval, timeout) = match hc {
+                HealthCheckConfig::Command(_) => (default_interval, default_timeout),
+                HealthCheckConfig::Probe(probe) => {
+                    (probe.interval_duration(), probe.timeout_duration())
+                }
+            };
             match hc {
                 HealthCheckConfig::Command(cmd) => {
-                    self.spawn_command_monitor(name, cmd.clone(), cwd);
+                    self.spawn_command_monitor(name, cmd.clone(), cwd, interval, timeout);
                 }
                 HealthCheckConfig::Probe(probe) => match probe.kind {
                     ProbeType::Http => {
                         if let Some(p) = port {
                             let path = probe.path.as_deref().unwrap_or("/");
-                            self.spawn_http_monitor(name, p, path.to_string());
+                            self.spawn_http_monitor(name, p, path.to_string(), interval, timeout);
                         }
                     }
                     ProbeType::Tcp => {
                         if let Some(p) = port {
-                            self.spawn_tcp_monitor(name, p);
+                            self.spawn_tcp_monitor(name, p, interval, timeout);
                         }
                     }
                     ProbeType::Command => {
                         if let Some(cmd) = &probe.command {
-                            self.spawn_command_monitor(name, cmd.clone(), cwd);
+                            self.spawn_command_monitor(name, cmd.clone(), cwd, interval, timeout);
                         }
                     }
                 },
             }
         } else if let Some(p) = port {
-            self.spawn_tcp_monitor(name, p);
+            self.spawn_tcp_monitor(name, p, default_interval, default_timeout);
         }
     }
 
@@ -292,7 +305,14 @@ impl HealthMonitor {
         }
     }
 
-    fn spawn_http_monitor(&self, name: String, port: u16, path: String) {
+    fn spawn_http_monitor(
+        &self,
+        name: String,
+        port: u16,
+        path: String,
+        interval: Duration,
+        timeout: Duration,
+    ) {
         let monitor = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -309,13 +329,13 @@ impl HealthMonitor {
                         break;
                     }
                 }
-                if locald_utils::probe::check_http(&url).await {
+                if locald_utils::probe::check_http(&url, timeout).await {
                     monitor
                         .update_health(&name, HealthStatus::Healthy, HealthSource::Http)
                         .await;
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }
@@ -325,6 +345,8 @@ impl HealthMonitor {
         name: String,
         command: String,
         cwd: Option<std::path::PathBuf>,
+        interval: Duration,
+        timeout: Duration,
     ) {
         let monitor = self.clone();
 
@@ -343,7 +365,8 @@ impl HealthMonitor {
                     }
                 }
 
-                let success = locald_utils::probe::check_command(&command, cwd.as_deref()).await;
+                let success =
+                    locald_utils::probe::check_command(&command, cwd.as_deref(), timeout).await;
 
                 if success {
                     monitor
@@ -352,12 +375,18 @@ impl HealthMonitor {
                     break;
                 }
 
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }
 
-    fn spawn_tcp_monitor(&self, name: String, assigned_port: u16) {
+    fn spawn_tcp_monitor(
+        &self,
+        name: String,
+        assigned_port: u16,
+        interval: Duration,
+        timeout: Duration,
+    ) {
         info!(
             "Starting TCP monitor for {} on port {}",
             name, assigned_port
@@ -391,7 +420,8 @@ impl HealthMonitor {
 
                 info!("About to probe {} on {}", name, assigned_port);
                 let result =
-                    locald_utils::probe::check_tcp(&format!("127.0.0.1:{assigned_port}")).await;
+                    locald_utils::probe::check_tcp(&format!("127.0.0.1:{assigned_port}"), timeout)
+                        .await;
                 info!(
                     "Probing {} on {}... Success: {}",
                     name, assigned_port, result
@@ -417,7 +447,7 @@ impl HealthMonitor {
                     }
                 }
 
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }
