@@ -458,14 +458,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             if *json {
-                if actions.len() == 1 {
-                    let json = serde_json::to_string_pretty(&actions[0])?;
-                    println!("{json}");
-                } else {
-                    let json =
-                        serde_json::to_string_pretty(&JsonServiceActions { services: actions })?;
-                    println!("{json}");
-                }
+                let json = serde_json::to_string_pretty(&JsonServiceActions { services: actions })?;
+                println!("{json}");
             }
         }
         Commands::Restart { name, json } => {
@@ -490,9 +484,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }) {
                 Ok(IpcResponse::Ok) => {
                     if *json {
-                        let response = JsonServiceAction {
-                            service: full_name,
-                            status: "restarted".to_string(),
+                        let response = JsonServiceActions {
+                            services: vec![JsonServiceAction {
+                                service: full_name,
+                                status: "restarted".to_string(),
+                            }],
                         };
                         let json = serde_json::to_string_pretty(&response)?;
                         println!("{json}");
