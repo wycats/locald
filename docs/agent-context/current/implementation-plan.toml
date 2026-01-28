@@ -2,8 +2,8 @@
 # Implementation Plan
 
 [phase]
-id = "59"
-title = "Systematic Investigation Protocol"
+id = "phase-32"
+title = "Phase 32: Systematic Investigation Protocol"
 rfcs = ["0066"]
 
 [plan]
