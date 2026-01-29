@@ -125,7 +125,7 @@ impl ServiceFactory for PostgresFactory {
         &self,
         name: String,
         config: &ServiceConfig,
-        _ctx: &ServiceContext,
+        ctx: &ServiceContext,
     ) -> Arc<Mutex<dyn ServiceController>> {
         if let ServiceConfig::Typed(TypedServiceConfig::Postgres(pg_config)) = config {
             // We need data_dir.
@@ -133,17 +133,16 @@ impl ServiceFactory for PostgresFactory {
                 .map(|d| d.data_dir().join("postgres").join(&name))
                 .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(&name));
 
+            // Use port from: 1) config, 2) context (allocated by manager), 3) fallback to 5432
+            let port = pg_config.common.port.or(ctx.port).unwrap_or(5432);
+
             let runner = Arc::new(PostgresRunner::new(
                 name.clone(),
                 pg_config
                     .version
                     .clone()
                     .unwrap_or_else(|| "15".to_string()),
-                pg_config.common.port.unwrap_or_else(|| {
-                    std::net::TcpListener::bind("127.0.0.1:0")
-                        .map(|l| l.local_addr().unwrap().port())
-                        .unwrap_or(5432)
-                }),
+                port,
                 data_dir,
             ));
 

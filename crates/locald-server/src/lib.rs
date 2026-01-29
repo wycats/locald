@@ -90,6 +90,8 @@ pub mod manager;
 #[doc(hidden)]
 pub mod plugins;
 #[doc(hidden)]
+pub mod port_allocator;
+#[doc(hidden)]
 // pub mod notify; // Moved to locald-utils
 #[doc(hidden)]
 pub mod proxy;

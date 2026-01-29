@@ -3,6 +3,7 @@
 use crate::config_loader::ConfigLoader;
 use crate::health::HealthMonitor;
 use crate::plugins;
+use crate::port_allocator::PortAllocator;
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
@@ -256,6 +257,7 @@ pub struct ProcessManager {
     factories: Vec<Arc<dyn ServiceFactory>>,
     hosts_sync_guard: ConcurrencyGuard,
     host_syncer: Arc<dyn HostSyncer>,
+    port_allocator: PortAllocator,
 }
 
 impl ProcessManager {
@@ -328,6 +330,7 @@ impl ProcessManager {
             factories,
             hosts_sync_guard: ConcurrencyGuard::new(),
             host_syncer: Arc::new(DefaultHostSyncer),
+            port_allocator: PortAllocator::new(),
         })
     }
 
@@ -1065,33 +1068,37 @@ impl ProcessManager {
             );
 
             // Find free port or use configured port
+            // Use PortGuard to prevent race conditions between parallel service starts
 
-            let port = if !needs_port {
-                None
-            } else if let Some(p) = service_config.port() {
-                Some(p)
-            } else {
-                // Check for sticky port
-                let sticky = {
-                    let services = self.services.lock().await;
-                    services.get(&name).and_then(|s| s.sticky_port)
-                };
-
-                if let Some(p) = sticky {
-                    // Try to bind to sticky port to ensure it's free
-                    if std::net::TcpListener::bind(format!("127.0.0.1:{p}")).is_ok() {
-                        info!("Reusing sticky port {p} for service {name}");
-                        Some(p)
-                    } else {
-                        warn!("Sticky port {p} for service {name} is taken, assigning new port");
-                        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-                        Some(listener.local_addr()?.port())
-                    }
+            let (port, mut port_guard): (Option<u16>, Option<crate::port_allocator::PortGuard>) =
+                if !needs_port {
+                    (None, None)
+                } else if let Some(p) = service_config.port() {
+                    (Some(p), None)
                 } else {
-                    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    Some(listener.local_addr()?.port())
-                }
-            };
+                    // Check for sticky port
+                    let sticky = {
+                        let services = self.services.lock().await;
+                        services.get(&name).and_then(|s| s.sticky_port)
+                    };
+
+                    if let Some(p) = sticky {
+                        // Try to bind to sticky port to ensure it's free
+                        if let Some(guard) = self.port_allocator.try_allocate_specific(p) {
+                            info!("Reusing sticky port {p} for service {name}");
+                            (Some(p), Some(guard))
+                        } else {
+                            warn!(
+                                "Sticky port {p} for service {name} is taken, assigning new port"
+                            );
+                            let guard = self.port_allocator.allocate()?;
+                            (Some(guard.port()), Some(guard))
+                        }
+                    } else {
+                        let guard = self.port_allocator.allocate()?;
+                        (Some(guard.port()), Some(guard))
+                    }
+                };
 
             info!("Starting service {name} on port {:?}", port);
 
@@ -1113,6 +1120,15 @@ impl ProcessManager {
                         port,
                         env: resolved_env.clone(),
                     };
+
+                    // Release the port guard's listener so the service can bind.
+                    // The guard stays alive (preventing re-allocation) until we're done.
+                    if let Some(ref mut guard) = port_guard {
+                        guard.release_listener();
+                    }
+                    // Drop the guard after releasing listener - removes port from pending set
+                    drop(port_guard.take());
+
                     let controller = factory.create(name.clone(), service_config, &ctx);
 
                     // Hook up logs immediately so we catch build logs

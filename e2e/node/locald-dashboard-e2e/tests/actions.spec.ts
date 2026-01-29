@@ -8,7 +8,7 @@ test("can start and stop services", async ({ page, locald }) => {
   await expect(page.locator("body")).toHaveAttribute(
     "data-sse-connected",
     "true",
-    { timeout: 10000 }
+    { timeout: 10000 },
   );
 
   // 2. Register dummy service

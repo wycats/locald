@@ -207,7 +207,7 @@ test.describe("StatusDot Component", () => {
     const moreBtn = rackItem.getByRole("button", { name: "More" });
     await expect(moreBtn).toBeVisible();
     await moreBtn.click();
-    
+
     // Click Stop in dropdown
     const stopMenuItem = page.locator(".menu-dropdown").getByText("Stop");
     await stopMenuItem.click();
