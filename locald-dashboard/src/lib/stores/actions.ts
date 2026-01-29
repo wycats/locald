@@ -1,6 +1,6 @@
 import { writable, derived } from 'svelte/store';
 
-export type ActionType = 'start' | 'stop' | 'restart';
+export type ActionType = 'start' | 'stop' | 'restart' | 'reset';
 
 interface PendingAction {
 	serviceName: string;

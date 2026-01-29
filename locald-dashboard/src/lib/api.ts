@@ -29,6 +29,13 @@ export async function restartService(name: string): Promise<void> {
 	}
 }
 
+export async function resetService(name: string): Promise<void> {
+	const res = await fetch(`/api/services/${name}/reset`, { method: 'POST' });
+	if (!res.ok) {
+		throw new Error(`Failed to reset service ${name}`);
+	}
+}
+
 export async function stopAllServices(): Promise<void> {
 	const res = await fetch('/api/services/stop-all', { method: 'POST' });
 	if (!res.ok) {

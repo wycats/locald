@@ -1,4 +1,4 @@
-import { startService, stopService, restartService } from '$lib/api';
+import { startService, stopService, restartService, resetService } from '$lib/api';
 import { pendingActions } from '$lib/stores/actions';
 import { toasts } from '$lib/stores/toasts';
 
@@ -41,5 +41,23 @@ export async function restartServiceWithFeedback(name: string): Promise<boolean>
 		return false;
 	} finally {
 		pendingActions.finish(name, 'restart');
+	}
+}
+
+export async function resetServiceWithFeedback(name: string): Promise<boolean> {
+	if (!confirm(`Reset "${name}"? This will stop the service and wipe all its data.`)) {
+		return false;
+	}
+
+	pendingActions.start(name, 'reset');
+	try {
+		await resetService(name);
+		toasts.success(`Reset ${name}`);
+		return true;
+	} catch (e) {
+		toasts.error(`Failed to reset ${name}: ${e instanceof Error ? e.message : String(e)}`);
+		return false;
+	} finally {
+		pendingActions.finish(name, 'reset');
 	}
 }

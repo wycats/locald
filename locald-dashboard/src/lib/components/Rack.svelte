@@ -5,7 +5,8 @@
 	import {
 		startServiceWithFeedback,
 		stopServiceWithFeedback,
-		restartServiceWithFeedback
+		restartServiceWithFeedback,
+		resetServiceWithFeedback
 	} from '$lib/actions/service';
 	import {
 		Activity,
@@ -16,6 +17,7 @@
 		MoreHorizontal,
 		Monitor,
 		RefreshCw,
+		RotateCcw,
 		ExternalLink,
 		Loader2
 	} from 'lucide-svelte';
@@ -300,6 +302,18 @@
 													<span>Port: {service.port || '-'}</span>
 												</div>
 												<div class="menu-separator"></div>
+												<button
+													class="menu-action danger"
+													disabled={isPending(service.name)}
+													on:click={() => resetServiceWithFeedback(service.name)}
+												>
+													{#if isPending(service.name)}
+														<Loader2 size={12} class="spin" />
+													{:else}
+														<RotateCcw size={12} />
+													{/if}
+													Reset
+												</button>
 												<button
 													class="menu-action danger"
 													disabled={isPending(service.name)}
