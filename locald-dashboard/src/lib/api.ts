@@ -1,4 +1,5 @@
 import type { ServiceStatus } from './types';
+import { connection } from '$lib/stores/connection';
 
 export async function getServices(): Promise<ServiceStatus[]> {
 	const res = await fetch('/api/state');
@@ -61,8 +62,15 @@ export async function getServiceInspect(name: string): Promise<unknown> {
 	return res.json();
 }
 
-export function connectEvents() {
-	const eventSource = new EventSource('/api/events');
+let eventSource: EventSource | null = null;
+
+function openEventSource() {
+	connection.setConnecting();
+	if (eventSource) {
+		eventSource.close();
+	}
+
+	eventSource = new EventSource('/api/events');
 
 	eventSource.onmessage = (event) => {
 		try {
@@ -80,6 +88,7 @@ export function connectEvents() {
 
 	eventSource.onopen = () => {
 		console.log('EventSource connected');
+		connection.setConnected();
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'true');
 		}
@@ -87,12 +96,24 @@ export function connectEvents() {
 
 	eventSource.onerror = (e) => {
 		console.error('EventSource error', e);
+		connection.setDisconnected();
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'false');
 		}
 	};
+}
+
+export function connectEvents() {
+	openEventSource();
 
 	return () => {
-		eventSource.close();
+		if (eventSource) {
+			eventSource.close();
+			eventSource = null;
+		}
 	};
+}
+
+export function reconnect() {
+	openEventSource();
 }
