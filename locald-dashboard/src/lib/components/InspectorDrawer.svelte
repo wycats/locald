@@ -10,6 +10,7 @@
 	} from 'lucide-svelte';
 	import { getServiceInspect } from '$lib/api';
 	import type { ServiceInspectResponse } from '$lib/types';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import Terminal from './Terminal.svelte';
 	import InteractiveTerminal from './InteractiveTerminal.svelte';
 
@@ -77,7 +78,7 @@
 								<button
 									class="copy-btn"
 									onclick={() =>
-										info?.connection_url && navigator.clipboard.writeText(info.connection_url)}
+										info?.connection_url && copyToClipboard(info.connection_url, 'connection URL')}
 								>
 									{info.connection_url}
 								</button>
@@ -132,7 +133,8 @@
 						<button
 							class="copy-btn"
 							title="Container ID (click to copy)"
-							onclick={() => info?.container_id && navigator.clipboard.writeText(info.container_id)}
+							onclick={() =>
+								info?.container_id && copyToClipboard(info.container_id, 'container ID')}
 						>
 							{info.container_id.slice(0, 12)}
 						</button>
