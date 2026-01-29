@@ -64,9 +64,18 @@
 	}
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="card" onclick={onSelect}>
+<div
+	class="card"
+	onclick={onSelect}
+	onkeydown={(e) => {
+		if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+			e.preventDefault();
+			onSelect();
+		}
+	}}
+	role="button"
+	tabindex="0"
+>
 	<div class="header">
 		<div class="title">
 			<span
@@ -154,6 +163,10 @@
 
 	.card:hover {
 		border-color: #3f3f46; /* Zinc-700 */
+	}
+	.card:focus-visible {
+		outline: 2px solid #3b82f6; /* Blue-500 */
+		outline-offset: 2px;
 	}
 
 	.header {
@@ -283,6 +296,10 @@
 		background: #27272a; /* Zinc-800 */
 		color: #e4e4e7; /* Zinc-200 */
 		border-color: #3f3f46; /* Zinc-700 */
+	}
+	button:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
 	}
 	button.config-btn {
 		border: none;

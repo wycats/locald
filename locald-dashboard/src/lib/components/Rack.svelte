@@ -184,6 +184,7 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
+<!-- a11y: Click-to-close has keyboard alternative via Escape key in handleKeydown -->
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
 <div class="rack" on:click={closeMenu} role="application">
@@ -220,17 +221,19 @@
 				{@const isCollapsed = collapsedGroups.includes(project.name)}
 				{@const isAllStopped = project.services.every((s) => s.status === 'stopped')}
 
-				<!-- svelte-ignore a11y-click-events-have-key-events -->
-				<!-- svelte-ignore a11y-no-static-element-interactions -->
 				<div class="rack-group-header" class:disabled={isAllStopped}>
-					<div class="group-title" on:click={() => toggleGroupCollapse(project.name)}>
+					<button
+						class="group-title"
+						type="button"
+						on:click={() => toggleGroupCollapse(project.name)}
+					>
 						{#if isCollapsed}
 							<ChevronRight size={12} />
 						{:else}
 							<ChevronDown size={12} />
 						{/if}
 						<span>{project.name}</span>
-					</div>
+					</button>
 					<div class="group-actions">
 						<button
 							class="group-btn"
@@ -254,8 +257,6 @@
 						{@const type = getServiceType(service)}
 						{@const displayName = getDisplayName(service.name, project.name)}
 
-						<!-- svelte-ignore a11y-click-events-have-key-events -->
-						<!-- svelte-ignore a11y-no-static-element-interactions -->
 						<div
 							id="service-{service.name}"
 							class="rack-item"
@@ -263,6 +264,14 @@
 							class:focused={focused === service.name}
 							class:disabled={service.status === 'stopped'}
 							on:click={() => toggleMonitor(service.name)}
+							on:keydown={(e) => {
+								if (e.key === 'Enter' || e.key === ' ') {
+									e.preventDefault();
+									toggleMonitor(service.name);
+								}
+							}}
+							role="button"
+							tabindex="0"
 						>
 							<!-- Layer 1: Content (Left Group) -->
 							<div class="item-content">
@@ -319,9 +328,13 @@
 												<MoreHorizontal size={14} />
 											</button>
 											{#if activeMenu === service.name}
-												<!-- svelte-ignore a11y-click-events-have-key-events -->
-												<!-- svelte-ignore a11y-no-static-element-interactions -->
-												<div class="menu-dropdown" on:click={(e) => e.stopPropagation()}>
+												<!-- Menu container only stops event propagation -->
+												<div
+													class="menu-dropdown"
+													on:click={(e) => e.stopPropagation()}
+													role="menu"
+													tabindex="-1"
+												>
 													<div class="menu-item info">
 														<span>PID: {service.pid || '-'}</span>
 														<span>Port: {service.port || '-'}</span>
@@ -529,6 +542,17 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
+		background: none;
+		border: none;
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+		padding: 0;
+	}
+	.group-title:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
+		border-radius: 4px;
 	}
 
 	.group-actions {
@@ -549,6 +573,11 @@
 		padding: 2px;
 	}
 	.group-btn:hover {
+		color: #fff;
+	}
+	.group-btn:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
 		color: #fff;
 	}
 
@@ -576,6 +605,11 @@
 
 	.rack-item:hover {
 		--row-bg: #18181b; /* Zinc-900 (Approx match for 5% white overlay) */
+	}
+	.rack-item:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+		--row-bg: #18181b;
 	}
 
 	.rack-item.monitored {
@@ -763,6 +797,10 @@
 		color: #e4e4e7;
 		background: rgba(255, 255, 255, 0.05);
 	}
+	.control-btn:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
+	}
 
 	/* Monitor Icon Active State - The "Blue Glow" */
 	.monitor-btn.active {
@@ -845,10 +883,18 @@
 	.menu-action:hover {
 		background: #27272a;
 	}
+	.menu-action:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+		background: #27272a;
+	}
 	.menu-action.danger {
 		color: #ef4444;
 	}
 	.menu-action.danger:hover {
+		background: #ef444422;
+	}
+	.menu-action.danger:focus-visible {
 		background: #ef444422;
 	}
 
@@ -860,6 +906,11 @@
 		transition: background 0.2s;
 	}
 	.rack-footer:hover {
+		background: rgba(255, 255, 255, 0.05);
+	}
+	.rack-footer:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
 		background: rgba(255, 255, 255, 0.05);
 	}
 	.rack-footer.active {

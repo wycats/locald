@@ -85,9 +85,18 @@
 		</button>
 		{#each project.services as service (service.name)}
 			{@const pending = isPending(service.name)}
-			<!-- svelte-ignore a11y_click_events_have_key_events -->
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="nav-item sub-item sidebar-item" onclick={() => onInspect(service.name)}>
+			<div
+				class="nav-item sub-item sidebar-item"
+				onclick={() => onInspect(service.name)}
+				onkeydown={(e) => {
+					if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+						e.preventDefault();
+						onInspect(service.name);
+					}
+				}}
+				role="button"
+				tabindex="0"
+			>
 				<div class="service-info">
 					<span
 						class="status-dot"
@@ -282,6 +291,11 @@
 		background: rgba(255, 255, 255, 0.05); /* bg-white/5 */
 		color: #e4e4e7; /* Zinc-200 */
 	}
+	.nav-item:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+		background: rgba(255, 255, 255, 0.05);
+	}
 
 	.nav-item.selected {
 		background: #27272a; /* Zinc-800 */
@@ -312,6 +326,10 @@
 	.sub-item:hover {
 		background: rgba(255, 255, 255, 0.05); /* bg-white/5 */
 		color: #e4e4e7; /* Zinc-200 */
+	}
+	.sidebar-item:focus-visible {
+		outline: 2px solid #3b82f6; /* Blue-500 */
+		outline-offset: 2px;
 	}
 
 	.service-info {
@@ -376,6 +394,16 @@
 	.sidebar-actions a:hover {
 		background: #3f3f46; /* Zinc-700 */
 		color: #e4e4e7; /* Zinc-200 */
+	}
+	.sidebar-actions button:focus-visible,
+	.sidebar-actions a:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
+	}
+
+	.global-controls button:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
 	}
 
 	.section-divider {
