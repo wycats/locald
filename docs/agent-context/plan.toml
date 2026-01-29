@@ -417,6 +417,7 @@ status = "completed"
 ulid = "01KEX4X98Z0RDREF382K6Q4MY4"
 slug = "E3"
 aliases = ["E3"]
+reviewed = true
 
 [[epochs.phases]]
 id = "phase-12"
@@ -539,6 +540,7 @@ status = "completed"
 ulid = "01KEX4X98ZADAXF8RJ92PFBGGF"
 slug = "E5"
 aliases = ["E5"]
+reviewed = true
 
 [[epochs.phases]]
 id = "phase-15"
@@ -1243,6 +1245,42 @@ status = "complete"
 ulid = "01KEX4X98Z41R5EDKE3ZXQSHKC"
 slug = "59.2"
 aliases = ["59.2"]
+
+[[epochs.phases]]
+id = "phase-ux-polish"
+title = "UX Polish: User-Visible Improvements"
+status = "pending"
+rfcs = ["0146"]
+
+[[epochs.phases.tasks]]
+id = "ux.1"
+label = "Service Status API: Add service_type and connection_url fields to status response"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "ux.2"
+label = "Postgres Env Injection: Auto-inject DATABASE_URL for services depending on Postgres"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "ux.3"
+label = "Dashboard Accuracy: Display actual service types and connection info from status API"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "ux.4"
+label = "CLI Error Standardization: Migrate all commands to use CliError consistently"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "ux.5"
+label = "CLI Documentation: Sync docs/manual/cli.md with actual command surface"
+status = "pending"
+
+[[epochs.phases.tasks]]
+id = "ux.6"
+label = "Add Postgres Command: Implement locald add postgres variant"
+status = "pending"
 
 [[epochs.phases]]
 id = "phase-33"
