@@ -60,6 +60,16 @@
 								<span>{info.url}</span>
 							</a>
 						{/if}
+						{#if info.connection_url}
+							<span class="pill connection-url" title="Connection URL (click to copy)">
+								<button
+									class="copy-btn"
+									onclick={() => navigator.clipboard.writeText(info?.connection_url as string)}
+								>
+									{info.connection_url}
+								</button>
+							</span>
+						{/if}
 					</div>
 				{/if}
 			</div>
@@ -202,6 +212,27 @@
 	}
 	.pill.link:hover {
 		background: #3d3d3d;
+		color: #fff;
+	}
+
+	.pill.connection-url {
+		background: #2d2d2d;
+		border: 1px solid #444;
+		font-family: monospace;
+		font-size: 0.75rem;
+	}
+
+	.pill.connection-url .copy-btn {
+		background: transparent;
+		border: none;
+		color: inherit;
+		font-family: inherit;
+		font-size: inherit;
+		cursor: pointer;
+		padding: 0;
+	}
+
+	.pill.connection-url .copy-btn:hover {
 		color: #fff;
 	}
 

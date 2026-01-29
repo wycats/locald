@@ -132,6 +132,27 @@
 	}
 
 	function getServiceType(service: ServiceStatus): string {
+		// Use the actual service_type from the API if available
+		if (service.service_type) {
+			switch (service.service_type) {
+				case 'postgres':
+					return 'db';
+				case 'container':
+					// Check if it's a cache-like container (redis, memcached, etc.)
+					if (service.name.includes('redis') || service.name.includes('cache')) {
+						return 'cache';
+					}
+					return 'container';
+				case 'worker':
+					return 'worker';
+				case 'site':
+					return 'site';
+				case 'exec':
+				default:
+					return service.port ? 'web' : 'worker';
+			}
+		}
+		// Fallback heuristics for older API responses
 		if (service.name.includes('db') || service.name.includes('postgres')) return 'db';
 		if (service.name.includes('redis') || service.name.includes('cache')) return 'cache';
 		if (service.port) return 'web';
