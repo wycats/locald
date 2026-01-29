@@ -10,7 +10,7 @@ Commands:
   init         Initialize a new locald project
   try          Experiment with a command (attached). On exit, prompts to save to locald.toml
   run          Run a one-off task in the context of a service (with injected environment)
-  add          Add a service to locald.toml (shortcut for `locald service add exec`)
+  add          Add a service to locald.toml
   service      Manage services
   monitor      Monitor running services (TUI)
   ping         Ping the locald daemon
