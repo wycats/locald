@@ -3,6 +3,7 @@
 use crate::config_loader::ConfigLoader;
 use crate::health::HealthMonitor;
 use crate::plugins;
+use crate::port_allocator::PortAllocator;
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
@@ -256,6 +257,7 @@ pub struct ProcessManager {
     factories: Vec<Arc<dyn ServiceFactory>>,
     hosts_sync_guard: ConcurrencyGuard,
     host_syncer: Arc<dyn HostSyncer>,
+    port_allocator: PortAllocator,
 }
 
 impl ProcessManager {
@@ -328,6 +330,7 @@ impl ProcessManager {
             factories,
             hosts_sync_guard: ConcurrencyGuard::new(),
             host_syncer: Arc::new(DefaultHostSyncer),
+            port_allocator: PortAllocator::new(),
         })
     }
 
@@ -350,6 +353,8 @@ impl ProcessManager {
         constellation: Option<String>,
         warnings: Vec<String>,
     ) -> ServiceStatus {
+        use locald_core::ipc::ServiceType;
+
         let (status, pid, port) = match snapshot {
             RuntimeSnapshot::Static {
                 is_running,
@@ -370,6 +375,10 @@ impl ProcessManager {
             }
         };
 
+        // Determine service type from config
+        let service_type = service_config.map(ServiceType::from).unwrap_or_default();
+
+        // Compute the public URL (domain-based or localhost)
         let url = if status == locald_core::state::ServiceState::Running && port.is_some() {
             if let Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) = service_config {
                 None
@@ -401,12 +410,26 @@ impl ProcessManager {
             None
         };
 
+        // Compute the connection URL (raw connection string)
+        let connection_url = if status == locald_core::state::ServiceState::Running {
+            match service_config {
+                Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) => {
+                    port.map(|p| format!("postgres://postgres@localhost:{p}/postgres"))
+                }
+                _ => port.map(|p| format!("http://localhost:{p}")),
+            }
+        } else {
+            None
+        };
+
         ServiceStatus {
             name: name.clone(),
+            service_type,
             pid,
             port,
             status,
             url,
+            connection_url,
             health_status,
             health_source,
             path,
@@ -910,8 +933,20 @@ impl ProcessManager {
 
         // Apply plugins to configuration
         // Plugin discovery and application failures are logged but do not fail startup
-        if let Err(e) = plugins::apply_plugins_to_config(&mut config, &path) {
-            warn!("Plugin processing failed: {}", e);
+        // The returned guards keep plugin-allocated ports reserved until services bind
+        let mut plugin_port_guards =
+            match plugins::apply_plugins_to_config(&mut config, &path, &self.port_allocator) {
+                Ok(guards) => guards,
+                Err(e) => {
+                    warn!("Plugin processing failed: {}", e);
+                    Vec::new()
+                }
+            };
+
+        // Release plugin guard listeners so services can bind to their allocated ports.
+        // Guards still track ports as pending until they drop at end of scope.
+        for guard in &mut plugin_port_guards {
+            guard.release_listener();
         }
 
         if let Some(tx) = &event_tx {
@@ -957,6 +992,31 @@ impl ProcessManager {
             let mut combined_env = dot_env_vars.clone();
             for (k, v) in service_config.env() {
                 combined_env.insert(k.clone(), v.clone());
+            }
+
+            // Auto-inject DATABASE_URL for services that depend on Postgres
+            if !combined_env.contains_key("DATABASE_URL") {
+                for dep in service_config.depends_on() {
+                    if let Some(dep_config) = config.services.get(dep) {
+                        if matches!(
+                            dep_config,
+                            ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+                        ) {
+                            // Use interpolation syntax so it resolves at runtime
+                            // Use the local service name (without project prefix) because
+                            // resolve_env adds the project prefix when looking up services
+                            combined_env.insert(
+                                "DATABASE_URL".to_string(),
+                                format!("${{services.{}.url}}", dep),
+                            );
+                            info!(
+                                "Auto-injected DATABASE_URL for {} from Postgres dependency {}",
+                                name, dep
+                            );
+                            break; // Only inject from first Postgres dependency
+                        }
+                    }
+                }
             }
 
             let manager = self.clone();
@@ -1020,33 +1080,37 @@ impl ProcessManager {
             );
 
             // Find free port or use configured port
+            // Use PortGuard to prevent race conditions between parallel service starts
 
-            let port = if !needs_port {
-                None
-            } else if let Some(p) = service_config.port() {
-                Some(p)
-            } else {
-                // Check for sticky port
-                let sticky = {
-                    let services = self.services.lock().await;
-                    services.get(&name).and_then(|s| s.sticky_port)
-                };
-
-                if let Some(p) = sticky {
-                    // Try to bind to sticky port to ensure it's free
-                    if std::net::TcpListener::bind(format!("127.0.0.1:{p}")).is_ok() {
-                        info!("Reusing sticky port {p} for service {name}");
-                        Some(p)
-                    } else {
-                        warn!("Sticky port {p} for service {name} is taken, assigning new port");
-                        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-                        Some(listener.local_addr()?.port())
-                    }
+            let (port, mut port_guard): (Option<u16>, Option<crate::port_allocator::PortGuard>) =
+                if !needs_port {
+                    (None, None)
+                } else if let Some(p) = service_config.port() {
+                    (Some(p), None)
                 } else {
-                    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    Some(listener.local_addr()?.port())
-                }
-            };
+                    // Check for sticky port
+                    let sticky = {
+                        let services = self.services.lock().await;
+                        services.get(&name).and_then(|s| s.sticky_port)
+                    };
+
+                    if let Some(p) = sticky {
+                        // Try to bind to sticky port to ensure it's free
+                        if let Some(guard) = self.port_allocator.try_allocate_specific(p) {
+                            info!("Reusing sticky port {p} for service {name}");
+                            (Some(p), Some(guard))
+                        } else {
+                            warn!(
+                                "Sticky port {p} for service {name} is taken, assigning new port"
+                            );
+                            let guard = self.port_allocator.allocate()?;
+                            (Some(guard.port()), Some(guard))
+                        }
+                    } else {
+                        let guard = self.port_allocator.allocate()?;
+                        (Some(guard.port()), Some(guard))
+                    }
+                };
 
             info!("Starting service {name} on port {:?}", port);
 
@@ -1068,6 +1132,13 @@ impl ProcessManager {
                         port,
                         env: resolved_env.clone(),
                     };
+
+                    // Release the port guard's listener so the service can bind.
+                    // The guard stays alive (preventing re-allocation) until we're done.
+                    if let Some(ref mut guard) = port_guard {
+                        guard.release_listener();
+                    }
+
                     let controller = factory.create(name.clone(), service_config, &ctx);
 
                     // Hook up logs immediately so we catch build logs
@@ -1600,6 +1671,26 @@ impl ProcessManager {
 
         if let Some(p) = port.or(sticky_port) {
             combined_env.insert("PORT".to_string(), p.to_string());
+        }
+
+        // Auto-inject DATABASE_URL for services that depend on Postgres
+        // (mirrors the logic in start_project)
+        if !combined_env.contains_key("DATABASE_URL") {
+            for dep in service_config.depends_on() {
+                if let Some(dep_config) = config.services.get(dep) {
+                    if matches!(
+                        dep_config,
+                        ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+                    ) {
+                        // Use local service name - resolve_env adds the project prefix
+                        combined_env.insert(
+                            "DATABASE_URL".to_string(),
+                            format!("${{services.{}.url}}", dep),
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         let manager = self.clone();

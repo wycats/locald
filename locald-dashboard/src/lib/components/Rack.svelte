@@ -1,7 +1,13 @@
 <script lang="ts">
 	/* eslint-disable svelte/no-navigation-without-resolve */
-	import { projects } from '$lib/stores/services';
-	import { startService, stopService, restartService } from '$lib/api';
+	import { projects, services, servicesError, servicesLoading } from '$lib/stores/services';
+	import { pendingActions } from '$lib/stores/actions';
+	import {
+		startServiceWithFeedback,
+		stopServiceWithFeedback,
+		restartServiceWithFeedback,
+		resetServiceWithFeedback
+	} from '$lib/actions/service';
 	import {
 		Activity,
 		Layers,
@@ -11,9 +17,12 @@
 		MoreHorizontal,
 		Monitor,
 		RefreshCw,
-		ExternalLink
+		RotateCcw,
+		ExternalLink,
+		AlertCircle
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
+	import Spinner from './Spinner.svelte';
 
 	export let monitored: string[] = [];
 
@@ -100,18 +109,18 @@
 		activeMenu = null;
 	}
 
+	function isPending(serviceName: string): boolean {
+		return $pendingActions.some((a) => a.serviceName === serviceName);
+	}
+
 	async function toggleGroup(groupServices: ServiceStatus[]) {
 		const allStopped = groupServices.every((s) => s.status === 'stopped');
-		try {
-			await Promise.all(
-				groupServices.map((s) => {
-					if (allStopped) return startService(s.name);
-					return stopService(s.name);
-				})
-			);
-		} catch (e) {
-			console.error(e);
-		}
+		await Promise.all(
+			groupServices.map((s) => {
+				if (allStopped) return startServiceWithFeedback(s.name);
+				return stopServiceWithFeedback(s.name);
+			})
+		);
 	}
 
 	function toggleGroupCollapse(group: string) {
@@ -132,6 +141,27 @@
 	}
 
 	function getServiceType(service: ServiceStatus): string {
+		// Use the actual service_type from the API if available
+		if (service.service_type) {
+			switch (service.service_type) {
+				case 'postgres':
+					return 'db';
+				case 'container':
+					// Check if it's a cache-like container (redis, memcached, etc.)
+					if (service.name.includes('redis') || service.name.includes('cache')) {
+						return 'cache';
+					}
+					return 'container';
+				case 'worker':
+					return 'worker';
+				case 'site':
+					return 'site';
+				case 'exec':
+				default:
+					return service.port ? 'web' : 'worker';
+			}
+		}
+		// Fallback heuristics for older API responses
 		if (service.name.includes('db') || service.name.includes('postgres')) return 'db';
 		if (service.name.includes('redis') || service.name.includes('cache')) return 'cache';
 		if (service.port) return 'web';
@@ -154,6 +184,7 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
+<!-- a11y: Click-to-close has keyboard alternative via Escape key in handleKeydown -->
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
 <div class="rack" on:click={closeMenu} role="application">
@@ -162,136 +193,201 @@
 	</div>
 
 	<div class="rack-list">
-		{#each $projects as project (project.name)}
-			{@const isCollapsed = collapsedGroups.includes(project.name)}
-			{@const isAllStopped = project.services.every((s) => s.status === 'stopped')}
-
-			<!-- svelte-ignore a11y-click-events-have-key-events -->
-			<!-- svelte-ignore a11y-no-static-element-interactions -->
-			<div class="rack-group-header" class:disabled={isAllStopped}>
-				<div class="group-title" on:click={() => toggleGroupCollapse(project.name)}>
-					{#if isCollapsed}
-						<ChevronRight size={12} />
-					{:else}
-						<ChevronDown size={12} />
-					{/if}
-					<span>{project.name}</span>
-				</div>
-				<div class="group-actions">
-					<button
-						class="group-btn"
-						on:click|stopPropagation={() => toggleMonitorGroup(project.name, project.services)}
-						title="Monitor group in Deck"
-					>
-						<Layers size={12} />
-					</button>
-					<button
-						class="group-btn"
-						on:click|stopPropagation={() => toggleGroup(project.services)}
-						title={isAllStopped ? 'Start Group' : 'Stop Group'}
-					>
-						<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
-					</button>
-				</div>
+		{#if $servicesLoading && $projects.length === 0}
+			<div class="rack-state">
+				<Spinner size={24} />
+				<span class="state-title">Loading services...</span>
 			</div>
+		{:else if $servicesError}
+			<div class="rack-state error">
+				<AlertCircle size={24} />
+				<span class="state-title">Failed to load services</span>
+				<span class="state-message">{$servicesError}</span>
+				<button class="retry-btn" on:click={() => services.refresh()}>
+					<RefreshCw size={14} />
+					Retry
+				</button>
+			</div>
+		{:else if $projects.length === 0}
+			<div class="rack-state empty">
+				<Layers size={24} />
+				<span class="state-title">No services found</span>
+				<span class="state-message">
+					Run <code>locald up</code> in a project directory to start services.
+				</span>
+			</div>
+		{:else}
+			{#each $projects as project (project.name)}
+				{@const isCollapsed = collapsedGroups.includes(project.name)}
+				{@const isAllStopped = project.services.every((s) => s.status === 'stopped')}
 
-			{#if !isCollapsed}
-				{#each project.services as service (service.name)}
-					{@const type = getServiceType(service)}
-					{@const displayName = getDisplayName(service.name, project.name)}
-
-					<!-- svelte-ignore a11y-click-events-have-key-events -->
-					<!-- svelte-ignore a11y-no-static-element-interactions -->
-					<div
-						id="service-{service.name}"
-						class="rack-item"
-						class:monitored={monitored.includes(service.name)}
-						class:focused={focused === service.name}
-						class:disabled={service.status === 'stopped'}
-						on:click={() => toggleMonitor(service.name)}
+				<div class="rack-group-header" class:disabled={isAllStopped}>
+					<button
+						class="group-title"
+						type="button"
+						on:click={() => toggleGroupCollapse(project.name)}
 					>
-						<!-- Layer 1: Content (Left Group) -->
-						<div class="item-content">
-							<div class="status-dot {service.status}"></div>
-							<span class="service-name" title={service.name}>{displayName}</span>
+						{#if isCollapsed}
+							<ChevronRight size={12} />
+						{:else}
+							<ChevronDown size={12} />
+						{/if}
+						<span>{project.name}</span>
+					</button>
+					<div class="group-actions">
+						<button
+							class="group-btn"
+							on:click|stopPropagation={() => toggleMonitorGroup(project.name, project.services)}
+							title="Monitor group in Deck"
+						>
+							<Layers size={12} />
+						</button>
+						<button
+							class="group-btn"
+							on:click|stopPropagation={() => toggleGroup(project.services)}
+							title={isAllStopped ? 'Start Group' : 'Stop Group'}
+						>
+							<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
+						</button>
+					</div>
+				</div>
 
-							{#if service.url && service.status === 'running'}
-								<a
-									href={service.url}
-									target="_blank"
-									class="type-chip {type} interactive"
-									title="Open {service.url}"
-									on:click={(e) => e.stopPropagation()}
-								>
-									{type}
-									<ExternalLink size={9} />
-								</a>
-							{:else}
-								<span class="type-chip {type}">{type}</span>
-							{/if}
-						</div>
+				{#if !isCollapsed}
+					{#each project.services as service (service.name)}
+						{@const type = getServiceType(service)}
+						{@const displayName = getDisplayName(service.name, project.name)}
 
-						<!-- Layer 2: Toolbar Overlay -->
-						<div class="item-toolbar">
-							<div class="toolbar-bg"></div>
-							<div class="toolbar-actions">
-								{#if service.status === 'running'}
-									<button
-										class="control-btn monitor-btn"
-										class:active={monitored.includes(service.name)}
-										on:click={(e) => toggleMonitor(service.name, e)}
-										title="Monitor in Deck"
+						<div
+							id="service-{service.name}"
+							class="rack-item"
+							class:monitored={monitored.includes(service.name)}
+							class:focused={focused === service.name}
+							class:disabled={service.status === 'stopped'}
+							on:click={() => toggleMonitor(service.name)}
+							on:keydown={(e) => {
+								if (e.key === 'Enter' || e.key === ' ') {
+									e.preventDefault();
+									toggleMonitor(service.name);
+								}
+							}}
+							role="button"
+							tabindex="0"
+						>
+							<!-- Layer 1: Content (Left Group) -->
+							<div class="item-content">
+								<div class="status-dot {service.status}"></div>
+								<span class="service-name" title={service.name}>{displayName}</span>
+
+								{#if service.url && service.status === 'running'}
+									<a
+										href={service.url}
+										target="_blank"
+										class="type-chip {type} interactive"
+										title="Open {service.url}"
+										on:click={(e) => e.stopPropagation()}
 									>
-										<Monitor size={14} />
-									</button>
-									<button
-										class="control-btn"
-										title="Restart"
-										on:click|stopPropagation={() => restartService(service.name)}
-									>
-										<RefreshCw size={14} />
-									</button>
-									<div class="menu-wrapper">
-										<button
-											class="control-btn"
-											on:click={(e) => toggleMenu(service.name, e)}
-											title="More"
-										>
-											<MoreHorizontal size={14} />
-										</button>
-										{#if activeMenu === service.name}
-											<!-- svelte-ignore a11y-click-events-have-key-events -->
-											<!-- svelte-ignore a11y-no-static-element-interactions -->
-											<div class="menu-dropdown" on:click={(e) => e.stopPropagation()}>
-												<div class="menu-item info">
-													<span>PID: {service.pid || '-'}</span>
-													<span>Port: {service.port || '-'}</span>
-												</div>
-												<div class="menu-separator"></div>
-												<button
-													class="menu-action danger"
-													on:click={() => stopService(service.name)}
-												>
-													<Power size={12} /> Stop
-												</button>
-											</div>
-										{/if}
-									</div>
+										{type}
+										<ExternalLink size={9} />
+									</a>
 								{:else}
-									<button
-										class="control-btn power-btn"
-										on:click|stopPropagation={() => startService(service.name)}
-										title="Start"
-									>
-										<Power size={14} />
-									</button>
+									<span class="type-chip {type}">{type}</span>
 								{/if}
 							</div>
+
+							<!-- Layer 2: Toolbar Overlay -->
+							<div class="item-toolbar">
+								<div class="toolbar-bg"></div>
+								<div class="toolbar-actions">
+									{#if service.status === 'running'}
+										<button
+											class="control-btn monitor-btn"
+											class:active={monitored.includes(service.name)}
+											on:click={(e) => toggleMonitor(service.name, e)}
+											title="Monitor in Deck"
+										>
+											<Monitor size={14} />
+										</button>
+										<button
+											class="control-btn"
+											title="Restart"
+											disabled={isPending(service.name)}
+											on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
+										>
+											{#if isPending(service.name)}
+												<Spinner size={14} />
+											{:else}
+												<RefreshCw size={14} />
+											{/if}
+										</button>
+										<div class="menu-wrapper">
+											<button
+												class="control-btn"
+												on:click={(e) => toggleMenu(service.name, e)}
+												title="More"
+											>
+												<MoreHorizontal size={14} />
+											</button>
+											{#if activeMenu === service.name}
+												<!-- Menu container only stops event propagation -->
+												<div
+													class="menu-dropdown"
+													on:click={(e) => e.stopPropagation()}
+													role="menu"
+													tabindex="-1"
+												>
+													<div class="menu-item info">
+														<span>PID: {service.pid || '-'}</span>
+														<span>Port: {service.port || '-'}</span>
+													</div>
+													<div class="menu-separator"></div>
+													<button
+														class="menu-action danger"
+														disabled={isPending(service.name)}
+														on:click={() => resetServiceWithFeedback(service.name)}
+													>
+														{#if isPending(service.name)}
+															<Spinner size={12} />
+														{:else}
+															<RotateCcw size={12} />
+														{/if}
+														Reset
+													</button>
+													<button
+														class="menu-action danger"
+														disabled={isPending(service.name)}
+														on:click={() => stopServiceWithFeedback(service.name)}
+													>
+														{#if isPending(service.name)}
+															<Spinner size={12} />
+														{:else}
+															<Power size={12} />
+														{/if}
+														Stop
+													</button>
+												</div>
+											{/if}
+										</div>
+									{:else}
+										<button
+											class="control-btn power-btn"
+											disabled={isPending(service.name)}
+											on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
+											title="Start"
+										>
+											{#if isPending(service.name)}
+												<Spinner size={14} />
+											{:else}
+												<Power size={14} />
+											{/if}
+										</button>
+									{/if}
+								</div>
+							</div>
 						</div>
-					</div>
-				{/each}
-			{/if}
-		{/each}
+					{/each}
+				{/if}
+			{/each}
+		{/if}
 	</div>
 
 	<div
@@ -319,6 +415,14 @@
 		min-height: 0;
 	}
 
+	@media (max-width: 640px) {
+		.rack {
+			max-height: 50vh;
+			border-right: none;
+			border-bottom: 1px solid #27272a;
+		}
+	}
+
 	.rack-header {
 		padding: 16px;
 		border-bottom: 1px solid #27272a;
@@ -331,6 +435,66 @@
 		overflow-y: auto;
 		overflow-x: hidden;
 		min-height: 0;
+	}
+
+	.rack-state {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		padding: 32px 24px;
+		color: #a1a1aa;
+		text-align: center;
+	}
+
+	.rack-state.error {
+		color: #fca5a5;
+	}
+
+	.rack-state.empty {
+		color: #a1a1aa;
+	}
+
+	.state-title {
+		font-size: 13px;
+		font-weight: 600;
+		color: #e4e4e7;
+	}
+
+	.rack-state.error .state-title {
+		color: #fecaca;
+	}
+
+	.state-message {
+		font-size: 12px;
+		color: #a1a1aa;
+		max-width: 240px;
+	}
+
+	.rack-state.error .state-message {
+		color: #fca5a5;
+	}
+
+	.retry-btn {
+		margin-top: 8px;
+		background: #1f2937;
+		border: 1px solid #374151;
+		color: #e5e7eb;
+		border-radius: 6px;
+		padding: 6px 10px;
+		font-size: 12px;
+		cursor: pointer;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		transition:
+			background 0.2s,
+			border-color 0.2s;
+	}
+	.retry-btn:hover {
+		background: #111827;
+		border-color: #4b5563;
 	}
 
 	.rack-list::-webkit-scrollbar {
@@ -346,6 +510,11 @@
 	}
 	.rack-list::-webkit-scrollbar-thumb:hover {
 		background: #52525b;
+	}
+
+	button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.rack-group-header {
@@ -368,6 +537,17 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
+		background: none;
+		border: none;
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+		padding: 0;
+	}
+	.group-title:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
+		border-radius: 4px;
 	}
 
 	.group-actions {
@@ -388,6 +568,11 @@
 		padding: 2px;
 	}
 	.group-btn:hover {
+		color: #fff;
+	}
+	.group-btn:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
 		color: #fff;
 	}
 
@@ -415,6 +600,11 @@
 
 	.rack-item:hover {
 		--row-bg: #18181b; /* Zinc-900 (Approx match for 5% white overlay) */
+	}
+	.rack-item:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+		--row-bg: #18181b;
 	}
 
 	.rack-item.monitored {
@@ -602,6 +792,10 @@
 		color: #e4e4e7;
 		background: rgba(255, 255, 255, 0.05);
 	}
+	.control-btn:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
+	}
 
 	/* Monitor Icon Active State - The "Blue Glow" */
 	.monitor-btn.active {
@@ -684,10 +878,18 @@
 	.menu-action:hover {
 		background: #27272a;
 	}
+	.menu-action:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+		background: #27272a;
+	}
 	.menu-action.danger {
 		color: #ef4444;
 	}
 	.menu-action.danger:hover {
+		background: #ef444422;
+	}
+	.menu-action.danger:focus-visible {
 		background: #ef444422;
 	}
 
@@ -699,6 +901,11 @@
 		transition: background 0.2s;
 	}
 	.rack-footer:hover {
+		background: rgba(255, 255, 255, 0.05);
+	}
+	.rack-footer:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
 		background: rgba(255, 255, 255, 0.05);
 	}
 	.rack-footer.active {

@@ -1,6 +1,16 @@
 <script lang="ts">
-	import { X, ExternalLink, Terminal as TerminalIcon, FileText } from 'lucide-svelte';
+	import {
+		X,
+		ExternalLink,
+		Terminal as TerminalIcon,
+		FileText,
+		AlertTriangle,
+		Folder,
+		Container
+	} from 'lucide-svelte';
 	import { getServiceInspect } from '$lib/api';
+	import type { ServiceInspectResponse } from '$lib/types';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import Terminal from './Terminal.svelte';
 	import InteractiveTerminal from './InteractiveTerminal.svelte';
 
@@ -11,7 +21,7 @@
 
 	let { serviceName, onClose }: Props = $props();
 
-	let info: Record<string, unknown> | null = $state(null);
+	let info: ServiceInspectResponse | null = $state(null);
 	let loading = $state(false);
 	let error: string | null = $state(null);
 	let viewMode: 'logs' | 'terminal' = $state('logs');
@@ -28,7 +38,7 @@
 		loading = true;
 		error = null;
 		try {
-			info = (await getServiceInspect(name)) as Record<string, unknown>;
+			info = await getServiceInspect(name);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -46,6 +56,9 @@
 					<div class="status-pills">
 						<span class="pill status" class:healthy={info.health_status === 'Healthy'}>
 							{info.health_status}
+							{#if info.health_source && info.health_source !== 'process'}
+								<span class="health-source">({info.health_source})</span>
+							{/if}
 						</span>
 						{#if info.pid}
 							<span class="pill">PID: {info.pid}</span>
@@ -59,6 +72,17 @@
 								<ExternalLink size={12} />
 								<span>{info.url}</span>
 							</a>
+						{/if}
+						{#if info.connection_url}
+							<span class="pill connection-url" title="Connection URL (click to copy)">
+								<button
+									class="copy-btn"
+									onclick={() =>
+										info?.connection_url && copyToClipboard(info.connection_url, 'connection URL')}
+								>
+									{info.connection_url}
+								</button>
+							</span>
 						{/if}
 					</div>
 				{/if}
@@ -83,6 +107,41 @@
 				<button onclick={onClose} aria-label="Close"><X size={20} /></button>
 			</div>
 		</div>
+
+		{#if info?.warnings && info.warnings.length > 0}
+			<div class="warnings-section">
+				{#each info.warnings as warning, i (i)}
+					<div class="warning-badge">
+						<AlertTriangle size={14} />
+						<span>{warning}</span>
+					</div>
+				{/each}
+			</div>
+		{/if}
+
+		{#if info && (info.path || info.container_id)}
+			<div class="metadata-section">
+				{#if info.path}
+					<div class="metadata-item">
+						<Folder size={14} />
+						<span class="path">{info.path}</span>
+					</div>
+				{/if}
+				{#if info.container_id}
+					<div class="metadata-item">
+						<Container size={14} />
+						<button
+							class="copy-btn"
+							title="Container ID (click to copy)"
+							onclick={() =>
+								info?.container_id && copyToClipboard(info.container_id, 'container ID')}
+						>
+							{info.container_id.slice(0, 12)}
+						</button>
+					</div>
+				{/if}
+			</div>
+		{/if}
 
 		<div class="content">
 			{#if loading}
@@ -115,6 +174,12 @@
 		z-index: 50;
 		display: flex;
 		flex-direction: column;
+	}
+
+	@media (max-width: 640px) {
+		.inspector-focus {
+			left: 0;
+		}
 	}
 
 	.header {
@@ -205,6 +270,27 @@
 		color: #fff;
 	}
 
+	.pill.connection-url {
+		background: #2d2d2d;
+		border: 1px solid #444;
+		font-family: monospace;
+		font-size: 0.75rem;
+	}
+
+	.pill.connection-url .copy-btn {
+		background: transparent;
+		border: none;
+		color: inherit;
+		font-family: inherit;
+		font-size: inherit;
+		cursor: pointer;
+		padding: 0;
+	}
+
+	.pill.connection-url .copy-btn:hover {
+		color: #fff;
+	}
+
 	.header button {
 		background: transparent;
 		border: none;
@@ -242,5 +328,66 @@
 	}
 	.error {
 		color: #f44336;
+	}
+
+	.warnings-section {
+		padding: 8px 16px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.warning-badge {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 4px 8px;
+		background: #3d2c00;
+		border: 1px solid #5c4300;
+		border-radius: 4px;
+		color: #ffa500;
+		font-size: 0.8rem;
+	}
+
+	.metadata-section {
+		padding: 8px 16px;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+		border-bottom: 1px solid #333;
+		background: #252526;
+	}
+
+	.metadata-item {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		color: #999;
+		font-size: 0.8rem;
+	}
+
+	.metadata-item .path {
+		font-family: monospace;
+		color: #ccc;
+	}
+
+	.metadata-item .copy-btn {
+		background: transparent;
+		border: none;
+		color: #ccc;
+		font-family: monospace;
+		font-size: 0.8rem;
+		cursor: pointer;
+		padding: 0;
+	}
+
+	.metadata-item .copy-btn:hover {
+		color: #fff;
+	}
+
+	.health-source {
+		opacity: 0.7;
+		font-size: 0.75rem;
+		margin-left: 4px;
 	}
 </style>

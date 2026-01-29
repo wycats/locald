@@ -121,15 +121,20 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Add a service to locald.toml (shortcut for `locald service add exec`)
+    /// Add a service to locald.toml
+    ///
+    /// Examples:
+    ///   locald add npm start        # Add an exec service
+    ///   locald add postgres mydb    # Add a postgres service named "mydb"
+    ///   locald add last             # Add the last successful `try` command
     Add {
-        /// Command to run (or "last" to use the last successful `try` command)
+        /// Command to run, "postgres [name]", or "last" for the last successful `try` command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
-        /// Name of the service (default: web)
+        /// Name of the service (default: web for exec, db for postgres)
         #[arg(short, long)]
         name: Option<String>,
-        /// Port the service listens on
+        /// Port the service listens on (exec services only)
         #[arg(short, long)]
         port: Option<u16>,
     },

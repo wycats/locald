@@ -2,6 +2,9 @@ import { writable, derived } from 'svelte/store';
 import type { ServiceStatus, ServiceMetrics } from '$lib/types';
 import { getServices } from '$lib/api';
 
+export const servicesLoading = writable<boolean>(true);
+export const servicesError = writable<string | null>(null);
+
 function createServicesStore() {
 	const { subscribe, set, update } = writable<ServiceStatus[]>([]);
 
@@ -10,8 +13,17 @@ function createServicesStore() {
 		set,
 		update,
 		refresh: async () => {
-			const services = await getServices();
-			set(services);
+			servicesLoading.set(true);
+			servicesError.set(null);
+			try {
+				const services = await getServices();
+				set(services);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : 'Failed to load services.';
+				servicesError.set(message);
+			} finally {
+				servicesLoading.set(false);
+			}
 		},
 		updateService: (updatedService: ServiceStatus) => {
 			update((services) => {

@@ -2,6 +2,7 @@ use crate::plugins::runner::{
     AllocatePortOp, DeclareServiceOp, Diagnostics, Expr, HostCapabilities, Op, OutputRef, Plan,
     Selector, Step, Value,
 };
+use crate::port_allocator::{PortAllocator, PortGuard};
 use locald_core::config::{
     CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, LocaldConfig,
     PostgresServiceConfig, ServiceConfig, SiteServiceConfig, TypedServiceConfig,
@@ -108,16 +109,20 @@ fn validate_acyclic(plan: &Plan) -> Result<(), String> {
 ///
 /// Other ops are rejected.
 ///
-/// Returns accumulated step outputs for use in expression resolution.
+/// Returns accumulated step outputs and port guards. The guards must be kept alive
+/// until the services have bound to their ports.
 pub fn apply_plan_to_config(
     config: &mut LocaldConfig,
     plan: &Plan,
     caps: &HostCapabilities,
-) -> std::result::Result<StepOutputs, Diagnostics> {
+    allocator: &PortAllocator,
+) -> std::result::Result<(StepOutputs, Vec<PortGuard>), Diagnostics> {
     validate_plan(plan, caps)?;
 
     // Track outputs from executed steps.
     let mut outputs = StepOutputs::new();
+    // Track port guards to keep allocated ports reserved.
+    let mut guards = Vec::new();
 
     // Apply steps in topological order.
     let order = topo_order(plan).map_err(diagnostics_error)?;
@@ -129,13 +134,16 @@ pub fn apply_plan_to_config(
             .find(|s| s.id == step_id)
             .ok_or_else(|| diagnostics_error("internal error: missing step during apply"))?;
 
-        let step_output = apply_step(config, step, &outputs)?;
+        let (step_output, guard) = apply_step(config, step, &outputs, allocator)?;
         if !step_output.is_empty() {
             outputs.insert(step.id.clone(), step_output);
         }
+        if let Some(g) = guard {
+            guards.push(g);
+        }
     }
 
-    Ok(outputs)
+    Ok((outputs, guards))
 }
 
 fn topo_order(plan: &Plan) -> Result<Vec<String>, String> {
@@ -195,13 +203,14 @@ fn apply_step(
     config: &mut LocaldConfig,
     step: &Step,
     outputs: &StepOutputs,
-) -> std::result::Result<BTreeMap<String, Value>, Diagnostics> {
+    allocator: &PortAllocator,
+) -> std::result::Result<(BTreeMap<String, Value>, Option<PortGuard>), Diagnostics> {
     match &step.op {
         Op::DeclareService(op) => {
             apply_declare_service(config, op, outputs)?;
-            Ok(BTreeMap::new()) // No outputs from declare-service
+            Ok((BTreeMap::new(), None)) // No outputs from declare-service
         }
-        Op::AllocatePort(op) => allocate_port_for_service(config, op),
+        Op::AllocatePort(op) => allocate_port_for_service(config, op, allocator),
         Op::OciPull(_) => Err(diagnostics_error(
             "unsupported op 'oci-pull' (not implemented in Phase 29.1.3)".to_string(),
         )),
@@ -216,11 +225,13 @@ fn apply_step(
 
 /// Allocate a port for a service.
 ///
-/// Returns outputs: `{ "port": Value::Unsigned(<allocated_port>) }`
+/// Returns outputs: `{ "port": Value::Unsigned(<allocated_port>) }` and a guard
+/// that must be kept alive until the service binds to the port.
 fn allocate_port_for_service(
     config: &LocaldConfig,
     op: &AllocatePortOp,
-) -> std::result::Result<BTreeMap<String, Value>, Diagnostics> {
+    allocator: &PortAllocator,
+) -> std::result::Result<(BTreeMap<String, Value>, Option<PortGuard>), Diagnostics> {
     // Verify service exists
     if !config.services.contains_key(&op.name) {
         return Err(diagnostics_error(format!(
@@ -229,22 +240,17 @@ fn allocate_port_for_service(
         )));
     }
 
-    // Allocate a free port by binding to port 0 and letting the OS choose.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+    // Allocate a port using the centralized allocator
+    let guard = allocator.allocate().map_err(|e| {
         diagnostics_error(format!("failed to allocate port for '{}': {}", op.name, e))
     })?;
 
-    let port = listener
-        .local_addr()
-        .map_err(|e| diagnostics_error(format!("failed to get local address: {}", e)))?
-        .port();
+    let port = guard.port();
 
-    drop(listener); // Release the port for the service to use
-
-    // Return port as output
+    // Return port as output, along with the guard
     let mut output = BTreeMap::new();
     output.insert("port".to_string(), Value::Unsigned(u64::from(port)));
-    Ok(output)
+    Ok((output, Some(guard)))
 }
 
 /// Classify a service by its runtime type.
@@ -686,6 +692,7 @@ fn value_to_string(v: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::plugins::runner::{AllocatePortOp, OutputRef, Selector};
+    use crate::port_allocator::PortAllocator;
 
     fn caps() -> HostCapabilities {
         HostCapabilities {
@@ -696,6 +703,10 @@ mod tests {
 
     fn base_config() -> LocaldConfig {
         LocaldConfig::default()
+    }
+
+    fn allocator() -> PortAllocator {
+        PortAllocator::new()
     }
 
     #[test]
@@ -743,7 +754,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        let (outputs, _guards) = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         // declare-service produces no outputs
         assert!(outputs.is_empty());
@@ -793,7 +805,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        let (outputs, _guards) = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         // Verify port was allocated
         assert!(outputs.contains_key("allocate"));
@@ -868,7 +881,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        let (outputs, _guards) = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         // Should have outputs for both port allocations
         assert_eq!(outputs.len(), 2);
@@ -919,7 +933,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        let a = allocator();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("unknown service")));
     }
 
@@ -972,7 +987,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let outputs = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        let (outputs, _guards) = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let app_svc = cfg.services.get("app").expect("app service created");
         match app_svc {
@@ -1030,7 +1046,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        let a = allocator();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("unknown step")));
     }
 
@@ -1084,7 +1101,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        let a = allocator();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("no output field")));
     }
 
@@ -1161,7 +1179,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let app = cfg.services.get("app").expect("app service");
         match app {
@@ -1229,7 +1248,8 @@ mod tests {
         };
 
         let mut cfg = base_config();
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let app = cfg.services.get("app").expect("app service");
         match app {
@@ -1284,7 +1304,8 @@ mod tests {
             }],
         };
 
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let svc = cfg.services.get("web").unwrap();
         match svc {
@@ -1331,7 +1352,8 @@ mod tests {
             }],
         };
 
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let svc = cfg.services.get("web").unwrap();
         match svc {
@@ -1371,7 +1393,8 @@ mod tests {
             }],
         };
 
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let svc = cfg.services.get("web").unwrap();
         match svc {
@@ -1409,7 +1432,8 @@ mod tests {
             }],
         };
 
-        let err = apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap_err();
+        let a = allocator();
+        let err = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("type conflict")));
     }
 
@@ -1449,7 +1473,8 @@ mod tests {
             }],
         };
 
-        apply_plan_to_config(&mut cfg, &plan, &caps()).unwrap();
+        let a = allocator();
+        apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap();
 
         let svc = cfg.services.get("web").unwrap();
         match svc {

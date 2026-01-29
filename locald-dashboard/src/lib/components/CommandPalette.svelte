@@ -197,6 +197,13 @@
 		flex-direction: column;
 	}
 
+	@media (max-width: 640px) {
+		.palette {
+			margin: 0 12px;
+			width: calc(100% - 24px);
+		}
+	}
+
 	.search-bar {
 		display: flex;
 		align-items: center;

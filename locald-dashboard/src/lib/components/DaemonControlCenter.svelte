@@ -96,7 +96,7 @@
 	}
 
 	.card {
-		background: #0b0b10;
+		background: #09090b;
 		border: 1px solid #27272a;
 		border-radius: 8px;
 		padding: 12px;

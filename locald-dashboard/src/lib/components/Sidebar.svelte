@@ -1,5 +1,12 @@
 <script lang="ts">
 	import { projects } from '$lib/stores/services';
+	import { toasts } from '$lib/stores/toasts';
+	import { pendingActions } from '$lib/stores/actions';
+	import {
+		startServiceWithFeedback,
+		stopServiceWithFeedback,
+		restartServiceWithFeedback
+	} from '$lib/actions/service';
 	import type { ServiceStatus } from '$lib/types';
 	import {
 		RotateCw,
@@ -10,13 +17,9 @@
 		Play,
 		ExternalLink
 	} from 'lucide-svelte';
-	import {
-		stopAllServices,
-		restartAllServices,
-		startService,
-		stopService,
-		restartService
-	} from '$lib/api';
+	import { stopAllServices, restartAllServices } from '$lib/api';
+	import Spinner from './Spinner.svelte';
+	import StatusDot from './StatusDot.svelte';
 
 	interface Props {
 		selectedProject: string | null;
@@ -29,6 +32,17 @@
 		services: ServiceStatus[];
 	}
 
+	type StatusDotStatus =
+		| 'running'
+		| 'stopped'
+		| 'building'
+		| 'healthy'
+		| 'starting'
+		| 'unhealthy'
+		| 'connected'
+		| 'disconnected'
+		| 'unknown';
+
 	let { selectedProject, onSelectProject, onInspect }: Props = $props();
 
 	async function handleStopAll() {
@@ -36,7 +50,7 @@
 		try {
 			await stopAllServices();
 		} catch (e) {
-			alert(e instanceof Error ? e.message : String(e));
+			toasts.error(e instanceof Error ? e.message : String(e));
 		}
 	}
 
@@ -45,27 +59,37 @@
 		try {
 			await restartAllServices();
 		} catch (e) {
-			alert(e instanceof Error ? e.message : String(e));
+			toasts.error(e instanceof Error ? e.message : String(e));
 		}
 	}
 
-	async function handleServiceAction(
+	function isPending(serviceName: string): boolean {
+		return $pendingActions.some((a) => a.serviceName === serviceName);
+	}
+
+	function handleServiceAction(
 		e: Event,
 		action: 'start' | 'stop' | 'restart',
 		serviceName: string
 	) {
 		e.stopPropagation();
-		try {
-			if (action === 'start') await startService(serviceName);
-			if (action === 'stop') await stopService(serviceName);
-			if (action === 'restart') await restartService(serviceName);
-		} catch (err) {
-			console.error(err);
-		}
+		if (action === 'start') startServiceWithFeedback(serviceName);
+		if (action === 'stop') stopServiceWithFeedback(serviceName);
+		if (action === 'restart') restartServiceWithFeedback(serviceName);
 	}
 
 	function getDisplayName(service: ServiceStatus) {
 		return service.name.split(':').pop();
+	}
+
+	function getStatus(service: ServiceStatus): StatusDotStatus {
+		if (service.status === 'building') return 'building';
+		if (service.health_status === 'Healthy') return 'healthy';
+		if (service.health_status === 'Starting') return 'starting';
+		if (service.health_status === 'Unhealthy') return 'unhealthy';
+		if (service.status === 'running') return 'running';
+		if (service.status === 'stopped') return 'stopped';
+		return 'unknown';
 	}
 
 	let systemProjects = $derived($projects.filter((p) => p.name.startsWith('locald-')));
@@ -82,17 +106,22 @@
 			<span>{project.name}</span>
 		</button>
 		{#each project.services as service (service.name)}
-			<!-- svelte-ignore a11y_click_events_have_key_events -->
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="nav-item sub-item sidebar-item" onclick={() => onInspect(service.name)}>
+			{@const pending = isPending(service.name)}
+			{@const status = getStatus(service)}
+			<div
+				class="nav-item sub-item sidebar-item"
+				onclick={() => onInspect(service.name)}
+				onkeydown={(e) => {
+					if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+						e.preventDefault();
+						onInspect(service.name);
+					}
+				}}
+				role="button"
+				tabindex="0"
+			>
 				<div class="service-info">
-					<span
-						class="status-dot"
-						class:running={service.status === 'running'}
-						class:healthy={service.health_status === 'Healthy'}
-						class:starting={service.health_status === 'Starting'}
-						class:unhealthy={service.health_status === 'Unhealthy'}
-					></span>
+					<StatusDot {status} size="sm" />
 					<span class="name">
 						{getDisplayName(service)}
 					</span>
@@ -102,13 +131,26 @@
 					{#if service.status === 'running'}
 						<button
 							title="Restart"
+							disabled={pending}
 							onclick={(e) => handleServiceAction(e, 'restart', service.name)}
 						>
-							<RotateCw size={12} />
+							{#if pending}
+								<Spinner size={12} />
+							{:else}
+								<RotateCw size={12} />
+							{/if}
 						</button>
 					{:else}
-						<button title="Start" onclick={(e) => handleServiceAction(e, 'start', service.name)}>
-							<Play size={12} />
+						<button
+							title="Start"
+							disabled={pending}
+							onclick={(e) => handleServiceAction(e, 'start', service.name)}
+						>
+							{#if pending}
+								<Spinner size={12} />
+							{:else}
+								<Play size={12} />
+							{/if}
 						</button>
 					{/if}
 
@@ -175,6 +217,11 @@
 </div>
 
 <style>
+	button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
 	.sidebar {
 		width: 280px;
 		background: #09090b; /* Zinc-950 */
@@ -250,6 +297,11 @@
 		background: rgba(255, 255, 255, 0.05); /* bg-white/5 */
 		color: #e4e4e7; /* Zinc-200 */
 	}
+	.nav-item:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+		background: rgba(255, 255, 255, 0.05);
+	}
 
 	.nav-item.selected {
 		background: #27272a; /* Zinc-800 */
@@ -281,6 +333,10 @@
 		background: rgba(255, 255, 255, 0.05); /* bg-white/5 */
 		color: #e4e4e7; /* Zinc-200 */
 	}
+	.sidebar-item:focus-visible {
+		outline: 2px solid #3b82f6; /* Blue-500 */
+		outline-offset: 2px;
+	}
 
 	.service-info {
 		display: flex;
@@ -288,27 +344,6 @@
 		gap: 8px;
 		overflow: hidden;
 		min-width: 0; /* Allow truncation */
-	}
-
-	.status-dot {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		background: #71717a; /* Zinc-500 */
-		flex-shrink: 0;
-	}
-	.status-dot.running {
-		background: #a1a1aa; /* Zinc-400 */
-	}
-	.status-dot.healthy {
-		background: #4ade80; /* Green-400 */
-		box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.2);
-	}
-	.status-dot.starting {
-		background: #facc15; /* Yellow-400 */
-	}
-	.status-dot.unhealthy {
-		background: #f87171; /* Red-400 */
 	}
 
 	.name {
@@ -344,6 +379,16 @@
 	.sidebar-actions a:hover {
 		background: #3f3f46; /* Zinc-700 */
 		color: #e4e4e7; /* Zinc-200 */
+	}
+	.sidebar-actions button:focus-visible,
+	.sidebar-actions a:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
+	}
+
+	.global-controls button:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: 2px;
 	}
 
 	.section-divider {

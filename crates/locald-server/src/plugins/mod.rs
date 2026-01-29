@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::port_allocator::{PortAllocator, PortGuard};
+
 pub mod discovery;
 pub mod plan;
 pub mod runner;
@@ -124,24 +126,29 @@ pub fn apply_plugin(
 /// # Arguments
 /// * `config` - The loaded configuration to modify
 /// * `project_root` - Path to the project root directory
+/// * `allocator` - Port allocator for safe port assignment
 ///
 /// # Returns
-/// Ok(()) if plugins were processed (even if none matched).
+/// Ok with a vector of port guards that must be kept alive until services bind.
 ///
 /// Plugin discovery and application failures are logged as warnings but do not
 /// fail the overall operation - plugins are optional enhancements.
 pub fn apply_plugins_to_config(
     config: &mut locald_core::config::LocaldConfig,
     project_root: &Path,
-) -> Result<()> {
+    allocator: &PortAllocator,
+) -> Result<Vec<PortGuard>> {
     use tracing::{debug, info, warn};
+
+    // Accumulate all port guards from plugin plans
+    let mut all_guards = Vec::new();
 
     // Discover plugins
     let plugin_paths = discover_plugins(project_root);
 
     if plugin_paths.is_empty() {
         debug!("No plugins discovered");
-        return Ok(());
+        return Ok(all_guards);
     }
 
     info!("Discovered {} plugin(s)", plugin_paths.len());
@@ -151,7 +158,7 @@ pub fn apply_plugins_to_config(
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to create plugin runner: {}", e);
-            return Ok(()); // Continue without plugins
+            return Ok(all_guards); // Continue without plugins
         }
     };
 
@@ -247,8 +254,8 @@ pub fn apply_plugins_to_config(
             };
 
             // Apply plan to config
-            match apply_plan_to_config(config, &plan, &caps) {
-                Ok(outputs) => {
+            match apply_plan_to_config(config, &plan, &caps, allocator) {
+                Ok((outputs, guards)) => {
                     info!(
                         "Plugin '{}' applied successfully to service '{}' ({} steps, {} outputs)",
                         plugin_name,
@@ -256,6 +263,7 @@ pub fn apply_plugins_to_config(
                         plan.steps.len(),
                         outputs.len()
                     );
+                    all_guards.extend(guards);
                 }
                 Err(diag) => {
                     warn!(
@@ -267,7 +275,7 @@ pub fn apply_plugins_to_config(
         }
     }
 
-    Ok(())
+    Ok(all_guards)
 }
 
 /// Classify a service's runtime kind for plugin detection.
@@ -674,6 +682,7 @@ mod tests {
 
     #[test]
     fn apply_plugins_to_config_no_plugins() {
+        use crate::port_allocator::PortAllocator;
         use locald_core::config::{LocaldConfig, ProjectConfig};
         use tempfile::TempDir;
 
@@ -691,12 +700,14 @@ mod tests {
             services: HashMap::new(),
         };
 
-        let result = apply_plugins_to_config(&mut config, project_root);
+        let allocator = PortAllocator::new();
+        let result = apply_plugins_to_config(&mut config, project_root, &allocator);
         assert!(result.is_ok());
     }
 
     #[test]
     fn apply_plugins_to_config_unchanged_when_no_match() {
+        use crate::port_allocator::PortAllocator;
         use locald_core::config::{LocaldConfig, ProjectConfig};
         use tempfile::TempDir;
 
@@ -726,7 +737,8 @@ mod tests {
 
         let original_len = config.services.len();
 
-        let result = apply_plugins_to_config(&mut config, project_root);
+        let allocator = PortAllocator::new();
+        let result = apply_plugins_to_config(&mut config, project_root, &allocator);
         assert!(result.is_ok());
         assert_eq!(config.services.len(), original_len);
     }
