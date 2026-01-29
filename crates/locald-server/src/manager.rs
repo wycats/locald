@@ -988,10 +988,11 @@ impl ProcessManager {
                             ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
                         ) {
                             // Use interpolation syntax so it resolves at runtime
-                            let full_dep_name = format!("{}:{}", config.project.name, dep);
+                            // Use the local service name (without project prefix) because
+                            // resolve_env adds the project prefix when looking up services
                             combined_env.insert(
                                 "DATABASE_URL".to_string(),
-                                format!("${{services.{}.url}}", full_dep_name),
+                                format!("${{services.{}.url}}", dep),
                             );
                             info!(
                                 "Auto-injected DATABASE_URL for {} from Postgres dependency {}",
@@ -1655,10 +1656,10 @@ impl ProcessManager {
                         dep_config,
                         ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
                     ) {
-                        let full_dep_name = format!("{}:{}", config.project.name, dep);
+                        // Use local service name - resolve_env adds the project prefix
                         combined_env.insert(
                             "DATABASE_URL".to_string(),
-                            format!("${{services.{}.url}}", full_dep_name),
+                            format!("${{services.{}.url}}", dep),
                         );
                         break;
                     }
