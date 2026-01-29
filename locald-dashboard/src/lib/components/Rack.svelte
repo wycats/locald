@@ -19,10 +19,10 @@
 		RefreshCw,
 		RotateCcw,
 		ExternalLink,
-		Loader2,
 		AlertCircle
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
+	import Spinner from './Spinner.svelte';
 
 	export let monitored: string[] = [];
 
@@ -195,7 +195,7 @@
 	<div class="rack-list">
 		{#if $servicesLoading && $projects.length === 0}
 			<div class="rack-state">
-				<Loader2 size={24} class="spin" />
+				<Spinner size={24} />
 				<span class="state-title">Loading services...</span>
 			</div>
 		{:else if $servicesError}
@@ -314,7 +314,7 @@
 											on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
 										>
 											{#if isPending(service.name)}
-												<Loader2 size={14} class="spin" />
+												<Spinner size={14} />
 											{:else}
 												<RefreshCw size={14} />
 											{/if}
@@ -346,7 +346,7 @@
 														on:click={() => resetServiceWithFeedback(service.name)}
 													>
 														{#if isPending(service.name)}
-															<Loader2 size={12} class="spin" />
+															<Spinner size={12} />
 														{:else}
 															<RotateCcw size={12} />
 														{/if}
@@ -358,7 +358,7 @@
 														on:click={() => stopServiceWithFeedback(service.name)}
 													>
 														{#if isPending(service.name)}
-															<Loader2 size={12} class="spin" />
+															<Spinner size={12} />
 														{:else}
 															<Power size={12} />
 														{/if}
@@ -375,7 +375,7 @@
 											title="Start"
 										>
 											{#if isPending(service.name)}
-												<Loader2 size={14} class="spin" />
+												<Spinner size={14} />
 											{:else}
 												<Power size={14} />
 											{/if}
@@ -502,19 +502,6 @@
 	}
 	.rack-list::-webkit-scrollbar-thumb:hover {
 		background: #52525b;
-	}
-
-	:global(.spin) {
-		animation: spin 1s linear infinite;
-	}
-
-	@keyframes spin {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
 	}
 
 	button:disabled {

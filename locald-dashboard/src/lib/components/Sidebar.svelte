@@ -15,10 +15,11 @@
 		Terminal as TerminalIcon,
 		Activity,
 		Play,
-		ExternalLink,
-		Loader2
+		ExternalLink
 	} from 'lucide-svelte';
 	import { stopAllServices, restartAllServices } from '$lib/api';
+	import Spinner from './Spinner.svelte';
+	import StatusDot from './StatusDot.svelte';
 
 	interface Props {
 		selectedProject: string | null;
@@ -30,6 +31,17 @@
 		name: string;
 		services: ServiceStatus[];
 	}
+
+	type StatusDotStatus =
+		| 'running'
+		| 'stopped'
+		| 'building'
+		| 'healthy'
+		| 'starting'
+		| 'unhealthy'
+		| 'connected'
+		| 'disconnected'
+		| 'unknown';
 
 	let { selectedProject, onSelectProject, onInspect }: Props = $props();
 
@@ -70,6 +82,16 @@
 		return service.name.split(':').pop();
 	}
 
+	function getStatus(service: ServiceStatus): StatusDotStatus {
+		if (service.status === 'building') return 'building';
+		if (service.health_status === 'Healthy') return 'healthy';
+		if (service.health_status === 'Starting') return 'starting';
+		if (service.health_status === 'Unhealthy') return 'unhealthy';
+		if (service.status === 'running') return 'running';
+		if (service.status === 'stopped') return 'stopped';
+		return 'unknown';
+	}
+
 	let systemProjects = $derived($projects.filter((p) => p.name.startsWith('locald-')));
 	let userProjects = $derived($projects.filter((p) => !p.name.startsWith('locald-')));
 </script>
@@ -85,6 +107,7 @@
 		</button>
 		{#each project.services as service (service.name)}
 			{@const pending = isPending(service.name)}
+			{@const status = getStatus(service)}
 			<div
 				class="nav-item sub-item sidebar-item"
 				onclick={() => onInspect(service.name)}
@@ -98,13 +121,7 @@
 				tabindex="0"
 			>
 				<div class="service-info">
-					<span
-						class="status-dot"
-						class:running={service.status === 'running'}
-						class:healthy={service.health_status === 'Healthy'}
-						class:starting={service.health_status === 'Starting'}
-						class:unhealthy={service.health_status === 'Unhealthy'}
-					></span>
+					<StatusDot {status} size="sm" />
 					<span class="name">
 						{getDisplayName(service)}
 					</span>
@@ -118,7 +135,7 @@
 							onclick={(e) => handleServiceAction(e, 'restart', service.name)}
 						>
 							{#if pending}
-								<Loader2 size={12} class="spin" />
+								<Spinner size={12} />
 							{:else}
 								<RotateCw size={12} />
 							{/if}
@@ -130,7 +147,7 @@
 							onclick={(e) => handleServiceAction(e, 'start', service.name)}
 						>
 							{#if pending}
-								<Loader2 size={12} class="spin" />
+								<Spinner size={12} />
 							{:else}
 								<Play size={12} />
 							{/if}
@@ -200,17 +217,6 @@
 </div>
 
 <style>
-	:global(.spin) {
-		animation: spin 1s linear infinite;
-	}
-	@keyframes spin {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
-	}
 	button:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
@@ -338,27 +344,6 @@
 		gap: 8px;
 		overflow: hidden;
 		min-width: 0; /* Allow truncation */
-	}
-
-	.status-dot {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		background: #71717a; /* Zinc-500 */
-		flex-shrink: 0;
-	}
-	.status-dot.running {
-		background: #a1a1aa; /* Zinc-400 */
-	}
-	.status-dot.healthy {
-		background: #4ade80; /* Green-400 */
-		box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.2);
-	}
-	.status-dot.starting {
-		background: #facc15; /* Yellow-400 */
-	}
-	.status-dot.unhealthy {
-		background: #f87171; /* Red-400 */
 	}
 
 	.name {

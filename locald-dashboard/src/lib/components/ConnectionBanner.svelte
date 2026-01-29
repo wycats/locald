@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { slide } from 'svelte/transition';
-	import { WifiOff, Loader2 } from 'lucide-svelte';
+	import { WifiOff } from 'lucide-svelte';
 	import { connection, isDisconnected } from '$lib/stores/connection';
 	import { reconnect } from '$lib/api';
+	import Spinner from './Spinner.svelte';
 
 	let isRetrying = false;
 
@@ -32,9 +33,7 @@
 			disabled={isRetrying || $connection.state === 'connecting'}
 		>
 			{#if isRetrying || $connection.state === 'connecting'}
-				<span class="spin">
-					<Loader2 size={14} />
-				</span>
+				<Spinner size={14} />
 				<span>Reconnecting...</span>
 			{:else}
 				<span>Retry</span>
@@ -105,19 +104,5 @@
 	.retry:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
-	}
-
-	.spin {
-		display: inline-flex;
-		animation: spin 0.9s linear infinite;
-	}
-
-	@keyframes spin {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
 	}
 </style>
