@@ -933,9 +933,15 @@ impl ProcessManager {
 
         // Apply plugins to configuration
         // Plugin discovery and application failures are logged but do not fail startup
-        if let Err(e) = plugins::apply_plugins_to_config(&mut config, &path) {
-            warn!("Plugin processing failed: {}", e);
-        }
+        // The returned guards keep plugin-allocated ports reserved until services bind
+        let _plugin_port_guards =
+            match plugins::apply_plugins_to_config(&mut config, &path, &self.port_allocator) {
+                Ok(guards) => guards,
+                Err(e) => {
+                    warn!("Plugin processing failed: {}", e);
+                    Vec::new()
+                }
+            };
 
         if let Some(tx) = &event_tx {
             let _ = tx
