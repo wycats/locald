@@ -979,6 +979,30 @@ impl ProcessManager {
                 combined_env.insert(k.clone(), v.clone());
             }
 
+            // Auto-inject DATABASE_URL for services that depend on Postgres
+            if !combined_env.contains_key("DATABASE_URL") {
+                for dep in service_config.depends_on() {
+                    if let Some(dep_config) = config.services.get(dep) {
+                        if matches!(
+                            dep_config,
+                            ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+                        ) {
+                            // Use interpolation syntax so it resolves at runtime
+                            let full_dep_name = format!("{}:{}", config.project.name, dep);
+                            combined_env.insert(
+                                "DATABASE_URL".to_string(),
+                                format!("${{services.{}.url}}", full_dep_name),
+                            );
+                            info!(
+                                "Auto-injected DATABASE_URL for {} from Postgres dependency {}",
+                                name, dep
+                            );
+                            break; // Only inject from first Postgres dependency
+                        }
+                    }
+                }
+            }
+
             let manager = self.clone();
             let lookup = move |service_name: String, field: String| {
                 let manager = manager.clone();
@@ -1620,6 +1644,26 @@ impl ProcessManager {
 
         if let Some(p) = port.or(sticky_port) {
             combined_env.insert("PORT".to_string(), p.to_string());
+        }
+
+        // Auto-inject DATABASE_URL for services that depend on Postgres
+        // (mirrors the logic in start_project)
+        if !combined_env.contains_key("DATABASE_URL") {
+            for dep in service_config.depends_on() {
+                if let Some(dep_config) = config.services.get(dep) {
+                    if matches!(
+                        dep_config,
+                        ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+                    ) {
+                        let full_dep_name = format!("{}:{}", config.project.name, dep);
+                        combined_env.insert(
+                            "DATABASE_URL".to_string(),
+                            format!("${{services.{}.url}}", full_dep_name),
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         let manager = self.clone();
