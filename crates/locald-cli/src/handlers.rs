@@ -59,7 +59,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
         } => {
             #[cfg(feature = "experimental-plugins")]
             if let Some(source) = from_distribution {
-                if let Err(e) = distribution::init_from_distribution(
+                distribution::init_from_distribution(
                     source,
                     name.as_deref(),
                     target.as_deref(),
@@ -67,10 +67,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     *offline,
                     *yes,
                     *verbose,
-                ) {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
+                )?;
                 return Ok(());
             }
             #[cfg(not(feature = "experimental-plugins"))]
@@ -78,10 +75,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 // Silence unused warnings when feature is disabled
                 let _ = (name, target, no_scaffold, offline, yes, verbose);
                 if from_distribution.is_some() {
-                    eprintln!(
-                        "Error: --from-distribution requires the experimental-plugins feature"
-                    );
-                    std::process::exit(1);
+                    return Err(CliError::message(
+                        "--from-distribution requires the experimental-plugins feature",
+                    ));
                 }
             }
             init::run()?;
@@ -1136,10 +1132,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 user,
                 force,
             } => {
-                if let Err(e) = plugin::install(source, name.clone(), *project, *user, *force) {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
+                plugin::install(source, name.clone(), *project, *user, *force)?;
             }
             PluginCommands::Inspect {
                 plugin: plugin_arg,
@@ -1149,17 +1142,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 config,
                 grant,
             } => {
-                if let Err(e) = plugin::inspect(
+                plugin::inspect(
                     plugin_arg,
                     kind,
                     name.as_deref(),
                     depends_on.as_deref(),
                     config,
                     grant,
-                ) {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
+                )?;
             }
             PluginCommands::Validate {
                 plugin: plugin_arg,
@@ -1169,17 +1159,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 config,
                 grant,
             } => {
-                if let Err(e) = plugin::validate(
+                plugin::validate(
                     plugin_arg,
                     kind,
                     name.as_deref(),
                     depends_on.as_deref(),
                     config,
                     grant,
-                ) {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
+                )?;
             }
             PluginCommands::Create {
                 source,
@@ -1189,17 +1176,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 force,
                 verbose,
             } => {
-                if let Err(e) = plugin::create(
+                plugin::create(
                     source,
                     output.as_deref(),
                     manifest.as_deref(),
                     *dry_run,
                     *force,
                     *verbose,
-                ) {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
+                )?;
             }
         },
 
@@ -1214,7 +1198,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 force,
                 verbose,
             } => {
-                if let Err(e) = distribution::create(
+                distribution::create(
                     source,
                     output.as_deref(),
                     manifest.as_deref(),
@@ -1222,10 +1206,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     *dry_run,
                     *force,
                     *verbose,
-                ) {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
+                )?;
             }
         },
 
