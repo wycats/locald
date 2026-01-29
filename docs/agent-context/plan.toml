@@ -2303,7 +2303,7 @@ aliases = ["96.4"]
 [[epochs.phases]]
 id = "phase-57"
 title = "Phase 57: Workspace & Constellations"
-status = "pending"
+status = "completed"
 rfcs = ["0026"]
 ulid = "01KEX4X98ZMNGWJ5TQTKE23JFP"
 slug = "27"
@@ -2312,7 +2312,7 @@ aliases = ["27"]
 [[epochs.phases.tasks]]
 id = "27.1"
 label = "Sorting & Grouping: Stable sort, grouping by Constellation/Category."
-status = "in-progress"
+status = "completed"
 ulid = "01KEX4X98ZQTBS9W2J1GWG95KB"
 slug = "27.1"
 aliases = ["27.1"]
@@ -2336,7 +2336,7 @@ aliases = ["27.3"]
 [[epochs.phases.tasks]]
 id = "27.4"
 label = "RFC Update: Evaluate 'defaults.services' vs 'services' split"
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98Z2DJT2C5FT0EN3A01"
 slug = "27.4"
 aliases = ["27.4"]
@@ -2425,7 +2425,7 @@ aliases = ["28.3"]
 [[epochs.phases]]
 id = "phase-60"
 title = "Phase 60: Extensibility & Plugins"
-status = "pending"
+status = "completed"
 rfcs = ["0028"]
 ulid = "01KEX4X98ZEM25Q2TFQ6G5CP74"
 slug = "29"
@@ -2450,7 +2450,7 @@ aliases = ["29.2"]
 [[epochs.phases.tasks]]
 id = "29.3"
 label = 'Distributions: Allow distribution of "flavored" binaries/configs without recompilation.'
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZWKJYSWM0Y46P591D"
 slug = "29.3"
 aliases = ["29.3"]
@@ -2539,7 +2539,7 @@ aliases = ["31.4"]
 [[epochs.phases]]
 id = "phase-62"
 title = "Phase 62: Host Diagnostics (locald doctor)"
-status = "pending"
+status = "completed"
 rfcs = [
     "0109",
     "0110",
@@ -2599,7 +2599,7 @@ aliases = ["109.6"]
 [[epochs.phases.tasks]]
 id = "109.7"
 label = "Future: optional auto-fix mode"
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZCWSDCZCN4YDESPSF"
 slug = "109.7"
 aliases = ["109.7"]
@@ -2607,7 +2607,7 @@ aliases = ["109.7"]
 [[epochs.phases.tasks]]
 id = "109.8"
 label = "Future: deeper runtime/kernel checks"
-status = "pending"
+status = "completed"
 ulid = "01KEX4X98ZB4GQ9CH5HACWNEZ0"
 slug = "109.8"
 aliases = ["109.8"]
