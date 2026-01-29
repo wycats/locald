@@ -1,7 +1,12 @@
 <script lang="ts">
 	/* eslint-disable svelte/no-navigation-without-resolve */
 	import { projects } from '$lib/stores/services';
-	import { startService, stopService, restartService } from '$lib/api';
+	import { pendingActions } from '$lib/stores/actions';
+	import {
+		startServiceWithFeedback,
+		stopServiceWithFeedback,
+		restartServiceWithFeedback
+	} from '$lib/actions/service';
 	import {
 		Activity,
 		Layers,
@@ -11,7 +16,8 @@
 		MoreHorizontal,
 		Monitor,
 		RefreshCw,
-		ExternalLink
+		ExternalLink,
+		Loader2
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
 
@@ -100,18 +106,18 @@
 		activeMenu = null;
 	}
 
+	function isPending(serviceName: string): boolean {
+		return $pendingActions.some((a) => a.serviceName === serviceName);
+	}
+
 	async function toggleGroup(groupServices: ServiceStatus[]) {
 		const allStopped = groupServices.every((s) => s.status === 'stopped');
-		try {
-			await Promise.all(
-				groupServices.map((s) => {
-					if (allStopped) return startService(s.name);
-					return stopService(s.name);
-				})
-			);
-		} catch (e) {
-			console.error(e);
-		}
+		await Promise.all(
+			groupServices.map((s) => {
+				if (allStopped) return startServiceWithFeedback(s.name);
+				return stopServiceWithFeedback(s.name);
+			})
+		);
 	}
 
 	function toggleGroupCollapse(group: string) {
@@ -268,9 +274,14 @@
 									<button
 										class="control-btn"
 										title="Restart"
-										on:click|stopPropagation={() => restartService(service.name)}
+										disabled={isPending(service.name)}
+										on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
 									>
-										<RefreshCw size={14} />
+										{#if isPending(service.name)}
+											<Loader2 size={14} class="spin" />
+										{:else}
+											<RefreshCw size={14} />
+										{/if}
 									</button>
 									<div class="menu-wrapper">
 										<button
@@ -291,9 +302,15 @@
 												<div class="menu-separator"></div>
 												<button
 													class="menu-action danger"
-													on:click={() => stopService(service.name)}
+													disabled={isPending(service.name)}
+													on:click={() => stopServiceWithFeedback(service.name)}
 												>
-													<Power size={12} /> Stop
+													{#if isPending(service.name)}
+														<Loader2 size={12} class="spin" />
+													{:else}
+														<Power size={12} />
+													{/if}
+													Stop
 												</button>
 											</div>
 										{/if}
@@ -301,10 +318,15 @@
 								{:else}
 									<button
 										class="control-btn power-btn"
-										on:click|stopPropagation={() => startService(service.name)}
+										disabled={isPending(service.name)}
+										on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
 										title="Start"
 									>
-										<Power size={14} />
+										{#if isPending(service.name)}
+											<Loader2 size={14} class="spin" />
+										{:else}
+											<Power size={14} />
+										{/if}
 									</button>
 								{/if}
 							</div>
@@ -367,6 +389,24 @@
 	}
 	.rack-list::-webkit-scrollbar-thumb:hover {
 		background: #52525b;
+	}
+
+	:global(.spin) {
+		animation: spin 1s linear infinite;
+	}
+
+	@keyframes spin {
+		from {
+			transform: rotate(0deg);
+		}
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.rack-group-header {

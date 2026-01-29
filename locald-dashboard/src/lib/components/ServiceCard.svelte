@@ -1,8 +1,13 @@
 <script lang="ts">
 	import type { ServiceStatus } from '$lib/types';
 	import { logs } from '$lib/stores/logs';
-	import { RotateCw, Square, Play, ExternalLink, Settings } from 'lucide-svelte';
-	import { startService, stopService, restartService } from '$lib/api';
+	import { pendingActions } from '$lib/stores/actions';
+	import { RotateCw, Square, Play, ExternalLink, Settings, Loader2 } from 'lucide-svelte';
+	import {
+		startServiceWithFeedback,
+		stopServiceWithFeedback,
+		restartServiceWithFeedback
+	} from '$lib/actions/service';
 	import { cleanLog } from '$lib/utils/logs';
 	import AnsiToHtml from 'ansi-to-html';
 
@@ -21,32 +26,21 @@
 	// Access store value reactively
 	let serviceLogs = $derived($logs[service.name] || []);
 	let lastLogs = $derived(serviceLogs.slice(-3));
+	let isPending = $derived($pendingActions.some((a) => a.serviceName === service.name));
 
 	async function handleStart(e: Event) {
 		e.stopPropagation();
-		try {
-			await startService(service.name);
-		} catch (err) {
-			console.error(err);
-		}
+		await startServiceWithFeedback(service.name);
 	}
 
 	async function handleStop(e: Event) {
 		e.stopPropagation();
-		try {
-			await stopService(service.name);
-		} catch (err) {
-			console.error(err);
-		}
+		await stopServiceWithFeedback(service.name);
 	}
 
 	async function handleRestart(e: Event) {
 		e.stopPropagation();
-		try {
-			await restartService(service.name);
-		} catch (err) {
-			console.error(err);
-		}
+		await restartServiceWithFeedback(service.name);
 	}
 
 	function getDisplayUrl(service: ServiceStatus) {
@@ -109,10 +103,28 @@
 	<div class="footer">
 		<div class="actions">
 			{#if service.status === 'running'}
-				<button title="Restart" onclick={handleRestart}><RotateCw size={14} /></button>
-				<button title="Stop" onclick={handleStop}><Square size={14} /></button>
+				<button title="Restart" onclick={handleRestart} disabled={isPending}>
+					{#if isPending}
+						<Loader2 size={14} class="spin" />
+					{:else}
+						<RotateCw size={14} />
+					{/if}
+				</button>
+				<button title="Stop" onclick={handleStop} disabled={isPending}>
+					{#if isPending}
+						<Loader2 size={14} class="spin" />
+					{:else}
+						<Square size={14} />
+					{/if}
+				</button>
 			{:else}
-				<button title="Start" onclick={handleStart}><Play size={14} /></button>
+				<button title="Start" onclick={handleStart} disabled={isPending}>
+					{#if isPending}
+						<Loader2 size={14} class="spin" />
+					{:else}
+						<Play size={14} />
+					{/if}
+				</button>
 			{/if}
 		</div>
 		<button
@@ -277,5 +289,23 @@
 	}
 	button.config-btn:hover {
 		background: #27272a; /* Zinc-800 */
+	}
+
+	:global(.spin) {
+		animation: spin 1s linear infinite;
+	}
+
+	@keyframes spin {
+		from {
+			transform: rotate(0deg);
+		}
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 </style>

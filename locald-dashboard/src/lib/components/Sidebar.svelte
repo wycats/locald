@@ -1,5 +1,12 @@
 <script lang="ts">
 	import { projects } from '$lib/stores/services';
+	import { toasts } from '$lib/stores/toasts';
+	import { pendingActions } from '$lib/stores/actions';
+	import {
+		startServiceWithFeedback,
+		stopServiceWithFeedback,
+		restartServiceWithFeedback
+	} from '$lib/actions/service';
 	import type { ServiceStatus } from '$lib/types';
 	import {
 		RotateCw,
@@ -8,15 +15,10 @@
 		Terminal as TerminalIcon,
 		Activity,
 		Play,
-		ExternalLink
+		ExternalLink,
+		Loader2
 	} from 'lucide-svelte';
-	import {
-		stopAllServices,
-		restartAllServices,
-		startService,
-		stopService,
-		restartService
-	} from '$lib/api';
+	import { stopAllServices, restartAllServices } from '$lib/api';
 
 	interface Props {
 		selectedProject: string | null;
@@ -36,7 +38,7 @@
 		try {
 			await stopAllServices();
 		} catch (e) {
-			alert(e instanceof Error ? e.message : String(e));
+			toasts.error(e instanceof Error ? e.message : String(e));
 		}
 	}
 
@@ -45,23 +47,23 @@
 		try {
 			await restartAllServices();
 		} catch (e) {
-			alert(e instanceof Error ? e.message : String(e));
+			toasts.error(e instanceof Error ? e.message : String(e));
 		}
 	}
 
-	async function handleServiceAction(
+	function isPending(serviceName: string): boolean {
+		return $pendingActions.some((a) => a.serviceName === serviceName);
+	}
+
+	function handleServiceAction(
 		e: Event,
 		action: 'start' | 'stop' | 'restart',
 		serviceName: string
 	) {
 		e.stopPropagation();
-		try {
-			if (action === 'start') await startService(serviceName);
-			if (action === 'stop') await stopService(serviceName);
-			if (action === 'restart') await restartService(serviceName);
-		} catch (err) {
-			console.error(err);
-		}
+		if (action === 'start') startServiceWithFeedback(serviceName);
+		if (action === 'stop') stopServiceWithFeedback(serviceName);
+		if (action === 'restart') restartServiceWithFeedback(serviceName);
 	}
 
 	function getDisplayName(service: ServiceStatus) {
@@ -82,6 +84,7 @@
 			<span>{project.name}</span>
 		</button>
 		{#each project.services as service (service.name)}
+			{@const pending = isPending(service.name)}
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="nav-item sub-item sidebar-item" onclick={() => onInspect(service.name)}>
@@ -102,13 +105,26 @@
 					{#if service.status === 'running'}
 						<button
 							title="Restart"
+							disabled={pending}
 							onclick={(e) => handleServiceAction(e, 'restart', service.name)}
 						>
-							<RotateCw size={12} />
+							{#if pending}
+								<Loader2 size={12} class="spin" />
+							{:else}
+								<RotateCw size={12} />
+							{/if}
 						</button>
 					{:else}
-						<button title="Start" onclick={(e) => handleServiceAction(e, 'start', service.name)}>
-							<Play size={12} />
+						<button
+							title="Start"
+							disabled={pending}
+							onclick={(e) => handleServiceAction(e, 'start', service.name)}
+						>
+							{#if pending}
+								<Loader2 size={12} class="spin" />
+							{:else}
+								<Play size={12} />
+							{/if}
 						</button>
 					{/if}
 
@@ -175,6 +191,22 @@
 </div>
 
 <style>
+	:global(.spin) {
+		animation: spin 1s linear infinite;
+	}
+	@keyframes spin {
+		from {
+			transform: rotate(0deg);
+		}
+		to {
+			transform: rotate(360deg);
+		}
+	}
+	button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
 	.sidebar {
 		width: 280px;
 		background: #09090b; /* Zinc-950 */
