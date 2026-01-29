@@ -14,7 +14,7 @@
 				<Info size={16} />
 			{/if}
 			<span>{toast.message}</span>
-			<button on:click={() => toasts.remove(toast.id)}>
+			<button on:click={() => toasts.remove(toast.id)} aria-label="Dismiss notification">
 				<X size={14} />
 			</button>
 		</div>

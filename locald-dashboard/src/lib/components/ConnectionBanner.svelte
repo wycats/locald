@@ -15,6 +15,12 @@
 		if (isRetrying || $connection.state === 'connecting') return;
 		isRetrying = true;
 		reconnect();
+
+		setTimeout(() => {
+			if (isRetrying) {
+				isRetrying = false;
+			}
+		}, 5000);
 	}
 </script>
 

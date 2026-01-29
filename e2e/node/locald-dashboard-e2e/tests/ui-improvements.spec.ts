@@ -353,9 +353,6 @@ test.describe("Inspector Drawer Fields", () => {
     await expect(drawer).toBeVisible({ timeout: 5000 });
 
     // If warnings exist, they should be in a warnings section
-    const warningsSection = drawer.locator(".warnings-section, .warning-badge");
-    // This is conditional - not all services have warnings
-    // Just verify the section renders if warnings exist
   });
 });
 

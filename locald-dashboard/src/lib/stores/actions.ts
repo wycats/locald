@@ -1,4 +1,4 @@
-import { writable, derived } from 'svelte/store';
+import { writable } from 'svelte/store';
 
 export type ActionType = 'start' | 'stop' | 'restart' | 'reset';
 
@@ -24,7 +24,3 @@ function createActionsStore() {
 }
 
 export const pendingActions = createActionsStore();
-
-export function isServicePending(serviceName: string) {
-	return derived(pendingActions, ($actions) => $actions.some((a) => a.serviceName === serviceName));
-}

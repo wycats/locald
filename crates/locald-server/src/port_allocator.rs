@@ -88,8 +88,6 @@ impl PortAllocator {
                 });
             }
             // Port is in our pending set (rare but possible if OS recycles aggressively)
-            // Remove it since we didn't actually allocate, then try again
-            inner.pending.remove(&port);
         }
 
         anyhow::bail!("Failed to allocate a unique port after 100 attempts")

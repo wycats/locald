@@ -934,7 +934,7 @@ impl ProcessManager {
         // Apply plugins to configuration
         // Plugin discovery and application failures are logged but do not fail startup
         // The returned guards keep plugin-allocated ports reserved until services bind
-        let _plugin_port_guards =
+        let mut plugin_port_guards =
             match plugins::apply_plugins_to_config(&mut config, &path, &self.port_allocator) {
                 Ok(guards) => guards,
                 Err(e) => {
@@ -942,6 +942,12 @@ impl ProcessManager {
                     Vec::new()
                 }
             };
+
+        // Release plugin guard listeners so services can bind to their allocated ports.
+        // Guards still track ports as pending until they drop at end of scope.
+        for guard in &mut plugin_port_guards {
+            guard.release_listener();
+        }
 
         if let Some(tx) = &event_tx {
             let _ = tx
@@ -1132,8 +1138,6 @@ impl ProcessManager {
                     if let Some(ref mut guard) = port_guard {
                         guard.release_listener();
                     }
-                    // Drop the guard after releasing listener - removes port from pending set
-                    drop(port_guard.take());
 
                     let controller = factory.create(name.clone(), service_config, &ctx);
 
