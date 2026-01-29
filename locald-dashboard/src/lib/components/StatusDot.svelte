@@ -62,8 +62,8 @@
 	}
 
 	.status-dot.unknown {
-		background: #6b7280;
-		box-shadow: 0 0 6px rgba(107, 114, 128, 0.4);
+		background: #71717a;
+		box-shadow: 0 0 6px rgba(113, 113, 122, 0.4);
 	}
 
 	@keyframes pulse {

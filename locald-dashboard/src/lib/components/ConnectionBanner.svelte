@@ -88,7 +88,7 @@
 		border-radius: 6px;
 		border: 1px solid #52525b; /* Zinc-600 */
 		background: #18181b; /* Zinc-900 */
-		color: #f4f4f5; /* Zinc-100 */
+		color: #e4e4e7; /* Zinc-200 */
 		font-size: 0.85rem;
 		cursor: pointer;
 		transition:
@@ -98,7 +98,12 @@
 
 	.retry:hover:not(:disabled) {
 		background: #27272a; /* Zinc-800 */
-		border-color: #71717a; /* Zinc-500 */
+		border-color: #3f3f46; /* Zinc-700 */
+	}
+
+	.retry:active:not(:disabled) {
+		background: #18181b; /* Zinc-900 */
+		border-color: #52525b; /* Zinc-600 */
 	}
 
 	.retry:disabled {
