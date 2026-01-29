@@ -1,3 +1,4 @@
+use crate::config::{ServiceConfig, TypedServiceConfig};
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,57 @@ pub enum LogStream {
     Stderr,
 }
 
+/// The type of a service.
+///
+/// # Example
+/// ```rust
+/// use locald_core::ipc::ServiceType;
+/// let service_type = ServiceType::Exec;
+/// assert_eq!(service_type.to_string(), "exec");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceType {
+    /// A generic executable service.
+    #[default]
+    Exec,
+    /// A managed Postgres database service.
+    Postgres,
+    /// A background worker service (no port).
+    Worker,
+    /// A container-based service.
+    Container,
+    /// A static site service.
+    Site,
+}
+
+impl std::fmt::Display for ServiceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exec => write!(f, "exec"),
+            Self::Postgres => write!(f, "postgres"),
+            Self::Worker => write!(f, "worker"),
+            Self::Container => write!(f, "container"),
+            Self::Site => write!(f, "site"),
+        }
+    }
+}
+
+impl From<&ServiceConfig> for ServiceType {
+    fn from(config: &ServiceConfig) -> Self {
+        match config {
+            ServiceConfig::Typed(typed) => match typed {
+                TypedServiceConfig::Exec(_) => Self::Exec,
+                TypedServiceConfig::Postgres(_) => Self::Postgres,
+                TypedServiceConfig::Worker(_) => Self::Worker,
+                TypedServiceConfig::Container(_) => Self::Container,
+                TypedServiceConfig::Site(_) => Self::Site,
+            },
+            ServiceConfig::Legacy(_) => Self::Exec,
+        }
+    }
+}
+
 impl std::fmt::Display for LogStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -31,15 +83,17 @@ impl std::fmt::Display for LogStream {
 ///
 /// # Example
 /// ```rust
-/// use locald_core::ipc::ServiceStatus;
+/// use locald_core::ipc::{ServiceStatus, ServiceType};
 /// use locald_core::state::{ServiceState, HealthStatus, HealthSource};
 ///
 /// let status = ServiceStatus {
 ///     name: "web".to_string(),
+///     service_type: ServiceType::Exec,
 ///     pid: Some(1234),
 ///     port: Some(8080),
 ///     status: ServiceState::Running,
 ///     url: Some("http://web.local".to_string()),
+///     connection_url: Some("http://localhost:8080".to_string()),
 ///     domain: Some("web.local".to_string()),
 ///     health_status: HealthStatus::Healthy,
 ///     health_source: HealthSource::Http,
@@ -53,6 +107,9 @@ impl std::fmt::Display for LogStream {
 pub struct ServiceStatus {
     /// The unique name of the service (e.g., "project:web").
     pub name: String,
+    /// The type of service (exec, postgres, worker, container, site).
+    #[serde(default)]
+    pub service_type: ServiceType,
     /// The process ID of the service, if running.
     pub pid: Option<u32>,
     /// The port the service is listening on, if any.
@@ -61,6 +118,9 @@ pub struct ServiceStatus {
     pub status: ServiceState,
     /// The public URL for the service, if applicable.
     pub url: Option<String>,
+    /// The connection URL for the service (e.g., postgres:// for databases, http://localhost:port for others).
+    #[serde(default)]
+    pub connection_url: Option<String>,
     /// The domain name for the service, if configured.
     pub domain: Option<String>,
     /// The health status of the service.
@@ -349,10 +409,12 @@ impl ServiceStatus {
     pub fn new(name: impl Into<String>, status: ServiceState) -> Self {
         Self {
             name: name.into(),
+            service_type: ServiceType::default(),
             pid: None,
             port: None,
             status,
             url: None,
+            connection_url: None,
             domain: None,
             health_status: HealthStatus::Unknown,
             health_source: HealthSource::None,

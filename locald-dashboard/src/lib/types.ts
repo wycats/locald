@@ -1,9 +1,13 @@
+export type ServiceType = 'exec' | 'postgres' | 'worker' | 'container' | 'site';
+
 export interface ServiceStatus {
 	name: string;
+	service_type: ServiceType;
 	pid: number | null;
 	port: number | null;
 	status: 'running' | 'stopped' | 'building';
 	url: string | null;
+	connection_url: string | null;
 	domain: string | null;
 	health_status: string;
 	health_source: string;

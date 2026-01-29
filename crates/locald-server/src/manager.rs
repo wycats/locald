@@ -350,6 +350,8 @@ impl ProcessManager {
         constellation: Option<String>,
         warnings: Vec<String>,
     ) -> ServiceStatus {
+        use locald_core::ipc::ServiceType;
+
         let (status, pid, port) = match snapshot {
             RuntimeSnapshot::Static {
                 is_running,
@@ -370,6 +372,10 @@ impl ProcessManager {
             }
         };
 
+        // Determine service type from config
+        let service_type = service_config.map(ServiceType::from).unwrap_or_default();
+
+        // Compute the public URL (domain-based or localhost)
         let url = if status == locald_core::state::ServiceState::Running && port.is_some() {
             if let Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) = service_config {
                 None
@@ -401,12 +407,26 @@ impl ProcessManager {
             None
         };
 
+        // Compute the connection URL (raw connection string)
+        let connection_url = if status == locald_core::state::ServiceState::Running {
+            match service_config {
+                Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) => {
+                    port.map(|p| format!("postgres://postgres@localhost:{p}/postgres"))
+                }
+                _ => port.map(|p| format!("http://localhost:{p}")),
+            }
+        } else {
+            None
+        };
+
         ServiceStatus {
             name: name.clone(),
+            service_type,
             pid,
             port,
             status,
             url,
+            connection_url,
             health_status,
             health_source,
             path,
