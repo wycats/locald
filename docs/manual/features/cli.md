@@ -179,7 +179,14 @@ locald add --name api --port 3000 npm start
 
 # Add the last successful 'try' command
 locald add last
+
+# Add a postgres service
+locald add postgres mydb
 ```
+
+**Options:**
+- `--name, -n <name>` - Service name (default: "web" for exec, "db" for postgres)
+- `--port, -p <port>` - Port to expose (exec services only)
 
 ### `locald service add`
 

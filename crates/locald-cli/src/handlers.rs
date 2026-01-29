@@ -105,12 +105,19 @@ pub fn run(cli: Cli) -> CliResult<()> {
             port,
         } => {
             utils::ensure_daemon_running()?;
-            let cmd_str = if command.len() == 1 && command[0] == "last" {
-                history::get_last().context("No history found")?
+            // Check if the first argument is "postgres" to route to postgres handler
+            if !command.is_empty() && command[0].to_lowercase() == "postgres" {
+                // Extract postgres name from remaining args (default to "db")
+                let pg_name = command.get(1).map(String::as_str).unwrap_or("db");
+                service::add_postgres(pg_name, None)?;
             } else {
-                command.join(" ")
-            };
-            service::add_exec(cmd_str, name.clone(), *port)?;
+                let cmd_str = if command.len() == 1 && command[0] == "last" {
+                    history::get_last().context("No history found")?
+                } else {
+                    command.join(" ")
+                };
+                service::add_exec(cmd_str, name.clone(), *port)?;
+            }
         }
         Commands::Service { command } => match command {
             ServiceCommands::Add { service_type } => match service_type {
