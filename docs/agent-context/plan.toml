@@ -2352,7 +2352,7 @@ aliases = ["27.1.1"]
 [[epochs.phases]]
 id = "phase-58"
 title = "Phase 58: Hot Reloading & Configuration Watcher"
-status = "pending"
+status = "completed"
 rfcs = ["0050"]
 ulid = "01KEX4X98ZNR62EYV55ANATQHM"
 slug = "36"
@@ -2361,7 +2361,7 @@ aliases = ["36"]
 [[epochs.phases.tasks]]
 id = "36.1"
 label = "Fix Manual Restart: Ensure `locald restart` reloads config from disk."
-status = "in-progress"
+status = "completed"
 ulid = "01KEX4X98ZF1A59D906X5TQK69"
 slug = "36.1"
 aliases = ["36.1"]
