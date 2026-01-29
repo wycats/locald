@@ -176,6 +176,12 @@
 		flex-direction: column;
 	}
 
+	@media (max-width: 640px) {
+		.inspector-focus {
+			left: 0;
+		}
+	}
+
 	.header {
 		padding: 12px 16px;
 		border-bottom: 1px solid #333;

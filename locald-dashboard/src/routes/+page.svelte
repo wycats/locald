@@ -59,4 +59,10 @@
 		flex-direction: column;
 		overflow: hidden;
 	}
+
+	@media (max-width: 640px) {
+		.workspace {
+			grid-template-columns: 1fr;
+		}
+	}
 </style>

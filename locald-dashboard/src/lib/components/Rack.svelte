@@ -415,6 +415,14 @@
 		min-height: 0;
 	}
 
+	@media (max-width: 640px) {
+		.rack {
+			max-height: 50vh;
+			border-right: none;
+			border-bottom: 1px solid #27272a;
+		}
+	}
+
 	.rack-header {
 		padding: 16px;
 		border-bottom: 1px solid #27272a;
