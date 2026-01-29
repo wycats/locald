@@ -132,6 +132,11 @@ async fn handle_events(
     let recent_logs = pm.get_recent_logs();
 
     let stream = async_stream::stream! {
+        // Send an initial comment to trigger the browser's onopen callback.
+        // Without this, EventSource waits for the first data event before
+        // firing onopen, which may never happen in an idle system.
+        yield Ok(SseEvent::default().comment("connected"));
+
         for entry in recent_logs {
              if let Ok(data) = serde_json::to_string(&Event::Log(entry)) {
                 yield Ok(SseEvent::default().data(data));

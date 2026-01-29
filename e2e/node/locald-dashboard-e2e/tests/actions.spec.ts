@@ -15,35 +15,38 @@ test("can start and stop services", async ({ page, locald }) => {
   await locald.runCli(["up", "examples/dummy-service"]);
 
   // 3. Wait for service to appear and be running
-  const card = page.locator(".card").filter({ hasText: "web" });
-  await expect(card).toBeVisible({ timeout: 10000 });
+  // The UI uses .rack-item for service items, not .card
+  const rackItem = page.locator(".rack-item").filter({ hasText: "web" });
+  await expect(rackItem).toBeVisible({ timeout: 10000 });
 
-  // Check for running status (dot has class 'running')
-  // We can check if the Stop button is visible, which implies running state
-  await expect(card.getByRole("button", { name: "Stop" })).toBeVisible();
+  // Check for running status - status dot should have 'running' class
+  const statusDot = rackItem.locator(".status-dot");
+  await expect(statusDot).toHaveClass(/running/, { timeout: 5000 });
 
-  // 4. Stop the service via card button
-  await card.getByRole("button", { name: "Stop" }).click();
+  // 4. Stop the service via More dropdown
+  await rackItem.hover();
+  const moreBtn = rackItem.getByRole("button", { name: "More" });
+  await expect(moreBtn).toBeVisible();
+  await moreBtn.click();
+  await page.locator(".menu-dropdown").getByText("Stop").click();
 
-  // 5. Verify it stops
-  // "Start" button should appear
-  await expect(card.getByRole("button", { name: "Start" })).toBeVisible();
-  // "Stop" button should disappear
-  await expect(card.getByRole("button", { name: "Stop" })).not.toBeVisible();
+  // 5. Verify it stops - status dot should change to 'stopped'
+  await expect(statusDot).toHaveClass(/stopped/, { timeout: 10000 });
+
+  // Start button should appear (in toolbar when stopped)
+  await rackItem.hover();
+  await expect(rackItem.getByRole("button", { name: "Start" })).toBeVisible();
 
   // 6. Start the service
-  await card.getByRole("button", { name: "Start" }).click();
+  await rackItem.getByRole("button", { name: "Start" }).click();
 
   // 7. Verify it starts
-  await expect(card.getByRole("button", { name: "Stop" })).toBeVisible();
+  await expect(statusDot).toHaveClass(/running/, { timeout: 10000 });
 
-  // 8. Stop All via sidebar
-  // Handle dialog
+  // 8. Stop Group via group header
   page.on("dialog", (dialog) => dialog.accept());
-
-  const sidebar = page.locator(".sidebar");
-  await sidebar.getByRole("button", { name: "Stop All" }).click();
+  await page.locator(".group-btn[title='Stop Group']").first().click();
 
   // 9. Verify service stops
-  await expect(card.getByRole("button", { name: "Start" })).toBeVisible();
+  await expect(statusDot).toHaveClass(/stopped/, { timeout: 10000 });
 });
