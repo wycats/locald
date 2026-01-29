@@ -129,6 +129,7 @@ locald init --name my-project --target ./my-project
 ```
 
 **Options:**
+
 - `--from-distribution <source>` - Initialize from a distribution archive (experimental)
 - `--name <name>` - Project name
 - `--target <path>` - Target directory
@@ -185,6 +186,7 @@ locald add postgres mydb
 ```
 
 **Options:**
+
 - `--name, -n <name>` - Service name (default: "web" for exec, "db" for postgres)
 - `--port, -p <port>` - Port to expose (exec services only)
 
@@ -295,6 +297,7 @@ locald doctor --verbose
 ```
 
 Checks:
+
 - Shim availability and permissions
 - Cgroup readiness
 - System requirements
@@ -344,6 +347,7 @@ sudo locald admin setup
 ```
 
 This command:
+
 1. Extracts the embedded shim binary
 2. Sets up permissions (root-owned, setuid)
 3. Configures cgroups for process isolation

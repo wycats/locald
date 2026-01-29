@@ -34,6 +34,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 **Problem**: Postgres services don't expose `DATABASE_URL` to dependent services automatically.
 
 **Solution**:
+
 - Add `connection_url` field to service status for data services
 - Auto-inject `DATABASE_URL` env var for services that depend on Postgres
 - Surface connection info in `locald status` and dashboard
@@ -43,6 +44,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 **Problem**: Docs promise live reload but it's not implemented.
 
 **Solution** (choose one):
+
 - **Option A**: Implement WebSocket-based reload signaling in the toolbar
 - **Option B**: Remove "live reload" claims from documentation until implemented
 
@@ -53,6 +55,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 **Problem**: Dashboard infers service type from name/port heuristics, not actual config.
 
 **Solution**:
+
 - Add `service_type` field to status API response
 - Update dashboard to display actual type from config
 
@@ -61,6 +64,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 **Problem**: Error handling varies between commands (miette vs eprintln).
 
 **Solution**:
+
 - Standardize all CLI errors through `CliError` type
 - Ensure consistent formatting and help text
 
@@ -69,6 +73,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 **Problem**: Many commands (`plugin`, `admin`, `ai`, `serve`) are undocumented.
 
 **Solution**:
+
 - Audit full CLI surface against docs
 - Either document commands or mark them as internal/experimental
 
@@ -77,6 +82,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 **Problem**: Can add `exec`, `site`, `container` services but not `postgres`.
 
 **Solution**:
+
 - Add `postgres` variant to `locald add` command
 
 ### P2: Nice-to-haves (Out of Scope for Initial Phase)
@@ -87,7 +93,7 @@ These gaps create friction and undermine the "clone → locald up" experience.
 ## Implementation Plan
 
 1. **Service status API enhancements** - Add `service_type` and `connection_url` fields
-2. **Postgres env injection** - Auto-inject DATABASE_URL for postgres dependencies  
+2. **Postgres env injection** - Auto-inject DATABASE_URL for postgres dependencies
 3. **Dashboard updates** - Display accurate service types and connection info
 4. **CLI error standardization** - Migrate all commands to CliError
 5. **Documentation sync** - Update CLI docs to match reality
