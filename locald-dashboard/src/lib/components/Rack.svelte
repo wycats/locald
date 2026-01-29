@@ -1,6 +1,6 @@
 <script lang="ts">
 	/* eslint-disable svelte/no-navigation-without-resolve */
-	import { projects } from '$lib/stores/services';
+	import { projects, services, servicesError, servicesLoading } from '$lib/stores/services';
 	import { pendingActions } from '$lib/stores/actions';
 	import {
 		startServiceWithFeedback,
@@ -19,7 +19,8 @@
 		RefreshCw,
 		RotateCcw,
 		ExternalLink,
-		Loader2
+		Loader2,
+		AlertCircle
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
 
@@ -191,164 +192,189 @@
 	</div>
 
 	<div class="rack-list">
-		{#each $projects as project (project.name)}
-			{@const isCollapsed = collapsedGroups.includes(project.name)}
-			{@const isAllStopped = project.services.every((s) => s.status === 'stopped')}
-
-			<!-- svelte-ignore a11y-click-events-have-key-events -->
-			<!-- svelte-ignore a11y-no-static-element-interactions -->
-			<div class="rack-group-header" class:disabled={isAllStopped}>
-				<div class="group-title" on:click={() => toggleGroupCollapse(project.name)}>
-					{#if isCollapsed}
-						<ChevronRight size={12} />
-					{:else}
-						<ChevronDown size={12} />
-					{/if}
-					<span>{project.name}</span>
-				</div>
-				<div class="group-actions">
-					<button
-						class="group-btn"
-						on:click|stopPropagation={() => toggleMonitorGroup(project.name, project.services)}
-						title="Monitor group in Deck"
-					>
-						<Layers size={12} />
-					</button>
-					<button
-						class="group-btn"
-						on:click|stopPropagation={() => toggleGroup(project.services)}
-						title={isAllStopped ? 'Start Group' : 'Stop Group'}
-					>
-						<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
-					</button>
-				</div>
+		{#if $servicesLoading && $projects.length === 0}
+			<div class="rack-state">
+				<Loader2 size={24} class="spin" />
+				<span class="state-title">Loading services...</span>
 			</div>
+		{:else if $servicesError}
+			<div class="rack-state error">
+				<AlertCircle size={24} />
+				<span class="state-title">Failed to load services</span>
+				<span class="state-message">{$servicesError}</span>
+				<button class="retry-btn" on:click={() => services.refresh()}>
+					<RefreshCw size={14} />
+					Retry
+				</button>
+			</div>
+		{:else if $projects.length === 0}
+			<div class="rack-state empty">
+				<Layers size={24} />
+				<span class="state-title">No services found</span>
+				<span class="state-message">
+					Run <code>locald up</code> in a project directory to start services.
+				</span>
+			</div>
+		{:else}
+			{#each $projects as project (project.name)}
+				{@const isCollapsed = collapsedGroups.includes(project.name)}
+				{@const isAllStopped = project.services.every((s) => s.status === 'stopped')}
 
-			{#if !isCollapsed}
-				{#each project.services as service (service.name)}
-					{@const type = getServiceType(service)}
-					{@const displayName = getDisplayName(service.name, project.name)}
+				<!-- svelte-ignore a11y-click-events-have-key-events -->
+				<!-- svelte-ignore a11y-no-static-element-interactions -->
+				<div class="rack-group-header" class:disabled={isAllStopped}>
+					<div class="group-title" on:click={() => toggleGroupCollapse(project.name)}>
+						{#if isCollapsed}
+							<ChevronRight size={12} />
+						{:else}
+							<ChevronDown size={12} />
+						{/if}
+						<span>{project.name}</span>
+					</div>
+					<div class="group-actions">
+						<button
+							class="group-btn"
+							on:click|stopPropagation={() => toggleMonitorGroup(project.name, project.services)}
+							title="Monitor group in Deck"
+						>
+							<Layers size={12} />
+						</button>
+						<button
+							class="group-btn"
+							on:click|stopPropagation={() => toggleGroup(project.services)}
+							title={isAllStopped ? 'Start Group' : 'Stop Group'}
+						>
+							<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
+						</button>
+					</div>
+				</div>
 
-					<!-- svelte-ignore a11y-click-events-have-key-events -->
-					<!-- svelte-ignore a11y-no-static-element-interactions -->
-					<div
-						id="service-{service.name}"
-						class="rack-item"
-						class:monitored={monitored.includes(service.name)}
-						class:focused={focused === service.name}
-						class:disabled={service.status === 'stopped'}
-						on:click={() => toggleMonitor(service.name)}
-					>
-						<!-- Layer 1: Content (Left Group) -->
-						<div class="item-content">
-							<div class="status-dot {service.status}"></div>
-							<span class="service-name" title={service.name}>{displayName}</span>
+				{#if !isCollapsed}
+					{#each project.services as service (service.name)}
+						{@const type = getServiceType(service)}
+						{@const displayName = getDisplayName(service.name, project.name)}
 
-							{#if service.url && service.status === 'running'}
-								<a
-									href={service.url}
-									target="_blank"
-									class="type-chip {type} interactive"
-									title="Open {service.url}"
-									on:click={(e) => e.stopPropagation()}
-								>
-									{type}
-									<ExternalLink size={9} />
-								</a>
-							{:else}
-								<span class="type-chip {type}">{type}</span>
-							{/if}
-						</div>
+						<!-- svelte-ignore a11y-click-events-have-key-events -->
+						<!-- svelte-ignore a11y-no-static-element-interactions -->
+						<div
+							id="service-{service.name}"
+							class="rack-item"
+							class:monitored={monitored.includes(service.name)}
+							class:focused={focused === service.name}
+							class:disabled={service.status === 'stopped'}
+							on:click={() => toggleMonitor(service.name)}
+						>
+							<!-- Layer 1: Content (Left Group) -->
+							<div class="item-content">
+								<div class="status-dot {service.status}"></div>
+								<span class="service-name" title={service.name}>{displayName}</span>
 
-						<!-- Layer 2: Toolbar Overlay -->
-						<div class="item-toolbar">
-							<div class="toolbar-bg"></div>
-							<div class="toolbar-actions">
-								{#if service.status === 'running'}
-									<button
-										class="control-btn monitor-btn"
-										class:active={monitored.includes(service.name)}
-										on:click={(e) => toggleMonitor(service.name, e)}
-										title="Monitor in Deck"
+								{#if service.url && service.status === 'running'}
+									<a
+										href={service.url}
+										target="_blank"
+										class="type-chip {type} interactive"
+										title="Open {service.url}"
+										on:click={(e) => e.stopPropagation()}
 									>
-										<Monitor size={14} />
-									</button>
-									<button
-										class="control-btn"
-										title="Restart"
-										disabled={isPending(service.name)}
-										on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
-									>
-										{#if isPending(service.name)}
-											<Loader2 size={14} class="spin" />
-										{:else}
-											<RefreshCw size={14} />
-										{/if}
-									</button>
-									<div class="menu-wrapper">
-										<button
-											class="control-btn"
-											on:click={(e) => toggleMenu(service.name, e)}
-											title="More"
-										>
-											<MoreHorizontal size={14} />
-										</button>
-										{#if activeMenu === service.name}
-											<!-- svelte-ignore a11y-click-events-have-key-events -->
-											<!-- svelte-ignore a11y-no-static-element-interactions -->
-											<div class="menu-dropdown" on:click={(e) => e.stopPropagation()}>
-												<div class="menu-item info">
-													<span>PID: {service.pid || '-'}</span>
-													<span>Port: {service.port || '-'}</span>
-												</div>
-												<div class="menu-separator"></div>
-												<button
-													class="menu-action danger"
-													disabled={isPending(service.name)}
-													on:click={() => resetServiceWithFeedback(service.name)}
-												>
-													{#if isPending(service.name)}
-														<Loader2 size={12} class="spin" />
-													{:else}
-														<RotateCcw size={12} />
-													{/if}
-													Reset
-												</button>
-												<button
-													class="menu-action danger"
-													disabled={isPending(service.name)}
-													on:click={() => stopServiceWithFeedback(service.name)}
-												>
-													{#if isPending(service.name)}
-														<Loader2 size={12} class="spin" />
-													{:else}
-														<Power size={12} />
-													{/if}
-													Stop
-												</button>
-											</div>
-										{/if}
-									</div>
+										{type}
+										<ExternalLink size={9} />
+									</a>
 								{:else}
-									<button
-										class="control-btn power-btn"
-										disabled={isPending(service.name)}
-										on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
-										title="Start"
-									>
-										{#if isPending(service.name)}
-											<Loader2 size={14} class="spin" />
-										{:else}
-											<Power size={14} />
-										{/if}
-									</button>
+									<span class="type-chip {type}">{type}</span>
 								{/if}
 							</div>
+
+							<!-- Layer 2: Toolbar Overlay -->
+							<div class="item-toolbar">
+								<div class="toolbar-bg"></div>
+								<div class="toolbar-actions">
+									{#if service.status === 'running'}
+										<button
+											class="control-btn monitor-btn"
+											class:active={monitored.includes(service.name)}
+											on:click={(e) => toggleMonitor(service.name, e)}
+											title="Monitor in Deck"
+										>
+											<Monitor size={14} />
+										</button>
+										<button
+											class="control-btn"
+											title="Restart"
+											disabled={isPending(service.name)}
+											on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
+										>
+											{#if isPending(service.name)}
+												<Loader2 size={14} class="spin" />
+											{:else}
+												<RefreshCw size={14} />
+											{/if}
+										</button>
+										<div class="menu-wrapper">
+											<button
+												class="control-btn"
+												on:click={(e) => toggleMenu(service.name, e)}
+												title="More"
+											>
+												<MoreHorizontal size={14} />
+											</button>
+											{#if activeMenu === service.name}
+												<!-- svelte-ignore a11y-click-events-have-key-events -->
+												<!-- svelte-ignore a11y-no-static-element-interactions -->
+												<div class="menu-dropdown" on:click={(e) => e.stopPropagation()}>
+													<div class="menu-item info">
+														<span>PID: {service.pid || '-'}</span>
+														<span>Port: {service.port || '-'}</span>
+													</div>
+													<div class="menu-separator"></div>
+													<button
+														class="menu-action danger"
+														disabled={isPending(service.name)}
+														on:click={() => resetServiceWithFeedback(service.name)}
+													>
+														{#if isPending(service.name)}
+															<Loader2 size={12} class="spin" />
+														{:else}
+															<RotateCcw size={12} />
+														{/if}
+														Reset
+													</button>
+													<button
+														class="menu-action danger"
+														disabled={isPending(service.name)}
+														on:click={() => stopServiceWithFeedback(service.name)}
+													>
+														{#if isPending(service.name)}
+															<Loader2 size={12} class="spin" />
+														{:else}
+															<Power size={12} />
+														{/if}
+														Stop
+													</button>
+												</div>
+											{/if}
+										</div>
+									{:else}
+										<button
+											class="control-btn power-btn"
+											disabled={isPending(service.name)}
+											on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
+											title="Start"
+										>
+											{#if isPending(service.name)}
+												<Loader2 size={14} class="spin" />
+											{:else}
+												<Power size={14} />
+											{/if}
+										</button>
+									{/if}
+								</div>
+							</div>
 						</div>
-					</div>
-				{/each}
-			{/if}
-		{/each}
+					{/each}
+				{/if}
+			{/each}
+		{/if}
 	</div>
 
 	<div
@@ -388,6 +414,66 @@
 		overflow-y: auto;
 		overflow-x: hidden;
 		min-height: 0;
+	}
+
+	.rack-state {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		padding: 32px 24px;
+		color: #a1a1aa;
+		text-align: center;
+	}
+
+	.rack-state.error {
+		color: #fca5a5;
+	}
+
+	.rack-state.empty {
+		color: #a1a1aa;
+	}
+
+	.state-title {
+		font-size: 13px;
+		font-weight: 600;
+		color: #e4e4e7;
+	}
+
+	.rack-state.error .state-title {
+		color: #fecaca;
+	}
+
+	.state-message {
+		font-size: 12px;
+		color: #a1a1aa;
+		max-width: 240px;
+	}
+
+	.rack-state.error .state-message {
+		color: #fca5a5;
+	}
+
+	.retry-btn {
+		margin-top: 8px;
+		background: #1f2937;
+		border: 1px solid #374151;
+		color: #e5e7eb;
+		border-radius: 6px;
+		padding: 6px 10px;
+		font-size: 12px;
+		cursor: pointer;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		transition:
+			background 0.2s,
+			border-color 0.2s;
+	}
+	.retry-btn:hover {
+		background: #111827;
+		border-color: #4b5563;
 	}
 
 	.rack-list::-webkit-scrollbar {
