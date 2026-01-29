@@ -1,6 +1,6 @@
 ---
 title: "Hot Reloading & Service Restart"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
+stage: 1 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
 feature: Hot Reloading
 ---
 
@@ -75,19 +75,23 @@ The `locald-server` needs to expand its file watching capabilities.
 
 ## Implementation Status
 
-**Current Status**: Partially implemented.
+**Current Status**: ✅ Fully implemented.
 
-### What's Implemented
+### Implemented
 
-- **File Watcher Infrastructure**: The `notify` crate is integrated and file watching exists
-- **Manual Restart**: `locald restart` command works
+| Component | Location | Notes |
+|-----------|----------|-------|
+| **File Watcher** | `crates/locald-server/src/manager.rs:860` | `notify` crate watches `locald.toml`, `Procfile`, `.env` |
+| **Debouncing** | `crates/locald-server/src/manager.rs:837` | 500ms debounce prevents rapid-fire restarts |
+| **Hot Reload Logic** | `crates/locald-server/src/manager.rs:848` | File changes trigger `apply_config()` |
+| **Config Diff Detection** | `crates/locald-server/src/manager.rs:1064` | Only changed services are restarted |
+| **Manual Restart Reload** | `crates/locald-server/src/api.rs:225` | `restart` → `start()` → `apply_config()` reads disk |
 
-### What's NOT Implemented
+### Future Polish (Optional)
 
-- **Automatic Config Reload**: The watcher exists but is NOT wired to trigger automatic service restarts on `locald.toml` changes
-- **Hot Reload Logic**: The connection between file change events and the service restart machinery is not implemented
-- **Dashboard Notification**: No "Configuration changed, restarting..." notification exists
+- **Dashboard Notification**: Visual "Configuration changed, restarting..." toast
+- **CLI Notification**: Surface reload events in `locald logs`
 
 ### Summary
 
-The foundation (file watcher) exists, but the core feature (automatic restart on config save) is not wired up. This remains a Stage 0 strawman - the design is documented but not executed.
+The hot reload feature is **fully functional**. Saving `locald.toml` triggers automatic service restarts with 500ms debouncing. Manual `locald restart` always reloads config from disk.
