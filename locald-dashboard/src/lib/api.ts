@@ -1,4 +1,4 @@
-import type { ServiceStatus } from './types';
+import type { ServiceInspectResponse, ServiceStatus } from './types';
 import { connection } from '$lib/stores/connection';
 
 export async function getServices(): Promise<ServiceStatus[]> {
@@ -54,7 +54,7 @@ export async function restartAllServices(): Promise<void> {
 import { services } from '$lib/stores/services';
 import { logs } from '$lib/stores/logs';
 
-export async function getServiceInspect(name: string): Promise<unknown> {
+export async function getServiceInspect(name: string): Promise<ServiceInspectResponse> {
 	const res = await fetch(`/api/services/${name}`);
 	if (!res.ok) {
 		throw new Error(`Failed to inspect service ${name}`);

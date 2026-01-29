@@ -32,3 +32,17 @@ export interface LogEntry {
 	stream: string;
 	message: string;
 }
+
+export interface ServiceInspectResponse {
+	name: string;
+	pid: number | null;
+	port: number | null;
+	url: string | null;
+	connection_url?: string;
+	health_status: string;
+	health_source: string;
+	path: string | null;
+	container_id: string | null;
+	warnings: string[];
+	config?: unknown;
+}
