@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use crate::build;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands, TrayCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
@@ -1067,6 +1067,138 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                     println!("Hosts file updated.");
                 }
+            }
+        }
+        Commands::Tray { command } => {
+            #[cfg(target_os = "macos")]
+            {
+                match command {
+                    TrayCommands::Start => {
+                        let plist = dirs::home_dir()
+                            .context("Could not determine home directory")?
+                            .join("Library/LaunchAgents/com.locald.agent.plist");
+                        if !plist.exists() {
+                            use std::io::IsTerminal;
+
+                            if std::io::stdin().is_terminal() {
+                                let run_setup = dialoguer::Confirm::new()
+                                    .with_prompt("The tray agent requires admin setup. Run it now?")
+                                    .default(true)
+                                    .interact()
+                                    .unwrap_or(false);
+
+                                if run_setup {
+                                    use std::os::unix::process::CommandExt;
+
+                                    let exe_path = std::env::current_exe()
+                                        .context("Failed to get executable path")?;
+                                    #[allow(clippy::disallowed_methods)]
+                                    let err = std::process::Command::new("sudo")
+                                        .arg("--")
+                                        .arg(&exe_path)
+                                        .arg("admin")
+                                        .arg("setup")
+                                        .exec();
+                                    return Err(CliError::message(format!(
+                                        "Failed to run admin setup: {err}"
+                                    )));
+                                }
+                            }
+
+                            return Err(CliError::message(
+                                "LaunchAgent not installed. Run `sudo locald admin setup` first.",
+                            ));
+                        }
+
+                        #[allow(clippy::disallowed_methods)]
+                        let status = std::process::Command::new("launchctl")
+                            .args(["start", "com.locald.agent"])
+                            .status()
+                            .context("Failed to run launchctl start")?;
+
+                        if !status.success() {
+                            return Err(CliError::message(format!(
+                                "launchctl start failed with status: {status}"
+                            )));
+                        }
+                    }
+                    TrayCommands::Stop => {
+                        #[allow(clippy::disallowed_methods)]
+                        let status = std::process::Command::new("launchctl")
+                            .args(["stop", "com.locald.agent"])
+                            .status()
+                            .context("Failed to run launchctl stop")?;
+
+                        if !status.success() {
+                            return Err(CliError::message(format!(
+                                "launchctl stop failed with status: {status}"
+                            )));
+                        }
+                    }
+                    TrayCommands::Status => {
+                        #[allow(clippy::disallowed_methods)]
+                        let output = std::process::Command::new("launchctl")
+                            .args(["list", "com.locald.agent"])
+                            .output()
+                            .context("Failed to run launchctl list")?;
+
+                        if output.status.success() {
+                            // launchctl list succeeds when loaded, but the agent
+                            // may not be running. Check for a PID in the output.
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            if stdout.contains("\"PID\"") {
+                                println!("locald tray agent is running");
+                            } else {
+                                println!("locald tray agent is loaded but not running");
+                                println!("  Start it with: locald tray start");
+                            }
+                        } else {
+                            println!("locald tray agent is not loaded");
+                        }
+                    }
+                    TrayCommands::Restart => {
+                        let plist = dirs::home_dir()
+                            .context("Could not determine home directory")?
+                            .join("Library/LaunchAgents/com.locald.agent.plist");
+                        if !plist.exists() {
+                            return Err(CliError::message(
+                                "LaunchAgent not installed. Run `sudo locald admin setup` first.",
+                            ));
+                        }
+
+                        #[allow(clippy::disallowed_methods)]
+                        let stop_status = std::process::Command::new("launchctl")
+                            .args(["stop", "com.locald.agent"])
+                            .status()
+                            .context("Failed to run launchctl stop")?;
+
+                        if !stop_status.success() {
+                            return Err(CliError::message(format!(
+                                "launchctl stop failed with status: {stop_status}"
+                            )));
+                        }
+
+                        #[allow(clippy::disallowed_methods)]
+                        let start_status = std::process::Command::new("launchctl")
+                            .args(["start", "com.locald.agent"])
+                            .status()
+                            .context("Failed to run launchctl start")?;
+
+                        if !start_status.success() {
+                            return Err(CliError::message(format!(
+                                "launchctl start failed with status: {start_status}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = command;
+                return Err(CliError::message(
+                    "Tray commands are only supported on macOS.",
+                ));
             }
         }
         Commands::Ai { command } => match command {

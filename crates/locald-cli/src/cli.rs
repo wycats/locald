@@ -222,6 +222,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+    /// Manage the menu bar agent
+    Tray {
+        #[command(subcommand)]
+        command: TrayCommands,
+    },
     /// AI integration commands
     Ai {
         #[command(subcommand)]
@@ -565,6 +570,18 @@ pub enum AdminCommands {
     Teardown,
     /// Sync hosts file with running services (requires sudo)
     SyncHosts,
+}
+
+#[derive(Subcommand)]
+pub enum TrayCommands {
+    /// Start the menu bar agent
+    Start,
+    /// Stop the menu bar agent
+    Stop,
+    /// Check whether the menu bar agent is running
+    Status,
+    /// Restart the menu bar agent
+    Restart,
 }
 
 #[derive(Subcommand)]
