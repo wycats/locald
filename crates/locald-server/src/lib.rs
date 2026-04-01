@@ -437,15 +437,30 @@ async fn async_main(
     // connections when we probe (pfctl redirects 80→8080, 443→8443).
     #[cfg(target_os = "macos")]
     if config.server.privileged_ports {
-        // Brief yield to let the serve tasks start accepting.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if pfctl_redirect_active(80) {
-            info!("pfctl redirect active: advertising port 80");
-            manager.set_http_port(Some(80)).await;
+        // Retry the pfctl probe — the serve tasks need a moment to start accepting.
+        let mut http_ready = false;
+        let mut tls_ready = false;
+        for attempt in 1..=5 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if !http_ready && pfctl_redirect_active(80) {
+                info!("pfctl redirect active: advertising port 80 (attempt {attempt})");
+                manager.set_http_port(Some(80)).await;
+                http_ready = true;
+            }
+            if !tls_ready && pfctl_redirect_active(443) {
+                info!("pfctl redirect active: advertising port 443 (attempt {attempt})");
+                manager.set_https_port(Some(443)).await;
+                tls_ready = true;
+            }
+            if http_ready && tls_ready {
+                break;
+            }
         }
-        if pfctl_redirect_active(443) {
-            info!("pfctl redirect active: advertising port 443");
-            manager.set_https_port(Some(443)).await;
+        if !http_ready || !tls_ready {
+            warn!(
+                "pfctl port forwarding not detected. Services will use ports 8080/8443. \
+                 Run `sudo locald admin setup` to configure port forwarding."
+            );
         }
     }
 

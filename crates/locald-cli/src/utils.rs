@@ -305,6 +305,104 @@ fn show_container_unsupported_error() -> ! {
 
 #[allow(clippy::missing_const_for_fn)]
 pub fn verify_shim() {
+    #[cfg(target_os = "macos")]
+    {
+        use dialoguer::Confirm;
+        use std::io::IsTerminal;
+
+        // Skip setup verification in sandbox mode (used for testing)
+        if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
+            return;
+        }
+
+        let config_path = crate::global_config::global_config_path();
+        let config_file_exists = config_path
+            .as_ref()
+            .map(|path| path.exists())
+            .unwrap_or(false);
+        if !config_file_exists {
+            return;
+        }
+
+        let config = crate::global_config::load();
+        if !config.server.privileged_ports {
+            return;
+        }
+
+        let certs_dir = match locald_utils::cert::get_certs_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to determine locald certs directory: {}",
+                    style::CROSS,
+                    e
+                );
+                std::process::exit(1);
+            }
+        };
+
+        let ca_path = certs_dir.join("rootCA.pem");
+        if ca_path.exists() {
+            return;
+        }
+
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "{} locald needs initial setup. Run `sudo locald admin setup`.",
+                style::CROSS
+            );
+            std::process::exit(1);
+        }
+
+        let run_setup = Confirm::new()
+            .with_prompt("locald needs initial setup. Run it now?")
+            .default(true)
+            .interact()
+            .unwrap_or(false);
+
+        if !run_setup {
+            eprintln!(
+                "{} locald needs initial setup. Run `sudo locald admin setup`.",
+                style::CROSS
+            );
+            std::process::exit(1);
+        }
+
+        let exe_path = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to get executable path: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let status = std::process::Command::new("sudo")
+            .arg("--")
+            .arg(&exe_path)
+            .arg("admin")
+            .arg("setup")
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                eprintln!();
+                eprintln!(
+                    "{} Setup complete! Continuing with your command...",
+                    style::CHECK
+                );
+                eprintln!();
+            }
+            Ok(s) => {
+                eprintln!("Setup failed with exit code: {:?}", s.code());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to run setup: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         // Skip shim verification in sandbox mode (used for testing)
