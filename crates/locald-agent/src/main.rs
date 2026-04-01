@@ -10,10 +10,11 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use core_foundation::runloop::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
     use locald_core::state::ServiceState;
     use locald_core::{IpcRequest, IpcResponse};
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_foundation::MainThreadMarker;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
@@ -47,6 +48,12 @@ mod macos {
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        // Initialize NSApplication — required for AppKit event dispatch (menu clicks, etc).
+        let mtm = MainThreadMarker::new().expect("locald-agent must run on the main thread");
+        let app = NSApplication::sharedApplication(mtm);
+        // Accessory = no Dock icon, no app menu, just the menu bar item.
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
         let icon = build_icon()?;
 
         let menu = Menu::new();
@@ -70,45 +77,54 @@ mod macos {
 
         spawn_status_thread(status_tx);
 
+        // NSApplication.run() owns the event loop. We use an NSTimer to
+        // periodically check our channels from the main thread.
         let menu_events = MenuEvent::receiver();
         let mut current_status = DaemonStatus::Checking;
-        let mut use_runloop = true;
-        let mut should_quit = false;
+
+        // Call finishLaunching to initialize the app — registers with the
+        // window server so click events are delivered.
+        app.finishLaunching();
 
         loop {
-            while let Ok(update) = status_rx.try_recv() {
-                if update != current_status {
-                    current_status = update;
-                    let label = current_status.label();
-                    status_item.set_text(label);
+            // Drain all pending AppKit events.
+            loop {
+                #[allow(unsafe_code)]
+                let event = unsafe {
+                    app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                        objc2_app_kit::NSEventMask::Any,
+                        None, // don't wait — return immediately if no events
+                        objc2_foundation::NSDefaultRunLoopMode,
+                        true,
+                    )
+                };
+                match event {
+                    Some(event) => app.sendEvent(&event),
+                    None => break,
                 }
             }
 
+            // Check for status updates from IPC thread.
+            while let Ok(update) = status_rx.try_recv() {
+                if update != current_status {
+                    current_status = update;
+                    status_item.set_text(current_status.label());
+                }
+            }
+
+            // Check for menu item clicks.
             while let Ok(event) = menu_events.try_recv() {
                 if event.id == open_item.id() {
                     open_dashboard();
                 } else if event.id == quit_item.id() {
-                    should_quit = true;
+                    return Ok(());
                 }
             }
 
-            if should_quit {
-                break;
-            }
-
-            if use_runloop {
-                let mode = unsafe { kCFRunLoopDefaultMode };
-                let result = CFRunLoop::run_in_mode(mode, Duration::from_millis(100), true);
-                if result == CFRunLoopRunResult::Finished {
-                    use_runloop = false;
-                }
-            } else {
-                #[allow(clippy::disallowed_methods)]
-                thread::sleep(Duration::from_millis(100));
-            }
+            // Yield briefly to avoid busy-spinning.
+            #[allow(clippy::disallowed_methods)]
+            thread::sleep(Duration::from_millis(50));
         }
-
-        Ok(())
     }
 
     fn spawn_status_thread(status_tx: mpsc::Sender<DaemonStatus>) {
