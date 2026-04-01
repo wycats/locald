@@ -7,7 +7,9 @@ pub static CROSS: Emoji<'_, '_> = Emoji("❌", "x");
 pub static PACKAGE: Emoji<'_, '_> = Emoji("📦", "[]");
 pub static WARN: Emoji<'_, '_> = Emoji("⚠", "!");
 pub static INFO: Emoji<'_, '_> = Emoji("ℹ️", "i");
+#[allow(dead_code)]
 pub static ROCKET: Emoji<'_, '_> = Emoji("🚀", ">");
+#[allow(dead_code)]
 pub static DOT: Emoji<'_, '_> = Emoji("•", "-");
 
 static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();

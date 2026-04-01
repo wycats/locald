@@ -34,7 +34,7 @@ pub fn run(sh: &Shell, full: bool) -> Result<()> {
     }
 
     println!("Running clippy...");
-    cmd!(sh, "cargo clippy --workspace -- -D warnings").run()?;
+    cmd!(sh, "cargo clippy -- -D warnings").run()?;
 
     println!("Building dashboard (CI-equivalent)...");
     cmd!(
@@ -86,11 +86,7 @@ pub fn run(sh: &Shell, full: bool) -> Result<()> {
     }
 
     println!("Running unit tests...");
-    cmd!(
-        sh,
-        "cargo test --tests --workspace --all-features --exclude locald-e2e"
-    )
-    .run()?;
+    cmd!(sh, "cargo test --tests --all-features").run()?;
 
     if full {
         println!("Running full checks (sudo + e2e)...");

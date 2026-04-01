@@ -487,10 +487,11 @@ struct OptionalIntegrationsRollup {
 }
 
 fn render_optional_integrations() -> OptionalIntegrationsRollup {
+    #[allow(unused_mut)]
     let mut rollup = OptionalIntegrationsRollup::default();
     println!("{} Optional integrations:", style::PACKAGE);
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::path::Path;
 
@@ -591,8 +592,11 @@ fn render_optional_integrations() -> OptionalIntegrationsRollup {
     rollup
 }
 
-fn render_optional_integrations_cliclack(verbose: bool) -> OptionalIntegrationsRollup {
+fn render_optional_integrations_cliclack(
+    #[allow(unused_variables)] verbose: bool,
+) -> OptionalIntegrationsRollup {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[allow(dead_code)]
     enum IntegrationStatus {
         Available,
         Unavailable,
@@ -626,11 +630,14 @@ fn render_optional_integrations_cliclack(verbose: bool) -> OptionalIntegrationsR
 
     // We print a roll-up summary for this section so "unavailable" doesn't get lost
     // among otherwise-similar lines.
+    #[allow(unused_mut, unused_variables)]
     let mut lines: Vec<IntegrationLine> = Vec::new();
+    #[allow(unused_mut, unused_variables)]
     let mut available_count: usize = 0;
+    #[allow(unused_mut, unused_variables)]
     let mut unavailable_count: usize = 0;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::path::Path;
 

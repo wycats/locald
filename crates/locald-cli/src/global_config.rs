@@ -12,3 +12,15 @@ pub fn load() -> GlobalConfig {
         .and_then(|contents| toml::from_str(&contents).ok())
         .unwrap_or_default()
 }
+
+/// Save the global config to disk, creating the directory if needed.
+pub fn save(config: GlobalConfig) -> anyhow::Result<()> {
+    let path = global_config_path()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine global config path"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = toml::to_string_pretty(&config)?;
+    std::fs::write(&path, contents)?;
+    Ok(())
+}

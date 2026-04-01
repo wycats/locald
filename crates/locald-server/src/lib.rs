@@ -322,6 +322,19 @@ async fn async_main(
             }
         }
     } else if config.server.privileged_ports {
+        // On macOS, pfctl redirects 80→8080, so we bind 8080 and advertise port 80.
+        // On Linux, the shim binds port 80 directly.
+        #[cfg(target_os = "macos")]
+        {
+            match proxy.bind_http(8080).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    error!("Failed to bind port 8080: {e}.");
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         match proxy.bind_http(80).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -348,6 +361,13 @@ async fn async_main(
         }
     };
 
+    // On macOS with pfctl, override the advertised port to the public-facing one.
+    // Only override if pfctl rules are actually installed (they're ephemeral across reboots).
+    #[cfg(target_os = "macos")]
+    if config.server.privileged_ports && pfctl_redirect_active() {
+        manager.set_http_port(Some(80)).await;
+    }
+
     if let Some(l) = listener_http {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -371,6 +391,19 @@ async fn async_main(
             }
         }
     } else if config.server.privileged_ports {
+        // On macOS, pfctl redirects 443→8443, so we bind 8443 and advertise port 443.
+        // On Linux, the shim binds port 443 directly.
+        #[cfg(target_os = "macos")]
+        {
+            match proxy.bind_https(8443).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    error!("Failed to bind port 8443: {e}.");
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         match proxy.bind_https(443).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -390,6 +423,12 @@ async fn async_main(
             }
         }
     };
+
+    // On macOS with pfctl, override the advertised port to the public-facing one.
+    #[cfg(target_os = "macos")]
+    if config.server.privileged_ports && pfctl_redirect_active() {
+        manager.set_https_port(Some(443)).await;
+    }
 
     if let Some(l) = listener_https {
         let proxy_clone = proxy.clone();
@@ -450,6 +489,19 @@ async fn async_main(
 
     info!("locald-server stopped");
     Ok(())
+}
+
+/// Check whether locald's pfctl redirect rules are active on macOS.
+///
+/// Checks for actual `rdr` rules in the anchor, not just anchor existence.
+#[cfg(target_os = "macos")]
+fn pfctl_redirect_active() -> bool {
+    #[allow(clippy::disallowed_methods)]
+    std::process::Command::new("pfctl")
+        .args(["-a", "com.locald/redirect", "-s", "rules"])
+        .output()
+        .map(|o| o.status.success() && o.stdout.windows(3).any(|w| w == b"rdr"))
+        .unwrap_or(false)
 }
 
 async fn watch_for_upgrade(

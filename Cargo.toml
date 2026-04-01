@@ -5,6 +5,7 @@ members = [
     "crates/locald-core",
     "crates/locald-shim",
     "crates/locald-builder",
+    "crates/locald-agent",
     "e2e/rust/locald-e2e",
     "examples/cnb-test/rust-extractor",
     "examples/oci-example",
@@ -12,6 +13,22 @@ members = [
     "crates/locald-oci",
     "crates/cnb-client",
     "crates/locald-vmm",
+    "crates/xtask",
+    "tools/fetch-kernel",
+]
+# Cross-platform crates. Platform-specific crates (locald-shim, locald-vmm,
+# locald-e2e = Linux-only; locald-agent = macOS-only) are still workspace
+# members but excluded from default operations.
+default-members = [
+    "crates/locald-server",
+    "crates/locald-cli",
+    "crates/locald-core",
+    "crates/locald-builder",
+    "examples/cnb-test/rust-extractor",
+    "examples/oci-example",
+    "crates/locald-utils",
+    "crates/locald-oci",
+    "crates/cnb-client",
     "crates/xtask",
     "tools/fetch-kernel",
 ]

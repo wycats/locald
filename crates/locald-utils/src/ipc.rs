@@ -29,3 +29,26 @@ pub fn socket_path() -> Result<PathBuf, IpcError> {
         |path| Ok(PathBuf::from(path)),
     )
 }
+
+/// Send a request to the locald daemon and return the response.
+///
+/// This is a basic blocking IPC client. For richer error handling
+/// (distinguishing not-running vs connection-refused, etc.), use
+/// the CLI's `client::send_request` instead.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be connected to, or if
+/// serialization/deserialization fails.
+pub fn send_request(request: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let path = socket_path()?;
+    let mut stream = UnixStream::connect(&path)?;
+    stream.write_all(request)?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(buf)
+}

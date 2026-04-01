@@ -117,6 +117,7 @@ pub fn ensure_root_ca() -> Result<EnsureRootCaResult> {
 /// Generates and caches certificates on the fly for requested domains, signed by the locald CA.
 pub struct CertManager {
     issuer: CertifiedIssuer<'static, KeyPair>,
+    ca_cert_der: rustls::pki_types::CertificateDer<'static>,
     cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
 
@@ -124,6 +125,7 @@ impl fmt::Debug for CertManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CertManager")
             .field("issuer", &"CertifiedIssuer(...)")
+            .field("ca_cert_der", &"CertificateDer(...)")
             .field("cache", &self.cache)
             .finish()
     }
@@ -153,10 +155,13 @@ impl CertManager {
             );
         }
 
-        // Use tokio::fs for reading the key
+        // Read both the CA key and cert
         let ca_key_pem = tokio::fs::read_to_string(&ensure.paths.key_path)
             .await
             .context("Failed to read rootCA-key.pem")?;
+        let ca_cert_pem = tokio::fs::read_to_string(&ensure.paths.cert_path)
+            .await
+            .context("Failed to read rootCA.pem")?;
 
         // Offload CPU-intensive key parsing and issuer creation
         let issuer = tokio::task::spawn_blocking(move || {
@@ -171,8 +176,21 @@ impl CertManager {
         })
         .await??;
 
+        // Parse the CA cert DER for inclusion in TLS cert chains.
+        // Note: pem::parse() returns only the first PEM block. This is correct
+        // for locald's single-block CA cert files.
+        let ca_cert_der = tokio::task::spawn_blocking(move || {
+            let pem_parsed = pem::parse(ca_cert_pem.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to parse CA cert PEM: {e}"))?;
+            Ok::<_, anyhow::Error>(rustls::pki_types::CertificateDer::from(
+                pem_parsed.into_contents(),
+            ))
+        })
+        .await??;
+
         Ok(Self {
             issuer,
+            ca_cert_der,
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -192,7 +210,8 @@ impl CertManager {
         let private_key_der = key_pair.serialize_der();
 
         let private_key = PrivateKeyDer::Pkcs8(private_key_der.into());
-        let cert_chain = vec![cert_der.clone()];
+        // Include the CA cert in the chain so browsers can verify the full trust path.
+        let cert_chain = vec![cert_der.clone(), self.ca_cert_der.clone()];
 
         let signing_key = sign::any_supported_type(&private_key)
             .map_err(|_| anyhow::anyhow!("Failed to create signing key"))?;
@@ -245,6 +264,9 @@ impl ResolvesServerCert for CertManager {
 
 /// Returns the directory where locald certificates are stored.
 ///
+/// On macOS: `~/Library/Application Support/locald/certs/`
+/// On Linux: `~/.locald/certs/`
+///
 /// # Errors
 ///
 /// Returns an error if the user's home directory cannot be determined.
@@ -252,7 +274,7 @@ pub fn get_certs_dir() -> Result<PathBuf> {
     // When invoked via pkexec/sudo, prefer the invoking user's home directory rather than /root.
     // This keeps the CA location consistent between the privileged setup path and the unprivileged
     // daemon/server path.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         if let Ok(pkexec_uid) = std::env::var("PKEXEC_UID")
             && let Ok(uid) = pkexec_uid.parse::<u32>()
@@ -270,8 +292,28 @@ pub fn get_certs_dir() -> Result<PathBuf> {
         }
     }
 
-    let home = directories::UserDirs::new().context("Could not find home directory")?;
-    Ok(home.home_dir().join(".locald").join("certs"))
+    Ok(locald_data_dir()?.join("certs"))
+}
+
+/// Returns the platform-appropriate data directory for locald.
+///
+/// On macOS: `~/Library/Application Support/locald/`
+/// On Linux/other: `~/.locald/`
+fn locald_data_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Could not find home directory")?;
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("locald"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(home.join(".locald"))
+    }
 }
 
 #[cfg(test)]
