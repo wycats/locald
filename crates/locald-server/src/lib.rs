@@ -361,13 +361,6 @@ async fn async_main(
         }
     };
 
-    // On macOS with pfctl, override the advertised port to the public-facing one.
-    // Only override if pfctl rules are actually installed (they're ephemeral across reboots).
-    #[cfg(target_os = "macos")]
-    if config.server.privileged_ports && pfctl_redirect_active() {
-        manager.set_http_port(Some(80)).await;
-    }
-
     if let Some(l) = listener_http {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -424,12 +417,6 @@ async fn async_main(
         }
     };
 
-    // On macOS with pfctl, override the advertised port to the public-facing one.
-    #[cfg(target_os = "macos")]
-    if config.server.privileged_ports && pfctl_redirect_active() {
-        manager.set_https_port(Some(443)).await;
-    }
-
     if let Some(l) = listener_https {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -437,6 +424,23 @@ async fn async_main(
                 error!("HTTPS proxy server error: {e}");
             }
         });
+    }
+
+    // On macOS with pfctl, override the advertised ports to the public-facing ones.
+    // This must happen after serve tasks are spawned so the proxy is accepting
+    // connections when we probe (pfctl redirects 80→8080, 443→8443).
+    #[cfg(target_os = "macos")]
+    if config.server.privileged_ports {
+        // Brief yield to let the serve tasks start accepting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if pfctl_redirect_active(80) {
+            info!("pfctl redirect active: advertising port 80");
+            manager.set_http_port(Some(80)).await;
+        }
+        if pfctl_redirect_active(443) {
+            info!("pfctl redirect active: advertising port 443");
+            manager.set_https_port(Some(443)).await;
+        }
     }
 
     let reason = tokio::select! {
@@ -491,17 +495,18 @@ async fn async_main(
     Ok(())
 }
 
-/// Check whether locald's pfctl redirect rules are active on macOS.
+/// Check whether pfctl port redirection is active for a given port.
 ///
-/// Checks for actual `rdr` rules in the anchor, not just anchor existence.
+/// Probes by attempting a TCP connection to localhost on the privileged port.
+/// If pfctl redirect rules are active, the connection reaches our proxy on
+/// the corresponding high port and succeeds. No root access needed.
 #[cfg(target_os = "macos")]
-fn pfctl_redirect_active() -> bool {
-    #[allow(clippy::disallowed_methods)]
-    std::process::Command::new("pfctl")
-        .args(["-a", "com.locald/redirect", "-s", "rules"])
-        .output()
-        .map(|o| o.status.success() && o.stdout.windows(3).any(|w| w == b"rdr"))
-        .unwrap_or(false)
+fn pfctl_redirect_active(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
 }
 
 async fn watch_for_upgrade(
