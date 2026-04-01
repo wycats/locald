@@ -621,14 +621,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 // `args` is used only on Linux; suppress warning on other platforms.
                 #[allow(unused_variables)]
                 AdminCommands::Setup => {
-                    #[cfg(all(unix, target_os = "linux"))]
+                    #[cfg(unix)]
                     if !nix::unistd::geteuid().is_root() {
                         use std::io::IsTerminal;
+                        use std::os::unix::process::CommandExt;
                         use std::process::Command;
 
-                        // `admin setup` fundamentally requires root, but we can be friendly here:
-                        // when run from a TTY, re-exec ourselves via `pkexec` (for GUI auth) or
-                        // `sudo` (fallback) so the user doesn't have to remember to type it.
+                        // `admin setup` requires root for privileged operations.
+                        // On Linux: shim install, cgroup setup, port binding.
+                        // On macOS: pfctl port forwarding rules.
                         if !std::io::stdin().is_terminal() {
                             return Err(CliError::message(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`.",
@@ -640,42 +641,29 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                         let args: Vec<_> = std::env::args_os().skip(1).collect();
 
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::process::CommandExt;
-
-                            // Prefer pkexec when polkit is available (provides GUI auth dialog).
-                            // Fall back to sudo if pkexec is not available.
-                            if locald_utils::shim::is_polkit_available() {
-                                eprintln!(
-                                    "{} Using polkit for privilege escalation (GUI auth dialog)...",
-                                    style::INFO
-                                );
-                                let err = Command::new("pkexec").arg(&exe_path).args(&args).exec();
-                                // pkexec failed, fall back to sudo
-                                eprintln!(
-                                    "{} pkexec failed ({err}), falling back to sudo...",
-                                    style::WARN
-                                );
-                            }
-
-                            // Fall back to sudo
-                            let err = Command::new("sudo")
-                                .arg("--")
-                                .arg(&exe_path)
-                                .args(&args)
-                                .exec();
-                            return Err(CliError::message(format!(
-                                "Failed to exec sudo for admin setup: {err}"
-                            )));
+                        // On Linux, prefer pkexec when polkit is available (GUI auth dialog).
+                        #[cfg(target_os = "linux")]
+                        if locald_utils::shim::is_polkit_available() {
+                            eprintln!(
+                                "{} Using polkit for privilege escalation (GUI auth dialog)...",
+                                style::INFO
+                            );
+                            let err = Command::new("pkexec").arg(&exe_path).args(&args).exec();
+                            eprintln!(
+                                "{} pkexec failed ({err}), falling back to sudo...",
+                                style::WARN
+                            );
                         }
 
-                        #[cfg(not(unix))]
-                        {
-                            return Err(CliError::message(
-                                "This command requires root privileges. Please run with sudo.",
-                            ));
-                        }
+                        // Fall back to sudo (works on both Linux and macOS).
+                        let err = Command::new("sudo")
+                            .arg("--")
+                            .arg(&exe_path)
+                            .args(&args)
+                            .exec();
+                        return Err(CliError::message(format!(
+                            "Failed to exec sudo for admin setup: {err}"
+                        )));
                     }
 
                     #[cfg(target_os = "linux")]
@@ -828,8 +816,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     {
                         cliclack::intro("locald admin setup (macOS)")?;
 
-                        // On macOS, generate and trust the Root CA certificate.
-                        // No shim installation or cgroup setup is needed.
+                        // Step 1: Generate and trust the Root CA certificate.
                         let mut trust_installed = false;
                         {
                             let s = cliclack::spinner();
@@ -850,6 +837,40 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 "{} HTTPS trust was not installed. You can retry with `locald admin setup` or manually trust the CA in Keychain Access.",
                                 style::WARN
                             );
+                        }
+
+                        // Step 2: Install pfctl port forwarding (80→8080, 443→8443).
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Configuring port forwarding (80 → 8080, 443 → 8443)...");
+                            match crate::port_forward::macos::install() {
+                                Ok(()) => {
+                                    s.stop("Port forwarding configured");
+                                }
+                                Err(e) => {
+                                    s.error(format!("Port forwarding failed: {e}"));
+                                    println!(
+                                        "{} Port forwarding was not configured. Services will be available on ports 8080/8443 instead of 80/443.",
+                                        style::WARN
+                                    );
+                                }
+                            }
+                        }
+
+                        // Step 3: Enable privileged ports in global config.
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Updating configuration...");
+                            let mut config = crate::global_config::load();
+                            config.server.privileged_ports = true;
+                            match crate::global_config::save(config) {
+                                Ok(()) => {
+                                    s.stop("Configuration updated (privileged_ports = true)");
+                                }
+                                Err(e) => {
+                                    s.stop(format!("Config save failed: {e} (non-fatal)"));
+                                }
+                            }
                         }
 
                         cliclack::outro("Setup complete")?;
