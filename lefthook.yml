@@ -7,7 +7,7 @@ pre-commit:
       stage_fixed: true
     clippy:
       glob: "*.rs"
-      run: cargo clippy --workspace --exclude locald-shim --exclude locald-vmm --exclude locald-e2e -- -D warnings
+      run: cargo clippy -- -D warnings
     dashboard-lint:
       root: locald-dashboard
       glob: "*.{js,ts,svelte}"

@@ -368,6 +368,7 @@ pub fn verify_shim() {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     // The following tests document the container detection behavior for locald.

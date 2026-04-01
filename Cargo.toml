@@ -16,6 +16,23 @@ members = [
     "crates/xtask",
     "tools/fetch-kernel",
 ]
+# Cross-platform crates only. Linux-only crates (locald-shim, locald-vmm,
+# locald-e2e) are still workspace members but excluded from default operations
+# so they don't cause errors in editors/CI on macOS.
+default-members = [
+    "crates/locald-server",
+    "crates/locald-cli",
+    "crates/locald-core",
+    "crates/locald-builder",
+    "crates/locald-agent",
+    "examples/cnb-test/rust-extractor",
+    "examples/oci-example",
+    "crates/locald-utils",
+    "crates/locald-oci",
+    "crates/cnb-client",
+    "crates/xtask",
+    "tools/fetch-kernel",
+]
 resolver = "3"
 
 [workspace.package]
