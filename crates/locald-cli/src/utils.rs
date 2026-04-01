@@ -45,35 +45,40 @@ pub fn spawn_daemon() -> CliResult<()> {
 
     let log_file = std::fs::File::create("/tmp/locald.log")?;
 
-    // On Linux, use setsid to create a new session so the daemon survives terminal close.
-    // On macOS, setsid doesn't exist as a command; use direct spawn instead.
-    #[cfg(target_os = "linux")]
+    // Use pre_exec to call setsid() (the POSIX syscall) in the child process before
+    // exec. This creates a new session so the daemon isn't killed by SIGHUP when the
+    // terminal closes. Works on both Linux and macOS.
+    #[cfg(unix)]
     {
-        let status = std::process::Command::new("setsid")
-            .arg(&exe_path)
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("server")
+            .arg("start")
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file);
+        // SAFETY: setsid() is async-signal-safe (POSIX.1-2008). It only affects the
+        // child process between fork and exec, with no side effects in the parent.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        cmd.spawn()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(&exe_path)
             .arg("server")
             .arg("start")
             .stdout(log_file.try_clone()?)
-            .stderr(log_file.try_clone()?)
-            .spawn();
-
-        match status {
-            Ok(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("Warning: setsid failed ({e}), trying direct spawn...");
-            }
-        }
+            .stderr(log_file)
+            .spawn()?;
     }
 
-    std::process::Command::new(&exe_path)
-        .arg("server")
-        .arg("start")
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file)
-        .spawn()?;
     std::thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
 }
