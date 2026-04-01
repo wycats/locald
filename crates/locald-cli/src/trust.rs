@@ -129,51 +129,35 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
-    use security_framework::certificate::SecCertificate;
-    use security_framework::trust_settings::{Domain, TrustSettings};
-
-    let pem_data = std::fs::read(cert_path)
-        .with_context(|| format!("Failed to read certificate at {}", cert_path.display()))?;
-
-    let parsed = pem::parse(&pem_data)
-        .map_err(|e| anyhow::anyhow!("Failed to parse PEM certificate: {e}"))?;
-
-    let cert = SecCertificate::from_der(parsed.contents())
-        .map_err(|e| anyhow::anyhow!("Failed to create SecCertificate from DER: {e}"))?;
-
-    // Add to the default (login) keychain.
-    // This may produce a duplicate-item error if already present — that's fine.
-    match cert.add_to_keychain(None) {
-        Ok(()) => {}
-        Err(e) if e.code() == -25299 => {
-            // errSecDuplicateItem — cert already in keychain, continue to trust settings
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to add certificate to login keychain: {e}. \
-                 You may need to open Keychain Access and add it manually."
-            ));
-        }
-    }
-
-    // Mark as trusted for all uses.
-    // Use Admin domain when running as root (e.g. via `sudo locald admin setup`),
-    // because the User domain requires the user's GUI session context which isn't
-    // available under sudo. Admin domain trust is system-wide and persists.
-    let domain = if nix::unistd::geteuid().is_root() {
-        Domain::Admin
+    // Use the `security` CLI to add the cert as trusted. This is the most reliable
+    // approach on macOS — the native SecTrustSettings API has issues with authorization
+    // dialogs and session contexts that the CLI handles transparently.
+    //
+    // When root: add to System keychain with admin-domain trust (system-wide, no GUI prompt).
+    // When user: add to login keychain with user-domain trust.
+    let status = if nix::unistd::geteuid().is_root() {
+        std::process::Command::new("security")
+            .args(["add-trusted-cert", "-d", "-r", "trustRoot", "-k"])
+            .arg("/Library/Keychains/System.keychain")
+            .arg(cert_path)
+            .status()
+            .context("Failed to execute `security add-trusted-cert`")?
     } else {
-        Domain::User
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+        std::process::Command::new("security")
+            .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
+            .arg(home.join("Library/Keychains/login.keychain-db"))
+            .arg(cert_path)
+            .status()
+            .context("Failed to execute `security add-trusted-cert`")?
     };
 
-    TrustSettings::new(domain)
-        .set_trust_settings_always(&cert)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to set trust settings ({domain:?}): {e}. \
-             If running via sudo, ensure you're in a desktop session."
-            )
-        })?;
+    if !status.success() {
+        anyhow::bail!(
+            "`security add-trusted-cert` failed with status: {status}. \
+             You may need to run `sudo locald admin setup` or manually trust the CA in Keychain Access."
+        );
+    }
 
     Ok(())
 }
