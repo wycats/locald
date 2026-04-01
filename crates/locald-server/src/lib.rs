@@ -362,9 +362,9 @@ async fn async_main(
     };
 
     // On macOS with pfctl, override the advertised port to the public-facing one.
-    // This must happen after bind_http which sets it to the actual bound port.
+    // Only override if pfctl rules are actually installed (they're ephemeral across reboots).
     #[cfg(target_os = "macos")]
-    if config.server.privileged_ports {
+    if config.server.privileged_ports && pfctl_redirect_active() {
         manager.set_http_port(Some(80)).await;
     }
 
@@ -426,7 +426,7 @@ async fn async_main(
 
     // On macOS with pfctl, override the advertised port to the public-facing one.
     #[cfg(target_os = "macos")]
-    if config.server.privileged_ports {
+    if config.server.privileged_ports && pfctl_redirect_active() {
         manager.set_https_port(Some(443)).await;
     }
 
@@ -489,6 +489,17 @@ async fn async_main(
 
     info!("locald-server stopped");
     Ok(())
+}
+
+/// Check whether locald's pfctl redirect rules are active on macOS.
+#[cfg(target_os = "macos")]
+fn pfctl_redirect_active() -> bool {
+    #[allow(clippy::disallowed_methods)]
+    std::process::Command::new("pfctl")
+        .args(["-s", "Anchors", "-a", "com.locald"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 async fn watch_for_upgrade(

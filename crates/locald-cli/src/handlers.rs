@@ -857,8 +857,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 3: Enable privileged ports in global config.
-                        {
+                        // Step 3: Enable privileged ports in global config only if pfctl succeeded.
+                        if crate::port_forward::macos::is_installed() {
                             let s = cliclack::spinner();
                             s.start("Updating configuration...");
                             let mut config = crate::global_config::load();

@@ -121,9 +121,21 @@ mod macos {
                 }
             }
 
-            // Yield briefly to avoid busy-spinning.
-            #[allow(clippy::disallowed_methods)]
-            thread::sleep(Duration::from_millis(50));
+            // Wait for next event with a timeout. This blocks the thread
+            // efficiently instead of busy-spinning, waking only when an AppKit
+            // event arrives or the timeout expires.
+            #[allow(unsafe_code)]
+            let next = unsafe {
+                app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    objc2_app_kit::NSEventMask::Any,
+                    Some(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.5)),
+                    objc2_foundation::NSDefaultRunLoopMode,
+                    true,
+                )
+            };
+            if let Some(event) = next {
+                app.sendEvent(&event);
+            }
         }
     }
 

@@ -698,14 +698,14 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
 pub fn collect_report(_config: AcquireConfig<'_>) -> Result<DoctorReport> {
     let mut problems: Vec<Problem> = Vec::new();
 
-    // On macOS, cgroups are not available — that's expected, not a failure.
+    // Cgroups are not available on non-Linux platforms — that's expected.
     problems.push(Problem {
         id: "platform.cgroups".to_string(),
         severity: Severity::Info,
         status: Status::Skip,
-        summary: "cgroups not available (expected on macOS)".to_string(),
+        summary: "cgroups not available (not Linux)".to_string(),
         details: Some(
-            "Resource isolation via cgroups is Linux-only. macOS uses host-first exec services."
+            "Resource isolation via cgroups is Linux-only. This platform uses host-first exec services."
                 .to_string(),
         ),
         remediation: vec![],
@@ -735,7 +735,7 @@ pub fn collect_report(_config: AcquireConfig<'_>) -> Result<DoctorReport> {
                 id: "host.shim.present".to_string(),
                 severity: Severity::Info,
                 status: Status::Skip,
-                summary: "locald-shim not found (optional on macOS)".to_string(),
+                summary: "locald-shim not found (optional on non-Linux)".to_string(),
                 details: None,
                 remediation: vec![],
                 evidence: vec![],
