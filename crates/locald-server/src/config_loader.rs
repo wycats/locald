@@ -80,9 +80,10 @@ impl ConfigLoader {
     }
 
     fn global_config_path() -> PathBuf {
-        directories::ProjectDirs::from("com", "locald", "locald").map_or_else(
+        // Use BaseDirs::config_dir() + "locald/config.toml" to match the CLI's global_config module.
+        directories::BaseDirs::new().map_or_else(
             || PathBuf::from("locald-config.toml"),
-            |dirs| dirs.config_dir().join("config.toml"),
+            |dirs| dirs.config_dir().join("locald/config.toml"),
         )
     }
 
