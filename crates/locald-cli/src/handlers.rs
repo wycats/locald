@@ -870,6 +870,38 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
+                        // Step 4: Install locald-agent as a LaunchAgent (starts at login).
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Installing menu bar agent...");
+
+                            let exe_dir = std::env::current_exe()?
+                                .parent()
+                                .context("Failed to get executable directory")?
+                                .to_path_buf();
+                            let agent_path = exe_dir.join("locald-agent");
+
+                            if agent_path.exists() {
+                                match install_launch_agent(&agent_path) {
+                                    Ok(()) => {
+                                        s.stop("Menu bar agent installed (starts at login)");
+                                    }
+                                    Err(e) => {
+                                        s.stop(format!(
+                                            "Menu bar agent install failed: {e} (non-fatal)"
+                                        ));
+                                    }
+                                }
+                            } else {
+                                s.stop("Menu bar agent not found (skipped)");
+                                println!(
+                                    "{} locald-agent not found at {}. The menu bar agent won't start at login.",
+                                    style::WARN,
+                                    agent_path.display()
+                                );
+                            }
+                        }
+
                         cliclack::outro("Setup complete")?;
                         println!("Next: run `locald up`.");
                     }
@@ -884,6 +916,89 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     // Note: We don't setcap on locald anymore, because the shim handles it.
                     // But if the user runs locald directly without shim, it won't have caps.
                     // That's fine, the shim is the intended way for privileged ops.
+                }
+                #[allow(unused_variables)]
+                AdminCommands::Teardown => {
+                    #[cfg(unix)]
+                    if !nix::unistd::geteuid().is_root() {
+                        use std::io::IsTerminal;
+                        use std::os::unix::process::CommandExt;
+                        use std::process::Command;
+
+                        if !std::io::stdin().is_terminal() {
+                            return Err(CliError::message(
+                                "This command requires root privileges. Re-run with `sudo locald admin teardown`.",
+                            ));
+                        }
+
+                        let exe_path = std::env::current_exe()
+                            .context("Failed to resolve current executable path")?;
+
+                        let args: Vec<_> = std::env::args_os().skip(1).collect();
+
+                        let err = Command::new("sudo")
+                            .arg("--")
+                            .arg(&exe_path)
+                            .args(&args)
+                            .exec();
+                        return Err(CliError::message(format!(
+                            "Failed to exec sudo for admin teardown: {err}"
+                        )));
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        cliclack::intro("locald admin teardown (macOS)")?;
+
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Removing menu bar agent...");
+
+                            match uninstall_launch_agent() {
+                                Ok(()) => {
+                                    s.stop("Menu bar agent removed (if installed)");
+                                    println!(
+                                        "{} LaunchAgent com.locald.agent removed (if present).",
+                                        style::CHECK
+                                    );
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Menu bar agent removal failed: {e} (non-fatal)"
+                                    ));
+                                }
+                            }
+                        }
+
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Removing port forwarding rules...");
+                            match crate::port_forward::macos::remove() {
+                                Ok(()) => {
+                                    s.stop("Port forwarding rules removed");
+                                    println!(
+                                        "{} Removed pfctl redirect rules (com.locald/redirect).",
+                                        style::CHECK
+                                    );
+                                }
+                                Err(e) => {
+                                    s.error(format!("Port forwarding removal failed: {e}"));
+                                    return Err(CliError::message(format!(
+                                        "Port forwarding teardown failed: {e}"
+                                    )));
+                                }
+                            }
+                        }
+
+                        cliclack::outro("Teardown complete")?;
+                    }
+
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        return Err(CliError::message(
+                            "Admin teardown is not supported on this platform.",
+                        ));
+                    }
                 }
                 AdminCommands::SyncHosts => {
                     // Fetch services
@@ -1305,6 +1420,99 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 println!("{json}");
             }
         },
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
+    let label = "com.locald.agent";
+
+    // When running under sudo, resolve the real user's home for the plist location.
+    let user_home = if nix::unistd::geteuid().is_root() {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER")
+            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+        {
+            Some(user.dir)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Write the plist directly to the correct user's LaunchAgents directory.
+    let plist_dir = if let Some(ref home) = user_home {
+        home.join("Library/LaunchAgents")
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .join("Library/LaunchAgents")
+    };
+    std::fs::create_dir_all(&plist_dir)?;
+
+    let plist_path = plist_dir.join(format!("{}.plist", label));
+
+    // Write a minimal launchd plist.
+    let plist_content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#,
+        label = label,
+        program = agent_path.display(),
+    );
+    std::fs::write(&plist_path, plist_content)?;
+
+    // Unload any existing agent, then load the new plist.
+    #[allow(clippy::disallowed_methods)]
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(&plist_path)
+        .output();
+
+    #[allow(clippy::disallowed_methods)]
+    let status = std::process::Command::new("launchctl")
+        .args(["load", "-w"])
+        .arg(&plist_path)
+        .status()
+        .context("Failed to run launchctl load")?;
+
+    if !status.success() {
+        anyhow::bail!("launchctl load failed with status: {status}");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launch_agent() -> anyhow::Result<()> {
+    let label = "com.locald.agent";
+    let plist_path = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+        .join("Library/LaunchAgents")
+        .join(format!("{label}.plist"));
+
+    if plist_path.exists() {
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w"])
+            .arg(&plist_path)
+            .output();
+        std::fs::remove_file(&plist_path)?;
     }
 
     Ok(())

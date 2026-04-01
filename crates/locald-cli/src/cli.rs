@@ -561,6 +561,8 @@ pub enum ServerCommands {
 pub enum AdminCommands {
     /// Setup locald permissions (requires sudo)
     Setup,
+    /// Remove admin setup changes (requires sudo)
+    Teardown,
     /// Sync hosts file with running services (requires sudo)
     SyncHosts,
 }
