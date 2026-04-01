@@ -45,31 +45,37 @@ pub fn spawn_daemon() -> CliResult<()> {
 
     let log_file = std::fs::File::create("/tmp/locald.log")?;
 
-    let status = std::process::Command::new("setsid")
-        .arg(&exe_path)
+    // On Linux, use setsid to create a new session so the daemon survives terminal close.
+    // On macOS, setsid doesn't exist as a command; use direct spawn instead.
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("setsid")
+            .arg(&exe_path)
+            .arg("server")
+            .arg("start")
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file.try_clone()?)
+            .spawn();
+
+        match status {
+            Ok(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Warning: setsid failed ({e}), trying direct spawn...");
+            }
+        }
+    }
+
+    std::process::Command::new(&exe_path)
         .arg("server")
         .arg("start")
         .stdout(log_file.try_clone()?)
-        .stderr(log_file.try_clone()?)
-        .spawn();
-
-    match status {
-        Ok(_) => {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Warning: setsid failed ({e}), trying direct spawn...");
-            std::process::Command::new(&exe_path)
-                .arg("server")
-                .arg("start")
-                .stdout(log_file.try_clone()?)
-                .stderr(log_file)
-                .spawn()?;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok(())
-        }
-    }
+        .stderr(log_file)
+        .spawn()?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    Ok(())
 }
 
 pub fn ensure_daemon_running() -> CliResult<()> {
