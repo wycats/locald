@@ -25,18 +25,20 @@ pub struct ServerConfig {
     /// Whether to attempt binding to privileged ports (80/443).
     /// If true, failure to bind these ports will result in an error.
     /// Use sandbox mode (`locald --sandbox test up`) for unprivileged testing.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_privileged_ports")]
     pub privileged_ports: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            privileged_ports: true,
+            privileged_ports: default_privileged_ports(),
         }
     }
 }
 
-const fn default_true() -> bool {
-    true
+/// On Linux, default to privileged ports (80/443 via setuid shim).
+/// On macOS, default to unprivileged ports (the shim model doesn't apply).
+const fn default_privileged_ports() -> bool {
+    cfg!(target_os = "linux")
 }
