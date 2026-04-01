@@ -297,6 +297,12 @@ async fn async_main(
     let cert_manager = match locald_utils::cert::CertManager::new().await {
         Ok(cm) => Some(std::sync::Arc::new(cm)),
         Err(e) => {
+            if config.server.privileged_ports {
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize HTTPS certificates: {e}\n\
+                     Run `sudo locald admin setup` to configure HTTPS trust."
+                ));
+            }
             warn!("Failed to initialize CertManager: {e}. HTTPS will be disabled.");
             None
         }

@@ -817,26 +817,22 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         cliclack::intro("locald admin setup (macOS)")?;
 
                         // Step 1: Generate and trust the Root CA certificate.
-                        let mut trust_installed = false;
                         {
                             let s = cliclack::spinner();
                             s.start("Configuring HTTPS trust...");
                             match crate::trust::install_root_ca_into_trust_store() {
                                 Ok(()) => {
-                                    trust_installed = true;
                                     s.stop("HTTPS trust configured");
                                 }
                                 Err(e) => {
                                     s.error(format!("HTTPS trust failed: {e}"));
+                                    return Err(CliError::message(format!(
+                                        "HTTPS trust setup failed: {e}\n\
+                                         This is required for locald to serve on ports 80/443.\n\
+                                         Make sure you're running with sudo: sudo locald admin setup"
+                                    )));
                                 }
                             }
-                        }
-
-                        if !trust_installed {
-                            println!(
-                                "{} HTTPS trust was not installed. You can retry with `locald admin setup` or manually trust the CA in Keychain Access.",
-                                style::WARN
-                            );
                         }
 
                         // Step 2: Install pfctl port forwarding (80→8080, 443→8443).
@@ -849,10 +845,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 }
                                 Err(e) => {
                                     s.error(format!("Port forwarding failed: {e}"));
-                                    println!(
-                                        "{} Port forwarding was not configured. Services will be available on ports 8080/8443 instead of 80/443.",
-                                        style::WARN
-                                    );
+                                    return Err(CliError::message(format!(
+                                        "Port forwarding setup failed: {e}\n\
+                                         This is required for locald to serve on ports 80/443.\n\
+                                         Make sure you're running with sudo: sudo locald admin setup"
+                                    )));
                                 }
                             }
                         }
