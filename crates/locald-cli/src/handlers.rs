@@ -990,13 +990,25 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
+                        // Reset privileged_ports config to default.
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Resetting configuration...");
+                            let mut config = crate::global_config::load();
+                            config.server.privileged_ports = false;
+                            match crate::global_config::save(config) {
+                                Ok(()) => s.stop("Configuration reset (privileged_ports = false)"),
+                                Err(e) => s.stop(format!("Config reset failed: {e} (non-fatal)")),
+                            }
+                        }
+
                         cliclack::outro("Teardown complete")?;
                     }
 
                     #[cfg(not(target_os = "macos"))]
                     {
                         return Err(CliError::message(
-                            "Admin teardown is not supported on this platform.",
+                            "Admin teardown is only supported on macOS. On Linux, use your package manager.",
                         ));
                     }
                 }
