@@ -315,15 +315,8 @@ pub fn verify_shim() {
             return;
         }
 
-        let config_path = crate::global_config::global_config_path();
-        let config_file_exists = config_path
-            .as_ref()
-            .map(|path| path.exists())
-            .unwrap_or(false);
-        if !config_file_exists {
-            return;
-        }
-
+        // Check if privileged ports are expected (either by default or explicit config).
+        // If privileged_ports is false (e.g. sandbox), skip the readiness check.
         let config = crate::global_config::load();
         if !config.server.privileged_ports {
             return;
