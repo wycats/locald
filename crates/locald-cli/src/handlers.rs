@@ -828,7 +828,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     s.error(format!("HTTPS trust failed: {e}"));
                                     return Err(CliError::message(format!(
                                         "HTTPS trust setup failed: {e}\n\
-                                         This is required for locald to serve on ports 80/443.\n\
+                                         This is required for browsers to trust locald's HTTPS certificates.\n\
                                          Make sure you're running with sudo: sudo locald admin setup"
                                     )));
                                 }

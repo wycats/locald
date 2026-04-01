@@ -334,8 +334,9 @@ pub fn verify_shim() {
             }
         };
 
-        let ca_path = certs_dir.join("rootCA.pem");
-        if ca_path.exists() {
+        let ca_cert = certs_dir.join("rootCA.pem");
+        let ca_key = certs_dir.join("rootCA-key.pem");
+        if ca_cert.exists() && ca_key.exists() {
             return;
         }
 
