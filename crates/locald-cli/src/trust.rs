@@ -133,6 +133,8 @@ fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
     // approach on macOS — the native SecTrustSettings API has issues with authorization
     // dialogs and session contexts that the CLI handles transparently.
     //
+    // Idempotent: `security add-trusted-cert` succeeds silently if the cert is already trusted.
+    //
     // When root: add to System keychain with admin-domain trust (system-wide, no GUI prompt).
     // When user: add to login keychain with user-domain trust.
     let status = if nix::unistd::geteuid().is_root() {

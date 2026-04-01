@@ -15,8 +15,6 @@ mod macos {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use objc2_foundation::MainThreadMarker;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -172,21 +170,10 @@ mod macos {
         }
     }
 
-    fn send_request(request: &IpcRequest) -> Result<IpcResponse, String> {
-        let socket_path = locald_utils::ipc::socket_path().map_err(|err| err.to_string())?;
-        let mut stream = UnixStream::connect(&socket_path).map_err(|err| err.to_string())?;
-
-        let request_bytes = serde_json::to_vec(request).map_err(|err| err.to_string())?;
-        stream
-            .write_all(&request_bytes)
-            .map_err(|err| err.to_string())?;
-
-        let mut response_bytes = Vec::new();
-        stream
-            .read_to_end(&mut response_bytes)
-            .map_err(|err| err.to_string())?;
-
-        serde_json::from_slice(&response_bytes).map_err(|err| err.to_string())
+    fn send_request(request: &IpcRequest) -> Result<IpcResponse, Box<dyn std::error::Error>> {
+        let request_bytes = serde_json::to_vec(request)?;
+        let response_bytes = locald_utils::ipc::send_request(&request_bytes)?;
+        Ok(serde_json::from_slice(&response_bytes)?)
     }
 
     fn open_dashboard() {

@@ -177,6 +177,8 @@ impl CertManager {
         .await??;
 
         // Parse the CA cert DER for inclusion in TLS cert chains.
+        // Note: pem::parse() returns only the first PEM block. This is correct
+        // for locald's single-block CA cert files.
         let ca_cert_der = tokio::task::spawn_blocking(move || {
             let pem_parsed = pem::parse(ca_cert_pem.as_bytes())
                 .map_err(|e| anyhow::anyhow!("Failed to parse CA cert PEM: {e}"))?;
