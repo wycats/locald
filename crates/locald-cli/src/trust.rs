@@ -156,13 +156,24 @@ fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
         }
     }
 
-    // Mark as trusted for all uses in the user domain (no admin password needed).
-    TrustSettings::new(Domain::User)
+    // Mark as trusted for all uses.
+    // Use Admin domain when running as root (e.g. via `sudo locald admin setup`),
+    // because the User domain requires the user's GUI session context which isn't
+    // available under sudo. Admin domain trust is system-wide and persists.
+    let domain = if nix::unistd::geteuid().is_root() {
+        Domain::Admin
+    } else {
+        Domain::User
+    };
+
+    TrustSettings::new(domain)
         .set_trust_settings_always(&cert)
-        .map_err(|e| anyhow::anyhow!(
-            "Failed to set trust settings: {e}. \
-             This can happen outside a GUI session. Try running from a terminal in a desktop session."
-        ))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to set trust settings ({domain:?}): {e}. \
+             If running via sudo, ensure you're in a desktop session."
+            )
+        })?;
 
     Ok(())
 }
