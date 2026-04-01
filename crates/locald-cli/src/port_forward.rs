@@ -74,11 +74,11 @@ pub mod macos {
 
     /// Check whether locald's pfctl redirect rules are installed.
     ///
-    /// Verifies actual redirect rules exist in the anchor, not just that the
-    /// anchor was created (which could be empty after a partial install failure).
+    /// Verifies actual redirect (nat/rdr) rules exist in the anchor.
+    /// Requires root to read `/dev/pf` — appropriate for `admin setup` context.
     pub fn is_installed() -> bool {
         std::process::Command::new("pfctl")
-            .args(["-a", "com.locald/redirect", "-s", "rules"])
+            .args(["-a", "com.locald/redirect", "-s", "nat"])
             .output()
             .map(|o| o.status.success() && o.stdout.windows(3).any(|w| w == b"rdr"))
             .unwrap_or(false)

@@ -297,6 +297,12 @@ async fn async_main(
     let cert_manager = match locald_utils::cert::CertManager::new().await {
         Ok(cm) => Some(std::sync::Arc::new(cm)),
         Err(e) => {
+            if config.server.privileged_ports {
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize HTTPS certificates: {e}\n\
+                     Run `sudo locald admin setup` to configure HTTPS trust."
+                ));
+            }
             warn!("Failed to initialize CertManager: {e}. HTTPS will be disabled.");
             None
         }
@@ -361,13 +367,7 @@ async fn async_main(
         }
     };
 
-    // On macOS with pfctl, override the advertised port to the public-facing one.
-    // Only override if pfctl rules are actually installed (they're ephemeral across reboots).
-    #[cfg(target_os = "macos")]
-    if config.server.privileged_ports && pfctl_redirect_active() {
-        manager.set_http_port(Some(80)).await;
-    }
-
+    let has_http = listener_http.is_some();
     if let Some(l) = listener_http {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -424,12 +424,7 @@ async fn async_main(
         }
     };
 
-    // On macOS with pfctl, override the advertised port to the public-facing one.
-    #[cfg(target_os = "macos")]
-    if config.server.privileged_ports && pfctl_redirect_active() {
-        manager.set_https_port(Some(443)).await;
-    }
-
+    let has_tls = listener_https.is_some();
     if let Some(l) = listener_https {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -437,6 +432,41 @@ async fn async_main(
                 error!("HTTPS proxy server error: {e}");
             }
         });
+    }
+
+    // On macOS with pfctl, override the advertised ports to the public-facing ones.
+    // Only probe ports whose listeners are actually bound and serving.
+    // Uses async TCP connect to avoid blocking the Tokio runtime.
+    //
+    // Note: The TCP probe can false-positive if another process is on port 80/443.
+    // This is acceptable — querying pfctl directly requires root, and the false-positive
+    // case (another server on 80) is rare in local dev and self-correcting.
+    #[cfg(target_os = "macos")]
+    if config.server.privileged_ports {
+        let mut http_ready = false;
+        let mut tls_ready = false;
+        for attempt in 1..=5 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if has_http && !http_ready && pfctl_redirect_active(80).await {
+                info!("pfctl redirect active: advertising port 80 (attempt {attempt})");
+                manager.set_http_port(Some(80)).await;
+                http_ready = true;
+            }
+            if has_tls && !tls_ready && pfctl_redirect_active(443).await {
+                info!("pfctl redirect active: advertising port 443 (attempt {attempt})");
+                manager.set_https_port(Some(443)).await;
+                tls_ready = true;
+            }
+            if (http_ready || !has_http) && (tls_ready || !has_tls) {
+                break;
+            }
+        }
+        if (has_http && !http_ready) || (has_tls && !tls_ready) {
+            warn!(
+                "pfctl port forwarding not detected. Services will use ports 8080/8443. \
+                 Run `sudo locald admin setup` to configure port forwarding."
+            );
+        }
     }
 
     let reason = tokio::select! {
@@ -491,17 +521,27 @@ async fn async_main(
     Ok(())
 }
 
-/// Check whether locald's pfctl redirect rules are active on macOS.
+/// Check whether pfctl port redirection is active for a given port.
 ///
-/// Checks for actual `rdr` rules in the anchor, not just anchor existence.
+/// Probes by attempting an async TCP connection to localhost on the privileged port.
+/// If pfctl redirect rules are active, the connection reaches our proxy on
+/// the corresponding high port and succeeds. No root access needed.
+///
+/// Note: This can false-positive if another process is listening on the port.
+/// Querying pfctl directly requires root, and the false-positive case is rare
+/// in local dev environments.
 #[cfg(target_os = "macos")]
-fn pfctl_redirect_active() -> bool {
-    #[allow(clippy::disallowed_methods)]
-    std::process::Command::new("pfctl")
-        .args(["-a", "com.locald/redirect", "-s", "rules"])
-        .output()
-        .map(|o| o.status.success() && o.stdout.windows(3).any(|w| w == b"rdr"))
-        .unwrap_or(false)
+async fn pfctl_redirect_active(port: u16) -> bool {
+    use std::net::SocketAddr;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
 }
 
 async fn watch_for_upgrade(

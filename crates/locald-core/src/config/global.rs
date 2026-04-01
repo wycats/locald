@@ -37,8 +37,11 @@ impl Default for ServerConfig {
     }
 }
 
-/// On Linux, default to privileged ports (80/443 via setuid shim).
-/// On macOS, default to unprivileged ports (the shim model doesn't apply).
+/// Default to privileged ports (80/443) on all platforms.
+///
+/// This is the intended production experience — `admin setup` configures
+/// the platform-specific mechanism (setuid shim on Linux, pfctl on macOS).
+/// Sandbox mode explicitly overrides this to false for testing.
 const fn default_privileged_ports() -> bool {
-    cfg!(target_os = "linux")
+    true
 }
