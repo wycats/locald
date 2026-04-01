@@ -492,13 +492,15 @@ async fn async_main(
 }
 
 /// Check whether locald's pfctl redirect rules are active on macOS.
+///
+/// Checks for actual `rdr` rules in the anchor, not just anchor existence.
 #[cfg(target_os = "macos")]
 fn pfctl_redirect_active() -> bool {
     #[allow(clippy::disallowed_methods)]
     std::process::Command::new("pfctl")
-        .args(["-s", "Anchors", "-a", "com.locald"])
+        .args(["-a", "com.locald/redirect", "-s", "rules"])
         .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .map(|o| o.status.success() && o.stdout.windows(3).any(|w| w == b"rdr"))
         .unwrap_or(false)
 }
 

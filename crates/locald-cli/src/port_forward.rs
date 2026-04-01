@@ -73,22 +73,14 @@ pub mod macos {
     }
 
     /// Check whether locald's pfctl redirect rules are installed.
-    #[allow(dead_code)]
+    ///
+    /// Verifies actual redirect rules exist in the anchor, not just that the
+    /// anchor was created (which could be empty after a partial install failure).
     pub fn is_installed() -> bool {
-        let Ok(pf) = PfCtl::new() else {
-            return false;
-        };
-        // If we can read rules from our anchor, they're installed.
-        // PfCtl doesn't expose a direct "list rules" API, but we can check
-        // if the anchor exists by trying to flush (which succeeds even if empty).
-        // A more reliable check: try to add the anchor — if it already exists, good.
-        drop(pf);
-
-        // Pragmatic check: see if pfctl can show our anchor.
         std::process::Command::new("pfctl")
-            .args(["-s", "Anchors", "-a", "com.locald"])
+            .args(["-a", "com.locald/redirect", "-s", "rules"])
             .output()
-            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .map(|o| o.status.success() && o.stdout.windows(3).any(|w| w == b"rdr"))
             .unwrap_or(false)
     }
 }
