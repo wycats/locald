@@ -145,9 +145,9 @@ fn try_auto_fix_shim() -> bool {
 #[cfg(target_os = "linux")]
 pub use locald_utils::container::blocking::is_probably_container;
 
-// For non-Linux platforms, provide stub implementations
 #[cfg(not(target_os = "linux"))]
-fn is_probably_container() -> bool {
+#[allow(dead_code)]
+const fn is_probably_container() -> bool {
     false
 }
 
@@ -275,6 +275,7 @@ fn offer_first_run_setup() -> bool {
 }
 
 /// Show error that locald cannot run inside containers.
+#[cfg(target_os = "linux")]
 fn show_container_unsupported_error() -> ! {
     eprintln!();
     eprintln!(
@@ -291,6 +292,7 @@ fn show_container_unsupported_error() -> ! {
     std::process::exit(1);
 }
 
+#[allow(clippy::missing_const_for_fn)]
 pub fn verify_shim() {
     #[cfg(target_os = "linux")]
     {

@@ -24,13 +24,17 @@ use crate::cgroup::{CgroupRootStrategy, cgroup_fs_root, is_root_ready};
 #[cfg(target_os = "linux")]
 use crate::container;
 use crate::shim;
-use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
 #[cfg(target_os = "linux")]
 use nix::unistd::User;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Severity level for a doctor problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +254,10 @@ impl Privileged {
     }
 
     /// Acquire a capability for privileged effects (non-Linux fallback).
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotReady` when the host is not ready for privileged operations.
     #[cfg(not(target_os = "linux"))]
     pub fn acquire(config: AcquireConfig<'_>) -> std::result::Result<Self, NotReady> {
         let report = collect_report(config).unwrap_or_else(|e| DoctorReport {
@@ -678,30 +686,131 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
     })
 }
 
-/// Collect a host readiness report (non-Linux stub).
+/// Collect a host readiness report (non-Linux).
 ///
-/// On non-Linux platforms, locald has limited functionality.
-/// This stub returns a report indicating the platform is not fully supported.
+/// On non-Linux platforms, checks shim presence and certificate readiness.
+/// Cgroups are reported as an expected skip.
+///
+/// # Errors
+///
+/// Returns an error if required host probes fail unexpectedly.
 #[cfg(not(target_os = "linux"))]
 pub fn collect_report(_config: AcquireConfig<'_>) -> Result<DoctorReport> {
+    let mut problems: Vec<Problem> = Vec::new();
+
+    // On macOS, cgroups are not available — that's expected, not a failure.
+    problems.push(Problem {
+        id: "platform.cgroups".to_string(),
+        severity: Severity::Info,
+        status: Status::Skip,
+        summary: "cgroups not available (expected on macOS)".to_string(),
+        details: Some(
+            "Resource isolation via cgroups is Linux-only. macOS uses host-first exec services."
+                .to_string(),
+        ),
+        remediation: vec![],
+        evidence: vec![],
+        fix: None,
+    });
+
+    // Check shim presence (it may still be useful for hosts-file updates on macOS).
+    match shim::find() {
+        Ok(Some(path)) => {
+            problems.push(Problem {
+                id: "host.shim.present".to_string(),
+                severity: Severity::Info,
+                status: Status::Pass,
+                summary: "locald-shim found".to_string(),
+                details: None,
+                remediation: vec![],
+                evidence: vec![EvidenceItem {
+                    key: "shim.path".to_string(),
+                    value: path.display().to_string(),
+                }],
+                fix: None,
+            });
+        }
+        Ok(None) => {
+            problems.push(Problem {
+                id: "host.shim.present".to_string(),
+                severity: Severity::Info,
+                status: Status::Skip,
+                summary: "locald-shim not found (optional on macOS)".to_string(),
+                details: None,
+                remediation: vec![],
+                evidence: vec![],
+                fix: None,
+            });
+        }
+        Err(e) => {
+            problems.push(Problem {
+                id: "host.shim.present".to_string(),
+                severity: Severity::Warning,
+                status: Status::Fail,
+                summary: format!("Error searching for shim: {e}"),
+                details: None,
+                remediation: vec![],
+                evidence: vec![],
+                fix: None,
+            });
+        }
+    }
+
+    // Check certificate readiness.
+    match cert::get_certs_dir() {
+        Ok(certs_dir) => {
+            let cert_exists = certs_dir.join("rootCA.pem").exists();
+            let key_exists = certs_dir.join("rootCA-key.pem").exists();
+            if cert_exists && key_exists {
+                problems.push(Problem {
+                    id: "host.cert.root_ca".to_string(),
+                    severity: Severity::Info,
+                    status: Status::Pass,
+                    summary: "Root CA certificate exists".to_string(),
+                    details: None,
+                    remediation: vec![],
+                    evidence: vec![EvidenceItem {
+                        key: "cert.dir".to_string(),
+                        value: certs_dir.display().to_string(),
+                    }],
+                    fix: None,
+                });
+            } else {
+                problems.push(Problem {
+                    id: "host.cert.root_ca".to_string(),
+                    severity: Severity::Warning,
+                    status: Status::Fail,
+                    summary: "Root CA not generated yet".to_string(),
+                    details: Some(
+                        "Run `locald admin setup` to generate and trust the Root CA.".to_string(),
+                    ),
+                    remediation: vec!["locald admin setup".to_string()],
+                    evidence: vec![],
+                    fix: Some(FixKey::RunAdminSetup),
+                });
+            }
+        }
+        Err(e) => {
+            problems.push(Problem {
+                id: "host.cert.root_ca".to_string(),
+                severity: Severity::Warning,
+                status: Status::Fail,
+                summary: format!("Could not determine cert directory: {e}"),
+                details: None,
+                remediation: vec![],
+                evidence: vec![],
+                fix: None,
+            });
+        }
+    }
+
     Ok(DoctorReport {
         strategy: StrategyReport {
             cgroup_root: CgroupStrategyKind::Direct,
-            why: "non-Linux platform (cgroups not available)".to_string(),
+            why: "non-Linux platform (host-first mode)".to_string(),
         },
-        mode: CleanupMode::Degraded,
-        problems: vec![Problem {
-            id: "platform.unsupported".to_string(),
-            severity: Severity::Warning,
-            status: Status::Skip,
-            summary: "locald privileged features require Linux".to_string(),
-            details: Some(
-                "cgroups, shim, and privileged process management are Linux-only".to_string(),
-            ),
-            remediation: vec![],
-            evidence: vec![],
-            fix: None,
-        }],
+        mode: CleanupMode::Enabled,
+        problems,
         fixes: vec![],
     })
 }

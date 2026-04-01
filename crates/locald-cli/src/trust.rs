@@ -55,29 +55,34 @@ pub fn install_root_ca_into_trust_store() -> Result<()> {
 }
 
 fn install_ca(cert_path: &std::path::Path) -> Result<()> {
-    let path_str = cert_path.to_str().context("Invalid path string")?;
+    // On macOS, ca_injector is not supported — use the native security CLI directly.
+    #[cfg(target_os = "macos")]
+    return install_ca_macos(cert_path);
 
-    if let Err(e) = ca_injector::install_ca(path_str) {
-        let msg = e.to_string();
-        if msg.contains("Permission denied") || msg.contains("os error 13") {
-            anyhow::bail!(
-                "Permission denied. Please run `locald admin setup` to configure HTTPS trust."
-            );
-        }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let path_str = cert_path.to_str().context("Invalid path string")?;
 
-        // Some platforms (or minimal installs) may not be recognized by ca_injector.
-        // Provide a Linux fallback using common trust-store tools.
-        #[cfg(target_os = "linux")]
-        {
-            if msg.contains("cannot find binary path") {
-                return install_ca_linux_fallback(cert_path)
-                    .with_context(|| format!("ca_injector failed: {msg}"));
+        if let Err(e) = ca_injector::install_ca(path_str) {
+            let msg = e.to_string();
+            if msg.contains("Permission denied") || msg.contains("os error 13") {
+                anyhow::bail!(
+                    "Permission denied. Please run `locald admin setup` to configure HTTPS trust."
+                );
             }
-        }
 
-        return Err(e).context("Failed to install CA certificate");
+            #[cfg(target_os = "linux")]
+            {
+                if msg.contains("cannot find binary path") {
+                    return install_ca_linux_fallback(cert_path)
+                        .with_context(|| format!("ca_injector failed: {msg}"));
+                }
+            }
+
+            return Err(e).context("Failed to install CA certificate");
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -120,4 +125,44 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
     anyhow::bail!(
         "No known Linux trust-store directories found; install p11-kit-trust / update-ca-trust or equivalent"
     );
+}
+
+#[cfg(target_os = "macos")]
+fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
+    use security_framework::certificate::SecCertificate;
+    use security_framework::trust_settings::{Domain, TrustSettings};
+
+    let pem_data = std::fs::read(cert_path)
+        .with_context(|| format!("Failed to read certificate at {}", cert_path.display()))?;
+
+    let parsed = pem::parse(&pem_data)
+        .map_err(|e| anyhow::anyhow!("Failed to parse PEM certificate: {e}"))?;
+
+    let cert = SecCertificate::from_der(parsed.contents())
+        .map_err(|e| anyhow::anyhow!("Failed to create SecCertificate from DER: {e}"))?;
+
+    // Add to the default (login) keychain.
+    // This may produce a duplicate-item error if already present — that's fine.
+    match cert.add_to_keychain(None) {
+        Ok(()) => {}
+        Err(e) if e.code() == -25299 => {
+            // errSecDuplicateItem — cert already in keychain, continue to trust settings
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to add certificate to login keychain: {e}. \
+                 You may need to open Keychain Access and add it manually."
+            ));
+        }
+    }
+
+    // Mark as trusted for all uses in the user domain (no admin password needed).
+    TrustSettings::new(Domain::User)
+        .set_trust_settings_always(&cert)
+        .map_err(|e| anyhow::anyhow!(
+            "Failed to set trust settings: {e}. \
+             This can happen outside a GUI session. Try running from a terminal in a desktop session."
+        ))?;
+
+    Ok(())
 }

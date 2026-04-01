@@ -245,6 +245,9 @@ impl ResolvesServerCert for CertManager {
 
 /// Returns the directory where locald certificates are stored.
 ///
+/// On macOS: `~/Library/Application Support/locald/certs/`
+/// On Linux: `~/.locald/certs/`
+///
 /// # Errors
 ///
 /// Returns an error if the user's home directory cannot be determined.
@@ -252,7 +255,7 @@ pub fn get_certs_dir() -> Result<PathBuf> {
     // When invoked via pkexec/sudo, prefer the invoking user's home directory rather than /root.
     // This keeps the CA location consistent between the privileged setup path and the unprivileged
     // daemon/server path.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         if let Ok(pkexec_uid) = std::env::var("PKEXEC_UID")
             && let Ok(uid) = pkexec_uid.parse::<u32>()
@@ -270,8 +273,28 @@ pub fn get_certs_dir() -> Result<PathBuf> {
         }
     }
 
-    let home = directories::UserDirs::new().context("Could not find home directory")?;
-    Ok(home.home_dir().join(".locald").join("certs"))
+    Ok(locald_data_dir()?.join("certs"))
+}
+
+/// Returns the platform-appropriate data directory for locald.
+///
+/// On macOS: `~/Library/Application Support/locald/`
+/// On Linux/other: `~/.locald/`
+fn locald_data_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Could not find home directory")?;
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("locald"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(home.join(".locald"))
+    }
 }
 
 #[cfg(test)]

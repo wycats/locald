@@ -824,9 +824,43 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         println!("Next: run `locald up`.");
                     }
 
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(target_os = "macos")]
                     {
-                        return Err(CliError::message("Admin setup is only supported on Linux."));
+                        cliclack::intro("locald admin setup (macOS)")?;
+
+                        // On macOS, generate and trust the Root CA certificate.
+                        // No shim installation or cgroup setup is needed.
+                        let mut trust_installed = false;
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Configuring HTTPS trust...");
+                            match crate::trust::install_root_ca_into_trust_store() {
+                                Ok(()) => {
+                                    trust_installed = true;
+                                    s.stop("HTTPS trust configured");
+                                }
+                                Err(e) => {
+                                    s.error(format!("HTTPS trust failed: {e}"));
+                                }
+                            }
+                        }
+
+                        if !trust_installed {
+                            println!(
+                                "{} HTTPS trust was not installed. You can retry with `locald admin setup` or manually trust the CA in Keychain Access.",
+                                style::WARN
+                            );
+                        }
+
+                        cliclack::outro("Setup complete")?;
+                        println!("Next: run `locald up`.");
+                    }
+
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    {
+                        return Err(CliError::message(
+                            "Admin setup is not supported on this platform.",
+                        ));
                     }
 
                     // Note: We don't setcap on locald anymore, because the shim handles it.
