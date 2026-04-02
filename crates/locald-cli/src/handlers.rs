@@ -852,6 +852,20 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     )));
                                 }
                             }
+
+                            // Make rules persistent across reboot via pf.conf anchor.
+                            let s = cliclack::spinner();
+                            s.start("Making port forwarding persistent...");
+                            match crate::port_forward::macos::install_persistent() {
+                                Ok(()) => {
+                                    s.stop("Port forwarding will survive reboot");
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Persistent rules not installed: {e} (non-fatal)"
+                                    ));
+                                }
+                            }
                         }
 
                         // Step 3: Enable privileged ports in global config only if pfctl succeeded.
@@ -985,6 +999,20 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     return Err(CliError::message(format!(
                                         "Port forwarding teardown failed: {e}"
                                     )));
+                                }
+                            }
+
+                            // Remove persistent anchor from pf.conf.
+                            let s = cliclack::spinner();
+                            s.start("Removing persistent port forwarding...");
+                            match crate::port_forward::macos::remove_persistent() {
+                                Ok(()) => {
+                                    s.stop("Persistent port forwarding removed");
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Persistent rules removal failed: {e} (non-fatal)"
+                                    ));
                                 }
                             }
                         }

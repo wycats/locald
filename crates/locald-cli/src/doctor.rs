@@ -90,6 +90,20 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
                 }
             }
         }
+
+        if !json {
+            if crate::port_forward::macos::is_persistent() {
+                let _ = cliclack::log::success("Port forwarding: persistent (survives reboot)");
+            } else if crate::port_forward::macos::is_installed() {
+                let _ = cliclack::log::warning(
+                    "Port forwarding: active but ephemeral (run `sudo locald admin setup` to persist)",
+                );
+            } else {
+                let _ = cliclack::log::warning(
+                    "Port forwarding: not configured (run `sudo locald admin setup`)",
+                );
+            }
+        }
     }
 
     Ok(i32::from(report.has_critical_failures()))
