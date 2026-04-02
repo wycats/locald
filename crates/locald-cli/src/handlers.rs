@@ -1692,7 +1692,9 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
 </dict>
 </plist>"#,
         label = label,
