@@ -1651,17 +1651,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
 fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     let label = "com.locald.agent";
 
-    // When running under sudo, resolve the real user's home for the plist location.
-    let user_home = if nix::unistd::geteuid().is_root() {
+    // When running under sudo, resolve the real user's home and UID for
+    // correct plist placement and launchctl domain targeting.
+    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER")
             && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
         {
-            Some(user.dir)
+            (Some(user.dir), Some(user.uid.as_raw()))
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     // Write the plist directly to the correct user's LaunchAgents directory.
@@ -1674,7 +1675,7 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&plist_dir)?;
 
-    let plist_path = plist_dir.join(format!("{}.plist", label));
+    let plist_path = plist_dir.join(format!("{label}.plist"));
 
     // Write a minimal launchd plist.
     let plist_content = format!(
@@ -1699,22 +1700,42 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     );
     std::fs::write(&plist_path, plist_content)?;
 
-    // Unload any existing agent, then load the new plist.
+    // Load into the correct user's GUI domain.
+    // Under sudo, `launchctl load` targets root's domain — use
+    // `launchctl bootstrap gui/<uid>` to load into the invoking user's domain.
     #[allow(clippy::disallowed_methods)]
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(&plist_path)
-        .output();
+    if let Some(uid) = target_uid {
+        let service_target = format!("gui/{uid}/{label}");
+        // Unload any existing (ignore errors — "not found" is fine).
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &service_target])
+            .output();
 
-    #[allow(clippy::disallowed_methods)]
-    let status = std::process::Command::new("launchctl")
-        .args(["load", "-w"])
-        .arg(&plist_path)
-        .status()
-        .context("Failed to run launchctl load")?;
+        let status = std::process::Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}")])
+            .arg(&plist_path)
+            .status()
+            .context("Failed to run launchctl bootstrap")?;
 
-    if !status.success() {
-        anyhow::bail!("launchctl load failed with status: {status}");
+        if !status.success() {
+            anyhow::bail!("launchctl bootstrap gui/{uid} failed with status: {status}");
+        }
+    } else {
+        // Not running as root — load into current user's domain (legacy syntax).
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w"])
+            .arg(&plist_path)
+            .output();
+
+        let status = std::process::Command::new("launchctl")
+            .args(["load", "-w"])
+            .arg(&plist_path)
+            .status()
+            .context("Failed to run launchctl load")?;
+
+        if !status.success() {
+            anyhow::bail!("launchctl load failed with status: {status}");
+        }
     }
 
     Ok(())
@@ -1724,17 +1745,17 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
 fn uninstall_launch_agent() -> anyhow::Result<()> {
     let label = "com.locald.agent";
 
-    // Under sudo, resolve the real user's plist location (mirrors install_launch_agent).
-    let user_home = if nix::unistd::geteuid().is_root() {
+    // Under sudo, resolve the real user's plist location and UID.
+    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER")
             && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
         {
-            Some(user.dir)
+            (Some(user.dir), Some(user.uid.as_raw()))
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     let plist_dir = if let Some(ref home) = user_home {
@@ -1748,11 +1769,19 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
     let plist_path = plist_dir.join(format!("{label}.plist"));
 
     if plist_path.exists() {
+        // Unload from the correct domain.
         #[allow(clippy::disallowed_methods)]
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&plist_path)
-            .output();
+        if let Some(uid) = target_uid {
+            let service_target = format!("gui/{uid}/{label}");
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &service_target])
+                .output();
+        } else {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", "-w"])
+                .arg(&plist_path)
+                .output();
+        }
         std::fs::remove_file(&plist_path)?;
     }
 
