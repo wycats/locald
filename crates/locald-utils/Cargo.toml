@@ -39,6 +39,7 @@ pem = "3"
 [dev-dependencies]
 proptest = "1.6.0"
 temp-env = "0.3.6"
+tempfile = "3"
 
 [lints]
 workspace = true

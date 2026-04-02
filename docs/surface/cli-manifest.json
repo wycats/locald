@@ -199,6 +199,13 @@
                 "hidden": false,
                 "args": [],
                 "subcommands": []
+              },
+              {
+                "name": "teardown",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
               }
             ]
           },
@@ -228,6 +235,30 @@
           },
           {
             "name": "sync-hosts",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "teardown",
             "aliases": [],
             "hidden": false,
             "args": [
@@ -623,6 +654,13 @@
                 "hidden": false,
                 "args": [],
                 "subcommands": []
+              },
+              {
+                "name": "teardown",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
               }
             ]
           },
@@ -884,6 +922,42 @@
             "hidden": false,
             "args": [],
             "subcommands": []
+          },
+          {
+            "name": "tray",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "restart",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "start",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "status",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "stop",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
           },
           {
             "name": "trust",
@@ -2013,6 +2087,170 @@
           }
         ],
         "subcommands": []
+      },
+      {
+        "name": "tray",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "restart",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "start",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "status",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "stop",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "restart",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "start",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "status",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "stop",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          }
+        ]
       },
       {
         "name": "trust",

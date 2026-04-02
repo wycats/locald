@@ -380,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn get_certs_dir_respects_pkexec_uid_and_sudo_user() {
         let _guard = ENV_LOCK.lock().unwrap();
 

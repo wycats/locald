@@ -45,6 +45,41 @@ mod macos {
         }
     }
 
+    /// Health checks that run without root — detect problems the agent can surface.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HealthStatus {
+        pfctl_active: bool,
+        ca_exists: bool,
+    }
+
+    impl HealthStatus {
+        fn is_healthy(&self) -> bool {
+            self.pfctl_active && self.ca_exists
+        }
+
+        fn warning_label(&self) -> Option<String> {
+            let mut problems = Vec::new();
+            if !self.pfctl_active {
+                problems.push("port forwarding inactive");
+            }
+            if !self.ca_exists {
+                problems.push("HTTPS not configured");
+            }
+            if problems.is_empty() {
+                None
+            } else {
+                Some(format!("⚠ {}", problems.join(", ")))
+            }
+        }
+    }
+
+    /// Combined update from the polling thread.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PollUpdate {
+        daemon: DaemonStatus,
+        health: HealthStatus,
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Initialize NSApplication — required for AppKit event dispatch (menu clicks, etc).
         let mtm = MainThreadMarker::new().expect("locald-agent must run on the main thread");
@@ -57,13 +92,27 @@ mod macos {
         let menu = Menu::new();
         let status_item = MenuItem::new("Status: checking...", false, None);
         menu.append(&status_item)?;
+
+        // Health warning — hidden when everything is healthy.
+        let health_item = MenuItem::new("", false, None);
+        menu.append(&health_item)?;
+
         menu.append(&PredefinedMenuItem::separator())?;
 
         let open_item = MenuItem::new("Open Dashboard", true, None);
         menu.append(&open_item)?;
 
+        // "Run Setup..." — visible only when health checks fail.
+        let setup_item = MenuItem::new("Run Setup...", true, None);
+        menu.append(&setup_item)?;
+
         let quit_item = MenuItem::new("Quit", true, None);
         menu.append(&quit_item)?;
+
+        // Initially hide health-related items.
+        health_item.set_text("");
+        health_item.set_enabled(false);
+        setup_item.set_enabled(false);
 
         let _tray_icon = TrayIconBuilder::new()
             .with_tooltip("locald")
@@ -71,14 +120,18 @@ mod macos {
             .with_menu(Box::new(menu))
             .build()?;
 
-        let (status_tx, status_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
 
-        spawn_status_thread(status_tx);
+        spawn_poll_thread(update_tx);
 
         // NSApplication.run() owns the event loop. We use an NSTimer to
         // periodically check our channels from the main thread.
         let menu_events = MenuEvent::receiver();
-        let mut current_status = DaemonStatus::Checking;
+        let mut current_daemon = DaemonStatus::Checking;
+        let mut current_health = HealthStatus {
+            pfctl_active: true,
+            ca_exists: true,
+        };
 
         // Call finishLaunching to initialize the app — registers with the
         // window server so click events are delivered.
@@ -102,11 +155,23 @@ mod macos {
                 }
             }
 
-            // Check for status updates from IPC thread.
-            while let Ok(update) = status_rx.try_recv() {
-                if update != current_status {
-                    current_status = update;
-                    status_item.set_text(current_status.label());
+            // Check for poll updates.
+            while let Ok(update) = update_rx.try_recv() {
+                if update.daemon != current_daemon {
+                    current_daemon = update.daemon.clone();
+                    status_item.set_text(current_daemon.label());
+                }
+                if update.health != current_health {
+                    current_health = update.health.clone();
+                    if let Some(label) = current_health.warning_label() {
+                        health_item.set_text(label);
+                        health_item.set_enabled(false);
+                        setup_item.set_enabled(true);
+                    } else {
+                        health_item.set_text("");
+                        health_item.set_enabled(false);
+                        setup_item.set_enabled(false);
+                    }
                 }
             }
 
@@ -114,6 +179,8 @@ mod macos {
             while let Ok(event) = menu_events.try_recv() {
                 if event.id == open_item.id() {
                     open_dashboard();
+                } else if event.id == setup_item.id() && !current_health.is_healthy() {
+                    run_admin_setup();
                 } else if event.id == quit_item.id() {
                     return Ok(());
                 }
@@ -137,11 +204,12 @@ mod macos {
         }
     }
 
-    fn spawn_status_thread(status_tx: mpsc::Sender<DaemonStatus>) {
+    fn spawn_poll_thread(update_tx: mpsc::Sender<PollUpdate>) {
         thread::spawn(move || {
             loop {
-                let status = poll_daemon_status();
-                if status_tx.send(status).is_err() {
+                let daemon = poll_daemon_status();
+                let health = poll_health();
+                if update_tx.send(PollUpdate { daemon, health }).is_err() {
                     break;
                 }
                 #[allow(clippy::disallowed_methods)]
@@ -170,6 +238,34 @@ mod macos {
         }
     }
 
+    /// Check system health without root.
+    fn poll_health() -> HealthStatus {
+        HealthStatus {
+            pfctl_active: check_pfctl_active(),
+            ca_exists: check_ca_exists(),
+        }
+    }
+
+    /// Probe whether pfctl port forwarding is active by attempting a TCP
+    /// connection to localhost:80. If pfctl redirects 80→8080 and the daemon
+    /// is listening on 8080, the connection succeeds. No root needed.
+    ///
+    /// Returns true if something is listening on port 80 (strong signal that
+    /// pfctl rules are active), or if we can't determine (benefit of the doubt).
+    fn check_pfctl_active() -> bool {
+        use std::net::{SocketAddr, TcpStream};
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], 80));
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    }
+
+    /// Check whether the locald Root CA certificate file exists.
+    fn check_ca_exists() -> bool {
+        locald_utils::cert::get_certs_dir()
+            .map(|dir| dir.join("rootCA.pem").exists())
+            .unwrap_or(false)
+    }
+
     fn send_request(request: &IpcRequest) -> Result<IpcResponse, Box<dyn std::error::Error>> {
         let request_bytes = serde_json::to_vec(request)?;
         let response_bytes = locald_utils::ipc::send_request(&request_bytes)?;
@@ -181,6 +277,41 @@ mod macos {
         let _ = std::process::Command::new("open")
             .arg(DASHBOARD_URL)
             .spawn();
+    }
+
+    /// Launch `locald admin setup` in Terminal.app via osascript.
+    ///
+    /// This opens a new Terminal window where the command auto-escalates
+    /// to root (prompts for sudo password in the terminal).
+    fn run_admin_setup() {
+        let locald_path = locald_path_for_setup();
+        let script = format!(
+            "tell application \"Terminal\" to do script \"{} admin setup\"",
+            locald_path.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+    }
+
+    /// Resolve the locald binary path for running admin setup.
+    ///
+    /// Prefers `locald` on PATH if it exists, otherwise falls back to a
+    /// known install location.
+    #[allow(clippy::disallowed_methods)]
+    fn locald_path_for_setup() -> String {
+        // Check if locald is on PATH.
+        if let Ok(output) = std::process::Command::new("which").arg("locald").output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+        // Fallback: assume standard install location.
+        "/usr/local/bin/locald".to_string()
     }
 
     fn build_icon() -> Result<Icon, Box<dyn std::error::Error>> {

@@ -5,6 +5,5 @@ The actual content varies by environment (container detection, shim status, etc.
 
 ```console
 $ locald doctor --json
-? failed
 ...
 ```

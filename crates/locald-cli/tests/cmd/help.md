@@ -25,6 +25,7 @@ Commands:
   status       List running services
   logs         Stream logs from services
   admin        Administrative commands
+  tray         Manage the menu bar agent
   ai           AI integration commands
   debug        Debugging tools
   config       Configuration management

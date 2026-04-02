@@ -58,3 +58,45 @@ pub fn agent_path() -> Result<std::path::PathBuf> {
     let data_dir = crate::cert::locald_data_dir()?;
     Ok(data_dir.join("locald-agent"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_integrity_returns_false_for_missing_file() {
+        let path = std::path::Path::new("/tmp/locald-test-nonexistent-agent");
+        assert!(!verify_integrity(path, b"anything").unwrap());
+    }
+
+    #[test]
+    fn verify_integrity_returns_true_for_matching_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locald-agent");
+        std::fs::write(&path, b"hello agent").unwrap();
+        assert!(verify_integrity(&path, b"hello agent").unwrap());
+    }
+
+    #[test]
+    fn verify_integrity_returns_false_for_mismatched_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locald-agent");
+        std::fs::write(&path, b"old version").unwrap();
+        assert!(!verify_integrity(&path, b"new version").unwrap());
+    }
+
+    #[test]
+    fn install_creates_dir_and_sets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("locald-agent");
+        install(&path, b"binary content").unwrap();
+
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"binary content");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+}
