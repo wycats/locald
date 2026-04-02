@@ -2,7 +2,7 @@
 ///
 /// Installs redirect rules so that traffic to privileged ports (80, 443)
 /// on localhost is transparently forwarded to locald's unprivileged proxy
-/// ports (8080, 8443). Rules live under a `com.locald/redirect` anchor.
+/// ports (8080, 8443). Rules live under a `com.locald` anchor.
 ///
 /// Requires root to open `/dev/pf`.
 #[cfg(target_os = "macos")]

@@ -250,8 +250,8 @@ mod macos {
     /// connection to localhost:80. If pfctl redirects 80→8080 and the daemon
     /// is listening on 8080, the connection succeeds. No root needed.
     ///
-    /// Returns true if something is listening on port 80 (strong signal that
-    /// pfctl rules are active), or if we can't determine (benefit of the doubt).
+    /// Returns true if a TCP connection to port 80 succeeds (strong signal
+    /// that pfctl rules are active), false on any error including timeouts.
     fn check_pfctl_active() -> bool {
         use std::net::{SocketAddr, TcpStream};
 
@@ -283,16 +283,35 @@ mod macos {
     ///
     /// This opens a new Terminal window where the command auto-escalates
     /// to root (prompts for sudo password in the terminal).
+    /// The resolved path is shell-quoted to handle spaces and special characters.
     fn run_admin_setup() {
         let locald_path = locald_path_for_setup();
-        let script = format!(
-            "tell application \"Terminal\" to do script \"{} admin setup\"",
-            locald_path.replace('\\', "\\\\").replace('"', "\\\"")
-        );
+        let command = format!("{} admin setup", shell_quote(&locald_path));
+        // Escape for embedding inside an AppleScript double-quoted string.
+        let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("tell application \"Terminal\" to do script \"{escaped}\"");
         #[allow(clippy::disallowed_methods)]
         let _ = std::process::Command::new("osascript")
             .args(["-e", &script])
             .spawn();
+    }
+
+    /// POSIX single-quote a string for safe shell interpolation.
+    fn shell_quote(s: &str) -> String {
+        if s.is_empty() {
+            return "''".to_string();
+        }
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        for ch in s.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
     }
 
     /// Resolve the locald binary path for running admin setup.

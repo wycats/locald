@@ -97,19 +97,36 @@ fn main() {
 
         println!("cargo:rustc-env=LOCALD_EXPECTED_AGENT_VERSION={agent_version}");
 
-        // Build the agent in release mode. macOS builds are always native (no cross-compile).
-        let status = Command::new("cargo")
-            .arg("build")
+        // Build the agent in release mode.
+        // Support cross-compilation (e.g. x86_64 on arm64 or vice versa).
+        let target = env::var("TARGET").expect("TARGET not set");
+        let host = env::var("HOST").expect("HOST not set");
+        let is_cross_compiling = target != host;
+
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
             .arg("--release")
             .arg("--manifest-path")
             .arg(agent_dir.join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(out_dir.join("agent-target"))
-            .status()
-            .expect("Failed to build locald-agent");
+            .arg(out_dir.join("agent-target"));
+
+        if is_cross_compiling {
+            cmd.arg("--target").arg(&target);
+        }
+
+        let status = cmd.status().expect("Failed to build locald-agent");
         assert!(status.success(), "Failed to build locald-agent");
 
-        let agent_bin = out_dir.join("agent-target/release/locald-agent");
+        let agent_bin = if is_cross_compiling {
+            out_dir
+                .join("agent-target")
+                .join(&target)
+                .join("release")
+                .join("locald-agent")
+        } else {
+            out_dir.join("agent-target/release/locald-agent")
+        };
         println!(
             "cargo:rustc-env=LOCALD_EMBEDDED_AGENT_PATH={}",
             agent_bin.display()

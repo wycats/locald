@@ -990,7 +990,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 Ok(()) => {
                                     s.stop("Port forwarding rules removed");
                                     println!(
-                                        "{} Removed pfctl redirect rules (com.locald/redirect).",
+                                        "{} Removed pfctl redirect rules (com.locald).",
                                         style::CHECK
                                     );
                                 }

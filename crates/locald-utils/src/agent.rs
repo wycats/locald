@@ -6,7 +6,8 @@ use std::path::Path;
 /// Install the agent binary to the specified path.
 ///
 /// Writes the embedded bytes and sets executable permissions (0o755).
-/// No setuid or root ownership needed — the agent runs as the current user.
+/// When running as root under `sudo`, chowns the file and parent directory
+/// to the invoking user so that later non-root auto-updates can overwrite it.
 ///
 /// # Errors
 ///
@@ -25,6 +26,27 @@ pub fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).context("Failed to chmod agent binary")?;
+
+    // When running under sudo, chown the agent binary and parent dir to the
+    // invoking user so non-root auto-updates (e.g. `locald tray start`) can
+    // overwrite the file later.
+    if nix::unistd::geteuid().is_root()
+        && let Ok(sudo_uid) = std::env::var("SUDO_UID")
+        && let Ok(sudo_gid) = std::env::var("SUDO_GID")
+        && let Ok(uid) = sudo_uid.parse::<u32>()
+        && let Ok(gid) = sudo_gid.parse::<u32>()
+    {
+        let uid = nix::unistd::Uid::from_raw(uid);
+        let gid = nix::unistd::Gid::from_raw(gid);
+        if let Err(e) = nix::unistd::chown(path, Some(uid), Some(gid)) {
+            tracing::warn!("Failed to chown agent binary: {e}");
+        }
+        if let Some(parent) = path.parent()
+            && let Err(e) = nix::unistd::chown(parent, Some(uid), Some(gid))
+        {
+            tracing::warn!("Failed to chown agent directory: {e}");
+        }
+    }
 
     Ok(())
 }
@@ -65,8 +87,9 @@ mod tests {
 
     #[test]
     fn verify_integrity_returns_false_for_missing_file() {
-        let path = std::path::Path::new("/tmp/locald-test-nonexistent-agent");
-        assert!(!verify_integrity(path, b"anything").unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent-agent");
+        assert!(!verify_integrity(&path, b"anything").unwrap());
     }
 
     #[test]
