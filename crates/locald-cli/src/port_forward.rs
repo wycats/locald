@@ -24,9 +24,8 @@ pub mod macos {
     ///
     /// Idempotent: safe to call multiple times.
     pub fn install() -> Result<()> {
-        let mut pf = PfCtl::new().context(
-            "Failed to open /dev/pf. This requires root — run with `sudo locald admin setup`.",
-        )?;
+        let mut pf = PfCtl::new()
+            .context("Failed to open /dev/pf. This requires root — run `locald admin setup`.")?;
 
         pf.try_enable().context("Failed to enable pf")?;
         pf.try_add_anchor(ANCHOR, AnchorKind::Redirect)

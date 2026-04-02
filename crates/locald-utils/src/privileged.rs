@@ -393,7 +393,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
             status: Status::Fail,
             summary: "cgroup v2 does not appear to be available".to_string(),
             details: Some("missing /sys/fs/cgroup/cgroup.controllers".to_string()),
-            remediation: vec!["sudo locald admin setup".to_string()],
+            remediation: vec!["locald admin setup".to_string()],
             evidence: if config.verbose {
                 vec![EvidenceItem {
                     key: "cgroup.root".to_string(),
@@ -419,7 +419,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
             status: Status::Fail,
             summary: "locald cgroup root is not established".to_string(),
             details: Some(format!("missing expected root: {expected}")),
-            remediation: vec!["sudo locald admin setup".to_string()],
+            remediation: vec!["locald admin setup".to_string()],
             evidence: if config.verbose {
                 vec![EvidenceItem {
                     key: "cgroup.expected_root".to_string(),
@@ -448,7 +448,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
                 status: Status::Fail,
                 summary: "privileged locald-shim not found".to_string(),
                 details: Some("expected locald-shim next to the locald executable".to_string()),
-                remediation: vec!["sudo locald admin setup".to_string()],
+                remediation: vec!["locald admin setup".to_string()],
                 evidence: vec![],
                 fix: Some(FixKey::RunAdminSetup),
             });
@@ -498,7 +498,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
                                 details: Some(
                                     "installed shim differs from embedded shim".to_string(),
                                 ),
-                                remediation: vec!["sudo locald admin setup".to_string()],
+                                remediation: vec!["locald admin setup".to_string()],
                                 evidence: evidence.clone(),
                                 fix: Some(FixKey::RunAdminSetup),
                             });
@@ -510,7 +510,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
                                 status: Status::Fail,
                                 summary: "failed to verify locald-shim".to_string(),
                                 details: Some(e.to_string()),
-                                remediation: vec!["sudo locald admin setup".to_string()],
+                                remediation: vec!["locald admin setup".to_string()],
                                 evidence: evidence.clone(),
                                 fix: Some(FixKey::RunAdminSetup),
                             });
@@ -542,7 +542,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
                                 "expected {expected_version}, got {}",
                                 detected.as_deref().unwrap_or("<unknown>")
                             )),
-                            remediation: vec!["sudo locald admin setup".to_string()],
+                            remediation: vec!["locald admin setup".to_string()],
                             evidence: evidence.clone(),
                             fix: Some(FixKey::RunAdminSetup),
                         });
@@ -585,7 +585,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
                     summary: "locald-shim is present but not configured for privileged use"
                         .to_string(),
                     details: Some("expected root ownership + setuid bit".to_string()),
-                    remediation: vec!["sudo locald admin setup".to_string()],
+                    remediation: vec!["locald admin setup".to_string()],
                     evidence: evidence.clone(),
                     fix: Some(FixKey::RunAdminSetup),
                 });
@@ -627,7 +627,7 @@ pub fn collect_report(config: AcquireConfig<'_>) -> Result<DoctorReport> {
                     ),
                     remediation: vec![
                         "locald trust".to_string(),
-                        "sudo locald admin setup".to_string(),
+                        "locald admin setup".to_string(),
                     ],
                     evidence: if config.verbose {
                         vec![
@@ -898,7 +898,7 @@ fn consolidate_fixes(problems: &[Problem]) -> Vec<FixAdvice> {
             FixKey::RunAdminSetup => out.push(FixAdvice {
                 key,
                 summary: "Install/repair the privileged helper and host setup".to_string(),
-                commands: vec!["sudo locald admin setup".to_string()],
+                commands: vec!["locald admin setup".to_string()],
             }),
             FixKey::HostPolicyBlocksPrivilegedHelper => out.push(FixAdvice {
                 key,
@@ -1047,14 +1047,14 @@ mod tests {
                 status: Status::Fail,
                 summary: "privileged locald-shim not found".to_string(),
                 details: None,
-                remediation: vec!["sudo locald admin setup".to_string()],
+                remediation: vec!["locald admin setup".to_string()],
                 evidence: vec![],
                 fix: Some(FixKey::RunAdminSetup),
             }],
             fixes: vec![FixAdvice {
                 key: FixKey::RunAdminSetup,
                 summary: "Install/repair the privileged helper and host setup".to_string(),
-                commands: vec!["sudo locald admin setup".to_string()],
+                commands: vec!["locald admin setup".to_string()],
             }],
         };
 
@@ -1429,7 +1429,7 @@ mod tests {
                 };
 
                 prop_assert_eq!(admin.commands.len(), 1);
-                prop_assert_eq!(admin.commands[0].as_str(), "sudo locald admin setup");
+                prop_assert_eq!(admin.commands[0].as_str(), "locald admin setup");
             } else {
                 prop_assert!(fixes.iter().all(|f| f.key != FixKey::RunAdminSetup));
             }

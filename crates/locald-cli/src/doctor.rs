@@ -75,11 +75,11 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
                 if !json {
                     if agent_path.exists() {
                         let _ = cliclack::log::warning(
-                            "Menu bar agent: outdated (run `sudo locald admin setup` to update)",
+                            "Menu bar agent: outdated (run `locald admin setup` to update)",
                         );
                     } else {
                         let _ = cliclack::log::warning(
-                            "Menu bar agent: not installed (run `sudo locald admin setup`)",
+                            "Menu bar agent: not installed (run `locald admin setup`)",
                         );
                     }
                 }
@@ -96,11 +96,11 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
                 let _ = cliclack::log::success("Port forwarding: persistent (survives reboot)");
             } else if crate::port_forward::macos::is_installed() {
                 let _ = cliclack::log::warning(
-                    "Port forwarding: active but ephemeral (run `sudo locald admin setup` to persist)",
+                    "Port forwarding: active but ephemeral (run `locald admin setup` to persist)",
                 );
             } else {
                 let _ = cliclack::log::warning(
-                    "Port forwarding: not configured (run `sudo locald admin setup`)",
+                    "Port forwarding: not configured (run `locald admin setup`)",
                 );
             }
         }

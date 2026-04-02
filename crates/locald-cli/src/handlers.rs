@@ -829,7 +829,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     return Err(CliError::message(format!(
                                         "HTTPS trust setup failed: {e}\n\
                                          This is required for browsers to trust locald's HTTPS certificates.\n\
-                                         Make sure you're running with sudo: sudo locald admin setup"
+                                         Run `locald admin setup` to retry."
                                     )));
                                 }
                             }
@@ -848,7 +848,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     return Err(CliError::message(format!(
                                         "Port forwarding setup failed: {e}\n\
                                          This is required for locald to serve on ports 80/443.\n\
-                                         Make sure you're running with sudo: sudo locald admin setup"
+                                         Run `locald admin setup` to retry."
                                     )));
                                 }
                             }
@@ -1133,7 +1133,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
 
                             return Err(CliError::message(
-                                "LaunchAgent not installed. Run `sudo locald admin setup` first.",
+                                "LaunchAgent not installed. Run `locald admin setup` first.",
                             ));
                         }
 
@@ -1212,7 +1212,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             .join("Library/LaunchAgents/com.locald.agent.plist");
                         if !plist.exists() {
                             return Err(CliError::message(
-                                "LaunchAgent not installed. Run `sudo locald admin setup` first.",
+                                "LaunchAgent not installed. Run `locald admin setup` first.",
                             ));
                         }
 
