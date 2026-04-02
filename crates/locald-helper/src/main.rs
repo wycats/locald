@@ -72,8 +72,10 @@ rdr pass on lo0 proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 8443
     async fn handle_client(mut client: XpcClient) {
         // Validate caller: reject connections from root (uid 0).
         // Only the console user's agent should be calling us.
+        // audit_token_t layout: [auid, euid, egid, ruid, rgid, pid, asid, pidver]
+        // Each field is u32. We want euid (field 1, bytes 4-7).
         let token = client.audit_token();
-        let caller_uid = u32::from_le_bytes([token[0], token[1], token[2], token[3]]);
+        let caller_uid = u32::from_le_bytes([token[4], token[5], token[6], token[7]]);
         if caller_uid == 0 {
             client.send_message(error_response("rejected: caller is root"));
             return;
@@ -294,23 +296,26 @@ rdr pass on lo0 proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 8443
             .join("locald")
             .join("config.toml");
 
-        // Read existing config or create minimal one.
-        let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        if content.contains("privileged_ports") {
-            // Already set — update in place.
-            content = content.replace("privileged_ports = false", "privileged_ports = true");
+        // Best-effort config update. Intentionally non-fatal (called with .ok()).
+        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+        let new_content = if content.contains("privileged_ports = true") {
+            // Already set correctly.
+            return Ok(());
+        } else if content.contains("privileged_ports") {
+            // Has the key but not set to true — flip it.
+            content.replace("privileged_ports = false", "privileged_ports = true")
+        } else if content.contains("[server]") {
+            // Has [server] section but no key.
+            content.replace("[server]", "[server]\nprivileged_ports = true")
         } else {
-            // Append server section.
-            if !content.contains("[server]") {
-                content.push_str("\n[server]\n");
-            }
-            content.push_str("privileged_ports = true\n");
-        }
+            // No server section at all.
+            format!("{content}\n[server]\nprivileged_ports = true\n")
+        };
 
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
-        std::fs::write(&config_path, &content).context("Failed to write config")?;
+        std::fs::write(&config_path, &new_content).context("Failed to write config")?;
 
         // Chown the config to the calling user so they can modify it later.
         let gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
