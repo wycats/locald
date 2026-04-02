@@ -870,35 +870,27 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 4: Install locald-agent as a LaunchAgent (starts at login).
+                        // Step 4: Extract embedded agent binary and install as LaunchAgent.
                         {
+                            const AGENT_BYTES: &[u8] =
+                                include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+
                             let s = cliclack::spinner();
                             s.start("Installing menu bar agent...");
 
-                            let exe_dir = std::env::current_exe()?
-                                .parent()
-                                .context("Failed to get executable directory")?
-                                .to_path_buf();
-                            let agent_path = exe_dir.join("locald-agent");
+                            let agent_path = locald_utils::agent::agent_path()?;
+                            locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
 
-                            if agent_path.exists() {
-                                match install_launch_agent(&agent_path) {
-                                    Ok(()) => {
-                                        s.stop("Menu bar agent installed (starts at login)");
-                                    }
-                                    Err(e) => {
-                                        s.stop(format!(
-                                            "Menu bar agent install failed: {e} (non-fatal)"
-                                        ));
-                                    }
+                            match install_launch_agent(&agent_path) {
+                                Ok(()) => {
+                                    s.stop("Menu bar agent installed (starts at login)");
                                 }
-                            } else {
-                                s.stop("Menu bar agent not found (skipped)");
-                                println!(
-                                    "{} locald-agent not found at {}. The menu bar agent won't start at login.",
-                                    style::WARN,
-                                    agent_path.display()
-                                );
+                                Err(e) => {
+                                    s.error(format!("Menu bar agent install failed: {e}"));
+                                    return Err(CliError::message(format!(
+                                        "Failed to install LaunchAgent: {e}"
+                                    )));
+                                }
                             }
                         }
 
@@ -966,6 +958,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     s.stop(format!(
                                         "Menu bar agent removal failed: {e} (non-fatal)"
                                     ));
+                                }
+                            }
+
+                            // Remove extracted agent binary.
+                            if let Ok(agent_path) = locald_utils::agent::agent_path() {
+                                if agent_path.exists() {
+                                    let _ = std::fs::remove_file(&agent_path);
                                 }
                             }
                         }
@@ -1108,6 +1107,29 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             return Err(CliError::message(
                                 "LaunchAgent not installed. Run `sudo locald admin setup` first.",
                             ));
+                        }
+
+                        // Verify agent binary integrity and auto-update if outdated.
+                        {
+                            const AGENT_BYTES: &[u8] =
+                                include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+
+                            let agent_path = locald_utils::agent::agent_path()?;
+                            match locald_utils::agent::verify_integrity(&agent_path, AGENT_BYTES) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!("{} Agent binary outdated, updating...", style::WARN);
+                                    // Stop the running agent before overwriting the binary.
+                                    #[allow(clippy::disallowed_methods)]
+                                    let _ = std::process::Command::new("launchctl")
+                                        .args(["stop", "com.locald.agent"])
+                                        .output();
+                                    locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
+                                }
+                                Err(e) => {
+                                    eprintln!("{} Failed to verify agent: {e}", style::WARN);
+                                }
+                            }
                         }
 
                         #[allow(clippy::disallowed_methods)]
@@ -1645,10 +1667,29 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn uninstall_launch_agent() -> anyhow::Result<()> {
     let label = "com.locald.agent";
-    let plist_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join("Library/LaunchAgents")
-        .join(format!("{label}.plist"));
+
+    // Under sudo, resolve the real user's plist location (mirrors install_launch_agent).
+    let user_home = if nix::unistd::geteuid().is_root() {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER")
+            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+        {
+            Some(user.dir)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let plist_dir = if let Some(ref home) = user_home {
+        home.join("Library/LaunchAgents")
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .join("Library/LaunchAgents")
+    };
+
+    let plist_path = plist_dir.join(format!("{label}.plist"));
 
     if plist_path.exists() {
         #[allow(clippy::disallowed_methods)]

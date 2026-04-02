@@ -57,6 +57,41 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         render_human(&report, verbose);
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        const AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+
+        let agent_path = locald_utils::agent::agent_path()?;
+        match locald_utils::agent::verify_integrity(&agent_path, AGENT_BYTES) {
+            Ok(true) => {
+                if !json {
+                    let _ = cliclack::log::success(format!(
+                        "Menu bar agent: OK ({})",
+                        agent_path.display()
+                    ));
+                }
+            }
+            Ok(false) => {
+                if !json {
+                    if agent_path.exists() {
+                        let _ = cliclack::log::warning(
+                            "Menu bar agent: outdated (run `sudo locald admin setup` to update)",
+                        );
+                    } else {
+                        let _ = cliclack::log::warning(
+                            "Menu bar agent: not installed (run `sudo locald admin setup`)",
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                if !json {
+                    let _ = cliclack::log::error(format!("Menu bar agent: error ({e})"));
+                }
+            }
+        }
+    }
+
     Ok(i32::from(report.has_critical_failures()))
 }
 

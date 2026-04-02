@@ -299,7 +299,35 @@ pub fn get_certs_dir() -> Result<PathBuf> {
 ///
 /// On macOS: `~/Library/Application Support/locald/`
 /// On Linux/other: `~/.locald/`
-fn locald_data_dir() -> Result<PathBuf> {
+///
+/// When running under `sudo`, resolves the invoking user's home directory
+/// rather than root's, so that extracted binaries and certificates end up
+/// in the correct user's data directory.
+///
+/// # Errors
+///
+/// Returns an error if the home directory cannot be determined.
+pub fn locald_data_dir() -> Result<PathBuf> {
+    // Under sudo, resolve the real user's home.
+    #[cfg(unix)]
+    if nix::unistd::geteuid().is_root()
+        && let Ok(sudo_user) = std::env::var("SUDO_USER")
+        && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+    {
+        let home = user.dir;
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(home
+                .join("Library")
+                .join("Application Support")
+                .join("locald"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Ok(home.join(".locald"));
+        }
+    }
+
     let home = dirs::home_dir().context("Could not find home directory")?;
 
     #[cfg(target_os = "macos")]

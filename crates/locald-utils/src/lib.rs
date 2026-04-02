@@ -1,5 +1,8 @@
 //! Shared utilities for locald.
 
+/// Menu bar agent management utilities (macOS).
+#[cfg(target_os = "macos")]
+pub mod agent;
 /// Certificate management utilities.
 pub mod cert;
 /// Cgroup v2 helpers (Linux only).

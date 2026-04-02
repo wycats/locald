@@ -76,6 +76,46 @@ fn main() {
         );
     }
 
+    // Build locald-agent when targeting macOS
+    if target_os == "macos" {
+        println!("cargo:rerun-if-changed=../locald-agent/src");
+        println!("cargo:rerun-if-changed=../locald-agent/Cargo.toml");
+
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+        let agent_dir = PathBuf::from("../locald-agent");
+
+        // Extract version from locald-agent/Cargo.toml
+        let agent_toml_path = agent_dir.join("Cargo.toml");
+        let agent_toml_content = std::fs::read_to_string(&agent_toml_path)
+            .expect("Failed to read locald-agent/Cargo.toml");
+
+        let agent_version = agent_toml_content
+            .lines()
+            .find(|line| line.starts_with("version = "))
+            .and_then(|line| line.split('"').nth(1))
+            .expect("Failed to parse version from locald-agent/Cargo.toml");
+
+        println!("cargo:rustc-env=LOCALD_EXPECTED_AGENT_VERSION={agent_version}");
+
+        // Build the agent in release mode. macOS builds are always native (no cross-compile).
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--release")
+            .arg("--manifest-path")
+            .arg(agent_dir.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(out_dir.join("agent-target"))
+            .status()
+            .expect("Failed to build locald-agent");
+        assert!(status.success(), "Failed to build locald-agent");
+
+        let agent_bin = out_dir.join("agent-target/release/locald-agent");
+        println!(
+            "cargo:rustc-env=LOCALD_EMBEDDED_AGENT_PATH={}",
+            agent_bin.display()
+        );
+    }
+
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
 
     // Determine channel from features
