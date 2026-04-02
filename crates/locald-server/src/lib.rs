@@ -368,6 +368,24 @@ async fn async_main(
     };
 
     let has_http = listener_http.is_some();
+
+    // Set the advertised HTTP port. This is the port users see in URLs.
+    // On macOS with pfctl: advertise 80 (pfctl redirects 80→8080).
+    // On Linux / direct bind: advertise the actual bind port.
+    // In sandbox mode: advertise the high port (8080).
+    if let Some(ref l) = listener_http {
+        let bind_port = l.local_addr().map(|a| a.port()).unwrap_or(8080);
+        #[cfg(target_os = "macos")]
+        let advertised_port = if config.server.privileged_ports {
+            80
+        } else {
+            bind_port
+        };
+        #[cfg(not(target_os = "macos"))]
+        let advertised_port = bind_port;
+        manager.set_http_port(Some(advertised_port)).await;
+    }
+
     if let Some(l) = listener_http {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -425,6 +443,21 @@ async fn async_main(
     };
 
     let has_tls = listener_https.is_some();
+
+    // Set the advertised HTTPS port (same logic as HTTP above).
+    if let Some(ref l) = listener_https {
+        let bind_port = l.local_addr().map(|a| a.port()).unwrap_or(8443);
+        #[cfg(target_os = "macos")]
+        let advertised_port = if config.server.privileged_ports {
+            443
+        } else {
+            bind_port
+        };
+        #[cfg(not(target_os = "macos"))]
+        let advertised_port = bind_port;
+        manager.set_https_port(Some(advertised_port)).await;
+    }
+
     if let Some(l) = listener_https {
         let proxy_clone = proxy.clone();
         tokio::spawn(async move {
@@ -434,37 +467,25 @@ async fn async_main(
         });
     }
 
-    // On macOS with pfctl, override the advertised ports to the public-facing ones.
-    // Only probe ports whose listeners are actually bound and serving.
-    // Uses async TCP connect to avoid blocking the Tokio runtime.
-    //
-    // Note: The TCP probe can false-positive if another process is on port 80/443.
-    // This is acceptable — querying pfctl directly requires root, and the false-positive
-    // case (another server on 80) is rare in local dev and self-correcting.
+    // On macOS with privileged_ports, verify pfctl is actually forwarding.
+    // Ports are already advertised as 80/443 — this is a health assertion,
+    // not a port-setter. If pfctl isn't working, warn clearly.
     #[cfg(target_os = "macos")]
     if config.server.privileged_ports {
-        let mut http_ready = false;
-        let mut tls_ready = false;
-        for attempt in 1..=5 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if has_http && !http_ready && pfctl_redirect_active(80).await {
-                info!("pfctl redirect active: advertising port 80 (attempt {attempt})");
-                manager.set_http_port(Some(80)).await;
-                http_ready = true;
-            }
-            if has_tls && !tls_ready && pfctl_redirect_active(443).await {
-                info!("pfctl redirect active: advertising port 443 (attempt {attempt})");
-                manager.set_https_port(Some(443)).await;
-                tls_ready = true;
-            }
-            if (http_ready || !has_http) && (tls_ready || !has_tls) {
-                break;
-            }
-        }
-        if (has_http && !http_ready) || (has_tls && !tls_ready) {
-            warn!(
-                "pfctl port forwarding not detected. Services will use ports 8080/8443. \
-                 Run `sudo locald admin setup` to configure port forwarding."
+        // Brief wait for the listeners to be ready before probing.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let http_ok = !has_http || pfctl_redirect_active(80).await;
+        let tls_ok = !has_tls || pfctl_redirect_active(443).await;
+
+        if http_ok && tls_ok {
+            info!("pfctl port forwarding verified");
+        } else {
+            error!(
+                "pfctl port forwarding not working. Ports 80/443 are advertised \
+                 but may not be reachable. Run `locald admin setup` to configure \
+                 port forwarding, or use `locald --sandbox <name> up` to run \
+                 without privileged ports."
             );
         }
     }

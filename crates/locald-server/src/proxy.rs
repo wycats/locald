@@ -89,7 +89,9 @@ impl ProxyManager {
 
         let addr = listener.local_addr()?;
         info!("Proxy bound to http://{addr}");
-        self.resolver.set_http_port(Some(addr.port())).await;
+        // Note: advertised port is set in lib.rs, not here. This method
+        // only binds the socket. lib.rs decides whether to advertise the
+        // bind port (sandbox/Linux) or the public port (macOS pfctl).
         Ok(listener)
     }
 
@@ -117,10 +119,9 @@ impl ProxyManager {
             return Ok(());
         };
 
-        // Update process manager
+        // Note: advertised port is set in lib.rs, not here.
         if let Ok(addr) = listener.local_addr() {
             info!("Proxy bound to https://{addr}");
-            self.resolver.set_https_port(Some(addr.port())).await;
         }
 
         let config = rustls::ServerConfig::builder()
