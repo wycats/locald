@@ -1,0 +1,19 @@
+[package]
+name = "xpc-spike"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spike-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "spike-client"
+path = "src/client.rs"
+
+[dependencies]
+xpc-connection = { git = "https://github.com/dfrankland/xpc-connection-rs.git", branch = "master", features = [
+  "audit_token",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"

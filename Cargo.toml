@@ -14,7 +14,9 @@ members = [
     "crates/cnb-client",
     "crates/locald-vmm",
     "crates/xtask",
+    "crates/locald-helper",
     "tools/fetch-kernel",
+    "examples/xpc-spike",
 ]
 # Cross-platform crates. Platform-specific crates (locald-shim, locald-vmm,
 # locald-e2e = Linux-only; locald-agent = macOS-only) are still workspace

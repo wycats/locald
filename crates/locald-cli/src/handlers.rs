@@ -908,6 +908,26 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
+                        // Step 5: Install privileged helper for passwordless future setup.
+                        {
+                            const HELPER_BYTES: &[u8] =
+                                include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
+
+                            let s = cliclack::spinner();
+                            s.start("Installing privileged helper...");
+
+                            match install_privileged_helper(HELPER_BYTES) {
+                                Ok(()) => {
+                                    s.stop("Privileged helper installed");
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Privileged helper install failed: {e} (non-fatal)"
+                                    ));
+                                }
+                            }
+                        }
+
                         cliclack::outro("Setup complete")?;
                         println!("Next: run `locald up`.");
                     }
@@ -1015,6 +1035,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     ));
                                 }
                             }
+                        }
+
+                        // Remove privileged helper.
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Removing privileged helper...");
+                            remove_privileged_helper();
+                            s.stop("Privileged helper removed");
                         }
 
                         // Reset privileged_ports config to default.
@@ -1729,4 +1757,78 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Install the privileged helper binary and its `LaunchDaemon` plist.
+///
+/// Writes the helper to `/Library/PrivilegedHelperTools/com.locald.helper` and
+/// registers it as a `LaunchDaemon` with a Mach service endpoint.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let helper_path = std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
+    std::fs::create_dir_all(
+        helper_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid helper path"))?,
+    )?;
+    std::fs::write(helper_path, helper_bytes)?;
+    std::fs::set_permissions(helper_path, std::fs::Permissions::from_mode(0o755))?;
+
+    let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.locald.helper</string>
+	<key>MachServices</key>
+	<dict>
+		<key>com.locald.helper</key>
+		<true/>
+	</dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/PrivilegedHelperTools/com.locald.helper</string>
+	</array>
+	<key>StandardOutPath</key>
+	<string>/var/log/com.locald.helper.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/com.locald.helper.log</string>
+</dict>
+</plist>"#;
+
+    let plist_path = std::path::Path::new("/Library/LaunchDaemons/com.locald.helper.plist");
+    std::fs::write(plist_path, plist_content)?;
+
+    // Unload any existing, then load.
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(plist_path)
+        .output();
+
+    let status = std::process::Command::new("launchctl")
+        .args(["load", "-w"])
+        .arg(plist_path)
+        .status()
+        .context("Failed to run launchctl load for helper")?;
+
+    if !status.success() {
+        anyhow::bail!("launchctl load for helper failed with status: {status}");
+    }
+
+    Ok(())
+}
+
+/// Remove the privileged helper binary and its `LaunchDaemon` plist.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn remove_privileged_helper() {
+    let plist_path = "/Library/LaunchDaemons/com.locald.helper.plist";
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w", plist_path])
+        .output();
+    let _ = std::fs::remove_file(plist_path);
+    let _ = std::fs::remove_file("/Library/PrivilegedHelperTools/com.locald.helper");
 }

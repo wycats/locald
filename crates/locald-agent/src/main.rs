@@ -278,12 +278,89 @@ mod macos {
             .spawn();
     }
 
+    /// Attempt privileged setup, preferring XPC helper, falling back to Terminal.
+    fn run_admin_setup() {
+        if try_xpc_setup() {
+            return;
+        }
+        run_admin_setup_via_terminal();
+    }
+
+    /// Try to perform setup via the privileged XPC helper.
+    ///
+    /// Connects to the `com.locald.helper` Mach service and sends a setup
+    /// command. Returns true if the helper responded with success.
+    fn try_xpc_setup() -> bool {
+        use std::sync::mpsc;
+
+        // XPC types aren't Send, so we run the entire XPC exchange on a
+        // dedicated thread and communicate the result back via a channel.
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = xpc_setup_on_thread();
+            let _ = tx.send(result);
+        });
+
+        // Wait up to 30s for the helper to respond.
+        rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false)
+    }
+
+    /// Perform the XPC setup exchange. Must run on the thread that created
+    /// the `XpcClient` (XPC types are not `Send`).
+    fn xpc_setup_on_thread() -> bool {
+        use futures::stream::StreamExt;
+        use std::ffi::CString;
+        use xpc_connection::{Message, XpcClient};
+
+        #[allow(clippy::expect_used)]
+        let name = CString::new("com.locald.helper").expect("static CString");
+        let mut client = XpcClient::connect(&name);
+
+        // Build { "command": "setup" } dictionary.
+        let mut dict = std::collections::HashMap::new();
+        #[allow(clippy::expect_used)]
+        {
+            dict.insert(
+                CString::new("command").expect("static CString"),
+                Message::String(CString::new("setup").expect("static CString")),
+            );
+        }
+        client.send_message(Message::Dictionary(dict));
+
+        // Drive the future to completion on a single-threaded runtime.
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return false;
+        };
+
+        let result = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(25), client.next())
+                .await
+                .ok()
+                .flatten()
+        });
+
+        match result {
+            Some(Message::Dictionary(ref dict)) => {
+                #[allow(clippy::expect_used)]
+                let status_key = CString::new("status").expect("static CString");
+                #[allow(clippy::expect_used)]
+                let success_val = CString::new("success").expect("static CString");
+                matches!(dict.get(&status_key), Some(Message::String(s)) if *s == success_val)
+            }
+            _ => false,
+        }
+    }
+
     /// Launch `locald admin setup` in Terminal.app via osascript.
     ///
     /// This opens a new Terminal window where the command auto-escalates
     /// to root (prompts for sudo password in the terminal).
     /// The resolved path is shell-quoted to handle spaces and special characters.
-    fn run_admin_setup() {
+    fn run_admin_setup_via_terminal() {
         let locald_path = locald_path_for_setup();
         let command = format!("{} admin setup", shell_quote(&locald_path));
         // Escape for embedding inside an AppleScript double-quoted string.
