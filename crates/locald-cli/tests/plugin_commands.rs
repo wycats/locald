@@ -161,6 +161,7 @@ fn plugin_inspect_errors_when_plugin_not_found() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn plugin_install_user_uses_xdg_data_home() {
     let root = tempfile::tempdir().expect("tempdir");
 

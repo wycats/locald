@@ -3,6 +3,7 @@
 use std::process::Command;
 
 #[test]
+#[cfg(target_os = "linux")]
 fn phase113_doctor_mentions_buildpacks_cnb_optional_integration() {
     // Goal: `locald doctor` should surface that Buildpacks/CNB support exists and
     // clearly communicate its dependency on the privileged shim (not Docker).
@@ -25,6 +26,7 @@ fn phase113_doctor_mentions_buildpacks_cnb_optional_integration() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn phase113_doctor_mentions_virtualization_kvm_optional_integration() {
     // Goal: `locald doctor` should surface virtualization availability, since some
     // workflows depend on KVM (/dev/kvm) on Linux.

@@ -145,6 +145,7 @@ impl Drop for TestContext {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn test_tui_progress() {
     let mut ctx = TestContext::new();
     ctx.start_daemon();

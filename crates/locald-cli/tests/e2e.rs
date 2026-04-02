@@ -154,6 +154,7 @@ impl Drop for TestContext {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn test_basic_lifecycle() {
     let mut ctx = TestContext::new();
 
@@ -178,6 +179,7 @@ fn test_basic_lifecycle() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn test_service_execution() {
     let mut ctx = TestContext::new();
     ctx.start_daemon();
@@ -246,6 +248,7 @@ command = "python3 -m http.server $PORT"
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn test_shim_bootstrap() {
     // This test verifies that locald-shim can bootstrap a container from a bundle.
     // It acts as the "Caller" in the Caller-Generates / Shim-Executes model.
