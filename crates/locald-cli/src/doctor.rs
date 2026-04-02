@@ -92,7 +92,7 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         }
 
         if !json {
-            if crate::port_forward::macos::is_persistent() {
+            if locald_utils::port_forward::is_persistent() {
                 let _ = cliclack::log::success("Port forwarding: persistent (survives reboot)");
             } else if crate::port_forward::macos::is_installed() {
                 let _ = cliclack::log::warning(
@@ -102,6 +102,23 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
                 let _ = cliclack::log::warning(
                     "Port forwarding: not configured (run `locald admin setup`)",
                 );
+            }
+
+            if locald_utils::cert::is_ca_trusted() {
+                let _ = cliclack::log::success("HTTPS trust: Root CA trusted by system");
+            } else {
+                let ca_exists = locald_utils::cert::get_certs_dir()
+                    .map(|dir| dir.join("rootCA.pem").exists())
+                    .unwrap_or(false);
+                if ca_exists {
+                    let _ = cliclack::log::warning(
+                        "HTTPS trust: Root CA exists but not trusted (run `locald admin setup`)",
+                    );
+                } else {
+                    let _ = cliclack::log::warning(
+                        "HTTPS trust: Root CA not generated (run `locald admin setup`)",
+                    );
+                }
             }
         }
     }

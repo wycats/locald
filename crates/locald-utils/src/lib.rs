@@ -21,6 +21,9 @@ pub mod ipc;
 /// Notification server utilities (Linux only).
 #[cfg(target_os = "linux")]
 pub mod notify;
+/// Port forwarding health checks (macOS).
+#[cfg(target_os = "macos")]
+pub mod port_forward;
 /// Postgres management utilities.
 pub mod postgres;
 /// Privileged capability acquisition + readiness reporting.

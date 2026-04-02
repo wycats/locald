@@ -176,16 +176,4 @@ rdr pass on lo0 proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 8443
 
         Ok(())
     }
-
-    /// Check whether persistent pfctl rules are configured.
-    ///
-    /// Verifies both the anchor file exists and pf.conf has the load anchor
-    /// line (which is what actually triggers rule loading on boot).
-    #[allow(clippy::disallowed_methods)]
-    pub fn is_persistent() -> bool {
-        std::path::Path::new(ANCHOR_FILE).exists()
-            && std::fs::read_to_string(PF_CONF)
-                .map(|c| c.contains(RDR_ANCHOR_LINE) && c.contains(LOAD_ANCHOR_LINE))
-                .unwrap_or(false)
-    }
 }

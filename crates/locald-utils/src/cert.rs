@@ -295,6 +295,32 @@ pub fn get_certs_dir() -> Result<PathBuf> {
     Ok(locald_data_dir()?.join("certs"))
 }
 
+/// Check whether the locald Root CA is trusted by the system.
+///
+/// On macOS, uses `security verify-cert` which works without root.
+/// Returns `true` if the CA file exists and is trusted, `false` otherwise.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+pub fn is_ca_trusted() -> bool {
+    let Ok(certs_dir) = get_certs_dir() else {
+        return false;
+    };
+    let ca_path = certs_dir.join("rootCA.pem");
+    if !ca_path.exists() {
+        return false;
+    }
+
+    // `security verify-cert` exits 0 if the cert is trusted.
+    std::process::Command::new("security")
+        .args(["verify-cert", "-c"])
+        .arg(&ca_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Returns the platform-appropriate data directory for locald.
 ///
 /// On macOS: `~/Library/Application Support/locald/`

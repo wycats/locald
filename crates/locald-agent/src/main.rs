@@ -49,21 +49,24 @@ mod macos {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct HealthStatus {
         pfctl_active: bool,
-        ca_exists: bool,
+        pfctl_persistent: bool,
+        ca_trusted: bool,
     }
 
     impl HealthStatus {
         fn is_healthy(&self) -> bool {
-            self.pfctl_active && self.ca_exists
+            self.pfctl_active && self.pfctl_persistent && self.ca_trusted
         }
 
         fn warning_label(&self) -> Option<String> {
             let mut problems = Vec::new();
             if !self.pfctl_active {
                 problems.push("port forwarding inactive");
+            } else if !self.pfctl_persistent {
+                problems.push("port forwarding won't survive reboot");
             }
-            if !self.ca_exists {
-                problems.push("HTTPS not configured");
+            if !self.ca_trusted {
+                problems.push("HTTPS not trusted");
             }
             if problems.is_empty() {
                 None
@@ -130,7 +133,8 @@ mod macos {
         let mut current_daemon = DaemonStatus::Checking;
         let mut current_health = HealthStatus {
             pfctl_active: true,
-            ca_exists: true,
+            pfctl_persistent: true,
+            ca_trusted: true,
         };
 
         // Call finishLaunching to initialize the app — registers with the
@@ -240,9 +244,11 @@ mod macos {
 
     /// Check system health without root.
     fn poll_health() -> HealthStatus {
+        let pfctl_active = check_pfctl_active();
         HealthStatus {
-            pfctl_active: check_pfctl_active(),
-            ca_exists: check_ca_exists(),
+            pfctl_active,
+            pfctl_persistent: locald_utils::port_forward::is_persistent(),
+            ca_trusted: locald_utils::cert::is_ca_trusted(),
         }
     }
 
@@ -257,13 +263,6 @@ mod macos {
 
         let addr = SocketAddr::from(([127, 0, 0, 1], 80));
         TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-    }
-
-    /// Check whether the locald Root CA certificate file exists.
-    fn check_ca_exists() -> bool {
-        locald_utils::cert::get_certs_dir()
-            .map(|dir| dir.join("rootCA.pem").exists())
-            .unwrap_or(false)
     }
 
     fn send_request(request: &IpcRequest) -> Result<IpcResponse, Box<dyn std::error::Error>> {
