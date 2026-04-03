@@ -1,4 +1,8 @@
 <script lang="ts">
+	import '@fontsource/geist/400.css';
+	import '@fontsource/geist/500.css';
+	import '@fontsource/geist/600.css';
+	import '@fontsource-variable/geist-mono';
 	import '../app.css';
 	import favicon from '$lib/assets/favicon.svg';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
