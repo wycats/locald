@@ -57,6 +57,72 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         render_human(&report, verbose);
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        const AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+
+        let agent_path = locald_utils::agent::agent_path()?;
+        match locald_utils::agent::verify_integrity(&agent_path, AGENT_BYTES) {
+            Ok(true) => {
+                if !json {
+                    let _ = cliclack::log::success(format!(
+                        "Menu bar agent: OK ({})",
+                        agent_path.display()
+                    ));
+                }
+            }
+            Ok(false) => {
+                if !json {
+                    if agent_path.exists() {
+                        let _ = cliclack::log::warning(
+                            "Menu bar agent: outdated (run `locald admin setup` to update)",
+                        );
+                    } else {
+                        let _ = cliclack::log::warning(
+                            "Menu bar agent: not installed (run `locald admin setup`)",
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                if !json {
+                    let _ = cliclack::log::error(format!("Menu bar agent: error ({e})"));
+                }
+            }
+        }
+
+        if !json {
+            if locald_utils::port_forward::is_persistent() {
+                let _ = cliclack::log::success("Port forwarding: persistent (survives reboot)");
+            } else if crate::port_forward::macos::is_installed() {
+                let _ = cliclack::log::warning(
+                    "Port forwarding: active but ephemeral (run `locald admin setup` to persist)",
+                );
+            } else {
+                let _ = cliclack::log::warning(
+                    "Port forwarding: not configured (run `locald admin setup`)",
+                );
+            }
+
+            if locald_utils::cert::is_ca_trusted() {
+                let _ = cliclack::log::success("HTTPS trust: Root CA trusted by system");
+            } else {
+                let ca_exists = locald_utils::cert::get_certs_dir()
+                    .map(|dir| dir.join("rootCA.pem").exists())
+                    .unwrap_or(false);
+                if ca_exists {
+                    let _ = cliclack::log::warning(
+                        "HTTPS trust: Root CA exists but not trusted (run `locald admin setup`)",
+                    );
+                } else {
+                    let _ = cliclack::log::warning(
+                        "HTTPS trust: Root CA not generated (run `locald admin setup`)",
+                    );
+                }
+            }
+        }
+    }
+
     Ok(i32::from(report.has_critical_failures()))
 }
 

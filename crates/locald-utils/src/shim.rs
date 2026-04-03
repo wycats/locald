@@ -269,7 +269,7 @@ pub fn ensure_permissions_with_sudo(shim_path: &Path) -> Result<()> {
             }
 
             anyhow::bail!(
-                "Privileged locald-shim is not configured. Run `sudo locald admin setup` to install/repair the setuid shim."
+                "Privileged locald-shim is not configured. Run `locald admin setup` to install/repair the setuid shim."
             );
         }
 
@@ -362,8 +362,8 @@ pub fn is_polkit_available() -> bool {
 /// Install the polkit policy file to enable GUI-based privilege escalation.
 ///
 /// This copies the policy file to `/usr/share/polkit-1/actions/` which allows
-/// users to use `pkexec locald admin setup` for a graphical authentication dialog
-/// instead of requiring `sudo` in the terminal.
+/// users to use `locald admin setup` with a graphical authentication dialog
+/// instead of a terminal-based sudo prompt.
 ///
 /// # Requirements
 ///

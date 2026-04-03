@@ -564,11 +564,11 @@ pub enum ServerCommands {
 
 #[derive(Subcommand)]
 pub enum AdminCommands {
-    /// Setup locald permissions (requires sudo)
+    /// Setup locald permissions (auto-escalates to root).
     Setup,
-    /// Remove macOS admin setup (pfctl rules, `LaunchAgent`, config). Requires sudo.
+    /// Remove admin setup (pfctl rules, `LaunchAgent`, config). Auto-escalates to root.
     Teardown,
-    /// Sync hosts file with running services (requires sudo)
+    /// Sync hosts file with running services. Auto-escalates to root.
     SyncHosts,
 }
 

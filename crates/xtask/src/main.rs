@@ -125,6 +125,8 @@ enum SandboxCommands {
 enum DevCommands {
     /// Run dev server
     Server,
+    /// Build and install locald + agent + helper (macOS). Runs admin setup.
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -211,6 +213,7 @@ fn main() -> Result<()> {
         },
         Commands::Dev { command } => match command {
             DevCommands::Server => dev::server(&sh)?,
+            DevCommands::Install => dev::install(&sh)?,
         },
         Commands::Coverage => coverage::run(&sh)?,
     }

@@ -174,10 +174,9 @@ fn offer_first_run_setup() -> bool {
         eprintln!("{} locald-shim is not installed.", style::CROSS);
         eprintln!();
         if locald_utils::shim::is_polkit_available() {
-            eprintln!("Run: pkexec locald admin setup  (GUI auth dialog)");
-            eprintln!("  or: sudo locald admin setup");
+            eprintln!("Run: locald admin setup  (will use polkit GUI auth dialog)");
         } else {
-            eprintln!("Run: sudo locald admin setup");
+            eprintln!("Run: locald admin setup");
         }
         eprintln!();
         eprintln!("Or use the install script:");

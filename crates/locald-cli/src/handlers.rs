@@ -829,7 +829,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     return Err(CliError::message(format!(
                                         "HTTPS trust setup failed: {e}\n\
                                          This is required for browsers to trust locald's HTTPS certificates.\n\
-                                         Make sure you're running with sudo: sudo locald admin setup"
+                                         Run `locald admin setup` to retry."
                                     )));
                                 }
                             }
@@ -848,8 +848,22 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     return Err(CliError::message(format!(
                                         "Port forwarding setup failed: {e}\n\
                                          This is required for locald to serve on ports 80/443.\n\
-                                         Make sure you're running with sudo: sudo locald admin setup"
+                                         Run `locald admin setup` to retry."
                                     )));
+                                }
+                            }
+
+                            // Make rules persistent across reboot via pf.conf anchor.
+                            let s = cliclack::spinner();
+                            s.start("Making port forwarding persistent...");
+                            match crate::port_forward::macos::install_persistent() {
+                                Ok(()) => {
+                                    s.stop("Port forwarding will survive reboot");
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Persistent rules not installed: {e} (non-fatal)"
+                                    ));
                                 }
                             }
                         }
@@ -870,35 +884,47 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 4: Install locald-agent as a LaunchAgent (starts at login).
+                        // Step 4: Extract embedded agent binary and install as LaunchAgent.
                         {
+                            const AGENT_BYTES: &[u8] =
+                                include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+
                             let s = cliclack::spinner();
                             s.start("Installing menu bar agent...");
 
-                            let exe_dir = std::env::current_exe()?
-                                .parent()
-                                .context("Failed to get executable directory")?
-                                .to_path_buf();
-                            let agent_path = exe_dir.join("locald-agent");
+                            let agent_path = locald_utils::agent::agent_path()?;
+                            locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
 
-                            if agent_path.exists() {
-                                match install_launch_agent(&agent_path) {
-                                    Ok(()) => {
-                                        s.stop("Menu bar agent installed (starts at login)");
-                                    }
-                                    Err(e) => {
-                                        s.stop(format!(
-                                            "Menu bar agent install failed: {e} (non-fatal)"
-                                        ));
-                                    }
+                            match install_launch_agent(&agent_path) {
+                                Ok(()) => {
+                                    s.stop("Menu bar agent installed (starts at login)");
                                 }
-                            } else {
-                                s.stop("Menu bar agent not found (skipped)");
-                                println!(
-                                    "{} locald-agent not found at {}. The menu bar agent won't start at login.",
-                                    style::WARN,
-                                    agent_path.display()
-                                );
+                                Err(e) => {
+                                    s.error(format!("Menu bar agent install failed: {e}"));
+                                    return Err(CliError::message(format!(
+                                        "Failed to install LaunchAgent: {e}"
+                                    )));
+                                }
+                            }
+                        }
+
+                        // Step 5: Install privileged helper for passwordless future setup.
+                        {
+                            const HELPER_BYTES: &[u8] =
+                                include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
+
+                            let s = cliclack::spinner();
+                            s.start("Installing privileged helper...");
+
+                            match install_privileged_helper(HELPER_BYTES) {
+                                Ok(()) => {
+                                    s.stop("Privileged helper installed");
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Privileged helper install failed: {e} (non-fatal)"
+                                    ));
+                                }
                             }
                         }
 
@@ -968,6 +994,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     ));
                                 }
                             }
+
+                            // Remove extracted agent binary.
+                            if let Ok(agent_path) = locald_utils::agent::agent_path() {
+                                if agent_path.exists() {
+                                    let _ = std::fs::remove_file(&agent_path);
+                                }
+                            }
                         }
 
                         {
@@ -977,7 +1010,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 Ok(()) => {
                                     s.stop("Port forwarding rules removed");
                                     println!(
-                                        "{} Removed pfctl redirect rules (com.locald/redirect).",
+                                        "{} Removed pfctl redirect rules (com.locald).",
                                         style::CHECK
                                     );
                                 }
@@ -988,6 +1021,28 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     )));
                                 }
                             }
+
+                            // Remove persistent anchor from pf.conf.
+                            let s = cliclack::spinner();
+                            s.start("Removing persistent port forwarding...");
+                            match crate::port_forward::macos::remove_persistent() {
+                                Ok(()) => {
+                                    s.stop("Persistent port forwarding removed");
+                                }
+                                Err(e) => {
+                                    s.stop(format!(
+                                        "Persistent rules removal failed: {e} (non-fatal)"
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Remove privileged helper.
+                        {
+                            let s = cliclack::spinner();
+                            s.start("Removing privileged helper...");
+                            remove_privileged_helper();
+                            s.stop("Privileged helper removed");
                         }
 
                         // Reset privileged_ports config to default.
@@ -1106,8 +1161,31 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
 
                             return Err(CliError::message(
-                                "LaunchAgent not installed. Run `sudo locald admin setup` first.",
+                                "LaunchAgent not installed. Run `locald admin setup` first.",
                             ));
+                        }
+
+                        // Verify agent binary integrity and auto-update if outdated.
+                        {
+                            const AGENT_BYTES: &[u8] =
+                                include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+
+                            let agent_path = locald_utils::agent::agent_path()?;
+                            match locald_utils::agent::verify_integrity(&agent_path, AGENT_BYTES) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    eprintln!("{} Agent binary outdated, updating...", style::WARN);
+                                    // Stop the running agent before overwriting the binary.
+                                    #[allow(clippy::disallowed_methods)]
+                                    let _ = std::process::Command::new("launchctl")
+                                        .args(["stop", "com.locald.agent"])
+                                        .output();
+                                    locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
+                                }
+                                Err(e) => {
+                                    eprintln!("{} Failed to verify agent: {e}", style::WARN);
+                                }
+                            }
                         }
 
                         #[allow(clippy::disallowed_methods)]
@@ -1162,7 +1240,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             .join("Library/LaunchAgents/com.locald.agent.plist");
                         if !plist.exists() {
                             return Err(CliError::message(
-                                "LaunchAgent not installed. Run `sudo locald admin setup` first.",
+                                "LaunchAgent not installed. Run `locald admin setup` first.",
                             ));
                         }
 
@@ -1573,17 +1651,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
 fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     let label = "com.locald.agent";
 
-    // When running under sudo, resolve the real user's home for the plist location.
-    let user_home = if nix::unistd::geteuid().is_root() {
+    // When running under sudo, resolve the real user's home and UID for
+    // correct plist placement and launchctl domain targeting.
+    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER")
             && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
         {
-            Some(user.dir)
+            (Some(user.dir), Some(user.uid.as_raw()))
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     // Write the plist directly to the correct user's LaunchAgents directory.
@@ -1596,7 +1675,7 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&plist_dir)?;
 
-    let plist_path = plist_dir.join(format!("{}.plist", label));
+    let plist_path = plist_dir.join(format!("{label}.plist"));
 
     // Write a minimal launchd plist.
     let plist_content = format!(
@@ -1613,7 +1692,9 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
 </dict>
 </plist>"#,
         label = label,
@@ -1621,22 +1702,42 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     );
     std::fs::write(&plist_path, plist_content)?;
 
-    // Unload any existing agent, then load the new plist.
+    // Load into the correct user's GUI domain.
+    // Under sudo, `launchctl load` targets root's domain — use
+    // `launchctl bootstrap gui/<uid>` to load into the invoking user's domain.
     #[allow(clippy::disallowed_methods)]
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(&plist_path)
-        .output();
+    if let Some(uid) = target_uid {
+        let service_target = format!("gui/{uid}/{label}");
+        // Unload any existing (ignore errors — "not found" is fine).
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &service_target])
+            .output();
 
-    #[allow(clippy::disallowed_methods)]
-    let status = std::process::Command::new("launchctl")
-        .args(["load", "-w"])
-        .arg(&plist_path)
-        .status()
-        .context("Failed to run launchctl load")?;
+        let status = std::process::Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}")])
+            .arg(&plist_path)
+            .status()
+            .context("Failed to run launchctl bootstrap")?;
 
-    if !status.success() {
-        anyhow::bail!("launchctl load failed with status: {status}");
+        if !status.success() {
+            anyhow::bail!("launchctl bootstrap gui/{uid} failed with status: {status}");
+        }
+    } else {
+        // Not running as root — load into current user's domain (legacy syntax).
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w"])
+            .arg(&plist_path)
+            .output();
+
+        let status = std::process::Command::new("launchctl")
+            .args(["load", "-w"])
+            .arg(&plist_path)
+            .status()
+            .context("Failed to run launchctl load")?;
+
+        if !status.success() {
+            anyhow::bail!("launchctl load failed with status: {status}");
+        }
     }
 
     Ok(())
@@ -1645,19 +1746,120 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn uninstall_launch_agent() -> anyhow::Result<()> {
     let label = "com.locald.agent";
-    let plist_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join("Library/LaunchAgents")
-        .join(format!("{label}.plist"));
+
+    // Under sudo, resolve the real user's plist location and UID.
+    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER")
+            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+        {
+            (Some(user.dir), Some(user.uid.as_raw()))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let plist_dir = if let Some(ref home) = user_home {
+        home.join("Library/LaunchAgents")
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .join("Library/LaunchAgents")
+    };
+
+    let plist_path = plist_dir.join(format!("{label}.plist"));
 
     if plist_path.exists() {
+        // Unload from the correct domain.
         #[allow(clippy::disallowed_methods)]
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&plist_path)
-            .output();
+        if let Some(uid) = target_uid {
+            let service_target = format!("gui/{uid}/{label}");
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &service_target])
+                .output();
+        } else {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", "-w"])
+                .arg(&plist_path)
+                .output();
+        }
         std::fs::remove_file(&plist_path)?;
     }
 
     Ok(())
+}
+
+/// Install the privileged helper binary and its `LaunchDaemon` plist.
+///
+/// Writes the helper to `/Library/PrivilegedHelperTools/com.locald.helper` and
+/// registers it as a `LaunchDaemon` with a Mach service endpoint.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let helper_path = std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
+    std::fs::create_dir_all(
+        helper_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid helper path"))?,
+    )?;
+    std::fs::write(helper_path, helper_bytes)?;
+    std::fs::set_permissions(helper_path, std::fs::Permissions::from_mode(0o755))?;
+
+    let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.locald.helper</string>
+	<key>MachServices</key>
+	<dict>
+		<key>com.locald.helper</key>
+		<true/>
+	</dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/PrivilegedHelperTools/com.locald.helper</string>
+	</array>
+	<key>StandardOutPath</key>
+	<string>/var/log/com.locald.helper.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/com.locald.helper.log</string>
+</dict>
+</plist>"#;
+
+    let plist_path = std::path::Path::new("/Library/LaunchDaemons/com.locald.helper.plist");
+    std::fs::write(plist_path, plist_content)?;
+
+    // Unload any existing, then load.
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(plist_path)
+        .output();
+
+    let status = std::process::Command::new("launchctl")
+        .args(["load", "-w"])
+        .arg(plist_path)
+        .status()
+        .context("Failed to run launchctl load for helper")?;
+
+    if !status.success() {
+        anyhow::bail!("launchctl load for helper failed with status: {status}");
+    }
+
+    Ok(())
+}
+
+/// Remove the privileged helper binary and its `LaunchDaemon` plist.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn remove_privileged_helper() {
+    let plist_path = "/Library/LaunchDaemons/com.locald.helper.plist";
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w", plist_path])
+        .output();
+    let _ = std::fs::remove_file(plist_path);
+    let _ = std::fs::remove_file("/Library/PrivilegedHelperTools/com.locald.helper");
 }
