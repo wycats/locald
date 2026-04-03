@@ -1,6 +1,17 @@
 use anyhow::Result;
 use xshell::{Shell, cmd};
 
+pub fn install(sh: &Shell) -> Result<()> {
+    println!("📦 Building locald (embeds agent + helper)...");
+    cmd!(sh, "cargo build --bin locald").run()?;
+
+    println!("🔧 Running admin setup (requires sudo)...");
+    cmd!(sh, "sudo target/debug/locald admin setup").run()?;
+
+    println!("✅ Installed. Agent is running in the menu bar.");
+    Ok(())
+}
+
 pub fn server(sh: &Shell) -> Result<()> {
     println!("📦 Building locald...");
     cmd!(sh, "cargo build").run()?;
