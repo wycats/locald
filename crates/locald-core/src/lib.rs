@@ -79,6 +79,7 @@ pub mod registry;
 pub use registry::Registry;
 pub mod attachments;
 pub mod resolver;
+pub mod worktree;
 #[doc(inline)]
 pub use resolver::ServiceResolver;
 pub mod buildpack;

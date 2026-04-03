@@ -324,6 +324,7 @@ impl ConfigLoader {
             project,
             plugins: _,
             services,
+            worktrees: _,
         } = project_config;
         all_layers.push((
             LayerConfig {
@@ -620,6 +621,7 @@ impl ConfigLoader {
             },
             plugins: std::collections::HashMap::new(),
             services,
+            worktrees: None,
         }
     }
 

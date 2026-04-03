@@ -28,6 +28,7 @@ fn load_or_create_config() -> Result<(std::path::PathBuf, LocaldConfig)> {
             },
             plugins: HashMap::new(),
             services: HashMap::new(),
+            worktrees: None,
         }
     };
 

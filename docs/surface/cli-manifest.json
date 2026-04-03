@@ -766,6 +766,56 @@
             "subcommands": []
           },
           {
+            "name": "project",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "attach",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "detach",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "list",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "start",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "status",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "stop",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
             "name": "registry",
             "aliases": [],
             "hidden": false,
@@ -1149,6 +1199,344 @@
           }
         ],
         "subcommands": []
+      },
+      {
+        "name": "project",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "attach",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "editor-id",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "editor-name",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "json",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "source",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "detach",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "editor-id",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "source",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": [
+              {
+                "name": "attach",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "detach",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "list",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "start",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "status",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "stop",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              }
+            ]
+          },
+          {
+            "name": "list",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "filter",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "json",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "start",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "status",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "json",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "stop",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          }
+        ]
       },
       {
         "name": "registry",

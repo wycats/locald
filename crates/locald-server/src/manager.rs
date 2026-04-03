@@ -459,22 +459,49 @@ impl ProcessManager {
         // Controllers handle their own reaping/status updates
     }
 
+    /// Resolve domain for a service. Shorthand that skips worktree resolution.
     pub(crate) fn get_service_domain(
         name: &str,
         project_config: &locald_core::config::ProjectConfig,
     ) -> String {
-        let domain = project_config
+        let config = locald_core::LocaldConfig {
+            project: project_config.clone(),
+            ..Default::default()
+        };
+        Self::get_service_domain_worktree(name, &config, None)
+    }
+
+    /// Resolve domain for a service with worktree awareness.
+    pub(crate) fn get_service_domain_worktree(
+        name: &str,
+        config: &locald_core::LocaldConfig,
+        project_path: Option<&std::path::Path>,
+    ) -> String {
+        let base_domain = config
+            .project
             .domain
             .clone()
-            .unwrap_or_else(|| format!("{}.localhost", project_config.name));
+            .unwrap_or_else(|| format!("{}.localhost", config.project.name));
+
+        // Resolve worktree-aware domain if applicable.
+        let domain = if let Some(path) = project_path {
+            resolve_worktree_domain(
+                &base_domain,
+                &config.project.name,
+                config.worktrees.as_ref(),
+                path,
+            )
+        } else {
+            base_domain
+        };
 
         let short_name = name.split(':').nth(1).unwrap_or(name);
 
         // If the service is named "web" or matches the project name, map it to the root domain.
-        if short_name == "web" || short_name == project_config.name {
+        if short_name == "web" || short_name == config.project.name {
             domain
         } else {
-            format!("{}.{}", short_name, domain)
+            format!("{short_name}.{domain}")
         }
     }
 
@@ -2034,6 +2061,40 @@ impl ServiceResolver for ProcessManager {
     async fn set_https_port(&self, port: Option<u16>) {
         self.set_https_port(port).await;
     }
+}
+
+/// Resolve the domain for a project, applying worktree branch qualification
+/// if the project is in a git worktree and has a `[worktrees]` config.
+fn resolve_worktree_domain(
+    base_domain: &str,
+    project_name: &str,
+    worktrees_config: Option<&locald_core::config::WorktreesConfig>,
+    project_path: &Path,
+) -> String {
+    let Some(git_ctx) = locald_core::worktree::detect(project_path) else {
+        return base_domain.to_string();
+    };
+
+    // Default branch always gets the base domain (no prefix).
+    if git_ctx.is_default_branch {
+        return base_domain.to_string();
+    }
+
+    // Non-worktree repos without [worktrees] config: use base domain.
+    // Worktrees without [worktrees] config: also use base domain (only one can run).
+    let Some(wt_config) = worktrees_config else {
+        return base_domain.to_string();
+    };
+
+    let Some(ref template) = wt_config.domain else {
+        return base_domain.to_string();
+    };
+
+    let Some(ref branch) = git_ctx.branch else {
+        return base_domain.to_string();
+    };
+
+    locald_core::worktree::resolve_domain_template(template, project_name, branch, base_domain)
 }
 
 #[cfg(test)]
