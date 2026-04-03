@@ -77,6 +77,7 @@ pub use state::{ServerState, ServiceState};
 pub mod registry;
 #[doc(inline)]
 pub use registry::Registry;
+pub mod attachments;
 pub mod resolver;
 #[doc(inline)]
 pub use resolver::ServiceResolver;

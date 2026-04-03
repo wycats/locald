@@ -1,3 +1,4 @@
+use crate::attachments::{AttachmentSource, ProjectFilter, ProjectListEntry, ProjectStatusInfo};
 use crate::config::{ServiceConfig, TypedServiceConfig};
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
@@ -297,6 +298,54 @@ pub enum IpcRequest {
     ///
     /// **Response:** `IpcResponse::RegistryCleaned(usize)`
     RegistryClean,
+    /// Register a project attachment.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    ProjectAttach {
+        /// The path to the project to attach.
+        project_path: PathBuf,
+        /// The source of the attachment.
+        source: AttachmentSource,
+    },
+    /// Remove a project attachment.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    ProjectDetach {
+        /// The path to the project to detach.
+        project_path: PathBuf,
+        /// Optional attachment source filter.
+        #[serde(default)]
+        source: Option<AttachmentSource>,
+    },
+    /// Get the status of a project.
+    ///
+    /// **Response:** `IpcResponse::ProjectStatus(ProjectStatusInfo)`
+    ProjectStatus {
+        /// The path to the project to inspect.
+        project_path: PathBuf,
+    },
+    /// List known projects with attachment state.
+    ///
+    /// **Response:** `IpcResponse::ProjectList(Vec<ProjectListEntry>)`
+    ProjectList {
+        /// Optional filter for list results.
+        #[serde(default)]
+        filter: Option<ProjectFilter>,
+    },
+    /// Force-start services for a project.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    ProjectForceStart {
+        /// The path to the project to start.
+        project_path: PathBuf,
+    },
+    /// Force-stop services for a project.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    ProjectForceStop {
+        /// The path to the project to stop.
+        project_path: PathBuf,
+    },
     /// Get the resolved environment variables for a service.
     ///
     /// **Response:** `IpcResponse::ServiceEnv(HashMap<String, String>)`
@@ -347,6 +396,10 @@ pub enum IpcResponse {
     RegistryCleaned(usize),
     /// Response to GetServiceEnv request.
     ServiceEnv(std::collections::HashMap<String, String>),
+    /// Response to ProjectStatus request.
+    ProjectStatus(ProjectStatusInfo),
+    /// Response to ProjectList request.
+    ProjectList(Vec<ProjectListEntry>),
 }
 
 /// Events broadcasted by the Server.

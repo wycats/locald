@@ -220,7 +220,21 @@ async fn async_main(
             .unwrap_or_default(),
     ));
 
-    let manager = ProcessManager::new(notify_path.clone(), state_manager, registry, Some(log_tx))?;
+    let mut attachment_store = locald_core::attachments::AttachmentStore::new(
+        locald_core::attachments::AttachmentStore::path(),
+    );
+    if let Err(e) = attachment_store.load().await {
+        warn!("Failed to load attachments store: {e}");
+    }
+    let attachments = std::sync::Arc::new(tokio::sync::Mutex::new(attachment_store));
+
+    let manager = ProcessManager::new(
+        notify_path.clone(),
+        state_manager,
+        registry,
+        attachments,
+        Some(log_tx),
+    )?;
     manager.spawn_metrics_collector();
 
     // Initialize ContainerManager

@@ -247,6 +247,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: RegistryCommands,
     },
+    /// Project lifecycle management (plumbing).
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
     /// Container management commands (nightly only)
     #[cfg(feature = "experimental-containers")]
     Container {
@@ -483,6 +488,56 @@ pub enum RegistryCommands {
     },
     /// Remove non-existent projects from the registry
     Clean,
+}
+
+#[derive(Subcommand)]
+pub enum ProjectCommands {
+    /// Register an attachment (editor, CLI, or pin).
+    Attach {
+        path: std::path::PathBuf,
+        /// Attachment source: editor or cli.
+        #[arg(long)]
+        source: Option<String>,
+        /// Editor name (required when source=editor).
+        #[arg(long)]
+        editor_name: Option<String>,
+        /// Editor id (required when source=editor).
+        #[arg(long)]
+        editor_id: Option<String>,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an attachment.
+    Detach {
+        path: std::path::PathBuf,
+        /// Attachment source: editor or cli.
+        #[arg(long)]
+        source: Option<String>,
+        /// Editor id (required when source=editor).
+        #[arg(long)]
+        editor_id: Option<String>,
+    },
+    /// Force-start services (emergency override).
+    Start { path: std::path::PathBuf },
+    /// Force-stop services (emergency override).
+    Stop { path: std::path::PathBuf },
+    /// Show project status.
+    Status {
+        path: std::path::PathBuf,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List known projects.
+    List {
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Filter: active, pinned, recent, all.
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

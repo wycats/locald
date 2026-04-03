@@ -3358,6 +3358,7 @@ dependencies = [
  "directories",
  "flate2",
  "futures",
+ "libc",
  "oci-distribution",
  "portable-pty",
  "schemars",

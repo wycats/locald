@@ -2,9 +2,11 @@ use crate::ShutdownReason;
 use crate::container::ContainerManager;
 use crate::manager::ProcessManager;
 use anyhow::Result;
+use locald_core::attachments::Attachment;
 use locald_core::config::LocaldConfig;
 use locald_core::{IpcRequest, IpcResponse};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc::Sender};
@@ -271,6 +273,39 @@ async fn handle_connection(
             Ok(count) => IpcResponse::RegistryCleaned(count),
             Err(e) => IpcResponse::Error(e.to_string()),
         },
+        IpcRequest::ProjectAttach {
+            project_path,
+            source,
+        } => match manager
+            .project_attach(Attachment {
+                project_path,
+                source,
+                created_at: SystemTime::now(),
+            })
+            .await
+        {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::ProjectDetach {
+            project_path,
+            source,
+        } => match manager.project_detach(&project_path, source).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::ProjectStatus { project_path } => {
+            match manager.project_status(&project_path).await {
+                Ok(info) => IpcResponse::ProjectStatus(info),
+                Err(e) => IpcResponse::Error(e.to_string()),
+            }
+        }
+        IpcRequest::ProjectList { filter } => match manager.project_list(filter).await {
+            Ok(entries) => IpcResponse::ProjectList(entries),
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::ProjectForceStart { .. } => IpcResponse::Ok,
+        IpcRequest::ProjectForceStop { .. } => IpcResponse::Ok,
         IpcRequest::GetServiceEnv { name } => match manager.get_service_env(&name).await {
             Ok(env) => IpcResponse::ServiceEnv(env),
             Err(e) => IpcResponse::Error(e.to_string()),

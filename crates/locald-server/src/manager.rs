@@ -9,6 +9,10 @@ use crate::state::StateManager;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
+use locald_core::attachments::{
+    Attachment, AttachmentSource, AttachmentStore, ProjectFilter, ProjectListEntry, ProjectSection,
+    ProjectStatusInfo,
+};
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{BootEvent, Event, LogEntry, ServiceStatus};
 use locald_core::registry::Registry;
@@ -21,7 +25,7 @@ use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, broadcast};
@@ -253,6 +257,7 @@ pub struct ProcessManager {
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
     watchers: Arc<Mutex<HashMap<PathBuf, RecommendedWatcher>>>,
     registry: Arc<Mutex<Registry>>,
+    attachments: Arc<Mutex<AttachmentStore>>,
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
     hosts_sync_guard: ConcurrencyGuard,
@@ -291,6 +296,7 @@ impl ProcessManager {
         notify_socket_path: PathBuf,
         state_manager: Arc<StateManager>,
         registry: Arc<Mutex<Registry>>,
+        attachments: Arc<Mutex<AttachmentStore>>,
         external_log_sender: Option<broadcast::Sender<LogEntry>>,
     ) -> Result<Self> {
         let (tx, _) = if let Some(tx) = external_log_sender {
@@ -326,6 +332,7 @@ impl ProcessManager {
             proxy_ports,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             registry,
+            attachments,
             health_monitor,
             factories,
             hosts_sync_guard: ConcurrencyGuard::new(),
@@ -1554,6 +1561,166 @@ impl ProcessManager {
     }
 
     #[allow(clippy::significant_drop_tightening)]
+    pub async fn project_attach(&self, attachment: Attachment) -> Result<()> {
+        let mut attachments = self.attachments.lock().await;
+        let _ = attachments.attach(attachment);
+        attachments.save().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn project_detach(
+        &self,
+        project_path: &Path,
+        source: Option<AttachmentSource>,
+    ) -> Result<()> {
+        let mut attachments = self.attachments.lock().await;
+        let sources = if let Some(source) = source {
+            vec![source]
+        } else {
+            attachments
+                .attachments_for(project_path)
+                .into_iter()
+                .map(|attachment| attachment.source.clone())
+                .collect()
+        };
+
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        let before = attachments.attachments_for(project_path).len();
+        for source in sources {
+            attachments.detach(project_path, &source);
+        }
+        let after = attachments.attachments_for(project_path).len();
+
+        if before != after {
+            attachments.save().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
+        self.refresh_attachments().await?;
+        let canonical = Self::canonicalize_path(project_path);
+
+        let project_name = {
+            let registry = self.registry.lock().await;
+            registry
+                .projects
+                .get(&canonical)
+                .and_then(|entry| entry.name.clone())
+        };
+
+        let attachments = {
+            let attachments = self.attachments.lock().await;
+            attachments
+                .attachments_for(&canonical)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let statuses = self.list().await;
+        let mut services = Vec::new();
+        let mut is_running = false;
+
+        for status in statuses {
+            if status.path.as_ref() == Some(&canonical) {
+                if status.status == ServiceState::Running {
+                    is_running = true;
+                }
+                services.push(status.name);
+            }
+        }
+
+        Ok(ProjectStatusInfo {
+            project_path: canonical,
+            project_name,
+            attachments,
+            is_running,
+            services,
+        })
+    }
+
+    pub async fn project_list(
+        &self,
+        filter: Option<ProjectFilter>,
+    ) -> Result<Vec<ProjectListEntry>> {
+        self.refresh_attachments().await?;
+
+        let registry_projects = {
+            let registry = self.registry.lock().await;
+            registry.projects.clone()
+        };
+
+        let attachment_projects = {
+            let attachments = self.attachments.lock().await;
+            attachments.all_projects()
+        };
+
+        let mut all_projects = HashSet::new();
+        for path in registry_projects.keys() {
+            all_projects.insert(path.clone());
+        }
+        for path in attachment_projects {
+            all_projects.insert(path);
+        }
+
+        let statuses = self.list().await;
+        let mut running_by_path: HashMap<PathBuf, bool> = HashMap::new();
+
+        for status in statuses {
+            let Some(path) = status.path else {
+                continue;
+            };
+            if status.status == ServiceState::Running {
+                running_by_path.insert(path, true);
+            }
+        }
+
+        let mut entries = Vec::new();
+        let filter = filter.unwrap_or(ProjectFilter::All);
+        let attachments = self.attachments.lock().await;
+        for path in all_projects {
+            let attachments_for = attachments
+                .attachments_for(&path)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let section = attachments.section_for(&path);
+            let is_running = running_by_path.get(&path).copied().unwrap_or(false);
+            let project_name = registry_projects
+                .get(&path)
+                .and_then(|entry| entry.name.clone());
+
+            let entry = ProjectListEntry {
+                project_path: path,
+                project_name,
+                attachments: attachments_for,
+                is_running,
+                section,
+            };
+
+            let include = match &filter {
+                ProjectFilter::All => true,
+                ProjectFilter::Active => entry.section == ProjectSection::Active,
+                ProjectFilter::Pinned => entry.section == ProjectSection::AlwaysOn,
+                ProjectFilter::Recent => entry.section == ProjectSection::Recent,
+            };
+
+            if include {
+                entries.push(entry);
+            }
+        }
+
+        entries.sort_by(|a, b| a.project_path.cmp(&b.project_path));
+        Ok(entries)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_pin(&self, path: &std::path::Path) -> Result<()> {
         let mut registry = self.registry.lock().await;
         if registry.pin_project(path) {
@@ -1621,6 +1788,19 @@ impl ProcessManager {
             registry.save().await?;
         }
         Ok(count)
+    }
+
+    async fn refresh_attachments(&self) -> Result<()> {
+        let mut attachments = self.attachments.lock().await;
+        let removed = attachments.reap_stale_pids();
+        if !removed.is_empty() {
+            attachments.save().await?;
+        }
+        Ok(())
+    }
+
+    fn canonicalize_path(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     pub async fn get_service_path(&self, name: &str) -> Option<PathBuf> {

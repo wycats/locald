@@ -1,5 +1,6 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
+use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -8,7 +9,8 @@ use std::collections::HashSet;
 use crate::build;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands, TrayCommands,
+    ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    TrayCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
@@ -44,6 +46,27 @@ struct JsonServiceAction {
 #[derive(Serialize)]
 struct JsonServiceActions {
     services: Vec<JsonServiceAction>,
+}
+
+#[derive(Serialize)]
+struct JsonProjectAction {
+    status: String,
+}
+
+fn format_attachment_source(source: &AttachmentSource) -> String {
+    match source {
+        AttachmentSource::Editor { name, id } => format!("editor:{name} ({id})"),
+        AttachmentSource::CLI { pid } => format!("cli:{pid}"),
+        AttachmentSource::Pin => "pin".to_string(),
+    }
+}
+
+const fn section_label(section: ProjectSection) -> &'static str {
+    match section {
+        ProjectSection::Active => "active",
+        ProjectSection::AlwaysOn => "always-on",
+        ProjectSection::Recent => "recent",
+    }
 }
 
 pub fn run(cli: Cli) -> CliResult<()> {
@@ -1432,6 +1455,231 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 .args(["/C", "start", url])
                 .spawn();
         }
+        Commands::Project { command } => match command {
+            ProjectCommands::Attach {
+                path,
+                source,
+                editor_name,
+                editor_id,
+                json,
+            } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let source = match source.as_deref() {
+                    Some("editor") => {
+                        let name = editor_name
+                            .clone()
+                            .ok_or_else(|| CliError::message("--editor-name is required"))?;
+                        let id = editor_id
+                            .clone()
+                            .ok_or_else(|| CliError::message("--editor-id is required"))?;
+                        AttachmentSource::Editor { name, id }
+                    }
+                    Some("cli") | None => AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    },
+                    Some(other) => {
+                        return Err(CliError::message(format!(
+                            "Unknown attachment source: {other}"
+                        )));
+                    }
+                };
+
+                match client::send_request(&IpcRequest::ProjectAttach {
+                    project_path: abs_path,
+                    source,
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        if *json {
+                            let payload = JsonProjectAction {
+                                status: "ok".to_string(),
+                            };
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        } else {
+                            println!("{} Attachment registered.", style::CHECK);
+                        }
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to attach project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Detach {
+                path,
+                source,
+                editor_id,
+            } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let source = match source.as_deref() {
+                    None => None,
+                    Some("editor") => {
+                        let id = editor_id
+                            .clone()
+                            .ok_or_else(|| CliError::message("--editor-id is required"))?;
+                        Some(AttachmentSource::Editor {
+                            name: String::new(),
+                            id,
+                        })
+                    }
+                    Some("cli") => Some(AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    }),
+                    Some(other) => {
+                        return Err(CliError::message(format!(
+                            "Unknown attachment source: {other}"
+                        )));
+                    }
+                };
+
+                match client::send_request(&IpcRequest::ProjectDetach {
+                    project_path: abs_path,
+                    source,
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        println!("{} Attachment removed.", style::CHECK);
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to detach project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Start { path } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                match client::send_request(&IpcRequest::ProjectForceStart {
+                    project_path: abs_path,
+                }) {
+                    Ok(IpcResponse::Ok) => println!("{} Project force-start queued.", style::CHECK),
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to start project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Stop { path } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                match client::send_request(&IpcRequest::ProjectForceStop {
+                    project_path: abs_path,
+                }) {
+                    Ok(IpcResponse::Ok) => println!("{} Project force-stop queued.", style::CHECK),
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to stop project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Status { path, json } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                match client::send_request(&IpcRequest::ProjectStatus {
+                    project_path: abs_path,
+                }) {
+                    Ok(IpcResponse::ProjectStatus(info)) => {
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&info)?);
+                        } else {
+                            println!("Path: {}", info.project_path.display());
+                            if let Some(name) = info.project_name {
+                                println!("Name: {name}");
+                            }
+                            println!("Running: {}", if info.is_running { "yes" } else { "no" });
+
+                            if info.services.is_empty() {
+                                println!("Services: none");
+                            } else {
+                                println!("Services:");
+                                for service in info.services {
+                                    println!("  - {service}");
+                                }
+                            }
+
+                            if info.attachments.is_empty() {
+                                println!("Attachments: none");
+                            } else {
+                                println!("Attachments:");
+                                for attachment in info.attachments {
+                                    let source = format_attachment_source(&attachment.source);
+                                    println!("  - {source}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to fetch project status: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::List { json, filter } => {
+                utils::ensure_daemon_running()?;
+                let filter = match filter.as_deref() {
+                    None => None,
+                    Some("active") => Some(ProjectFilter::Active),
+                    Some("pinned") => Some(ProjectFilter::Pinned),
+                    Some("recent") => Some(ProjectFilter::Recent),
+                    Some("all") => Some(ProjectFilter::All),
+                    Some(other) => {
+                        return Err(CliError::message(format!("Unknown filter: {other}")));
+                    }
+                };
+
+                match client::send_request(&IpcRequest::ProjectList { filter }) {
+                    Ok(IpcResponse::ProjectList(entries)) => {
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&entries)?);
+                        } else if entries.is_empty() {
+                            println!("No projects found.");
+                        } else {
+                            println!("{:<10} {:<6} {:<40} NAME", "SECTION", "RUN", "PATH");
+                            for entry in entries {
+                                let run = if entry.is_running { "yes" } else { "no" };
+                                let section = section_label(entry.section);
+                                let name = entry.project_name.unwrap_or_default();
+                                println!(
+                                    "{:<10} {:<6} {:<40} {}",
+                                    section,
+                                    run,
+                                    entry.project_path.display(),
+                                    name
+                                );
+                            }
+                        }
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to list projects: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+        },
         Commands::Registry { command } => match command {
             RegistryCommands::List => {
                 utils::ensure_daemon_running()?;
