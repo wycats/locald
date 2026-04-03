@@ -15,6 +15,7 @@ mod macos {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use objc2_foundation::MainThreadMarker;
+    use std::cell::RefCell;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -132,87 +133,116 @@ mod macos {
 
         spawn_poll_thread(update_tx);
 
-        // NSApplication.run() owns the event loop. We use an NSTimer to
-        // periodically check our channels from the main thread.
+        // Use NSApplication::run() for the event loop. This properly handles
+        // all system events including display reconfiguration (monitor switching),
+        // sleep/wake, and menu bar rebuilds. A manual nextEvent pump misses some
+        // of these, causing the tray icon to disappear on display changes.
+        //
+        // We check our channels (status updates, menu clicks) via an NSTimer
+        // callback that fires every 0.5 seconds on the main run loop.
         let menu_events = MenuEvent::receiver();
-        let mut current_daemon = DaemonStatus::Checking;
-        let mut current_health = HealthStatus {
-            pfctl_active: true,
-            pfctl_persistent: true,
-            ca_trusted: true,
-        };
 
-        // Call finishLaunching to initialize the app — registers with the
-        // window server so click events are delivered.
-        app.finishLaunching();
-
-        loop {
-            // Drain all pending AppKit events.
-            loop {
-                #[allow(unsafe_code)]
-                let event = unsafe {
-                    app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                        objc2_app_kit::NSEventMask::Any,
-                        None, // don't wait — return immediately if no events
-                        objc2_foundation::NSDefaultRunLoopMode,
-                        true,
-                    )
-                };
-                match event {
-                    Some(event) => app.sendEvent(&event),
-                    None => break,
-                }
-            }
-
-            // Check for poll updates.
-            while let Ok(update) = update_rx.try_recv() {
-                if update.daemon != current_daemon {
-                    current_daemon = update.daemon.clone();
-                    status_item.set_text(current_daemon.label());
-                }
-                if update.health != current_health {
-                    current_health = update.health.clone();
-                    if let Some(label) = current_health.warning_label() {
-                        health_item.set_text(label);
-                        health_item.set_enabled(false);
-                        setup_item.set_enabled(true);
-                    } else {
-                        health_item.set_text("");
-                        health_item.set_enabled(false);
-                        setup_item.set_enabled(false);
-                    }
-                }
-            }
-
-            // Check for menu item clicks.
-            while let Ok(event) = menu_events.try_recv() {
-                if event.id == open_item.id() {
-                    open_dashboard();
-                } else if event.id == restart_item.id() {
-                    restart_all_services();
-                } else if event.id == setup_item.id() && !current_health.is_healthy() {
-                    run_admin_setup();
-                } else if event.id == quit_item.id() {
-                    return Ok(());
-                }
-            }
-
-            // Wait for next event with a timeout. This blocks the thread
-            // efficiently instead of busy-spinning, waking only when an AppKit
-            // event arrives or the timeout expires.
-            #[allow(unsafe_code)]
-            let next = unsafe {
-                app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                    objc2_app_kit::NSEventMask::Any,
-                    Some(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.5)),
-                    objc2_foundation::NSDefaultRunLoopMode,
-                    true,
-                )
-            };
-            if let Some(event) = next {
-                app.sendEvent(&event);
-            }
+        // State shared with the timer callback via thread-local RefCell
+        // (the callback runs on the main thread, same as NSApplication::run).
+        thread_local! {
+            static STATE: RefCell<Option<CallbackState>> = const { RefCell::new(None) };
         }
+
+        struct CallbackState {
+            update_rx: mpsc::Receiver<PollUpdate>,
+            current_daemon: DaemonStatus,
+            current_health: HealthStatus,
+            status_item: MenuItem,
+            health_item: MenuItem,
+            setup_item: MenuItem,
+            open_item_id: muda::MenuId,
+            restart_item_id: muda::MenuId,
+            setup_item_id: muda::MenuId,
+            quit_item_id: muda::MenuId,
+        }
+
+        STATE.with(|s| {
+            *s.borrow_mut() = Some(CallbackState {
+                update_rx,
+                current_daemon: DaemonStatus::Checking,
+                current_health: HealthStatus {
+                    pfctl_active: true,
+                    pfctl_persistent: true,
+                    ca_trusted: true,
+                },
+                status_item,
+                health_item,
+                setup_item: setup_item.clone(),
+                open_item_id: open_item.id().clone(),
+                restart_item_id: restart_item.id().clone(),
+                setup_item_id: setup_item.id().clone(),
+                quit_item_id: quit_item.id().clone(),
+            });
+        });
+
+        // Schedule a repeating timer on the main run loop.
+        let timer_callback = block2::RcBlock::new(
+            move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+                STATE.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let Some(state) = borrow.as_mut() else {
+                        return;
+                    };
+
+                    // Check for poll updates.
+                    while let Ok(update) = state.update_rx.try_recv() {
+                        if update.daemon != state.current_daemon {
+                            state.current_daemon = update.daemon.clone();
+                            state.status_item.set_text(state.current_daemon.label());
+                        }
+                        if update.health != state.current_health {
+                            state.current_health = update.health.clone();
+                            if let Some(label) = state.current_health.warning_label() {
+                                state.health_item.set_text(label);
+                                state.health_item.set_enabled(false);
+                                state.setup_item.set_enabled(true);
+                            } else {
+                                state.health_item.set_text("");
+                                state.health_item.set_enabled(false);
+                                state.setup_item.set_enabled(false);
+                            }
+                        }
+                    }
+
+                    // Check for menu item clicks.
+                    while let Ok(event) = menu_events.try_recv() {
+                        if event.id == state.open_item_id {
+                            open_dashboard();
+                        } else if event.id == state.restart_item_id {
+                            restart_all_services();
+                        } else if event.id == state.setup_item_id
+                            && !state.current_health.is_healthy()
+                        {
+                            run_admin_setup();
+                        } else if event.id == state.quit_item_id {
+                            let app =
+                                NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+                            app.terminate(None);
+                        }
+                    }
+                });
+            },
+        );
+
+        #[allow(unsafe_code)]
+        unsafe {
+            use objc2_foundation::NSTimer;
+            let _timer =
+                NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.5, true, &timer_callback);
+        }
+
+        // NSApplication::run() never returns. It properly handles all system
+        // events including display reconfiguration.
+        app.run();
+
+        // run() never returns, but Rust needs a return value.
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
     fn spawn_poll_thread(update_tx: mpsc::Sender<PollUpdate>) {

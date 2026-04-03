@@ -20,7 +20,9 @@ objc2-app-kit = { version = "0.3", features = [
   "NSEvent",
   "NSRunningApplication",
 ] }
-objc2-foundation = { version = "0.3", features = ["NSDate", "NSRunLoop"] }
+objc2 = { version = "0.6" }
+objc2-foundation = { version = "0.3", features = ["NSDate", "NSRunLoop", "NSTimer", "block2"] }
+block2 = "0.6"
 xpc-connection = { git = "https://github.com/dfrankland/xpc-connection-rs.git", branch = "master" }
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "time"] }

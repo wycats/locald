@@ -3259,10 +3259,12 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "locald-agent"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "futures",
  "locald-core",
  "locald-utils",
  "muda",
+ "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "serde_json",
