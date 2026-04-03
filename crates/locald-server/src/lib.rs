@@ -283,6 +283,15 @@ async fn async_main(
         }
     });
 
+    // Spawn attachment reaper — cleans up stale editor/CLI attachments
+    let manager_reaper = manager.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            manager_reaper.reap_and_stop_orphans().await;
+        }
+    });
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
 
     // Run IPC server

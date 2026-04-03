@@ -28,6 +28,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 use tokio::sync::{Mutex, broadcast};
 use tracing::{error, info, warn};
 
@@ -1340,6 +1341,24 @@ impl ProcessManager {
         Ok(())
     }
 
+    pub async fn stop_project(&self, project_path: &Path) -> Result<()> {
+        let service_names: Vec<String> = {
+            let services = self.services.lock().await;
+            services
+                .iter()
+                .filter(|(_, service)| service.path == project_path)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+
+        for name in service_names {
+            if let Err(e) = self.stop(&name).await {
+                warn!("Failed to stop service {name}: {e}");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn restart_all(&self) -> Result<()> {
         // 1. Collect unique project paths
         let paths: HashSet<PathBuf> = {
@@ -1588,45 +1607,83 @@ impl ProcessManager {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn project_attach(&self, attachment: Attachment) -> Result<()> {
-        let mut attachments = self.attachments.lock().await;
-        let _ = attachments.attach(attachment);
-        attachments.save().await?;
+    pub async fn project_attach(
+        &self,
+        project_path: PathBuf,
+        source: AttachmentSource,
+    ) -> Result<()> {
+        let is_first = {
+            let mut attachments = self.attachments.lock().await;
+            let attachment = Attachment {
+                project_path: project_path.clone(),
+                source,
+                created_at: SystemTime::now(),
+            };
+            let first = attachments.attach(attachment);
+            attachments.clear_stopped(&project_path);
+            if let Err(e) = attachments.save().await {
+                error!("Failed to save attachments: {e}");
+            }
+            first
+        };
+
+        if is_first {
+            info!(
+                "First attachment for {}, starting services",
+                project_path.display()
+            );
+            if let Err(e) = self.start(project_path, None, false).await {
+                warn!("Failed to start project on attach: {e}");
+            }
+        }
         Ok(())
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn project_detach(
         &self,
-        project_path: &Path,
+        project_path: PathBuf,
         source: Option<AttachmentSource>,
     ) -> Result<()> {
-        let mut attachments = self.attachments.lock().await;
-        let sources = if let Some(source) = source {
-            vec![source]
-        } else {
-            attachments
-                .attachments_for(project_path)
-                .into_iter()
-                .map(|attachment| attachment.source.clone())
-                .collect()
+        let should_stop = {
+            let mut attachments = self.attachments.lock().await;
+            let is_last = if let Some(source) = &source {
+                attachments.detach(&project_path, source)
+            } else {
+                attachments.detach_all_non_pin(&project_path)
+            };
+            if let Err(e) = attachments.save().await {
+                error!("Failed to save attachments: {e}");
+            }
+            is_last && !attachments.is_stopped(&project_path)
         };
 
-        if sources.is_empty() {
-            return Ok(());
+        if should_stop {
+            info!(
+                "Last attachment removed for {}, stopping services",
+                project_path.display()
+            );
+            self.stop_project(&project_path).await?;
         }
-
-        let before = attachments.attachments_for(project_path).len();
-        for source in sources {
-            attachments.detach(project_path, &source);
-        }
-        let after = attachments.attachments_for(project_path).len();
-
-        if before != after {
-            attachments.save().await?;
-        }
-
         Ok(())
+    }
+
+    pub async fn project_force_start(&self, project_path: PathBuf) -> Result<()> {
+        {
+            let mut attachments = self.attachments.lock().await;
+            attachments.clear_stopped(&project_path);
+            let _ = attachments.save().await;
+        }
+        self.start(project_path, None, false).await
+    }
+
+    pub async fn project_force_stop(&self, project_path: PathBuf) -> Result<()> {
+        {
+            let mut attachments = self.attachments.lock().await;
+            attachments.mark_stopped(&project_path);
+            let _ = attachments.save().await;
+        }
+        self.stop_project(&project_path).await
     }
 
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
@@ -1824,6 +1881,27 @@ impl ProcessManager {
             attachments.save().await?;
         }
         Ok(())
+    }
+
+    pub async fn reap_and_stop_orphans(&self) {
+        let orphaned = {
+            let mut attachments = self.attachments.lock().await;
+            let orphaned = attachments.reap_stale_pids();
+            if !orphaned.is_empty() {
+                let _ = attachments.save().await;
+            }
+            orphaned
+        };
+
+        for path in orphaned {
+            info!(
+                "Stale attachments reaped for {}, stopping services",
+                path.display()
+            );
+            if let Err(e) = self.stop_project(&path).await {
+                warn!("Failed to stop orphaned project: {e}");
+            }
+        }
     }
 
     fn canonicalize_path(path: &Path) -> PathBuf {
@@ -2100,8 +2178,12 @@ fn resolve_worktree_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use locald_core::config::ProjectConfig;
+    use locald_core::config::{ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig};
+    use locald_core::registry::Registry;
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     #[test]
     fn test_get_service_domain_default() {
@@ -2322,6 +2404,54 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].message, "2");
         assert_eq!(logs[1].message, "3");
+    }
+
+    #[tokio::test]
+    async fn test_stop_project_targets_matching_paths() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("Failed to create ProcessManager");
+
+        let project_path = dir.path().join("project");
+        let other_path = dir.path().join("other");
+
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let service = |path: PathBuf| Service {
+            config: LocaldConfig::default(),
+            service_config: service_config.clone(),
+            resolved_env: HashMap::new(),
+            runtime_state: ServiceRuntime::None,
+            sticky_port: None,
+            path,
+            health_status: HealthStatus::Healthy,
+            health_source: HealthSource::None,
+            warnings: Vec::new(),
+        };
+
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("project:web".to_string(), service(project_path.clone()));
+            services.insert("other:web".to_string(), service(other_path));
+        }
+
+        manager.stop_project(&project_path).await.unwrap();
+
+        let services = manager.services.lock().await;
+        assert_eq!(
+            services.get("project:web").unwrap().health_status,
+            HealthStatus::Unknown
+        );
+        assert_eq!(
+            services.get("other:web").unwrap().health_status,
+            HealthStatus::Healthy
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -59,12 +59,15 @@ pub enum ProjectSection {
 struct AttachmentStoreData {
     #[serde(default)]
     attachments: HashMap<PathBuf, Vec<Attachment>>,
+    #[serde(default)]
+    manually_stopped: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Default)]
 pub struct AttachmentStore {
     path: PathBuf,
     attachments: HashMap<PathBuf, Vec<Attachment>>,
+    manually_stopped: HashSet<PathBuf>,
 }
 
 impl AttachmentStore {
@@ -72,6 +75,7 @@ impl AttachmentStore {
         Self {
             path,
             attachments: HashMap::new(),
+            manually_stopped: HashSet::new(),
         }
     }
 
@@ -88,10 +92,12 @@ impl AttachmentStore {
             let content = tokio::fs::read_to_string(&self.path).await?;
             if content.trim().is_empty() {
                 self.attachments.clear();
+                self.manually_stopped.clear();
                 return Ok(());
             }
             let data: AttachmentStoreData = serde_json::from_str(&content)?;
             self.attachments = data.attachments;
+            self.manually_stopped = data.manually_stopped;
         }
         Ok(())
     }
@@ -103,6 +109,7 @@ impl AttachmentStore {
         }
         let data = AttachmentStoreData {
             attachments: self.attachments.clone(),
+            manually_stopped: self.manually_stopped.clone(),
         };
         let content = serde_json::to_string_pretty(&data)?;
         tokio::fs::write(&self.path, content).await?;
@@ -137,6 +144,38 @@ impl AttachmentStore {
         }
 
         false
+    }
+
+    pub fn detach_all_non_pin(&mut self, project_path: &Path) -> bool {
+        let path = Self::canonicalize_path(project_path);
+        let Some(entry) = self.attachments.get_mut(&path) else {
+            return false;
+        };
+
+        let before = entry.len();
+        entry.retain(|attachment| matches!(attachment.source, AttachmentSource::Pin));
+
+        if entry.is_empty() {
+            self.attachments.remove(&path);
+            return before > 0;
+        }
+
+        false
+    }
+
+    pub fn mark_stopped(&mut self, project_path: &Path) {
+        let path = Self::canonicalize_path(project_path);
+        self.manually_stopped.insert(path);
+    }
+
+    pub fn clear_stopped(&mut self, project_path: &Path) {
+        let path = Self::canonicalize_path(project_path);
+        self.manually_stopped.remove(&path);
+    }
+
+    pub fn is_stopped(&self, project_path: &Path) -> bool {
+        let path = Self::canonicalize_path(project_path);
+        self.manually_stopped.contains(&path)
     }
 
     pub fn attachments_for(&self, project_path: &Path) -> Vec<&Attachment> {
@@ -293,6 +332,31 @@ mod tests {
     }
 
     #[test]
+    fn detach_all_non_pin_keeps_pin() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Pin,
+            created_at: SystemTime::now(),
+        });
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::CLI { pid: 42 },
+            created_at: SystemTime::now(),
+        });
+
+        let last_removed = store.detach_all_non_pin(&project);
+        assert!(!last_removed);
+
+        let remaining = store.attachments_for(&project);
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(remaining[0].source, AttachmentSource::Pin));
+    }
+
+    #[test]
     fn reap_stale_pids_prunes_dead_entries() {
         let dir = tempdir().unwrap();
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
@@ -323,6 +387,28 @@ mod tests {
         let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
         assert_eq!(removed, vec![canonical]);
         assert!(store.attachments_for(&project).is_empty());
+    }
+
+    #[tokio::test]
+    async fn manually_stopped_persists() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.mark_stopped(&project);
+        store.save().await.unwrap();
+
+        let mut loaded = AttachmentStore::new(store_path.clone());
+        loaded.load().await.unwrap();
+        assert!(loaded.is_stopped(&project));
+
+        loaded.clear_stopped(&project);
+        loaded.save().await.unwrap();
+
+        let mut reloaded = AttachmentStore::new(store_path);
+        reloaded.load().await.unwrap();
+        assert!(!reloaded.is_stopped(&project));
     }
 
     #[test]
