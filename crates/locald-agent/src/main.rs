@@ -442,4 +442,119 @@ mod macos {
 
         Ok(Icon::from_rgba(rgba, size as u32, size as u32)?)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn health_all_good() {
+            let h = HealthStatus {
+                pfctl_active: true,
+                pfctl_persistent: true,
+                ca_trusted: true,
+            };
+            assert!(h.is_healthy());
+            assert_eq!(h.warning_label(), None);
+        }
+
+        #[test]
+        fn health_pfctl_inactive() {
+            let h = HealthStatus {
+                pfctl_active: false,
+                pfctl_persistent: false,
+                ca_trusted: true,
+            };
+            assert!(!h.is_healthy());
+            let label = h.warning_label().unwrap();
+            assert!(label.contains("port forwarding inactive"));
+            // When pfctl is inactive, don't also warn about persistence.
+            assert!(!label.contains("reboot"));
+        }
+
+        #[test]
+        fn health_pfctl_not_persistent() {
+            let h = HealthStatus {
+                pfctl_active: true,
+                pfctl_persistent: false,
+                ca_trusted: true,
+            };
+            assert!(!h.is_healthy());
+            let label = h.warning_label().unwrap();
+            assert!(label.contains("reboot"));
+        }
+
+        #[test]
+        fn health_ca_untrusted() {
+            let h = HealthStatus {
+                pfctl_active: true,
+                pfctl_persistent: true,
+                ca_trusted: false,
+            };
+            assert!(!h.is_healthy());
+            let label = h.warning_label().unwrap();
+            assert!(label.contains("HTTPS not trusted"));
+        }
+
+        #[test]
+        fn health_multiple_problems() {
+            let h = HealthStatus {
+                pfctl_active: false,
+                pfctl_persistent: false,
+                ca_trusted: false,
+            };
+            assert!(!h.is_healthy());
+            let label = h.warning_label().unwrap();
+            assert!(label.contains("port forwarding inactive"));
+            assert!(label.contains("HTTPS not trusted"));
+        }
+
+        #[test]
+        fn daemon_status_labels() {
+            assert_eq!(DaemonStatus::Checking.label(), "Status: checking...");
+            assert_eq!(DaemonStatus::NotRunning.label(), "Status: not running");
+            assert_eq!(
+                DaemonStatus::Running {
+                    total: 3,
+                    running: 2
+                }
+                .label(),
+                "Status: 2/3 running"
+            );
+            assert_eq!(
+                DaemonStatus::Running {
+                    total: 0,
+                    running: 0
+                }
+                .label(),
+                "Status: running (no services)"
+            );
+        }
+
+        #[test]
+        fn shell_quote_simple_path() {
+            assert_eq!(
+                shell_quote("/usr/local/bin/locald"),
+                "'/usr/local/bin/locald'"
+            );
+        }
+
+        #[test]
+        fn shell_quote_path_with_spaces() {
+            assert_eq!(
+                shell_quote("/Applications/My App/locald"),
+                "'/Applications/My App/locald'"
+            );
+        }
+
+        #[test]
+        fn shell_quote_path_with_single_quote() {
+            assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        }
+
+        #[test]
+        fn shell_quote_empty() {
+            assert_eq!(shell_quote(""), "''");
+        }
+    }
 }

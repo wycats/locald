@@ -2004,6 +2004,27 @@ mod tests {
         )
         .await;
         assert_eq!(status.url, Some("https://app.test:8443".to_string()));
+
+        // Case 5: macOS privileged ports — pfctl redirects 80→8080, 443→8443
+        // but we advertise 80/443. URLs should NOT contain :8080 or :8443.
+        let status = ProcessManager::build_service_status(
+            name.clone(),
+            Some("myapp.localhost".to_string()),
+            path.clone(),
+            (Some(80), Some(443)),
+            health_status,
+            health_source,
+            running_snapshot(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status.url, Some("https://myapp.localhost".to_string()));
+        // Verify no high port leaks into URLs
+        assert!(!status.url.as_deref().unwrap_or("").contains("8443"));
+        assert!(!status.url.as_deref().unwrap_or("").contains("8080"));
     }
 
     #[test]

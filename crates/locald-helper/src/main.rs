@@ -355,4 +355,80 @@ rdr pass on lo0 proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 8443
         }
         Message::Dictionary(dict)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn make_command_dict(command: &str) -> HashMap<CString, Message> {
+            let mut dict = HashMap::new();
+            dict.insert(
+                CString::new("command").unwrap(),
+                Message::String(CString::new(command).unwrap()),
+            );
+            dict
+        }
+
+        fn get_status(msg: &Message) -> String {
+            match msg {
+                Message::Dictionary(d) => {
+                    let key = CString::new("status").unwrap();
+                    match d.get(&key) {
+                        Some(Message::String(s)) => s.to_string_lossy().to_string(),
+                        _ => panic!("no status field"),
+                    }
+                }
+                _ => panic!("expected dictionary"),
+            }
+        }
+
+        fn get_message_field(msg: &Message) -> String {
+            match msg {
+                Message::Dictionary(d) => {
+                    let key = CString::new("message").unwrap();
+                    match d.get(&key) {
+                        Some(Message::String(s)) => s.to_string_lossy().to_string(),
+                        _ => panic!("no message field"),
+                    }
+                }
+                _ => panic!("expected dictionary"),
+            }
+        }
+
+        #[test]
+        fn unknown_command_returns_error() {
+            let dict = make_command_dict("bogus");
+            let resp = handle_command(&dict, 501);
+            assert_eq!(get_status(&resp), "error");
+            assert!(get_message_field(&resp).contains("unknown command: bogus"));
+        }
+
+        #[test]
+        fn missing_command_field_returns_error() {
+            let dict = HashMap::new();
+            let resp = handle_command(&dict, 501);
+            assert_eq!(get_status(&resp), "error");
+            assert!(get_message_field(&resp).contains("missing or invalid"));
+        }
+
+        #[test]
+        fn wrong_command_type_returns_error() {
+            let mut dict = HashMap::new();
+            dict.insert(CString::new("command").unwrap(), Message::Int64(42));
+            let resp = handle_command(&dict, 501);
+            assert_eq!(get_status(&resp), "error");
+        }
+
+        #[test]
+        fn success_response_has_correct_format() {
+            let resp = success_response();
+            assert_eq!(get_status(&resp), "success");
+        }
+
+        #[test]
+        fn error_response_strips_null_bytes() {
+            let resp = error_response("bad\0data");
+            assert_eq!(get_message_field(&resp), "baddata");
+        }
+    }
 }
