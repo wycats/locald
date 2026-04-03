@@ -1,9 +1,22 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { projects, services } from '$lib/stores/services';
+	import { restartAllServices } from '$lib/api';
 	import Terminal from './Terminal.svelte';
 
 	let sseConnected = $state<boolean | null>(null);
+	let restarting = $state(false);
+
+	async function handleRestartAll() {
+		restarting = true;
+		try {
+			await restartAllServices();
+		} catch {
+			// Silently handle — services store will update via SSE
+		} finally {
+			setTimeout(() => (restarting = false), 2000);
+		}
+	}
 
 	let projectsCount = $derived($projects.length);
 	let servicesCount = $derived($services.length);
@@ -47,7 +60,17 @@
 		</div>
 
 		<div class="card">
-			<div class="card-title">Workspace Summary</div>
+			<div class="card-header">
+				<div class="card-title">Workspace Summary</div>
+				<button
+					class="restart-btn"
+					onclick={handleRestartAll}
+					disabled={restarting || runningCount === 0}
+					title="Restart all running services"
+				>
+					{restarting ? 'Restarting…' : 'Restart All'}
+				</button>
+			</div>
 			<div class="summary">
 				<div class="stat">
 					<div class="stat-num">{projectsCount}</div>
@@ -103,11 +126,39 @@
 		min-height: 96px;
 	}
 
+	.card-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 8px;
+	}
+
 	.card-title {
 		font-size: 12px;
 		font-weight: 600;
 		color: #e4e4e7;
-		margin-bottom: 8px;
+	}
+
+	.restart-btn {
+		font-size: 11px;
+		padding: 3px 8px;
+		border-radius: 4px;
+		border: 1px solid #3f3f46;
+		background: #18181b;
+		color: #a1a1aa;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+
+	.restart-btn:hover:not(:disabled) {
+		background: #27272a;
+		color: #e4e4e7;
+		border-color: #52525b;
+	}
+
+	.restart-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
 	}
 
 	.muted {

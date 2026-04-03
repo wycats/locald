@@ -105,9 +105,14 @@ mod macos {
         let open_item = MenuItem::new("Open Dashboard", true, None);
         menu.append(&open_item)?;
 
+        let restart_item = MenuItem::new("Restart All Services", true, None);
+        menu.append(&restart_item)?;
+
         // "Run Setup..." — visible only when health checks fail.
         let setup_item = MenuItem::new("Run Setup...", true, None);
         menu.append(&setup_item)?;
+
+        menu.append(&PredefinedMenuItem::separator())?;
 
         let quit_item = MenuItem::new("Quit", true, None);
         menu.append(&quit_item)?;
@@ -183,6 +188,8 @@ mod macos {
             while let Ok(event) = menu_events.try_recv() {
                 if event.id == open_item.id() {
                     open_dashboard();
+                } else if event.id == restart_item.id() {
+                    restart_all_services();
                 } else if event.id == setup_item.id() && !current_health.is_healthy() {
                     run_admin_setup();
                 } else if event.id == quit_item.id() {
@@ -269,6 +276,10 @@ mod macos {
         let request_bytes = serde_json::to_vec(request)?;
         let response_bytes = locald_utils::ipc::send_request(&request_bytes)?;
         Ok(serde_json::from_slice(&response_bytes)?)
+    }
+
+    fn restart_all_services() {
+        let _ = send_request(&IpcRequest::RestartAll);
     }
 
     fn open_dashboard() {
