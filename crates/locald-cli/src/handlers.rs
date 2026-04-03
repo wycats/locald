@@ -403,7 +403,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
 
-            // Retry loop for connection?
+            // Register a CLI attachment so the project's lifecycle is tracked.
+            // The attachment is tied to this process's PID — when the CLI exits,
+            // the daemon's periodic reaper will detect the PID is gone and
+            // detach (stopping services if no other attachments remain).
+            let _ = client::send_request(&IpcRequest::ProjectAttach {
+                project_path: abs_path.clone(),
+                source: locald_core::attachments::AttachmentSource::CLI {
+                    pid: std::process::id(),
+                },
+            });
+
+            // Start services with streaming output.
             let mut attempts = 0;
             loop {
                 match client::stream_boot_events(&IpcRequest::Start {
@@ -444,6 +455,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         "No locald.toml found in current directory. Please specify a service name.",
                     ));
                 }
+
+                // Detach this project (removes CLI attachment, triggers stop if last).
+                if let Ok(abs_path) = std::fs::canonicalize(std::env::current_dir()?) {
+                    let _ = client::send_request(&IpcRequest::ProjectDetach {
+                        project_path: abs_path,
+                        source: None, // detach all non-pin sources
+                    });
+                }
+
                 let config_content =
                     std::fs::read_to_string(&config_path).context("Failed to read locald.toml")?;
                 let config: LocaldConfig =
