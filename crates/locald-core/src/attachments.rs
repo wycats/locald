@@ -218,17 +218,25 @@ impl AttachmentStore {
             return ProjectSection::Recent;
         };
 
-        if attachments
-            .iter()
-            .any(|attachment| matches!(attachment.source, AttachmentSource::Pin))
-        {
-            return ProjectSection::AlwaysOn;
+        if attachments.is_empty() {
+            return ProjectSection::Recent;
         }
 
-        if attachments.is_empty() {
-            ProjectSection::Recent
-        } else {
+        let has_pin = attachments
+            .iter()
+            .any(|a| matches!(a.source, AttachmentSource::Pin));
+        let has_active = attachments
+            .iter()
+            .any(|a| !matches!(a.source, AttachmentSource::Pin));
+
+        // Active takes priority: if there are non-Pin attachments, it's Active
+        // even if also pinned.
+        if has_active {
             ProjectSection::Active
+        } else if has_pin {
+            ProjectSection::AlwaysOn
+        } else {
+            ProjectSection::Recent
         }
     }
 
@@ -328,6 +336,11 @@ mod tests {
             source: AttachmentSource::Pin,
             created_at: SystemTime::now(),
         });
+        // Active takes priority: pinned + CLI attachment = Active.
+        assert_eq!(store.section_for(&project), ProjectSection::Active);
+
+        // Remove the CLI attachment — now only Pin remains = AlwaysOn.
+        store.detach(&project, &AttachmentSource::CLI { pid: 42 });
         assert_eq!(store.section_for(&project), ProjectSection::AlwaysOn);
     }
 

@@ -1612,15 +1612,19 @@ impl ProcessManager {
         project_path: PathBuf,
         source: AttachmentSource,
     ) -> Result<()> {
+        // Canonicalize to prevent duplicate attachments from different relative paths.
+        let canonical =
+            std::fs::canonicalize(&project_path).unwrap_or_else(|_| project_path.clone());
+
         let is_first = {
             let mut attachments = self.attachments.lock().await;
             let attachment = Attachment {
-                project_path: project_path.clone(),
+                project_path: canonical.clone(),
                 source,
                 created_at: SystemTime::now(),
             };
             let first = attachments.attach(attachment);
-            attachments.clear_stopped(&project_path);
+            attachments.clear_stopped(&canonical);
             if let Err(e) = attachments.save().await {
                 error!("Failed to save attachments: {e}");
             }
@@ -1630,10 +1634,15 @@ impl ProcessManager {
         if is_first {
             info!(
                 "First attachment for {}, starting services",
-                project_path.display()
+                canonical.display()
             );
-            if let Err(e) = self.start(project_path, None, false).await {
+            if let Err(e) = self.start(canonical.clone(), None, false).await {
+                // Roll back attachment so future attaches retry start.
                 warn!("Failed to start project on attach: {e}");
+                let mut attachments = self.attachments.lock().await;
+                attachments.detach_all_non_pin(&canonical);
+                let _ = attachments.save().await;
+                return Err(e);
             }
         }
         Ok(())
@@ -2153,13 +2162,18 @@ fn resolve_worktree_domain(
         return base_domain.to_string();
     };
 
+    // Only apply branch-qualified domains to actual worktrees.
+    // A normal repo on a feature branch keeps the base domain.
+    if !git_ctx.is_worktree {
+        return base_domain.to_string();
+    }
+
     // Default branch always gets the base domain (no prefix).
     if git_ctx.is_default_branch {
         return base_domain.to_string();
     }
 
-    // Non-worktree repos without [worktrees] config: use base domain.
-    // Worktrees without [worktrees] config: also use base domain (only one can run).
+    // Worktrees without [worktrees] config: use base domain (only one can run).
     let Some(wt_config) = worktrees_config else {
         return base_domain.to_string();
     };

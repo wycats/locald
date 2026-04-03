@@ -74,6 +74,11 @@ pub fn sanitize_branch_for_dns(branch: &str) -> String {
 
     let result = result.trim_matches('-').to_string();
 
+    // Guard against empty result (branch name was all special chars).
+    if result.is_empty() {
+        return "branch".to_string();
+    }
+
     if result.len() > 63 {
         result[..63].trim_end_matches('-').to_string()
     } else {
