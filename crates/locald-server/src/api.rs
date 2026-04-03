@@ -21,6 +21,8 @@ pub fn router(pm: ProcessManager) -> Router {
         .route("/state", get(handle_state))
         .route("/logs", get(handle_ws))
         .route("/events", get(handle_events))
+        .route("/projects", get(handle_projects))
+        .route("/projects/remove", post(handle_project_remove))
         .route("/services/stop-all", post(handle_stop_all))
         .route("/services/restart-all", post(handle_restart_all))
         .route("/services/:name/start", post(handle_service_start))
@@ -252,5 +254,28 @@ async fn handle_service_inspect(
     match pm.inspect(&name).await {
         Ok(info) => axum::Json(info).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_projects(State(pm): State<Arc<ProcessManager>>) -> impl IntoResponse {
+    match pm.project_list(None).await {
+        Ok(projects) => axum::Json(projects).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoveProjectRequest {
+    path: String,
+}
+
+async fn handle_project_remove(
+    State(pm): State<Arc<ProcessManager>>,
+    axum::Json(body): axum::Json<RemoveProjectRequest>,
+) -> impl IntoResponse {
+    let project_path = std::path::PathBuf::from(&body.path);
+    match pm.remove_project(&project_path).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

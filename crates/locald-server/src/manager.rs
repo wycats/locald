@@ -1695,6 +1695,29 @@ impl ProcessManager {
         self.stop_project(&project_path).await
     }
 
+    pub async fn remove_project(&self, project_path: &Path) -> Result<()> {
+        let canonical = Self::canonicalize_path(project_path);
+
+        // Stop services.
+        let _ = self.stop_project(&canonical).await;
+
+        // Remove all attachments.
+        {
+            let mut attachments = self.attachments.lock().await;
+            attachments.detach_all_non_pin(&canonical);
+            let _ = attachments.save().await;
+        }
+
+        // Remove from registry.
+        {
+            let mut registry = self.registry.lock().await;
+            registry.unregister_project(&canonical);
+            let _ = registry.save().await;
+        }
+
+        Ok(())
+    }
+
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
         self.refresh_attachments().await?;
         let canonical = Self::canonicalize_path(project_path);

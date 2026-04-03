@@ -51,6 +51,35 @@ export async function restartAllServices(): Promise<void> {
 	}
 }
 
+export interface ProjectListEntry {
+	project_path: string;
+	project_name: string | null;
+	attachments: Array<{
+		source: { Editor?: { name: string; id: string }; CLI?: { pid: number }; Pin?: null };
+	}>;
+	is_running: boolean;
+	section: 'Active' | 'AlwaysOn' | 'Recent';
+}
+
+export async function getProjects(): Promise<ProjectListEntry[]> {
+	const res = await fetch('/api/projects');
+	if (!res.ok) {
+		throw new Error('Failed to fetch projects');
+	}
+	return res.json();
+}
+
+export async function removeProject(path: string): Promise<void> {
+	const res = await fetch('/api/projects/remove', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path })
+	});
+	if (!res.ok) {
+		throw new Error('Failed to remove project');
+	}
+}
+
 import { services } from '$lib/stores/services';
 import { logs } from '$lib/stores/logs';
 
