@@ -68,7 +68,7 @@ Dashboard state derives from attachments:
 | **Always On** | Has `Pin` attachment, no editor attachments | Monitor, Start, Disable |
 | **Recent** | Zero attachments, still in registry | Start, Enable, Remove |
 
-> Note: Per RFC 0135, the dashboard does not use the term "pin." The registry layer uses "pin" (enable/disable); the dashboard uses "Always On" and "Enable/Disable" for the same concept.
+> Note: Per RFC 0135, the dashboard does not use the term "pin." The registry uses `pin`/`unpin` commands; the dashboard shows this state as "Always On" with "Enable"/"Disable" actions.
 
 ### Worktree-aware domains
 
@@ -92,7 +92,7 @@ Resolution rules:
 
 Config source:
 
-Each worktree reads its own working copy of `locald.toml`. Service definitions, environment variables, and other config can vary per branch — that's what the developer is iterating on. The `[worktrees]` section defines the domain template, which is typically the same across branches but can be changed on a branch like any other config.
+Each worktree reads its own working copy of `locald.toml`. Service definitions, environment variables, and all other config can vary per branch. The `[worktrees]` section is config like any other and can be changed on a branch.
 
 Template variables:
 
@@ -107,13 +107,7 @@ Default `[worktrees].domain` uses `{{branch.last}}`.
 
 Project identity remains `path`. Each worktree has a distinct path, so each worktree is a separate registry entry. The dashboard groups worktrees under the parent repository.
 
-Implementation uses `git2`:
-
-- `Repository::open(path)` — works for both normal repos and worktrees
-- `.git` file vs `.git` directory distinguishes worktree from main repository
-- `repo.head()?.shorthand()` — current branch name
-- `repo.worktrees()` — list all worktrees from the main repo
-- `repo.workdir()` — the working directory
+Worktree detection uses `git2`. `Repository::open(path)` handles both normal repos and worktrees. A `.git` file (vs directory) indicates a worktree. `repo.head()?.shorthand()` provides the branch name. `repo.worktrees()` lists all worktrees from the main repo. Default branch detection falls back to treating the branch as non-default if `git symbolic-ref refs/remotes/origin/HEAD` fails (e.g., no remote configured).
 
 ### Editor integration protocol
 
@@ -135,19 +129,17 @@ Command semantics:
 - `start` and `stop` are explicit overrides that bypass attachment counting.
 - `status` returns machine-readable project state (services, ports, domains, attachments).
 - `list` returns known projects with attachment state.
-- All commands accept `--json` for machine-readable output. Schema TBD in Stage 1.
+- All commands accept `--json` for machine-readable output. TODO(MISSING): Define JSON schema in Stage 1.
 
-VS Code extension surface:
-
-- Status bar item showing service count and health.
-- Click opens the locald dashboard filtered to the project.
-- Command palette: Open Dashboard, Restart Services, Stop Services.
-
-Other editors can implement the same protocol.
+The VS Code extension shows a status bar item with service count and health. Clicking the item opens the locald dashboard filtered to the project. The command palette exposes Open Dashboard, Restart Services, and Stop Services. The protocol is editor-agnostic.
 
 Porcelain compatibility:
 
-`locald up`, `locald stop`, and `locald status` remain human-facing commands. `locald up` maps to `locald project attach <path> --source cli --pid $$` with interactive output (build progress, log streaming). locald creates the `CLI(pid)` attachment on start and removes it when the CLI process exits.
+`locald up`, `locald stop`, and `locald status` remain human-facing commands.
+
+- `locald up` maps to `locald project attach <path> --source cli` with interactive output (build progress, log streaming). locald records the calling process PID and removes the attachment when it exits.
+- `locald stop` maps to `locald project detach <path>` (normal graceful flow), not `locald project stop` (emergency override).
+- `locald status` maps to `locald project list` with human-formatted output.
 
 ### Dashboard behavior
 
@@ -162,7 +154,7 @@ myapp
 
 The Remove action in Recent stops services if running, removes the project from the registry, and cleans up the state directory.
 
-## Open questions
+## Resolved questions
 
 1. **Stale attachment cleanup.** RESOLVED: Editors proactively detach on window close (normal path). The daemon also polls attached PIDs and detaches when a PID disappears (fallback for crashes, force-quit, power loss). PID is stored at attach time. No heartbeat protocol needed.
 
@@ -172,7 +164,7 @@ The Remove action in Recent stops services if running, removes the project from 
 
 4. **Port allocation for worktrees.** RESOLVED: Ports are dynamically assigned per service start (OS picks a free port). Each worktree is a separate project (distinct path), so each gets its own ports. No collision risk.
 
-5. **`start`/`stop` vs attachment counting.** RESOLVED: Normal lifecycle flows through attachments: attach starts, detach stops, enable/disable controls persistence. `start` and `stop` are low-level emergency overrides (e.g., runaway process). `stop` force-stops services without modifying attachments — a still-attached editor will re-trigger start on its next poll. The dashboard's primary actions are attach-oriented (Enable, Disable, Remove), not process-oriented (start, stop).
+5. **`start`/`stop` vs attachment counting.** RESOLVED: Normal lifecycle flows through attachments: attach starts, detach stops, enable/disable controls persistence. `start` and `stop` are low-level emergency overrides (e.g., runaway process). `stop` force-stops services and sets a "manually stopped" flag. The flag inhibits auto-restart from existing attachments until the next explicit `start` or a new `attach`. For pinned projects, `stop` also sets this flag — the daemon does not auto-restart until `start` or re-pin. The dashboard's primary actions are attach-oriented (Enable, Disable, Remove), not process-oriented (start, stop).
 
 6. **Constellation interaction.** RESOLVED: Workspaces (multiple services in one `locald.toml`) are already implemented and compose naturally — one project, one attachment, all services start/stop together. A worktree of a workspace gets all the same services on a branch-qualified domain. Constellations (cross-repo grouping) are orthogonal future work.
 
