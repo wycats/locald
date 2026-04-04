@@ -33,9 +33,9 @@ export class StatusBar implements vscode.Disposable {
   }
 
   private update(info: ProjectStatusInfo): void {
-    const services = info.service_details;
-    const total = services.length;
-    const healthy = services.filter((s) => s.healthy).length;
+    const services = info.service_details ?? [];
+    const total = services.length || info.services.length;
+    const healthy = services.filter((s) => s.health_status === "Healthy").length;
 
     if (total === 0) {
       this.item.text = "$(server) locald";

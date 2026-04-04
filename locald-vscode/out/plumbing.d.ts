@@ -2,15 +2,18 @@ export interface ServiceStatus {
     name: string;
     url: string | null;
     port: number | null;
-    healthy: boolean;
     status: string;
+    health_status: string;
+    domain: string | null;
+    service_type: string;
 }
 export interface ProjectStatusInfo {
-    path: string;
-    name: string;
+    project_path: string;
+    project_name: string | null;
     services: string[];
     service_details: ServiceStatus[];
     attachments: unknown[];
+    is_running: boolean;
 }
 export declare function attach(projectPath: string, windowId: string): Promise<void>;
 export declare function detach(projectPath: string, windowId: string): Promise<void>;
