@@ -36,6 +36,9 @@ pub struct ProjectStatusInfo {
     pub is_running: bool,
     #[serde(default)]
     pub services: Vec<String>,
+    /// Full service details (ports, URLs, health, etc.)
+    #[serde(default)]
+    pub service_details: Vec<crate::ipc::ServiceStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

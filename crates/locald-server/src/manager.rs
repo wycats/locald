@@ -1755,6 +1755,7 @@ impl ProcessManager {
 
         let statuses = self.list().await;
         let mut services = Vec::new();
+        let mut service_details = Vec::new();
         let mut is_running = false;
 
         for status in statuses {
@@ -1762,7 +1763,8 @@ impl ProcessManager {
                 if status.status == ServiceState::Running {
                     is_running = true;
                 }
-                services.push(status.name);
+                services.push(status.name.clone());
+                service_details.push(status);
             }
         }
 
@@ -1772,6 +1774,7 @@ impl ProcessManager {
             attachments,
             is_running,
             services,
+            service_details,
         })
     }
 

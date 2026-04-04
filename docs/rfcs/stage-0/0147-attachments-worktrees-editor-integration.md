@@ -133,6 +133,39 @@ Command semantics:
 
 The VS Code extension shows a status bar item with service count and health. Clicking the item opens the locald dashboard filtered to the project. The command palette exposes Open Dashboard, Restart Services, and Stop Services. The protocol is editor-agnostic.
 
+### Copilot integration
+
+The VS Code extension exposes locald to Copilot through two mechanisms:
+
+**`chatInstructions`** (stable API). A `contributes.chatInstructions` entry in `package.json` loads when `locald:projectDetected` context key is set. This tells Copilot:
+
+- Services are managed by locald — don't start them manually
+- How to query status via `locald project status <path> --json`
+- The dev URLs for each running service
+- That the integrated browser can reach `*.localhost` domains via HTTPS
+
+**Copilot tool** (proposed API). The extension registers a language model tool (`vscode.lm.registerTool`) that Copilot can invoke directly:
+
+| Tool | Input | Output |
+|------|-------|--------|
+| `locald_services` | none | List of services with name, status, port, URL, health |
+| `locald_restart` | `{ service: string }` | Restart result |
+| `locald_logs` | `{ service?: string, lines?: number }` | Recent log lines |
+| `locald_open` | `{ service: string }` | Opens the service URL in Simple Browser, returns the URL |
+
+The tool enables a workflow where Copilot can make a code change, ask locald for the service URL, open it in the integrated browser, and verify the result visually — all without the user leaving the editor.
+
+Example interaction:
+```
+User: "Fix the login form validation and make sure it works"
+Copilot: [edits the validation code]
+Copilot: [calls locald_services to find the web service URL]
+Copilot: [calls locald_open to open it in Simple Browser]
+Copilot: [uses the browser tool to navigate to /login and test the form]
+```
+
+The tool calls the same plumbing CLI commands. The `locald_open` tool uses `vscode.env.openExternal` or `vscode.commands.executeCommand('simpleBrowser.show', url)` to open the URL.
+
 Porcelain compatibility:
 
 `locald up`, `locald stop`, and `locald status` remain human-facing commands.
