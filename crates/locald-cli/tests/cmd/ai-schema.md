@@ -26,6 +26,17 @@ $ locald ai schema
         "$ref": "#/$defs/ServiceConfig"
       },
       "default": {}
+    },
+    "worktrees": {
+      "description": "Worktree-specific configuration (domain templates for git worktrees).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorktreesConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
@@ -637,6 +648,19 @@ $ locald ai schema
       "required": [
         "command"
       ]
+    },
+    "WorktreesConfig": {
+      "description": "Configuration for git worktree domain resolution./n/nWhen a project is opened from a git worktree, the domain can be/nqualified with the branch name using template variables./n/n# Example/n```toml/n[worktrees]/ndomain = /"{{branch.last}}.{{project.domain}}/"/n```",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "description": "Domain template for worktrees. Supports `{{branch.last}}`, `{{branch.hyphenated}}`,/n`{{name}}`, and `{{project.domain}}`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     }
   }
 }
