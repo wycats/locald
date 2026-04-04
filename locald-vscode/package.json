@@ -5,6 +5,11 @@
   "version": "0.1.0",
   "publisher": "locald",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/locald",
+    "directory": "locald-vscode"
+  },
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -32,71 +37,91 @@
     ],
     "chatInstructions": [
       {
-        "file": "copilot-instructions.md",
+        "path": "copilot-instructions.md",
         "when": "locald:projectDetected"
       }
     ],
     "languageModelTools": [
       {
         "name": "locald_services",
-        "description": "List locald services with their status and URLs.",
+        "tags": ["locald"],
+        "displayName": "locald Services",
+        "modelDescription": "List all locald-managed services for the current project, including name, status, port, URL, domain, and health",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(server)",
         "inputSchema": {
           "type": "object",
-          "properties": {},
-          "additionalProperties": false
+          "properties": {}
         }
       },
       {
         "name": "locald_restart",
-        "description": "Restart locald services (optionally one service).",
+        "tags": ["locald"],
+        "displayName": "locald Restart",
+        "modelDescription": "Restart locald services for the current project",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(debug-restart)",
         "inputSchema": {
           "type": "object",
           "properties": {
             "service": {
-              "type": "string"
+              "type": "string",
+              "description": "Name of a specific service to restart"
             }
-          },
-          "additionalProperties": false
+          }
         }
       },
       {
         "name": "locald_logs",
-        "description": "Fetch locald logs (optionally by service and line count).",
+        "tags": ["locald"],
+        "displayName": "locald Logs",
+        "modelDescription": "Fetch recent log output from locald-managed services",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(output)",
         "inputSchema": {
           "type": "object",
           "properties": {
             "service": {
-              "type": "string"
+              "type": "string",
+              "description": "Name of a specific service to get logs from"
             },
             "lines": {
-              "type": "number"
+              "type": "number",
+              "description": "Number of log lines to return (default 200)"
             }
-          },
-          "additionalProperties": false
+          }
         }
       },
       {
         "name": "locald_open",
-        "description": "Open a locald service URL in the Simple Browser.",
+        "tags": ["locald"],
+        "displayName": "Open in Browser",
+        "modelDescription": "Open a locald service URL in VS Code's Simple Browser for visual verification",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(globe)",
         "inputSchema": {
           "type": "object",
           "properties": {
             "service": {
-              "type": "string"
+              "type": "string",
+              "description": "Name of the service to open (opens first service with a URL if omitted)"
             }
-          },
-          "additionalProperties": false
+          }
         }
       }
     ]
   },
   "scripts": {
     "build": "tsc",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --skip-license -o locald-vscode.vsix",
+    "install-ext": "npm run package && code --install-extension locald-vscode.vsix --force",
+    "dev": "npm run install-ext && echo 'Extension installed. Reload VS Code window to activate.'"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
     "@types/vscode": "^1.100.0",
+    "@vscode/vsce": "^3.5.0",
     "typescript": "^5.8.0"
   }
 }
