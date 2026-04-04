@@ -1,0 +1,102 @@
+{
+  "name": "locald-vscode",
+  "displayName": "locald",
+  "description": "Local development environment powered by locald",
+  "version": "0.1.0",
+  "publisher": "locald",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:locald.toml"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "locald.openDashboard",
+        "title": "locald: Open Dashboard"
+      },
+      {
+        "command": "locald.restartServices",
+        "title": "locald: Restart Services"
+      },
+      {
+        "command": "locald.stopServices",
+        "title": "locald: Stop Services"
+      }
+    ],
+    "chatInstructions": [
+      {
+        "file": "copilot-instructions.md",
+        "when": "locald:projectDetected"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "locald_services",
+        "description": "List locald services with their status and URLs.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "locald_restart",
+        "description": "Restart locald services (optionally one service).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "locald_logs",
+        "description": "Fetch locald logs (optionally by service and line count).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "string"
+            },
+            "lines": {
+              "type": "number"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "locald_open",
+        "description": "Open a locald service URL in the Simple Browser.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/vscode": "^1.100.0",
+    "typescript": "^5.8.0"
+  }
+}
