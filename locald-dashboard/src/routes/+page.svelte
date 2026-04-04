@@ -1,13 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { services } from '$lib/stores/services';
+	import { projectList } from '$lib/stores/projects';
 	import { connectEvents } from '$lib/api';
 	import Rack from '$lib/components/Rack.svelte';
 	import Stream from '$lib/components/Stream.svelte';
 	import Deck from '$lib/components/Deck.svelte';
+	import ProjectView from '$lib/components/ProjectView.svelte';
 
 	// --- State ---
 	let monitored = $state<string[]>([]);
+	let selectedProject = $state<string | null>(null);
 
 	onMount(() => {
 		const params = new URLSearchParams(window.location.search);
@@ -22,24 +25,29 @@
 		}
 
 		services.refresh();
+		projectList.refresh();
 		const cleanup = connectEvents();
 		return cleanup;
 	});
 
 	let isDeckMode = $derived(monitored.length > 0);
+
+	function handleSelectProject(path: string | null) {
+		selectedProject = path;
+	}
 </script>
 
 <div class="workspace">
-	<!-- THE RACK (Sidebar) -->
-	<Rack bind:monitored />
+	<!-- THE RACK -->
+	<Rack bind:monitored {selectedProject} onSelectProject={handleSelectProject} />
 
 	<!-- MAIN VIEW -->
 	<div class="main-view">
-		{#if isDeckMode}
-			<!-- THE DECK (Tiled Terminals) -->
+		{#if selectedProject}
+			<ProjectView projectPath={selectedProject} />
+		{:else if isDeckMode}
 			<Deck bind:monitored />
 		{:else}
-			<!-- THE STREAM (Unified Log) -->
 			<Stream />
 		{/if}
 	</div>

@@ -1,7 +1,15 @@
 <script lang="ts">
 	/* eslint-disable svelte/no-navigation-without-resolve */
 	import { projects, services, servicesError, servicesLoading } from '$lib/stores/services';
+	import {
+		projectList,
+		activeProjects,
+		alwaysOnProjects,
+		recentProjects
+	} from '$lib/stores/projects';
+	import { removeProject, type ProjectListEntry } from '$lib/api';
 	import { pendingActions } from '$lib/stores/actions';
+	import { toasts } from '$lib/stores/toasts';
 	import {
 		startServiceWithFeedback,
 		stopServiceWithFeedback,
@@ -19,18 +27,143 @@
 		RefreshCw,
 		RotateCcw,
 		ExternalLink,
-		AlertCircle
+		AlertCircle,
+		Pin,
+		Clock
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
 	import Spinner from './Spinner.svelte';
 
 	export let monitored: string[] = [];
+	export let selectedProject: string | null = null;
+	export let onSelectProject: (path: string | null) => void = () => {};
 
 	let collapsedGroups: string[] = [];
+	let collapsedSections: string[] = [];
 	let activeMenu: string | null = null;
 	let focused: string | null = null;
+	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
+
+	function toggleSectionCollapse(section: string) {
+		if (collapsedSections.includes(section)) {
+			collapsedSections = collapsedSections.filter((s) => s !== section);
+		} else {
+			collapsedSections = [...collapsedSections, section];
+		}
+	}
 
 	$: allServices = $projects.flatMap((p) => p.services);
+
+	type SectionHeader = { kind: 'section'; section: 'Active' | 'AlwaysOn' | 'Recent' };
+	type ProjectGroup = {
+		kind: 'project';
+		name: string;
+		path: string | null;
+		entry: ProjectListEntry | null;
+		services: ServiceStatus[];
+		section: string | null;
+	};
+	type RackEntry = SectionHeader | ProjectGroup;
+
+	// Build an ordered list: section headers interleaved with project groups
+	$: rackEntries = buildRackEntries(
+		$activeProjects,
+		$alwaysOnProjects,
+		$recentProjects,
+		$projects,
+		collapsedSections
+	);
+
+	function buildRackEntries(
+		active: ProjectListEntry[],
+		alwaysOn: ProjectListEntry[],
+		recent: ProjectListEntry[],
+		serviceProjects: { name: string; services: ServiceStatus[] }[],
+		collapsed: string[]
+	): RackEntry[] {
+		const entries: RackEntry[] = [];
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity
+		const claimed = new Set<string>();
+
+		// Count how many sections have content — only show headers when 2+
+		const sectionCount = [active, alwaysOn, recent].filter((l) => l.length > 0).length;
+		const showHeaders = sectionCount >= 2;
+
+		function addSection(section: 'Active' | 'AlwaysOn' | 'Recent', list: ProjectListEntry[]) {
+			if (list.length === 0) return;
+			if (showHeaders) entries.push({ kind: 'section', section });
+			// Always claim names so collapsed projects don't leak into the unattached list
+			for (const entry of list) {
+				const entryName = entry.project_name || entry.project_path.split('/').pop() || '';
+				claimed.add(entryName);
+			}
+			if (showHeaders && collapsed.includes(section)) return;
+			for (const entry of list) {
+				const entryName = entry.project_name || entry.project_path.split('/').pop() || '';
+				const group = serviceProjects.find((p) => p.name === entryName);
+				entries.push({
+					kind: 'project',
+					name: entryName,
+					path: entry.project_path,
+					entry,
+					services: group?.services ?? [],
+					section
+				});
+			}
+		}
+
+		addSection('Active', active);
+		addSection('AlwaysOn', alwaysOn);
+		addSection('Recent', recent);
+
+		// Projects with services but no attachment entry
+		for (const p of serviceProjects) {
+			if (!claimed.has(p.name)) {
+				entries.push({
+					kind: 'project',
+					name: p.name,
+					path: null,
+					entry: null,
+					services: p.services,
+					section: null
+				});
+			}
+		}
+
+		return entries;
+	}
+
+	function handleProjectContextMenu(e: MouseEvent, project: ProjectListEntry) {
+		e.preventDefault();
+		e.stopPropagation();
+		contextMenu = { x: e.clientX, y: e.clientY, project };
+	}
+
+	function closeContextMenu() {
+		contextMenu = null;
+	}
+
+	async function handleRemoveProject() {
+		if (!contextMenu) return;
+		const { project } = contextMenu;
+		const name = project.project_name || project.project_path.split('/').pop() || 'this project';
+		closeContextMenu();
+
+		if (project.is_running) {
+			if (!confirm(`"${name}" is running. Remove will stop all its services. Continue?`)) return;
+		}
+
+		try {
+			await removeProject(project.project_path);
+			await projectList.refresh();
+			if (selectedProject === project.project_path) {
+				onSelectProject(null);
+			}
+			toasts.success(`Removed ${name}`);
+		} catch (e) {
+			toasts.error(e instanceof Error ? e.message : String(e));
+		}
+	}
 
 	function handleKeydown(event: KeyboardEvent) {
 		if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)
@@ -187,7 +320,14 @@
 <!-- a11y: Click-to-close has keyboard alternative via Escape key in handleKeydown -->
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
-<div class="rack" on:click={closeMenu} role="application">
+<div
+	class="rack"
+	on:click={() => {
+		closeMenu();
+		closeContextMenu();
+	}}
+	role="application"
+>
 	<div class="rack-header">
 		<div class="logo">locald</div>
 	</div>
@@ -208,7 +348,7 @@
 					Retry
 				</button>
 			</div>
-		{:else if $projects.length === 0}
+		{:else if $projects.length === 0 && $projectList.length === 0}
 			<div class="rack-state empty">
 				<Layers size={24} />
 				<span class="state-title">No services found</span>
@@ -217,174 +357,204 @@
 				</span>
 			</div>
 		{:else}
-			{#each $projects as project (project.name)}
-				{@const isCollapsed = collapsedGroups.includes(project.name)}
-				{@const isAllStopped = project.services.every((s) => s.status === 'stopped')}
-
-				<div class="rack-group-header" class:disabled={isAllStopped}>
+			{#each rackEntries as rackEntry (rackEntry.kind === 'section' ? rackEntry.section : rackEntry.name)}
+				{#if rackEntry.kind === 'section'}
+					{@const sectionCollapsed = collapsedSections.includes(rackEntry.section)}
 					<button
-						class="group-title"
-						type="button"
-						on:click={() => toggleGroupCollapse(project.name)}
+						class="rack-section-header"
+						on:click={() => toggleSectionCollapse(rackEntry.section)}
 					>
-						{#if isCollapsed}
-							<ChevronRight size={12} />
+						{#if sectionCollapsed}
+							<ChevronRight size={10} />
 						{:else}
-							<ChevronDown size={12} />
+							<ChevronDown size={10} />
 						{/if}
-						<span>{project.name}</span>
+						{#if rackEntry.section === 'Active'}
+							<div class="section-dot active"></div>
+						{:else if rackEntry.section === 'AlwaysOn'}
+							<Pin size={10} />
+						{:else}
+							<Clock size={10} />
+						{/if}
+						<span>{rackEntry.section === 'AlwaysOn' ? 'Always On' : rackEntry.section}</span>
 					</button>
-					<div class="group-actions">
+				{:else}
+					{@const project = rackEntry}
+					{@const isCollapsed = collapsedGroups.includes(project.name)}
+					{@const isAllStopped =
+						project.services.length === 0 || project.services.every((s) => s.status === 'stopped')}
+					<!-- svelte-ignore a11y-no-static-element-interactions -->
+					<div
+						class="rack-group-header"
+						class:disabled={isAllStopped}
+						class:selected={project.path != null && selectedProject === project.path}
+						on:contextmenu={(e) => project.entry && handleProjectContextMenu(e, project.entry)}
+					>
 						<button
-							class="group-btn"
-							on:click|stopPropagation={() => toggleMonitorGroup(project.name, project.services)}
-							title="Monitor group in Deck"
+							class="group-title"
+							type="button"
+							on:click={() =>
+								project.path
+									? onSelectProject(selectedProject === project.path ? null : project.path)
+									: toggleGroupCollapse(project.name)}
 						>
-							<Layers size={12} />
+							<span>{project.name}</span>
 						</button>
-						<button
-							class="group-btn"
-							on:click|stopPropagation={() => toggleGroup(project.services)}
-							title={isAllStopped ? 'Start Group' : 'Stop Group'}
-						>
-							<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
-						</button>
-					</div>
-				</div>
-
-				{#if !isCollapsed}
-					{#each project.services as service (service.name)}
-						{@const type = getServiceType(service)}
-						{@const displayName = getDisplayName(service.name, project.name)}
-
-						<div
-							id="service-{service.name}"
-							class="rack-item"
-							class:monitored={monitored.includes(service.name)}
-							class:focused={focused === service.name}
-							class:disabled={service.status === 'stopped'}
-							on:click={() => toggleMonitor(service.name)}
-							on:keydown={(e) => {
-								if (e.key === 'Enter' || e.key === ' ') {
-									e.preventDefault();
-									toggleMonitor(service.name);
-								}
-							}}
-							role="button"
-							tabindex="0"
-						>
-							<!-- Layer 1: Content (Left Group) -->
-							<div class="item-content">
-								<div class="status-dot {service.status}"></div>
-								<span class="service-name" title={service.name}>{displayName}</span>
-
-								{#if service.url && service.status === 'running'}
-									<a
-										href={service.url}
-										target="_blank"
-										class="type-chip {type} interactive"
-										title="Open {service.url}"
-										on:click={(e) => e.stopPropagation()}
-									>
-										{type}
-										<ExternalLink size={9} />
-									</a>
-								{:else}
-									<span class="type-chip {type}">{type}</span>
-								{/if}
+						{#if project.services.length > 0}
+							<div class="group-actions">
+								<button
+									class="group-btn"
+									on:click|stopPropagation={() =>
+										toggleMonitorGroup(project.name, project.services)}
+									title="Monitor group in Deck"
+								>
+									<Layers size={12} />
+								</button>
+								<button
+									class="group-btn"
+									on:click|stopPropagation={() => toggleGroup(project.services)}
+									title={isAllStopped ? 'Start Group' : 'Stop Group'}
+								>
+									<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
+								</button>
 							</div>
+						{/if}
+					</div>
 
-							<!-- Layer 2: Toolbar Overlay -->
-							<div class="item-toolbar">
-								<div class="toolbar-bg"></div>
-								<div class="toolbar-actions">
-									{#if service.status === 'running'}
-										<button
-											class="control-btn monitor-btn"
-											class:active={monitored.includes(service.name)}
-											on:click={(e) => toggleMonitor(service.name, e)}
-											title="Monitor in Deck"
+					{#if !isCollapsed && project.services.length > 0}
+						{#each project.services as service (service.name)}
+							{@const type = getServiceType(service)}
+							{@const displayName = getDisplayName(service.name, project.name)}
+
+							<div
+								id="service-{service.name}"
+								class="rack-item"
+								class:monitored={monitored.includes(service.name)}
+								class:focused={focused === service.name}
+								class:disabled={service.status === 'stopped'}
+								on:click={() => toggleMonitor(service.name)}
+								on:keydown={(e) => {
+									if (e.key === 'Enter' || e.key === ' ') {
+										e.preventDefault();
+										toggleMonitor(service.name);
+									}
+								}}
+								role="button"
+								tabindex="0"
+							>
+								<!-- Layer 1: Content (Left Group) -->
+								<div class="item-content">
+									<div class="status-dot {service.status}"></div>
+									<span class="service-name" title={service.name}>{displayName}</span>
+
+									{#if service.url && service.status === 'running'}
+										<a
+											href={service.url}
+											target="_blank"
+											class="type-chip {type} interactive"
+											title="Open {service.url}"
+											on:click={(e) => e.stopPropagation()}
 										>
-											<Monitor size={14} />
-										</button>
-										<button
-											class="control-btn"
-											title="Restart"
-											disabled={isPending(service.name)}
-											on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
-										>
-											{#if isPending(service.name)}
-												<Spinner size={14} />
-											{:else}
-												<RefreshCw size={14} />
-											{/if}
-										</button>
-										<div class="menu-wrapper">
-											<button
-												class="control-btn"
-												on:click={(e) => toggleMenu(service.name, e)}
-												title="More"
-											>
-												<MoreHorizontal size={14} />
-											</button>
-											{#if activeMenu === service.name}
-												<!-- Menu container only stops event propagation -->
-												<div
-													class="menu-dropdown"
-													on:click={(e) => e.stopPropagation()}
-													role="menu"
-													tabindex="-1"
-												>
-													<div class="menu-item info">
-														<span>PID: {service.pid || '-'}</span>
-														<span>Port: {service.port || '-'}</span>
-													</div>
-													<div class="menu-separator"></div>
-													<button
-														class="menu-action danger"
-														disabled={isPending(service.name)}
-														on:click={() => resetServiceWithFeedback(service.name)}
-													>
-														{#if isPending(service.name)}
-															<Spinner size={12} />
-														{:else}
-															<RotateCcw size={12} />
-														{/if}
-														Reset
-													</button>
-													<button
-														class="menu-action danger"
-														disabled={isPending(service.name)}
-														on:click={() => stopServiceWithFeedback(service.name)}
-													>
-														{#if isPending(service.name)}
-															<Spinner size={12} />
-														{:else}
-															<Power size={12} />
-														{/if}
-														Stop
-													</button>
-												</div>
-											{/if}
-										</div>
+											{type}
+											<ExternalLink size={9} />
+										</a>
 									{:else}
-										<button
-											class="control-btn power-btn"
-											disabled={isPending(service.name)}
-											on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
-											title="Start"
-										>
-											{#if isPending(service.name)}
-												<Spinner size={14} />
-											{:else}
-												<Power size={14} />
-											{/if}
-										</button>
+										<span class="type-chip {type}">{type}</span>
 									{/if}
 								</div>
+
+								<!-- Layer 2: Toolbar Overlay -->
+								<div class="item-toolbar">
+									<div class="toolbar-bg"></div>
+									<div class="toolbar-actions">
+										{#if service.status === 'running'}
+											<button
+												class="control-btn monitor-btn"
+												class:active={monitored.includes(service.name)}
+												on:click={(e) => toggleMonitor(service.name, e)}
+												title="Monitor in Deck"
+											>
+												<Monitor size={14} />
+											</button>
+											<button
+												class="control-btn"
+												title="Restart"
+												disabled={isPending(service.name)}
+												on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
+											>
+												{#if isPending(service.name)}
+													<Spinner size={14} />
+												{:else}
+													<RefreshCw size={14} />
+												{/if}
+											</button>
+											<div class="menu-wrapper">
+												<button
+													class="control-btn"
+													on:click={(e) => toggleMenu(service.name, e)}
+													title="More"
+												>
+													<MoreHorizontal size={14} />
+												</button>
+												{#if activeMenu === service.name}
+													<!-- Menu container only stops event propagation -->
+													<div
+														class="menu-dropdown"
+														on:click={(e) => e.stopPropagation()}
+														role="menu"
+														tabindex="-1"
+													>
+														<div class="menu-item info">
+															<span>PID: {service.pid || '-'}</span>
+															<span>Port: {service.port || '-'}</span>
+														</div>
+														<div class="menu-separator"></div>
+														<button
+															class="menu-action danger"
+															disabled={isPending(service.name)}
+															on:click={() => resetServiceWithFeedback(service.name)}
+														>
+															{#if isPending(service.name)}
+																<Spinner size={12} />
+															{:else}
+																<RotateCcw size={12} />
+															{/if}
+															Reset
+														</button>
+														<button
+															class="menu-action danger"
+															disabled={isPending(service.name)}
+															on:click={() => stopServiceWithFeedback(service.name)}
+														>
+															{#if isPending(service.name)}
+																<Spinner size={12} />
+															{:else}
+																<Power size={12} />
+															{/if}
+															Stop
+														</button>
+													</div>
+												{/if}
+											</div>
+										{:else}
+											<button
+												class="control-btn power-btn"
+												disabled={isPending(service.name)}
+												on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
+												title="Start"
+											>
+												{#if isPending(service.name)}
+													<Spinner size={14} />
+												{:else}
+													<Power size={14} />
+												{/if}
+											</button>
+										{/if}
+									</div>
+								</div>
 							</div>
-						</div>
-					{/each}
+						{/each}
+					{/if}
 				{/if}
 			{/each}
 		{/if}
@@ -403,6 +573,18 @@
 			<span>System Normal</span>
 		</div>
 	</div>
+
+	{#if contextMenu}
+		<!-- svelte-ignore a11y-no-static-element-interactions -->
+		<!-- svelte-ignore a11y-click-events-have-key-events -->
+		<div
+			class="rack-context-menu"
+			style="top: {contextMenu.y}px; left: {contextMenu.x}px;"
+			on:click|stopPropagation
+		>
+			<button on:click={handleRemoveProject}>Remove project</button>
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -518,13 +700,13 @@
 	}
 
 	.rack-group-header {
-		padding: 8px 16px;
+		padding: 6px 16px 6px 20px;
 		font-size: 11px;
 		text-transform: uppercase;
 		color: #a1a1aa;
 		font-weight: bold;
 		letter-spacing: 0.05em;
-		margin-top: 8px;
+		margin-top: 2px;
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
@@ -585,7 +767,7 @@
 		grid-template-columns: 100%;
 		grid-template-rows: 100%;
 		align-items: center;
-		padding: 0 12px;
+		padding: 0 12px 0 28px;
 		border-bottom: 1px solid #27272a;
 		cursor: pointer;
 		transition: background 0.2s;
@@ -917,5 +1099,81 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+	}
+
+	.rack-section-header {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		padding: 12px 8px 4px 8px;
+		font-size: 10px;
+		text-transform: uppercase;
+		color: #52525b;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		border: none;
+		background: none;
+		width: 100%;
+		cursor: pointer;
+		text-align: left;
+		margin-top: 4px;
+		border-top: 1px solid rgba(39, 39, 42, 0.5);
+	}
+	.rack-section-header:first-child {
+		padding-top: 8px;
+		margin-top: 0;
+		border-top: none;
+	}
+	.rack-section-header:hover {
+		color: #71717a;
+	}
+	.rack-section-header:focus-visible {
+		outline: 2px solid #3b82f6;
+		outline-offset: -2px;
+	}
+
+	.section-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: #71717a;
+	}
+	.section-dot.active {
+		background: #4ade80;
+		box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.2);
+	}
+
+	.rack-group-header.selected {
+		background: #27272a;
+	}
+	.rack-group-header.selected .group-title span {
+		color: #e4e4e7;
+	}
+
+	/* Context menu */
+	.rack-context-menu {
+		position: fixed;
+		z-index: 200;
+		background: #18181b;
+		border: 1px solid #3f3f46;
+		border-radius: 6px;
+		padding: 4px;
+		min-width: 160px;
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+	}
+	.rack-context-menu button {
+		display: block;
+		width: 100%;
+		padding: 6px 8px;
+		background: transparent;
+		border: none;
+		color: #ef4444;
+		cursor: pointer;
+		border-radius: 4px;
+		text-align: left;
+		font-size: 12px;
+	}
+	.rack-context-menu button:hover {
+		background: rgba(239, 68, 68, 0.1);
 	}
 </style>
