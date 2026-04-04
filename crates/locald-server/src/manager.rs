@@ -1302,24 +1302,38 @@ impl ProcessManager {
     /// Returns an error if the service state cannot be persisted, though
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
-        let mut runtime_state = ServiceRuntime::None;
-
-        {
+        let runtime_state = {
             let mut services = self.services.lock().await;
             if let Some(service) = services.get_mut(name) {
-                runtime_state = std::mem::replace(&mut service.runtime_state, ServiceRuntime::None);
-                // Note: We do NOT clear sticky_port here, so we can reuse it on restart.
-                service.health_status = HealthStatus::Unknown;
+                std::mem::replace(&mut service.runtime_state, ServiceRuntime::None)
+            } else {
+                return Ok(());
             }
-        }
+        };
 
         match runtime_state {
             ServiceRuntime::Controller(c) => {
-                if let Err(e) = c.lock().await.stop().await {
+                let stop_result = c.lock().await.stop().await;
+                if let Err(e) = stop_result {
                     warn!("Failed to stop service {name}: {e}");
+                    // Restore the controller — the service is still running
+                    let mut services = self.services.lock().await;
+                    if let Some(service) = services.get_mut(name) {
+                        service.runtime_state = ServiceRuntime::Controller(c);
+                    }
+                    return Ok(());
                 }
             }
-            ServiceRuntime::None => {}
+            ServiceRuntime::None => return Ok(()),
+        }
+
+        // Only clear health and broadcast after successful stop
+        {
+            let mut services = self.services.lock().await;
+            if let Some(service) = services.get_mut(name) {
+                // Note: We do NOT clear sticky_port here, so we can reuse it on restart.
+                service.health_status = HealthStatus::Unknown;
+            }
         }
 
         self.persist_state().await;

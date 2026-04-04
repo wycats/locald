@@ -444,6 +444,24 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             report_update(&update_rx);
+
+            // Stay alive streaming logs. The CLI attachment is tied to our PID —
+            // when we exit, the daemon detaches and stops services if no other
+            // attachments remain. Ctrl+C triggers graceful detach below.
+            let detach_path = abs_path;
+            let _ = ctrlc::set_handler(move || {
+                // Best-effort detach on Ctrl+C
+                let _ = client::send_request(&IpcRequest::ProjectDetach {
+                    project_path: detach_path.clone(),
+                    source: Some(AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    }),
+                });
+                std::process::exit(0);
+            });
+
+            println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
+            client::stream_logs(None, true)?;
         }
         Commands::Stop { name, json } => {
             let names = if let Some(n) = name {
