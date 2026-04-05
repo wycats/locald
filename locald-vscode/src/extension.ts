@@ -53,16 +53,15 @@ export async function activate(
     vscode.commands.registerCommand("locald.openDashboard", async () => {
       try {
         const info = await status(projectPath!);
-        // Dashboard runs on the daemon — find its URL from the first service or use default
-        const dashboardUrl = `https://locald.localhost`;
-        await vscode.commands.executeCommand(
-          "simpleBrowser.show",
-          vscode.Uri.parse(dashboardUrl),
+        // Try to find the dashboard service URL, fall back to locald.localhost
+        const dashSvc = info.service_details?.find(
+          (s) => s.name.includes("dashboard") && s.url,
         );
+        const dashboardUrl = dashSvc?.url ?? "http://locald.localhost";
+        await vscode.env.openExternal(vscode.Uri.parse(dashboardUrl));
       } catch {
-        await vscode.commands.executeCommand(
-          "simpleBrowser.show",
-          vscode.Uri.parse("https://locald.localhost"),
+        await vscode.env.openExternal(
+          vscode.Uri.parse("http://locald.localhost"),
         );
       }
     }),
