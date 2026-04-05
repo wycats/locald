@@ -66,10 +66,10 @@
 
 	<!-- MAIN VIEW -->
 	<div class="main-view">
-		{#if selectedProject}
-			<ProjectView projectPath={selectedProject} initialService={selectedService} />
-		{:else if isDeckMode}
+		{#if isDeckMode}
 			<Deck bind:monitored />
+		{:else if selectedProject}
+			<ProjectView projectPath={selectedProject} initialService={selectedService} />
 		{:else}
 			<Stream />
 		{/if}
