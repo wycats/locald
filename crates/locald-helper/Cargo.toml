@@ -11,7 +11,6 @@ path = "src/main.rs"
 xpc-connection = { git = "https://github.com/dfrankland/xpc-connection-rs.git", branch = "master", features = [
   "audit_token",
 ] }
-pfctl = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 anyhow = "1"
