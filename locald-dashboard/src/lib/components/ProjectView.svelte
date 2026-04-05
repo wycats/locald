@@ -103,12 +103,25 @@
 		if (action === 'stop') await stopServiceWithFeedback(serviceName);
 		if (action === 'restart') await restartServiceWithFeedback(serviceName);
 	}
+
+	function splitDomain(domain: string): { service: string; project: string; tld: string } {
+		// Domain format: service.project.localhost
+		const parts = domain.split('.');
+		if (parts.length >= 3) {
+			return {
+				service: parts.slice(0, -2).join('.'),
+				project: parts[parts.length - 2],
+				tld: parts[parts.length - 1]
+			};
+		}
+		return { service: domain, project: '', tld: '' };
+	}
 </script>
 
 <div class="project-view">
 	<div class="project-header">
 		<div class="project-title">
-			<h2>{displayName}</h2>
+			<h2 class="project-name-header">{displayName}</h2>
 			<div class="project-meta">
 				<span
 					class="section-badge"
@@ -183,13 +196,16 @@
 						{/if}
 
 						{#if service.domain && service.status === 'running'}
+							{@const parts = splitDomain(service.domain)}
 							<a
 								href={service.url}
 								target="_blank"
 								class="domain-link"
 								onclick={(e) => e.stopPropagation()}
 							>
-								{service.domain}
+								<span class="domain-service">{parts.service}</span><span class="domain-project"
+									>.{parts.project}</span
+								><span class="domain-tld">.{parts.tld}</span>
 								<ExternalLink size={9} />
 							</a>
 						{/if}
@@ -281,6 +297,13 @@
 		font-size: 1.25rem;
 		font-weight: 600;
 		color: #e4e4e7;
+	}
+
+	.project-name-header {
+		color: #c4b5fd;
+		text-decoration: underline;
+		text-decoration-color: rgba(196, 181, 253, 0.3);
+		text-underline-offset: 3px;
 	}
 
 	.project-meta {
@@ -536,6 +559,22 @@
 	}
 	.domain-link:hover {
 		color: #a1a1aa;
+	}
+	.domain-link:hover .domain-service {
+		color: #e4e4e7;
+	}
+	.domain-link:hover .domain-project {
+		color: #ddd6fe;
+	}
+
+	.domain-service {
+		color: #a1a1aa;
+	}
+	.domain-project {
+		color: #c4b5fd;
+	}
+	.domain-tld {
+		color: #3f3f46;
 	}
 
 	/* --- Toolbar overlay (Rack-style) --- */
