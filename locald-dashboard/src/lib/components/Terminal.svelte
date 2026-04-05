@@ -81,7 +81,8 @@
 			terminal = new Terminal({
 				cursorBlink: false,
 				theme: terminalTheme,
-				fontFamily: 'JetBrains Mono, Menlo, Monaco, "Courier New", monospace',
+				fontFamily: '"Geist Mono Variable", Menlo, Monaco, "Courier New", monospace',
+				fontWeightBold: '600',
 				fontSize: 13,
 				convertEol: true,
 				disableStdin: true

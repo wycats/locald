@@ -21,7 +21,8 @@
 			terminal = new Terminal({
 				cursorBlink: true,
 				fontSize: 14,
-				fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+				fontFamily: '"Geist Mono Variable", Menlo, Monaco, "Courier New", monospace',
+				fontWeightBold: '600',
 				theme: terminalTheme
 			});
 
