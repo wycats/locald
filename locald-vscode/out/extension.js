@@ -84,18 +84,11 @@ async function activate(context) {
         const url = projectName
             ? `https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName)}`
             : "https://dashboard.dotlocal.localhost";
-        if (dashboardPanel) {
-            // Reuse existing panel — update URL and reveal it
-            dashboardPanel.webview.html = getDashboardHtml(url);
-            dashboardPanel.reveal(vscode.ViewColumn.Beside, false);
-        }
-        else {
-            dashboardPanel = vscode.window.createWebviewPanel("locald.dashboard", "locald Dashboard", { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false }, { enableScripts: true, retainContextWhenHidden: true });
-            dashboardPanel.webview.html = getDashboardHtml(url);
-            dashboardPanel.onDidDispose(() => {
-                dashboardPanel = undefined;
-            });
-        }
+        // Try the integrated browser with reuseUrlFilter (undocumented but exists in source)
+        vscode.commands.executeCommand("workbench.action.browser.open", {
+            url,
+            reuseUrlFilter: "https://dashboard.dotlocal.localhost/**",
+        });
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
         try {
