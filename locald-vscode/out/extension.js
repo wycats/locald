@@ -73,13 +73,12 @@ async function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", async () => {
         try {
             const info = await (0, plumbing_js_1.status)(projectPath);
-            // Try to find the dashboard service URL, fall back to locald.localhost
-            const dashSvc = info.service_details?.find((s) => s.name.includes("dashboard") && s.url);
-            const dashboardUrl = dashSvc?.url ?? "http://locald.localhost";
-            await vscode.env.openExternal(vscode.Uri.parse(dashboardUrl));
+            // Use HTTP for Simple Browser (avoids dev CA trust issues)
+            const dashboardUrl = "http://locald.localhost";
+            await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse(dashboardUrl));
         }
         catch {
-            await vscode.env.openExternal(vscode.Uri.parse("http://locald.localhost"));
+            await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse("http://locald.localhost"));
         }
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
