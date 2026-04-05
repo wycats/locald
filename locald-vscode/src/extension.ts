@@ -68,7 +68,7 @@ export async function activate(
       vscode.commands.executeCommand(
         "simpleBrowser.api.open",
         vscode.Uri.parse(url),
-        { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+        { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
       );
     }),
   );

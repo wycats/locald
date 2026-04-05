@@ -85,7 +85,7 @@ async function activate(context) {
         const url = projectName
             ? `https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName)}`
             : "https://dashboard.dotlocal.localhost";
-        vscode.commands.executeCommand("simpleBrowser.api.open", vscode.Uri.parse(url), { viewColumn: vscode.ViewColumn.Active, preserveFocus: false });
+        vscode.commands.executeCommand("simpleBrowser.api.open", vscode.Uri.parse(url), { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false });
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
         try {
