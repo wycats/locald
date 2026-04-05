@@ -73,12 +73,11 @@ async function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", async () => {
         try {
             const info = await (0, plumbing_js_1.status)(projectPath);
-            // Use HTTP for Simple Browser (avoids dev CA trust issues)
-            const dashboardUrl = "http://locald.localhost";
+            const dashboardUrl = "https://locald.localhost";
             await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse(dashboardUrl));
         }
         catch {
-            await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse("http://locald.localhost"));
+            await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse("https://locald.localhost"));
         }
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {

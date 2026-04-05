@@ -53,8 +53,7 @@ export async function activate(
     vscode.commands.registerCommand("locald.openDashboard", async () => {
       try {
         const info = await status(projectPath!);
-        // Use HTTP for Simple Browser (avoids dev CA trust issues)
-        const dashboardUrl = "http://locald.localhost";
+        const dashboardUrl = "https://locald.localhost";
         await vscode.commands.executeCommand(
           "simpleBrowser.show",
           vscode.Uri.parse(dashboardUrl),
@@ -62,7 +61,7 @@ export async function activate(
       } catch {
         await vscode.commands.executeCommand(
           "simpleBrowser.show",
-          vscode.Uri.parse("http://locald.localhost"),
+          vscode.Uri.parse("https://locald.localhost"),
         );
       }
     }),
