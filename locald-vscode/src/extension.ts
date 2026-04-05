@@ -5,6 +5,7 @@ import { registerTools } from "./tools.js";
 
 let statusBar: StatusBar | undefined;
 let projectPath: string | undefined;
+let projectName: string | undefined;
 let windowId: string | undefined;
 
 export async function activate(
@@ -33,6 +34,14 @@ export async function activate(
     );
   }
 
+  // Get project name for deep linking
+  try {
+    const info = await status(projectPath);
+    projectName = info.project_name ?? projectPath.split("/").pop();
+  } catch {
+    projectName = projectPath.split("/").pop();
+  }
+
   // Set context key for chatInstructions
   await vscode.commands.executeCommand(
     "setContext",
@@ -51,10 +60,10 @@ export async function activate(
   // Commands
   context.subscriptions.push(
     vscode.commands.registerCommand("locald.openDashboard", () => {
-      vscode.commands.executeCommand(
-        "simpleBrowser.show",
-        "https://locald.localhost",
-      );
+      const url = projectName
+        ? `https://locald.localhost/?project=${encodeURIComponent(projectName)}`
+        : "https://locald.localhost";
+      vscode.commands.executeCommand("simpleBrowser.show", url);
     }),
   );
 

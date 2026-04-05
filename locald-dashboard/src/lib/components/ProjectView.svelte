@@ -25,14 +25,16 @@
 
 	interface Props {
 		projectPath: string;
+		initialService?: string | null;
 	}
 
-	let { projectPath }: Props = $props();
+	let { projectPath, initialService = null }: Props = $props();
 
-	let selectedService = $state<string | null>(null);
+	let localServiceOverride = $state<string | null>(null);
+	let selectedService = $derived(localServiceOverride ?? initialService);
 
 	function toggleServiceFilter(name: string) {
-		selectedService = selectedService === name ? null : name;
+		localServiceOverride = selectedService === name ? null : name;
 	}
 
 	let project = $derived(

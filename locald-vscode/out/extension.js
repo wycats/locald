@@ -41,6 +41,7 @@ const status_bar_js_1 = require("./status-bar.js");
 const tools_js_1 = require("./tools.js");
 let statusBar;
 let projectPath;
+let projectName;
 let windowId;
 async function activate(context) {
     // Find locald.toml in the workspace
@@ -61,6 +62,14 @@ async function activate(context) {
     catch (e) {
         vscode.window.showWarningMessage(`locald: failed to attach — ${e instanceof Error ? e.message : e}`);
     }
+    // Get project name for deep linking
+    try {
+        const info = await (0, plumbing_js_1.status)(projectPath);
+        projectName = info.project_name ?? projectPath.split("/").pop();
+    }
+    catch {
+        projectName = projectPath.split("/").pop();
+    }
     // Set context key for chatInstructions
     await vscode.commands.executeCommand("setContext", "locald:projectDetected", true);
     // Status bar
@@ -71,7 +80,10 @@ async function activate(context) {
     (0, tools_js_1.registerTools)(context, projectPath);
     // Commands
     context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", () => {
-        vscode.commands.executeCommand("simpleBrowser.show", "https://locald.localhost");
+        const url = projectName
+            ? `https://locald.localhost/?project=${encodeURIComponent(projectName)}`
+            : "https://locald.localhost";
+        vscode.commands.executeCommand("simpleBrowser.show", url);
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
         try {

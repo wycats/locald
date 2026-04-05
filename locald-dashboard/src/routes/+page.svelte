@@ -1,5 +1,8 @@
 <script lang="ts">
+	/* eslint-disable svelte/no-navigation-without-resolve */
 	import { onMount } from 'svelte';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
 	import { services } from '$lib/stores/services';
 	import { projectList } from '$lib/stores/projects';
 	import { connectEvents } from '$lib/api';
@@ -8,20 +11,46 @@
 	import Deck from '$lib/components/Deck.svelte';
 	import ProjectView from '$lib/components/ProjectView.svelte';
 
-	// --- State ---
+	// --- URL-derived state ---
+	// project and service derive from the URL. monitored is mutable (Rack/Deck write to it).
+
+	let selectedProject = $derived.by(() => {
+		const name = $page.url.searchParams.get('project');
+		if (!name) return null;
+		const entry = $projectList.find((p) => p.project_name === name);
+		return entry?.project_path ?? null;
+	});
+
+	let selectedService = $derived($page.url.searchParams.get('service'));
+
 	let monitored = $state<string[]>([]);
-	let selectedProject = $state<string | null>(null);
+
+	let isDeckMode = $derived(monitored.length > 0);
+
+	// --- Navigation (writes to URL) ---
+
+	function handleSelectProject(path: string | null) {
+		if (!path) {
+			goto('/', { replaceState: true });
+			return;
+		}
+		const entry = $projectList.find((p) => p.project_path === path);
+		const name = entry?.project_name ?? path.split('/').pop();
+		if (name) {
+			goto(`?project=${encodeURIComponent(name)}`, { replaceState: true });
+		}
+	}
+
+	// --- Data loading ---
 
 	onMount(() => {
-		const params = new URLSearchParams(window.location.search);
-		const monitorParams = params.getAll('monitor');
-		const monitors = monitorParams
-			.flatMap((value) => value.split(','))
-			.map((value) => value.trim())
-			.filter(Boolean);
-
-		if (monitors.length > 0) {
-			monitored = Array.from(new Set(monitors));
+		// Initialize monitored from URL (one-time, then mutable)
+		const monitorParam = new URLSearchParams(window.location.search).get('monitor');
+		if (monitorParam) {
+			monitored = monitorParam
+				.split(',')
+				.map((v) => v.trim())
+				.filter(Boolean);
 		}
 
 		services.refresh();
@@ -29,12 +58,6 @@
 		const cleanup = connectEvents();
 		return cleanup;
 	});
-
-	let isDeckMode = $derived(monitored.length > 0);
-
-	function handleSelectProject(path: string | null) {
-		selectedProject = path;
-	}
 </script>
 
 <div class="workspace">
@@ -44,7 +67,7 @@
 	<!-- MAIN VIEW -->
 	<div class="main-view">
 		{#if selectedProject}
-			<ProjectView projectPath={selectedProject} />
+			<ProjectView projectPath={selectedProject} initialService={selectedService} />
 		{:else if isDeckMode}
 			<Deck bind:monitored />
 		{:else}
