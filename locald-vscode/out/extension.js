@@ -80,9 +80,11 @@ async function activate(context) {
     (0, tools_js_1.registerTools)(context, projectPath);
     // Commands
     context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", () => {
+        // Use the dev dashboard if the dotlocal:dashboard service is running,
+        // otherwise fall back to the embedded dashboard at locald.localhost
         const url = projectName
-            ? `https://locald.localhost/?project=${encodeURIComponent(projectName)}`
-            : "https://locald.localhost";
+            ? `https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName)}`
+            : "https://dashboard.dotlocal.localhost";
         vscode.commands.executeCommand("simpleBrowser.show", url);
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
