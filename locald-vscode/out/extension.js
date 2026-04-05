@@ -43,6 +43,7 @@ let statusBar;
 let projectPath;
 let projectName;
 let windowId;
+let dashboardPanel;
 async function activate(context) {
     // Find locald.toml in the workspace
     const files = await vscode.workspace.findFiles("locald.toml", null, 1);
@@ -80,12 +81,21 @@ async function activate(context) {
     (0, tools_js_1.registerTools)(context, projectPath);
     // Commands
     context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", () => {
-        // Use the dev dashboard if the dotlocal:dashboard service is running,
-        // otherwise fall back to the embedded dashboard at locald.localhost
         const url = projectName
             ? `https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName)}`
             : "https://dashboard.dotlocal.localhost";
-        vscode.commands.executeCommand("simpleBrowser.api.open", vscode.Uri.parse(url), { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false });
+        if (dashboardPanel) {
+            // Reuse existing panel — update URL and reveal it
+            dashboardPanel.webview.html = getDashboardHtml(url);
+            dashboardPanel.reveal(vscode.ViewColumn.Beside, false);
+        }
+        else {
+            dashboardPanel = vscode.window.createWebviewPanel("locald.dashboard", "locald Dashboard", { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false }, { enableScripts: true, retainContextWhenHidden: true });
+            dashboardPanel.webview.html = getDashboardHtml(url);
+            dashboardPanel.onDidDispose(() => {
+                dashboardPanel = undefined;
+            });
+        }
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
         try {
@@ -117,5 +127,13 @@ async function deactivate() {
             // Best-effort detach on shutdown
         }
     }
+}
+function getDashboardHtml(url) {
+    return `<!DOCTYPE html>
+<html style="height:100%;width:100%;margin:0;padding:0;">
+<body style="height:100%;width:100%;margin:0;padding:0;overflow:hidden;">
+<iframe src="${url}" style="width:100%;height:100%;border:none;"></iframe>
+</body>
+</html>`;
 }
 //# sourceMappingURL=extension.js.map
