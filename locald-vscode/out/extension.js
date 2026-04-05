@@ -70,15 +70,8 @@ async function activate(context) {
     // Register Copilot tools
     (0, tools_js_1.registerTools)(context, projectPath);
     // Commands
-    context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", async () => {
-        try {
-            const info = await (0, plumbing_js_1.status)(projectPath);
-            const dashboardUrl = "https://locald.localhost";
-            await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse(dashboardUrl));
-        }
-        catch {
-            await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse("https://locald.localhost"));
-        }
+    context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", () => {
+        vscode.commands.executeCommand("simpleBrowser.show", "https://locald.localhost");
     }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
         try {

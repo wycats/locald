@@ -50,20 +50,11 @@ export async function activate(
 
   // Commands
   context.subscriptions.push(
-    vscode.commands.registerCommand("locald.openDashboard", async () => {
-      try {
-        const info = await status(projectPath!);
-        const dashboardUrl = "https://locald.localhost";
-        await vscode.commands.executeCommand(
-          "simpleBrowser.show",
-          vscode.Uri.parse(dashboardUrl),
-        );
-      } catch {
-        await vscode.commands.executeCommand(
-          "simpleBrowser.show",
-          vscode.Uri.parse("https://locald.localhost"),
-        );
-      }
+    vscode.commands.registerCommand("locald.openDashboard", () => {
+      vscode.commands.executeCommand(
+        "simpleBrowser.show",
+        "https://locald.localhost",
+      );
     }),
   );
 
