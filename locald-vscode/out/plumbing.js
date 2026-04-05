@@ -31,18 +31,27 @@ function run(args) {
 }
 async function attach(projectPath, windowId) {
     await run([
-        "project", "attach", projectPath,
-        "--source", "editor",
-        "--editor-name", "vscode",
-        "--editor-id", windowId,
+        "project",
+        "attach",
+        projectPath,
+        "--source",
+        "editor",
+        "--editor-name",
+        "vscode",
+        "--editor-id",
+        windowId,
         "--json",
     ]);
 }
 async function detach(projectPath, windowId) {
     await run([
-        "project", "detach", projectPath,
-        "--source", "editor",
-        "--editor-id", windowId,
+        "project",
+        "detach",
+        projectPath,
+        "--source",
+        "editor",
+        "--editor-id",
+        windowId,
     ]);
 }
 async function status(projectPath) {

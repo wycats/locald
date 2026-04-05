@@ -44,7 +44,9 @@
     "languageModelTools": [
       {
         "name": "locald_services",
-        "tags": ["locald"],
+        "tags": [
+          "locald"
+        ],
         "displayName": "locald Services",
         "modelDescription": "List all locald-managed services for the current project, including name, status, port, URL, domain, and health",
         "canBeReferencedInPrompt": true,
@@ -56,7 +58,9 @@
       },
       {
         "name": "locald_restart",
-        "tags": ["locald"],
+        "tags": [
+          "locald"
+        ],
         "displayName": "locald Restart",
         "modelDescription": "Restart locald services for the current project",
         "canBeReferencedInPrompt": true,
@@ -73,7 +77,9 @@
       },
       {
         "name": "locald_logs",
-        "tags": ["locald"],
+        "tags": [
+          "locald"
+        ],
         "displayName": "locald Logs",
         "modelDescription": "Fetch recent log output from locald-managed services",
         "canBeReferencedInPrompt": true,
@@ -94,7 +100,9 @@
       },
       {
         "name": "locald_open",
-        "tags": ["locald"],
+        "tags": [
+          "locald"
+        ],
         "displayName": "Open in Browser",
         "modelDescription": "Open a locald service URL in VS Code's Simple Browser for visual verification",
         "canBeReferencedInPrompt": true,

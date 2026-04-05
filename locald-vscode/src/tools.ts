@@ -28,7 +28,9 @@ export function registerTools(
   context.subscriptions.push(
     vscode.lm.registerTool("locald_restart", {
       async invoke(
-        options: vscode.LanguageModelToolInvocationOptions<{ service?: string }>,
+        options: vscode.LanguageModelToolInvocationOptions<{
+          service?: string;
+        }>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
         void options.input?.service;
@@ -64,7 +66,9 @@ export function registerTools(
   context.subscriptions.push(
     vscode.lm.registerTool("locald_open", {
       async invoke(
-        options: vscode.LanguageModelToolInvocationOptions<{ service?: string }>,
+        options: vscode.LanguageModelToolInvocationOptions<{
+          service?: string;
+        }>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
         const info = await status(projectPath);
@@ -81,7 +85,9 @@ export function registerTools(
           vscode.Uri.parse(service.url),
         );
         return new vscode.LanguageModelToolResult([
-          new vscode.LanguageModelTextPart(`Opened ${service.url} in Simple Browser.`),
+          new vscode.LanguageModelTextPart(
+            `Opened ${service.url} in Simple Browser.`,
+          ),
         ]);
       },
     } satisfies vscode.LanguageModelTool<{ service?: string }>),

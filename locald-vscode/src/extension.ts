@@ -7,7 +7,9 @@ let statusBar: StatusBar | undefined;
 let projectPath: string | undefined;
 let windowId: string | undefined;
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+export async function activate(
+  context: vscode.ExtensionContext,
+): Promise<void> {
   // Find locald.toml in the workspace
   const files = await vscode.workspace.findFiles("locald.toml", null, 1);
   if (files.length === 0) {
@@ -26,11 +28,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     await attach(projectPath, windowId);
   } catch (e) {
-    vscode.window.showWarningMessage(`locald: failed to attach — ${e instanceof Error ? e.message : e}`);
+    vscode.window.showWarningMessage(
+      `locald: failed to attach — ${e instanceof Error ? e.message : e}`,
+    );
   }
 
   // Set context key for chatInstructions
-  await vscode.commands.executeCommand("setContext", "locald:projectDetected", true);
+  await vscode.commands.executeCommand(
+    "setContext",
+    "locald:projectDetected",
+    true,
+  );
 
   // Status bar
   statusBar = new StatusBar(projectPath);
@@ -66,7 +74,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await startProject(projectPath!);
         vscode.window.showInformationMessage("locald: services restarted");
       } catch (e) {
-        vscode.window.showErrorMessage(`locald: restart failed — ${e instanceof Error ? e.message : e}`);
+        vscode.window.showErrorMessage(
+          `locald: restart failed — ${e instanceof Error ? e.message : e}`,
+        );
       }
     }),
   );
@@ -79,7 +89,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         vscode.window.showInformationMessage("locald: services stopped");
       } catch (e) {
-        vscode.window.showErrorMessage(`locald: stop failed — ${e instanceof Error ? e.message : e}`);
+        vscode.window.showErrorMessage(
+          `locald: stop failed — ${e instanceof Error ? e.message : e}`,
+        );
       }
     }),
   );

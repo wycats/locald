@@ -32,31 +32,55 @@ function findBinary(): string {
 
 function run(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(findBinary(), args, { timeout: 10_000 }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new Error(`locald ${args.join(" ")} failed: ${stderr || error.message}`));
-      } else {
-        resolve(stdout);
-      }
-    });
+    execFile(
+      findBinary(),
+      args,
+      { timeout: 10_000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              `locald ${args.join(" ")} failed: ${stderr || error.message}`,
+            ),
+          );
+        } else {
+          resolve(stdout);
+        }
+      },
+    );
   });
 }
 
-export async function attach(projectPath: string, windowId: string): Promise<void> {
+export async function attach(
+  projectPath: string,
+  windowId: string,
+): Promise<void> {
   await run([
-    "project", "attach", projectPath,
-    "--source", "editor",
-    "--editor-name", "vscode",
-    "--editor-id", windowId,
+    "project",
+    "attach",
+    projectPath,
+    "--source",
+    "editor",
+    "--editor-name",
+    "vscode",
+    "--editor-id",
+    windowId,
     "--json",
   ]);
 }
 
-export async function detach(projectPath: string, windowId: string): Promise<void> {
+export async function detach(
+  projectPath: string,
+  windowId: string,
+): Promise<void> {
   await run([
-    "project", "detach", projectPath,
-    "--source", "editor",
-    "--editor-id", windowId,
+    "project",
+    "detach",
+    projectPath,
+    "--source",
+    "editor",
+    "--editor-id",
+    windowId,
   ]);
 }
 

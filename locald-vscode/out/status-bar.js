@@ -64,21 +64,38 @@ class StatusBar {
         }
     }
     update(info) {
+        const name = info.project_name ?? "locald";
         const services = info.service_details ?? [];
         const total = services.length || info.services.length;
         const healthy = services.filter((s) => s.health_status === "Healthy").length;
         if (total === 0) {
-            this.item.text = "$(server) locald";
-            this.item.tooltip = "locald — no services";
+            this.item.text = `$(server) ${name}`;
+            this.item.tooltip = `${name} — no services`;
         }
         else if (healthy === total) {
-            this.item.text = `$(server) ${healthy}/${total} healthy`;
-            this.item.tooltip = "locald — all services healthy";
+            this.item.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
+            this.item.tooltip = this.buildTooltip(name, services, info);
         }
         else {
-            this.item.text = `$(warning) ${healthy}/${total} healthy`;
-            this.item.tooltip = `locald — ${total - healthy} service(s) unhealthy`;
+            this.item.text = `$(warning) ${name} · ${healthy}/${total}`;
+            this.item.tooltip = this.buildTooltip(name, services, info);
         }
+    }
+    buildTooltip(name, services, info) {
+        const lines = [`${name} — editor attached`];
+        lines.push("Services stop when this window closes.");
+        lines.push("");
+        for (const s of services) {
+            const icon = s.status === "running" ? "●" : "○";
+            const url = s.domain ? `  ${s.domain}` : "";
+            lines.push(`${icon} ${s.name}${url}`);
+        }
+        if (services.length === 0) {
+            for (const n of info.services) {
+                lines.push(`● ${n}`);
+            }
+        }
+        return lines.join("\n");
     }
     dispose() {
         if (this.timer !== undefined) {
