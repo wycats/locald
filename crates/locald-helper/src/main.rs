@@ -224,6 +224,20 @@ rdr pass on lo0 proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 8443
         std::fs::write(&tmp, &new_content).context("Failed to write temporary pf.conf")?;
         std::fs::rename(&tmp, PF_CONF).context("Failed to rename temporary pf.conf")?;
 
+        // Reload the main ruleset so the anchor file is picked up.
+        // Without this, the anchor rules only take effect on next boot.
+        let output = std::process::Command::new("pfctl")
+            .args(["-f", PF_CONF])
+            .output()
+            .context("Failed to run pfctl -f")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // pfctl prints "ALTQ" warnings that are harmless — only fail on real errors
+            if !stderr.contains("Use of -f option") {
+                anyhow::bail!("pfctl -f failed: {stderr}");
+            }
+        }
+
         Ok(())
     }
 
