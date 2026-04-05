@@ -182,10 +182,6 @@
 							<span class="type-chip {type}">{type}</span>
 						{/if}
 
-						{#if service.port}
-							<span class="port-label">:{service.port}</span>
-						{/if}
-
 						{#if service.domain && service.status === 'running'}
 							<a
 								href={service.url}
