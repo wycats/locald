@@ -80,56 +80,42 @@ async function activate(context) {
     // Register Copilot tools
     (0, tools_js_1.registerTools)(context, projectPath);
     // Commands
-    context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", async () => {
-        // Build a quick pick with dashboard + each web service
-        const items = [
-            {
-                label: "$(browser) Dashboard",
-                description: "locald dashboard",
-                detail: projectName ?? "locald",
-            },
-        ];
-        try {
-            const info = await (0, plumbing_js_1.status)(projectPath);
-            for (const svc of info.service_details ?? []) {
-                if (svc.url && svc.status === "running") {
-                    const serviceName = svc.name.split(":").pop() ?? svc.name;
-                    items.push({
-                        label: `$(globe) ${serviceName}`,
-                        description: svc.domain ?? svc.url,
-                        detail: svc.url,
-                    });
-                }
-            }
-        }
-        catch {
-            // Fall through with just the dashboard option
-        }
-        if (items.length === 1) {
-            // No services with URLs — just open dashboard directly
-            openInBrowser(`https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName ?? "")}`, "https://dashboard.dotlocal.localhost/**");
-            return;
-        }
-        const picked = await vscode.window.showQuickPick(items, {
-            placeHolder: "Open in browser",
-        });
-        if (!picked)
-            return;
-        if (picked.label.includes("Dashboard")) {
-            openInBrowser(`https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName ?? "")}`, "https://dashboard.dotlocal.localhost/**");
-        }
-        else if (picked.detail) {
-            // Each service gets its own persistent tab via reuseUrlFilter scoped to its domain
-            const domain = picked.description ?? new URL(picked.detail).hostname;
-            openInBrowser(picked.detail, `https://${domain}/**`);
-        }
-    }));
     function openInBrowser(url, reuseFilter) {
         vscode.commands.executeCommand("workbench.action.browser.open", {
             url,
             reuseUrlFilter: reuseFilter,
         });
     }
+    context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", () => {
+        const url = projectName
+            ? `https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName)}`
+            : "https://dashboard.dotlocal.localhost";
+        openInBrowser(url, "https://dashboard.dotlocal.localhost/**");
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand("locald.openWebService", async () => {
+        const webServices = statusBar.getWebServices();
+        if (webServices.length === 0)
+            return;
+        if (webServices.length === 1) {
+            const svc = webServices[0];
+            if (svc.url && svc.domain) {
+                openInBrowser(svc.url, `https://${svc.domain}/**`);
+            }
+            return;
+        }
+        // Multiple web services — show picker
+        const items = webServices.map((svc) => ({
+            label: svc.name.split(":").pop() ?? svc.name,
+            description: svc.domain ?? undefined,
+            detail: svc.url ?? undefined,
+        }));
+        const picked = await vscode.window.showQuickPick(items, {
+            placeHolder: "Open web service",
+        });
+        if (picked?.detail && picked?.description) {
+            openInBrowser(picked.detail, `https://${picked.description}/**`);
+        }
+    }));
     context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
         try {
             await (0, plumbing_js_1.startProject)(projectPath);

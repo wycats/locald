@@ -1,12 +1,17 @@
 import * as vscode from "vscode";
+import { type ServiceStatus } from "./plumbing.js";
 export declare class StatusBar implements vscode.Disposable {
-    private item;
+    private dashboardItem;
+    private webItem;
     private timer;
     private projectPath;
+    private webServices;
     constructor(projectPath: string);
     start(): void;
+    getWebServices(): ServiceStatus[];
     private refresh;
-    private update;
+    private updateDashboard;
+    private updateWebItem;
     private buildTooltip;
     dispose(): void;
 }

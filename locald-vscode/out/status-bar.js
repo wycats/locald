@@ -38,48 +38,81 @@ const vscode = __importStar(require("vscode"));
 const plumbing_js_1 = require("./plumbing.js");
 const POLL_INTERVAL = 5_000;
 class StatusBar {
-    item;
+    dashboardItem;
+    webItem;
     timer;
     projectPath;
+    webServices = [];
     constructor(projectPath) {
         this.projectPath = projectPath;
-        this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
-        this.item.command = "locald.openDashboard";
-        this.item.text = "$(server) locald";
-        this.item.tooltip = "locald — loading…";
-        this.item.show();
+        // Dashboard item (left)
+        this.dashboardItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 51);
+        this.dashboardItem.command = "locald.openDashboard";
+        this.dashboardItem.text = "$(server) locald";
+        this.dashboardItem.tooltip = "locald — loading…";
+        this.dashboardItem.show();
+        // Web service item (right of dashboard)
+        this.webItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+        this.webItem.command = "locald.openWebService";
     }
     start() {
         this.refresh();
         this.timer = setInterval(() => this.refresh(), POLL_INTERVAL);
     }
+    getWebServices() {
+        return this.webServices;
+    }
     async refresh() {
         try {
             const info = await (0, plumbing_js_1.status)(this.projectPath);
-            this.update(info);
+            this.updateDashboard(info);
+            this.updateWebItem(info);
         }
         catch {
-            this.item.text = "$(error) locald";
-            this.item.tooltip = "locald — unable to reach daemon";
+            this.dashboardItem.text = "$(error) locald";
+            this.dashboardItem.tooltip = "locald — unable to reach daemon";
+            this.webItem.hide();
         }
     }
-    update(info) {
+    updateDashboard(info) {
         const name = info.project_name ?? "locald";
         const services = info.service_details ?? [];
         const total = services.length || info.services.length;
         const healthy = services.filter((s) => s.health_status === "Healthy").length;
         if (total === 0) {
-            this.item.text = `$(server) ${name}`;
-            this.item.tooltip = `${name} — no services`;
+            this.dashboardItem.text = `$(server) ${name}`;
+            this.dashboardItem.tooltip = `${name} — no services`;
         }
         else if (healthy === total) {
-            this.item.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
-            this.item.tooltip = this.buildTooltip(name, services, info);
+            this.dashboardItem.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
+            this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
         }
         else {
-            this.item.text = `$(warning) ${name} · ${healthy}/${total}`;
-            this.item.tooltip = this.buildTooltip(name, services, info);
+            this.dashboardItem.text = `$(warning) ${name} · ${healthy}/${total}`;
+            this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
         }
+    }
+    updateWebItem(info) {
+        const services = info.service_details ?? [];
+        this.webServices = services.filter((s) => s.url && s.status === "running");
+        if (this.webServices.length === 0) {
+            this.webItem.hide();
+            return;
+        }
+        if (this.webServices.length === 1) {
+            const svc = this.webServices[0];
+            const label = svc.name.split(":").pop() ?? svc.name;
+            this.webItem.text = `$(globe) ${label}`;
+            this.webItem.tooltip = svc.domain ?? svc.url ?? label;
+        }
+        else {
+            // Multiple web services — show count, click for picker
+            this.webItem.text = `$(globe) ${this.webServices.length} sites`;
+            this.webItem.tooltip = this.webServices
+                .map((s) => s.name.split(":").pop() ?? s.name)
+                .join(", ");
+        }
+        this.webItem.show();
     }
     buildTooltip(name, services, info) {
         const lines = [`${name} — editor attached`];
@@ -102,7 +135,8 @@ class StatusBar {
             clearInterval(this.timer);
             this.timer = undefined;
         }
-        this.item.dispose();
+        this.dashboardItem.dispose();
+        this.webItem.dispose();
     }
 }
 exports.StatusBar = StatusBar;
