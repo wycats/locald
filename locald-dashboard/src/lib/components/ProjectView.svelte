@@ -178,7 +178,9 @@
 				>
 					<div class="row-content">
 						<div class="status-dot {service.status}"></div>
-						<span class="service-name">{getDisplayName(service)}</span>
+						{#if !(service.domain && service.status === 'running')}
+							<span class="service-name">{getDisplayName(service)}</span>
+						{/if}
 
 						{#if service.url && service.status === 'running'}
 							<a
