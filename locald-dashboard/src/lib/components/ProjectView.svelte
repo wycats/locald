@@ -300,10 +300,7 @@
 	}
 
 	.project-name-header {
-		color: #c4b5fd;
-		text-decoration: underline;
-		text-decoration-color: rgba(196, 181, 253, 0.3);
-		text-underline-offset: 3px;
+		color: #71717a;
 	}
 
 	.project-meta {
@@ -561,17 +558,14 @@
 		color: #a1a1aa;
 	}
 	.domain-link:hover .domain-service {
-		color: #e4e4e7;
-	}
-	.domain-link:hover .domain-project {
-		color: #ddd6fe;
+		color: #fff;
 	}
 
 	.domain-service {
-		color: #a1a1aa;
+		color: #e4e4e7;
 	}
 	.domain-project {
-		color: #c4b5fd;
+		color: #71717a;
 	}
 	.domain-tld {
 		color: #3f3f46;
