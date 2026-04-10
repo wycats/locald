@@ -117,6 +117,7 @@ function openEventSource() {
 
 	eventSource.onopen = () => {
 		console.log('EventSource connected');
+		resetReconnectDelay();
 		connection.setConnected();
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'true');
@@ -129,13 +130,42 @@ function openEventSource() {
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'false');
 		}
+		// Auto-reconnect with backoff. EventSource's native retry gives up
+		// when the server is down; we retry manually on a longer interval.
+		if (eventSource?.readyState === EventSource.CLOSED) {
+			scheduleReconnect();
+		}
 	};
+}
+
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelay = 2000;
+const MAX_RECONNECT_DELAY = 30000;
+
+function scheduleReconnect() {
+	if (reconnectTimer) return;
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		console.log(`Reconnecting SSE (after ${reconnectDelay}ms)...`);
+		openEventSource();
+		// Back off, but cap at 30s
+		reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
+	}, reconnectDelay);
+}
+
+function resetReconnectDelay() {
+	reconnectDelay = 2000;
+	if (reconnectTimer) {
+		clearTimeout(reconnectTimer);
+		reconnectTimer = null;
+	}
 }
 
 export function connectEvents() {
 	openEventSource();
 
 	return () => {
+		resetReconnectDelay();
 		if (eventSource) {
 			eventSource.close();
 			eventSource = null;
@@ -144,5 +174,6 @@ export function connectEvents() {
 }
 
 export function reconnect() {
+	resetReconnectDelay();
 	openEventSource();
 }

@@ -37,11 +37,12 @@
 	export let monitored: string[] = [];
 	export let selectedProject: string | null = null;
 	export let onSelectProject: (path: string | null) => void = () => {};
+	export let onToggleMonitor: (name: string | string[]) => void = () => {};
 
 	let collapsedGroups: string[] = [];
 	let collapsedSections: string[] = [];
 	let activeMenu: string | null = null;
-	let focused: string | null = null;
+	let keyboardFocus: string | null = null;
 	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
 
 	function toggleSectionCollapse(section: string) {
@@ -175,9 +176,8 @@
 			moveFocus(-1);
 		} else if (event.key === 'Enter' || event.key === ' ') {
 			event.preventDefault();
-			if (focused) toggleMonitor(focused);
+			if (keyboardFocus) toggleMonitor(keyboardFocus);
 		} else if (event.key === 'Escape') {
-			monitored = [];
 			activeMenu = null;
 		}
 	}
@@ -186,8 +186,8 @@
 		if (allServices.length === 0) return;
 
 		let currentIndex = -1;
-		if (focused) {
-			currentIndex = allServices.findIndex((s) => s.name === focused);
+		if (keyboardFocus) {
+			currentIndex = allServices.findIndex((s) => s.name === keyboardFocus);
 		}
 
 		let nextIndex = currentIndex + direction;
@@ -196,13 +196,14 @@
 		if (nextIndex < 0) nextIndex = 0;
 		if (nextIndex >= allServices.length) nextIndex = allServices.length - 1;
 
-		focused = allServices[nextIndex].name;
+		keyboardFocus = allServices[nextIndex].name;
 
 		// Ensure visible
-		ensureVisible(focused);
+		ensureVisible(keyboardFocus);
 	}
 
-	function ensureVisible(name: string) {
+	function ensureVisible(name: string | null) {
+		if (!name) return;
 		// Simple implementation: find element and scrollIntoView
 		// We need a way to ref the elements.
 		// For now, let's skip complex scrolling logic or use document.getElementById if we add IDs.
@@ -214,23 +215,16 @@
 
 	function toggleMonitor(name: string, event?: Event) {
 		if (event) event.stopPropagation();
-
-		if (monitored.includes(name)) {
-			monitored = monitored.filter((n) => n !== name);
-		} else {
-			monitored = [...monitored, name];
-		}
+		onToggleMonitor(name);
 	}
 
-	function toggleMonitorGroup(groupName: string, groupServices: ServiceStatus[]) {
+	function toggleMonitorGroup(groupServices: ServiceStatus[]) {
 		const serviceNames = groupServices.map((s) => s.name);
 		const allMonitored = serviceNames.every((name) => monitored.includes(name));
-
-		if (allMonitored) {
-			monitored = monitored.filter((n) => !serviceNames.includes(n));
-		} else {
-			monitored = [...new Set([...monitored, ...serviceNames])];
-		}
+		const next = allMonitored
+			? monitored.filter((n) => !serviceNames.includes(n))
+			: [...new Set([...monitored, ...serviceNames])];
+		onToggleMonitor(next);
 	}
 
 	function toggleMenu(name: string, event: Event) {
@@ -265,12 +259,7 @@
 	}
 
 	function toggleSystemMonitor() {
-		const name = 'locald';
-		if (monitored.includes(name)) {
-			monitored = monitored.filter((n) => n !== name);
-		} else {
-			monitored = [...monitored, name];
-		}
+		onToggleMonitor('locald');
 	}
 
 	function getServiceType(service: ServiceStatus): string {
@@ -401,12 +390,17 @@
 							<span>{project.name}</span>
 						</button>
 						{#if project.services.length > 0}
+							{@const serviceNames = project.services.map((s) => s.name)}
+							{@const allMonitored =
+								serviceNames.length > 0 && serviceNames.every((n) => monitored.includes(n))}
+							{@const someMonitored = serviceNames.some((n) => monitored.includes(n))}
 							<div class="group-actions">
 								<button
-									class="group-btn"
-									on:click|stopPropagation={() =>
-										toggleMonitorGroup(project.name, project.services)}
-									title="Monitor group in Deck"
+									class="group-btn monitor-group-btn"
+									class:active={allMonitored}
+									class:partial={someMonitored && !allMonitored}
+									on:click|stopPropagation={() => toggleMonitorGroup(project.services)}
+									title={allMonitored ? 'Unmonitor all' : 'Monitor all'}
 								>
 									<Layers size={12} />
 								</button>
@@ -430,7 +424,7 @@
 								id="service-{service.name}"
 								class="rack-item"
 								class:monitored={monitored.includes(service.name)}
-								class:focused={focused === service.name}
+								class:keyboard-focused={keyboardFocus === service.name}
 								class:disabled={service.status === 'stopped'}
 								on:click={() => toggleMonitor(service.name)}
 								on:keydown={(e) => {
@@ -467,15 +461,15 @@
 								<div class="item-toolbar">
 									<div class="toolbar-bg"></div>
 									<div class="toolbar-actions">
+										<button
+											class="control-btn monitor-btn"
+											class:active={monitored.includes(service.name)}
+											title={monitored.includes(service.name) ? 'Unmonitor' : 'Monitor'}
+											on:click={(e) => toggleMonitor(service.name, e)}
+										>
+											<Monitor size={14} />
+										</button>
 										{#if service.status === 'running'}
-											<button
-												class="control-btn monitor-btn"
-												class:active={monitored.includes(service.name)}
-												on:click={(e) => toggleMonitor(service.name, e)}
-												title="Monitor in Deck"
-											>
-												<Monitor size={14} />
-											</button>
 											<button
 												class="control-btn"
 												title="Restart"
@@ -757,6 +751,13 @@
 		outline-offset: 2px;
 		color: #fff;
 	}
+	.monitor-group-btn.active {
+		color: #3b82f6; /* Blue-500 */
+	}
+	.monitor-group-btn.partial {
+		color: #60a5fa; /* Blue-400, lighter for partial */
+		opacity: 0.7;
+	}
 
 	/* --- Rack Item Layout --- */
 	.rack-item {
@@ -794,13 +795,8 @@
 		border-left: 2px solid #fff;
 	}
 
-	.rack-item.focused {
-		/* Fallback if not monitored/hovered, but focused usually implies one of those or keyboard nav */
-		/* Let's keep it simple and match hover for focus to ensure gradient works */
+	.rack-item.keyboard-focused {
 		--row-bg: #27272a;
-	}
-	.rack-item.focused:not(.monitored) {
-		border-left: 2px solid #52525b;
 	}
 
 	/* --- Layer 1: Content --- */
@@ -860,10 +856,10 @@
 		color: #71717a; /* Zinc-500 */
 	}
 
-	/* State A (Monitored) & State C (Hover) -> Bright Text */
+	/* Monitored & Hover -> White */
 	.rack-item.monitored .service-name,
 	.rack-item:hover .service-name {
-		color: #ffffff; /* White */
+		color: #ffffff;
 	}
 
 	.type-chip {

@@ -10,7 +10,7 @@ body {
 	background: #09090b; /* Zinc-950 */
 	color: #e4e4e7; /* Zinc-200 */
 	margin: 0;
-	height: 100vh;
+	height: 100dvh;
 	overflow: hidden;
 }
 
