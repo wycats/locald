@@ -2382,8 +2382,7 @@ mod tests {
         .await;
         assert_eq!(status.url, Some("https://app.test:8443".to_string()));
 
-        // Case 5: macOS privileged ports — pfctl redirects 80→8080, 443→8443
-        // but we advertise 80/443. URLs should NOT contain :8080 or :8443.
+        // Case 5: Privileged ports (80/443). URLs should NOT contain port numbers.
         let status = ProcessManager::build_service_status(
             name.clone(),
             Some("myapp.localhost".to_string()),

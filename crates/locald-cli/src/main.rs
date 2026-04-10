@@ -49,7 +49,6 @@ mod init;
 mod monitor;
 #[cfg(feature = "experimental-plugins")]
 mod plugin;
-mod port_forward;
 mod progress;
 mod run;
 mod selfupgrade;

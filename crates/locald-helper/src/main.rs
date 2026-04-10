@@ -1,8 +1,9 @@
 //! macOS privileged helper daemon for locald.
 //!
 //! Runs as a `LaunchDaemon` and performs operations that require root:
-//! pfctl port forwarding and CA trust installation. Communicates with
-//! the locald agent via XPC (Mach service `com.locald.helper`).
+//! privileged port binding (80/443) and CA trust installation.
+//! Communicates with the server and agent via XPC (Mach service
+//! `com.locald.helper`).
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,25 +27,6 @@ mod macos {
     use xpc_connection::{Message, XpcClient, XpcListener};
 
     const MACH_SERVICE: &str = "com.locald.helper";
-    // ── pfctl constants ─────────────────────────────────────────────────
-
-    const ANCHOR_FILE: &str = "/etc/pf.anchors/com.locald";
-    const PF_CONF: &str = "/etc/pf.conf";
-    const RDR_ANCHOR_LINE: &str = "rdr-anchor \"com.locald\"";
-    const LOAD_ANCHOR_LINE: &str = "load anchor \"com.locald\" from \"/etc/pf.anchors/com.locald\"";
-
-    struct PortForward {
-        from: u16,
-        to: u16,
-    }
-
-    const FORWARDS: &[PortForward] = &[
-        PortForward { from: 80, to: 8080 },
-        PortForward {
-            from: 443,
-            to: 8443,
-        },
-    ];
 
     // ── entry point ─────────────────────────────────────────────────────
 
@@ -107,6 +89,7 @@ mod macos {
 
         match command.as_str() {
             "setup" => execute_setup(caller_uid),
+            "bind" => execute_bind(dict),
             _ => error_response(&format!("unknown command: {command}")),
         }
     }
@@ -119,100 +102,67 @@ mod macos {
     }
 
     fn do_setup(caller_uid: u32) -> Result<()> {
-        // 1. Install pfctl redirect rules (runtime + persistent).
-        apply_port_forwarding().context("pfctl install failed")?;
-
-        // 3. Trust the Root CA in the system keychain (for the calling user).
+        // 1. Trust the Root CA in the system keychain (for the calling user).
         trust_root_ca(caller_uid).context("CA trust failed")?;
 
-        // 4. Update global config to enable privileged ports.
-        update_privileged_ports_config(caller_uid)
-            .context("config update failed (non-fatal)")
-            .ok();
-
         Ok(())
     }
 
-    // ── pfctl ───────────────────────────────────────────────────────────
+    // ── bind (privileged port) ──────────────────────────────────────────
 
-    fn generate_anchor_rules() -> String {
-        use std::fmt::Write;
+    fn execute_bind(dict: &HashMap<CString, Message>) -> Message {
+        #[allow(clippy::expect_used)]
+        let port_key = CString::new("port").expect("static CString");
 
-        let mut rules = String::new();
-        for f in FORWARDS {
-            if let Err(e) = writeln!(
-                rules,
-                "rdr pass on lo0 proto tcp from any to 127.0.0.1 port {} -> 127.0.0.1 port {}",
-                f.from, f.to
-            ) {
-                tracing::warn!("Failed to write pf anchor rule: {e}");
-            }
+        let port = match dict.get(&port_key) {
+            Some(Message::Int64(p)) => *p as u16,
+            _ => return error_response("missing or invalid 'port' field"),
+        };
+
+        // Only allow binding well-known privileged ports.
+        if port != 80 && port != 443 {
+            return error_response(&format!(
+                "refused to bind port {port}: only 80 and 443 are allowed"
+            ));
         }
 
-        rules
+        match bind_privileged_port(port) {
+            Ok(fd) => {
+                let mut resp = HashMap::new();
+                #[allow(clippy::expect_used)]
+                {
+                    resp.insert(
+                        CString::new("status").expect("static CString"),
+                        Message::String(CString::new("success").expect("static CString")),
+                    );
+                    resp.insert(CString::new("fd").expect("static CString"), Message::Fd(fd));
+                }
+                Message::Dictionary(resp)
+            }
+            Err(e) => error_response(&format!("{e:#}")),
+        }
     }
 
-    /// Apply port forwarding rules. Writes the anchor file, ensures pf.conf
-    /// references it, enables pf, and reloads from disk. Idempotent.
-    #[allow(clippy::disallowed_methods)]
-    fn apply_port_forwarding() -> Result<()> {
-        // 1. Write anchor file
-        std::fs::write(ANCHOR_FILE, generate_anchor_rules())
-            .context("Failed to write /etc/pf.anchors/com.locald")?;
+    /// Bind a privileged TCP port and return the raw FD.
+    /// The caller receives the FD via XPC and takes ownership.
+    fn bind_privileged_port(port: u16) -> Result<std::os::unix::io::RawFd> {
+        use std::os::unix::io::IntoRawFd;
 
-        // 2. Ensure pf.conf references our anchor
-        let content = std::fs::read_to_string(PF_CONF).context("Failed to read /etc/pf.conf")?;
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .context("Failed to create socket")?;
 
-        let has_rdr = content.lines().any(|l| l.trim() == RDR_ANCHOR_LINE);
-        let has_load = content.lines().any(|l| l.trim() == LOAD_ANCHOR_LINE);
+        socket.set_reuse_address(true)?;
+        socket
+            .bind(&addr.into())
+            .with_context(|| format!("Failed to bind port {port}"))?;
+        socket.listen(1024).context("Failed to listen")?;
 
-        if !has_rdr || !has_load {
-            let mut lines: Vec<String> = content.lines().map(String::from).collect();
-
-            if !has_rdr {
-                let pos = lines
-                    .iter()
-                    .rposition(|l| l.trim().starts_with("rdr-anchor"));
-                let insert_at = pos.map_or(lines.len(), |i| i + 1);
-                lines.insert(insert_at, RDR_ANCHOR_LINE.to_string());
-            }
-
-            if !has_load {
-                let pos = lines
-                    .iter()
-                    .rposition(|l| l.trim().starts_with("load anchor"));
-                let insert_at = pos.map_or(lines.len(), |i| i + 1);
-                lines.insert(insert_at, LOAD_ANCHOR_LINE.to_string());
-            }
-
-            let mut new_content = lines.join("\n");
-            if !new_content.ends_with('\n') {
-                new_content.push('\n');
-            }
-
-            let tmp = format!("{PF_CONF}.locald.tmp");
-            std::fs::write(&tmp, &new_content).context("Failed to write temporary pf.conf")?;
-            std::fs::rename(&tmp, PF_CONF).context("Failed to rename temporary pf.conf")?;
-        }
-
-        // 3. Enable pf (idempotent)
-        if let Err(e) = std::process::Command::new("pfctl").args(["-e"]).output() {
-            tracing::warn!("pfctl -e failed: {e}");
-        }
-
-        // 4. Reload from disk — this is the single activation path
-        let output = std::process::Command::new("pfctl")
-            .args(["-f", PF_CONF])
-            .output()
-            .context("Failed to run pfctl -f")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("Use of -f option") && !stderr.contains("ALTQ") {
-                anyhow::bail!("pfctl -f failed: {stderr}");
-            }
-        }
-
-        Ok(())
+        Ok(socket.into_raw_fd())
     }
 
     // ── CA trust ────────────────────────────────────────────────────────
@@ -264,54 +214,6 @@ mod macos {
             .join("rootCA.pem");
 
         Ok(ca_path)
-    }
-
-    /// Update the global config to enable privileged ports.
-    ///
-    /// The config file lives in the calling user's data dir, so we resolve
-    /// it from their UID.
-    #[allow(clippy::disallowed_methods)]
-    fn update_privileged_ports_config(caller_uid: u32) -> Result<()> {
-        let uid = nix::unistd::Uid::from_raw(caller_uid);
-        let user = nix::unistd::User::from_uid(uid)
-            .context("Failed to look up user by UID")?
-            .context("User not found for UID")?;
-
-        let config_path = user
-            .dir
-            .join("Library")
-            .join("Application Support")
-            .join("locald")
-            .join("config.toml");
-
-        // Best-effort config update. Intentionally non-fatal (called with .ok()).
-        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        let new_content = if content.contains("privileged_ports = true") {
-            // Already set correctly.
-            return Ok(());
-        } else if content.contains("privileged_ports") {
-            // Has the key but not set to true — flip it.
-            content.replace("privileged_ports = false", "privileged_ports = true")
-        } else if content.contains("[server]") {
-            // Has [server] section but no key.
-            content.replace("[server]", "[server]\nprivileged_ports = true")
-        } else {
-            // No server section at all.
-            format!("{content}\n[server]\nprivileged_ports = true\n")
-        };
-
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent).context("Failed to create config directory")?;
-        }
-        std::fs::write(&config_path, &new_content).context("Failed to write config")?;
-
-        // Chown the config to the calling user so they can modify it later.
-        let gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
-        if let Err(e) = nix::unistd::chown(&config_path, Some(uid), Some(gid)) {
-            tracing::warn!("Failed to chown config: {e}");
-        }
-
-        Ok(())
     }
 
     // ── XPC response helpers ────────────────────────────────────────────

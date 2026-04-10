@@ -95,3 +95,12 @@ These protocols are derived from the Mental Model. Follow them to ensure consist
 # Project Mission
 
 `locald` treats the local machine as a first-class platform: a daemon-first development environment where “clone → locald up” feels coherent (stable domains, managed services, built-in observability).
+## Product Axioms
+
+### Privileges are the default, not an opt-in
+
+The standard path is: `sudo locald admin setup` once, then everything works — stable `*.localhost` domains on ports 80/443, HTTPS certs trusted, helper installed. This is not optional infrastructure that degrades gracefully. It's the product.
+
+The only alternative is **sandbox mode** — a deliberately constrained mode for CI, containers, or testing the daemon itself. Sandbox skips privileged ports and cert trust. It's an explicit "I know what I'm doing" flag, not a default.
+
+**Implication for agents**: never add silent fallback from privileged to unprivileged. If `admin setup` was run and privileged features don't work, that's a fatal error with a clear fix message — not a graceful degradation to high ports. The server either starts on the ports it promises, or it doesn't start. See [docs/design/axioms/environment/09-managed-networking.md](docs/design/axioms/environment/09-managed-networking.md) and [docs/rfcs/stage-4/0010-privileged-ports.md](docs/rfcs/stage-4/0010-privileged-ports.md).

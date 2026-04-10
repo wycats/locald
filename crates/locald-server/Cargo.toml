@@ -66,5 +66,8 @@ thiserror = "2.0.17"
 wasmtime = { version = "24.0.0", features = ["component-model"] }
 wasmtime-wasi = "24.0.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+xpc-connection = { git = "https://github.com/dfrankland/xpc-connection-rs.git", branch = "master" }
+
 [lints]
 workspace = true

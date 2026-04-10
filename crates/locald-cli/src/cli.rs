@@ -621,7 +621,7 @@ pub enum ServerCommands {
 pub enum AdminCommands {
     /// Setup locald permissions (auto-escalates to root).
     Setup,
-    /// Remove admin setup (pfctl rules, `LaunchAgent`, config). Auto-escalates to root.
+    /// Remove admin setup (helper, `LaunchAgent`, config). Auto-escalates to root.
     Teardown,
     /// Sync hosts file with running services. Auto-escalates to root.
     SyncHosts,

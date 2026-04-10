@@ -77,8 +77,12 @@ impl ProxyManager {
     }
 
     pub async fn bind_http(&self, port: u16) -> anyhow::Result<TcpListener> {
-        // Port 0 means "pick any free port" and does not require privileges.
         let listener = if port != 0 && port < 1024 {
+            // Privileged port: request from platform helper.
+            // macOS: XPC to com.locald.helper. Linux: locald-shim via SCM_RIGHTS.
+            #[cfg(target_os = "macos")]
+            let l = crate::helper_client::bind_privileged_port(port).await?;
+            #[cfg(not(target_os = "macos"))]
             let l = crate::shim_client::bind_privileged_port(port).await?;
             l.set_nonblocking(true)?;
             TcpListener::from_std(l)?
@@ -89,9 +93,6 @@ impl ProxyManager {
 
         let addr = listener.local_addr()?;
         info!("Proxy bound to http://{addr}");
-        // Note: advertised port is set in lib.rs, not here. This method
-        // only binds the socket. lib.rs decides whether to advertise the
-        // bind port (sandbox/Linux) or the public port (macOS pfctl).
         Ok(listener)
     }
 
@@ -102,9 +103,12 @@ impl ProxyManager {
     }
 
     pub async fn bind_https(&self, port: u16) -> anyhow::Result<std::net::TcpListener> {
-        // Port 0 means "pick any free port" and does not require privileges.
         let listener = if port != 0 && port < 1024 {
-            crate::shim_client::bind_privileged_port(port).await?
+            #[cfg(target_os = "macos")]
+            let l = crate::helper_client::bind_privileged_port(port).await?;
+            #[cfg(not(target_os = "macos"))]
+            let l = crate::shim_client::bind_privileged_port(port).await?;
+            l
         } else {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             tokio::net::TcpListener::bind(addr).await?.into_std()?
@@ -692,8 +696,8 @@ fn loading_response(service_name: &str) -> Response {
 <body>
     <div class="container">
         <div class="spinner"></div>
-        <h1>Building {service_name}...</h1>
-        <p>Waiting for service to become ready</p>
+        <h1>Starting {service_name}...</h1>
+        <p>Waiting for first response</p>
         <div id="terminal" class="terminal"></div>
     </div>
     <script>

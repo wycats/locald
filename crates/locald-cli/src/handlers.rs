@@ -690,7 +690,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                         // `admin setup` requires root for privileged operations.
                         // On Linux: shim install, cgroup setup, port binding.
-                        // On macOS: pfctl port forwarding rules.
+                        // On macOS: CA trust, privileged helper install.
                         if !std::io::stdin().is_terminal() {
                             return Err(CliError::message(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`.",
@@ -896,56 +896,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 2: Install pfctl port forwarding (80→8080, 443→8443).
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Configuring port forwarding (80 → 8080, 443 → 8443)...");
-                            match crate::port_forward::macos::install() {
-                                Ok(()) => {
-                                    s.stop("Port forwarding configured");
-                                }
-                                Err(e) => {
-                                    s.error(format!("Port forwarding failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Port forwarding setup failed: {e}\n\
-                                         This is required for locald to serve on ports 80/443.\n\
-                                         Run `locald admin setup` to retry."
-                                    )));
-                                }
-                            }
-
-                            // Make rules persistent across reboot via pf.conf anchor.
-                            let s = cliclack::spinner();
-                            s.start("Making port forwarding persistent...");
-                            match crate::port_forward::macos::install_persistent() {
-                                Ok(()) => {
-                                    s.stop("Port forwarding will survive reboot");
-                                }
-                                Err(e) => {
-                                    s.stop(format!(
-                                        "Persistent rules not installed: {e} (non-fatal)"
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Step 3: Enable privileged ports in global config only if pfctl succeeded.
-                        if crate::port_forward::macos::is_installed() {
-                            let s = cliclack::spinner();
-                            s.start("Updating configuration...");
-                            let mut config = crate::global_config::load();
-                            config.server.privileged_ports = true;
-                            match crate::global_config::save(config) {
-                                Ok(()) => {
-                                    s.stop("Configuration updated (privileged_ports = true)");
-                                }
-                                Err(e) => {
-                                    s.stop(format!("Config save failed: {e} (non-fatal)"));
-                                }
-                            }
-                        }
-
-                        // Step 4: Extract embedded agent binary and install as LaunchAgent.
+                        // Step 2: Extract embedded agent binary and install as LaunchAgent.
                         {
                             const AGENT_BYTES: &[u8] =
                                 include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
@@ -969,7 +920,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 5: Install privileged helper for passwordless future setup.
+                        // Step 3: Install privileged helper (required for port 80/443 binding).
                         {
                             const HELPER_BYTES: &[u8] =
                                 include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
@@ -979,12 +930,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                             match install_privileged_helper(HELPER_BYTES) {
                                 Ok(()) => {
-                                    s.stop("Privileged helper installed");
+                                    s.stop("Privileged helper installed (binds ports 80/443)");
                                 }
                                 Err(e) => {
-                                    s.stop(format!(
-                                        "Privileged helper install failed: {e} (non-fatal)"
-                                    ));
+                                    s.error(format!("Privileged helper install failed: {e}"));
+                                    return Err(CliError::message(format!(
+                                        "Failed to install privileged helper: {e}\n\
+                                         The helper is required for locald to serve on ports 80/443.\n\
+                                         Run `locald admin setup` to retry."
+                                    )));
                                 }
                             }
                         }
@@ -1064,58 +1018,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Removing port forwarding rules...");
-                            match crate::port_forward::macos::remove() {
-                                Ok(()) => {
-                                    s.stop("Port forwarding rules removed");
-                                    println!(
-                                        "{} Removed pfctl redirect rules (com.locald).",
-                                        style::CHECK
-                                    );
-                                }
-                                Err(e) => {
-                                    s.error(format!("Port forwarding removal failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Port forwarding teardown failed: {e}"
-                                    )));
-                                }
-                            }
-
-                            // Remove persistent anchor from pf.conf.
-                            let s = cliclack::spinner();
-                            s.start("Removing persistent port forwarding...");
-                            match crate::port_forward::macos::remove_persistent() {
-                                Ok(()) => {
-                                    s.stop("Persistent port forwarding removed");
-                                }
-                                Err(e) => {
-                                    s.stop(format!(
-                                        "Persistent rules removal failed: {e} (non-fatal)"
-                                    ));
-                                }
-                            }
-                        }
-
                         // Remove privileged helper.
                         {
                             let s = cliclack::spinner();
                             s.start("Removing privileged helper...");
                             remove_privileged_helper();
                             s.stop("Privileged helper removed");
-                        }
-
-                        // Reset privileged_ports config to default.
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Resetting configuration...");
-                            let mut config = crate::global_config::load();
-                            config.server.privileged_ports = false;
-                            match crate::global_config::save(config) {
-                                Ok(()) => s.stop("Configuration reset (privileged_ports = false)"),
-                                Err(e) => s.stop(format!("Config reset failed: {e} (non-fatal)")),
-                            }
                         }
 
                         cliclack::outro("Teardown complete")?;
@@ -1380,9 +1288,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                     println!("[server]");
                     println!(
-                        "privileged_ports = {}  (from {})",
-                        loader.global.server.privileged_ports,
-                        loader.explain_global("server.privileged_ports")
+                        "sandbox = {}  (from {})",
+                        loader.global.server.is_sandbox(),
+                        loader.explain_global("server.sandbox")
                     );
 
                     if let Ok(report) = rt.block_on(loader.load_service_provenance_report(&cwd)) {
