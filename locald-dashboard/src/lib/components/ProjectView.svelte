@@ -10,32 +10,24 @@
 	} from '$lib/actions/service';
 	import type { ProjectListEntry } from '$lib/api';
 	import type { ServiceStatus } from '$lib/types';
-	import {
-		RotateCw,
-		Square,
-		Play,
-		ExternalLink,
-		Terminal as TerminalIcon,
-		Folder,
-		Users,
-		Pin
-	} from 'lucide-svelte';
+	import { RotateCw, Square, Play, ExternalLink, Folder, Users, Pin, X } from 'lucide-svelte';
 	import Spinner from './Spinner.svelte';
 	import Terminal from './Terminal.svelte';
 
 	interface Props {
 		projectPath: string;
-		initialService?: string | null;
+		monitored: string[];
+		onToggleMonitor: (name: string | string[]) => void;
+		onDeselectProject: () => void;
 	}
 
-	let { projectPath, initialService = null }: Props = $props();
-
-	let localServiceOverride = $state<string | null>(null);
-	let selectedService = $derived(localServiceOverride ?? initialService);
-
-	function toggleServiceFilter(name: string) {
-		localServiceOverride = selectedService === name ? null : name;
-	}
+	let {
+		projectPath,
+		monitored = [],
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		onToggleMonitor = (_name: string | string[]) => {},
+		onDeselectProject = () => {}
+	}: Props = $props();
 
 	let project = $derived(
 		$projectList.find((p: ProjectListEntry) => p.project_path === projectPath)
@@ -122,6 +114,9 @@
 	<div class="project-header">
 		<div class="project-title">
 			<h2 class="project-name-header">{displayName}</h2>
+			<button class="project-close" title="Back to stream" onclick={onDeselectProject}>
+				<X size={14} />
+			</button>
 			<div class="project-meta">
 				<span
 					class="section-badge"
@@ -165,12 +160,14 @@
 				<div
 					class="service-row"
 					class:disabled={service.status === 'stopped'}
-					class:active={selectedService === service.name}
-					onclick={() => toggleServiceFilter(service.name)}
+					class:monitored={monitored.includes(service.name)}
+					onclick={() => {
+						onToggleMonitor(service.name);
+					}}
 					onkeydown={(e) => {
 						if (e.key === 'Enter' || e.key === ' ') {
 							e.preventDefault();
-							toggleServiceFilter(service.name);
+							onToggleMonitor(service.name);
 						}
 					}}
 					role="button"
@@ -251,16 +248,6 @@
 									{/if}
 								</button>
 							{/if}
-							<button
-								class="control-btn"
-								title="Filter logs"
-								onclick={(e) => {
-									e.stopPropagation();
-									toggleServiceFilter(service.name);
-								}}
-							>
-								<TerminalIcon size={14} />
-							</button>
 						</div>
 					</div>
 				</div>
@@ -268,7 +255,7 @@
 		</div>
 
 		<div class="log-area">
-			<Terminal filter={selectedService} />
+			<Terminal filter={null} />
 		</div>
 	{/if}
 </div>
@@ -277,7 +264,8 @@
 	.project-view {
 		display: flex;
 		flex-direction: column;
-		height: 100%;
+		flex: 1;
+		min-height: 0;
 		overflow: hidden;
 	}
 
@@ -303,6 +291,22 @@
 
 	.project-name-header {
 		color: #71717a;
+	}
+
+	.project-close {
+		background: none;
+		border: none;
+		color: #52525b;
+		cursor: pointer;
+		padding: 4px;
+		border-radius: 4px;
+		display: flex;
+		align-items: center;
+		transition: color 0.15s;
+	}
+	.project-close:hover {
+		color: #e4e4e7;
+		background: rgba(255, 255, 255, 0.05);
 	}
 
 	.project-meta {
@@ -384,6 +388,7 @@
 	.service-list {
 		flex-shrink: 0;
 		overflow-y: auto;
+		overflow-x: hidden;
 	}
 
 	.log-area {
@@ -415,11 +420,11 @@
 	.service-row:hover {
 		--row-bg: #18181b;
 	}
-	.service-row.active {
+	.service-row.monitored {
 		--row-bg: #27272a;
-		border-left: 2px solid #fff;
+		border-left: 2px solid #3b82f6; /* Blue-500 */
 	}
-	.service-row.active .service-name {
+	.service-row.monitored .service-name {
 		color: #fff;
 	}
 	.service-row:focus-visible {

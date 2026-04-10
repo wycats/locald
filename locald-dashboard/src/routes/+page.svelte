@@ -1,18 +1,19 @@
 <script lang="ts">
 	/* eslint-disable svelte/no-navigation-without-resolve */
 	import { onMount } from 'svelte';
+	import { SvelteURLSearchParams } from 'svelte/reactivity';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { services } from '$lib/stores/services';
 	import { projectList } from '$lib/stores/projects';
 	import { connectEvents } from '$lib/api';
 	import Rack from '$lib/components/Rack.svelte';
-	import Stream from '$lib/components/Stream.svelte';
 	import Deck from '$lib/components/Deck.svelte';
+	import Stream from '$lib/components/Stream.svelte';
 	import ProjectView from '$lib/components/ProjectView.svelte';
 
 	// --- URL-derived state ---
-	// project and service derive from the URL. monitored is mutable (Rack/Deck write to it).
+	// All view state derives from the URL. Helpers below write back via goto().
 
 	let selectedProject = $derived.by(() => {
 		const name = $page.url.searchParams.get('project');
@@ -21,11 +22,7 @@
 		return entry?.project_path ?? null;
 	});
 
-	let selectedService = $derived($page.url.searchParams.get('service'));
-
-	let monitored = $state<string[]>([]);
-
-	let isDeckMode = $derived(monitored.length > 0);
+	let monitored = $derived($page.url.searchParams.get('monitor')?.split(',').filter(Boolean) ?? []);
 
 	// --- Navigation (writes to URL) ---
 
@@ -41,18 +38,27 @@
 		}
 	}
 
+	function toggleMonitor(name: string | string[]) {
+		const next = Array.isArray(name)
+			? name
+			: monitored.includes(name)
+				? monitored.filter((n) => n !== name)
+				: [...monitored, name];
+		updateUrl({ monitor: next.length ? next.join(',') : null });
+	}
+
+	function updateUrl(changes: Record<string, string | null>) {
+		const params = new SvelteURLSearchParams($page.url.searchParams);
+		for (const [key, value] of Object.entries(changes)) {
+			if (value) params.set(key, value);
+			else params.delete(key);
+		}
+		goto(`?${params.toString()}`, { replaceState: true });
+	}
+
 	// --- Data loading ---
 
 	onMount(() => {
-		// Initialize monitored from URL (one-time, then mutable)
-		const monitorParam = new URLSearchParams(window.location.search).get('monitor');
-		if (monitorParam) {
-			monitored = monitorParam
-				.split(',')
-				.map((v) => v.trim())
-				.filter(Boolean);
-		}
-
 		services.refresh();
 		projectList.refresh();
 		const cleanup = connectEvents();
@@ -62,14 +68,24 @@
 
 <div class="workspace">
 	<!-- THE RACK -->
-	<Rack bind:monitored {selectedProject} onSelectProject={handleSelectProject} />
+	<Rack
+		{monitored}
+		{selectedProject}
+		onSelectProject={handleSelectProject}
+		onToggleMonitor={toggleMonitor}
+	/>
 
 	<!-- MAIN VIEW -->
 	<div class="main-view">
-		{#if isDeckMode}
-			<Deck bind:monitored />
+		{#if monitored.length > 0}
+			<Deck {monitored} onToggleMonitor={toggleMonitor} />
 		{:else if selectedProject}
-			<ProjectView projectPath={selectedProject} initialService={selectedService} />
+			<ProjectView
+				projectPath={selectedProject}
+				{monitored}
+				onToggleMonitor={toggleMonitor}
+				onDeselectProject={() => handleSelectProject(null)}
+			/>
 		{:else}
 			<Stream />
 		{/if}
@@ -80,14 +96,15 @@
 	.workspace {
 		display: grid;
 		grid-template-columns: 280px 1fr;
-		height: 100vh;
-		width: 100vw;
+		height: 100dvh;
 	}
 
 	.main-view {
 		background: #09090b;
 		display: flex;
 		flex-direction: column;
+		min-height: 0;
+		min-width: 0;
 		overflow: hidden;
 	}
 

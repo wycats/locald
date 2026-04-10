@@ -39,9 +39,8 @@
 	"dependencies": {
 		"@fontsource-variable/geist-mono": "^5.2.7",
 		"@fontsource/geist": "^5.2.8",
-		"@xterm/addon-fit": "^0.10.0",
-		"@xterm/xterm": "^5.5.0",
 		"ansi-to-html": "^0.7.2",
+		"ghostty-web": "^0.4.0",
 		"lucide-svelte": "^0.555.0"
 	}
 }

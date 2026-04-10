@@ -14,3 +14,6 @@ ignoredBuiltDependencies:
 
 onlyBuiltDependencies:
   - lefthook
+
+patchedDependencies:
+  ghostty-web: patches/ghostty-web.patch
