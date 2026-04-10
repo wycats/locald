@@ -1,7 +1,6 @@
 <script lang="ts">
 	/* eslint-disable svelte/no-navigation-without-resolve */
 	import { onMount } from 'svelte';
-	import { SvelteURLSearchParams } from 'svelte/reactivity';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { services } from '$lib/stores/services';
@@ -48,7 +47,8 @@
 	}
 
 	function updateUrl(changes: Record<string, string | null>) {
-		const params = new SvelteURLSearchParams($page.url.searchParams);
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity
+		const params = new URLSearchParams($page.url.searchParams);
 		for (const [key, value] of Object.entries(changes)) {
 			if (value) params.set(key, value);
 			else params.delete(key);

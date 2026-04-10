@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Extension",
+      "type": "shell",
+      "command": "npm run build",
+      "group": "build",
+      "options": { "cwd": "${workspaceFolder}/locald-vscode" },
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "Recycle",
+      "type": "shell",
+      "command": "cargo build -p locald-cli && cargo install --path crates/locald-cli --debug --force 2>&1 | tail -1 && (pgrep -f 'locald server start' | xargs kill 2>/dev/null; sleep 1; true) && sudo locald admin setup && locald up &disown && sleep 2 && locald ping && echo '✓ locald recycled'",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}

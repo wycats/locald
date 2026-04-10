@@ -54,19 +54,19 @@ Lifecycle rules:
 
 Attachment sources:
 
-| Source | Created when | Removed when |
-|--------|-------------|--------------|
-| `Editor(name, id)` | Editor opens a folder with `locald.toml` | Editor closes that folder or window |
-| `CLI(pid)` | `locald up` runs | `locald down` or the CLI process exits |
-| `Pin` | `locald registry pin` | `locald registry unpin` |
+| Source             | Created when                             | Removed when                           |
+| ------------------ | ---------------------------------------- | -------------------------------------- |
+| `Editor(name, id)` | Editor opens a folder with `locald.toml` | Editor closes that folder or window    |
+| `CLI(pid)`         | `locald up` runs                         | `locald down` or the CLI process exits |
+| `Pin`              | `locald registry pin`                    | `locald registry unpin`                |
 
 Dashboard state derives from attachments:
 
-| Section | Criteria | Actions |
-|---------|----------|---------|
-| **Active** | Has non-`Pin` attachments | Monitor, Stop, Restart, Open in Editor |
-| **Always On** | Has `Pin` attachment, no editor attachments | Monitor, Start, Disable |
-| **Recent** | Zero attachments, still in registry | Start, Enable, Remove |
+| Section       | Criteria                                    | Actions                                |
+| ------------- | ------------------------------------------- | -------------------------------------- |
+| **Active**    | Has non-`Pin` attachments                   | Monitor, Stop, Restart, Open in Editor |
+| **Always On** | Has `Pin` attachment, no editor attachments | Monitor, Start, Disable                |
+| **Recent**    | Zero attachments, still in registry         | Start, Enable, Remove                  |
 
 > Note: Per RFC 0135, the dashboard does not use the term "pin." The registry uses `pin`/`unpin` commands; the dashboard shows this state as "Always On" with "Enable"/"Disable" actions.
 
@@ -96,12 +96,12 @@ Each worktree reads its own working copy of `locald.toml`. Service definitions, 
 
 Template variables:
 
-| Variable | Value | Example (`feature/checkout-flow`) |
-|----------|-------|----------------------------------|
-| `{{name}}` | `[project].name` | `myapp` |
-| `{{branch.last}}` | Last segment after `/`, sanitized | `checkout-flow` |
-| `{{branch.hyphenated}}` | Full branch name, `/` → `-`, sanitized | `feature-checkout-flow` |
-| `{{project.domain}}` | Resolved `[project].domain` | `myapp.localhost` |
+| Variable                | Value                                  | Example (`feature/checkout-flow`) |
+| ----------------------- | -------------------------------------- | --------------------------------- |
+| `{{name}}`              | `[project].name`                       | `myapp`                           |
+| `{{branch.last}}`       | Last segment after `/`, sanitized      | `checkout-flow`                   |
+| `{{branch.hyphenated}}` | Full branch name, `/` → `-`, sanitized | `feature-checkout-flow`           |
+| `{{project.domain}}`    | Resolved `[project].domain`            | `myapp.localhost`                 |
 
 Default `[worktrees].domain` uses `{{branch.last}}`.
 
@@ -146,16 +146,17 @@ The VS Code extension exposes locald to Copilot through two mechanisms:
 
 **Copilot tool** (proposed API). The extension registers a language model tool (`vscode.lm.registerTool`) that Copilot can invoke directly:
 
-| Tool | Input | Output |
-|------|-------|--------|
-| `locald_services` | none | List of services with name, status, port, URL, health |
-| `locald_restart` | `{ service: string }` | Restart result |
-| `locald_logs` | `{ service?: string, lines?: number }` | Recent log lines |
-| `locald_open` | `{ service: string }` | Opens the service URL in Simple Browser, returns the URL |
+| Tool              | Input                                  | Output                                                   |
+| ----------------- | -------------------------------------- | -------------------------------------------------------- |
+| `locald_services` | none                                   | List of services with name, status, port, URL, health    |
+| `locald_restart`  | `{ service: string }`                  | Restart result                                           |
+| `locald_logs`     | `{ service?: string, lines?: number }` | Recent log lines                                         |
+| `locald_open`     | `{ service: string }`                  | Opens the service URL in Simple Browser, returns the URL |
 
 The tool enables a workflow where Copilot can make a code change, ask locald for the service URL, open it in the integrated browser, and verify the result visually — all without the user leaving the editor.
 
 Example interaction:
+
 ```
 User: "Fix the login form validation and make sure it works"
 Copilot: [edits the validation code]
