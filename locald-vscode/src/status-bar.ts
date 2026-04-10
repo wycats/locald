@@ -1,5 +1,10 @@
 import * as vscode from "vscode";
-import { status, type ProjectStatusInfo, type ServiceStatus } from "./plumbing.js";
+import {
+  attach,
+  status,
+  type ProjectStatusInfo,
+  type ServiceStatus,
+} from "./plumbing.js";
 
 const POLL_INTERVAL = 5_000;
 
@@ -8,10 +13,13 @@ export class StatusBar implements vscode.Disposable {
   private webItem: vscode.StatusBarItem;
   private timer: ReturnType<typeof setInterval> | undefined;
   private projectPath: string;
+  private windowId: string;
   private webServices: ServiceStatus[] = [];
+  private wasUnreachable = false;
 
-  constructor(projectPath: string) {
+  constructor(projectPath: string, windowId: string) {
     this.projectPath = projectPath;
+    this.windowId = windowId;
 
     // Dashboard item (left)
     this.dashboardItem = vscode.window.createStatusBarItem(
@@ -43,9 +51,14 @@ export class StatusBar implements vscode.Disposable {
   private async refresh(): Promise<void> {
     try {
       const info = await status(this.projectPath);
+      if (this.wasUnreachable) {
+        this.wasUnreachable = false;
+        attach(this.projectPath, this.windowId).catch(() => {});
+      }
       this.updateDashboard(info);
       this.updateWebItem(info);
     } catch {
+      this.wasUnreachable = true;
       this.dashboardItem.text = "$(error) locald";
       this.dashboardItem.tooltip = "locald — unable to reach daemon";
       this.webItem.hide();
@@ -74,9 +87,7 @@ export class StatusBar implements vscode.Disposable {
 
   private updateWebItem(info: ProjectStatusInfo): void {
     const services = info.service_details ?? [];
-    this.webServices = services.filter(
-      (s) => s.url && s.status === "running",
-    );
+    this.webServices = services.filter((s) => s.url && s.status === "running");
 
     if (this.webServices.length === 0) {
       this.webItem.hide();

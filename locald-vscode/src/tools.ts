@@ -1,14 +1,16 @@
 import * as vscode from "vscode";
 import { status, startProject, getLogs } from "./plumbing.js";
+import { log } from "./extension.js";
 
 export function registerTools(
   context: vscode.ExtensionContext,
   projectPath: string,
 ): void {
-  // vscode.lm.registerTool is a proposed API — bail if unavailable
   if (!vscode.lm || typeof vscode.lm.registerTool !== "function") {
+    log.warn("vscode.lm.registerTool not available — tools disabled");
     return;
   }
+  log.info("Registering 4 Copilot tools");
 
   context.subscriptions.push(
     vscode.lm.registerTool("locald_services", {

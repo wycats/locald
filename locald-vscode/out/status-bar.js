@@ -42,9 +42,12 @@ class StatusBar {
     webItem;
     timer;
     projectPath;
+    windowId;
     webServices = [];
-    constructor(projectPath) {
+    wasUnreachable = false;
+    constructor(projectPath, windowId) {
         this.projectPath = projectPath;
+        this.windowId = windowId;
         // Dashboard item (left)
         this.dashboardItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 51);
         this.dashboardItem.command = "locald.openDashboard";
@@ -65,10 +68,15 @@ class StatusBar {
     async refresh() {
         try {
             const info = await (0, plumbing_js_1.status)(this.projectPath);
+            if (this.wasUnreachable) {
+                this.wasUnreachable = false;
+                (0, plumbing_js_1.attach)(this.projectPath, this.windowId).catch(() => { });
+            }
             this.updateDashboard(info);
             this.updateWebItem(info);
         }
         catch {
+            this.wasUnreachable = true;
             this.dashboardItem.text = "$(error) locald";
             this.dashboardItem.tooltip = "locald — unable to reach daemon";
             this.webItem.hide();

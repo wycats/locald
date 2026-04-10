@@ -36,11 +36,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.registerTools = registerTools;
 const vscode = __importStar(require("vscode"));
 const plumbing_js_1 = require("./plumbing.js");
+const extension_js_1 = require("./extension.js");
 function registerTools(context, projectPath) {
-    // vscode.lm.registerTool is a proposed API — bail if unavailable
     if (!vscode.lm || typeof vscode.lm.registerTool !== "function") {
+        extension_js_1.log.warn("vscode.lm.registerTool not available — tools disabled");
         return;
     }
+    extension_js_1.log.info("Registering 4 Copilot tools");
     context.subscriptions.push(vscode.lm.registerTool("locald_services", {
         async invoke(_options, _token) {
             const info = await (0, plumbing_js_1.status)(projectPath);

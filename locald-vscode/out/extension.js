@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.log = void 0;
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
@@ -44,12 +45,16 @@ let projectPath;
 let projectName;
 let windowId;
 let dashboardPanel;
+exports.log = vscode.window.createOutputChannel("locald", { log: true });
 async function activate(context) {
-    // Find locald.toml in the workspace
+    context.subscriptions.push(exports.log);
+    exports.log.info("Extension activating...");
     const files = await vscode.workspace.findFiles("locald.toml", null, 1);
     if (files.length === 0) {
+        exports.log.info("No locald.toml found, deactivating");
         return;
     }
+    exports.log.info("Found locald.toml, proceeding with activation");
     const tomlUri = files[0];
     projectPath = vscode.workspace.getWorkspaceFolder(tomlUri)?.uri.fsPath;
     if (!projectPath) {
@@ -74,7 +79,7 @@ async function activate(context) {
     // Set context key for chatInstructions
     await vscode.commands.executeCommand("setContext", "locald:projectDetected", true);
     // Status bar
-    statusBar = new status_bar_js_1.StatusBar(projectPath);
+    statusBar = new status_bar_js_1.StatusBar(projectPath, windowId);
     context.subscriptions.push(statusBar);
     statusBar.start();
     // Register Copilot tools

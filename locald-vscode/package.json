@@ -44,6 +44,7 @@
     "languageModelTools": [
       {
         "name": "locald_services",
+        "toolReferenceName": "localdServices",
         "tags": [
           "locald"
         ],
@@ -58,6 +59,7 @@
       },
       {
         "name": "locald_restart",
+        "toolReferenceName": "localdRestart",
         "tags": [
           "locald"
         ],
@@ -77,6 +79,7 @@
       },
       {
         "name": "locald_logs",
+        "toolReferenceName": "localdLogs",
         "tags": [
           "locald"
         ],
@@ -100,6 +103,7 @@
       },
       {
         "name": "locald_open",
+        "toolReferenceName": "localdOpen",
         "tags": [
           "locald"
         ],

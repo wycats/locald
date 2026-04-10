@@ -9,14 +9,20 @@ let projectName: string | undefined;
 let windowId: string | undefined;
 let dashboardPanel: vscode.WebviewPanel | undefined;
 
+export const log = vscode.window.createOutputChannel("locald", { log: true });
+
 export async function activate(
   context: vscode.ExtensionContext,
 ): Promise<void> {
-  // Find locald.toml in the workspace
+  context.subscriptions.push(log);
+  log.info("Extension activating...");
+
   const files = await vscode.workspace.findFiles("locald.toml", null, 1);
   if (files.length === 0) {
+    log.info("No locald.toml found, deactivating");
     return;
   }
+  log.info("Found locald.toml, proceeding with activation");
 
   const tomlUri = files[0];
   projectPath = vscode.workspace.getWorkspaceFolder(tomlUri)?.uri.fsPath;
@@ -51,7 +57,7 @@ export async function activate(
   );
 
   // Status bar
-  statusBar = new StatusBar(projectPath);
+  statusBar = new StatusBar(projectPath, windowId);
   context.subscriptions.push(statusBar);
   statusBar.start();
 
