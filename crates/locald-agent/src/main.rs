@@ -247,8 +247,19 @@ mod macos {
 
     fn spawn_poll_thread(update_tx: mpsc::Sender<PollUpdate>) {
         thread::spawn(move || {
+            let mut last_start_attempt: Option<std::time::Instant> = None;
             loop {
                 let daemon = poll_daemon_status();
+
+                if daemon == DaemonStatus::NotRunning {
+                    let should_start =
+                        last_start_attempt.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+                    if should_start {
+                        last_start_attempt = Some(std::time::Instant::now());
+                        start_daemon();
+                    }
+                }
+
                 let health = poll_health();
                 if update_tx.send(PollUpdate { daemon, health }).is_err() {
                     break;
@@ -428,6 +439,36 @@ mod macos {
         }
         out.push('\'');
         out
+    }
+
+    /// Spawn the daemon if it isn't running. Errors are intentionally
+    /// swallowed — the poll loop will retry on the next cycle.
+    fn start_daemon() {
+        let exe_path = locald_path_for_setup();
+        let log_file = match std::fs::File::create("/tmp/locald.log") {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let log_clone = match log_file.try_clone() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        use std::os::unix::process::CommandExt;
+        #[allow(clippy::disallowed_methods)]
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("server")
+            .arg("start")
+            .stdout(log_clone)
+            .stderr(log_file);
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        let _ = cmd.spawn();
     }
 
     /// Resolve the locald binary path for running admin setup.
