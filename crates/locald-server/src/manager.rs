@@ -1324,10 +1324,10 @@ impl ProcessManager {
                     return Ok(());
                 }
             }
-            ServiceRuntime::None => return Ok(()),
+            ServiceRuntime::None => {}
         }
 
-        // Only clear health and broadcast after successful stop
+        // Clear health and broadcast after stop
         {
             let mut services = self.services.lock().await;
             if let Some(service) = services.get_mut(name) {
