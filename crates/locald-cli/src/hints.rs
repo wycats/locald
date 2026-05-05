@@ -13,7 +13,7 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
     None
 }
 
-fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -32,4 +32,24 @@ pub fn admin_setup_command_for_current_exe() -> String {
     }
 
     format!("{} admin setup", current_exe.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_refer_to_same_file;
+
+    #[test]
+    fn paths_refer_to_same_file_matches_existing_file() {
+        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert!(paths_refer_to_same_file(&cargo_toml, &cargo_toml));
+    }
+
+    #[test]
+    fn paths_refer_to_same_file_returns_false_for_missing_file() {
+        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-locald-file");
+        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert!(!paths_refer_to_same_file(&missing, &cargo_toml));
+    }
 }

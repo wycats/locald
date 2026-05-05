@@ -18,8 +18,8 @@ use crate::cli::{DistributionCommands, PluginCommands};
 use crate::container;
 use crate::error::{CliError, CliResult, DaemonError};
 use crate::{
-    client, debug, doctor, global_config, history, init, monitor, run, selfupgrade, service, style,
-    trust, try_cmd, update_check, utils,
+    client, debug, doctor, global_config, hints, history, init, monitor, run, selfupgrade, service,
+    style, trust, try_cmd, update_check, utils,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
@@ -1283,7 +1283,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 },
                                 "daemon": identity,
                                 "version_match": identity.version == cli_version,
-                                "executable_match": paths_refer_to_same_file(
+                                "executable_match": hints::paths_refer_to_same_file(
                                     &identity.executable,
                                     &cli_executable,
                                 ),
@@ -1302,7 +1302,10 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             } else {
                                 println!("Version: mismatch");
                             }
-                            if paths_refer_to_same_file(&identity.executable, &cli_executable) {
+                            if hints::paths_refer_to_same_file(
+                                &identity.executable,
+                                &cli_executable,
+                            ) {
                                 println!("Executable: match");
                             } else {
                                 println!("Executable: mismatch");
@@ -1882,33 +1885,6 @@ pub fn run(cli: Cli) -> CliResult<()> {
     }
 
     Ok(())
-}
-
-fn paths_refer_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::paths_refer_to_same_file;
-
-    #[test]
-    fn paths_refer_to_same_file_matches_existing_file() {
-        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-
-        assert!(paths_refer_to_same_file(&cargo_toml, &cargo_toml));
-    }
-
-    #[test]
-    fn paths_refer_to_same_file_returns_false_for_missing_file() {
-        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-locald-file");
-        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-
-        assert!(!paths_refer_to_same_file(&missing, &cargo_toml));
-    }
 }
 
 #[cfg(target_os = "macos")]

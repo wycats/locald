@@ -206,14 +206,14 @@ async fn handle_connection(
     let response = match request {
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::GetVersion => IpcResponse::Version(version),
-        IpcRequest::GetDaemonIdentity => {
-            let executable = std::env::current_exe()?;
-            IpcResponse::DaemonIdentity(DaemonIdentity {
+        IpcRequest::GetDaemonIdentity => match std::env::current_exe() {
+            Ok(executable) => IpcResponse::DaemonIdentity(DaemonIdentity {
                 version,
                 pid: std::process::id(),
                 executable,
-            })
-        }
+            }),
+            Err(e) => IpcResponse::Error(format!("failed to resolve daemon executable: {e}")),
+        },
         IpcRequest::Start { .. } => unreachable!(),
         IpcRequest::Stop { name } => match manager.stop(&name).await {
             Ok(()) => IpcResponse::Ok,
