@@ -182,6 +182,17 @@ pub struct ServiceMetrics {
     pub timestamp: i64,
 }
 
+/// Runtime identity for the daemon currently serving IPC requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonIdentity {
+    /// The daemon build version.
+    pub version: String,
+    /// The daemon process id.
+    pub pid: u32,
+    /// The executable path for the running daemon process.
+    pub executable: PathBuf,
+}
+
 /// The mode for log streaming.
 ///
 /// # Example
@@ -220,6 +231,10 @@ pub enum IpcRequest {
     ///
     /// **Response:** `IpcResponse::Version(String)`
     GetVersion,
+    /// Get the daemon runtime identity.
+    ///
+    /// **Response:** `IpcResponse::DaemonIdentity(DaemonIdentity)`
+    GetDaemonIdentity,
     /// Start a project or service at the given path.
     ///
     /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
@@ -380,6 +395,8 @@ pub enum IpcResponse {
     Pong,
     /// Response to GetVersion.
     Version(String),
+    /// Response to GetDaemonIdentity.
+    DaemonIdentity(DaemonIdentity),
     /// Generic success response.
     Ok,
     /// Response to Status request.

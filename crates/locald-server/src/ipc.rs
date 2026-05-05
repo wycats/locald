@@ -3,6 +3,7 @@ use crate::container::ContainerManager;
 use crate::manager::ProcessManager;
 use anyhow::Result;
 use locald_core::config::LocaldConfig;
+use locald_core::ipc::DaemonIdentity;
 use locald_core::{IpcRequest, IpcResponse};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -205,6 +206,14 @@ async fn handle_connection(
     let response = match request {
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::GetVersion => IpcResponse::Version(version),
+        IpcRequest::GetDaemonIdentity => match std::env::current_exe() {
+            Ok(executable) => IpcResponse::DaemonIdentity(DaemonIdentity {
+                version,
+                pid: std::process::id(),
+                executable,
+            }),
+            Err(e) => IpcResponse::Error(format!("failed to resolve daemon executable: {e}")),
+        },
         IpcRequest::Start { .. } => unreachable!(),
         IpcRequest::Stop { name } => match manager.stop(&name).await {
             Ok(()) => IpcResponse::Ok,

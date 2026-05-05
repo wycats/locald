@@ -525,6 +525,13 @@
                 "subcommands": []
               },
               {
+                "name": "identity",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
                 "name": "port",
                 "aliases": [],
                 "hidden": false,
@@ -532,6 +539,38 @@
                 "subcommands": []
               }
             ]
+          },
+          {
+            "name": "identity",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "json",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              }
+            ],
+            "subcommands": []
           },
           {
             "name": "port",
@@ -714,6 +753,13 @@
             "hidden": false,
             "args": [],
             "subcommands": [
+              {
+                "name": "identity",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
               {
                 "name": "port",
                 "aliases": [],

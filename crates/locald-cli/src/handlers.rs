@@ -18,8 +18,8 @@ use crate::cli::{DistributionCommands, PluginCommands};
 use crate::container;
 use crate::error::{CliError, CliResult, DaemonError};
 use crate::{
-    client, debug, doctor, global_config, history, init, monitor, run, selfupgrade, service, style,
-    trust, try_cmd, update_check, utils,
+    client, debug, doctor, global_config, hints, history, init, monitor, run, selfupgrade, service,
+    style, trust, try_cmd, update_check, utils,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
@@ -1269,6 +1269,52 @@ pub fn run(cli: Cli) -> CliResult<()> {
         Commands::Debug { command } => match command {
             DebugCommands::Port { port } => {
                 debug::check_port(*port)?;
+            }
+            DebugCommands::Identity { json } => {
+                let cli_executable = std::env::current_exe()?;
+                let cli_version = env!("LOCALD_BUILD_VERSION");
+                match client::send_request(&IpcRequest::GetDaemonIdentity) {
+                    Ok(IpcResponse::DaemonIdentity(identity)) => {
+                        if *json {
+                            let output = serde_json::json!({
+                                "cli": {
+                                    "version": cli_version,
+                                    "executable": cli_executable,
+                                },
+                                "daemon": identity,
+                                "version_match": identity.version == cli_version,
+                                "executable_match": hints::paths_refer_to_same_file(
+                                    &identity.executable,
+                                    &cli_executable,
+                                ),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&output)?);
+                        } else {
+                            println!("CLI:    {} ({})", cli_version, cli_executable.display());
+                            println!(
+                                "Daemon: {} ({}, pid {})",
+                                identity.version,
+                                identity.executable.display(),
+                                identity.pid
+                            );
+                            if identity.version == cli_version {
+                                println!("Version: match");
+                            } else {
+                                println!("Version: mismatch");
+                            }
+                            if hints::paths_refer_to_same_file(
+                                &identity.executable,
+                                &cli_executable,
+                            ) {
+                                println!("Executable: match");
+                            } else {
+                                println!("Executable: mismatch");
+                            }
+                        }
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
             }
         },
         Commands::Config { command } => match command {

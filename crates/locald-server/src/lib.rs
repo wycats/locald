@@ -196,7 +196,15 @@ async fn async_main(
     version: String,
     log_tx: tokio::sync::broadcast::Sender<locald_core::ipc::LogEntry>,
 ) -> Result<()> {
-    info!("locald-server starting... (version: {})", version);
+    let executable = std::env::current_exe().ok();
+    info!(
+        "locald-server starting... (version: {}, pid: {}, executable: {})",
+        version,
+        std::process::id(),
+        executable
+            .as_ref()
+            .map_or_else(|| "<unknown>".into(), |path| path.display().to_string())
+    );
 
     // Load configuration
     let config = crate::config_loader::ConfigLoader::load()

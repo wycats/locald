@@ -31,12 +31,21 @@ fn connect_to_daemon() -> Result<(UnixStream, String), DaemonError> {
 
 pub fn send_request(request: &IpcRequest) -> CliResult<IpcResponse> {
     let (mut stream, _socket_display) = connect_to_daemon()?;
+    send_request_on_stream(&mut stream, request)
+}
 
+fn send_request_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliResult<IpcResponse> {
     let request_bytes = serde_json::to_vec(request)?;
     stream.write_all(&request_bytes)?;
 
     let mut response_bytes = Vec::new();
     stream.read_to_end(&mut response_bytes)?;
+    if response_bytes.is_empty() {
+        return Err(DaemonError::RequestFailed {
+            message: "daemon closed the connection without a response".to_string(),
+        }
+        .into());
+    }
 
     let response: IpcResponse = serde_json::from_slice(&response_bytes)?;
     Ok(response)
@@ -113,4 +122,31 @@ pub fn stream_boot_events(request: &IpcRequest) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_request_on_stream;
+    use locald_core::IpcRequest;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+
+    #[test]
+    fn send_request_reports_empty_response() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server_thread = thread::spawn(move || {
+            let mut server = server;
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+        });
+
+        let err = send_request_on_stream(&mut client, &IpcRequest::Ping).unwrap_err();
+        server_thread.join().unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("daemon closed the connection without a response")
+        );
+    }
 }

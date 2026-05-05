@@ -58,3 +58,37 @@ Usage: locald [OPTIONS] <COMMAND>
 For more information, try '--help'.
 
 ```
+
+# locald debug --help
+
+```console
+$ locald debug --help
+Debugging tools
+
+Usage: locald debug [OPTIONS] <COMMAND>
+
+Commands:
+  port      Check which process is listening on a port
+  identity  Show CLI and daemon binary identity
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --sandbox <SANDBOX>  Run in a sandbox environment
+  -h, --help               Print help
+
+```
+
+# locald debug identity --help
+
+```console
+$ locald debug identity --help
+Show CLI and daemon binary identity
+
+Usage: locald debug identity [OPTIONS]
+
+Options:
+      --json               Machine-readable JSON output
+      --sandbox <SANDBOX>  Run in a sandbox environment
+  -h, --help               Print help
+
+```
