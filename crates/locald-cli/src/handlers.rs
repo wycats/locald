@@ -1270,6 +1270,49 @@ pub fn run(cli: Cli) -> CliResult<()> {
             DebugCommands::Port { port } => {
                 debug::check_port(*port)?;
             }
+            DebugCommands::Identity { json } => {
+                let cli_executable = std::env::current_exe()?;
+                let cli_version = env!("LOCALD_BUILD_VERSION");
+                match client::send_request(&IpcRequest::GetDaemonIdentity) {
+                    Ok(IpcResponse::DaemonIdentity(identity)) => {
+                        if *json {
+                            let output = serde_json::json!({
+                                "cli": {
+                                    "version": cli_version,
+                                    "executable": cli_executable,
+                                },
+                                "daemon": identity,
+                                "version_match": identity.version == cli_version,
+                                "executable_match": paths_refer_to_same_file(
+                                    &identity.executable,
+                                    &cli_executable,
+                                ),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&output)?);
+                        } else {
+                            println!("CLI:    {} ({})", cli_version, cli_executable.display());
+                            println!(
+                                "Daemon: {} ({}, pid {})",
+                                identity.version,
+                                identity.executable.display(),
+                                identity.pid
+                            );
+                            if identity.version == cli_version {
+                                println!("Version: match");
+                            } else {
+                                println!("Version: mismatch");
+                            }
+                            if paths_refer_to_same_file(&identity.executable, &cli_executable) {
+                                println!("Executable: match");
+                            } else {
+                                println!("Executable: mismatch");
+                            }
+                        }
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
         },
         Commands::Config { command } => match command {
             ConfigCommands::Show { provenance } => {
@@ -1839,6 +1882,33 @@ pub fn run(cli: Cli) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+fn paths_refer_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_refer_to_same_file;
+
+    #[test]
+    fn paths_refer_to_same_file_matches_existing_file() {
+        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert!(paths_refer_to_same_file(&cargo_toml, &cargo_toml));
+    }
+
+    #[test]
+    fn paths_refer_to_same_file_returns_false_for_missing_file() {
+        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-locald-file");
+        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert!(!paths_refer_to_same_file(&missing, &cargo_toml));
+    }
 }
 
 #[cfg(target_os = "macos")]

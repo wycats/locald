@@ -30,6 +30,7 @@ Commands:
   debug        Debugging tools
   config       Configuration management
   registry     Registry management commands
+  project      Project lifecycle management (plumbing)
   serve        Serve a directory via HTTP
   help         Print this message or the help of the given subcommand(s)
 

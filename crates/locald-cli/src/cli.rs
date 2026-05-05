@@ -654,6 +654,12 @@ pub enum DebugCommands {
         /// Port number to check
         port: u16,
     },
+    /// Show CLI and daemon binary identity
+    Identity {
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]
