@@ -33,22 +33,17 @@ export function findBinary(): string {
 function run(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const binary = findBinary();
-    execFile(
-      binary,
-      args,
-      { timeout: 10_000 },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(
-            new Error(
-              `${binary} ${args.join(" ")} failed: ${stderr || error.message}`,
-            ),
-          );
-        } else {
-          resolve(stdout);
-        }
-      },
-    );
+    execFile(binary, args, { timeout: 10_000 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(
+          new Error(
+            `${binary} ${args.join(" ")} failed: ${stderr || error.message}`,
+          ),
+        );
+      } else {
+        resolve(stdout);
+      }
+    });
   });
 }
 
