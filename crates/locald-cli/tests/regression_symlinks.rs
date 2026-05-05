@@ -52,17 +52,17 @@ fn test_build_with_broken_symlink() {
     // 4. Verify
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}\n{stderr}");
 
     println!("Stdout: {}", stdout);
     println!("Stderr: {}", stderr);
 
     // It should NOT contain "os error 2" or "No such file or directory" related to the copy
-    assert!(!stderr.contains("os error 2"));
-    assert!(!stderr.contains("No such file or directory"));
+    assert!(!combined.contains("os error 2"));
+    assert!(!combined.contains("No such file or directory"));
 
     // It should contain our warning
-    // Note: tracing logs go to stdout by default in locald-cli
-    assert!(stdout.contains("Encountered broken symlink"));
+    assert!(combined.contains("Encountered broken symlink"));
 
     // The build itself might fail due to network or other reasons in this isolated env,
     // but we are testing for the *crash*.
@@ -109,7 +109,9 @@ fn test_build_with_valid_symlink() {
     let output = cmd.output().expect("failed to execute locald build");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}\n{stderr}");
 
     // Should not warn about broken symlink
-    assert!(!stderr.contains("Encountered broken symlink"));
+    assert!(!combined.contains("Encountered broken symlink"));
 }
