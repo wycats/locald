@@ -31,6 +31,7 @@ Commands:
   debug         Debugging tools
   config        Configuration management
   registry      Registry management commands
+  project       Project lifecycle management (plumbing)
   container     Container management commands (nightly only)
   plugin        Manage WASM plugins (nightly only)
   distribution  Manage distributions (nightly only)

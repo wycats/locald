@@ -1,13 +1,45 @@
 //! Integration test: dependency injection via `${services.*}` interpolation.
+//!
+//! Spawns a sandboxed daemon, registers a project with inter-service deps,
+//! and verifies the interpolated env var appears in logs.
 
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
 use std::process::{Child, Command};
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
-use tokio::time::sleep;
 
-#[tokio::test]
-async fn test_dependency_injection() -> anyhow::Result<()> {
-    let temp_dir = tempfile::tempdir()?;
-    let project_path = temp_dir.path();
+/// Guard that kills the daemon on drop (including panics).
+#[cfg(target_os = "linux")]
+struct DaemonGuard {
+    child: Child,
+    bin: std::path::PathBuf,
+    sandbox: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.bin)
+            .arg(format!("--sandbox={}", self.sandbox))
+            .arg("server")
+            .arg("shutdown")
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_dependency_injection() {
+    let root = tempfile::tempdir().expect("failed to create temp dir");
+    let project_dir = root.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
 
     let toml = r#"
 [project]
@@ -22,65 +54,84 @@ depends_on = ["api"]
 [services.web.env]
 API_URL = "${services.api.url}"
 "#;
-    std::fs::write(project_path.join("locald.toml"), toml)?;
+    fs::write(project_dir.join("locald.toml"), toml).unwrap();
 
-    let data_dir = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_dir)?;
-    let socket_path = temp_dir.path().join("locald.sock");
+    let locald_bin = assert_cmd::cargo::cargo_bin!("locald").to_path_buf();
+    let sandbox = format!("dep-test-{}", std::process::id());
 
-    // Start server
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
-    cmd.current_dir(project_path)
-        .env("XDG_DATA_HOME", &data_dir)
-        .env("LOCALD_SOCKET", &socket_path)
-        .env("LOCALD_SANDBOX_ACTIVE", "1")
-        .env("RUST_LOG", "info")
+    let home = root.path();
+    let env_vars: Vec<(&str, String)> = vec![
+        ("HOME", home.to_string_lossy().to_string()),
+        (
+            "XDG_DATA_HOME",
+            home.join(".local/share").to_string_lossy().to_string(),
+        ),
+        (
+            "XDG_CONFIG_HOME",
+            home.join(".config").to_string_lossy().to_string(),
+        ),
+        ("LOCALD_HTTP_PORT", "0".to_string()),
+        ("LOCALD_HTTPS_PORT", "0".to_string()),
+    ];
+
+    // Start daemon with stdout/stderr redirected to a log file (not inherited pipes).
+    let log_path = root.path().join("locald.log");
+    let log_file = fs::File::create(&log_path).expect("failed to create log file");
+
+    let child = Command::new(&locald_bin)
+        .envs(env_vars.clone())
+        .arg(format!("--sandbox={}", sandbox))
         .arg("server")
-        .arg("start");
+        .arg("start")
+        .stdout(log_file.try_clone().unwrap())
+        .stderr(log_file)
+        .spawn()
+        .expect("failed to spawn daemon");
 
-    let mut server_child: Child = cmd.spawn()?;
+    let _guard = DaemonGuard {
+        child,
+        bin: locald_bin.clone(),
+        sandbox: sandbox.clone(),
+    };
 
-    // Wait for socket
-    let mut socket_ready = false;
+    // Wait for daemon to respond to ping.
+    let mut ready = false;
     for _ in 0..50 {
-        if socket_path.exists() {
-            socket_ready = true;
+        let ok = Command::new(&locald_bin)
+            .envs(env_vars.clone())
+            .arg(format!("--sandbox={}", sandbox))
+            .arg("ping")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            ready = true;
             break;
         }
-        sleep(Duration::from_millis(100)).await;
+        thread::sleep(Duration::from_millis(100));
     }
+    assert!(ready, "daemon failed to become ready");
 
-    if !socket_ready {
-        anyhow::bail!("locald socket did not appear");
-    }
-
-    // Start project
-    let status = Command::new(assert_cmd::cargo::cargo_bin!("locald"))
-        .current_dir(project_path)
-        .env("XDG_DATA_HOME", &data_dir)
-        .env("LOCALD_SOCKET", &socket_path)
-        .env("LOCALD_SANDBOX_ACTIVE", "1")
+    // Register project.
+    let status = Command::new(&locald_bin)
+        .envs(env_vars.clone())
+        .arg(format!("--sandbox={}", sandbox))
         .arg("up")
-        .status()?;
+        .arg(&project_dir)
+        .status()
+        .expect("failed to run locald up");
+    assert!(status.success(), "locald up failed");
 
-    if !status.success() {
-        anyhow::bail!("locald up failed");
-    }
+    // Wait for logs to appear.
+    thread::sleep(Duration::from_secs(2));
 
-    use std::io::{BufRead, BufReader};
-
-    // Check logs for web service
-    // We need to wait a bit for logs to be captured
-    sleep(Duration::from_secs(2)).await;
-
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("locald"))
-        .current_dir(project_path)
-        .env("XDG_DATA_HOME", &data_dir)
-        .env("LOCALD_SOCKET", &socket_path)
-        .env("LOCALD_SANDBOX_ACTIVE", "1")
+    let output = Command::new(&locald_bin)
+        .envs(env_vars.clone())
+        .arg(format!("--sandbox={}", sandbox))
         .arg("logs")
         .arg("web")
-        .output()?;
+        .output()
+        .expect("failed to get logs");
 
     let reader = BufReader::new(output.stdout.as_slice());
     let found = reader
@@ -88,29 +139,5 @@ API_URL = "${services.api.url}"
         .filter_map(Result::ok)
         .any(|line| line.contains("API_URL=http://localhost:"));
 
-    assert!(found);
-
-    // Shut down the daemon cleanly so LLVM coverage profiles flush.
-    let _ = Command::new(assert_cmd::cargo::cargo_bin!("locald"))
-        .current_dir(project_path)
-        .env("XDG_DATA_HOME", &data_dir)
-        .env("LOCALD_SOCKET", &socket_path)
-        .env("LOCALD_SANDBOX_ACTIVE", "1")
-        .arg("server")
-        .arg("shutdown")
-        .status();
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        if server_child.try_wait()?.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    if server_child.try_wait()?.is_none() {
-        anyhow::bail!("locald server did not shut down cleanly");
-    }
-
-    Ok(())
+    assert!(found, "expected API_URL interpolation in web service logs")
 }

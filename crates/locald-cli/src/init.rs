@@ -110,6 +110,7 @@ pub fn run() -> Result<()> {
         },
         plugins: std::collections::HashMap::new(),
         services,
+        worktrees: None,
     };
 
     let toml_string = toml::to_string_pretty(&config)?;

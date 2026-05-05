@@ -1,0 +1,139 @@
+{
+  "name": "locald-vscode",
+  "displayName": "locald",
+  "description": "Local development environment powered by locald",
+  "version": "0.1.0",
+  "publisher": "locald",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/locald",
+    "directory": "locald-vscode"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:locald.toml"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "locald.openDashboard",
+        "title": "locald: Open Dashboard"
+      },
+      {
+        "command": "locald.restartServices",
+        "title": "locald: Restart Services"
+      },
+      {
+        "command": "locald.stopServices",
+        "title": "locald: Stop Services"
+      }
+    ],
+    "chatInstructions": [
+      {
+        "path": "copilot-instructions.md",
+        "when": "locald:projectDetected"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "locald_services",
+        "toolReferenceName": "localdServices",
+        "tags": [
+          "locald"
+        ],
+        "displayName": "locald Services",
+        "modelDescription": "List all locald-managed services for the current project, including name, status, port, URL, domain, and health",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(server)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "locald_restart",
+        "toolReferenceName": "localdRestart",
+        "tags": [
+          "locald"
+        ],
+        "displayName": "locald Restart",
+        "modelDescription": "Restart locald services for the current project",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(debug-restart)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "string",
+              "description": "Name of a specific service to restart"
+            }
+          }
+        }
+      },
+      {
+        "name": "locald_logs",
+        "toolReferenceName": "localdLogs",
+        "tags": [
+          "locald"
+        ],
+        "displayName": "locald Logs",
+        "modelDescription": "Fetch recent log output from locald-managed services",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(output)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "string",
+              "description": "Name of a specific service to get logs from"
+            },
+            "lines": {
+              "type": "number",
+              "description": "Number of log lines to return (default 200)"
+            }
+          }
+        }
+      },
+      {
+        "name": "locald_open",
+        "toolReferenceName": "localdOpen",
+        "tags": [
+          "locald"
+        ],
+        "displayName": "Open in Browser",
+        "modelDescription": "Open a locald service URL in VS Code's Simple Browser for visual verification",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(globe)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "string",
+              "description": "Name of the service to open (opens first service with a URL if omitted)"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --skip-license -o locald-vscode.vsix",
+    "install-ext": "npm run package && code --install-extension locald-vscode.vsix --force",
+    "dev": "npm run install-ext && echo 'Extension installed. Reload VS Code window to activate.'"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/vscode": "^1.100.0",
+    "@vscode/vsce": "^3.5.0",
+    "typescript": "^5.8.0"
+  }
+}

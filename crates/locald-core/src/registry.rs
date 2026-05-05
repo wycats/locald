@@ -93,6 +93,12 @@ impl Registry {
         }
     }
 
+    /// Remove a project from the registry.
+    pub fn unregister_project(&mut self, path: &Path) {
+        let path = Self::canonicalize_path(path);
+        self.projects.remove(&path);
+    }
+
     /// Get a project entry by path.
     pub fn get_project(&self, path: &Path) -> Option<&ProjectEntry> {
         let path = Self::canonicalize_path(path);

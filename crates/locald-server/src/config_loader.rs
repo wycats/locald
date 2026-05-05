@@ -7,7 +7,7 @@ use locald_core::config::{
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayerConfig {
@@ -95,16 +95,9 @@ impl ConfigLoader {
             GlobalConfig::default()
         };
 
-        // Sandbox override
+        // Sandbox override from environment
         if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
-            config.server.privileged_ports = false;
-        }
-
-        // Warn on deprecated env vars
-        if std::env::var("LOCALD_PRIVILEGED_PORTS").is_ok() {
-            warn!(
-                "WARNING: LOCALD_PRIVILEGED_PORTS is deprecated and will be ignored. Use locald.toml or sandbox mode."
-            );
+            config.server.sandbox = true;
         }
 
         Ok(config)
@@ -114,7 +107,7 @@ impl ConfigLoader {
     pub fn explain_global(&self, key: &str) -> Provenance {
         // This is a bit manual for now. We could use a macro or something smarter later.
         match key {
-            "server.privileged_ports" => {
+            "server.sandbox" => {
                 if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
                     Provenance::EnvVar("LOCALD_SANDBOX_ACTIVE".to_string())
                 } else if self.global_path.exists() {
@@ -324,6 +317,7 @@ impl ConfigLoader {
             project,
             plugins: _,
             services,
+            worktrees: _,
         } = project_config;
         all_layers.push((
             LayerConfig {
@@ -620,6 +614,7 @@ impl ConfigLoader {
             },
             plugins: std::collections::HashMap::new(),
             services,
+            worktrees: None,
         }
     }
 

@@ -1,5 +1,6 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
+use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -8,7 +9,8 @@ use std::collections::HashSet;
 use crate::build;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands, TrayCommands,
+    ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    TrayCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
@@ -44,6 +46,27 @@ struct JsonServiceAction {
 #[derive(Serialize)]
 struct JsonServiceActions {
     services: Vec<JsonServiceAction>,
+}
+
+#[derive(Serialize)]
+struct JsonProjectAction {
+    status: String,
+}
+
+fn format_attachment_source(source: &AttachmentSource) -> String {
+    match source {
+        AttachmentSource::Editor { name, id } => format!("editor:{name} ({id})"),
+        AttachmentSource::CLI { pid } => format!("cli:{pid}"),
+        AttachmentSource::Pin => "pin".to_string(),
+    }
+}
+
+const fn section_label(section: ProjectSection) -> &'static str {
+    match section {
+        ProjectSection::Active => "active",
+        ProjectSection::AlwaysOn => "always-on",
+        ProjectSection::Recent => "recent",
+    }
 }
 
 pub fn run(cli: Cli) -> CliResult<()> {
@@ -380,7 +403,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
 
-            // Retry loop for connection?
+            // Register a CLI attachment so the project's lifecycle is tracked.
+            // The attachment is tied to this process's PID — when the CLI exits,
+            // the daemon's periodic reaper will detect the PID is gone and
+            // detach (stopping services if no other attachments remain).
+            let _ = client::send_request(&IpcRequest::ProjectAttach {
+                project_path: abs_path.clone(),
+                source: locald_core::attachments::AttachmentSource::CLI {
+                    pid: std::process::id(),
+                },
+            });
+
+            // Start services with streaming output.
             let mut attempts = 0;
             loop {
                 match client::stream_boot_events(&IpcRequest::Start {
@@ -410,6 +444,24 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             report_update(&update_rx);
+
+            // Stay alive streaming logs. The CLI attachment is tied to our PID —
+            // when we exit, the daemon detaches and stops services if no other
+            // attachments remain. Ctrl+C triggers graceful detach below.
+            let detach_path = abs_path;
+            let _ = ctrlc::set_handler(move || {
+                // Best-effort detach on Ctrl+C
+                let _ = client::send_request(&IpcRequest::ProjectDetach {
+                    project_path: detach_path.clone(),
+                    source: Some(AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    }),
+                });
+                std::process::exit(0);
+            });
+
+            println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
+            client::stream_logs(None, true)?;
         }
         Commands::Stop { name, json } => {
             let names = if let Some(n) = name {
@@ -421,6 +473,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         "No locald.toml found in current directory. Please specify a service name.",
                     ));
                 }
+
+                // Detach this project (removes CLI attachment, triggers stop if last).
+                if let Ok(abs_path) = std::fs::canonicalize(std::env::current_dir()?) {
+                    let _ = client::send_request(&IpcRequest::ProjectDetach {
+                        project_path: abs_path,
+                        source: None, // detach all non-pin sources
+                    });
+                }
+
                 let config_content =
                     std::fs::read_to_string(&config_path).context("Failed to read locald.toml")?;
                 let config: LocaldConfig =
@@ -629,7 +690,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                         // `admin setup` requires root for privileged operations.
                         // On Linux: shim install, cgroup setup, port binding.
-                        // On macOS: pfctl port forwarding rules.
+                        // On macOS: CA trust, privileged helper install.
                         if !std::io::stdin().is_terminal() {
                             return Err(CliError::message(
                                 "This command requires root privileges. Re-run with `sudo locald admin setup`.",
@@ -835,56 +896,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 2: Install pfctl port forwarding (80→8080, 443→8443).
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Configuring port forwarding (80 → 8080, 443 → 8443)...");
-                            match crate::port_forward::macos::install() {
-                                Ok(()) => {
-                                    s.stop("Port forwarding configured");
-                                }
-                                Err(e) => {
-                                    s.error(format!("Port forwarding failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Port forwarding setup failed: {e}\n\
-                                         This is required for locald to serve on ports 80/443.\n\
-                                         Run `locald admin setup` to retry."
-                                    )));
-                                }
-                            }
-
-                            // Make rules persistent across reboot via pf.conf anchor.
-                            let s = cliclack::spinner();
-                            s.start("Making port forwarding persistent...");
-                            match crate::port_forward::macos::install_persistent() {
-                                Ok(()) => {
-                                    s.stop("Port forwarding will survive reboot");
-                                }
-                                Err(e) => {
-                                    s.stop(format!(
-                                        "Persistent rules not installed: {e} (non-fatal)"
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Step 3: Enable privileged ports in global config only if pfctl succeeded.
-                        if crate::port_forward::macos::is_installed() {
-                            let s = cliclack::spinner();
-                            s.start("Updating configuration...");
-                            let mut config = crate::global_config::load();
-                            config.server.privileged_ports = true;
-                            match crate::global_config::save(config) {
-                                Ok(()) => {
-                                    s.stop("Configuration updated (privileged_ports = true)");
-                                }
-                                Err(e) => {
-                                    s.stop(format!("Config save failed: {e} (non-fatal)"));
-                                }
-                            }
-                        }
-
-                        // Step 4: Extract embedded agent binary and install as LaunchAgent.
+                        // Step 2: Extract embedded agent binary and install as LaunchAgent.
                         {
                             const AGENT_BYTES: &[u8] =
                                 include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
@@ -908,7 +920,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        // Step 5: Install privileged helper for passwordless future setup.
+                        // Step 3: Install privileged helper (required for port 80/443 binding).
                         {
                             const HELPER_BYTES: &[u8] =
                                 include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
@@ -918,12 +930,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                             match install_privileged_helper(HELPER_BYTES) {
                                 Ok(()) => {
-                                    s.stop("Privileged helper installed");
+                                    s.stop("Privileged helper installed (binds ports 80/443)");
                                 }
                                 Err(e) => {
-                                    s.stop(format!(
-                                        "Privileged helper install failed: {e} (non-fatal)"
-                                    ));
+                                    s.error(format!("Privileged helper install failed: {e}"));
+                                    return Err(CliError::message(format!(
+                                        "Failed to install privileged helper: {e}\n\
+                                         The helper is required for locald to serve on ports 80/443.\n\
+                                         Run `locald admin setup` to retry."
+                                    )));
                                 }
                             }
                         }
@@ -1003,58 +1018,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
 
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Removing port forwarding rules...");
-                            match crate::port_forward::macos::remove() {
-                                Ok(()) => {
-                                    s.stop("Port forwarding rules removed");
-                                    println!(
-                                        "{} Removed pfctl redirect rules (com.locald).",
-                                        style::CHECK
-                                    );
-                                }
-                                Err(e) => {
-                                    s.error(format!("Port forwarding removal failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Port forwarding teardown failed: {e}"
-                                    )));
-                                }
-                            }
-
-                            // Remove persistent anchor from pf.conf.
-                            let s = cliclack::spinner();
-                            s.start("Removing persistent port forwarding...");
-                            match crate::port_forward::macos::remove_persistent() {
-                                Ok(()) => {
-                                    s.stop("Persistent port forwarding removed");
-                                }
-                                Err(e) => {
-                                    s.stop(format!(
-                                        "Persistent rules removal failed: {e} (non-fatal)"
-                                    ));
-                                }
-                            }
-                        }
-
                         // Remove privileged helper.
                         {
                             let s = cliclack::spinner();
                             s.start("Removing privileged helper...");
                             remove_privileged_helper();
                             s.stop("Privileged helper removed");
-                        }
-
-                        // Reset privileged_ports config to default.
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Resetting configuration...");
-                            let mut config = crate::global_config::load();
-                            config.server.privileged_ports = false;
-                            match crate::global_config::save(config) {
-                                Ok(()) => s.stop("Configuration reset (privileged_ports = false)"),
-                                Err(e) => s.stop(format!("Config reset failed: {e} (non-fatal)")),
-                            }
                         }
 
                         cliclack::outro("Teardown complete")?;
@@ -1319,9 +1288,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                     println!("[server]");
                     println!(
-                        "privileged_ports = {}  (from {})",
-                        loader.global.server.privileged_ports,
-                        loader.explain_global("server.privileged_ports")
+                        "sandbox = {}  (from {})",
+                        loader.global.server.is_sandbox(),
+                        loader.explain_global("server.sandbox")
                     );
 
                     if let Ok(report) = rt.block_on(loader.load_service_provenance_report(&cwd)) {
@@ -1432,6 +1401,231 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 .args(["/C", "start", url])
                 .spawn();
         }
+        Commands::Project { command } => match command {
+            ProjectCommands::Attach {
+                path,
+                source,
+                editor_name,
+                editor_id,
+                json,
+            } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let source = match source.as_deref() {
+                    Some("editor") => {
+                        let name = editor_name
+                            .clone()
+                            .ok_or_else(|| CliError::message("--editor-name is required"))?;
+                        let id = editor_id
+                            .clone()
+                            .ok_or_else(|| CliError::message("--editor-id is required"))?;
+                        AttachmentSource::Editor { name, id }
+                    }
+                    Some("cli") | None => AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    },
+                    Some(other) => {
+                        return Err(CliError::message(format!(
+                            "Unknown attachment source: {other}"
+                        )));
+                    }
+                };
+
+                match client::send_request(&IpcRequest::ProjectAttach {
+                    project_path: abs_path,
+                    source,
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        if *json {
+                            let payload = JsonProjectAction {
+                                status: "ok".to_string(),
+                            };
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        } else {
+                            println!("{} Attachment registered.", style::CHECK);
+                        }
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to attach project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Detach {
+                path,
+                source,
+                editor_id,
+            } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let source = match source.as_deref() {
+                    None => None,
+                    Some("editor") => {
+                        let id = editor_id
+                            .clone()
+                            .ok_or_else(|| CliError::message("--editor-id is required"))?;
+                        Some(AttachmentSource::Editor {
+                            name: String::new(),
+                            id,
+                        })
+                    }
+                    Some("cli") => Some(AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    }),
+                    Some(other) => {
+                        return Err(CliError::message(format!(
+                            "Unknown attachment source: {other}"
+                        )));
+                    }
+                };
+
+                match client::send_request(&IpcRequest::ProjectDetach {
+                    project_path: abs_path,
+                    source,
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        println!("{} Attachment removed.", style::CHECK);
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to detach project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Start { path } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                match client::send_request(&IpcRequest::ProjectForceStart {
+                    project_path: abs_path,
+                }) {
+                    Ok(IpcResponse::Ok) => println!("{} Project force-start queued.", style::CHECK),
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to start project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Stop { path } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                match client::send_request(&IpcRequest::ProjectForceStop {
+                    project_path: abs_path,
+                }) {
+                    Ok(IpcResponse::Ok) => println!("{} Project force-stop queued.", style::CHECK),
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to stop project: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::Status { path, json } => {
+                utils::ensure_daemon_running()?;
+                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                match client::send_request(&IpcRequest::ProjectStatus {
+                    project_path: abs_path,
+                }) {
+                    Ok(IpcResponse::ProjectStatus(info)) => {
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&info)?);
+                        } else {
+                            println!("Path: {}", info.project_path.display());
+                            if let Some(name) = info.project_name {
+                                println!("Name: {name}");
+                            }
+                            println!("Running: {}", if info.is_running { "yes" } else { "no" });
+
+                            if info.services.is_empty() {
+                                println!("Services: none");
+                            } else {
+                                println!("Services:");
+                                for service in info.services {
+                                    println!("  - {service}");
+                                }
+                            }
+
+                            if info.attachments.is_empty() {
+                                println!("Attachments: none");
+                            } else {
+                                println!("Attachments:");
+                                for attachment in info.attachments {
+                                    let source = format_attachment_source(&attachment.source);
+                                    println!("  - {source}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to fetch project status: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+            ProjectCommands::List { json, filter } => {
+                utils::ensure_daemon_running()?;
+                let filter = match filter.as_deref() {
+                    None => None,
+                    Some("active") => Some(ProjectFilter::Active),
+                    Some("pinned") => Some(ProjectFilter::Pinned),
+                    Some("recent") => Some(ProjectFilter::Recent),
+                    Some("all") => Some(ProjectFilter::All),
+                    Some(other) => {
+                        return Err(CliError::message(format!("Unknown filter: {other}")));
+                    }
+                };
+
+                match client::send_request(&IpcRequest::ProjectList { filter }) {
+                    Ok(IpcResponse::ProjectList(entries)) => {
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&entries)?);
+                        } else if entries.is_empty() {
+                            println!("No projects found.");
+                        } else {
+                            println!("{:<10} {:<6} {:<40} NAME", "SECTION", "RUN", "PATH");
+                            for entry in entries {
+                                let run = if entry.is_running { "yes" } else { "no" };
+                                let section = section_label(entry.section);
+                                let name = entry.project_name.unwrap_or_default();
+                                println!(
+                                    "{:<10} {:<6} {:<40} {}",
+                                    section,
+                                    run,
+                                    entry.project_path.display(),
+                                    name
+                                );
+                            }
+                        }
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to list projects: {msg}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
+                    Err(e) => return Err(e),
+                }
+            }
+        },
         Commands::Registry { command } => match command {
             RegistryCommands::List => {
                 utils::ensure_daemon_running()?;

@@ -81,6 +81,9 @@ pub mod config_loader;
 pub mod container;
 #[doc(hidden)]
 pub mod health;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub mod helper_client;
 #[doc(hidden)]
 pub mod ipc;
 #[doc(hidden)]
@@ -220,7 +223,21 @@ async fn async_main(
             .unwrap_or_default(),
     ));
 
-    let manager = ProcessManager::new(notify_path.clone(), state_manager, registry, Some(log_tx))?;
+    let mut attachment_store = locald_core::attachments::AttachmentStore::new(
+        locald_core::attachments::AttachmentStore::path(),
+    );
+    if let Err(e) = attachment_store.load().await {
+        warn!("Failed to load attachments store: {e}");
+    }
+    let attachments = std::sync::Arc::new(tokio::sync::Mutex::new(attachment_store));
+
+    let manager = ProcessManager::new(
+        notify_path.clone(),
+        state_manager,
+        registry,
+        attachments,
+        Some(log_tx),
+    )?;
     manager.spawn_metrics_collector();
 
     // Initialize ContainerManager
@@ -269,6 +286,15 @@ async fn async_main(
         }
     });
 
+    // Spawn attachment reaper — cleans up stale editor/CLI attachments
+    let manager_reaper = manager.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            manager_reaper.reap_and_stop_orphans().await;
+        }
+    });
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
 
     // Run IPC server
@@ -297,7 +323,7 @@ async fn async_main(
     let cert_manager = match locald_utils::cert::CertManager::new().await {
         Ok(cm) => Some(std::sync::Arc::new(cm)),
         Err(e) => {
-            if config.server.privileged_ports {
+            if !config.server.is_sandbox() {
                 return Err(anyhow::anyhow!(
                     "Failed to initialize HTTPS certificates: {e}\n\
                      Run `sudo locald admin setup` to configure HTTPS trust."
@@ -327,31 +353,8 @@ async fn async_main(
                 None
             }
         }
-    } else if config.server.privileged_ports {
-        // On macOS, pfctl redirects 80→8080, so we bind 8080 and advertise port 80.
-        // On Linux, the shim binds port 80 directly.
-        #[cfg(target_os = "macos")]
-        {
-            match proxy.bind_http(8080).await {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    error!("Failed to bind port 8080: {e}.");
-                    return Err(e);
-                }
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        match proxy.bind_http(80).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                error!(
-                    "Failed to bind port 80: {e}. Run `sudo locald admin setup` or use `locald --sandbox test up`."
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // Sandbox mode or privileged_ports disabled: use high ports
+    } else if config.server.is_sandbox() {
+        // Sandbox mode: use high ports, best-effort
         match proxy.bind_http(8080).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -365,25 +368,28 @@ async fn async_main(
                 }
             }
         }
+    } else {
+        // Standard mode: bind privileged port 80.
+        // On macOS, the helper binds as root and passes the FD via XPC.
+        // On Linux, the shim binds as root and passes the FD via SCM_RIGHTS.
+        match proxy.bind_http(80).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!(
+                    "Failed to bind port 80: {e}.\n\
+                     Run `sudo locald admin setup` to install the privileged helper."
+                );
+                return Err(e);
+            }
+        }
     };
 
-    let has_http = listener_http.is_some();
+    let _has_http = listener_http.is_some();
 
-    // Set the advertised HTTP port. This is the port users see in URLs.
-    // On macOS with pfctl: advertise 80 (pfctl redirects 80→8080).
-    // On Linux / direct bind: advertise the actual bind port.
-    // In sandbox mode: advertise the high port (8080).
+    // Set the advertised HTTP port (always matches the bind port).
     if let Some(ref l) = listener_http {
-        let bind_port = l.local_addr().map(|a| a.port()).unwrap_or(8080);
-        #[cfg(target_os = "macos")]
-        let advertised_port = if config.server.privileged_ports {
-            80
-        } else {
-            bind_port
-        };
-        #[cfg(not(target_os = "macos"))]
-        let advertised_port = bind_port;
-        manager.set_http_port(Some(advertised_port)).await;
+        let port = l.local_addr().map(|a| a.port()).unwrap_or(8080);
+        manager.set_http_port(Some(port)).await;
     }
 
     if let Some(l) = listener_http {
@@ -396,66 +402,44 @@ async fn async_main(
     }
 
     // Bind HTTPS
-    let listener_https: Option<std::net::TcpListener> = if let Ok(port_str) =
-        std::env::var("LOCALD_HTTPS_PORT")
-    {
-        let port = port_str.parse::<u16>().unwrap_or(8443);
-        info!("Binding HTTPS to configured port: {}", port);
-        match proxy.bind_https(port).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                error!("Failed to bind configured port {}: {}", port, e);
-                None
+    let listener_https: Option<std::net::TcpListener> =
+        if let Ok(port_str) = std::env::var("LOCALD_HTTPS_PORT") {
+            let port = port_str.parse::<u16>().unwrap_or(8443);
+            info!("Binding HTTPS to configured port: {}", port);
+            match proxy.bind_https(port).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    error!("Failed to bind configured port {}: {}", port, e);
+                    None
+                }
             }
-        }
-    } else if config.server.privileged_ports {
-        // On macOS, pfctl redirects 443→8443, so we bind 8443 and advertise port 443.
-        // On Linux, the shim binds port 443 directly.
-        #[cfg(target_os = "macos")]
-        {
+        } else if config.server.is_sandbox() {
+            // Sandbox mode: use high ports, best-effort
             match proxy.bind_https(8443).await {
                 Ok(l) => Some(l),
                 Err(e) => {
-                    error!("Failed to bind port 8443: {e}.");
+                    error!("Failed to bind port 8443: {e}. HTTPS disabled.");
+                    None
+                }
+            }
+        } else {
+            // Standard mode: bind privileged port 443.
+            match proxy.bind_https(443).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    error!(
+                        "Failed to bind port 443: {e}.\n\
+                     Run `sudo locald admin setup` to install the privileged helper."
+                    );
                     return Err(e);
                 }
             }
-        }
-        #[cfg(not(target_os = "macos"))]
-        match proxy.bind_https(443).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                error!(
-                    "Failed to bind port 443: {e}. Run `sudo locald admin setup` or use `locald --sandbox test up`."
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // Sandbox mode or privileged_ports disabled: use high ports
-        match proxy.bind_https(8443).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                error!("Failed to bind port 8443: {e}. HTTPS disabled.");
-                None
-            }
-        }
-    };
-
-    let has_tls = listener_https.is_some();
-
-    // Set the advertised HTTPS port (same logic as HTTP above).
-    if let Some(ref l) = listener_https {
-        let bind_port = l.local_addr().map(|a| a.port()).unwrap_or(8443);
-        #[cfg(target_os = "macos")]
-        let advertised_port = if config.server.privileged_ports {
-            443
-        } else {
-            bind_port
         };
-        #[cfg(not(target_os = "macos"))]
-        let advertised_port = bind_port;
-        manager.set_https_port(Some(advertised_port)).await;
+
+    // Set the advertised HTTPS port (always matches the bind port).
+    if let Some(ref l) = listener_https {
+        let port = l.local_addr().map(|a| a.port()).unwrap_or(8443);
+        manager.set_https_port(Some(port)).await;
     }
 
     if let Some(l) = listener_https {
@@ -465,29 +449,6 @@ async fn async_main(
                 error!("HTTPS proxy server error: {e}");
             }
         });
-    }
-
-    // On macOS with privileged_ports, verify pfctl is actually forwarding.
-    // Ports are already advertised as 80/443 — this is a health assertion,
-    // not a port-setter. If pfctl isn't working, warn clearly.
-    #[cfg(target_os = "macos")]
-    if config.server.privileged_ports {
-        // Brief wait for the listeners to be ready before probing.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let http_ok = !has_http || pfctl_redirect_active(80).await;
-        let tls_ok = !has_tls || pfctl_redirect_active(443).await;
-
-        if http_ok && tls_ok {
-            info!("pfctl port forwarding verified");
-        } else {
-            error!(
-                "pfctl port forwarding not working. Ports 80/443 are advertised \
-                 but may not be reachable. Run `locald admin setup` to configure \
-                 port forwarding, or use `locald --sandbox <name> up` to run \
-                 without privileged ports."
-            );
-        }
     }
 
     let reason = tokio::select! {
@@ -540,29 +501,6 @@ async fn async_main(
 
     info!("locald-server stopped");
     Ok(())
-}
-
-/// Check whether pfctl port redirection is active for a given port.
-///
-/// Probes by attempting an async TCP connection to localhost on the privileged port.
-/// If pfctl redirect rules are active, the connection reaches our proxy on
-/// the corresponding high port and succeeds. No root access needed.
-///
-/// Note: This can false-positive if another process is listening on the port.
-/// Querying pfctl directly requires root, and the false-positive case is rare
-/// in local dev environments.
-#[cfg(target_os = "macos")]
-async fn pfctl_redirect_active(port: u16) -> bool {
-    use std::net::SocketAddr;
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
-    .map(|r| r.is_ok())
-    .unwrap_or(false)
 }
 
 async fn watch_for_upgrade(

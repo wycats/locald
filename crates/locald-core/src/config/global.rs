@@ -20,28 +20,29 @@ pub struct UpdateConfig {
     pub auto_check: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// Whether to attempt binding to privileged ports (80/443).
-    /// If true, failure to bind these ports will result in an error.
-    /// Use sandbox mode (`locald --sandbox test up`) for unprivileged testing.
-    #[serde(default = "default_privileged_ports")]
-    pub privileged_ports: bool,
+    /// Sandbox mode: skip privileged port binding (80/443) and cert trust.
+    /// Used for CI, containers, or testing the daemon itself.
+    /// When false (the default), the server binds ports 80/443 via the
+    /// platform's privileged helper — failure is fatal.
+    #[serde(default)]
+    pub sandbox: bool,
+
+    // Support reading old config files that use `privileged_ports`.
+    #[serde(default, rename = "privileged_ports")]
+    #[doc(hidden)]
+    privileged_ports_compat: Option<bool>,
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            privileged_ports: default_privileged_ports(),
+impl ServerConfig {
+    /// Effective sandbox state: explicit `sandbox = true`, or legacy
+    /// `privileged_ports = false`.
+    pub const fn is_sandbox(&self) -> bool {
+        if self.sandbox {
+            return true;
         }
+        // Legacy compat: privileged_ports = false → sandbox
+        matches!(self.privileged_ports_compat, Some(false))
     }
-}
-
-/// Default to privileged ports (80/443) on all platforms.
-///
-/// This is the intended production experience — `admin setup` configures
-/// the platform-specific mechanism (setuid shim on Linux, pfctl on macOS).
-/// Sandbox mode explicitly overrides this to false for testing.
-const fn default_privileged_ports() -> bool {
-    true
 }

@@ -49,22 +49,22 @@ mod macos {
     /// Health checks that run without root — detect problems the agent can surface.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct HealthStatus {
-        pfctl_active: bool,
-        pfctl_persistent: bool,
+        helper_installed: bool,
+        port_80_reachable: bool,
         ca_trusted: bool,
     }
 
     impl HealthStatus {
         fn is_healthy(&self) -> bool {
-            self.pfctl_active && self.pfctl_persistent && self.ca_trusted
+            self.helper_installed && self.port_80_reachable && self.ca_trusted
         }
 
         fn warning_label(&self) -> Option<String> {
             let mut problems = Vec::new();
-            if !self.pfctl_active {
-                problems.push("port forwarding inactive");
-            } else if !self.pfctl_persistent {
-                problems.push("port forwarding won't survive reboot");
+            if !self.helper_installed {
+                problems.push("privileged helper not installed");
+            } else if !self.port_80_reachable {
+                problems.push("port 80 not reachable");
             }
             if !self.ca_trusted {
                 problems.push("HTTPS not trusted");
@@ -166,8 +166,8 @@ mod macos {
                 update_rx,
                 current_daemon: DaemonStatus::Checking,
                 current_health: HealthStatus {
-                    pfctl_active: true,
-                    pfctl_persistent: true,
+                    helper_installed: true,
+                    port_80_reachable: true,
                     ca_trusted: true,
                 },
                 status_item,
@@ -247,8 +247,19 @@ mod macos {
 
     fn spawn_poll_thread(update_tx: mpsc::Sender<PollUpdate>) {
         thread::spawn(move || {
+            let mut last_start_attempt: Option<std::time::Instant> = None;
             loop {
                 let daemon = poll_daemon_status();
+
+                if daemon == DaemonStatus::NotRunning {
+                    let should_start =
+                        last_start_attempt.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+                    if should_start {
+                        last_start_attempt = Some(std::time::Instant::now());
+                        start_daemon();
+                    }
+                }
+
                 let health = poll_health();
                 if update_tx.send(PollUpdate { daemon, health }).is_err() {
                     break;
@@ -281,24 +292,23 @@ mod macos {
 
     /// Check system health without root.
     fn poll_health() -> HealthStatus {
-        let pfctl_active = check_pfctl_active();
+        let helper_installed =
+            std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper").exists();
+        let port_80_reachable = check_port_reachable(80);
         HealthStatus {
-            pfctl_active,
-            pfctl_persistent: locald_utils::port_forward::is_persistent(),
+            helper_installed,
+            port_80_reachable,
             ca_trusted: locald_utils::cert::is_ca_trusted(),
         }
     }
 
-    /// Probe whether pfctl port forwarding is active by attempting a TCP
-    /// connection to localhost:80. If pfctl redirects 80→8080 and the daemon
-    /// is listening on 8080, the connection succeeds. No root needed.
-    ///
-    /// Returns true if a TCP connection to port 80 succeeds (strong signal
-    /// that pfctl rules are active), false on any error including timeouts.
-    fn check_pfctl_active() -> bool {
+    /// Probe whether port 80 is reachable by attempting a TCP connection.
+    /// When the helper has bound port 80 and passed the FD to the server,
+    /// this connection succeeds.
+    fn check_port_reachable(port: u16) -> bool {
         use std::net::{SocketAddr, TcpStream};
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], 80));
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
         TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
     }
 
@@ -431,6 +441,36 @@ mod macos {
         out
     }
 
+    /// Spawn the daemon if it isn't running. Errors are intentionally
+    /// swallowed — the poll loop will retry on the next cycle.
+    fn start_daemon() {
+        let exe_path = locald_path_for_setup();
+        let log_file = match std::fs::File::create("/tmp/locald.log") {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let log_clone = match log_file.try_clone() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        use std::os::unix::process::CommandExt;
+        #[allow(clippy::disallowed_methods)]
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("server")
+            .arg("start")
+            .stdout(log_clone)
+            .stderr(log_file);
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        let _ = cmd.spawn();
+    }
+
     /// Resolve the locald binary path for running admin setup.
     ///
     /// Prefers `locald` on PATH if it exists, otherwise falls back to a
@@ -480,8 +520,8 @@ mod macos {
         #[test]
         fn health_all_good() {
             let h = HealthStatus {
-                pfctl_active: true,
-                pfctl_persistent: true,
+                helper_installed: true,
+                port_80_reachable: true,
                 ca_trusted: true,
             };
             assert!(h.is_healthy());
@@ -489,36 +529,34 @@ mod macos {
         }
 
         #[test]
-        fn health_pfctl_inactive() {
+        fn health_helper_missing() {
             let h = HealthStatus {
-                pfctl_active: false,
-                pfctl_persistent: false,
+                helper_installed: false,
+                port_80_reachable: false,
                 ca_trusted: true,
             };
             assert!(!h.is_healthy());
             let label = h.warning_label().unwrap();
-            assert!(label.contains("port forwarding inactive"));
-            // When pfctl is inactive, don't also warn about persistence.
-            assert!(!label.contains("reboot"));
+            assert!(label.contains("helper not installed"));
         }
 
         #[test]
-        fn health_pfctl_not_persistent() {
+        fn health_port_unreachable() {
             let h = HealthStatus {
-                pfctl_active: true,
-                pfctl_persistent: false,
+                helper_installed: true,
+                port_80_reachable: false,
                 ca_trusted: true,
             };
             assert!(!h.is_healthy());
             let label = h.warning_label().unwrap();
-            assert!(label.contains("reboot"));
+            assert!(label.contains("port 80"));
         }
 
         #[test]
         fn health_ca_untrusted() {
             let h = HealthStatus {
-                pfctl_active: true,
-                pfctl_persistent: true,
+                helper_installed: true,
+                port_80_reachable: true,
                 ca_trusted: false,
             };
             assert!(!h.is_healthy());
@@ -529,13 +567,13 @@ mod macos {
         #[test]
         fn health_multiple_problems() {
             let h = HealthStatus {
-                pfctl_active: false,
-                pfctl_persistent: false,
+                helper_installed: false,
+                port_80_reachable: false,
                 ca_trusted: false,
             };
             assert!(!h.is_healthy());
             let label = h.warning_label().unwrap();
-            assert!(label.contains("port forwarding inactive"));
+            assert!(label.contains("helper not installed"));
             assert!(label.contains("HTTPS not trusted"));
         }
 

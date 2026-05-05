@@ -96,6 +96,27 @@ pub struct LocaldConfig {
     /// Service definitions for the project.
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
+    /// Worktree-specific configuration (domain templates for git worktrees).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<WorktreesConfig>,
+}
+
+/// Configuration for git worktree domain resolution.
+///
+/// When a project is opened from a git worktree, the domain can be
+/// qualified with the branch name using template variables.
+///
+/// # Example
+/// ```toml
+/// [worktrees]
+/// domain = "{{branch.last}}.{{project.domain}}"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WorktreesConfig {
+    /// Domain template for worktrees. Supports `{{branch.last}}`, `{{branch.hyphenated}}`,
+    /// `{{name}}`, and `{{project.domain}}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// A plugin source reference in locald.toml.
@@ -542,6 +563,7 @@ mod tests {
             },
             plugins: HashMap::new(),
             services: HashMap::from([("web".to_string(), service_config)]),
+            worktrees: None,
         };
 
         let toml_string = toml::to_string_pretty(&config).unwrap();

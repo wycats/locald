@@ -314,10 +314,9 @@ pub fn verify_shim() {
             return;
         }
 
-        // Check if privileged ports are expected (either by default or explicit config).
-        // If privileged_ports is false (e.g. sandbox), skip the readiness check.
+        // Skip readiness check in sandbox mode.
         let config = crate::global_config::load();
-        if !config.server.privileged_ports {
+        if config.server.is_sandbox() {
             return;
         }
 

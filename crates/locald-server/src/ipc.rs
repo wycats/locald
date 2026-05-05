@@ -271,6 +271,42 @@ async fn handle_connection(
             Ok(count) => IpcResponse::RegistryCleaned(count),
             Err(e) => IpcResponse::Error(e.to_string()),
         },
+        IpcRequest::ProjectAttach {
+            project_path,
+            source,
+        } => match manager.project_attach(project_path, source).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::ProjectDetach {
+            project_path,
+            source,
+        } => match manager.project_detach(project_path, source).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::ProjectStatus { project_path } => {
+            match manager.project_status(&project_path).await {
+                Ok(info) => IpcResponse::ProjectStatus(info),
+                Err(e) => IpcResponse::Error(e.to_string()),
+            }
+        }
+        IpcRequest::ProjectList { filter } => match manager.project_list(filter).await {
+            Ok(entries) => IpcResponse::ProjectList(entries),
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::ProjectForceStart { project_path } => {
+            match manager.project_force_start(project_path).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(e) => IpcResponse::Error(e.to_string()),
+            }
+        }
+        IpcRequest::ProjectForceStop { project_path } => {
+            match manager.project_force_stop(project_path).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(e) => IpcResponse::Error(e.to_string()),
+            }
+        }
         IpcRequest::GetServiceEnv { name } => match manager.get_service_env(&name).await {
             Ok(env) => IpcResponse::ServiceEnv(env),
             Err(e) => IpcResponse::Error(e.to_string()),

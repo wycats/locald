@@ -14,6 +14,7 @@ pub fn load() -> GlobalConfig {
 }
 
 /// Save the global config to disk, creating the directory if needed.
+#[allow(dead_code)]
 pub fn save(config: GlobalConfig) -> anyhow::Result<()> {
     let path = global_config_path()
         .ok_or_else(|| anyhow::anyhow!("Could not determine global config path"))?;

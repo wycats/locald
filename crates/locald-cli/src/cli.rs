@@ -247,6 +247,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: RegistryCommands,
     },
+    /// Project lifecycle management (plumbing).
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
     /// Container management commands (nightly only)
     #[cfg(feature = "experimental-containers")]
     Container {
@@ -486,6 +491,56 @@ pub enum RegistryCommands {
 }
 
 #[derive(Subcommand)]
+pub enum ProjectCommands {
+    /// Register an attachment (editor, CLI, or pin).
+    Attach {
+        path: std::path::PathBuf,
+        /// Attachment source: editor or cli.
+        #[arg(long)]
+        source: Option<String>,
+        /// Editor name (required when source=editor).
+        #[arg(long)]
+        editor_name: Option<String>,
+        /// Editor id (required when source=editor).
+        #[arg(long)]
+        editor_id: Option<String>,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an attachment.
+    Detach {
+        path: std::path::PathBuf,
+        /// Attachment source: editor or cli.
+        #[arg(long)]
+        source: Option<String>,
+        /// Editor id (required when source=editor).
+        #[arg(long)]
+        editor_id: Option<String>,
+    },
+    /// Force-start services (emergency override).
+    Start { path: std::path::PathBuf },
+    /// Force-stop services (emergency override).
+    Stop { path: std::path::PathBuf },
+    /// Show project status.
+    Status {
+        path: std::path::PathBuf,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List known projects.
+    List {
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Filter: active, pinned, recent, all.
+        #[arg(long)]
+        filter: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ServiceCommands {
     /// Add a new service
     Add {
@@ -566,7 +621,7 @@ pub enum ServerCommands {
 pub enum AdminCommands {
     /// Setup locald permissions (auto-escalates to root).
     Setup,
-    /// Remove admin setup (pfctl rules, `LaunchAgent`, config). Auto-escalates to root.
+    /// Remove admin setup (helper, `LaunchAgent`, config). Auto-escalates to root.
     Teardown,
     /// Sync hosts file with running services. Auto-escalates to root.
     SyncHosts,

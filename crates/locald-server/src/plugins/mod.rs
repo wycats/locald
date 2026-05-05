@@ -698,6 +698,7 @@ mod tests {
             },
             plugins: HashMap::new(),
             services: HashMap::new(),
+            worktrees: None,
         };
 
         let allocator = PortAllocator::new();
@@ -723,6 +724,7 @@ mod tests {
             },
             plugins: HashMap::new(),
             services: HashMap::new(),
+            worktrees: None,
         };
 
         config.services.insert(

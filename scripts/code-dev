@@ -1,0 +1,19 @@
+#!/bin/sh
+# Open VS Code with local extension development paths.
+# Reads .vscode/dev-extensions for relative paths to extension directories.
+
+DEV_EXTENSIONS_FILE=".vscode/dev-extensions"
+
+if [ ! -f "$DEV_EXTENSIONS_FILE" ]; then
+  echo "error: no $DEV_EXTENSIONS_FILE found in $(pwd)" >&2
+  exit 1
+fi
+
+ARGS=""
+while IFS= read -r ext_path; do
+  [ -z "$ext_path" ] && continue
+  case "$ext_path" in \#*) continue ;; esac
+  ARGS="$ARGS --extensionDevelopmentPath=$(pwd)/$ext_path"
+done < "$DEV_EXTENSIONS_FILE"
+
+exec code $ARGS "$@"

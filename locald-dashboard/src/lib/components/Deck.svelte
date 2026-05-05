@@ -5,10 +5,16 @@
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 
-	let { monitored = $bindable([]) }: { monitored: string[] } = $props();
+	interface Props {
+		monitored: string[];
+		onToggleMonitor: (name: string) => void;
+	}
+
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	let { monitored = [], onToggleMonitor = (_name: string) => {} }: Props = $props();
 
 	function unmonitor(name: string) {
-		monitored = monitored.filter((n) => n !== name);
+		onToggleMonitor(name);
 	}
 </script>
 

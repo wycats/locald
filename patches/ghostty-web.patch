@@ -1,0 +1,22 @@
+diff --git a/dist/ghostty-web.js b/dist/ghostty-web.js
+index a4ca427b95288e70c782ce303013cd644893dcec..a9dc90a2dea1c9aa3b71813266e9cd66ebe18f08 100644
+--- a/dist/ghostty-web.js
++++ b/dist/ghostty-web.js
+@@ -1526,7 +1526,7 @@ class $ {
+       return;
+     const D = this.isInSelection(B, g);
+     let i = "";
+-    if (A.flags & e.ITALIC && (i += "italic "), A.flags & e.BOLD && (i += "bold "), this.ctx.font = `${i}${this.fontSize}px ${this.fontFamily}`, D)
++    if (A.flags & e.ITALIC && (i += "italic "), A.flags & e.BOLD && (i += "400 "), this.ctx.font = `${i}${this.fontSize}px ${this.fontFamily}`, D)
+       this.ctx.fillStyle = this.theme.selectionForeground;
+     else {
+       let M = A.fg_r, a = A.fg_g, h = A.fg_b;
+@@ -2834,7 +2834,7 @@ class IA {
+     return this.assertOpen(), this.wasmTerm.hasMouseTracking();
+   }
+ }
+-const QA = 2, BA = 1, gA = 15, EA = 100;
++const QA = 2, BA = 1, gA = 0, EA = 100;
+ class DA {
+   constructor() {
+     this._isResizing = !1;

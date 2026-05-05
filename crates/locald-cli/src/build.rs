@@ -55,14 +55,28 @@ fn is_ephemeral_sandbox_run() -> bool {
         return false;
     }
 
-    // Integration tests set HOME/XDG to a temporary directory (usually under /tmp).
-    // In that environment, we should avoid long-running network build steps.
+    fn under_temp_dir(path: &str) -> bool {
+        let path = PathBuf::from(path);
+        let temp_dir = std::env::temp_dir();
+
+        if path.starts_with(&temp_dir) {
+            return true;
+        }
+
+        let canonical_path = path.canonicalize().unwrap_or(path);
+        let canonical_temp = temp_dir.canonicalize().unwrap_or(temp_dir);
+        canonical_path.starts_with(canonical_temp)
+    }
+
+    // Integration tests set HOME/XDG to a temporary directory. On macOS,
+    // that usually means /var/folders/... rather than /tmp, so compare with
+    // std::env::temp_dir() instead of a hard-coded prefix.
     let is_tmp_home = std::env::var("HOME")
         .ok()
-        .is_some_and(|h| h.starts_with("/tmp/"));
+        .is_some_and(|h| under_temp_dir(&h));
     let is_tmp_xdg = std::env::var("XDG_DATA_HOME")
         .ok()
-        .is_some_and(|p| p.starts_with("/tmp/"));
+        .is_some_and(|p| under_temp_dir(&p));
 
     is_tmp_home || is_tmp_xdg
 }

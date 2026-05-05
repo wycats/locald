@@ -240,8 +240,8 @@ pub fn autostart(sh: &Shell) -> Result<()> {
     let example_dir = "examples/adhoc-test";
     let _guard = sh.push_dir(example_dir);
 
-    // Disable privileged ports for testing
-    let _env_guard = sh.push_env("LOCALD_PRIVILEGED_PORTS", "false");
+    // Enable sandbox mode for testing
+    let _env_guard = sh.push_env("LOCALD_SANDBOX_ACTIVE", "1");
 
     cmd!(sh, "{locald} try echo 'Hello from try'").run()?;
 
@@ -324,8 +324,8 @@ pub fn phase33(sh: &Shell) -> Result<()> {
     let _ = util::process::kill_pids(&pids, util::process::KillStrategy::TermThenKill);
     std::thread::sleep(std::time::Duration::from_secs(1));
 
-    // Disable privileged ports
-    let _env_guard = sh.push_env("LOCALD_PRIVILEGED_PORTS", "false");
+    // Enable sandbox mode
+    let _env_guard = sh.push_env("LOCALD_SANDBOX_ACTIVE", "1");
 
     // Clean up
     let _ = sh.remove_path("examples/adhoc-test/locald.toml");

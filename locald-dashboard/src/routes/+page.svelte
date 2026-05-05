@@ -1,45 +1,92 @@
 <script lang="ts">
+	/* eslint-disable svelte/no-navigation-without-resolve */
 	import { onMount } from 'svelte';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
 	import { services } from '$lib/stores/services';
+	import { projectList } from '$lib/stores/projects';
 	import { connectEvents } from '$lib/api';
 	import Rack from '$lib/components/Rack.svelte';
-	import Stream from '$lib/components/Stream.svelte';
 	import Deck from '$lib/components/Deck.svelte';
+	import Stream from '$lib/components/Stream.svelte';
+	import ProjectView from '$lib/components/ProjectView.svelte';
 
-	// --- State ---
-	let monitored = $state<string[]>([]);
+	// --- URL-derived state ---
+	// All view state derives from the URL. Helpers below write back via goto().
+
+	let selectedProject = $derived.by(() => {
+		const name = $page.url.searchParams.get('project');
+		if (!name) return null;
+		const entry = $projectList.find((p) => p.project_name === name);
+		return entry?.project_path ?? null;
+	});
+
+	let monitored = $derived($page.url.searchParams.get('monitor')?.split(',').filter(Boolean) ?? []);
+
+	// --- Navigation (writes to URL) ---
+
+	function handleSelectProject(path: string | null) {
+		if (!path) {
+			goto('/', { replaceState: true });
+			return;
+		}
+		const entry = $projectList.find((p) => p.project_path === path);
+		const name = entry?.project_name ?? path.split('/').pop();
+		if (name) {
+			goto(`?project=${encodeURIComponent(name)}`, { replaceState: true });
+		}
+	}
+
+	function toggleMonitor(name: string | string[]) {
+		const next = Array.isArray(name)
+			? name
+			: monitored.includes(name)
+				? monitored.filter((n) => n !== name)
+				: [...monitored, name];
+		updateUrl({ monitor: next.length ? next.join(',') : null });
+	}
+
+	function updateUrl(changes: Record<string, string | null>) {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity
+		const params = new URLSearchParams($page.url.searchParams);
+		for (const [key, value] of Object.entries(changes)) {
+			if (value) params.set(key, value);
+			else params.delete(key);
+		}
+		goto(`?${params.toString()}`, { replaceState: true });
+	}
+
+	// --- Data loading ---
 
 	onMount(() => {
-		const params = new URLSearchParams(window.location.search);
-		const monitorParams = params.getAll('monitor');
-		const monitors = monitorParams
-			.flatMap((value) => value.split(','))
-			.map((value) => value.trim())
-			.filter(Boolean);
-
-		if (monitors.length > 0) {
-			monitored = Array.from(new Set(monitors));
-		}
-
 		services.refresh();
+		projectList.refresh();
 		const cleanup = connectEvents();
 		return cleanup;
 	});
-
-	let isDeckMode = $derived(monitored.length > 0);
 </script>
 
 <div class="workspace">
-	<!-- THE RACK (Sidebar) -->
-	<Rack bind:monitored />
+	<!-- THE RACK -->
+	<Rack
+		{monitored}
+		{selectedProject}
+		onSelectProject={handleSelectProject}
+		onToggleMonitor={toggleMonitor}
+	/>
 
 	<!-- MAIN VIEW -->
 	<div class="main-view">
-		{#if isDeckMode}
-			<!-- THE DECK (Tiled Terminals) -->
-			<Deck bind:monitored />
+		{#if monitored.length > 0}
+			<Deck {monitored} onToggleMonitor={toggleMonitor} />
+		{:else if selectedProject}
+			<ProjectView
+				projectPath={selectedProject}
+				{monitored}
+				onToggleMonitor={toggleMonitor}
+				onDeselectProject={() => handleSelectProject(null)}
+			/>
 		{:else}
-			<!-- THE STREAM (Unified Log) -->
 			<Stream />
 		{/if}
 	</div>
@@ -49,14 +96,15 @@
 	.workspace {
 		display: grid;
 		grid-template-columns: 280px 1fr;
-		height: 100vh;
-		width: 100vw;
+		height: 100dvh;
 	}
 
 	.main-view {
 		background: #09090b;
 		display: flex;
 		flex-direction: column;
+		min-height: 0;
+		min-width: 0;
 		overflow: hidden;
 	}
 

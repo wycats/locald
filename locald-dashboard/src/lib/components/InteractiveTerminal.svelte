@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import '@xterm/xterm/css/xterm.css';
-	import type { Terminal } from '@xterm/xterm';
-	import type { FitAddon } from '@xterm/addon-fit';
+	import type { Terminal } from 'ghostty-web';
+	import type { FitAddon } from 'ghostty-web';
+	import { loadGhostty } from '$lib/ghostty';
 	import { terminalTheme } from '$lib/theme';
 
 	let { serviceName }: { serviceName: string } = $props();
@@ -15,13 +15,12 @@
 
 	onMount(async () => {
 		if (typeof window !== 'undefined') {
-			const { Terminal } = await import('@xterm/xterm');
-			const { FitAddon } = await import('@xterm/addon-fit');
+			const { Terminal, FitAddon } = await loadGhostty();
 
 			terminal = new Terminal({
 				cursorBlink: true,
 				fontSize: 14,
-				fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+				fontFamily: '"Geist Mono Variable", Menlo, Monaco, "Courier New", monospace',
 				theme: terminalTheme
 			});
 
@@ -45,7 +44,7 @@
 				};
 				socket.send(JSON.stringify(dims));
 
-				terminal.onData((data) => {
+				terminal.onData((data: string) => {
 					if (socket.readyState === WebSocket.OPEN) {
 						const msg = {
 							type: 'input',
@@ -55,7 +54,7 @@
 					}
 				});
 
-				terminal.onResize((size) => {
+				terminal.onResize((size: { cols: number; rows: number }) => {
 					if (socket.readyState === WebSocket.OPEN) {
 						const msg = {
 							type: 'resize',

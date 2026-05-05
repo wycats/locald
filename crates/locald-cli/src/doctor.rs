@@ -92,15 +92,16 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         }
 
         if !json {
-            if locald_utils::port_forward::is_persistent() {
-                let _ = cliclack::log::success("Port forwarding: persistent (survives reboot)");
-            } else if crate::port_forward::macos::is_installed() {
-                let _ = cliclack::log::warning(
-                    "Port forwarding: active but ephemeral (run `locald admin setup` to persist)",
+            // Check if the privileged helper is installed and reachable.
+            let helper_path =
+                std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
+            if helper_path.exists() {
+                let _ = cliclack::log::success(
+                    "Privileged helper: installed (ports 80/443 via FD passing)",
                 );
             } else {
                 let _ = cliclack::log::warning(
-                    "Port forwarding: not configured (run `locald admin setup`)",
+                    "Privileged helper: not installed (run `locald admin setup`)",
                 );
             }
 

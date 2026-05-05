@@ -51,6 +51,35 @@ export async function restartAllServices(): Promise<void> {
 	}
 }
 
+export interface ProjectListEntry {
+	project_path: string;
+	project_name: string | null;
+	attachments: Array<{
+		source: { Editor?: { name: string; id: string }; CLI?: { pid: number }; Pin?: null };
+	}>;
+	is_running: boolean;
+	section: 'Active' | 'AlwaysOn' | 'Recent';
+}
+
+export async function getProjects(): Promise<ProjectListEntry[]> {
+	const res = await fetch('/api/projects');
+	if (!res.ok) {
+		throw new Error('Failed to fetch projects');
+	}
+	return res.json();
+}
+
+export async function removeProject(path: string): Promise<void> {
+	const res = await fetch('/api/projects/remove', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path })
+	});
+	if (!res.ok) {
+		throw new Error('Failed to remove project');
+	}
+}
+
 import { services } from '$lib/stores/services';
 import { logs } from '$lib/stores/logs';
 
@@ -88,6 +117,7 @@ function openEventSource() {
 
 	eventSource.onopen = () => {
 		console.log('EventSource connected');
+		resetReconnectDelay();
 		connection.setConnected();
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'true');
@@ -100,13 +130,42 @@ function openEventSource() {
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'false');
 		}
+		// Auto-reconnect with backoff. EventSource's native retry gives up
+		// when the server is down; we retry manually on a longer interval.
+		if (eventSource?.readyState === EventSource.CLOSED) {
+			scheduleReconnect();
+		}
 	};
+}
+
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelay = 2000;
+const MAX_RECONNECT_DELAY = 30000;
+
+function scheduleReconnect() {
+	if (reconnectTimer) return;
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		console.log(`Reconnecting SSE (after ${reconnectDelay}ms)...`);
+		openEventSource();
+		// Back off, but cap at 30s
+		reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
+	}, reconnectDelay);
+}
+
+function resetReconnectDelay() {
+	reconnectDelay = 2000;
+	if (reconnectTimer) {
+		clearTimeout(reconnectTimer);
+		reconnectTimer = null;
+	}
 }
 
 export function connectEvents() {
 	openEventSource();
 
 	return () => {
+		resetReconnectDelay();
 		if (eventSource) {
 			eventSource.close();
 			eventSource = null;
@@ -115,5 +174,6 @@ export function connectEvents() {
 }
 
 export function reconnect() {
+	resetReconnectDelay();
 	openEventSource();
 }
