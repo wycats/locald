@@ -134,6 +134,11 @@
 		return entries;
 	}
 
+	function rackEntryKey(entry: RackEntry): string {
+		if (entry.kind === 'section') return `section:${entry.section}`;
+		return `project:${entry.path ?? entry.name}`;
+	}
+
 	function handleProjectContextMenu(e: MouseEvent, project: ProjectListEntry) {
 		e.preventDefault();
 		e.stopPropagation();
@@ -302,6 +307,17 @@
 		}
 		return serviceName;
 	}
+
+	function displayUrl(service: ServiceStatus): string {
+		if (service.domain) return service.domain;
+		if (!service.url) return '';
+		try {
+			const parsed = new URL(service.url);
+			return parsed.hostname.endsWith('.localhost') ? parsed.hostname : parsed.host;
+		} catch {
+			return service.url.replace(/^https?:\/\//, '');
+		}
+	}
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -346,7 +362,7 @@
 				</span>
 			</div>
 		{:else}
-			{#each rackEntries as rackEntry (rackEntry.kind === 'section' ? rackEntry.section : rackEntry.name)}
+			{#each rackEntries as rackEntry (rackEntryKey(rackEntry))}
 				{#if rackEntry.kind === 'section'}
 					{@const sectionCollapsed = collapsedSections.includes(rackEntry.section)}
 					<button
@@ -419,6 +435,7 @@
 						{#each project.services as service (service.name)}
 							{@const type = getServiceType(service)}
 							{@const displayName = getDisplayName(service.name, project.name)}
+							{@const urlLabel = displayUrl(service)}
 
 							<div
 								id="service-{service.name}"
@@ -440,20 +457,19 @@
 								<div class="item-content">
 									<div class="status-dot {service.status}"></div>
 									<span class="service-name" title={service.name}>{displayName}</span>
+									<span class="type-chip {type}">{type}</span>
 
 									{#if service.url && service.status === 'running'}
 										<a
 											href={service.url}
 											target="_blank"
-											class="type-chip {type} interactive"
+											class="service-url"
 											title="Open {service.url}"
 											on:click={(e) => e.stopPropagation()}
 										>
-											{type}
-											<ExternalLink size={9} />
+											<span>{urlLabel}</span>
+											<ExternalLink size={10} />
 										</a>
-									{:else}
-										<span class="type-chip {type}">{type}</span>
 									{/if}
 								</div>
 
@@ -808,7 +824,7 @@
 		width: 100%;
 		min-width: 0;
 		z-index: 1;
-		padding-right: 64px; /* pr-16 to avoid overlap */
+		padding-right: 72px; /* avoid toolbar overlap */
 	}
 
 	.status-dot {
@@ -897,18 +913,38 @@
 		background: rgba(251, 191, 36, 0.05);
 	}
 
-	.type-chip.interactive {
-		cursor: pointer;
+	.service-url {
 		display: flex;
 		align-items: center;
-		gap: 4px;
+		gap: 5px;
+		min-width: 0;
+		font-size: 11px;
+		font-weight: 500;
+		color: #cbd5e1;
 		text-decoration: none;
-		transition: all 0.2s;
+		font-family: var(--font-mono, monospace);
+		letter-spacing: -0.01em;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		padding: 3px 6px;
+		border-radius: 6px;
+		background: rgba(34, 211, 238, 0.07);
+		border: 1px solid rgba(34, 211, 238, 0.18);
+		transition:
+			color 0.2s,
+			background 0.2s,
+			border-color 0.2s;
 	}
-	.type-chip.interactive:hover {
-		color: #fff;
-		border-color: #52525b;
-		background: #27272a;
+	.service-url:hover {
+		color: #f8fafc;
+		background: rgba(34, 211, 238, 0.12);
+		border-color: rgba(34, 211, 238, 0.35);
+	}
+	.service-url span {
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
 	}
 
 	/* --- Layer 2: Toolbar Overlay --- */

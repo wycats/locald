@@ -96,17 +96,15 @@
 		if (action === 'restart') await restartServiceWithFeedback(serviceName);
 	}
 
-	function splitDomain(domain: string): { service: string; project: string; tld: string } {
-		// Domain format: service.project.localhost
-		const parts = domain.split('.');
-		if (parts.length >= 3) {
-			return {
-				service: parts.slice(0, -2).join('.'),
-				project: parts[parts.length - 2],
-				tld: parts[parts.length - 1]
-			};
+	function displayUrl(service: ServiceStatus): string {
+		if (service.domain) return service.domain;
+		if (!service.url) return '';
+		try {
+			const parsed = new URL(service.url);
+			return parsed.hostname.endsWith('.localhost') ? parsed.hostname : parsed.host;
+		} catch {
+			return service.url.replace(/^https?:\/\//, '');
 		}
-		return { service: domain, project: '', tld: '' };
 	}
 </script>
 
@@ -157,6 +155,7 @@
 			{#each projectServices as service (service.name)}
 				{@const pending = isPending(service.name)}
 				{@const type = getServiceType(service)}
+				{@const urlLabel = displayUrl(service)}
 				<div
 					class="service-row"
 					class:disabled={service.status === 'stopped'}
@@ -175,37 +174,20 @@
 				>
 					<div class="row-content">
 						<div class="status-dot {service.status}"></div>
-						{#if !(service.domain && service.status === 'running')}
-							<span class="service-name">{getDisplayName(service)}</span>
-						{/if}
+						<span class="service-name">{getDisplayName(service)}</span>
+
+						<span class="type-chip {type}">{type}</span>
 
 						{#if service.url && service.status === 'running'}
 							<a
 								href={service.url}
 								target="_blank"
-								class="type-chip {type} interactive"
+								class="primary-url"
 								title="Open {service.url}"
 								onclick={(e) => e.stopPropagation()}
 							>
-								{type}
-								<ExternalLink size={9} />
-							</a>
-						{:else}
-							<span class="type-chip {type}">{type}</span>
-						{/if}
-
-						{#if service.domain && service.status === 'running'}
-							{@const parts = splitDomain(service.domain)}
-							<a
-								href={service.url}
-								target="_blank"
-								class="domain-link"
-								onclick={(e) => e.stopPropagation()}
-							>
-								<span class="domain-service">{parts.service}</span><span class="domain-project"
-									>.{parts.project}</span
-								><span class="domain-tld">.{parts.tld}</span>
-								<ExternalLink size={9} />
+								<span>{urlLabel}</span>
+								<ExternalLink size={11} />
 							</a>
 						{/if}
 					</div>
@@ -543,39 +525,38 @@
 		background: #27272a;
 	}
 
-	.port-label {
-		font-size: 11px;
-		color: #52525b;
-		font-family: var(--font-mono, monospace);
-		flex-shrink: 0;
-	}
-
-	.domain-link {
+	.primary-url {
 		display: flex;
 		align-items: center;
-		gap: 4px;
-		font-size: 11px;
-		color: #52525b;
+		gap: 6px;
+		min-width: 0;
+		font-size: 12px;
+		font-weight: 500;
+		color: #cbd5e1;
 		text-decoration: none;
 		font-family: var(--font-mono, monospace);
-		flex-shrink: 0;
-		transition: color 0.2s;
+		letter-spacing: -0.01em;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		padding: 3px 7px;
+		border-radius: 6px;
+		background: rgba(34, 211, 238, 0.07);
+		border: 1px solid rgba(34, 211, 238, 0.18);
+		transition:
+			color 0.2s,
+			background 0.2s,
+			border-color 0.2s;
 	}
-	.domain-link:hover {
-		color: #a1a1aa;
+	.primary-url:hover {
+		color: #f8fafc;
+		background: rgba(34, 211, 238, 0.12);
+		border-color: rgba(34, 211, 238, 0.35);
 	}
-	.domain-link:hover .domain-service {
-		color: #fff;
-	}
-
-	.domain-service {
-		color: #e4e4e7;
-	}
-	.domain-project {
-		color: #71717a;
-	}
-	.domain-tld {
-		color: #3f3f46;
+	.primary-url span {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	/* --- Toolbar overlay (Rack-style) --- */
