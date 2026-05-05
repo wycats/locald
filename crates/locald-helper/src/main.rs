@@ -24,6 +24,7 @@ mod macos {
     use futures::stream::StreamExt;
     use std::collections::HashMap;
     use std::ffi::CString;
+    use std::os::unix::io::RawFd;
     use xpc_connection::{Message, XpcClient, XpcListener};
 
     const MACH_SERVICE: &str = "com.locald.helper";
@@ -68,7 +69,7 @@ mod macos {
             match client.next().await {
                 None | Some(Message::Error(_)) => break,
                 Some(Message::Dictionary(dict)) => {
-                    let response = handle_command(&dict, caller_uid);
+                    let response = close_after_send(handle_command(&dict, caller_uid));
                     client.send_message(response);
                 }
                 Some(_) => {
@@ -78,19 +79,59 @@ mod macos {
         }
     }
 
-    fn handle_command(dict: &HashMap<CString, Message>, caller_uid: u32) -> Message {
+    #[cfg_attr(test, derive(Debug))]
+    struct CommandResponse {
+        message: Message,
+        close_fd: Option<RawFd>,
+    }
+
+    impl CommandResponse {
+        const fn message(message: Message) -> Self {
+            Self {
+                message,
+                close_fd: None,
+            }
+        }
+
+        const fn transferred_fd(message: Message, fd: RawFd) -> Self {
+            Self {
+                message,
+                close_fd: Some(fd),
+            }
+        }
+    }
+
+    fn close_transferred_fd(fd: RawFd) {
+        if let Err(e) = nix::unistd::close(fd) {
+            tracing::warn!("failed to close transferred fd {fd}: {e}");
+        }
+    }
+
+    fn close_after_send(response: CommandResponse) -> Message {
+        let CommandResponse { message, close_fd } = response;
+        if let Some(fd) = close_fd {
+            close_transferred_fd(fd);
+        }
+        message
+    }
+
+    fn handle_command(dict: &HashMap<CString, Message>, caller_uid: u32) -> CommandResponse {
         #[allow(clippy::expect_used)]
         let command_key = CString::new("command").expect("static CString");
 
         let command = match dict.get(&command_key) {
             Some(Message::String(s)) => s.to_string_lossy().to_string(),
-            _ => return error_response("missing or invalid 'command' field"),
+            _ => {
+                return CommandResponse::message(error_response(
+                    "missing or invalid 'command' field",
+                ));
+            }
         };
 
         match command.as_str() {
-            "setup" => execute_setup(caller_uid),
+            "setup" => CommandResponse::message(execute_setup(caller_uid)),
             "bind" => execute_bind(dict),
-            _ => error_response(&format!("unknown command: {command}")),
+            _ => CommandResponse::message(error_response(&format!("unknown command: {command}"))),
         }
     }
 
@@ -110,20 +151,22 @@ mod macos {
 
     // ── bind (privileged port) ──────────────────────────────────────────
 
-    fn execute_bind(dict: &HashMap<CString, Message>) -> Message {
+    fn execute_bind(dict: &HashMap<CString, Message>) -> CommandResponse {
         #[allow(clippy::expect_used)]
         let port_key = CString::new("port").expect("static CString");
 
         let port = match dict.get(&port_key) {
             Some(Message::Int64(p)) => *p as u16,
-            _ => return error_response("missing or invalid 'port' field"),
+            _ => {
+                return CommandResponse::message(error_response("missing or invalid 'port' field"));
+            }
         };
 
         // Only allow binding well-known privileged ports.
         if port != 80 && port != 443 {
-            return error_response(&format!(
+            return CommandResponse::message(error_response(&format!(
                 "refused to bind port {port}: only 80 and 443 are allowed"
-            ));
+            )));
         }
 
         match bind_privileged_port(port) {
@@ -137,9 +180,9 @@ mod macos {
                     );
                     resp.insert(CString::new("fd").expect("static CString"), Message::Fd(fd));
                 }
-                Message::Dictionary(resp)
+                CommandResponse::transferred_fd(Message::Dictionary(resp), fd)
             }
-            Err(e) => error_response(&format!("{e:#}")),
+            Err(e) => CommandResponse::message(error_response(&format!("{e:#}"))),
         }
     }
 
@@ -289,16 +332,18 @@ mod macos {
         fn unknown_command_returns_error() {
             let dict = make_command_dict("bogus");
             let resp = handle_command(&dict, 501);
-            assert_eq!(get_status(&resp), "error");
-            assert!(get_message_field(&resp).contains("unknown command: bogus"));
+            assert_eq!(get_status(&resp.message), "error");
+            assert!(get_message_field(&resp.message).contains("unknown command: bogus"));
+            assert!(resp.close_fd.is_none());
         }
 
         #[test]
         fn missing_command_field_returns_error() {
             let dict = HashMap::new();
             let resp = handle_command(&dict, 501);
-            assert_eq!(get_status(&resp), "error");
-            assert!(get_message_field(&resp).contains("missing or invalid"));
+            assert_eq!(get_status(&resp.message), "error");
+            assert!(get_message_field(&resp.message).contains("missing or invalid"));
+            assert!(resp.close_fd.is_none());
         }
 
         #[test]
@@ -306,7 +351,48 @@ mod macos {
             let mut dict = HashMap::new();
             dict.insert(CString::new("command").unwrap(), Message::Int64(42));
             let resp = handle_command(&dict, 501);
-            assert_eq!(get_status(&resp), "error");
+            assert_eq!(get_status(&resp.message), "error");
+            assert!(resp.close_fd.is_none());
+        }
+
+        #[test]
+        fn bind_rejects_unapproved_ports_without_cleanup_fd() {
+            let mut dict = make_command_dict("bind");
+            dict.insert(CString::new("port").unwrap(), Message::Int64(3000));
+
+            let resp = handle_command(&dict, 501);
+
+            assert_eq!(get_status(&resp.message), "error");
+            assert!(get_message_field(&resp.message).contains("only 80 and 443"));
+            assert!(resp.close_fd.is_none());
+        }
+
+        #[test]
+        fn transferred_fd_response_tracks_cleanup_fd() {
+            let message = success_response();
+            let resp = CommandResponse::transferred_fd(message, 123);
+
+            assert_eq!(get_status(&resp.message), "success");
+            assert_eq!(resp.close_fd, Some(123));
+        }
+
+        #[test]
+        fn close_after_send_closes_transferred_fd() {
+            let mut path = std::env::temp_dir();
+            path.push(format!("locald-helper-fd-cleanup-{}", std::process::id()));
+            let file = std::fs::File::create(&path).expect("temp file");
+            let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+            let response = CommandResponse::transferred_fd(success_response(), fd);
+
+            let message = close_after_send(response);
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(get_status(&message), "success");
+            assert_eq!(
+                nix::unistd::close(fd),
+                Err(nix::errno::Errno::EBADF),
+                "fd should already be closed by close_after_send"
+            );
         }
 
         #[test]

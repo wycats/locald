@@ -5,7 +5,7 @@
 //! the file descriptor via XPC's native FD passing.
 
 use anyhow::{Context, Result};
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use tracing::info;
 
 pub async fn bind_privileged_port(port: u16) -> Result<std::net::TcpListener> {
@@ -17,12 +17,33 @@ pub async fn bind_privileged_port(port: u16) -> Result<std::net::TcpListener> {
         .context("XPC helper task panicked")??;
 
     // SAFETY: We received this FD from the helper via XPC (xpc_fd_dup).
+    // Wrap it immediately so fallible setup below cannot leak the listener.
+    #[allow(unsafe_code)]
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    set_cloexec(&fd).context("Failed to set FD_CLOEXEC on helper listener")?;
+
+    let fd = fd.into_raw_fd();
+
+    // SAFETY: We received this FD from the helper via XPC (xpc_fd_dup).
     // We are taking ownership and converting it to a TcpListener.
     #[allow(unsafe_code)]
     let tcp_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
 
     info!("Acquired port {port} from helper");
     Ok(tcp_listener)
+}
+
+fn set_cloexec(fd: &OwnedFd) -> Result<()> {
+    let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFD).context("Failed to get FD flags")?;
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::F_SETFD(
+            nix::fcntl::FdFlag::from_bits_truncate(flags) | nix::fcntl::FdFlag::FD_CLOEXEC,
+        ),
+    )
+    .context("Failed to set FD_CLOEXEC")?;
+    Ok(())
 }
 
 fn xpc_bind(port: u16) -> Result<std::os::unix::io::RawFd> {
