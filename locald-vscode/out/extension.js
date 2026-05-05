@@ -79,7 +79,7 @@ async function activate(context) {
     // Set context key for chatInstructions
     await vscode.commands.executeCommand("setContext", "locald:projectDetected", true);
     // Status bar
-    statusBar = new status_bar_js_1.StatusBar(projectPath, windowId);
+    statusBar = new status_bar_js_1.StatusBar(projectPath, windowId, exports.log);
     context.subscriptions.push(statusBar);
     statusBar.start();
     // Register Copilot tools

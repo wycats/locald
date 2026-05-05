@@ -57,7 +57,7 @@ export async function activate(
   );
 
   // Status bar
-  statusBar = new StatusBar(projectPath, windowId);
+  statusBar = new StatusBar(projectPath, windowId, log);
   context.subscriptions.push(statusBar);
   statusBar.start();
 

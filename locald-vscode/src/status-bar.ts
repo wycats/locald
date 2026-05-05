@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import {
   attach,
+  findBinary,
   status,
   type ProjectStatusInfo,
   type ServiceStatus,
@@ -14,12 +15,19 @@ export class StatusBar implements vscode.Disposable {
   private timer: ReturnType<typeof setInterval> | undefined;
   private projectPath: string;
   private windowId: string;
+  private log: vscode.LogOutputChannel;
   private webServices: ServiceStatus[] = [];
   private wasUnreachable = false;
+  private consecutiveFailures = 0;
 
-  constructor(projectPath: string, windowId: string) {
+  constructor(
+    projectPath: string,
+    windowId: string,
+    log: vscode.LogOutputChannel,
+  ) {
     this.projectPath = projectPath;
     this.windowId = windowId;
+    this.log = log;
 
     // Dashboard item (left)
     this.dashboardItem = vscode.window.createStatusBarItem(
@@ -52,15 +60,39 @@ export class StatusBar implements vscode.Disposable {
     try {
       const info = await status(this.projectPath);
       if (this.wasUnreachable) {
+        this.log.info(
+          `locald daemon reachable again after ${this.consecutiveFailures} failed status poll${this.consecutiveFailures === 1 ? "" : "s"}`,
+        );
         this.wasUnreachable = false;
-        attach(this.projectPath, this.windowId).catch(() => {});
+        attach(this.projectPath, this.windowId).catch((error: unknown) => {
+          this.log.warn(
+            `Failed to re-attach editor after daemon recovery: ${formatError(error)}`,
+          );
+        });
       }
+      this.consecutiveFailures = 0;
       this.updateDashboard(info);
       this.updateWebItem(info);
-    } catch {
+    } catch (error) {
+      this.consecutiveFailures += 1;
+      const message = formatError(error);
+      if (!this.wasUnreachable) {
+        this.log.warn(
+          `locald status poll failed; retrying every ${POLL_INTERVAL / 1000}s using ${findBinary()}: ${message}`,
+        );
+      } else if (this.consecutiveFailures % 12 === 0) {
+        this.log.warn(
+          `locald status poll still failing after ${this.consecutiveFailures} attempts: ${message}`,
+        );
+      }
       this.wasUnreachable = true;
       this.dashboardItem.text = "$(error) locald";
-      this.dashboardItem.tooltip = "locald — unable to reach daemon";
+      this.dashboardItem.tooltip = [
+        "locald — unable to reach daemon",
+        `Retrying every ${POLL_INTERVAL / 1000}s.`,
+        "",
+        message,
+      ].join("\n");
       this.webItem.hide();
     }
   }
@@ -138,4 +170,8 @@ export class StatusBar implements vscode.Disposable {
     this.dashboardItem.dispose();
     this.webItem.dispose();
   }
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

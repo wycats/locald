@@ -15,6 +15,7 @@ export interface ProjectStatusInfo {
     attachments: unknown[];
     is_running: boolean;
 }
+export declare function findBinary(): string;
 export declare function attach(projectPath: string, windowId: string): Promise<void>;
 export declare function detach(projectPath: string, windowId: string): Promise<void>;
 export declare function status(projectPath: string): Promise<ProjectStatusInfo>;

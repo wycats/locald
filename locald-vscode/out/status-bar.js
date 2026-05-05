@@ -43,11 +43,14 @@ class StatusBar {
     timer;
     projectPath;
     windowId;
+    log;
     webServices = [];
     wasUnreachable = false;
-    constructor(projectPath, windowId) {
+    consecutiveFailures = 0;
+    constructor(projectPath, windowId, log) {
         this.projectPath = projectPath;
         this.windowId = windowId;
+        this.log = log;
         // Dashboard item (left)
         this.dashboardItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 51);
         this.dashboardItem.command = "locald.openDashboard";
@@ -69,16 +72,33 @@ class StatusBar {
         try {
             const info = await (0, plumbing_js_1.status)(this.projectPath);
             if (this.wasUnreachable) {
+                this.log.info(`locald daemon reachable again after ${this.consecutiveFailures} failed status poll${this.consecutiveFailures === 1 ? "" : "s"}`);
                 this.wasUnreachable = false;
-                (0, plumbing_js_1.attach)(this.projectPath, this.windowId).catch(() => { });
+                (0, plumbing_js_1.attach)(this.projectPath, this.windowId).catch((error) => {
+                    this.log.warn(`Failed to re-attach editor after daemon recovery: ${formatError(error)}`);
+                });
             }
+            this.consecutiveFailures = 0;
             this.updateDashboard(info);
             this.updateWebItem(info);
         }
-        catch {
+        catch (error) {
+            this.consecutiveFailures += 1;
+            const message = formatError(error);
+            if (!this.wasUnreachable) {
+                this.log.warn(`locald status poll failed; retrying every ${POLL_INTERVAL / 1000}s using ${(0, plumbing_js_1.findBinary)()}: ${message}`);
+            }
+            else if (this.consecutiveFailures % 12 === 0) {
+                this.log.warn(`locald status poll still failing after ${this.consecutiveFailures} attempts: ${message}`);
+            }
             this.wasUnreachable = true;
             this.dashboardItem.text = "$(error) locald";
-            this.dashboardItem.tooltip = "locald — unable to reach daemon";
+            this.dashboardItem.tooltip = [
+                "locald — unable to reach daemon",
+                `Retrying every ${POLL_INTERVAL / 1000}s.`,
+                "",
+                message,
+            ].join("\n");
             this.webItem.hide();
         }
     }
@@ -148,4 +168,7 @@ class StatusBar {
     }
 }
 exports.StatusBar = StatusBar;
+function formatError(error) {
+    return error instanceof Error ? error.message : String(error);
+}
 //# sourceMappingURL=status-bar.js.map

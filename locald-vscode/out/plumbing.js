@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.findBinary = findBinary;
 exports.attach = attach;
 exports.detach = detach;
 exports.status = status;
@@ -19,9 +20,10 @@ function findBinary() {
 }
 function run(args) {
     return new Promise((resolve, reject) => {
-        (0, node_child_process_1.execFile)(findBinary(), args, { timeout: 10_000 }, (error, stdout, stderr) => {
+        const binary = findBinary();
+        (0, node_child_process_1.execFile)(binary, args, { timeout: 10_000 }, (error, stdout, stderr) => {
             if (error) {
-                reject(new Error(`locald ${args.join(" ")} failed: ${stderr || error.message}`));
+                reject(new Error(`${binary} ${args.join(" ")} failed: ${stderr || error.message}`));
             }
             else {
                 resolve(stdout);

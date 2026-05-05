@@ -22,7 +22,7 @@ export interface ProjectStatusInfo {
   is_running: boolean;
 }
 
-function findBinary(): string {
+export function findBinary(): string {
   const cargoPath = join(homedir(), ".cargo", "bin", "locald");
   if (existsSync(cargoPath)) {
     return cargoPath;
@@ -32,15 +32,16 @@ function findBinary(): string {
 
 function run(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
+    const binary = findBinary();
     execFile(
-      findBinary(),
+      binary,
       args,
       { timeout: 10_000 },
       (error, stdout, stderr) => {
         if (error) {
           reject(
             new Error(
-              `locald ${args.join(" ")} failed: ${stderr || error.message}`,
+              `${binary} ${args.join(" ")} failed: ${stderr || error.message}`,
             ),
           );
         } else {
