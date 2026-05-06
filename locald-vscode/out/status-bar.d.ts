@@ -17,5 +17,6 @@ export declare class StatusBar implements vscode.Disposable {
     private updateDashboard;
     private updateWebItem;
     private buildTooltip;
+    private withBinaryInfo;
     dispose(): void;
 }

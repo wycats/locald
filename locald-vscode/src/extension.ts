@@ -1,5 +1,11 @@
 import * as vscode from "vscode";
-import { attach, detach, startProject, status } from "./plumbing.js";
+import {
+  attach,
+  detach,
+  formatBinaryIdentity,
+  startProject,
+  status,
+} from "./plumbing.js";
 import { StatusBar } from "./status-bar.js";
 import { registerTools } from "./tools.js";
 
@@ -16,6 +22,7 @@ export async function activate(
 ): Promise<void> {
   context.subscriptions.push(log);
   log.info("Extension activating...");
+  log.info(`Using locald binary ${formatBinaryIdentity()}`);
 
   const files = await vscode.workspace.findFiles("locald.toml", null, 1);
   if (files.length === 0) {

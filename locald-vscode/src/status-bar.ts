@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import {
   attach,
-  findBinary,
+  formatBinaryIdentity,
   status,
   type ProjectStatusInfo,
   type ServiceStatus,
@@ -78,7 +78,7 @@ export class StatusBar implements vscode.Disposable {
       const message = formatError(error);
       if (!this.wasUnreachable) {
         this.log.warn(
-          `locald status poll failed; retrying every ${POLL_INTERVAL / 1000}s using ${findBinary()}: ${message}`,
+          `locald status poll failed; retrying every ${POLL_INTERVAL / 1000}s using ${formatBinaryIdentity()}: ${message}`,
         );
       } else if (this.consecutiveFailures % 12 === 0) {
         this.log.warn(
@@ -90,6 +90,8 @@ export class StatusBar implements vscode.Disposable {
       this.dashboardItem.tooltip = [
         "locald — unable to reach daemon",
         `Retrying every ${POLL_INTERVAL / 1000}s.`,
+        "",
+        `Binary: ${formatBinaryIdentity()}`,
         "",
         message,
       ].join("\n");
@@ -107,7 +109,7 @@ export class StatusBar implements vscode.Disposable {
 
     if (total === 0) {
       this.dashboardItem.text = `$(server) ${name}`;
-      this.dashboardItem.tooltip = `${name} — no services`;
+      this.dashboardItem.tooltip = this.withBinaryInfo(`${name} — no services`);
     } else if (healthy === total) {
       this.dashboardItem.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
       this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
@@ -159,7 +161,11 @@ export class StatusBar implements vscode.Disposable {
         lines.push(`● ${n}`);
       }
     }
-    return lines.join("\n");
+    return this.withBinaryInfo(lines.join("\n"));
+  }
+
+  private withBinaryInfo(tooltip: string): string {
+    return [tooltip, "", `Binary: ${formatBinaryIdentity()}`].join("\n");
   }
 
   dispose(): void {

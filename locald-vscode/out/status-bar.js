@@ -86,7 +86,7 @@ class StatusBar {
             this.consecutiveFailures += 1;
             const message = formatError(error);
             if (!this.wasUnreachable) {
-                this.log.warn(`locald status poll failed; retrying every ${POLL_INTERVAL / 1000}s using ${(0, plumbing_js_1.findBinary)()}: ${message}`);
+                this.log.warn(`locald status poll failed; retrying every ${POLL_INTERVAL / 1000}s using ${(0, plumbing_js_1.formatBinaryIdentity)()}: ${message}`);
             }
             else if (this.consecutiveFailures % 12 === 0) {
                 this.log.warn(`locald status poll still failing after ${this.consecutiveFailures} attempts: ${message}`);
@@ -96,6 +96,8 @@ class StatusBar {
             this.dashboardItem.tooltip = [
                 "locald — unable to reach daemon",
                 `Retrying every ${POLL_INTERVAL / 1000}s.`,
+                "",
+                `Binary: ${(0, plumbing_js_1.formatBinaryIdentity)()}`,
                 "",
                 message,
             ].join("\n");
@@ -109,7 +111,7 @@ class StatusBar {
         const healthy = services.filter((s) => s.health_status === "Healthy").length;
         if (total === 0) {
             this.dashboardItem.text = `$(server) ${name}`;
-            this.dashboardItem.tooltip = `${name} — no services`;
+            this.dashboardItem.tooltip = this.withBinaryInfo(`${name} — no services`);
         }
         else if (healthy === total) {
             this.dashboardItem.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
@@ -156,7 +158,10 @@ class StatusBar {
                 lines.push(`● ${n}`);
             }
         }
-        return lines.join("\n");
+        return this.withBinaryInfo(lines.join("\n"));
+    }
+    withBinaryInfo(tooltip) {
+        return [tooltip, "", `Binary: ${(0, plumbing_js_1.formatBinaryIdentity)()}`].join("\n");
     }
     dispose() {
         if (this.timer !== undefined) {

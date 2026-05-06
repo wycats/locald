@@ -49,6 +49,7 @@ exports.log = vscode.window.createOutputChannel("locald", { log: true });
 async function activate(context) {
     context.subscriptions.push(exports.log);
     exports.log.info("Extension activating...");
+    exports.log.info(`Using locald binary ${(0, plumbing_js_1.formatBinaryIdentity)()}`);
     const files = await vscode.workspace.findFiles("locald.toml", null, 1);
     if (files.length === 0) {
         exports.log.info("No locald.toml found, deactivating");
