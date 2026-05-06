@@ -1183,6 +1183,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         }
                     }
                     TrayCommands::Status => {
+                        let plist_path = dirs::home_dir()
+                            .context("Could not determine home directory")?
+                            .join("Library/LaunchAgents/com.locald.agent.plist");
+                        let pinned_daemon_path = read_launch_agent_daemon_path(&plist_path)?;
+
                         #[allow(clippy::disallowed_methods)]
                         let output = std::process::Command::new("launchctl")
                             .args(["list", "com.locald.agent"])
@@ -1201,6 +1206,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         } else {
                             println!("locald tray agent is not loaded");
+                        }
+
+                        match pinned_daemon_path {
+                            Some(path) => println!("Pinned daemon: {}", path.display()),
+                            None => println!("Pinned daemon: not configured"),
                         }
                     }
                     TrayCommands::Restart => {
@@ -1917,29 +1927,9 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
 
     let plist_path = plist_dir.join(format!("{label}.plist"));
 
-    // Write a minimal launchd plist.
-    let plist_content = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{program}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>LimitLoadToSessionType</key>
-    <string>Aqua</string>
-</dict>
-</plist>"#,
-        label = label,
-        program = agent_path.display(),
-    );
+    let daemon_path =
+        std::env::current_exe().context("Failed to resolve current executable path")?;
+    let plist_content = render_launch_agent_plist(label, agent_path, &daemon_path);
     std::fs::write(&plist_path, plist_content)?;
 
     // Load into the correct user's GUI domain.
@@ -1981,6 +1971,179 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn render_launch_agent_plist(
+    label: &str,
+    agent_path: &std::path::Path,
+    daemon_path: &std::path::Path,
+) -> String {
+    let label = escape_xml(label);
+    let program = escape_xml(&agent_path.display().to_string());
+    let daemon = escape_xml(&daemon_path.display().to_string());
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LOCALD_DAEMON_PATH</key>
+        <string>{daemon}</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>"#,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn escape_xml(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(target_os = "macos")]
+fn read_launch_agent_daemon_path(
+    plist_path: &std::path::Path,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let content = match std::fs::read_to_string(plist_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("Failed to read LaunchAgent plist"),
+    };
+    Ok(parse_launch_agent_daemon_path(&content).map(std::path::PathBuf::from))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_launch_agent_daemon_path(plist: &str) -> Option<String> {
+    let key_start = plist.find("<key>LOCALD_DAEMON_PATH</key>")?;
+    let after_key = &plist[key_start..];
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let after_string = &after_key[string_start..];
+    let string_end = after_string.find("</string>")?;
+    let value = unescape_xml(&after_string[..string_end]);
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn unescape_xml(value: &str) -> String {
+    let mut unescaped = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(amp_index) = rest.find('&') {
+        unescaped.push_str(&rest[..amp_index]);
+        rest = &rest[amp_index..];
+
+        if let Some(stripped) = rest.strip_prefix("&amp;") {
+            unescaped.push('&');
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix("&lt;") {
+            unescaped.push('<');
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix("&gt;") {
+            unescaped.push('>');
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix("&quot;") {
+            unescaped.push('"');
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix("&apos;") {
+            unescaped.push('\'');
+            rest = stripped;
+        } else {
+            unescaped.push('&');
+            rest = &rest['&'.len_utf8()..];
+        }
+    }
+
+    unescaped.push_str(rest);
+    unescaped
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_agent_plist_pins_daemon_path() {
+        let plist = render_launch_agent_plist(
+            "com.locald.agent",
+            std::path::Path::new("/Applications/locald agent/locald-agent"),
+            std::path::Path::new("/Users/me/bin/locald"),
+        );
+
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("<key>LOCALD_DAEMON_PATH</key>"));
+        assert_eq!(
+            parse_launch_agent_daemon_path(&plist),
+            Some("/Users/me/bin/locald".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_agent_plist_escapes_xml_values() {
+        let plist = render_launch_agent_plist(
+            "com.locald.agent",
+            std::path::Path::new("/Applications/A&B/locald-agent"),
+            std::path::Path::new("/Users/me/<debug>/locald"),
+        );
+
+        assert!(plist.contains("/Applications/A&amp;B/locald-agent"));
+        assert!(plist.contains("/Users/me/&lt;debug&gt;/locald"));
+        assert_eq!(
+            parse_launch_agent_daemon_path(&plist),
+            Some("/Users/me/<debug>/locald".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_agent_daemon_path_is_trimmed_when_parsed() {
+        let plist = r#"
+<plist version="1.0">
+<dict>
+    <key>LOCALD_DAEMON_PATH</key>
+    <string>  /Users/me/bin/locald  </string>
+</dict>
+</plist>"#;
+
+        assert_eq!(
+            parse_launch_agent_daemon_path(plist),
+            Some("/Users/me/bin/locald".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_agent_daemon_path_is_absent_when_key_missing() {
+        assert_eq!(parse_launch_agent_daemon_path("<plist></plist>"), None);
+    }
 }
 
 #[cfg(target_os = "macos")]
