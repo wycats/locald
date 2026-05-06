@@ -60,17 +60,22 @@ function resolveBinaryIdentity(): LocaldBinaryIdentity {
 function run(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const binary = getBinaryIdentity();
-    execFile(binary.path, args, { timeout: 10_000 }, (error, stdout, stderr) => {
-      if (error) {
-        reject(
-          new Error(
-            `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`,
-          ),
-        );
-      } else {
-        resolve(stdout);
-      }
-    });
+    execFile(
+      binary.path,
+      args,
+      { timeout: 10_000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`,
+            ),
+          );
+        } else {
+          resolve(stdout);
+        }
+      },
+    );
   });
 }
 
