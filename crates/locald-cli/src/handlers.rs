@@ -4,6 +4,7 @@ use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
@@ -592,7 +593,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
         }
         Commands::Status { json } => {
             utils::ensure_daemon_running()?;
-            if !*json {
+            if !*json && std::io::stderr().is_terminal() {
                 warn_if_daemon_identity_mismatch();
             }
             match client::send_request(&IpcRequest::Status) {

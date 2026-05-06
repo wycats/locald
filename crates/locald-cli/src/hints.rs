@@ -15,10 +15,11 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
 }
 
 pub fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
+    paths_refer_to_same_file_result(a, b).unwrap_or(false)
+}
+
+fn paths_refer_to_same_file_result(a: &Path, b: &Path) -> Option<bool> {
+    Some(a.canonicalize().ok()? == b.canonicalize().ok()?)
 }
 
 pub fn admin_setup_command_for_current_exe() -> String {
@@ -41,7 +42,9 @@ pub fn daemon_identity_mismatch_warning(
     daemon: &DaemonIdentity,
 ) -> Option<String> {
     let version_mismatch = daemon.version != cli_version;
-    let executable_mismatch = !paths_refer_to_same_file(&daemon.executable, cli_executable);
+    let executable_mismatch = paths_refer_to_same_file_result(&daemon.executable, cli_executable)
+        .map(|same| !same)
+        .unwrap_or(false);
 
     if !version_mismatch && !executable_mismatch {
         return None;
@@ -96,6 +99,14 @@ mod tests {
         let cargo_toml = fixture_path("Cargo.toml");
 
         assert!(!paths_refer_to_same_file(&missing, &cargo_toml));
+    }
+
+    #[test]
+    fn daemon_identity_mismatch_warning_does_not_report_executable_when_uncomparable() {
+        let cli_executable = fixture_path("Cargo.toml");
+        let daemon = daemon_identity("1.2.3", fixture_path("missing-locald-file"));
+
+        assert!(daemon_identity_mismatch_warning("1.2.3", &cli_executable, &daemon).is_none());
     }
 
     #[test]
