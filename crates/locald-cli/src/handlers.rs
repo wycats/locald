@@ -69,6 +69,26 @@ const fn section_label(section: ProjectSection) -> &'static str {
     }
 }
 
+fn warn_if_daemon_identity_mismatch() {
+    let Ok(cli_executable) = std::env::current_exe() else {
+        return;
+    };
+
+    let Ok(IpcResponse::DaemonIdentity(identity)) =
+        client::send_request(&IpcRequest::GetDaemonIdentity)
+    else {
+        return;
+    };
+
+    if let Some(warning) = hints::daemon_identity_mismatch_warning(
+        env!("LOCALD_BUILD_VERSION"),
+        &cli_executable,
+        &identity,
+    ) {
+        eprintln!("{warning}");
+    }
+}
+
 pub fn run(cli: Cli) -> CliResult<()> {
     match &cli.command {
         Commands::Init {
@@ -572,6 +592,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
         }
         Commands::Status { json } => {
             utils::ensure_daemon_running()?;
+            if !*json {
+                warn_if_daemon_identity_mismatch();
+            }
             match client::send_request(&IpcRequest::Status) {
                 Ok(IpcResponse::Status(services)) => {
                     if *json {
