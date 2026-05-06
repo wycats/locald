@@ -1578,41 +1578,71 @@ impl ProcessManager {
         &self,
         domain: &str,
     ) -> Option<locald_core::resolver::DomainResolution> {
-        let (name, controller_to_check) = {
+        struct Candidate {
+            name: String,
+            runtime: ServiceRuntime,
+        }
+
+        let candidates = {
             let services = self.services.lock().await;
-            let found = services.iter().find_map(|(name, service)| {
-                let d = Self::get_service_domain(name, &service.config.project);
-                if d == domain {
-                    match &service.runtime_state {
-                        ServiceRuntime::Controller(c) => {
-                            return Some((name.clone(), Err(c.clone())));
-                        }
-                        ServiceRuntime::None => return Some((name.clone(), Ok(None))),
+            services
+                .iter()
+                .filter_map(|(name, service)| {
+                    let d = Self::get_service_domain(name, &service.config.project);
+                    if d == domain {
+                        Some(Candidate {
+                            name: name.clone(),
+                            runtime: service.runtime_state.clone(),
+                        })
+                    } else {
+                        None
                     }
-                }
-                None
-            });
-            match found {
-                Some(x) => x,
-                None => return None,
-            }
+                })
+                .collect::<Vec<_>>()
         };
 
-        match controller_to_check {
-            Ok(port) => Some(locald_core::resolver::DomainResolution {
-                name,
-                port,
-                status: locald_core::state::ServiceState::Stopped,
-            }),
-            Err(c) => {
-                let runtime = c.lock().await.read_state().await;
-                Some(locald_core::resolver::DomainResolution {
-                    name,
-                    port: runtime.port,
-                    status: runtime.status,
-                })
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut resolved = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match candidate.runtime {
+                ServiceRuntime::None => resolved.push(locald_core::resolver::DomainResolution {
+                    name: candidate.name,
+                    port: None,
+                    status: locald_core::state::ServiceState::Stopped,
+                }),
+                ServiceRuntime::Controller(c) => {
+                    let runtime = c.lock().await.read_state().await;
+                    resolved.push(locald_core::resolver::DomainResolution {
+                        name: candidate.name,
+                        port: runtime.port,
+                        status: runtime.status,
+                    });
+                }
             }
         }
+
+        resolved.sort_by(|left, right| {
+            let left_rank = match (left.port, left.status) {
+                (Some(_), _) => 0,
+                (None, locald_core::state::ServiceState::Building) => 1,
+                (None, locald_core::state::ServiceState::Running) => 2,
+                _ => 3,
+            };
+            let right_rank = match (right.port, right.status) {
+                (Some(_), _) => 0,
+                (None, locald_core::state::ServiceState::Building) => 1,
+                (None, locald_core::state::ServiceState::Running) => 2,
+                _ => 3,
+            };
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        resolved.into_iter().next()
     }
 
     pub async fn registry_list(&self) -> Vec<locald_core::registry::ProjectEntry> {
@@ -2232,12 +2262,77 @@ fn resolve_worktree_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures_util::{StreamExt, stream};
     use locald_core::config::{ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig};
     use locald_core::registry::Registry;
+    use locald_core::service::{RuntimeState, ServiceCommand};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TestController {
+        id: String,
+        state: RuntimeState,
+    }
+
+    impl TestController {
+        fn new(id: impl Into<String>, state: RuntimeState) -> Self {
+            Self {
+                id: id.into(),
+                state,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ServiceController for TestController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
 
     #[test]
     fn test_get_service_domain_default() {
@@ -2565,5 +2660,183 @@ mod tests {
 
         // Wait for handle to finish
         handle.await.unwrap().unwrap();
+    }
+
+    fn test_config_with_domain(name: &str, domain: &str) -> LocaldConfig {
+        LocaldConfig {
+            project: ProjectConfig {
+                name: name.to_string(),
+                domain: Some(domain.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn test_service(
+        config: LocaldConfig,
+        service_config: ServiceConfig,
+        runtime_state: ServiceRuntime,
+        path: PathBuf,
+    ) -> Service {
+        Service {
+            config,
+            service_config,
+            resolved_env: HashMap::new(),
+            runtime_state,
+            sticky_port: None,
+            path,
+            health_status: HealthStatus::Healthy,
+            health_source: HealthSource::None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_prefers_portful_running() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("Failed to create ProcessManager");
+
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let domain = "shared.localhost";
+
+        let stopped = test_service(
+            test_config_with_domain("stale", domain),
+            service_config.clone(),
+            ServiceRuntime::None,
+            dir.path().join("stale"),
+        );
+
+        let running_state = RuntimeState {
+            pid: Some(123),
+            port: Some(3000),
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        let running_controller =
+            Arc::new(Mutex::new(TestController::new("active:web", running_state)));
+        let running = test_service(
+            test_config_with_domain("active", domain),
+            service_config.clone(),
+            ServiceRuntime::Controller(running_controller),
+            dir.path().join("active"),
+        );
+
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("stale:web".to_string(), stopped);
+            services.insert("active:web".to_string(), running);
+        }
+
+        let resolution = manager
+            .resolve_service_by_domain(domain)
+            .await
+            .expect("Expected resolution");
+
+        assert_eq!(resolution.name, "active:web");
+        assert_eq!(resolution.port, Some(3000));
+        assert_eq!(resolution.status, ServiceState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_prefers_building() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("Failed to create ProcessManager");
+
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let domain = "shared.localhost";
+
+        let stopped = test_service(
+            test_config_with_domain("stale", domain),
+            service_config.clone(),
+            ServiceRuntime::None,
+            dir.path().join("stale"),
+        );
+
+        let building_state = RuntimeState {
+            pid: None,
+            port: None,
+            status: ServiceState::Building,
+            health_status: HealthStatus::Starting,
+        };
+        let building_controller = Arc::new(Mutex::new(TestController::new(
+            "builder:web",
+            building_state,
+        )));
+        let building = test_service(
+            test_config_with_domain("builder", domain),
+            service_config.clone(),
+            ServiceRuntime::Controller(building_controller),
+            dir.path().join("builder"),
+        );
+
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("stale:web".to_string(), stopped);
+            services.insert("builder:web".to_string(), building);
+        }
+
+        let resolution = manager
+            .resolve_service_by_domain(domain)
+            .await
+            .expect("Expected resolution");
+
+        assert_eq!(resolution.name, "builder:web");
+        assert_eq!(resolution.port, None);
+        assert_eq!(resolution.status, ServiceState::Building);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_returns_stopped() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("Failed to create ProcessManager");
+
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let domain = "shared.localhost";
+
+        let stopped = test_service(
+            test_config_with_domain("stale", domain),
+            service_config,
+            ServiceRuntime::None,
+            dir.path().join("stale"),
+        );
+
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("stale:web".to_string(), stopped);
+        }
+
+        let resolution = manager
+            .resolve_service_by_domain(domain)
+            .await
+            .expect("Expected resolution");
+
+        assert_eq!(resolution.name, "stale:web");
+        assert_eq!(resolution.port, None);
+        assert_eq!(resolution.status, ServiceState::Stopped);
     }
 }
