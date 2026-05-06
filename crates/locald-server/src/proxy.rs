@@ -59,7 +59,7 @@ impl ProxyManager {
     pub(crate) fn make_app(&self) -> Router {
         let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         connector.set_nodelay(true);
-        connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
+        connector.set_keepalive(Some(std::time::Duration::from_mins(1)));
 
         let client =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
