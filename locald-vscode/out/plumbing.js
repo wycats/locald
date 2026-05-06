@@ -1,5 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getBinaryIdentity = getBinaryIdentity;
+exports.formatBinaryIdentity = formatBinaryIdentity;
 exports.findBinary = findBinary;
 exports.attach = attach;
 exports.detach = detach;
@@ -11,19 +13,34 @@ const node_child_process_1 = require("node:child_process");
 const node_fs_1 = require("node:fs");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
+let cachedBinaryIdentity;
+function getBinaryIdentity() {
+    cachedBinaryIdentity ??= resolveBinaryIdentity();
+    return cachedBinaryIdentity;
+}
+function formatBinaryIdentity(identity = getBinaryIdentity()) {
+    return `${identity.path} (${identity.source})`;
+}
 function findBinary() {
+    return getBinaryIdentity().path;
+}
+function resolveBinaryIdentity() {
+    const configuredPath = process.env.LOCALD_BINARY?.trim();
+    if (configuredPath) {
+        return { path: configuredPath, source: "LOCALD_BINARY" };
+    }
     const cargoPath = (0, node_path_1.join)((0, node_os_1.homedir)(), ".cargo", "bin", "locald");
     if ((0, node_fs_1.existsSync)(cargoPath)) {
-        return cargoPath;
+        return { path: cargoPath, source: "cargo" };
     }
-    return "locald";
+    return { path: "locald", source: "PATH" };
 }
 function run(args) {
     return new Promise((resolve, reject) => {
-        const binary = findBinary();
-        (0, node_child_process_1.execFile)(binary, args, { timeout: 10_000 }, (error, stdout, stderr) => {
+        const binary = getBinaryIdentity();
+        (0, node_child_process_1.execFile)(binary.path, args, { timeout: 10_000 }, (error, stdout, stderr) => {
             if (error) {
-                reject(new Error(`${binary} ${args.join(" ")} failed: ${stderr || error.message}`));
+                reject(new Error(`${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`));
             }
             else {
                 resolve(stdout);

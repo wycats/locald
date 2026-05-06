@@ -15,6 +15,13 @@ export interface ProjectStatusInfo {
     attachments: unknown[];
     is_running: boolean;
 }
+export type LocaldBinarySource = "LOCALD_BINARY" | "cargo" | "PATH";
+export interface LocaldBinaryIdentity {
+    path: string;
+    source: LocaldBinarySource;
+}
+export declare function getBinaryIdentity(): LocaldBinaryIdentity;
+export declare function formatBinaryIdentity(identity?: LocaldBinaryIdentity): string;
 export declare function findBinary(): string;
 export declare function attach(projectPath: string, windowId: string): Promise<void>;
 export declare function detach(projectPath: string, windowId: string): Promise<void>;

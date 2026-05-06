@@ -22,22 +22,49 @@ export interface ProjectStatusInfo {
   is_running: boolean;
 }
 
+export type LocaldBinarySource = "LOCALD_BINARY" | "cargo" | "PATH";
+
+export interface LocaldBinaryIdentity {
+  path: string;
+  source: LocaldBinarySource;
+}
+
+let cachedBinaryIdentity: LocaldBinaryIdentity | undefined;
+
+export function getBinaryIdentity(): LocaldBinaryIdentity {
+  cachedBinaryIdentity ??= resolveBinaryIdentity();
+  return cachedBinaryIdentity;
+}
+
+export function formatBinaryIdentity(identity = getBinaryIdentity()): string {
+  return `${identity.path} (${identity.source})`;
+}
+
 export function findBinary(): string {
+  return getBinaryIdentity().path;
+}
+
+function resolveBinaryIdentity(): LocaldBinaryIdentity {
+  const configuredPath = process.env.LOCALD_BINARY?.trim();
+  if (configuredPath) {
+    return { path: configuredPath, source: "LOCALD_BINARY" };
+  }
+
   const cargoPath = join(homedir(), ".cargo", "bin", "locald");
   if (existsSync(cargoPath)) {
-    return cargoPath;
+    return { path: cargoPath, source: "cargo" };
   }
-  return "locald";
+  return { path: "locald", source: "PATH" };
 }
 
 function run(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const binary = findBinary();
-    execFile(binary, args, { timeout: 10_000 }, (error, stdout, stderr) => {
+    const binary = getBinaryIdentity();
+    execFile(binary.path, args, { timeout: 10_000 }, (error, stdout, stderr) => {
       if (error) {
         reject(
           new Error(
-            `${binary} ${args.join(" ")} failed: ${stderr || error.message}`,
+            `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`,
           ),
         );
       } else {
