@@ -22,6 +22,7 @@ mod macos {
     use tray_icon::{Icon, TrayIconBuilder};
 
     const DASHBOARD_URL: &str = "http://locald.localhost";
+    const LOCALD_DAEMON_PATH_ENV: &str = "LOCALD_DAEMON_PATH";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum DaemonStatus {
@@ -412,7 +413,7 @@ mod macos {
     /// to root (prompts for sudo password in the terminal).
     /// The resolved path is shell-quoted to handle spaces and special characters.
     fn run_admin_setup_via_terminal() {
-        let locald_path = locald_path_for_setup();
+        let locald_path = locald_path_for_admin_setup();
         let command = format!("{} admin setup", shell_quote(&locald_path));
         // Escape for embedding inside an AppleScript double-quoted string.
         let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
@@ -444,7 +445,13 @@ mod macos {
     /// Spawn the daemon if it isn't running. Errors are intentionally
     /// swallowed — the poll loop will retry on the next cycle.
     fn start_daemon() {
-        let exe_path = locald_path_for_setup();
+        let exe_path = match locald_path_for_daemon_start() {
+            Ok(path) => path,
+            Err(message) => {
+                log_agent_message(&format!("locald-agent: {message}"));
+                return;
+            }
+        };
         let log_file = match std::fs::File::create("/tmp/locald.log") {
             Ok(f) => f,
             Err(_) => return,
@@ -468,7 +475,11 @@ mod macos {
                 Ok(())
             });
         }
-        let _ = cmd.spawn();
+        if let Err(e) = cmd.spawn() {
+            log_agent_message(&format!(
+                "locald-agent: failed to start daemon from {exe_path}: {e}"
+            ));
+        }
     }
 
     /// Resolve the locald binary path for running admin setup.
@@ -476,7 +487,7 @@ mod macos {
     /// Prefers `locald` on PATH if it exists, otherwise falls back to a
     /// known install location.
     #[allow(clippy::disallowed_methods)]
-    fn locald_path_for_setup() -> String {
+    fn locald_path_for_admin_setup() -> String {
         // Check if locald is on PATH.
         if let Ok(output) = std::process::Command::new("which").arg("locald").output()
             && output.status.success()
@@ -488,6 +499,46 @@ mod macos {
         }
         // Fallback: assume standard install location.
         "/usr/local/bin/locald".to_string()
+    }
+
+    /// Resolve the pinned locald binary path for daemon auto-start.
+    ///
+    /// The LaunchAgent should provide this. If it does not, the agent skips
+    /// daemon auto-start rather than guessing from PATH.
+    fn locald_path_for_daemon_start() -> Result<String, String> {
+        match std::env::var(LOCALD_DAEMON_PATH_ENV) {
+            Ok(value) => locald_path_for_daemon_start_from_value(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Err(format!(
+                "{LOCALD_DAEMON_PATH_ENV} is not set; skipping daemon auto-start"
+            )),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+                "{LOCALD_DAEMON_PATH_ENV} is not valid UTF-8; skipping daemon auto-start"
+            )),
+        }
+    }
+
+    fn locald_path_for_daemon_start_from_value(value: Option<&str>) -> Result<String, String> {
+        match value {
+            Some(path) if !path.trim().is_empty() => Ok(path.to_string()),
+            Some(_) => Err(format!(
+                "{LOCALD_DAEMON_PATH_ENV} is empty; skipping daemon auto-start"
+            )),
+            None => Err(format!(
+                "{LOCALD_DAEMON_PATH_ENV} is not set; skipping daemon auto-start"
+            )),
+        }
+    }
+
+    fn log_agent_message(message: &str) {
+        use std::io::Write;
+
+        if let Ok(mut log_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/locald.log")
+        {
+            let _ = writeln!(log_file, "{message}");
+        }
     }
 
     fn build_icon() -> Result<Icon, Box<dyn std::error::Error>> {
@@ -623,6 +674,30 @@ mod macos {
         #[test]
         fn shell_quote_empty() {
             assert_eq!(shell_quote(""), "''");
+        }
+
+        #[test]
+        fn daemon_start_path_uses_pinned_env_value() {
+            assert_eq!(
+                locald_path_for_daemon_start_from_value(Some("/opt/locald/bin/locald")),
+                Ok("/opt/locald/bin/locald".to_string())
+            );
+        }
+
+        #[test]
+        fn daemon_start_path_rejects_missing_env_value() {
+            assert_eq!(
+                locald_path_for_daemon_start_from_value(None),
+                Err("LOCALD_DAEMON_PATH is not set; skipping daemon auto-start".to_string())
+            );
+        }
+
+        #[test]
+        fn daemon_start_path_rejects_empty_env_value() {
+            assert_eq!(
+                locald_path_for_daemon_start_from_value(Some("  ")),
+                Err("LOCALD_DAEMON_PATH is empty; skipping daemon auto-start".to_string())
+            );
         }
     }
 }
