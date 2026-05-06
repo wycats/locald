@@ -2046,10 +2046,11 @@ fn parse_launch_agent_daemon_path(plist: &str) -> Option<String> {
     let after_string = &after_key[string_start..];
     let string_end = after_string.find("</string>")?;
     let value = unescape_xml(&after_string[..string_end]);
-    if value.trim().is_empty() {
+    let value = value.trim();
+    if value.is_empty() {
         None
     } else {
-        Some(value)
+        Some(value.to_string())
     }
 }
 
@@ -2120,6 +2121,22 @@ mod tests {
         assert_eq!(
             parse_launch_agent_daemon_path(&plist),
             Some("/Users/me/<debug>/locald".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_agent_daemon_path_is_trimmed_when_parsed() {
+        let plist = r#"
+<plist version="1.0">
+<dict>
+    <key>LOCALD_DAEMON_PATH</key>
+    <string>  /Users/me/bin/locald  </string>
+</dict>
+</plist>"#;
+
+        assert_eq!(
+            parse_launch_agent_daemon_path(plist),
+            Some("/Users/me/bin/locald".to_string())
         );
     }
 

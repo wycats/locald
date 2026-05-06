@@ -519,7 +519,7 @@ mod macos {
 
     fn locald_path_for_daemon_start_from_value(value: Option<&str>) -> Result<String, String> {
         match value {
-            Some(path) if !path.trim().is_empty() => Ok(path.to_string()),
+            Some(path) if !path.trim().is_empty() => Ok(path.trim().to_string()),
             Some(_) => Err(format!(
                 "{LOCALD_DAEMON_PATH_ENV} is empty; skipping daemon auto-start"
             )),
@@ -680,6 +680,14 @@ mod macos {
         fn daemon_start_path_uses_pinned_env_value() {
             assert_eq!(
                 locald_path_for_daemon_start_from_value(Some("/opt/locald/bin/locald")),
+                Ok("/opt/locald/bin/locald".to_string())
+            );
+        }
+
+        #[test]
+        fn daemon_start_path_trims_pinned_env_value() {
+            assert_eq!(
+                locald_path_for_daemon_start_from_value(Some("  /opt/locald/bin/locald  ")),
                 Ok("/opt/locald/bin/locald".to_string())
             );
         }
