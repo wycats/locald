@@ -8,10 +8,11 @@ use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
+#[cfg(target_os = "macos")]
+use crate::cli::TrayCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
     ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
-    TrayCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
