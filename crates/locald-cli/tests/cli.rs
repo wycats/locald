@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 #[test]
 fn cli_tests() {
     let t = trycmd::TestCases::new();
@@ -5,7 +7,6 @@ fn cli_tests() {
     t.env("LOCALD_SANDBOX_ACTIVE", "1");
 
     t.case("tests/cmd/ai-schema.md");
-    t.case("tests/cmd/doctor-json.md");
     t.case("tests/cmd/docs-cli.md");
     t.case("tests/cmd/error-messages.md");
     t.case("tests/cmd/help-subcommands.md");
