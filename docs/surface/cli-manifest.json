@@ -2748,6 +2748,14 @@
         "hidden": false,
         "args": [
           {
+            "long": "exit-after-register",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": true,
+            "positional": false
+          },
+          {
             "long": "help",
             "short": "h",
             "aliases": [],
