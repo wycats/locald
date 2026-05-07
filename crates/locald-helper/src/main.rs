@@ -69,8 +69,8 @@ mod macos {
             match client.next().await {
                 None | Some(Message::Error(_)) => break,
                 Some(Message::Dictionary(dict)) => {
-                    let response = close_after_send(handle_command(&dict, caller_uid));
-                    client.send_message(response);
+                    let response = handle_command(&dict, caller_uid);
+                    send_response(&client, response);
                 }
                 Some(_) => {
                     client.send_message(error_response("expected dictionary message"));
@@ -107,12 +107,16 @@ mod macos {
         }
     }
 
-    fn close_after_send(response: CommandResponse) -> Message {
+    fn send_response(client: &XpcClient, response: CommandResponse) {
+        send_response_with(response, |message| client.send_message(message));
+    }
+
+    fn send_response_with(response: CommandResponse, send: impl FnOnce(Message)) {
         let CommandResponse { message, close_fd } = response;
+        send(message);
         if let Some(fd) = close_fd {
             close_transferred_fd(fd);
         }
-        message
     }
 
     fn handle_command(dict: &HashMap<CString, Message>, caller_uid: u32) -> CommandResponse {
@@ -377,21 +381,61 @@ mod macos {
         }
 
         #[test]
-        fn close_after_send_closes_transferred_fd() {
+        fn send_response_runs_send_before_closing_fd() {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "locald-helper-fd-send-order-{}",
+                std::process::id()
+            ));
+            let file = std::fs::File::create(&path).expect("temp file");
+            let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+            let response = CommandResponse::transferred_fd(success_response(), fd);
+
+            send_response_with(response, |message| {
+                assert_eq!(get_status(&message), "success");
+                assert!(
+                    fd_is_open(fd),
+                    "fd should remain open while sending response"
+                );
+            });
+
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(
+                nix::unistd::close(fd),
+                Err(nix::errno::Errno::EBADF),
+                "fd should be closed after send_response_with returns"
+            );
+        }
+
+        fn fd_is_open(fd: RawFd) -> bool {
+            use std::os::fd::BorrowedFd;
+
+            #[allow(unsafe_code)]
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            nix::fcntl::fcntl(borrowed, nix::fcntl::F_GETFD).is_ok()
+        }
+
+        #[test]
+        fn send_response_closes_transferred_fd_after_send() {
             let mut path = std::env::temp_dir();
             path.push(format!("locald-helper-fd-cleanup-{}", std::process::id()));
             let file = std::fs::File::create(&path).expect("temp file");
             let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
             let response = CommandResponse::transferred_fd(success_response(), fd);
 
-            let message = close_after_send(response);
-            let _ = std::fs::remove_file(&path);
+            send_response_with(response, |message| {
+                assert_eq!(get_status(&message), "success");
+                assert!(
+                    fd_is_open(fd),
+                    "fd should remain open while sending response"
+                );
+            });
 
-            assert_eq!(get_status(&message), "success");
+            let _ = std::fs::remove_file(&path);
             assert_eq!(
                 nix::unistd::close(fd),
                 Err(nix::errno::Errno::EBADF),
-                "fd should already be closed by close_after_send"
+                "fd should be closed after send_response_with returns"
             );
         }
 
