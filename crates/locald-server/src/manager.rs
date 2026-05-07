@@ -1615,9 +1615,14 @@ impl ProcessManager {
                 }),
                 ServiceRuntime::Controller(c) => {
                     let runtime = c.lock().await.read_state().await;
+                    let port = if runtime.status == locald_core::state::ServiceState::Running {
+                        runtime.port
+                    } else {
+                        None
+                    };
                     resolved.push(locald_core::resolver::DomainResolution {
                         name: candidate.name,
-                        port: runtime.port,
+                        port,
                         status: runtime.status,
                     });
                 }
@@ -1626,13 +1631,13 @@ impl ProcessManager {
 
         resolved.sort_by(|left, right| {
             let left_rank = match (left.port, left.status) {
-                (Some(_), _) => 0,
+                (Some(_), locald_core::state::ServiceState::Running) => 0,
                 (None, locald_core::state::ServiceState::Building) => 1,
                 (None, locald_core::state::ServiceState::Running) => 2,
                 _ => 3,
             };
             let right_rank = match (right.port, right.status) {
-                (Some(_), _) => 0,
+                (Some(_), locald_core::state::ServiceState::Running) => 0,
                 (None, locald_core::state::ServiceState::Building) => 1,
                 (None, locald_core::state::ServiceState::Running) => 2,
                 _ => 3,
@@ -2743,6 +2748,68 @@ mod tests {
 
         assert_eq!(resolution.name, "active:web");
         assert_eq!(resolution.port, Some(3000));
+        assert_eq!(resolution.status, ServiceState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_ignores_stopped_port() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("Failed to create ProcessManager");
+
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let domain = "shared.localhost";
+
+        let stopped_state = RuntimeState {
+            pid: None,
+            port: Some(3000),
+            status: ServiceState::Stopped,
+            health_status: HealthStatus::Unknown,
+        };
+        let stopped_controller =
+            Arc::new(Mutex::new(TestController::new("stale:web", stopped_state)));
+        let stopped = test_service(
+            test_config_with_domain("stale", domain),
+            service_config.clone(),
+            ServiceRuntime::Controller(stopped_controller),
+            dir.path().join("stale"),
+        );
+
+        let running_state = RuntimeState {
+            pid: Some(123),
+            port: Some(4000),
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        let running_controller =
+            Arc::new(Mutex::new(TestController::new("active:web", running_state)));
+        let running = test_service(
+            test_config_with_domain("active", domain),
+            service_config.clone(),
+            ServiceRuntime::Controller(running_controller),
+            dir.path().join("active"),
+        );
+
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("stale:web".to_string(), stopped);
+            services.insert("active:web".to_string(), running);
+        }
+
+        let resolution = manager
+            .resolve_service_by_domain(domain)
+            .await
+            .expect("Expected resolution");
+
+        assert_eq!(resolution.name, "active:web");
+        assert_eq!(resolution.port, Some(4000));
         assert_eq!(resolution.status, ServiceState::Running);
     }
 
