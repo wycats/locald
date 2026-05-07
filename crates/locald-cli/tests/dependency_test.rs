@@ -6,13 +6,11 @@
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::{BufRead, BufReader};
-#[cfg(target_os = "linux")]
 use std::process::{Child, Command};
 #[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Guard that kills the daemon on drop (including panics).
 #[cfg(target_os = "linux")]
@@ -112,32 +110,49 @@ API_URL = "${services.api.url}"
     }
     assert!(ready, "daemon failed to become ready");
 
-    // Register project.
-    let status = Command::new(&locald_bin)
+    // Register project. `locald up` stays attached to stream logs, so kill it
+    // once the interpolation has appeared instead of waiting for it to exit.
+    let mut up = Command::new(&locald_bin)
         .envs(env_vars.clone())
         .arg(format!("--sandbox={}", sandbox))
         .arg("up")
         .arg(&project_dir)
-        .status()
+        .spawn()
         .expect("failed to run locald up");
-    assert!(status.success(), "locald up failed");
 
-    // Wait for logs to appear.
-    thread::sleep(Duration::from_secs(2));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut found = false;
+    let mut up_exit = None;
+    while Instant::now() < deadline {
+        let output = Command::new(&locald_bin)
+            .envs(env_vars.clone())
+            .arg(format!("--sandbox={}", sandbox))
+            .arg("logs")
+            .arg("web")
+            .output()
+            .expect("failed to get logs");
 
-    let output = Command::new(&locald_bin)
-        .envs(env_vars.clone())
-        .arg(format!("--sandbox={}", sandbox))
-        .arg("logs")
-        .arg("web")
-        .output()
-        .expect("failed to get logs");
+        found = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.contains("API_URL=http://localhost:"));
+        if found {
+            break;
+        }
 
-    let reader = BufReader::new(output.stdout.as_slice());
-    let found = reader
-        .lines()
-        .filter_map(Result::ok)
-        .any(|line| line.contains("API_URL=http://localhost:"));
+        if let Some(status) = up.try_wait().expect("failed to check locald up status") {
+            up_exit = Some(status);
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    let _ = up.kill();
+    let _ = up.wait();
+
+    if let Some(status) = up_exit {
+        panic!("locald up exited before expected log appeared: {status}");
+    }
 
     assert!(found, "expected API_URL interpolation in web service logs")
 }
