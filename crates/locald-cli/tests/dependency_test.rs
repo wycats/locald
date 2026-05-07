@@ -18,16 +18,19 @@ struct DaemonGuard {
     child: Child,
     bin: std::path::PathBuf,
     sandbox: String,
+    env_vars: Vec<(&'static str, String)>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = Command::new(&self.bin)
+            .envs(self.env_vars.clone())
             .arg(format!("--sandbox={}", self.sandbox))
             .arg("server")
             .arg("shutdown")
             .status();
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -90,6 +93,7 @@ API_URL = "${services.api.url}"
         child,
         bin: locald_bin.clone(),
         sandbox: sandbox.clone(),
+        env_vars: env_vars.clone(),
     };
 
     // Wait for daemon to respond to ping.
@@ -129,7 +133,7 @@ API_URL = "${services.api.url}"
             .envs(env_vars.clone())
             .arg(format!("--sandbox={}", sandbox))
             .arg("logs")
-            .arg("web")
+            .arg("dep-test:web")
             .output()
             .expect("failed to get logs");
 
