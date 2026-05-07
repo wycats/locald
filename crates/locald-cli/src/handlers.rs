@@ -307,7 +307,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 selfupgrade::upgrade(version.as_deref())?;
             }
         }
-        Commands::Up { path, verbose } => {
+        Commands::Up {
+            path,
+            verbose,
+            exit_after_register,
+        } => {
             let config = global_config::load();
             let update_rx = if config.updates.auto_check {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -467,14 +471,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             report_update(&update_rx);
 
-            // Stay alive streaming logs. The CLI attachment is tied to our PID —
-            // when we exit, the daemon detaches and stops services if no other
-            // attachments remain. Ctrl+C triggers graceful detach below.
-            if std::env::var("LOCALD_UP_EXIT_AFTER_REGISTER")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
+            // Test harnesses use the hidden flag so `locald up` can assert that
+            // registration finished without staying attached to service logs.
+            if *exit_after_register {
                 return Ok(());
             }
 

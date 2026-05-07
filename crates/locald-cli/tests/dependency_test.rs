@@ -115,12 +115,12 @@ API_URL = "${services.api.url}"
     assert!(ready, "daemon failed to become ready");
 
     // Register project. In production `locald up` stays attached to stream logs;
-    // the test-only env var lets this command return after registration.
+    // the hidden test flag lets this command return after registration.
     let status = Command::new(&locald_bin)
         .envs(env_vars.clone())
-        .env("LOCALD_UP_EXIT_AFTER_REGISTER", "1")
         .arg(format!("--sandbox={}", sandbox))
         .arg("up")
+        .arg("--exit-after-register")
         .arg(&project_dir)
         .status()
         .expect("failed to run locald up");

@@ -210,8 +210,8 @@ command = "python3 -m http.server $PORT"
 
     // Run locald up
     ctx.command()
-        .env("LOCALD_UP_EXIT_AFTER_REGISTER", "1")
         .arg("up")
+        .arg("--exit-after-register")
         .arg(&project_dir)
         .assert()
         .success();

@@ -164,8 +164,8 @@ fn test_tui_progress() {
     // Construct command for rexpect
     let mut cmd = StdCommand::new(&ctx.locald_bin);
     cmd.envs(ctx.env());
-    cmd.env("LOCALD_UP_EXIT_AFTER_REGISTER", "1");
     cmd.arg("up");
+    cmd.arg("--exit-after-register");
     cmd.arg(&project_dir);
     cmd.arg(format!("--sandbox={}", ctx.sandbox));
 
