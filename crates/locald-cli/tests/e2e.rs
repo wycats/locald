@@ -209,7 +209,12 @@ command = "python3 -m http.server $PORT"
     // fs::write(project_dir.join("runtime.txt"), "python-3.11.0").unwrap();
 
     // Run locald up
-    ctx.command().arg("up").arg(&project_dir).assert().success();
+    ctx.command()
+        .arg("up")
+        .arg("--exit-after-register")
+        .arg(&project_dir)
+        .assert()
+        .success();
 
     // Verify registry
     ctx.command()

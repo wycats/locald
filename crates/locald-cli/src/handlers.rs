@@ -4,13 +4,15 @@ use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
+#[cfg(target_os = "macos")]
+use crate::cli::TrayCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
     ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
-    TrayCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
@@ -66,6 +68,26 @@ const fn section_label(section: ProjectSection) -> &'static str {
         ProjectSection::Active => "active",
         ProjectSection::AlwaysOn => "always-on",
         ProjectSection::Recent => "recent",
+    }
+}
+
+fn warn_if_daemon_identity_mismatch() {
+    let Ok(cli_executable) = std::env::current_exe() else {
+        return;
+    };
+
+    let Ok(IpcResponse::DaemonIdentity(identity)) =
+        client::send_request(&IpcRequest::GetDaemonIdentity)
+    else {
+        return;
+    };
+
+    if let Some(warning) = hints::daemon_identity_mismatch_warning(
+        env!("LOCALD_BUILD_VERSION"),
+        &cli_executable,
+        &identity,
+    ) {
+        eprintln!("{warning}");
     }
 }
 
@@ -285,7 +307,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 selfupgrade::upgrade(version.as_deref())?;
             }
         }
-        Commands::Up { path, verbose } => {
+        Commands::Up {
+            path,
+            verbose,
+            exit_after_register,
+        } => {
             let config = global_config::load();
             let update_rx = if config.updates.auto_check {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -445,9 +471,12 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             report_update(&update_rx);
 
-            // Stay alive streaming logs. The CLI attachment is tied to our PID —
-            // when we exit, the daemon detaches and stops services if no other
-            // attachments remain. Ctrl+C triggers graceful detach below.
+            // Test harnesses use the hidden flag so `locald up` can assert that
+            // registration finished without staying attached to service logs.
+            if *exit_after_register {
+                return Ok(());
+            }
+
             let detach_path = abs_path;
             let _ = ctrlc::set_handler(move || {
                 // Best-effort detach on Ctrl+C
@@ -572,6 +601,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
         }
         Commands::Status { json } => {
             utils::ensure_daemon_running()?;
+            if !*json && std::io::stderr().is_terminal() {
+                warn_if_daemon_identity_mismatch();
+            }
             match client::send_request(&IpcRequest::Status) {
                 Ok(IpcResponse::Status(services)) => {
                     if *json {

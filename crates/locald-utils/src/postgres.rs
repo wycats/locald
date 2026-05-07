@@ -166,7 +166,7 @@ impl PostgresRunner {
         }
 
         // Sort by modified time, descending
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
 
         if let Some((bin, _)) = candidates.into_iter().next() {
             return Ok(bin);

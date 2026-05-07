@@ -190,7 +190,7 @@ impl ShimRuntime {
             .await?;
 
         if !status.success() {
-            return Err(anyhow::anyhow!("Shim cleanup failed with status: {status}",));
+            return Err(anyhow::anyhow!("Shim cleanup failed with status: {status}"));
         }
 
         Ok(())

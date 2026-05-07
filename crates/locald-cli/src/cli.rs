@@ -171,6 +171,9 @@ pub enum Commands {
         /// Show verbose output
         #[arg(long, short)]
         verbose: bool,
+        /// Exit after project registration instead of attaching to service logs
+        #[arg(long, hide = true)]
+        exit_after_register: bool,
     },
     /// Open the dashboard in the default browser
     Dashboard,

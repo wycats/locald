@@ -6,13 +6,11 @@
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::{BufRead, BufReader};
-#[cfg(target_os = "linux")]
 use std::process::{Child, Command};
 #[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Guard that kills the daemon on drop (including panics).
 #[cfg(target_os = "linux")]
@@ -20,16 +18,19 @@ struct DaemonGuard {
     child: Child,
     bin: std::path::PathBuf,
     sandbox: String,
+    env_vars: Vec<(&'static str, String)>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = Command::new(&self.bin)
+            .envs(self.env_vars.clone())
             .arg(format!("--sandbox={}", self.sandbox))
             .arg("server")
             .arg("shutdown")
             .status();
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -92,6 +93,7 @@ API_URL = "${services.api.url}"
         child,
         bin: locald_bin.clone(),
         sandbox: sandbox.clone(),
+        env_vars: env_vars.clone(),
     };
 
     // Wait for daemon to respond to ping.
@@ -112,32 +114,38 @@ API_URL = "${services.api.url}"
     }
     assert!(ready, "daemon failed to become ready");
 
-    // Register project.
+    // Register project. In production `locald up` stays attached to stream logs;
+    // the hidden test flag lets this command return after registration.
     let status = Command::new(&locald_bin)
         .envs(env_vars.clone())
         .arg(format!("--sandbox={}", sandbox))
         .arg("up")
+        .arg("--exit-after-register")
         .arg(&project_dir)
         .status()
         .expect("failed to run locald up");
     assert!(status.success(), "locald up failed");
 
-    // Wait for logs to appear.
-    thread::sleep(Duration::from_secs(2));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut found = false;
+    while Instant::now() < deadline {
+        let output = Command::new(&locald_bin)
+            .envs(env_vars.clone())
+            .arg(format!("--sandbox={}", sandbox))
+            .arg("logs")
+            .arg("dep-test:web")
+            .output()
+            .expect("failed to get logs");
 
-    let output = Command::new(&locald_bin)
-        .envs(env_vars.clone())
-        .arg(format!("--sandbox={}", sandbox))
-        .arg("logs")
-        .arg("web")
-        .output()
-        .expect("failed to get logs");
+        found = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.contains("API_URL=http://localhost:"));
+        if found {
+            break;
+        }
 
-    let reader = BufReader::new(output.stdout.as_slice());
-    let found = reader
-        .lines()
-        .filter_map(Result::ok)
-        .any(|line| line.contains("API_URL=http://localhost:"));
+        thread::sleep(Duration::from_millis(250));
+    }
 
     assert!(found, "expected API_URL interpolation in web service logs")
 }
