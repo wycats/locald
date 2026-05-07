@@ -110,19 +110,20 @@ API_URL = "${services.api.url}"
     }
     assert!(ready, "daemon failed to become ready");
 
-    // Register project. `locald up` stays attached to stream logs, so kill it
-    // once the interpolation has appeared instead of waiting for it to exit.
-    let mut up = Command::new(&locald_bin)
+    // Register project. In production `locald up` stays attached to stream logs;
+    // the test-only env var lets this command return after registration.
+    let status = Command::new(&locald_bin)
         .envs(env_vars.clone())
+        .env("LOCALD_UP_EXIT_AFTER_REGISTER", "1")
         .arg(format!("--sandbox={}", sandbox))
         .arg("up")
         .arg(&project_dir)
-        .spawn()
+        .status()
         .expect("failed to run locald up");
+    assert!(status.success(), "locald up failed");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut found = false;
-    let mut up_exit = None;
     while Instant::now() < deadline {
         let output = Command::new(&locald_bin)
             .envs(env_vars.clone())
@@ -139,19 +140,7 @@ API_URL = "${services.api.url}"
             break;
         }
 
-        if let Some(status) = up.try_wait().expect("failed to check locald up status") {
-            up_exit = Some(status);
-            break;
-        }
-
         thread::sleep(Duration::from_millis(250));
-    }
-
-    let _ = up.kill();
-    let _ = up.wait();
-
-    if let Some(status) = up_exit {
-        panic!("locald up exited before expected log appeared: {status}");
     }
 
     assert!(found, "expected API_URL interpolation in web service logs")

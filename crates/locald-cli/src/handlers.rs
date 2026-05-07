@@ -470,6 +470,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
             // Stay alive streaming logs. The CLI attachment is tied to our PID —
             // when we exit, the daemon detaches and stops services if no other
             // attachments remain. Ctrl+C triggers graceful detach below.
+            if std::env::var("LOCALD_UP_EXIT_AFTER_REGISTER")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return Ok(());
+            }
+
             let detach_path = abs_path;
             let _ = ctrlc::set_handler(move || {
                 // Best-effort detach on Ctrl+C
