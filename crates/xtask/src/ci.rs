@@ -112,7 +112,10 @@ pub fn tripwire(sh: &Shell, base: String) -> Result<()> {
         if !line.starts_with('+') && !line.starts_with('-') {
             return false;
         }
-        line.contains("#[test]") || line.contains("#[cfg(test)]") || line.contains("mod tests")
+        line.contains("#[test]")
+            || line.contains("#[tokio::test]")
+            || line.contains("#[cfg(test)]")
+            || line.contains("mod tests")
     });
 
     if has_inline_tests {
