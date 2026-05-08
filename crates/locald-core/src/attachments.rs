@@ -3,12 +3,21 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+const LEGACY_EDITOR_TTL: Duration = Duration::from_mins(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub enum AttachmentSource {
-    Editor { name: String, id: String },
-    CLI { pid: u32 },
+    Editor {
+        name: String,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+    },
+    CLI {
+        pid: u32,
+    },
     Pin,
 }
 
@@ -192,15 +201,13 @@ impl AttachmentStore {
         self.attachments.keys().cloned().collect()
     }
 
-    pub fn reap_stale_pids(&mut self) -> Vec<PathBuf> {
+    pub fn reap_stale_attachments(&mut self) -> Vec<PathBuf> {
         let mut emptied = Vec::new();
+        let now = SystemTime::now();
 
         let mut to_remove = Vec::new();
         for (path, attachments) in &mut self.attachments {
-            attachments.retain(|attachment| match attachment.source {
-                AttachmentSource::CLI { pid } => Self::pid_alive(pid),
-                _ => true,
-            });
+            attachments.retain(|attachment| Self::attachment_alive(attachment, now));
 
             if attachments.is_empty() {
                 to_remove.push(path.clone());
@@ -213,6 +220,27 @@ impl AttachmentStore {
         }
 
         emptied
+    }
+
+    pub fn reap_stale_attachments_for(&mut self, project_path: &Path) -> bool {
+        let path = Self::canonicalize_path(project_path);
+        let Some(attachments) = self.attachments.get_mut(&path) else {
+            return false;
+        };
+
+        let now = SystemTime::now();
+        attachments.retain(|attachment| Self::attachment_alive(attachment, now));
+
+        if attachments.is_empty() {
+            self.attachments.remove(&path);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn reap_stale_pids(&mut self) -> Vec<PathBuf> {
+        self.reap_stale_attachments()
     }
 
     pub fn section_for(&self, project_path: &Path) -> ProjectSection {
@@ -250,10 +278,11 @@ impl AttachmentStore {
     fn matches_source(needle: &AttachmentSource, existing: &AttachmentSource) -> bool {
         match (needle, existing) {
             (
-                AttachmentSource::Editor { name, id },
+                AttachmentSource::Editor { name, id, .. },
                 AttachmentSource::Editor {
                     name: existing_name,
                     id: existing_id,
+                    ..
                 },
             ) => {
                 if name.is_empty() {
@@ -263,6 +292,18 @@ impl AttachmentStore {
                 }
             }
             _ => needle == existing,
+        }
+    }
+
+    fn attachment_alive(attachment: &Attachment, now: SystemTime) -> bool {
+        match attachment.source {
+            AttachmentSource::CLI { pid } | AttachmentSource::Editor { pid: Some(pid), .. } => {
+                Self::pid_alive(pid)
+            }
+            AttachmentSource::Editor { pid: None, .. } => now
+                .duration_since(attachment.created_at)
+                .map_or(true, |age| age <= LEGACY_EDITOR_TTL),
+            AttachmentSource::Pin => true,
         }
     }
 
@@ -405,6 +446,117 @@ mod tests {
         assert!(store.attachments_for(&project).is_empty());
     }
 
+    #[test]
+    fn reap_stale_attachments_prunes_legacy_old_editor() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Editor {
+                name: "vscode".to_string(),
+                id: "abc".to_string(),
+                pid: None,
+            },
+            created_at: SystemTime::now() - Duration::from_secs(31 * 60),
+        });
+
+        let removed = store.reap_stale_attachments();
+        let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
+        assert_eq!(removed, vec![canonical]);
+        assert!(store.attachments_for(&project).is_empty());
+    }
+
+    #[test]
+    fn reap_stale_attachments_keeps_legacy_fresh_editor() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Editor {
+                name: "vscode".to_string(),
+                id: "abc".to_string(),
+                pid: None,
+            },
+            created_at: SystemTime::now(),
+        });
+
+        let removed = store.reap_stale_attachments();
+        assert!(removed.is_empty());
+        assert_eq!(store.attachments_for(&project).len(), 1);
+    }
+
+    #[test]
+    fn reap_stale_attachments_prunes_dead_editor_pid() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Editor {
+                name: "vscode".to_string(),
+                id: "abc".to_string(),
+                pid: Some(u32::MAX),
+            },
+            created_at: SystemTime::now(),
+        });
+
+        let removed = store.reap_stale_attachments();
+        let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
+        assert_eq!(removed, vec![canonical]);
+        assert!(store.attachments_for(&project).is_empty());
+    }
+
+    #[test]
+    fn reap_stale_attachments_keeps_pin() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Pin,
+            created_at: SystemTime::now() - Duration::from_secs(31 * 60),
+        });
+
+        let removed = store.reap_stale_attachments();
+        assert!(removed.is_empty());
+        assert_eq!(store.attachments_for(&project).len(), 1);
+    }
+
+    #[test]
+    fn detach_editor_matching_ignores_pid() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Editor {
+                name: "vscode".to_string(),
+                id: "abc".to_string(),
+                pid: Some(1234),
+            },
+            created_at: SystemTime::now(),
+        });
+
+        let last_removed = store.detach(
+            &project,
+            &AttachmentSource::Editor {
+                name: String::new(),
+                id: "abc".to_string(),
+                pid: None,
+            },
+        );
+
+        assert!(last_removed);
+        assert!(store.attachments_for(&project).is_empty());
+    }
+
     #[tokio::test]
     async fn manually_stopped_persists() {
         let dir = tempdir().unwrap();
@@ -435,6 +587,7 @@ mod tests {
             source: AttachmentSource::Editor {
                 name: "vscode".to_string(),
                 id: "abc".to_string(),
+                pid: Some(std::process::id()),
             },
             created_at: SystemTime::now(),
         };
@@ -444,5 +597,35 @@ mod tests {
 
         assert_eq!(decoded.project_path, attachment.project_path);
         assert_eq!(decoded.source, attachment.source);
+    }
+
+    #[test]
+    fn legacy_editor_json_deserializes_without_pid() {
+        let json = r#"
+{
+    "project_path": "/tmp/project",
+    "source": {
+        "Editor": {
+            "name": "vscode",
+            "id": "abc"
+        }
+    },
+    "created_at": {
+        "secs_since_epoch": 1,
+        "nanos_since_epoch": 0
+    }
+}
+"#;
+
+        let decoded: Attachment = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded.source,
+            AttachmentSource::Editor {
+                name: "vscode".to_string(),
+                id: "abc".to_string(),
+                pid: None,
+            }
+        );
     }
 }

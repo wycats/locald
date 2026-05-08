@@ -1291,6 +1291,14 @@
                 "positional": false
               },
               {
+                "long": "editor-pid",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": true,
+                "positional": false
+              },
+              {
                 "long": "help",
                 "short": "h",
                 "aliases": [],

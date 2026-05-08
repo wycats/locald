@@ -93,6 +93,8 @@ export async function attach(
     "vscode",
     "--editor-id",
     windowId,
+    "--editor-pid",
+    String(process.pid),
     "--json",
   ]);
 }

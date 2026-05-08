@@ -507,6 +507,9 @@ pub enum ProjectCommands {
         /// Editor id (required when source=editor).
         #[arg(long)]
         editor_id: Option<String>,
+        /// Editor process id (used to reap stale editor attachments).
+        #[arg(long, hide = true)]
+        editor_pid: Option<u32>,
         /// Machine-readable JSON output.
         #[arg(long)]
         json: bool,

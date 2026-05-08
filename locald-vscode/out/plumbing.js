@@ -59,6 +59,8 @@ async function attach(projectPath, windowId) {
         "vscode",
         "--editor-id",
         windowId,
+        "--editor-pid",
+        String(process.pid),
         "--json",
     ]);
 }
