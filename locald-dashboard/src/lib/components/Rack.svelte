@@ -28,7 +28,6 @@
 		RotateCcw,
 		ExternalLink,
 		AlertCircle,
-		Pin,
 		Clock
 	} from 'lucide-svelte';
 	import type { ServiceStatus } from '$lib/types';
@@ -40,12 +39,29 @@
 	export let onToggleMonitor: (name: string | string[]) => void = () => {};
 
 	let collapsedGroups: string[] = [];
-	let collapsedSections: string[] = [];
 	let activeMenu: string | null = null;
 	let keyboardFocus: string | null = null;
 	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
 
-	function toggleSectionCollapse(section: string) {
+	type ProjectSection = ProjectListEntry['section'];
+	let collapsedSections: ProjectSection[] = [];
+
+	const SECTION_COPY: Record<ProjectSection, { label: string; subtitle: string }> = {
+		Active: {
+			label: 'Active',
+			subtitle: 'Attached/open now; services may be stopped'
+		},
+		AlwaysOn: {
+			label: 'Always On',
+			subtitle: 'Kept available'
+		},
+		Recent: {
+			label: 'Recent',
+			subtitle: 'Known projects'
+		}
+	};
+
+	function toggleSectionCollapse(section: ProjectSection) {
 		if (collapsedSections.includes(section)) {
 			collapsedSections = collapsedSections.filter((s) => s !== section);
 		} else {
@@ -55,14 +71,14 @@
 
 	$: allServices = $projects.flatMap((p) => p.services);
 
-	type SectionHeader = { kind: 'section'; section: 'Active' | 'AlwaysOn' | 'Recent' };
+	type SectionHeader = { kind: 'section'; section: ProjectSection; count: number };
 	type ProjectGroup = {
 		kind: 'project';
 		name: string;
 		path: string | null;
 		entry: ProjectListEntry | null;
 		services: ServiceStatus[];
-		section: string | null;
+		section: ProjectSection | null;
 	};
 	type RackEntry = SectionHeader | ProjectGroup;
 
@@ -80,25 +96,21 @@
 		alwaysOn: ProjectListEntry[],
 		recent: ProjectListEntry[],
 		serviceProjects: { name: string; services: ServiceStatus[] }[],
-		collapsed: string[]
+		collapsed: ProjectSection[]
 	): RackEntry[] {
 		const entries: RackEntry[] = [];
 		// eslint-disable-next-line svelte/prefer-svelte-reactivity
 		const claimed = new Set<string>();
 
-		// Count how many sections have content — only show headers when 2+
-		const sectionCount = [active, alwaysOn, recent].filter((l) => l.length > 0).length;
-		const showHeaders = sectionCount >= 2;
-
-		function addSection(section: 'Active' | 'AlwaysOn' | 'Recent', list: ProjectListEntry[]) {
+		function addSection(section: ProjectSection, list: ProjectListEntry[]) {
 			if (list.length === 0) return;
-			if (showHeaders) entries.push({ kind: 'section', section });
+			entries.push({ kind: 'section', section, count: list.length });
 			// Always claim names so collapsed projects don't leak into the unattached list
 			for (const entry of list) {
 				const entryName = entry.project_name || entry.project_path.split('/').pop() || '';
 				claimed.add(entryName);
 			}
-			if (showHeaders && collapsed.includes(section)) return;
+			if (collapsed.includes(section)) return;
 			for (const entry of list) {
 				const entryName = entry.project_name || entry.project_path.split('/').pop() || '';
 				const group = serviceProjects.find((p) => p.name === entryName);
@@ -318,6 +330,48 @@
 			return service.url.replace(/^https?:\/\//, '');
 		}
 	}
+
+	function projectCountLabel(count: number): string {
+		return `${count} project${count === 1 ? '' : 's'}`;
+	}
+
+	function lifecycleSummary(services: ServiceStatus[]): string {
+		if (services.length === 0) return 'No services';
+
+		const running = services.filter((s) => s.status === 'running').length;
+		const building = services.filter((s) => s.status === 'building').length;
+		const stopped = services.length - running - building;
+		const parts = [`${running} running`];
+
+		if (building > 0) parts.push(`${building} building`);
+		if (stopped > 0) parts.push(`${stopped} stopped`);
+
+		return parts.join(' · ');
+	}
+
+	function lifecycleLabel(status: ServiceStatus['status']): string {
+		return status[0].toUpperCase() + status.slice(1);
+	}
+
+	function deckSummary(services: ServiceStatus[]): string | null {
+		const count = services.filter((s) => monitored.includes(s.name)).length;
+		if (count === 0) return null;
+		return `${count} in Deck`;
+	}
+
+	function attachmentSummary(entry: ProjectListEntry | null): string | null {
+		if (!entry) return null;
+
+		const editors = entry.attachments.filter((a) => a.source.Editor).length;
+		const cli = entry.attachments.filter((a) => a.source.CLI).length;
+		const parts: string[] = [];
+
+		if (editors > 0) parts.push(`${editors} editor${editors === 1 ? '' : 's'}`);
+		if (cli > 0) parts.push(`${cli} CLI`);
+
+		if (parts.length === 0) return null;
+		return `${parts.join(' · ')} attached`;
+	}
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -365,29 +419,37 @@
 			{#each rackEntries as rackEntry (rackEntryKey(rackEntry))}
 				{#if rackEntry.kind === 'section'}
 					{@const sectionCollapsed = collapsedSections.includes(rackEntry.section)}
+					{@const sectionCopy = SECTION_COPY[rackEntry.section]}
 					<button
 						class="rack-section-header"
 						on:click={() => toggleSectionCollapse(rackEntry.section)}
 					>
-						{#if sectionCollapsed}
-							<ChevronRight size={10} />
-						{:else}
-							<ChevronDown size={10} />
-						{/if}
-						{#if rackEntry.section === 'Active'}
-							<div class="section-dot active"></div>
-						{:else if rackEntry.section === 'AlwaysOn'}
-							<Pin size={10} />
-						{:else}
-							<Clock size={10} />
-						{/if}
-						<span>{rackEntry.section === 'AlwaysOn' ? 'Always On' : rackEntry.section}</span>
+						<div class="section-title-row">
+							{#if sectionCollapsed}
+								<ChevronRight size={10} />
+							{:else}
+								<ChevronDown size={10} />
+							{/if}
+							{#if rackEntry.section === 'Active'}
+								<div class="section-dot active"></div>
+							{:else if rackEntry.section === 'AlwaysOn'}
+								<Layers size={10} />
+							{:else}
+								<Clock size={10} />
+							{/if}
+							<span>{sectionCopy.label}</span>
+							<span class="section-count">{projectCountLabel(rackEntry.count)}</span>
+						</div>
+						<span class="section-subtitle">{sectionCopy.subtitle}</span>
 					</button>
 				{:else}
 					{@const project = rackEntry}
 					{@const isCollapsed = collapsedGroups.includes(project.name)}
 					{@const isAllStopped =
 						project.services.length === 0 || project.services.every((s) => s.status === 'stopped')}
+					{@const projectLifecycle = lifecycleSummary(project.services)}
+					{@const projectDeck = deckSummary(project.services)}
+					{@const projectAttachments = attachmentSummary(project.entry)}
 					<!-- svelte-ignore a11y-no-static-element-interactions -->
 					<div
 						class="rack-group-header"
@@ -395,16 +457,27 @@
 						class:selected={project.path != null && selectedProject === project.path}
 						on:contextmenu={(e) => project.entry && handleProjectContextMenu(e, project.entry)}
 					>
-						<button
-							class="group-title"
-							type="button"
-							on:click={() =>
-								project.path
-									? onSelectProject(selectedProject === project.path ? null : project.path)
-									: toggleGroupCollapse(project.name)}
-						>
-							<span>{project.name}</span>
-						</button>
+						<div class="group-main">
+							<button
+								class="group-title"
+								type="button"
+								on:click={() =>
+									project.path
+										? onSelectProject(selectedProject === project.path ? null : project.path)
+										: toggleGroupCollapse(project.name)}
+							>
+								<span>{project.name}</span>
+							</button>
+							<div class="group-meta" aria-label="Project state">
+								<span>{projectLifecycle}</span>
+								{#if projectDeck}
+									<span class="group-cue deck">{projectDeck}</span>
+								{/if}
+								{#if project.section === 'Active' && projectAttachments}
+									<span class="group-cue">{projectAttachments}</span>
+								{/if}
+							</div>
+						</div>
 						{#if project.services.length > 0}
 							{@const serviceNames = project.services.map((s) => s.name)}
 							{@const allMonitored =
@@ -416,7 +489,7 @@
 									class:active={allMonitored}
 									class:partial={someMonitored && !allMonitored}
 									on:click|stopPropagation={() => toggleMonitorGroup(project.services)}
-									title={allMonitored ? 'Unmonitor all' : 'Monitor all'}
+									title={allMonitored ? 'Remove all from Deck' : 'Add all to Deck'}
 								>
 									<Layers size={12} />
 								</button>
@@ -436,11 +509,12 @@
 							{@const type = getServiceType(service)}
 							{@const displayName = getDisplayName(service.name, project.name)}
 							{@const urlLabel = displayUrl(service)}
+							{@const inDeck = monitored.includes(service.name)}
 
 							<div
 								id="service-{service.name}"
 								class="rack-item"
-								class:monitored={monitored.includes(service.name)}
+								class:monitored={inDeck}
 								class:keyboard-focused={keyboardFocus === service.name}
 								class:disabled={service.status === 'stopped'}
 								on:click={() => toggleMonitor(service.name)}
@@ -457,7 +531,11 @@
 								<div class="item-content">
 									<div class="status-dot {service.status}"></div>
 									<span class="service-name" title={service.name}>{displayName}</span>
+									<span class="status-chip {service.status}">{lifecycleLabel(service.status)}</span>
 									<span class="type-chip {type}">{type}</span>
+									{#if inDeck}
+										<span class="deck-chip">In Deck</span>
+									{/if}
 
 									{#if service.url && service.status === 'running'}
 										<a
@@ -479,8 +557,8 @@
 									<div class="toolbar-actions">
 										<button
 											class="control-btn monitor-btn"
-											class:active={monitored.includes(service.name)}
-											title={monitored.includes(service.name) ? 'Unmonitor' : 'Monitor'}
+											class:active={inDeck}
+											title={inDeck ? 'Remove from Deck' : 'Add to Deck'}
 											on:click={(e) => toggleMonitor(service.name, e)}
 										>
 											<Monitor size={14} />
@@ -710,21 +788,25 @@
 	}
 
 	.rack-group-header {
-		padding: 6px 16px 6px 20px;
-		font-size: 11px;
-		text-transform: uppercase;
+		padding: 8px 16px 8px 20px;
 		color: #a1a1aa;
-		font-weight: bold;
-		letter-spacing: 0.05em;
 		margin-top: 2px;
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
+		gap: 8px;
 		cursor: pointer;
 	}
 	.rack-group-header.disabled {
 		opacity: 0.5;
 	}
+	.group-main {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
+	}
+
 	.group-title {
 		display: flex;
 		align-items: center;
@@ -735,11 +817,41 @@
 		font: inherit;
 		cursor: pointer;
 		padding: 0;
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		min-width: 0;
+	}
+	.group-title span {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.group-title:focus-visible {
 		outline: 2px solid #3b82f6;
 		outline-offset: 2px;
 		border-radius: 4px;
+	}
+	.group-meta {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		min-width: 0;
+		font-size: 10px;
+		font-weight: 500;
+		letter-spacing: 0;
+		text-transform: none;
+		color: #52525b;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.group-cue {
+		color: #71717a;
+	}
+	.group-cue.deck {
+		color: #93c5fd;
 	}
 
 	.group-actions {
@@ -820,7 +932,7 @@
 		grid-area: stack;
 		display: flex;
 		align-items: center;
-		gap: 8px; /* gap-2 */
+		gap: 6px;
 		width: 100%;
 		min-width: 0;
 		z-index: 1;
@@ -890,6 +1002,36 @@
 		border-radius: 6px; /* Rounded rect, not pill */
 		border: 1px solid rgba(113, 113, 122, 0.2); /* Zinc-500/20 */
 		background: rgba(113, 113, 122, 0.05);
+	}
+	.status-chip,
+	.deck-chip {
+		font-size: 10px;
+		font-weight: 600;
+		line-height: 1;
+		flex-shrink: 0;
+		padding: 3px 6px;
+		border-radius: 999px;
+		border: 1px solid rgba(113, 113, 122, 0.2);
+		background: rgba(113, 113, 122, 0.05);
+		color: #71717a;
+	}
+	.status-chip.running {
+		color: #86efac;
+		border-color: rgba(74, 222, 128, 0.22);
+		background: rgba(74, 222, 128, 0.07);
+	}
+	.status-chip.building {
+		color: #d8b4fe;
+		border-color: rgba(192, 132, 252, 0.22);
+		background: rgba(192, 132, 252, 0.07);
+	}
+	.status-chip.stopped {
+		color: #71717a;
+	}
+	.deck-chip {
+		color: #93c5fd;
+		border-color: rgba(96, 165, 250, 0.22);
+		background: rgba(96, 165, 250, 0.07);
 	}
 	/* Colors for types */
 	.type-chip.db {
@@ -1135,14 +1277,12 @@
 
 	.rack-section-header {
 		display: flex;
-		align-items: center;
-		gap: 5px;
-		padding: 12px 8px 4px 8px;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 3px;
+		padding: 12px 8px 6px 8px;
 		font-size: 10px;
-		text-transform: uppercase;
 		color: #52525b;
-		font-weight: 700;
-		letter-spacing: 0.05em;
 		border: none;
 		background: none;
 		width: 100%;
@@ -1162,6 +1302,31 @@
 	.rack-section-header:focus-visible {
 		outline: 2px solid #3b82f6;
 		outline-offset: -2px;
+	}
+	.section-title-row {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+	}
+	.section-count {
+		margin-left: auto;
+		color: #71717a;
+		font-weight: 600;
+		letter-spacing: 0;
+		text-transform: none;
+	}
+	.section-subtitle {
+		display: block;
+		padding-left: 20px;
+		font-size: 10px;
+		font-weight: 500;
+		letter-spacing: 0;
+		line-height: 1.25;
+		text-transform: none;
+		color: #52525b;
 	}
 
 	.section-dot {
