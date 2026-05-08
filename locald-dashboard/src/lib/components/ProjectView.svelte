@@ -10,7 +10,7 @@
 	} from '$lib/actions/service';
 	import type { ProjectListEntry } from '$lib/api';
 	import type { ServiceStatus } from '$lib/types';
-	import { RotateCw, Square, Play, ExternalLink, Folder, Users, Pin, X } from 'lucide-svelte';
+	import { RotateCw, Square, Play, ExternalLink, Folder, Users, Layers, X } from 'lucide-svelte';
 	import Spinner from './Spinner.svelte';
 	import Terminal from './Terminal.svelte';
 
@@ -49,9 +49,35 @@
 		}
 	});
 
+	let sectionSubtitle = $derived.by(() => {
+		if (!project) return '';
+		switch (project.section) {
+			case 'Active':
+				return 'Attached/open now; services may be stopped';
+			case 'AlwaysOn':
+				return 'Kept available';
+			case 'Recent':
+				return 'Known project';
+		}
+	});
+
 	let editorCount = $derived(project?.attachments.filter((a) => a.source.Editor).length ?? 0);
 
-	let isPinned = $derived(project?.attachments.some((a) => a.source.Pin !== undefined) ?? false);
+	let cliCount = $derived(project?.attachments.filter((a) => a.source.CLI).length ?? 0);
+
+	let deckCount = $derived(
+		projectServices.filter((s: ServiceStatus) => monitored.includes(s.name)).length
+	);
+
+	let runningCount = $derived(
+		projectServices.filter((s: ServiceStatus) => s.status === 'running').length
+	);
+
+	let buildingCount = $derived(
+		projectServices.filter((s: ServiceStatus) => s.status === 'building').length
+	);
+
+	let stoppedCount = $derived(projectServices.length - runningCount - buildingCount);
 
 	function isPending(serviceName: string): boolean {
 		return $pendingActions.some((a) => a.serviceName === serviceName);
@@ -106,6 +132,10 @@
 			return service.url.replace(/^https?:\/\//, '');
 		}
 	}
+
+	function lifecycleLabel(status: ServiceStatus['status']): string {
+		return status[0].toUpperCase() + status.slice(1);
+	}
 </script>
 
 <div class="project-view">
@@ -119,20 +149,26 @@
 				<span
 					class="section-badge"
 					class:active={project?.section === 'Active'}
-					class:pinned={project?.section === 'AlwaysOn'}
+					class:always-on={project?.section === 'AlwaysOn'}
 				>
 					{sectionLabel}
 				</span>
+				{#if sectionSubtitle}
+					<span class="meta-item section-subtitle">{sectionSubtitle}</span>
+				{/if}
 				{#if editorCount > 0}
 					<span class="meta-item">
 						<Users size={12} />
 						{editorCount} editor{editorCount > 1 ? 's' : ''}
 					</span>
 				{/if}
-				{#if isPinned}
-					<span class="meta-item pinned">
-						<Pin size={12} />
-						Pinned
+				{#if cliCount > 0}
+					<span class="meta-item">{cliCount} CLI</span>
+				{/if}
+				{#if deckCount > 0}
+					<span class="meta-item deck">
+						<Layers size={12} />
+						{deckCount} in Deck
 					</span>
 				{/if}
 			</div>
@@ -151,15 +187,26 @@
 			</p>
 		</div>
 	{:else}
+		<div class="service-summary" aria-label="Service lifecycle summary">
+			<span>{projectServices.length} service{projectServices.length === 1 ? '' : 's'}</span>
+			<span>{runningCount} running</span>
+			{#if buildingCount > 0}
+				<span>{buildingCount} building</span>
+			{/if}
+			{#if stoppedCount > 0}
+				<span>{stoppedCount} stopped</span>
+			{/if}
+		</div>
 		<div class="service-list">
 			{#each projectServices as service (service.name)}
 				{@const pending = isPending(service.name)}
 				{@const type = getServiceType(service)}
 				{@const urlLabel = displayUrl(service)}
+				{@const inDeck = monitored.includes(service.name)}
 				<div
 					class="service-row"
 					class:disabled={service.status === 'stopped'}
-					class:monitored={monitored.includes(service.name)}
+					class:monitored={inDeck}
 					onclick={() => {
 						onToggleMonitor(service.name);
 					}}
@@ -175,8 +222,13 @@
 					<div class="row-content">
 						<div class="status-dot {service.status}"></div>
 						<span class="service-name">{getDisplayName(service)}</span>
+						<span class="status-chip {service.status}">{lifecycleLabel(service.status)}</span>
 
 						<span class="type-chip {type}">{type}</span>
+
+						{#if inDeck}
+							<span class="deck-chip">In Deck</span>
+						{/if}
 
 						{#if service.url && service.status === 'running'}
 							<a
@@ -313,7 +365,7 @@
 		color: #22c55e;
 	}
 
-	.section-badge.pinned {
+	.section-badge.always-on {
 		background: rgba(59, 130, 246, 0.15);
 		color: #3b82f6;
 	}
@@ -326,8 +378,11 @@
 		color: #71717a;
 	}
 
-	.meta-item.pinned {
+	.meta-item.deck {
 		color: #3b82f6;
+	}
+	.meta-item.section-subtitle {
+		color: #52525b;
 	}
 
 	.project-path {
@@ -371,6 +426,21 @@
 		flex-shrink: 0;
 		overflow-y: auto;
 		overflow-x: hidden;
+	}
+
+	.service-summary {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 8px 12px;
+		border-bottom: 1px solid #27272a;
+		font-size: 11px;
+		color: #71717a;
+		background: #09090b;
+	}
+	.service-summary span:first-child {
+		color: #a1a1aa;
+		font-weight: 600;
 	}
 
 	.log-area {
@@ -485,6 +555,36 @@
 		border-radius: 6px;
 		border: 1px solid rgba(113, 113, 122, 0.2);
 		background: rgba(113, 113, 122, 0.05);
+	}
+	.status-chip,
+	.deck-chip {
+		font-size: 10px;
+		font-weight: 600;
+		line-height: 1;
+		flex-shrink: 0;
+		padding: 3px 6px;
+		border-radius: 999px;
+		border: 1px solid rgba(113, 113, 122, 0.2);
+		background: rgba(113, 113, 122, 0.05);
+		color: #71717a;
+	}
+	.status-chip.running {
+		color: #86efac;
+		border-color: rgba(74, 222, 128, 0.22);
+		background: rgba(74, 222, 128, 0.07);
+	}
+	.status-chip.building {
+		color: #d8b4fe;
+		border-color: rgba(192, 132, 252, 0.22);
+		background: rgba(192, 132, 252, 0.07);
+	}
+	.status-chip.stopped {
+		color: #71717a;
+	}
+	.deck-chip {
+		color: #93c5fd;
+		border-color: rgba(96, 165, 250, 0.22);
+		background: rgba(96, 165, 250, 0.07);
 	}
 	.type-chip.db {
 		color: #a78bfa;
