@@ -39,12 +39,12 @@
 	export let onToggleMonitor: (name: string | string[]) => void = () => {};
 
 	let collapsedGroups: string[] = [];
-	let collapsedSections: string[] = [];
 	let activeMenu: string | null = null;
 	let keyboardFocus: string | null = null;
 	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
 
 	type ProjectSection = ProjectListEntry['section'];
+	let collapsedSections: ProjectSection[] = [];
 
 	const SECTION_COPY: Record<ProjectSection, { label: string; subtitle: string }> = {
 		Active: {
@@ -96,7 +96,7 @@
 		alwaysOn: ProjectListEntry[],
 		recent: ProjectListEntry[],
 		serviceProjects: { name: string; services: ServiceStatus[] }[],
-		collapsed: string[]
+		collapsed: ProjectSection[]
 	): RackEntry[] {
 		const entries: RackEntry[] = [];
 		// eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -349,6 +349,10 @@
 		return parts.join(' · ');
 	}
 
+	function lifecycleLabel(status: ServiceStatus['status']): string {
+		return status[0].toUpperCase() + status.slice(1);
+	}
+
 	function deckSummary(services: ServiceStatus[]): string | null {
 		const count = services.filter((s) => monitored.includes(s.name)).length;
 		if (count === 0) return null;
@@ -527,7 +531,7 @@
 								<div class="item-content">
 									<div class="status-dot {service.status}"></div>
 									<span class="service-name" title={service.name}>{displayName}</span>
-									<span class="status-chip {service.status}">{service.status}</span>
+									<span class="status-chip {service.status}">{lifecycleLabel(service.status)}</span>
 									<span class="type-chip {type}">{type}</span>
 									{#if inDeck}
 										<span class="deck-chip">In Deck</span>
