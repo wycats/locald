@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const LEGACY_EDITOR_TTL: Duration = Duration::from_secs(30 * 60);
+const LEGACY_EDITOR_TTL: Duration = Duration::from_mins(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub enum AttachmentSource {
