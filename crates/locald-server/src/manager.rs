@@ -1667,6 +1667,7 @@ impl ProcessManager {
 
         let is_first = {
             let mut attachments = self.attachments.lock().await;
+            attachments.reap_stale_attachments_for(&canonical);
             let attachment = Attachment {
                 project_path: canonical.clone(),
                 source,
@@ -1960,7 +1961,7 @@ impl ProcessManager {
 
     async fn refresh_attachments(&self) -> Result<()> {
         let mut attachments = self.attachments.lock().await;
-        let removed = attachments.reap_stale_pids();
+        let removed = attachments.reap_stale_attachments();
         if !removed.is_empty() {
             attachments.save().await?;
         }
@@ -1970,7 +1971,7 @@ impl ProcessManager {
     pub async fn reap_and_stop_orphans(&self) {
         let orphaned = {
             let mut attachments = self.attachments.lock().await;
-            let orphaned = attachments.reap_stale_pids();
+            let orphaned = attachments.reap_stale_attachments();
             if !orphaned.is_empty() {
                 let _ = attachments.save().await;
             }
@@ -2339,6 +2340,15 @@ mod tests {
         }
     }
 
+    struct NoopHostSyncer;
+
+    #[async_trait]
+    impl HostSyncer for NoopHostSyncer {
+        async fn sync(&self, _domains: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_get_service_domain_default() {
         let project_config = ProjectConfig {
@@ -2605,6 +2615,81 @@ mod tests {
             services.get("other:web").unwrap().health_status,
             HealthStatus::Healthy
         );
+    }
+
+    #[tokio::test]
+    async fn test_project_attach_reaps_stale_editor_before_first_attach() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let mut manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry,
+            attachments.clone(),
+            None,
+        )
+        .expect("Failed to create ProcessManager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).unwrap();
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "attached"
+
+[services.web]
+command = "sleep 30"
+"#,
+        )
+        .unwrap();
+
+        {
+            let mut store = attachments.lock().await;
+            store.attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_string(),
+                    id: "stale".to_string(),
+                    pid: None,
+                },
+                created_at: SystemTime::now() - std::time::Duration::from_secs(31 * 60),
+            });
+        }
+
+        manager
+            .project_attach(
+                project_path.clone(),
+                AttachmentSource::Editor {
+                    name: "vscode".to_string(),
+                    id: "fresh".to_string(),
+                    pid: Some(std::process::id()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let services = manager.services.lock().await;
+        assert!(services.contains_key("attached:web"));
+        drop(services);
+
+        let store = attachments.lock().await;
+        let remaining = store.attachments_for(&project_path);
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(
+            remaining[0].source,
+            AttachmentSource::Editor { ref id, .. } if id == "fresh"
+        ));
+        drop(store);
+
+        manager.stop_project(&project_path).await.unwrap();
     }
 
     #[tokio::test]

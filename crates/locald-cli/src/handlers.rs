@@ -57,7 +57,7 @@ struct JsonProjectAction {
 
 fn format_attachment_source(source: &AttachmentSource) -> String {
     match source {
-        AttachmentSource::Editor { name, id } => format!("editor:{name} ({id})"),
+        AttachmentSource::Editor { name, id, .. } => format!("editor:{name} ({id})"),
         AttachmentSource::CLI { pid } => format!("cli:{pid}"),
         AttachmentSource::Pin => "pin".to_string(),
     }
@@ -1495,6 +1495,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 source,
                 editor_name,
                 editor_id,
+                editor_pid,
                 json,
             } => {
                 utils::ensure_daemon_running()?;
@@ -1507,7 +1508,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         let id = editor_id
                             .clone()
                             .ok_or_else(|| CliError::message("--editor-id is required"))?;
-                        AttachmentSource::Editor { name, id }
+                        AttachmentSource::Editor {
+                            name,
+                            id,
+                            pid: *editor_pid,
+                        }
                     }
                     Some("cli") | None => AttachmentSource::CLI {
                         pid: std::process::id(),
@@ -1559,6 +1564,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         Some(AttachmentSource::Editor {
                             name: String::new(),
                             id,
+                            pid: None,
                         })
                     }
                     Some("cli") => Some(AttachmentSource::CLI {
