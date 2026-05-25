@@ -1,3 +1,7 @@
+<!-- exo:54 ulid:01krkpxdw1s0aq9f0hgtcsv4f4 -->
+
+# RFC 54: Dashboard Log Interaction & Copying
+
 # RFC 0054: Dashboard Log Interaction & Copying
 
 - **Status**: Stage 0 (Strawman)

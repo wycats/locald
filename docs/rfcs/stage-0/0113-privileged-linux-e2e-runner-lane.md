@@ -1,8 +1,7 @@
----
-title: Privileged Linux E2E Runner Lane
-stage: 0
-feature: CI
----
+<!-- exo:113 ulid:01krkpxdt7g5yr9tbp20mnfvm5 -->
+
+# RFC 113: Privileged Linux E2E Runner Lane
+
 
 
 # RFC 0113: Privileged Linux E2E Runner Lane

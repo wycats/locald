@@ -1,8 +1,7 @@
----
-title: "Privileged Ports: Capabilities over Root"
-stage: 3
-feature: Architecture
----
+<!-- exo:10 ulid:01krkpxdxbkngtd4ep33frsx3x -->
+
+# RFC 10: Privileged Ports: Capabilities over Root
+
 
 # RFC: Privileged Ports: Capabilities over Root
 

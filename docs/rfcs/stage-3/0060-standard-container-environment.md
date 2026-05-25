@@ -1,8 +1,7 @@
----
-title: "Standard Container Environment"
-stage: 3 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Core Architecture
----
+<!-- exo:60 ulid:01krkpxdw43hd1ks4h6xe4d0fv -->
+
+# RFC 60: Standard Container Environment
+
 
 # RFC 0060: Standard Container Environment
 

@@ -1,8 +1,7 @@
----
-title: "Configuration: In-Repo"
-stage: 3
-feature: Architecture
----
+<!-- exo:3 ulid:01krkpxdx5dcnsm8namqsxdr78 -->
+
+# RFC 3: Configuration: In-Repo
+
 
 # RFC: Configuration: In-Repo
 

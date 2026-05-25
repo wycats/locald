@@ -1,8 +1,7 @@
----
-title: Property Tests as Invariant Specs (Doctor/Fix Consolidation)
-stage: 2
-feature: Engineering Excellence
----
+<!-- exo:111 ulid:01krkpxdv33b6qxh1xg3rtt4sk -->
+
+# RFC 111: Property Tests as Invariant Specs (Doctor/Fix Consolidation)
+
 
 # RFC 0111: Property Tests as Invariant Specs (Doctor/Fix Consolidation)
 

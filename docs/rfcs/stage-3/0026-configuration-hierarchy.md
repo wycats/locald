@@ -1,8 +1,7 @@
----
-title: "Configuration Hierarchy & Workspaces"
-stage: 3
-feature: Configuration
----
+<!-- exo:26 ulid:01krkpxdvn90a3p1zs0akhrrvv -->
+
+# RFC 26: Configuration Hierarchy & Workspaces
+
 
 # RFC: Configuration Hierarchy & Workspaces
 

@@ -1,8 +1,7 @@
----
-title: Dashboard Vocabulary and User Mental Model
-stage: 0
-feature: Dashboard
----
+<!-- exo:135 ulid:01krkpxdtr8a9axpjhy6g6xkdx -->
+
+# RFC 135: Dashboard Vocabulary and User Mental Model
+
 
 # RFC 0135: Dashboard Vocabulary and User Mental Model ✅ RESOLVED
 

@@ -1,8 +1,7 @@
----
-title: "Project Registry: Centralized Tracking"
-stage: 3
-feature: Architecture
----
+<!-- exo:36 ulid:01krkpxdvvp9b2md07v35nbh8j -->
+
+# RFC 36: Project Registry: Centralized Tracking
+
 
 # RFC: Project Registry: Centralized Tracking
 

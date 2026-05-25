@@ -1,8 +1,7 @@
----
-title: "Documentation: Persona-Based Structure"
-stage: 3
-feature: Documentation
----
+<!-- exo:14 ulid:01krkpxdvfheeg8rgmdvv6hc99 -->
+
+# RFC 14: Documentation: Persona-Based Structure
+
 
 # RFC: Documentation: Persona-Based Structure
 

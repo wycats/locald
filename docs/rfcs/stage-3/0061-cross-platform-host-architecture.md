@@ -1,8 +1,7 @@
----
-title: "Cross-Platform Host Architecture"
-stage: 1 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Core Architecture
----
+<!-- exo:61 ulid:01krkpxdw5j3ajbmnsk1mkxp0n -->
+
+# RFC 61: Cross-Platform Host Architecture
+
 
 # RFC 0061: Cross-Platform Host Architecture
 

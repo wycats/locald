@@ -1,10 +1,6 @@
----
-title: "Strawman: Standalone OCI Fetcher Crate"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Architecture
----
+<!-- exo:65 ulid:01krkpxdw72x1tce2t5b7kcjdv -->
 
-# RFC 0046: Strawman: Standalone OCI Fetcher Crate
+# RFC 65: Strawman: Standalone OCI Fetcher Crate
 
 ## 1. Summary
 

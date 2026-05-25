@@ -1,8 +1,7 @@
----
-title: "Engineering Excellence"
-stage: 0
-feature: General
----
+<!-- exo:40 ulid:01krkpxdvwa2gg7bft046jfjkj -->
+
+# RFC 40: Engineering Excellence
+
 
 # Design: Engineering Excellence
 

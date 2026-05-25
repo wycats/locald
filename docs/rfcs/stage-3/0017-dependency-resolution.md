@@ -1,8 +1,7 @@
----
-title: "Dependency Resolution: Topological Sort"
-stage: 3
-feature: Architecture
----
+<!-- exo:17 ulid:01krkpxdvgfy26gxndgz2dvf3j -->
+
+# RFC 17: Dependency Resolution: Topological Sort
+
 
 # RFC: Dependency Resolution: Topological Sort
 

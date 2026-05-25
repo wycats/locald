@@ -1,8 +1,7 @@
----
-title: "Remove DockerRuntime"
-stage: 3
-feature: Core Architecture
----
+<!-- exo:142 ulid:01krkpxdv9z518cmtewegcbzjm -->
+
+# RFC 142: Remove DockerRuntime
+
 
 # RFC 0142: Remove DockerRuntime
 

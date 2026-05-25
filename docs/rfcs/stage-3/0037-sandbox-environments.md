@@ -1,8 +1,7 @@
----
-title: "Sandbox Environments: Explicit Isolation"
-stage: 3
-feature: Architecture
----
+<!-- exo:37 ulid:01krkpxdvwfs6xxrk3b6z03m05 -->
+
+# RFC 37: Sandbox Environments: Explicit Isolation
+
 
 # RFC: Sandbox Environments: Explicit Isolation
 

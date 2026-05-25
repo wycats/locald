@@ -1,3 +1,7 @@
+<!-- exo:68 ulid:01krkpxdway1fgh5sc545d4fz7 -->
+
+# RFC 68: CNB Library Extraction & OCI Layering
+
 # RFC 0068: CNB Library Extraction & OCI Layering
 
 ## Status

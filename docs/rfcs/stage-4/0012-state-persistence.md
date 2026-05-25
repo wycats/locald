@@ -1,8 +1,7 @@
----
-title: "State Persistence: JSON in XDG Data Dir"
-stage: 3
-feature: Architecture
----
+<!-- exo:12 ulid:01krkpxdxcfeb86qve5ayhsvgv -->
+
+# RFC 12: State Persistence: JSON in XDG Data Dir
+
 
 # RFC: State Persistence: JSON in XDG Data Dir
 

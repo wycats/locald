@@ -1,8 +1,7 @@
----
-title: "Server Idempotency: Socket Check"
-stage: 3
-feature: Architecture
----
+<!-- exo:9 ulid:01krkpxdxawf0b0w337w5hbm0p -->
+
+# RFC 9: Server Idempotency: Socket Check
+
 
 # RFC: Server Idempotency: Socket Check
 

@@ -1,11 +1,7 @@
----
-title: Minimum AWESOME Product (MAP): scope, quarantine, and enforcement
-stage: 0
-feature: Shipping
-exo:
-    tool: exo rfc create
-    protocol: 1
----
+<!-- exo:116 ulid:01krkpxdtrft0rsmns384dp08g -->
+
+# RFC 116: Minimum AWESOME Product (MAP): scope, quarantine, and enforcement
+
 
 # RFC 0116: Minimum AWESOME Product (MAP): scope, quarantine, and enforcement
 

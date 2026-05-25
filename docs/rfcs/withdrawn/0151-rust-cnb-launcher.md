@@ -1,4 +1,6 @@
-# Rust Implementation of CNB Launcher
+<!-- exo:151 ulid:01krkpxdwzcvwyf2g2gnq68b6q -->
+
+# RFC 151: Rust Implementation of CNB Launcher
 
 - Feature Name: `rust_cnb_launcher`
 - Start Date: 2025-12-08

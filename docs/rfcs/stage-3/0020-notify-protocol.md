@@ -1,8 +1,7 @@
----
-title: "Notify Protocol: Unix Datagram"
-stage: 3
-feature: Architecture
----
+<!-- exo:20 ulid:01krkpxdvkcwvby0t6pm5gm3r5 -->
+
+# RFC 20: Notify Protocol: Unix Datagram
+
 
 # RFC: Notify Protocol: Unix Datagram
 

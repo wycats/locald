@@ -1,8 +1,7 @@
----
-title: "Ephemeral Runtime, Persistent Context"
-stage: 3
-feature: Architecture
----
+<!-- exo:33 ulid:01krkpxdvshfdhd772h796pvs8 -->
+
+# RFC 33: Ephemeral Runtime, Persistent Context
+
 
 # RFC: Ephemeral Runtime, Persistent Context
 

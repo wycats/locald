@@ -1,8 +1,7 @@
----
-title: "The Manifesto Structure"
-stage: 3
-feature: Documentation
----
+<!-- exo:46 ulid:01krkpxdx1aryx6cg6tx4xmn71 -->
+
+# RFC 46: The Manifesto Structure
+
 
 # RFC: The Manifesto Structure
 

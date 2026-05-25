@@ -1,8 +1,7 @@
----
-title: "Advanced Proxying Strategy"
-stage: 3
-feature: Networking
----
+<!-- exo:35 ulid:01krkpxdvt9mmantn6ac7hs8wb -->
+
+# RFC 35: Advanced Proxying Strategy
+
 
 # RFC: Advanced Proxying Strategy
 

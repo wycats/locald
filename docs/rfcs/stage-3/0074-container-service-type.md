@@ -1,3 +1,7 @@
+<!-- exo:74 ulid:01krkpxdwcq4zjx9bdr42sttwj -->
+
+# RFC 74: Explicit Container Service Type
+
 # Explicit Container Service Type
 
 - Feature Name: `container_service_type`

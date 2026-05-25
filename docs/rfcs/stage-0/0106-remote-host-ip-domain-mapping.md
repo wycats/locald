@@ -1,8 +1,7 @@
----
-title: Remote Host/IP Domain Mapping
-stage: 0
-feature: Networking
----
+<!-- exo:106 ulid:01krkpxdt47fj3zvdp3cczt5m4 -->
+
+# RFC 106: Remote Host/IP Domain Mapping
+
 
 
 # RFC 0106: Remote Host/IP Domain Mapping

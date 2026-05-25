@@ -1,8 +1,7 @@
----
-title: "Privileged Cleanup via Shim"
-stage: 3 # Recommended
-feature: Architecture
----
+<!-- exo:91 ulid:01krkpxdwgh12xd32a9fnv97jf -->
+
+# RFC 91: Privileged Cleanup via Shim
+
 
 # RFC 0091: Privileged Cleanup via Shim
 

@@ -1,8 +1,7 @@
----
-title: "Firecracker Hardened Images via locald-init (Template + Inject)"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: VMM
----
+<!-- exo:108 ulid:01krkpxdt5z8tthdwmheg55ysg -->
+
+# RFC 108: Firecracker Hardened Images via locald-init (Template + Inject)
+
 
 # RFC 0108: Firecracker Hardened Images via locald-init (Template + Inject)
 

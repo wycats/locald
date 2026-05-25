@@ -1,8 +1,7 @@
----
-title: "Premium Dashboard Experience"
-stage: 3 # Recommended
-feature: Dashboard
----
+<!-- exo:81 ulid:01krkpxdv8ad59073wztzyd7m7 -->
+
+# RFC 81: Premium Dashboard Experience
+
 
 # RFC 0081: Premium Dashboard Experience
 

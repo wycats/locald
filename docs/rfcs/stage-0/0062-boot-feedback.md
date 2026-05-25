@@ -1,8 +1,7 @@
----
-title: "Boot Feedback & Progress UI"
-stage: 3 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Experience
----
+<!-- exo:62 ulid:01krkpxdtf1q5hfhnr1ypb1v1x -->
+
+# RFC 62: Boot Feedback & Progress UI
+
 
 # RFC 0062: Boot Feedback & Progress UI
 

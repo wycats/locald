@@ -1,10 +1,6 @@
----
-title: Codebase Cleanup
-stage: 2
-feature: Engineering Excellence
----
+<!-- exo:153 ulid:01krkpxdv40mqb4fgndn83g28g -->
 
-# RFC 0104: Codebase Cleanup
+# RFC 153: Codebase Cleanup
 
 ## Status
 

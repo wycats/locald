@@ -1,9 +1,7 @@
----
-title: Host Shim Daemon for Container Development Environments
-stage: 1
-feature: Container Development
-superseded_by: "0138"
----
+<!-- exo:130 ulid:01krkpxdx2t7q846zzj04r1gq4 -->
+
+# RFC 130: Host Shim Daemon for Container Development Environments
+
 
 
 # RFC 0130: Host Shim Daemon for Container Development Environments

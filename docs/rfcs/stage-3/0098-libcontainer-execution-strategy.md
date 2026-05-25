@@ -1,8 +1,7 @@
----
-title: "Libcontainer Execution Strategy"
-stage: 3 # Recommended
-feature: Core Architecture
----
+<!-- exo:98 ulid:01krkpxdwnv15z079ngz5st648 -->
+
+# RFC 98: Libcontainer Execution Strategy
+
 
 # RFC 0098: Libcontainer Execution Strategy
 

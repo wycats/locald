@@ -1,12 +1,7 @@
----
-title: Superseded by RFC 0138
-stage: 0
-feature: Engineering Excellence
-exo:
-    tool: exo rfc create
-    protocol: 1
-superseded_by: "0138"
----
+<!-- exo:137 ulid:01krkpxdx0y3fg6pkgk37sbdfy -->
+
+# RFC 137: Superseded by RFC 0138
+
 
 
 # RFC 0137: Superseded by RFC 0138

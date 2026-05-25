@@ -1,11 +1,7 @@
----
-title: "Explicit Defaults vs. Services"
-stage: 0
-feature: Configuration
-exo:
-    tool: exo rfc create
-    protocol: 1
----
+<!-- exo:127 ulid:01krkpxdtazvc6xdpcaab1gar7 -->
+
+# RFC 127: Explicit Defaults vs. Services
+
 
 # RFC 0127: Explicit Defaults vs. Services
 

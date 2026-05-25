@@ -1,8 +1,7 @@
----
-title: "Hot Reloading & Service Restart"
-stage: 1 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Hot Reloading
----
+<!-- exo:50 ulid:01krkpxdv2swn61agjjz4b02t4 -->
+
+# RFC 50: Hot Reloading & Service Restart
+
 
 # RFC: Hot Reloading & Service Restart
 

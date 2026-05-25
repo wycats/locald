@@ -1,8 +1,7 @@
----
-title: locald doctor
-stage: 3
-feature: Installation & Update Experience
----
+<!-- exo:109 ulid:01krkpxdva427n73nmdn3gm912 -->
+
+# RFC 109: locald doctor
+
 
 # RFC 0109: locald doctor
 

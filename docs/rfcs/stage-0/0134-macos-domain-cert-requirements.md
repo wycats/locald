@@ -1,8 +1,7 @@
----
-title: macOS Domain and Certificate Requirements
-stage: 0
-feature: Platform Support
----
+<!-- exo:134 ulid:01krkpxdtdapc2q2w3wwm9bm6b -->
+
+# RFC 134: macOS Domain and Certificate Requirements
+
 
 # RFC 0134: macOS Domain and Certificate Requirements
 

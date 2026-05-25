@@ -1,7 +1,7 @@
----
-title: Dashboard E2E Strategy
-stage: 3
----
+<!-- exo:83 ulid:01krkpxdwf0a4s9zxk7248xnm0 -->
+
+# RFC 83: Dashboard E2E Strategy
+
 
 # RFC 0083: Dashboard E2E Strategy
 

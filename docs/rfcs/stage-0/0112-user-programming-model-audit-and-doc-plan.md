@@ -1,8 +1,7 @@
----
-title: "User Programming Model Audit and Doc Plan"
-stage: 0
-feature: Documentation / UX Coherence
----
+<!-- exo:112 ulid:01krkpxdtpgn70s86dsmgd5rkk -->
+
+# RFC 112: User Programming Model Audit and Doc Plan
+
 
 # User Programming Model Audit and Doc Plan
 

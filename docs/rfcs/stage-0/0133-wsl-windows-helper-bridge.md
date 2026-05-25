@@ -1,8 +1,7 @@
----
-title: WSL Windows Helper Bridge
-stage: 0
-feature: Platform Support
----
+<!-- exo:133 ulid:01krkpxdtcd3pdxc8h84qq9w4r -->
+
+# RFC 133: WSL Windows Helper Bridge
+
 
 # RFC 0133: WSL Windows Helper Bridge
 

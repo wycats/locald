@@ -1,8 +1,7 @@
----
-title: "Dashboard Self-Representation & Real-time Health"
-stage: 1 # Accepted
-feature: Dashboard
----
+<!-- exo:73 ulid:01krkpxdv6332x1mw9zjg3fd2e -->
+
+# RFC 73: Dashboard Self-Representation & Real-time Health
+
 
 # RFC 0073: Dashboard Self-Representation & Real-time Health
 

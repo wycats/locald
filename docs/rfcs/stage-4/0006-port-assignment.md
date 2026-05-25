@@ -1,8 +1,7 @@
----
-title: "Port Assignment: Dynamic & Env Var"
-stage: 3
-feature: Architecture
----
+<!-- exo:6 ulid:01krkpxdx8ctzmknwe70e9yawn -->
+
+# RFC 6: Port Assignment: Dynamic & Env Var
+
 
 # RFC: Port Assignment: Dynamic & Env Var
 

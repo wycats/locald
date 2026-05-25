@@ -1,8 +1,7 @@
----
-title: "Shim Versioning & Upgrades"
-stage: 3
-feature: Security
----
+<!-- exo:45 ulid:01krkpxdvzna1tqz3qrb03f7q6 -->
+
+# RFC 45: Shim Versioning & Upgrades
+
 
 # Design: Shim Versioning & Upgrades
 

@@ -1,8 +1,7 @@
----
-title: "Improved Hardlink Pattern"
-stage: 0 # 0: Strawman
-feature: Performance
----
+<!-- exo:92 ulid:01krkpxdv0e62drz0b8sf402m5 -->
+
+# RFC 92: Improved Hardlink Pattern
+
 
 # RFC: Improved Hardlink Pattern for Image Unpacking
 

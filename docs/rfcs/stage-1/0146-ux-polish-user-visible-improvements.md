@@ -1,11 +1,7 @@
----
-title: UX Polish: User-Visible Improvements
-stage: 1
-feature: ux
-exo:
-    tool: exo rfc create
-    protocol: 1
----
+<!-- exo:146 ulid:01krkpxdv12syfc0z9ced8dypy -->
+
+# RFC 146: UX Polish: User-Visible Improvements
+
 
 # RFC 0146: UX Polish: User-Visible Improvements
 

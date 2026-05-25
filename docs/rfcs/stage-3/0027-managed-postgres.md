@@ -1,8 +1,7 @@
----
-title: "Managed Postgres: postgresql_embedded"
-stage: 3
-feature: Database
----
+<!-- exo:27 ulid:01krkpxdvnq2kz0qp65vt622sj -->
+
+# RFC 27: Managed Postgres: postgresql_embedded
+
 
 # RFC: Managed Postgres: postgresql_embedded
 

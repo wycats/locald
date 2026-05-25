@@ -1,9 +1,6 @@
----
-title: Systematic Investigation Protocol
-stage: 3
----
+<!-- exo:66 ulid:01krkpxdw7f33qzp95cer23fet -->
 
-# RFC 0059: Systematic Investigation Protocol
+# RFC 66: Systematic Investigation Protocol
 
 ## Context
 

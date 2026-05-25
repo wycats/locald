@@ -1,10 +1,6 @@
----
-title: "Dependency Management Policy"
-stage: 1 # Accepted
-feature: Engineering Excellence
----
+<!-- exo:150 ulid:01krkpxdtvf3fm647sjyxras18 -->
 
-# RFC 0068: Dependency Management Policy
+# RFC 150: Dependency Management Policy
 
 ## 1. Summary
 

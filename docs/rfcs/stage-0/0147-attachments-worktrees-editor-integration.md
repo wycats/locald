@@ -1,8 +1,7 @@
----
-title: "Attachments, Worktrees, and Editor Integration"
-stage: 0
-feature: Architecture / UX
----
+<!-- exo:147 ulid:01krkpxdtsbaq5qpqc5sqzbam2 -->
+
+# RFC 147: Attachments, Worktrees, and Editor Integration
+
 
 # RFC 0147: Attachments, Worktrees, and Editor Integration
 

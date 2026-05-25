@@ -1,11 +1,7 @@
----
-title: CI Acceleration: Stop-the-Line for Main
-stage: 0
-feature: Developer Experience
-exo:
-    tool: exo rfc create
-    protocol: 1
----
+<!-- exo:132 ulid:01krkpxdtcs0mbyjfx21qg1vcs -->
+
+# RFC 132: CI Acceleration: Stop-the-Line for Main
+
 
 # RFC 0132: CI Acceleration: Stop-the-Line for Main
 

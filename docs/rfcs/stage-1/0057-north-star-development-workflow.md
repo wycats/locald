@@ -1,8 +1,7 @@
----
-title: "North Star: The Zero-Friction Development Workflow"
-stage: 0 # 0: Strawman
-feature: Developer Experience
----
+<!-- exo:57 ulid:01krkpxdtyrwqv1dweqq56x1kw -->
+
+# RFC 57: North Star: The Zero-Friction Development Workflow
+
 
 # RFC 0057: North Star - The Zero-Friction Development Workflow
 

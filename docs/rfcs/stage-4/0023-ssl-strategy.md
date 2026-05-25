@@ -1,8 +1,7 @@
----
-title: "SSL Strategy: Pure Rust Stack"
-stage: 3
-feature: Architecture
----
+<!-- exo:23 ulid:01krkpxdxdwz5hc7tx6mrfsp25 -->
+
+# RFC 23: SSL Strategy: Pure Rust Stack
+
 
 # RFC: SSL Strategy: Pure Rust Stack
 

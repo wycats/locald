@@ -1,8 +1,7 @@
----
-title: "Respectful Doctor Output"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Doctor Output
----
+<!-- exo:125 ulid:01krkpxdv4cre7gj7y7ccsawek -->
+
+# RFC 125: Respectful Doctor Output
+
 
 # RFC: Respectful Doctor Output
 

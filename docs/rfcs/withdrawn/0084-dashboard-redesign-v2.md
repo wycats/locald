@@ -1,8 +1,7 @@
----
-title: "Dashboard Redesign v2: The Immersive Workspace"
-stage: 0 # Strawman
-feature: Design
----
+<!-- exo:84 ulid:01krkpxdwzf2d99qjp9eaknskb -->
+
+# RFC 84: Dashboard Redesign v2: The Immersive Workspace
+
 
 # RFC 0084: Dashboard Redesign v2 - The Immersive Workspace
 

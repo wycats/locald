@@ -1,9 +1,6 @@
----
-title: Shared Utility Crate
-stage: 3
----
+<!-- exo:149 ulid:01krkpxdw9p2rnj01vp1d1gkeq -->
 
-# RFC 0067: Shared Utility Crate
+# RFC 149: Shared Utility Crate
 
 ## Summary
 

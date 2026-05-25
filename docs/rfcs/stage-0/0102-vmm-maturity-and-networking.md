@@ -1,8 +1,7 @@
----
-title: "VMM Maturity and Networking"
-stage: 0 # Strawman
-feature: VMM
----
+<!-- exo:102 ulid:01krkpxdtm25f976xyq74dmdxn -->
+
+# RFC 102: VMM Maturity and Networking
+
 
 # RFC 0102: VMM Maturity and Networking
 

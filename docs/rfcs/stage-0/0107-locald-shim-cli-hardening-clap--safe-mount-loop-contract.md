@@ -1,8 +1,7 @@
----
-title: locald-shim CLI Hardening (clap) + Safe Mount-Loop Contract
-stage: 0
-feature: Security
----
+<!-- exo:107 ulid:01krkpxdt54dwrp59hh5d6qrmx -->
+
+# RFC 107: locald-shim CLI Hardening (clap) + Safe Mount-Loop Contract
+
 
 
 # RFC 0107: locald-shim CLI Hardening (clap) + Safe Mount-Loop Contract

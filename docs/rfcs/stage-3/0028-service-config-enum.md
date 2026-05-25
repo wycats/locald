@@ -1,8 +1,7 @@
----
-title: "Service Configuration: Typed Enum"
-stage: 3
-feature: Configuration
----
+<!-- exo:28 ulid:01krkpxdvp90gfbe7w9kjpe1vw -->
+
+# RFC 28: Service Configuration: Typed Enum
+
 
 # RFC: Service Configuration: Typed Enum
 

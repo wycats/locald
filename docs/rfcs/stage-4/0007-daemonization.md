@@ -1,8 +1,7 @@
----
-title: "Daemonization: Self-Managed"
-stage: 3
-feature: Architecture
----
+<!-- exo:7 ulid:01krkpxdx8wghckmm6d12d60x3 -->
+
+# RFC 7: Daemonization: Self-Managed
+
 
 # RFC: Daemonization: Self-Managed
 

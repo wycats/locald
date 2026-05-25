@@ -1,8 +1,7 @@
----
-title: "CLI Surface Overhaul & Dashboard Integration"
-stage: 0 # 0: Strawman
-feature: CLI Redesign
----
+<!-- exo:86 ulid:01krkpxdtzgmza6tamtwxvqscg -->
+
+# RFC 86: CLI Surface Overhaul & Dashboard Integration
+
 
 # RFC: CLI Surface Overhaul & Dashboard Integration
 
