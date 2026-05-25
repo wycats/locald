@@ -1,9 +1,6 @@
-<!-- exo:104 ulid:01krkpxdv40mqb4fgndn83g28g -->
+<!-- exo:153 ulid:01krkpxdv40mqb4fgndn83g28g -->
 
-# RFC 104: Codebase Cleanup
-
-
-# RFC 0104: Codebase Cleanup
+# RFC 153: Codebase Cleanup
 
 ## Status
 

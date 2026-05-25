@@ -1,9 +1,6 @@
-<!-- exo:68 ulid:01krkpxdtvf3fm647sjyxras18 -->
+<!-- exo:150 ulid:01krkpxdtvf3fm647sjyxras18 -->
 
-# RFC 68: Dependency Management Policy
-
-
-# RFC 0068: Dependency Management Policy
+# RFC 150: Dependency Management Policy
 
 ## 1. Summary
 

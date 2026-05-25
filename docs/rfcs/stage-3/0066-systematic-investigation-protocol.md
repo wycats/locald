@@ -2,9 +2,6 @@
 
 # RFC 66: Systematic Investigation Protocol
 
-
-# RFC 0059: Systematic Investigation Protocol
-
 ## Context
 
 When debugging complex failures in `locald`, especially those involving privileged operations (shim), containers (runc), or IPC, "mashing" (trying random fixes) is inefficient and risky. We need a structured approach to narrow down the search space scientifically.

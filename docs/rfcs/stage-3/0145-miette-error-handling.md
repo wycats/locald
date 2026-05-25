@@ -1,9 +1,6 @@
 <!-- exo:145 ulid:01krkpxdwqmkfazrkcrej5th1x -->
 
-# RFC 145: RFC 0145: Miette Error Handling for CLI
-
-
-# RFC 0145: Miette Error Handling for CLI
+# RFC 145: Miette Error Handling for CLI
 
 Status: Stage 2 (Draft)
 

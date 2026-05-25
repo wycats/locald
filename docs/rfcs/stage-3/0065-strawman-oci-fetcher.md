@@ -2,9 +2,6 @@
 
 # RFC 65: Strawman: Standalone OCI Fetcher Crate
 
-
-# RFC 0046: Strawman: Standalone OCI Fetcher Crate
-
 ## 1. Summary
 
 This RFC proposes extracting the OCI image fetching and extraction logic, currently embedded in `locald-builder`, into a standalone, reusable Rust crate.
