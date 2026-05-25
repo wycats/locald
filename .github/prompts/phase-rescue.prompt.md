@@ -16,7 +16,7 @@ Use this prompt when starting a new chat to continue a phase, especially if the 
 #### 2. Reality Check (The Audit)
 - **Do not assume the Context is perfect.** The previous session may have failed to update it.
 - If a phase is active, run `exo task list`. For the last completed task and the current pending task:
-  - **Verify in Code**: specificially check the files to see if the code changes are actually present.
+  - **Verify in Code**: specifically check the files to see if the code changes are actually present.
   - **Verify in Tests**: Check if the tests for those features exist and pass.
 
 #### 3. Reconcile
