@@ -1,8 +1,7 @@
----
-title: "Extensibility & Plugins"
-stage: 3
-feature: General
----
+<!-- exo:38 ulid:01krkpxdvb0ss8trwywazxbbw3 -->
+
+# RFC 38: Extensibility & Plugins
+
 
 # Design: Extensibility & Plugins
 

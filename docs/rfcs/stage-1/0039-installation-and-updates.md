@@ -1,8 +1,7 @@
----
-title: "Installation & Updates"
-stage: 0
-feature: General
----
+<!-- exo:39 ulid:01krkpxdtwsns5ba2xc39qfnaz -->
+
+# RFC 39: Installation & Updates
+
 
 # Design: Installation & Updates
 

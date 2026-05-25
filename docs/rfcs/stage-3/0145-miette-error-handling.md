@@ -1,8 +1,7 @@
----
-title: "RFC 0145: Miette Error Handling for CLI"
-stage: 2 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Miette Error Handling for CLI
----
+<!-- exo:145 ulid:01krkpxdwqmkfazrkcrej5th1x -->
+
+# RFC 145: RFC 0145: Miette Error Handling for CLI
+
 
 # RFC 0145: Miette Error Handling for CLI
 

@@ -1,8 +1,7 @@
----
-title: "LocalD Shim Architecture"
-stage: 3 # Recommended
-feature: Security
----
+<!-- exo:53 ulid:01krkpxdw048pp1nwncpbmvm6g -->
+
+# RFC 53: LocalD Shim Architecture
+
 
 # RFC 0053: LocalD Shim Architecture
 

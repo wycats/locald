@@ -1,8 +1,7 @@
----
-title: Cross-Surface Workflow Contracts
-stage: 0
-feature: Engineering Excellence
----
+<!-- exo:105 ulid:01krkpxdt3bfezrw6pfkt4td7v -->
+
+# RFC 105: Cross-Surface Workflow Contracts
+
 
 
 # RFC 0105: Cross-Surface Workflow Contracts

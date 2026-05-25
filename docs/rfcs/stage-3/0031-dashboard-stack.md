@@ -1,8 +1,7 @@
----
-title: "Dashboard Stack: Svelte 5 & xterm.js"
-stage: 3
-feature: Dashboard
----
+<!-- exo:31 ulid:01krkpxdvq90m9whvceesmf0tz -->
+
+# RFC 31: Dashboard Stack: Svelte 5 & xterm.js
+
 
 # RFC: Dashboard Stack: Svelte 5 & xterm.js
 

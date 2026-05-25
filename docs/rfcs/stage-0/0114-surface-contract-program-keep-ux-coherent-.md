@@ -1,8 +1,7 @@
----
-title: Surface Contract Program (Keep UX Coherent)
-stage: 0
-feature: Documentation / UX Coherence
----
+<!-- exo:114 ulid:01krkpxdt75nk0n3aded2rbbbd -->
+
+# RFC 114: Surface Contract Program (Keep UX Coherent)
+
 
 
 # RFC 0114: Surface Contract Program (Keep UX Coherent)

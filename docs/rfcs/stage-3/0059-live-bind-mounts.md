@@ -1,8 +1,7 @@
----
-title: "Live Bind Mounts for Development"
-stage: 1 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Hot Reloading
----
+<!-- exo:59 ulid:01krkpxdw464h5b5dv88xvdb0r -->
+
+# RFC 59: Live Bind Mounts for Development
+
 
 # RFC 0059: Live Bind Mounts for Development
 

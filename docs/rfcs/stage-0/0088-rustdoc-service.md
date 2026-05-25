@@ -1,3 +1,7 @@
+<!-- exo:88 ulid:01krkpxdtk02veeh2z29nkvxbm -->
+
+# RFC 88: Rustdoc Service
+
 # Rustdoc Service
 
 ## Context

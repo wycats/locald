@@ -1,8 +1,7 @@
----
-title: "Hosts File: Section Management"
-stage: 3
-feature: Networking
----
+<!-- exo:11 ulid:01krkpxdxbb9yhpjxrf31g18z8 -->
+
+# RFC 11: Hosts File: Section Management
+
 
 # RFC: Hosts File: Section Management
 

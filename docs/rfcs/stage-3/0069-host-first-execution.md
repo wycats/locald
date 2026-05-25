@@ -1,8 +1,7 @@
----
-title: "Host-First Execution Strategy"
-stage: 3 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Runtime
----
+<!-- exo:69 ulid:01krkpxdvdfs4yeem0kynsy857 -->
+
+# RFC 69: Host-First Execution Strategy
+
 
 # RFC 0069: Host-First Execution Strategy
 

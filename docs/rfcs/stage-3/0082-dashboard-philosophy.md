@@ -1,8 +1,7 @@
----
-title: "Rationale: The Dashboard is a Living Workspace"
-stage: 3 # Recommended
-feature: Design
----
+<!-- exo:82 ulid:01krkpxdvddj6v7rgbwkt2q5b2 -->
+
+# RFC 82: Rationale: The Dashboard is a Living Workspace
+
 
 # RFC 0082: Rationale for Dashboard Philosophy
 

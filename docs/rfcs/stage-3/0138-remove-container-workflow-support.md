@@ -1,11 +1,7 @@
----
-title: Remove Container Workflow Support
-stage: 3
-feature: Engineering Excellence
-exo:
-  tool: exo rfc create
-  protocol: 1
----
+<!-- exo:138 ulid:01krkpxdwt36w6h334dr30ya1q -->
+
+# RFC 138: Remove Container Workflow Support
+
 
 # RFC 0138: Remove Container Workflow Support
 

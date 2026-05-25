@@ -1,8 +1,7 @@
----
-title: "macOS Platform Support Strategy"
-stage: 1
-feature: Cross-Platform Support
----
+<!-- exo:104 ulid:01krkpxdv1v9zxe358vtvcxe9f -->
+
+# RFC 104: macOS Platform Support Strategy
+
 
 # RFC 0104: macOS Platform Support Strategy
 

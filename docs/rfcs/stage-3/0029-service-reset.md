@@ -1,8 +1,7 @@
----
-title: "Service Reset: Explicit Command"
-stage: 3
-feature: Architecture
----
+<!-- exo:29 ulid:01krkpxdvq086xfkre7aqge5p5 -->
+
+# RFC 29: Service Reset: Explicit Command
+
 
 # RFC: Service Reset: Explicit Command
 

@@ -1,8 +1,7 @@
----
-title: "CNB Integration Polish"
-stage: 0 # 0: Strawman
-feature: CNB Integration
----
+<!-- exo:55 ulid:01krkpxdw1kgwajy3gs3tc445a -->
+
+# RFC 55: CNB Integration Polish
+
 
 # RFC: CNB Integration Polish
 

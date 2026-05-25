@@ -1,8 +1,7 @@
----
-title: "Ad-Hoc Execution & History"
-stage: 3 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Ad-Hoc Execution
----
+<!-- exo:32 ulid:01krkpxdvr1b7dmt3bfbkgng06 -->
+
+# RFC 32: Ad-Hoc Execution & History
+
 
 # RFC 0032: Ad-Hoc Execution & History
 

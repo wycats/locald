@@ -1,3 +1,7 @@
+<!-- exo:69 ulid:01krkpxdwzcvwyf2g2gnq68b6q -->
+
+# RFC 69: Rust Implementation of CNB Launcher
+
 # Rust Implementation of CNB Launcher
 
 - Feature Name: `rust_cnb_launcher`

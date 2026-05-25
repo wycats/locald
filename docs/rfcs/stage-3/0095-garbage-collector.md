@@ -1,3 +1,7 @@
+<!-- exo:95 ulid:01krkpxdwkwwd5c3fjnqvrtyfj -->
+
+# RFC 95: The Garbage Collector Protocol
+
 # RFC 0095: The Garbage Collector Protocol
 
 - **Date:** 2025-12-11

@@ -1,8 +1,7 @@
----
-title: Privileged Capability Acquisition
-stage: 1
-feature: Engineering Excellence
----
+<!-- exo:110 ulid:01krkpxdttjz5kbagakfyhqva6 -->
+
+# RFC 110: Privileged Capability Acquisition
+
 
 # RFC 0110: Privileged Capability Acquisition
 

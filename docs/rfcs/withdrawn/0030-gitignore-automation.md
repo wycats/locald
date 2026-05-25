@@ -1,8 +1,7 @@
----
-title: "Gitignore: Automated Management"
-stage: 3
-feature: DX
----
+<!-- exo:30 ulid:01krkpxdwxhrynxvkxv5vgrnnf -->
+
+# RFC 30: Gitignore: Automated Management
+
 
 # RFC: Gitignore: Automated Management
 

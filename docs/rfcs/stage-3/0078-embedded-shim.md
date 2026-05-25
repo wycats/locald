@@ -1,8 +1,7 @@
----
-title: "Embedded Shim Distribution"
-stage: 3 # Recommended
-feature: Architecture
----
+<!-- exo:78 ulid:01krkpxdwdrjr4dm1df31nhxz8 -->
+
+# RFC 78: Embedded Shim Distribution
+
 
 # RFC 0078: Embedded Shim Distribution
 

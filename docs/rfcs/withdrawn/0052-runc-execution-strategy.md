@@ -1,8 +1,7 @@
----
-title: "Runc Execution Strategy"
-stage: 1 # Superseded by RFC 0098
-feature: Core Architecture
----
+<!-- exo:52 ulid:01krkpxdwy0by8tha5hrj1n2zx -->
+
+# RFC 52: Runc Execution Strategy
+
 
 > **Note**: This RFC has been superseded by [RFC 0098: Libcontainer Execution Strategy](0098-libcontainer-execution-strategy.md). The `runc` strategy was implemented but later replaced by the embedded `libcontainer` strategy.
 

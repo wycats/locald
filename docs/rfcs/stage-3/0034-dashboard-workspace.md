@@ -1,8 +1,7 @@
----
-title: "Dashboard as Workspace"
-stage: 3
-feature: Design
----
+<!-- exo:34 ulid:01krkpxdvtmesys1b4rmqq37wb -->
+
+# RFC 34: Dashboard as Workspace
+
 
 # RFC: Dashboard as Workspace
 

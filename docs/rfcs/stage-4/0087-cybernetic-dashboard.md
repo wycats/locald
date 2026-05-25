@@ -1,8 +1,7 @@
----
-title: "The Cybernetic Workspace: Rack, Stream, Deck"
-stage: 3 # Recommended
-feature: Dashboard
----
+<!-- exo:87 ulid:01krkpxdxe575cer7mz9as8czk -->
+
+# RFC 87: The Cybernetic Workspace: Rack, Stream, Deck
+
 
 # RFC 0087: The Cybernetic Workspace (Rack, Stream, Deck)
 

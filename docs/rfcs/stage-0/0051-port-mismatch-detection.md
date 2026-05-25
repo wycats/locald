@@ -1,8 +1,7 @@
----
-title: "Port Mismatch Detection & Negotiation"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Port Mismatch Detection
----
+<!-- exo:51 ulid:01krkpxdtfweg5j6xpg9v5wzxe -->
+
+# RFC 51: Port Mismatch Detection & Negotiation
+
 
 # RFC: Port Mismatch Detection & Negotiation
 

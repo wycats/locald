@@ -1,8 +1,7 @@
----
-title: "CLI: TUI Monitor"
-stage: 3
-feature: CLI
----
+<!-- exo:16 ulid:01krkpxdvfzwezz2m5gggkjbmf -->
+
+# RFC 16: CLI: TUI Monitor
+
 
 # RFC: CLI: TUI Monitor
 

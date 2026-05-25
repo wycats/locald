@@ -1,8 +1,7 @@
----
-title: "Rust-based OCI Registry (Strawman)"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Distribution
----
+<!-- exo:48 ulid:01krkpxdteexr5gyy102be1f65 -->
+
+# RFC 48: Rust-based OCI Registry (Strawman)
+
 
 # RFC 0048: Rust-based OCI Registry (Strawman)
 

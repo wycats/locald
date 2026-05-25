@@ -1,7 +1,7 @@
----
-title: Testing Philosophy
-stage: 3
----
+<!-- exo:82 ulid:01krkpxdtv6es0px056mkwhkh7 -->
+
+# RFC 82: Testing Philosophy
+
 
 # RFC 0082: Testing Philosophy: No Mocks, Just Fakes
 

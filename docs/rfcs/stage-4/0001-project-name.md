@@ -1,8 +1,7 @@
----
-title: "Project Name: locald"
-stage: 3
-feature: Architecture
----
+<!-- exo:1 ulid:01krkpxdx31yzqvyfns2swfj3w -->
+
+# RFC 1: Project Name: locald
+
 
 # RFC: Project Name: locald
 

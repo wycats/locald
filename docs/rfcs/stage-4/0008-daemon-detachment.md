@@ -1,8 +1,7 @@
----
-title: "Daemon Detachment: setsid"
-stage: 3
-feature: Architecture
----
+<!-- exo:8 ulid:01krkpxdx9avymd4ja0av8narp -->
+
+# RFC 8: Daemon Detachment: setsid
+
 
 # RFC: Daemon Detachment: setsid
 

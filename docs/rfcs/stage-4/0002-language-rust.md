@@ -1,8 +1,7 @@
----
-title: "Language: Rust"
-stage: 3
-feature: Architecture
----
+<!-- exo:2 ulid:01krkpxdx4f1fkfc3t3frgywg1 -->
+
+# RFC 2: Language: Rust
+
 
 # RFC: Language: Rust
 

@@ -1,8 +1,7 @@
----
-title: "Architecture: Daemon + CLI"
-stage: 3
-feature: Architecture
----
+<!-- exo:4 ulid:01krkpxdx64sjpdqm8vqpbzn4v -->
+
+# RFC 4: Architecture: Daemon + CLI
+
 
 # RFC: Architecture: Daemon + CLI
 

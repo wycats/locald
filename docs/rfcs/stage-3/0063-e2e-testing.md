@@ -1,8 +1,7 @@
----
-title: "E2E Testing Infrastructure"
-stage: 3
-feature: Testing
----
+<!-- exo:63 ulid:01krkpxdw6qx0vkrb2brsa320m -->
+
+# RFC 63: E2E Testing Infrastructure
+
 
 # Design: E2E Testing Infrastructure
 

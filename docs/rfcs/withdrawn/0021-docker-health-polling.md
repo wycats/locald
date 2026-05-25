@@ -1,8 +1,7 @@
----
-title: "Docker Health: Polling"
-stage: 3
-feature: Health
----
+<!-- exo:21 ulid:01krkpxdwwxskh0zj1fmpbtt8g -->
+
+# RFC 21: Docker Health: Polling
+
 
 # RFC: Docker Health: Polling
 

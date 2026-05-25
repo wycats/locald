@@ -1,8 +1,7 @@
----
-title: "Cloud Native Buildpacks (CNB) Integration"
-stage: 3 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Build System
----
+<!-- exo:43 ulid:01krkpxdvxx6105gr4ea65xgjk -->
+
+# RFC 43: Cloud Native Buildpacks (CNB) Integration
+
 
 # RFC 0043: Cloud Native Buildpacks (CNB) Integration
 

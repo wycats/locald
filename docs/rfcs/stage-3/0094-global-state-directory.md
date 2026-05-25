@@ -1,3 +1,7 @@
+<!-- exo:94 ulid:01krkpxdwjw6pp9bd5mm2prnvg -->
+
+# RFC 94: Global State Directory
+
 # Global State Directory
 
 - **Status**: Stage 3 (Recommended)

@@ -1,8 +1,7 @@
----
-title: "Process Recovery: Kill & Restart"
-stage: 3
-feature: Architecture
----
+<!-- exo:13 ulid:01krkpxdve7dyvdh04d90q1sht -->
+
+# RFC 13: Process Recovery: Kill & Restart
+
 
 # RFC: Process Recovery: Kill & Restart
 

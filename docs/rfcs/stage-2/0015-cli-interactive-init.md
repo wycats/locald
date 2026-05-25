@@ -1,8 +1,7 @@
----
-title: "CLI: Interactive Init"
-stage: 3
-feature: CLI
----
+<!-- exo:15 ulid:01krkpxdv53t1c9v1w0et2t99v -->
+
+# RFC 15: CLI: Interactive Init
+
 
 # RFC: CLI: Interactive Init
 

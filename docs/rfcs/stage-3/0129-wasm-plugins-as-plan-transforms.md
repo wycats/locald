@@ -1,11 +1,7 @@
----
-title: WASM Plugins as Plan Transforms
-stage: 3
-feature: Extensibility
-exo:
-  tool: exo rfc create
-  protocol: 1
----
+<!-- exo:129 ulid:01krkpxdvcjazwz86ytz2tn03k -->
+
+# RFC 129: WASM Plugins as Plan Transforms
+
 
 # RFC 0129: WASM Plugins as Plan Transforms
 

@@ -1,11 +1,7 @@
----
-title: Post-MAP Release Themes: Front End Apps
-stage: 0
-feature: Shipping
-exo:
-    tool: exo rfc create
-    protocol: 1
----
+<!-- exo:124 ulid:01krkpxdt803s35vya82dd5jcy -->
+
+# RFC 124: Post-MAP Release Themes: Front End Apps
+
 
 
 # RFC 0124: Post-MAP Release Themes: Front End Apps

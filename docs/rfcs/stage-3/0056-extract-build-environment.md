@@ -1,8 +1,7 @@
----
-title: "Extract Build Environment & DevContainers"
-stage: 0 # 0: Strawman
-feature: Developer Experience
----
+<!-- exo:56 ulid:01krkpxdw2j62gem9hmdz42t96 -->
+
+# RFC 56: Extract Build Environment & DevContainers
+
 
 # RFC: Extract Build Environment & DevContainers
 

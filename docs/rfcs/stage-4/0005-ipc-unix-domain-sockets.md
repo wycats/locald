@@ -1,8 +1,7 @@
----
-title: "IPC: Unix Domain Sockets"
-stage: 3
-feature: Architecture
----
+<!-- exo:5 ulid:01krkpxdx7de8naqjtbjedf27h -->
+
+# RFC 5: IPC: Unix Domain Sockets
+
 
 # RFC: IPC: Unix Domain Sockets
 

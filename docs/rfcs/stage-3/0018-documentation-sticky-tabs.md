@@ -1,8 +1,7 @@
----
-title: "Documentation: Sticky Language Tabs"
-stage: 3
-feature: Documentation
----
+<!-- exo:18 ulid:01krkpxdvha9wr2gdm6vd3smsw -->
+
+# RFC 18: Documentation: Sticky Language Tabs
+
 
 # RFC: Documentation: Sticky Language Tabs
 

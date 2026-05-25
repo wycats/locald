@@ -1,8 +1,7 @@
----
-title: "Default Domain: .localhost"
-stage: 3
-feature: Architecture
----
+<!-- exo:24 ulid:01krkpxdvk7nmr55a0zsf1ac0b -->
+
+# RFC 24: Default Domain: .localhost
+
 
 # RFC: Default Domain: .localhost
 

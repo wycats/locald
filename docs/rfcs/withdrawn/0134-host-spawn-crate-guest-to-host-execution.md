@@ -1,12 +1,7 @@
----
-title: Host-Spawn Crate (Guest-to-Host Execution)
-stage: 2
-feature: Container Development
-exo:
-    tool: exo rfc create
-    protocol: 1
-superseded_by: "0138"
----
+<!-- exo:134 ulid:01krkpxdwve8pz8gwd9cspzsb3 -->
+
+# RFC 134: Host-Spawn Crate (Guest-to-Host Execution)
+
 
 
 # RFC 0134: Host-Spawn Crate (Guest-to-Host Execution)

@@ -1,3 +1,7 @@
+<!-- exo:58 ulid:01krkpxdw3myfqpjqgaz23cymm -->
+
+# RFC 58: Documentation-Driven Design (DDD) Audit
+
 # RFC 0058: Documentation-Driven Design (DDD) Audit
 
 - **Status**: Stage 0 (Strawman)

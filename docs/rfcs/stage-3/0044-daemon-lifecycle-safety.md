@@ -1,8 +1,7 @@
----
-title: "Daemon Lifecycle: PID File & Socket Safety"
-stage: 3
-feature: Architecture
----
+<!-- exo:44 ulid:01krkpxdvym86b3a0xkcrmvbg9 -->
+
+# RFC 44: Daemon Lifecycle: PID File & Socket Safety
+
 
 # RFC: Daemon Lifecycle: PID File & Socket Safety
 

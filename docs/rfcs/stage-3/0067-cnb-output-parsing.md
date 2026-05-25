@@ -1,3 +1,7 @@
+<!-- exo:67 ulid:01krkpxdw8t1kz6qs0mp41627k -->
+
+# RFC 67: CNB Output Parsing Strategy
+
 # RFC 0067: CNB Output Parsing Strategy
 
 - **Status**: Accepted

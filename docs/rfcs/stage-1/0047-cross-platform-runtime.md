@@ -1,8 +1,7 @@
----
-title: "Cross-Platform Container Runtime Strategy"
-stage: 1 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Core Architecture
----
+<!-- exo:47 ulid:01krkpxdtxm20pzrbn05yvmejx -->
+
+# RFC 47: Cross-Platform Container Runtime Strategy
+
 
 # RFC 0047: Cross-Platform Container Runtime Strategy
 

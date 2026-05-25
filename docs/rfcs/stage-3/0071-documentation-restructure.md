@@ -1,3 +1,7 @@
+<!-- exo:71 ulid:01krkpxdwb23ek17atkhjrvkc0 -->
+
+# RFC 71: Documentation Restructure
+
 # Documentation Restructure
 
 - Feature Name: `documentation_restructure`

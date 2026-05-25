@@ -1,8 +1,7 @@
----
-title: "Composable CNB Library (locald-pack)"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Build System
----
+<!-- exo:49 ulid:01krkpxdtx7cj449ptqppq3qaz -->
+
+# RFC 49: Composable CNB Library (locald-pack)
+
 
 # RFC 0049: Composable CNB Library (`locald-pack`)
 

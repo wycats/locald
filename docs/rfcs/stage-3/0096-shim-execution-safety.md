@@ -1,8 +1,7 @@
----
-title: "Shim Architecture: The Leaf Node Axiom"
-stage: 3 # Recommended
-feature: Security
----
+<!-- exo:96 ulid:01krkpxdwmpj7crjfvkcpndxwc -->
+
+# RFC 96: Shim Architecture: The Leaf Node Axiom
+
 
 # RFC 0096: Shim Architecture: The Leaf Node Axiom
 

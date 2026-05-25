@@ -1,8 +1,7 @@
----
-title: "System Plane and Unified Pinning"
-stage: 3 # Available
-feature: Dashboard
----
+<!-- exo:100 ulid:01krkpxdwq756hk8y2qm73zma6 -->
+
+# RFC 100: System Plane and Unified Pinning
+
 
 # RFC 0100: System Plane and Unified Pinning
 

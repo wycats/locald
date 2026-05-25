@@ -1,8 +1,7 @@
----
-title: "Single Binary Distribution"
-stage: 3
-feature: Architecture
----
+<!-- exo:25 ulid:01krkpxdvm5d60b5yd77yy3xd6 -->
+
+# RFC 25: Single Binary Distribution
+
 
 # RFC: Single Binary Distribution
 

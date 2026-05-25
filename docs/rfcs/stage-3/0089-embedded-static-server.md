@@ -1,3 +1,7 @@
+<!-- exo:89 ulid:01krkpxdwfmsyvsm711csgk9bm -->
+
+# RFC 89: Embedded Static Server
+
 # Embedded Static Server
 
 ## Context

@@ -1,8 +1,7 @@
----
-title: "Docs Site: Persona Routing + Jargon Budget"
-stage: 0 # 0: Strawman, 1: Accepted, 2: Available, 3: Recommended, 4: Stable
-feature: Documentation
----
+<!-- exo:103 ulid:01krkpxdtn6sq5wtzaj0g864fj -->
+
+# RFC 103: Docs Site: Persona Routing + Jargon Budget
+
 
 # RFC 0103: Docs Site: Persona Routing + Jargon Budget
 

@@ -1,7 +1,7 @@
----
-title: Formalizing Container Engine Responsibilities
-stage: 0
----
+<!-- exo:64 ulid:01krkpxdtgemkkwfp2pp38dzaw -->
+
+# RFC 64: Formalizing Container Engine Responsibilities
+
 
 # Formalizing Container Engine Responsibilities
 

@@ -1,3 +1,7 @@
+<!-- exo:70 ulid:01krkpxdv6m8821s44x1qj5d3w -->
+
+# RFC 70: Cliclack UI Adoption
+
 # RFC 0070: Cliclack UI Adoption
 
 ## Summary

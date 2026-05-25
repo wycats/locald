@@ -1,3 +1,7 @@
+<!-- exo:97 ulid:01krkpxdwm2xmvmbyw499q9f7g -->
+
+# RFC 97: Strict Shim Discovery
+
 # RFC 0097: Strict Shim Discovery
 
 - **Status**: Accepted

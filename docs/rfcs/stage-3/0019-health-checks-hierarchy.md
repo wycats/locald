@@ -1,8 +1,7 @@
----
-title: "Health Checks: Zero-Config Hierarchy"
-stage: 3
-feature: Health
----
+<!-- exo:19 ulid:01krkpxdvjx3302atv5ap4kdrb -->
+
+# RFC 19: Health Checks: Zero-Config Hierarchy
+
 
 # RFC: Health Checks: Zero-Config Hierarchy
 
