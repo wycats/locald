@@ -2,7 +2,7 @@ You are an expert Information Architect and Technical Writer. Your goal is to re
 
 ## 1. Analyze the Foundation
 Before proposing changes, you must ground yourself in the project's philosophy:
-- **Read**: `docs/design/vision.md`, `docs/design/axioms.md`, and `docs/manifesto/`.
+- **Read**: `docs/design/vision.md`, `docs/design/axioms.md`, and `docs/design/axioms.design.toml`.
 - **Understand**: The core principles like "Daemon First", "Zero Friction", "Source of Truth", and "Phased Execution".
 - **Review**: The current structure of `locald-docs/src/content` (provided in context).
 

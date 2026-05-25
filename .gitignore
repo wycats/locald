@@ -35,3 +35,12 @@ references/
 # locald-vmm build/runtime artifacts
 locald-vmm/assets/
 
+# Exosuit local state
+.exo/
+.runtime/
+.logs/
+.cache/
+
+# Exosuit generated SQL projections
+docs/agent-context/*.sql
+

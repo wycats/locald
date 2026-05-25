@@ -10,9 +10,9 @@ When picking up work in the middle of a phase (e.g., starting a new chat session
 - **Context Restoration**: Run \`exo context restore\`.
   - This command will output the current project context, including the active task list and implementation plan.
 - **State Analysis**:
-  - Review the \`Task List\` output to identify completed and pending items.
-  - Review the `Implementation Plan` to understand the current technical direction.
-  - Review the `Walkthrough` (if any) to see what has been accomplished so far.
+  - Review `exo task list` when a phase is active to identify completed and pending items.
+  - Review the implementation plan artifact to understand the current technical direction.
+  - Review `docs/agent-context/current/walkthrough.md` (if any) to see what has been accomplished so far.
 - **Resume Work**:
   - Identify the next incomplete task from the task list.
   - Continue execution from that point.

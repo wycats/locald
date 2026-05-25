@@ -5,8 +5,8 @@ Your goal is to rebuild your mental model of the project's coherence and archite
 ## Core Documentation
 
 1.  **Start with `AGENTS.md`**: This is the primary protocol file. It defines your persona, guiding principles, and workflow.
-2.  **Read `docs/manual/vision.md`**: Understand the high-level goals of the project.
-3.  **Read `docs/design/axioms.md`**: Understand the fundamental design constraints.
+2.  **Read `docs/design/vision.md`**: Understand the high-level goals of the project.
+3.  **Read `docs/design/axioms.md` and `docs/design/axioms.design.toml`**: Understand the fundamental design constraints.
 
 ## Package Architecture
 
