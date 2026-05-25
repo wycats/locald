@@ -1,0 +1,10 @@
+# Use the Exosuit semantic TOML merge driver for structured TOML files.
+#
+# Install the driver locally (one-time):
+#   exo update  # or: ./scripts/dev/install-merge-driver.sh
+
+docs/agent-context/current/*.toml merge=exo-toml
+
+# Repo-policy SQL projections are generated files. Sidecar and shadow policy
+# projects do not write operational state into the workspace.
+docs/agent-context/*.sql merge=ours

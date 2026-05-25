@@ -15,5 +15,5 @@ files = []
 tests = []
 
 [verification]
-automated = ["Run scripts/verify-phase.sh"]
+automated = ["Run exo verify run"]
 manual = []

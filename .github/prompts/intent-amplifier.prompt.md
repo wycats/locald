@@ -23,7 +23,7 @@ Before processing, you must locate the project's "Generating Equation":
 
 1.  **Axioms**: The core math (Workflow/System/Design) (e.g., `docs/agent-context/axioms.workflow.toml`, `docs/agent-context/axioms.system.toml`, `docs/design/axioms.design.toml`).
 2.  **Laws**: The historical decisions (e.g., `docs/rfcs/`).
-3.  **Plan**: The current trajectory (e.g., `docs/agent-context/plan.toml`).
+3.  **Plan**: The current trajectory from `exo status` and `exo plan review`.
 
 ## Instructions
 

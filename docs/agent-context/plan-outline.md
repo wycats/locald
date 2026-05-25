@@ -341,7 +341,7 @@ Conventions:
 ### Phase 36: Hot Reloading & Configuration Watcher
 
 **Goal**: Make the system responsive to configuration changes by automatically restarting services when `locald.toml` is modified, and ensuring manual restarts always pick up the latest config.
-**RFC**: [docs/rfcs/0050-hot-reloading.md](../rfcs/0050-hot-reloading.md)
+**RFC**: [docs/rfcs/stage-1/0050-hot-reloading.md](../rfcs/stage-1/0050-hot-reloading.md)
 
 - [ ] **Fix Manual Restart**: Ensure `locald restart` reloads config from disk.
 - [ ] **Project Config Watcher**: Implement a watcher for registered project `locald.toml` files.

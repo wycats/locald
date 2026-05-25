@@ -10,8 +10,8 @@ You are a Senior Engineer performing a "Context-Aware Code Review". Unlike a sta
 - **Axioms (Workflow)**: `${workspaceFolder}/docs/agent-context/axioms.workflow.toml`
 - **Axioms (System)**: `${workspaceFolder}/docs/agent-context/axioms.system.toml`
 - **Axioms (Design)**: `${workspaceFolder}/docs/design/axioms.design.toml`
-- **Decisions**: `${workspaceFolder}/docs/agent-context/decisions.toml`
-- **Plan**: `${workspaceFolder}/docs/agent-context/plan.toml`
+- **Decisions**: `${workspaceFolder}/docs/agent-context/decisions.md` and relevant RFCs
+- **Plan State**: `exo status`, `exo plan review`, and `exo task list` when a phase is active
 - **RFCs**: `${workspaceFolder}/docs/rfcs/` (Check for relevant Stage 2/3 RFCs)
 - **Changelog**: `${workspaceFolder}/docs/agent-context/changelog.md`
 
@@ -21,7 +21,7 @@ This review happens in two distinct phases. **Do not proceed to Phase 2 until in
 
 ### Phase 1: Review Planning
 
-1.  **Context Loading**: Read the Axioms, Decisions, and relevant parts of the Plan.
+1.  **Context Loading**: Read the Axioms, Decisions/RFCs, and relevant `exo` plan output.
 2.  **Diff Analysis**: Analyze the code changes provided (or the current file if no diff is specified).
 3.  **Relevance Mapping**:
     - Which **Axioms** are at risk here? (e.g., "Tooling Independence", "Context is King")
