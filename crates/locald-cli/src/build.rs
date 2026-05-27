@@ -1,11 +1,12 @@
 #![allow(clippy::collapsible_if)]
-use anyhow::{Context, Result};
+use crate::error::CliResult;
+use anyhow::Context;
 use locald_builder::{BuilderImage, Lifecycle};
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::warn;
 
-fn warn_broken_symlinks(project_root: &Path) -> Result<()> {
+fn warn_broken_symlinks(project_root: &Path) -> CliResult<()> {
     fn is_ignored_dir(name: &str) -> bool {
         matches!(
             name,
@@ -13,7 +14,7 @@ fn warn_broken_symlinks(project_root: &Path) -> Result<()> {
         )
     }
 
-    fn walk(dir: &Path) -> Result<()> {
+    fn walk(dir: &Path) -> CliResult<()> {
         for entry in
             std::fs::read_dir(dir).with_context(|| format!("Failed to read dir {dir:?}"))?
         {
@@ -86,7 +87,7 @@ pub fn run(
     builder_image: &str,
     buildpacks: &[String],
     verbose: bool,
-) -> Result<()> {
+) -> CliResult<()> {
     // Initialize tracing if not already done
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)

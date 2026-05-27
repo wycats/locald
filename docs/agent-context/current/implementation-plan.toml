@@ -8,12 +8,113 @@ rfcs = ["0146"]
 
 [plan]
 [[plan.changes]]
-name = "First Step"
+name = "Service status connection data"
 type = "feat"
-details = "Description"
-files = []
-tests = []
+details = "Expose typed service status through IPC/API surfaces by adding service_type and connection_url, with Postgres reporting the same passwordless URL used by interpolation."
+files = [
+  "crates/locald-core/src/ipc.rs",
+  "crates/locald-server/src/api.rs",
+  "crates/locald-server/src/ipc.rs",
+  "crates/locald-server/src/manager.rs",
+  "crates/locald-server/src/service/postgres.rs",
+]
+tests = [
+  "cargo test -p locald-server manager::tests::postgres_status_connection_url_matches_service_interpolation_url",
+  "cargo test -p locald-server manager::tests::inspect_includes_connection_url_for_postgres_service",
+]
+
+[[plan.changes]]
+name = "Dashboard connection display"
+type = "feat"
+details = "Render public browser URLs separately from copyable connection URLs so data services do not appear as browser links."
+files = [
+  "locald-dashboard/src/lib/components/ProjectView.svelte",
+  "locald-dashboard/src/lib/components/Rack.svelte",
+  "locald-dashboard/src/lib/components/ServiceCard.svelte",
+  "locald-dashboard/src/lib/types.ts",
+  "locald-dashboard/src/lib/utils/service-display.ts",
+  "locald-dashboard/src/lib/utils/service-display.test.ts",
+]
+tests = ["pnpm -C locald-dashboard test -- service-display"]
+
+[[plan.changes]]
+name = "CLI error and docs polish"
+type = "fix"
+details = "Normalize default-path CLI errors through CliError/miette and make the website CLI reference the source of truth for the current command surface, including typed Postgres add commands."
+files = [
+  "crates/locald-cli/src/cli.rs",
+  "crates/locald-cli/src/error.rs",
+  "crates/locald-cli/src/handlers.rs",
+  "crates/locald-cli/src/service.rs",
+  "crates/locald-cli/tests/cmd/error-messages.md",
+  "docs/manual/features/cli.md",
+  "locald-docs/src/content/docs/reference/cli.md",
+]
+tests = [
+  "cargo test -p locald-cli handlers::ux_tests",
+  "cargo test -p locald-cli service::tests::postgres_add_command_generates_typed_service_config",
+]
+
+[[plan.changes]]
+name = "Host process startup UX"
+type = "fix"
+details = "Pass the CLI PATH through Start and ProjectAttach IPC into daemon-spawned host services while keeping .env and explicit service env precedence; keep locald up quiet unless --verbose is requested."
+files = [
+  "crates/locald-cli/src/handlers.rs",
+  "crates/locald-cli/src/service.rs",
+  "crates/locald-core/src/ipc.rs",
+  "crates/locald-server/src/api.rs",
+  "crates/locald-server/src/ipc.rs",
+  "crates/locald-server/src/manager.rs",
+]
+tests = [
+  "cargo test -p locald-cli handlers::ux_tests",
+  "cargo test -p locald-server manager::tests::merge_service_start_env_preserves_precedence",
+]
+
+[[plan.changes]]
+name = "Postgres contract reconciliation"
+type = "fix"
+details = "Make managed Postgres docs, status metadata, service interpolation, dashboard tests, and integration examples agree on the RFC 0112 C-013 passwordless URL contract and XDG-first state location."
+files = [
+  "crates/locald-cli/tests/postgres_test.rs",
+  "crates/locald-server/src/manager.rs",
+  "crates/locald-server/src/service/postgres.rs",
+  "docs/manual/features/service-urls.md",
+  "locald-dashboard/src/lib/utils/service-display.test.ts",
+  "locald-docs/src/content/docs/guides/managed-services.md",
+]
+tests = [
+  "cargo test -p locald-server manager::tests::postgres_status_connection_url_matches_service_interpolation_url",
+  "cargo test -p locald-server manager::tests::inspect_includes_connection_url_for_postgres_service",
+]
+
+[[plan.changes]]
+name = "Current handoff coherence"
+type = "docs"
+details = "Replace stale previous-phase current-context artifacts with the active phase-ux-polish plan, task list, and walkthrough so phase finish handoff matches the working tree and Exosuit state."
+files = [
+  "docs/agent-context/current/implementation-plan.toml",
+  "docs/agent-context/current/implementation-plan.md",
+  "docs/agent-context/current/task-list.md",
+  "docs/agent-context/current/walkthrough.md",
+]
+tests = [
+  "grep current agent context for previous-phase and placeholder drift markers",
+]
 
 [verification]
-automated = ["Run exo verify run"]
-manual = []
+automated = [
+  "cargo fmt --check",
+  "cargo check -q -p locald-core -p locald-server -p locald-cli",
+  "cargo test -p locald-cli handlers::ux_tests",
+  "cargo test -p locald-server manager::tests::merge_service_start_env_preserves_precedence",
+  "cargo test -p locald-server manager::tests::postgres_status_connection_url_matches_service_interpolation_url",
+  "cargo test -p locald-server manager::tests::inspect_includes_connection_url_for_postgres_service",
+  "pnpm -C locald-docs build",
+]
+manual = [
+  "Confirm locald up default output is concise and points to locald logs --follow.",
+  "Confirm locald up --verbose still streams startup logs.",
+  "Confirm Postgres examples use postgres://postgres@localhost:<port>/postgres without invented passwords.",
+]

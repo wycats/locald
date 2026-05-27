@@ -1,9 +1,10 @@
-use anyhow::{Context, Result};
+use crate::error::CliResult;
+use anyhow::Context;
 use listeners::get_all;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-pub fn check_port(port: u16) -> Result<()> {
+pub fn check_port(port: u16) -> CliResult<()> {
     // If we are not root, try to use the shim to see all processes
     #[cfg(unix)]
     if !nix::unistd::geteuid().is_root() {
@@ -24,7 +25,7 @@ pub fn check_port(port: u16) -> Result<()> {
     println!("Checking port {port}...");
 
     let listeners = get_all()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .map_err(|e| crate::error::CliError::message(e.to_string()))
         .context("Failed to get system listeners")?;
 
     let mut found = false;

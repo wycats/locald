@@ -44,7 +44,7 @@ Other web-facing services are mapped to subdomains of the project domain.
 Services with specific types (like `postgres`, `redis`) are assigned protocol-specific URLs. These are connection strings rather than web links.
 
 - **Service Name**: `db` (`type = "postgres"`)
-- **Assigned URL**: `postgres://postgres:postgres@localhost:5432/postgres`
+- **Assigned URL**: `postgres://postgres@localhost:<assigned-port>/postgres`
 - **Dashboard Behavior**: These URLs are displayed for reference but do not open in a browser.
 
 ### 4. Workers (No URL)

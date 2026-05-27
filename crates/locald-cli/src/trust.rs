@@ -1,10 +1,11 @@
+use crate::error::{CliError, CliResult};
 use crate::style;
-use anyhow::{Context, Result};
+use anyhow::Context;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-pub fn run() -> Result<()> {
+pub fn run() -> CliResult<()> {
     // If we're not root and a privileged shim exists, delegate the entire operation to it.
     #[cfg(unix)]
     if !nix::unistd::geteuid().is_root() {
@@ -14,7 +15,9 @@ pub fn run() -> Result<()> {
                     .arg("admin")
                     .arg("trust")
                     .exec();
-                anyhow::bail!("Failed to exec shim for trust install: {err}");
+                return Err(CliError::message(format!(
+                    "Failed to exec shim for trust install: {err}"
+                )));
             }
         }
     }
@@ -47,14 +50,14 @@ pub fn run() -> Result<()> {
 /// Ensure a locald Root CA exists and install it into the system trust store.
 ///
 /// This function performs no user-facing printing so callers can control output.
-pub fn install_root_ca_into_trust_store() -> Result<()> {
+pub fn install_root_ca_into_trust_store() -> CliResult<()> {
     let ensure = locald_utils::cert::ensure_root_ca()?;
     install_ca(&ensure.paths.cert_path)?;
 
     Ok(())
 }
 
-fn install_ca(cert_path: &std::path::Path) -> Result<()> {
+fn install_ca(cert_path: &std::path::Path) -> CliResult<()> {
     // On macOS, ca_injector is not supported — use the native security CLI directly.
     #[cfg(target_os = "macos")]
     return install_ca_macos(cert_path);
@@ -66,27 +69,30 @@ fn install_ca(cert_path: &std::path::Path) -> Result<()> {
         if let Err(e) = ca_injector::install_ca(path_str) {
             let msg = e.to_string();
             if msg.contains("Permission denied") || msg.contains("os error 13") {
-                anyhow::bail!(
-                    "Permission denied. Please run `locald admin setup` to configure HTTPS trust."
-                );
+                return Err(CliError::message(
+                    "Permission denied. Please run `locald admin setup` to configure HTTPS trust.",
+                ));
             }
 
             #[cfg(target_os = "linux")]
             {
                 if msg.contains("cannot find binary path") {
-                    return install_ca_linux_fallback(cert_path)
-                        .with_context(|| format!("ca_injector failed: {msg}"));
+                    return install_ca_linux_fallback(cert_path).map_err(|err| {
+                        anyhow::Error::from(err)
+                            .context(format!("ca_injector failed: {msg}"))
+                            .into()
+                    });
                 }
             }
 
-            return Err(e).context("Failed to install CA certificate");
+            return Err(e.context("Failed to install CA certificate").into());
         }
         Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
-fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
+fn install_ca_linux_fallback(cert_path: &std::path::Path) -> CliResult<()> {
     use std::process::Command;
 
     // Fedora/RHEL family
@@ -101,7 +107,9 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
             .status()
             .context("Failed to execute update-ca-trust extract")?;
         if !status.success() {
-            anyhow::bail!("update-ca-trust extract failed with status: {status}");
+            return Err(CliError::message(format!(
+                "update-ca-trust extract failed with status: {status}"
+            )));
         }
         return Ok(());
     }
@@ -117,18 +125,20 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
             .status()
             .context("Failed to execute update-ca-certificates")?;
         if !status.success() {
-            anyhow::bail!("update-ca-certificates failed with status: {status}");
+            return Err(CliError::message(format!(
+                "update-ca-certificates failed with status: {status}"
+            )));
         }
         return Ok(());
     }
 
-    anyhow::bail!(
-        "No known Linux trust-store directories found; install p11-kit-trust / update-ca-trust or equivalent"
-    );
+    Err(CliError::message(
+        "No known Linux trust-store directories found; install p11-kit-trust / update-ca-trust or equivalent",
+    ))
 }
 
 #[cfg(target_os = "macos")]
-fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
+fn install_ca_macos(cert_path: &std::path::Path) -> CliResult<()> {
     // Use the `security` CLI to add the cert as trusted. This is the most reliable
     // approach on macOS — the native SecTrustSettings API has issues with authorization
     // dialogs and session contexts that the CLI handles transparently.
@@ -155,10 +165,10 @@ fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
     };
 
     if !status.success() {
-        anyhow::bail!(
+        return Err(CliError::message(format!(
             "`security add-trusted-cert` failed with status: {status}. \
              You may need to run `sudo locald admin setup` or manually trust the CA in Keychain Access."
-        );
+        )));
     }
 
     Ok(())

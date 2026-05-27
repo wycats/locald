@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use crate::error::{CliError, CliResult};
+use anyhow::Context;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-fn get_history_path() -> Result<PathBuf> {
+fn get_history_path() -> CliResult<PathBuf> {
     let data_dir = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(xdg)
     } else {
@@ -13,7 +14,7 @@ fn get_history_path() -> Result<PathBuf> {
     Ok(data_dir.join("locald/history"))
 }
 
-pub fn append(command: &str) -> Result<()> {
+pub fn append(command: &str) -> CliResult<()> {
     let path = get_history_path()?;
 
     if let Some(parent) = path.parent() {
@@ -29,11 +30,11 @@ pub fn append(command: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn get_last() -> Result<String> {
+pub fn get_last() -> CliResult<String> {
     let path = get_history_path()?;
 
     if !path.exists() {
-        anyhow::bail!("No history found.");
+        return Err(CliError::message("No history found."));
     }
 
     let file = std::fs::File::open(path)?;

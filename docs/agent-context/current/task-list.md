@@ -1,52 +1,76 @@
-# Task List - Phase 97: Remove `runc` (Libcontainer “Fat Shim”)
+# Task List - UX Polish: User-Visible Improvements
 
-## 0. Planning / Review
+## 0. Phase State
 
-- [x] **Confirm shim interface** (Option A: `bundle run` only; rely on existing privileged cleanup/state conventions)
-- [x] **Define success matrix** (Linux dev flow + sandboxed e2e; prove `runc` is not required)
+- **Epoch:** E4 — The Build Era
+- **Phase:** `phase-ux-polish`
+- **Mode:** executing
+- **Active remaining goal:** `ux.8` — Phase Finish Blockers: Resolve Postgres URL contract and current handoff drift
 
-**Success matrix (current)**:
+## 1. Completed Goals
 
-- [x] `locald --sandbox=<name> container run alpine echo hello` works after `sudo locald admin setup`.
-- [x] `cargo test -p locald-cli --test e2e` passes.
-- [x] `cargo test -p locald-cli --test tui_test` passes.
-- [x] E2E asserts stderr does not mention `runc`.
+- [x] **ux.1 — Service Status Contract**
+  - `ServiceStatus` includes `service_type` and `connection_url`.
+  - Server status/API surfaces populate these fields from service config/runtime data.
 
-## 1. Inventory
+- [x] **ux.2 — Postgres DATABASE_URL Injection**
+  - Services depending on typed Postgres receive a shared interpolation-based `DATABASE_URL`.
+  - Added direct regression coverage for injection and env resolution behavior.
 
-- [x] **Enumerate `runc` call sites** (daemon, `cnb-client`, examples, tests)
-- [x] **Classify usage**: runtime dependency vs docs/examples vs legacy compatibility
+- [x] **ux.3 — Dashboard Accuracy**
+  - Inspect/status surfaces expose `service_type` and nullable `connection_url`.
+  - Dashboard components render browser URLs as links and data-service connection URLs as copyable non-navigation values.
+  - Added `service-display` utility coverage.
 
-**Current status**:
+- [x] **ux.4 — CLI Error Standardization**
+  - Default-path CLI runtime errors render through `CliError`/miette.
+  - Empty command coverage asserts normalized error output without crash-report footer noise.
 
-- **Runtime**: no remaining code paths should shell out to an external `runc` binary.
-- **Docs**: `locald-docs/` documents that `runc` is not required; rebuild generated docs artifacts if they still contain stale `runc` wording.
-- **Legacy**: some RFCs/specs intentionally discuss `runc` historically; leave as-is unless they claim it is still required.
+- [x] **ux.5 — CLI Documentation**
+  - Manual CLI page is a pointer-only stub.
+  - Website CLI reference documents the current command surface and avoids removed/plumbing commands.
 
-## 2. `locald-shim`: `libcontainer` runtime
+- [x] **ux.6 — Postgres Add Command Coverage**
+  - `locald add postgres` and `locald service add postgres` dispatch to typed Postgres configuration generation.
+  - Added direct parser/config regression coverage.
 
-- [x] **Add libcontainer dependency** with conservative feature flags
-- [x] **Implement bundle run** (`bundle run --bundle <path> --id <id>`)
-- [x] **Bundle cleanup semantics** (Option A: no `bundle delete` subcommand; rely on state-dir conventions + existing privileged cleanup)
-- [x] **Harden error reporting** (actionable caller errors, preserve backtraces in debug)
+- [x] **ux.7 — Host Process UX Follow-up**
+  - CLI `PATH` is inherited through Start and ProjectAttach IPC into daemon host-service startup.
+  - Env precedence remains inherited CLI env < `.env` < explicit service env.
+  - `locald up` no longer streams logs by default; `--verbose` preserves log streaming.
 
-## 3. Caller migrations
+## 2. Active Goal: `ux.8`
 
-- [x] **Daemon/runtime**: replace `runc` invocation path with new shim bundle path
-- [x] **CNB runtime (`cnb-client`)**: replace `runc` invocation path with new shim bundle path
-- [x] **Remove/retire legacy helpers** (`spawn_runc_process`, `ShimRuntime::*runc*`)
+- [ ] **ux.8::ux.8::postgres-url-contract — Resolve Postgres URL contract**
+  - [x] Update shared Postgres URL helper to return `postgres://postgres@localhost:<port>/postgres`.
+  - [x] Update server status/inspect tests to expect passwordless URL shape.
+  - [x] Update dashboard display tests to expect passwordless Postgres connection URLs.
+  - [x] Update managed services and service URL docs to stop inventing passwords.
+  - [x] Update ignored Postgres integration example to use the same passwordless URL contract.
+  - [ ] Finish focused validation and complete Exosuit task.
 
-## 4. Verification
+- [ ] **ux.8::ux.8::current-handoff-drift — Refresh current handoff artifacts**
+  - [x] Replace stale implementation plan with UX polish plan.
+  - [x] Replace stale task list with UX polish goal/task status.
+  - [x] Replace stale walkthrough with UX polish walkthrough.
+  - [x] Remove obsolete completion status from the current directory.
+  - [ ] Confirm grep no longer finds previous-phase/current placeholder drift in `docs/agent-context/current`.
+  - [ ] Complete Exosuit task.
 
-- [x] **E2E suite green**
-- [x] **Regression**: host exec services unaffected (no behavior change expected; existing exec-based examples continue to work)
-- [x] **No-`runc` test**: prove container execution works when `runc` is missing
+## 3. Validation Checklist
 
-Notes:
+- [ ] `cargo fmt --check`
+- [ ] `cargo check -q -p locald-core -p locald-server -p locald-cli`
+- [ ] `cargo test -p locald-cli handlers::ux_tests`
+- [ ] `cargo test -p locald-server manager::tests::merge_service_start_env_preserves_precedence`
+- [ ] `cargo test -p locald-server manager::tests::postgres_status_connection_url_matches_service_interpolation_url`
+- [ ] `cargo test -p locald-server manager::tests::inspect_includes_connection_url_for_postgres_service`
+- [ ] Dashboard focused service display test
+- [ ] `pnpm -C locald-docs build`
+- [ ] Grep source/current docs for stale Postgres URL and previous-phase handoff markers
 
-- The key invariant is: container execution does not shell out to `runc` and does not require `runc` to be installed.
+## 4. Finish Criteria
 
-## 5. Cleanup
-
-- [x] **Remove `runc` examples/tests** or migrate them to libcontainer terminology
-- [x] **Docs refresh**: update any references implying `runc` is required
+- `ux.8` tasks are complete in Exosuit.
+- `ux.8` goal outcome is reviewed and recorded.
+- Phase finish only after current handoff artifacts and validation evidence are coherent.

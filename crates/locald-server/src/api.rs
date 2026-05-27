@@ -200,7 +200,10 @@ async fn handle_service_start(
     State(pm): State<Arc<ProcessManager>>,
 ) -> impl IntoResponse {
     if let Some(path) = pm.get_service_path(&name).await {
-        match pm.start(path, None, false).await {
+        match pm
+            .start(path, None, false, std::collections::HashMap::new())
+            .await
+        {
             Ok(()) => StatusCode::OK.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
@@ -228,7 +231,10 @@ async fn handle_service_restart(
     }
 
     if let Some(path) = pm.get_service_path(&name).await {
-        match pm.start(path, None, false).await {
+        match pm
+            .start(path, None, false, std::collections::HashMap::new())
+            .await
+        {
             Ok(()) => StatusCode::OK.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }

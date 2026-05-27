@@ -1,5 +1,5 @@
 use crate::client;
-use anyhow::Result;
+use crate::error::CliResult;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -12,7 +12,7 @@ use ratatui::{
 };
 use std::{fmt::Write as FmtWrite, io, time::Duration};
 
-pub fn run() -> Result<()> {
+pub fn run() -> CliResult<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -34,7 +34,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> CliResult<()> {
     loop {
         // Fetch status
         let services = match client::send_request(&IpcRequest::Status) {

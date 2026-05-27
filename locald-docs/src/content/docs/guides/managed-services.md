@@ -59,16 +59,16 @@ DATABASE_URL = "${services.db.url}"
 ```
 
 When `api` starts, it sees:
-`DATABASE_URL=postgres://postgres:password@127.0.0.1:45123/postgres`
+`DATABASE_URL=postgres://postgres@localhost:45123/postgres`
 
 ### 3. Data Persistence
 
-Your data lives in `.locald/data/postgres-<name>`.
+Your data lives in the locald XDG data directory, under `postgres/<name>` (for example, `~/.local/share/locald/postgres/db` on many Linux systems). If the platform data directory is unavailable, locald falls back to `.locald/postgres/<name>`.
 This folder is:
 
 - **Local**: Fast disk access.
 - **Isolated**: Specific to this project.
-- **Ignored**: Automatically added to `.gitignore`.
+- **Managed**: Used by `locald service reset` when you need to wipe the database state.
 
 ### 4. Resetting State
 

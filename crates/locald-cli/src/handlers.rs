@@ -3,7 +3,7 @@ use crossterm::style::Stylize;
 use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
@@ -69,6 +69,20 @@ const fn section_label(section: ProjectSection) -> &'static str {
         ProjectSection::AlwaysOn => "always-on",
         ProjectSection::Recent => "recent",
     }
+}
+
+pub fn inherited_service_env() -> HashMap<String, String> {
+    inherited_service_env_from(std::env::vars())
+}
+
+fn inherited_service_env_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    vars.into_iter().filter(|(key, _)| key == "PATH").collect()
+}
+
+const fn should_stream_logs_after_up(verbose: bool) -> bool {
+    verbose
 }
 
 fn warn_if_daemon_identity_mismatch() {
@@ -429,6 +443,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
 
+            let inherited_env = inherited_service_env();
+
             // Register a CLI attachment so the project's lifecycle is tracked.
             // The attachment is tied to this process's PID — when the CLI exits,
             // the daemon's periodic reaper will detect the PID is gone and
@@ -438,6 +454,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 source: locald_core::attachments::AttachmentSource::CLI {
                     pid: std::process::id(),
                 },
+                inherited_env: inherited_env.clone(),
             });
 
             // Start services with streaming output.
@@ -445,6 +462,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             loop {
                 match client::stream_boot_events(&IpcRequest::Start {
                     project_path: abs_path.clone(),
+                    inherited_env: inherited_env.clone(),
                     verbose: *verbose,
                 }) {
                     Ok(()) => {
@@ -489,8 +507,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 std::process::exit(0);
             });
 
-            println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
-            client::stream_logs(None, true)?;
+            if should_stream_logs_after_up(*verbose) {
+                println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
+                client::stream_logs(None, true)?;
+            } else {
+                println!(
+                    "{} Project is running. Use `locald logs --follow` to stream logs.",
+                    style::INFO
+                );
+            }
         }
         Commands::Stop { name, json } => {
             let names = if let Some(n) = name {
@@ -1527,6 +1552,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 match client::send_request(&IpcRequest::ProjectAttach {
                     project_path: abs_path,
                     source,
+                    inherited_env: inherited_service_env(),
                 }) {
                     Ok(IpcResponse::Ok) => {
                         if *json {
@@ -1936,7 +1962,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
+fn install_launch_agent(agent_path: &std::path::Path) -> CliResult<()> {
     let label = "com.locald.agent";
 
     // When running under sudo, resolve the real user's home and UID for
@@ -1958,7 +1984,7 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
         home.join("Library/LaunchAgents")
     } else {
         dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .ok_or_else(|| CliError::message("Could not determine home directory"))?
             .join("Library/LaunchAgents")
     };
     std::fs::create_dir_all(&plist_dir)?;
@@ -1988,7 +2014,9 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
             .context("Failed to run launchctl bootstrap")?;
 
         if !status.success() {
-            anyhow::bail!("launchctl bootstrap gui/{uid} failed with status: {status}");
+            return Err(CliError::message(format!(
+                "launchctl bootstrap gui/{uid} failed with status: {status}"
+            )));
         }
     } else {
         // Not running as root — load into current user's domain (legacy syntax).
@@ -2004,7 +2032,9 @@ fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
             .context("Failed to run launchctl load")?;
 
         if !status.success() {
-            anyhow::bail!("launchctl load failed with status: {status}");
+            return Err(CliError::message(format!(
+                "launchctl load failed with status: {status}"
+            )));
         }
     }
 
@@ -2067,11 +2097,15 @@ fn escape_xml(value: &str) -> String {
 #[cfg(target_os = "macos")]
 fn read_launch_agent_daemon_path(
     plist_path: &std::path::Path,
-) -> anyhow::Result<Option<std::path::PathBuf>> {
+) -> CliResult<Option<std::path::PathBuf>> {
     let content = match std::fs::read_to_string(plist_path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("Failed to read LaunchAgent plist"),
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context("Failed to read LaunchAgent plist")
+                .into());
+        }
     };
     Ok(parse_launch_agent_daemon_path(&content).map(std::path::PathBuf::from))
 }
@@ -2126,8 +2160,34 @@ fn unescape_xml(value: &str) -> String {
     unescaped
 }
 
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_service_env_from_keeps_only_path() {
+        let env = inherited_service_env_from([
+            ("PATH".to_string(), "/cli/bin:/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/me".to_string()),
+            ("SHELL".to_string(), "/bin/zsh".to_string()),
+        ]);
+
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/cli/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn up_streams_logs_only_when_verbose() {
+        assert!(!should_stream_logs_after_up(false));
+        assert!(should_stream_logs_after_up(true));
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+mod macos_tests {
     use super::*;
 
     #[test]
@@ -2185,7 +2245,7 @@ mod tests {
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_launch_agent() -> anyhow::Result<()> {
+fn uninstall_launch_agent() -> CliResult<()> {
     let label = "com.locald.agent";
 
     // Under sudo, resolve the real user's plist location and UID.
@@ -2205,7 +2265,7 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
         home.join("Library/LaunchAgents")
     } else {
         dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .ok_or_else(|| CliError::message("Could not determine home directory"))?
             .join("Library/LaunchAgents")
     };
 
@@ -2237,14 +2297,14 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
 /// registers it as a `LaunchDaemon` with a Mach service endpoint.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
-fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
+fn install_privileged_helper(helper_bytes: &[u8]) -> CliResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let helper_path = std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
     std::fs::create_dir_all(
         helper_path
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid helper path"))?,
+            .ok_or_else(|| CliError::message("invalid helper path"))?,
     )?;
     std::fs::write(helper_path, helper_bytes)?;
     std::fs::set_permissions(helper_path, std::fs::Permissions::from_mode(0o755))?;
@@ -2287,7 +2347,9 @@ fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
         .context("Failed to run launchctl load for helper")?;
 
     if !status.success() {
-        anyhow::bail!("launchctl load for helper failed with status: {status}");
+        return Err(CliError::message(format!(
+            "launchctl load for helper failed with status: {status}"
+        )));
     }
 
     Ok(())

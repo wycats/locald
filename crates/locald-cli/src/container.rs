@@ -1,9 +1,14 @@
-use anyhow::Result;
+use crate::error::{CliError, CliResult, DaemonError};
 use locald_core::{IpcRequest, IpcResponse, ipc::Event};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
-pub fn run(image: String, command: Vec<String>, interactive: bool, detached: bool) -> Result<()> {
+pub fn run(
+    image: String,
+    command: Vec<String>,
+    interactive: bool,
+    detached: bool,
+) -> CliResult<()> {
     let cmd_opt = if command.is_empty() {
         None
     } else {
@@ -19,19 +24,21 @@ pub fn run(image: String, command: Vec<String>, interactive: bool, detached: boo
 
     // We manually handle the connection here to stream the response
     let socket_path = locald_utils::ipc::socket_path()?;
+    let socket_display = socket_path.display().to_string();
     let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "locald is not running (socket not found at {})",
-                socket_path.display()
-            )
+            DaemonError::NotRunning {
+                socket_path: socket_display.clone(),
+            }
         } else if e.kind() == std::io::ErrorKind::ConnectionRefused {
-            anyhow::anyhow!(
-                "locald is not running (connection refused at {})",
-                socket_path.display()
-            )
+            DaemonError::ConnectionRefused {
+                socket_path: socket_display.clone(),
+            }
         } else {
-            anyhow::Error::new(e)
+            DaemonError::ConnectionFailed {
+                socket_path: socket_display.clone(),
+                source: e,
+            }
         }
     })?;
 
@@ -63,10 +70,12 @@ pub fn run(image: String, command: Vec<String>, interactive: bool, detached: boo
                     return Ok(());
                 }
                 IpcResponse::Error(e) => {
-                    anyhow::bail!("Container failed: {}", e);
+                    return Err(CliError::message(format!("Container failed: {e}")));
                 }
                 _ => {
-                    anyhow::bail!("Unexpected response: {:?}", response);
+                    return Err(CliError::message(format!(
+                        "Unexpected response: {response:?}"
+                    )));
                 }
             }
         }

@@ -5,6 +5,7 @@ use crate::health::HealthMonitor;
 use crate::plugins;
 use crate::port_allocator::PortAllocator;
 use crate::runtime::Runtime;
+use crate::service::postgres::postgres_connection_url;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -422,7 +423,7 @@ impl ProcessManager {
         let connection_url = if status == locald_core::state::ServiceState::Running {
             match service_config {
                 Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) => {
-                    port.map(|p| format!("postgres://postgres@localhost:{p}/postgres"))
+                    port.map(postgres_connection_url)
                 }
                 _ => port.map(|p| format!("http://localhost:{p}")),
             }
@@ -686,7 +687,7 @@ impl ProcessManager {
 
         for path in paths {
             info!("Restoring project at {path:?}");
-            if let Err(e) = self.start(path.clone(), None, false).await {
+            if let Err(e) = self.start(path.clone(), None, false, HashMap::new()).await {
                 error!("Failed to restore project at {path:?}: {e}");
             }
         }
@@ -788,9 +789,9 @@ impl ProcessManager {
                 let port = port.ok_or_else(|| anyhow::anyhow!("Service {name} has no port"))?;
 
                 match svc_config {
-                    ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => Ok(format!(
-                        "postgres://postgres:postgres@localhost:{port}/postgres"
-                    )),
+                    ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => {
+                        Ok(postgres_connection_url(port))
+                    }
                     ServiceConfig::Typed(_) | ServiceConfig::Legacy(_) => {
                         Ok(format!("http://localhost:{port}"))
                     }
@@ -842,9 +843,11 @@ impl ProcessManager {
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
+        inherited_env: HashMap<String, String>,
     ) -> Result<()> {
         self.watch_config(path.clone()).await;
-        self.apply_config(path, event_tx, verbose).await
+        self.apply_config(path, event_tx, verbose, inherited_env)
+            .await
     }
 
     async fn watch_config(&self, path: PathBuf) {
@@ -880,7 +883,7 @@ impl ProcessManager {
                         () = timeout => {
                             // Timeout expired, trigger reload
                             info!("Reloading config for {:?}", path_clone);
-                            if let Err(e) = manager.apply_config(path_clone.clone(), None, false).await {
+                            if let Err(e) = manager.apply_config(path_clone.clone(), None, false, HashMap::new()).await {
                                 error!("Failed to reload config: {e}");
                             }
                             break; // Break inner loop, go back to waiting for first event
@@ -933,6 +936,7 @@ impl ProcessManager {
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
+        inherited_env: HashMap<String, String>,
     ) -> Result<()> {
         // Setup log forwarding if verbose
         let _log_guard = if verbose {
@@ -1024,34 +1028,18 @@ impl ProcessManager {
             let name = format!("{}:{}", config.project.name, service_name);
             active_services.insert(name.clone());
 
-            let mut combined_env = dot_env_vars.clone();
-            for (k, v) in service_config.env() {
-                combined_env.insert(k.clone(), v.clone());
-            }
+            let mut combined_env =
+                merge_service_start_env(&inherited_env, &dot_env_vars, service_config.env());
 
-            // Auto-inject DATABASE_URL for services that depend on Postgres
-            if !combined_env.contains_key("DATABASE_URL") {
-                for dep in service_config.depends_on() {
-                    if let Some(dep_config) = config.services.get(dep) {
-                        if matches!(
-                            dep_config,
-                            ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
-                        ) {
-                            // Use interpolation syntax so it resolves at runtime
-                            // Use the local service name (without project prefix) because
-                            // resolve_env adds the project prefix when looking up services
-                            combined_env.insert(
-                                "DATABASE_URL".to_string(),
-                                format!("${{services.{}.url}}", dep),
-                            );
-                            info!(
-                                "Auto-injected DATABASE_URL for {} from Postgres dependency {}",
-                                name, dep
-                            );
-                            break; // Only inject from first Postgres dependency
-                        }
-                    }
-                }
+            if let Some(dep) = inject_database_url_for_postgres_dependency(
+                &mut combined_env,
+                service_config,
+                &config,
+            ) {
+                info!(
+                    "Auto-injected DATABASE_URL for {} from Postgres dependency {}",
+                    name, dep
+                );
             }
 
             let manager = self.clone();
@@ -1385,7 +1373,7 @@ impl ProcessManager {
 
         // 3. Start each project
         for path in paths {
-            if let Err(e) = self.start(path.clone(), None, false).await {
+            if let Err(e) = self.start(path.clone(), None, false, HashMap::new()).await {
                 error!("Failed to restart project at {:?}: {}", path, e);
             }
         }
@@ -1462,7 +1450,7 @@ impl ProcessManager {
         };
 
         if let Some(path) = path {
-            self.start(path, None, false).await?;
+            self.start(path, None, false, HashMap::new()).await?;
         } else {
             anyhow::bail!("Service {name} not found");
         }
@@ -1660,6 +1648,7 @@ impl ProcessManager {
         &self,
         project_path: PathBuf,
         source: AttachmentSource,
+        inherited_env: HashMap<String, String>,
     ) -> Result<()> {
         // Canonicalize to prevent duplicate attachments from different relative paths.
         let canonical =
@@ -1686,7 +1675,10 @@ impl ProcessManager {
                 "First attachment for {}, starting services",
                 canonical.display()
             );
-            if let Err(e) = self.start(canonical.clone(), None, false).await {
+            if let Err(e) = self
+                .start(canonical.clone(), None, false, inherited_env)
+                .await
+            {
                 // Roll back attachment so future attaches retry start.
                 warn!("Failed to start project on attach: {e}");
                 let mut attachments = self.attachments.lock().await;
@@ -1733,7 +1725,7 @@ impl ProcessManager {
             attachments.clear_stopped(&project_path);
             let _ = attachments.save().await;
         }
-        self.start(project_path, None, false).await
+        self.start(project_path, None, false, HashMap::new()).await
     }
 
     pub async fn project_force_stop(&self, project_path: PathBuf) -> Result<()> {
@@ -2043,25 +2035,7 @@ impl ProcessManager {
             combined_env.insert("PORT".to_string(), p.to_string());
         }
 
-        // Auto-inject DATABASE_URL for services that depend on Postgres
-        // (mirrors the logic in start_project)
-        if !combined_env.contains_key("DATABASE_URL") {
-            for dep in service_config.depends_on() {
-                if let Some(dep_config) = config.services.get(dep) {
-                    if matches!(
-                        dep_config,
-                        ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
-                    ) {
-                        // Use local service name - resolve_env adds the project prefix
-                        combined_env.insert(
-                            "DATABASE_URL".to_string(),
-                            format!("${{services.{}.url}}", dep),
-                        );
-                        break;
-                    }
-                }
-            }
-        }
+        inject_database_url_for_postgres_dependency(&mut combined_env, &service_config, &config);
 
         let manager = self.clone();
         let lookup = move |service_name: String, field: String| {
@@ -2129,7 +2103,15 @@ impl ProcessManager {
             }
         };
 
-        let url = if status == locald_core::state::ServiceState::Running && port.is_some() {
+        let is_postgres = matches!(
+            service_config.as_ref(),
+            Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_)))
+        );
+
+        let url = if status == locald_core::state::ServiceState::Running
+            && port.is_some()
+            && !is_postgres
+        {
             domain.as_ref().map_or_else(
                 || port.map(|p| format!("http://localhost:{p}")),
                 |d| {
@@ -2156,6 +2138,16 @@ impl ProcessManager {
             None
         };
 
+        let connection_url = if status == locald_core::state::ServiceState::Running {
+            if is_postgres {
+                port.map(postgres_connection_url)
+            } else {
+                port.map(|p| format!("http://localhost:{p}"))
+            }
+        } else {
+            None
+        };
+
         let mut info = serde_json::json!({
             "name": name,
             "pid": pid,
@@ -2165,6 +2157,7 @@ impl ProcessManager {
             "health_status": health_status,
             "health_source": health_source,
             "url": url,
+            "connection_url": connection_url,
             "warnings": warnings,
         });
 
@@ -2226,6 +2219,46 @@ impl ServiceResolver for ProcessManager {
     }
 }
 
+fn inject_database_url_for_postgres_dependency(
+    env: &mut HashMap<String, String>,
+    service_config: &ServiceConfig,
+    config: &LocaldConfig,
+) -> Option<String> {
+    if env.contains_key("DATABASE_URL") {
+        return None;
+    }
+
+    for dep in service_config.depends_on() {
+        if let Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) =
+            config.services.get(dep)
+        {
+            // Use interpolation syntax so it resolves at runtime. The local service
+            // name is intentional: resolve_env adds the project prefix when looking
+            // up services.
+            env.insert(
+                "DATABASE_URL".to_string(),
+                format!("${{services.{dep}.url}}"),
+            );
+            return Some(dep.clone());
+        }
+    }
+
+    None
+}
+
+fn merge_service_start_env<'a>(
+    inherited_env: &HashMap<String, String>,
+    dot_env_vars: &HashMap<String, String>,
+    service_env: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> HashMap<String, String> {
+    let mut combined_env = inherited_env.clone();
+    combined_env.extend(dot_env_vars.clone());
+    for (key, value) in service_env {
+        combined_env.insert(key.clone(), value.clone());
+    }
+    combined_env
+}
+
 /// Resolve the domain for a project, applying worktree branch qualification
 /// if the project is in a git worktree and has a `[worktrees]` config.
 fn resolve_worktree_domain(
@@ -2270,7 +2303,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use futures_util::{StreamExt, stream};
-    use locald_core::config::{ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig};
+    use locald_core::config::{
+        CommonServiceConfig, ExecServiceConfig, LocaldConfig, PostgresServiceConfig, ProjectConfig,
+        ServiceConfig, TypedServiceConfig,
+    };
     use locald_core::registry::Registry;
     use locald_core::service::{RuntimeState, ServiceCommand};
     use std::collections::HashMap;
@@ -2347,6 +2383,124 @@ mod tests {
         async fn sync(&self, _domains: Vec<String>) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn merge_service_start_env_preserves_precedence() {
+        let inherited_env = HashMap::from([
+            ("PATH".to_string(), "/cli/bin:/usr/bin".to_string()),
+            ("LOCALD_TEST".to_string(), "inherited".to_string()),
+        ]);
+        let dot_env_vars = HashMap::from([
+            ("PATH".to_string(), "/env/bin".to_string()),
+            ("FROM_DOTENV".to_string(), "yes".to_string()),
+        ]);
+        let service_env = HashMap::from([
+            ("PATH".to_string(), "/service/bin".to_string()),
+            ("FROM_SERVICE".to_string(), "yes".to_string()),
+        ]);
+
+        let merged = merge_service_start_env(&inherited_env, &dot_env_vars, &service_env);
+
+        assert_eq!(merged.get("PATH").map(String::as_str), Some("/service/bin"));
+        assert_eq!(
+            merged.get("LOCALD_TEST").map(String::as_str),
+            Some("inherited")
+        );
+        assert_eq!(merged.get("FROM_DOTENV").map(String::as_str), Some("yes"));
+        assert_eq!(merged.get("FROM_SERVICE").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn inject_database_url_for_postgres_dependency_injects_first_postgres_dependency() {
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig {
+                depends_on: vec!["cache".to_string(), "db".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let config = LocaldConfig {
+            services: HashMap::from([
+                (
+                    "cache".to_string(),
+                    ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ),
+                (
+                    "db".to_string(),
+                    ServiceConfig::Typed(TypedServiceConfig::Postgres(
+                        PostgresServiceConfig::default(),
+                    )),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut env = HashMap::new();
+
+        let injected =
+            inject_database_url_for_postgres_dependency(&mut env, &service_config, &config);
+
+        assert_eq!(injected.as_deref(), Some("db"));
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some("${services.db.url}")
+        );
+    }
+
+    #[test]
+    fn inject_database_url_for_postgres_dependency_preserves_explicit_value() {
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig {
+                depends_on: vec!["db".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let config = LocaldConfig {
+            services: HashMap::from([(
+                "db".to_string(),
+                ServiceConfig::Typed(TypedServiceConfig::Postgres(
+                    PostgresServiceConfig::default(),
+                )),
+            )]),
+            ..Default::default()
+        };
+        let mut env =
+            HashMap::from([("DATABASE_URL".to_string(), "postgres://custom".to_string())]);
+
+        let injected =
+            inject_database_url_for_postgres_dependency(&mut env, &service_config, &config);
+
+        assert_eq!(injected, None);
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://custom")
+        );
+    }
+
+    #[test]
+    fn inject_database_url_for_postgres_dependency_ignores_non_postgres_dependencies() {
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig {
+                depends_on: vec!["api".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let config = LocaldConfig {
+            services: HashMap::from([(
+                "api".to_string(),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+            )]),
+            ..Default::default()
+        };
+        let mut env = HashMap::new();
+
+        let injected =
+            inject_database_url_for_postgres_dependency(&mut env, &service_config, &config);
+
+        assert_eq!(injected, None);
+        assert!(!env.contains_key("DATABASE_URL"));
     }
 
     #[test]
@@ -2513,6 +2667,98 @@ mod tests {
         assert!(!status.url.as_deref().unwrap_or("").contains("8080"));
     }
 
+    #[tokio::test]
+    async fn postgres_status_connection_url_matches_service_interpolation_url() {
+        let status = ProcessManager::build_service_status(
+            "test:db".to_string(),
+            Some("db.test.localhost".to_string()),
+            None,
+            (None, None),
+            locald_core::state::HealthStatus::Healthy,
+            locald_core::state::HealthSource::None,
+            RuntimeSnapshot::Static {
+                is_running: true,
+                pid: Some(123),
+                port: Some(15432),
+            },
+            Some(&ServiceConfig::Typed(TypedServiceConfig::Postgres(
+                PostgresServiceConfig::default(),
+            ))),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(status.url, None);
+        assert_eq!(
+            status.connection_url.as_deref(),
+            Some("postgres://postgres@localhost:15432/postgres")
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_includes_connection_url_for_postgres_service() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("Failed to create ProcessManager");
+
+        let service_config = ServiceConfig::Typed(TypedServiceConfig::Postgres(
+            PostgresServiceConfig::default(),
+        ));
+        let config = LocaldConfig {
+            project: ProjectConfig {
+                name: "inspect".to_string(),
+                ..Default::default()
+            },
+            services: HashMap::from([("db".to_string(), service_config.clone())]),
+            ..Default::default()
+        };
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "inspect:db",
+                RuntimeState {
+                    pid: Some(123),
+                    port: Some(15432),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+
+        {
+            let mut services = manager.services.lock().await;
+            services.insert(
+                "inspect:db".to_string(),
+                Service {
+                    config,
+                    service_config,
+                    resolved_env: HashMap::new(),
+                    runtime_state: ServiceRuntime::Controller(controller),
+                    sticky_port: Some(15432),
+                    path: dir.path().join("project"),
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                    warnings: Vec::new(),
+                },
+            );
+        }
+
+        let inspect = manager.inspect("inspect:db").await.unwrap();
+
+        assert_eq!(inspect.get("url"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            inspect.get("connection_url").and_then(|v| v.as_str()),
+            Some("postgres://postgres@localhost:15432/postgres")
+        );
+    }
+
     #[test]
     fn test_log_buffer_capacity() {
         let mut buffer = LogBuffer::new(3);
@@ -2672,6 +2918,7 @@ command = "sleep 30"
                     id: "fresh".to_string(),
                     pid: Some(std::process::id()),
                 },
+                HashMap::new(),
             )
             .await
             .unwrap();

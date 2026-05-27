@@ -697,4 +697,49 @@ mod tests {
             _ => panic!("expected Commands::Exec"),
         }
     }
+
+    #[test]
+    fn parse_add_postgres_shortcut_preserves_service_name() {
+        let cli = Cli::try_parse_from(["locald", "add", "postgres", "db"]).unwrap();
+
+        match cli.command {
+            Commands::Add {
+                command,
+                name,
+                port,
+            } => {
+                assert_eq!(command, vec!["postgres".to_string(), "db".to_string()]);
+                assert_eq!(name, None);
+                assert_eq!(port, None);
+            }
+            _ => panic!("expected Commands::Add"),
+        }
+    }
+
+    #[test]
+    fn parse_service_add_postgres_preserves_name_and_version() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "service",
+            "add",
+            "postgres",
+            "--version",
+            "15",
+            "db",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Service {
+                command:
+                    ServiceCommands::Add {
+                        service_type: AddServiceType::Postgres { name, version },
+                    },
+            } => {
+                assert_eq!(name, "db");
+                assert_eq!(version.as_deref(), Some("15"));
+            }
+            _ => panic!("expected postgres service add command"),
+        }
+    }
 }
