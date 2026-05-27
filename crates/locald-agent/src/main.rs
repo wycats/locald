@@ -1,3 +1,5 @@
+mod status;
+
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     macos::run()
@@ -10,7 +12,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use locald_core::state::ServiceState;
+    use crate::status::{DaemonStatus, HealthStatus, PollUpdate};
     use locald_core::{IpcRequest, IpcResponse};
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -24,67 +26,6 @@ mod macos {
     const DASHBOARD_URL: &str = "http://locald.localhost";
     const LOCALD_DAEMON_PATH_ENV: &str = "LOCALD_DAEMON_PATH";
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum DaemonStatus {
-        Checking,
-        NotRunning,
-        Running { total: usize, running: usize },
-    }
-
-    impl DaemonStatus {
-        fn label(&self) -> String {
-            match self {
-                DaemonStatus::Checking => "Status: checking...".to_string(),
-                DaemonStatus::NotRunning => "Status: not running".to_string(),
-                DaemonStatus::Running { total, running } => {
-                    if *total == 0 {
-                        "Status: running (no services)".to_string()
-                    } else {
-                        format!("Status: {running}/{total} running")
-                    }
-                }
-            }
-        }
-    }
-
-    /// Health checks that run without root — detect problems the agent can surface.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct HealthStatus {
-        helper_installed: bool,
-        port_80_reachable: bool,
-        ca_trusted: bool,
-    }
-
-    impl HealthStatus {
-        fn is_healthy(&self) -> bool {
-            self.helper_installed && self.port_80_reachable && self.ca_trusted
-        }
-
-        fn warning_label(&self) -> Option<String> {
-            let mut problems = Vec::new();
-            if !self.helper_installed {
-                problems.push("privileged helper not installed");
-            } else if !self.port_80_reachable {
-                problems.push("port 80 not reachable");
-            }
-            if !self.ca_trusted {
-                problems.push("HTTPS not trusted");
-            }
-            if problems.is_empty() {
-                None
-            } else {
-                Some(format!("⚠ {}", problems.join(", ")))
-            }
-        }
-    }
-
-    /// Combined update from the polling thread.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct PollUpdate {
-        daemon: DaemonStatus,
-        health: HealthStatus,
-    }
-
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Initialize NSApplication — required for AppKit event dispatch (menu clicks, etc).
         let mtm = MainThreadMarker::new().expect("locald-agent must run on the main thread");
@@ -95,7 +36,7 @@ mod macos {
         let icon = build_icon()?;
 
         let menu = Menu::new();
-        let status_item = MenuItem::new("Status: checking...", false, None);
+        let status_item = MenuItem::new(DaemonStatus::Checking.label(), false, None);
         menu.append(&status_item)?;
 
         // Health warning — hidden when everything is healthy.
@@ -277,16 +218,7 @@ mod macos {
         }
 
         match send_request(&IpcRequest::Status) {
-            Ok(IpcResponse::Status(services)) => {
-                let running = services
-                    .iter()
-                    .filter(|service| service.status == ServiceState::Running)
-                    .count();
-                DaemonStatus::Running {
-                    total: services.len(),
-                    running,
-                }
-            }
+            Ok(IpcResponse::Status(services)) => DaemonStatus::from_services(&services),
             _ => DaemonStatus::NotRunning,
         }
     }
@@ -567,88 +499,6 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn health_all_good() {
-            let h = HealthStatus {
-                helper_installed: true,
-                port_80_reachable: true,
-                ca_trusted: true,
-            };
-            assert!(h.is_healthy());
-            assert_eq!(h.warning_label(), None);
-        }
-
-        #[test]
-        fn health_helper_missing() {
-            let h = HealthStatus {
-                helper_installed: false,
-                port_80_reachable: false,
-                ca_trusted: true,
-            };
-            assert!(!h.is_healthy());
-            let label = h.warning_label().unwrap();
-            assert!(label.contains("helper not installed"));
-        }
-
-        #[test]
-        fn health_port_unreachable() {
-            let h = HealthStatus {
-                helper_installed: true,
-                port_80_reachable: false,
-                ca_trusted: true,
-            };
-            assert!(!h.is_healthy());
-            let label = h.warning_label().unwrap();
-            assert!(label.contains("port 80"));
-        }
-
-        #[test]
-        fn health_ca_untrusted() {
-            let h = HealthStatus {
-                helper_installed: true,
-                port_80_reachable: true,
-                ca_trusted: false,
-            };
-            assert!(!h.is_healthy());
-            let label = h.warning_label().unwrap();
-            assert!(label.contains("HTTPS not trusted"));
-        }
-
-        #[test]
-        fn health_multiple_problems() {
-            let h = HealthStatus {
-                helper_installed: false,
-                port_80_reachable: false,
-                ca_trusted: false,
-            };
-            assert!(!h.is_healthy());
-            let label = h.warning_label().unwrap();
-            assert!(label.contains("helper not installed"));
-            assert!(label.contains("HTTPS not trusted"));
-        }
-
-        #[test]
-        fn daemon_status_labels() {
-            assert_eq!(DaemonStatus::Checking.label(), "Status: checking...");
-            assert_eq!(DaemonStatus::NotRunning.label(), "Status: not running");
-            assert_eq!(
-                DaemonStatus::Running {
-                    total: 3,
-                    running: 2
-                }
-                .label(),
-                "Status: 2/3 running"
-            );
-            assert_eq!(
-                DaemonStatus::Running {
-                    total: 0,
-                    running: 0
-                }
-                .label(),
-                "Status: running (no services)"
-            );
-        }
 
         #[test]
         fn shell_quote_simple_path() {
