@@ -204,6 +204,28 @@ Stage 2 should determine the concrete Linux implementation path. The contract re
 - On GNOME, provide an actionable diagnostic if the shell lacks StatusNotifier/AppIndicator support.
 - Keep KDE support in scope when it naturally falls out of the StatusNotifier implementation, but validate against GNOME first because this phase is explicitly GNOME-oriented.
 
+Stage 2 selects `ksni` as the first implementation path for the Linux backend.
+
+Rationale:
+
+- `ksni` implements the KDE/freedesktop StatusNotifierItem specification directly over DBus, matching the RFC's StatusNotifier/AppIndicator contract without routing the feature through GTK or a native shared-library AppIndicator binding.
+- `ksni` exposes watcher and visibility failures as typed states such as watcher registration errors and `WontShow`, which maps directly to the RFC requirement that unsupported or invisible tray hosts fail with actionable diagnostics instead of silently starting a headless process.
+- `ksni` supports Tokio and async-io runtimes. The first locald integration should use Tokio because locald already uses Tokio elsewhere and the tray agent already accepts platform-specific runtime dependencies.
+- `ksni` keeps KDE naturally in scope while allowing GNOME-first validation because it targets the shared StatusNotifierItem protocol rather than a GNOME-only shell extension or an AppIndicator-only FFI surface.
+
+Rejected paths for the first Linux backend:
+
+- `tray-icon` remains appropriate for the existing macOS menu-bar implementation, but its Linux path is a higher-level GTK/libappindicator stack with extra system library and event-loop requirements. That makes visible-host diagnostics and DBus watcher handling less precise for the first GNOME implementation slice.
+- `appindicator3`, `libayatana-appindicator`, and related bindings expose native AppIndicator/Ayatana libraries through GTK or FFI. They are useful comparison points, but they add system shared-library coupling and are less aligned with locald's preference for precise primitives.
+- Raw `zbus` is the fallback if `ksni` blocks required behavior, but hand-implementing StatusNotifierItem, menu export, watcher registration, and lifecycle handling from raw DBus is unnecessary for the first implementation pass.
+
+Implementation guidance for the selected path:
+
+- Add Linux-only dependencies for `ksni` and the minimal Tokio runtime features needed by the backend.
+- Do not enable `ksni`'s "assume SNI available" behavior for normal startup; locald should fail fast when no watcher/host can show a visible tray item.
+- Map `ksni` watcher registration failures, `WontShow`, and watcher-offline callbacks into locald's unsupported-host diagnostics and `locald tray status` lifecycle states.
+- Keep a small local adapter around `ksni` so shared locald status/action semantics remain owned by locald rather than by the crate API.
+
 The agent should avoid requiring root. If privileged setup is missing, the tray should surface `Run Setup...` and delegate to the existing `locald admin setup` flow rather than doing privileged work itself.
 
 The Linux backend should not introduce Linux-only meanings for shared tray actions unless the RFC is updated to define those semantics for all platforms. Linux-specific diagnostics are allowed, but they should describe host/platform limitations rather than changing what `locald tray` means.
@@ -223,7 +245,7 @@ Candidate Stage 2 changes:
 - [ ] Extract a shared tray status model from the current macOS agent, preserving the state distinctions defined in this RFC.
 - [ ] Define shared tray action/status semantics in code and verify the Linux backend preserves macOS-equivalent user expectations.
 - [ ] Refactor the macOS backend behind a backend boundary without changing behavior.
-- [ ] Research and select the Rust/Linux StatusNotifier/AppIndicator integration path.
+- [x] Research and select the Rust/Linux StatusNotifier/AppIndicator integration path.
 - [ ] Implement Linux agent startup and visible tray-host detection.
 - [ ] Implement explicit unsupported-host diagnostics for pure GNOME without AppIndicator support, headless Linux sessions, and unsupported operating systems.
 - [ ] Implement GNOME-visible status menu with status, health warning, dashboard, restart, setup, and quit actions.
