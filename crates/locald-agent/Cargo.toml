@@ -32,3 +32,7 @@ xpc-connection = { git = "https://github.com/dfrankland/xpc-connection-rs.git", 
 nix = { version = "0.30.1", features = ["process"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }

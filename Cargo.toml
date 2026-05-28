@@ -18,8 +18,8 @@ members = [
     "tools/fetch-kernel",
 ]
 # Cross-platform crates. Platform-specific crates (locald-shim, locald-vmm,
-# locald-e2e = Linux-only; locald-agent = macOS-only) are still workspace
-# members but excluded from default operations.
+# locald-e2e = Linux-only; locald-agent = desktop-tray platforms) are still
+# workspace members but excluded from default operations.
 default-members = [
     "crates/locald-server",
     "crates/locald-cli",

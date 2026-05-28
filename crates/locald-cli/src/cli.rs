@@ -225,7 +225,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
-    /// Manage the menu bar agent
+    /// Manage the desktop tray/menu bar agent
     Tray {
         #[command(subcommand)]
         command: TrayCommands,
@@ -635,13 +635,13 @@ pub enum AdminCommands {
 
 #[derive(Subcommand)]
 pub enum TrayCommands {
-    /// Start the menu bar agent
+    /// Start the desktop tray/menu bar agent
     Start,
-    /// Stop the menu bar agent
+    /// Stop the desktop tray/menu bar agent
     Stop,
-    /// Check whether the menu bar agent is running
+    /// Check whether the desktop tray/menu bar agent is running
     Status,
-    /// Restart the menu bar agent
+    /// Restart the desktop tray/menu bar agent
     Restart,
 }
 

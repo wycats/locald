@@ -79,6 +79,10 @@ See: https://github.com/$REPO for updates."
     ensure mkdir -p "$INSTALL_DIR"
     ensure install -m 755 "$_tmp/locald" "$INSTALL_DIR/locald"
 
+    if [ -f "$_tmp/locald-agent" ]; then
+        ensure install -m 755 "$_tmp/locald-agent" "$INSTALL_DIR/locald-agent"
+    fi
+
     # The shim is included in the tarball but shouldn't be installed by the user directly.
     # It will be installed by `locald admin setup` to the correct location with setuid.
 

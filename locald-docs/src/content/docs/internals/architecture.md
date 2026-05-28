@@ -10,6 +10,8 @@ description: High-level architecture of locald.
 ```mermaid
 graph TD
     CLI[locald (Client)] -- IPC (Unix Socket) --> Server[locald (Daemon)]
+  Tray[locald-agent (Tray/Menu Bar)] -- IPC (Unix Socket) --> Server
+  CLI -- Starts/Stops --> Tray
     Server -- Invokes (setuid) --> Shim[locald-shim (Root)]
     Shim -- Binds --> Ports[Ports 80/443]
     Shim -- Modifies --> Trust[System Trust Store]
@@ -45,7 +47,14 @@ The `locald` binary contains both the client and server logic.
 - **Responsibility**: Parses arguments, sends commands to the server via IPC, and formats the response.
 - **Key Feature**: It is ephemeral. It runs, sends a command, and exits.
 
-### 4. The Shim (`locald-shim`)
+### 4. The Desktop Agent (`locald-agent`)
+
+- **Role**: Optional desktop status surface.
+- **Responsibility**: Renders daemon/service status and quick actions in the macOS menu bar or a Linux StatusNotifier/AppIndicator tray host.
+- **Backend split**: The agent dispatches to platform backends: AppKit/menu bar on macOS and StatusNotifier/AppIndicator over D-Bus on Linux. Unsupported platforms fail explicitly.
+- **Control plane**: `locald tray start|stop|status|restart` manages only the tray/menu-bar process. The agent talks to the daemon through the same locald IPC used by the CLI.
+
+### 5. The Shim (`locald-shim`)
 
 - **Role**: The privileged gatekeeper.
 - **Responsibility**:

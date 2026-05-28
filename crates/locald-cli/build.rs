@@ -76,7 +76,7 @@ fn main() {
         );
     }
 
-    // Build locald-agent when targeting macOS
+    // Build locald-agent when targeting macOS.
     if target_os == "macos" {
         println!("cargo:rerun-if-changed=../locald-agent/src");
         println!("cargo:rerun-if-changed=../locald-agent/Cargo.toml");

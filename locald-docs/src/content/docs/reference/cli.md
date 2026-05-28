@@ -242,12 +242,32 @@ locald serve
 locald serve ./public --port 3000 --bind 127.0.0.1
 ```
 
+### `locald tray start|stop|status|restart`
+
+Manage the optional desktop tray/menu-bar status agent. The tray agent shows daemon status, service health, and quick actions such as opening the dashboard, restarting all services, running setup when host readiness is missing, and quitting the tray agent without stopping the daemon or services.
+
+```bash
+locald tray start
+locald tray status
+locald tray stop
+locald tray restart
+```
+
+Supported backends:
+
+- macOS menu bar sessions use the LaunchAgent installed by `sudo locald admin setup`.
+- Linux desktop sessions use StatusNotifier/AppIndicator support. GNOME may require AppIndicator/StatusNotifier support to be installed or enabled.
+
+On Linux, run `locald tray start` from your desktop user session, not through `sudo`. Headless shells, missing D-Bus session buses, and desktops without a visible tray host fail with an explicit diagnostic instead of silently starting an invisible agent. `locald tray status` reports whether the agent is installed/running and which `locald` daemon path is pinned.
+
+For platform requirements, see [Desktop Tray](/reference/desktop-tray/).
+
 ## Not taught as primary workflows
 
 Some commands are available for contributors, automation, diagnostics, or feature-gated experiments but are not part of the stable front-door workflow. Use `locald --help` for the complete generated list in your build.
 
 - `locald server ...` is daemon lifecycle plumbing; normal commands start the daemon when needed.
-- `locald project ...`, `locald tray ...`, and `locald debug ...` are contributor or integration surfaces.
+- `locald project ...` and `locald debug ...` are contributor or integration surfaces.
 - `locald build`, `locald container ...`, `locald plugin ...`, and `locald distribution ...` are gated by experimental build features when present.
 - `--sandbox` is a contributor/CI isolation option, not the default user setup path.
 

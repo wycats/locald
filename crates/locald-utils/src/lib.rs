@@ -1,7 +1,7 @@
 //! Shared utilities for locald.
 
-/// Menu bar agent management utilities (macOS).
-#[cfg(target_os = "macos")]
+/// Desktop tray/menu bar agent management utilities.
+#[cfg(unix)]
 pub mod agent;
 /// Certificate management utilities.
 pub mod cert;

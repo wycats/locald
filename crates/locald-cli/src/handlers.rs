@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::cli::TrayCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
@@ -1307,11 +1307,16 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 }
             }
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            {
+                handle_linux_tray_command(command)?;
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = command;
                 return Err(CliError::message(
-                    "Tray commands are only supported on macOS.",
+                    "Tray commands are only supported on macOS and Linux desktop sessions.",
                 ));
             }
         }
@@ -1959,6 +1964,390 @@ pub fn run(cli: Cli) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const LOCALD_AGENT_PATH_ENV: &str = "LOCALD_AGENT_PATH";
+#[cfg(target_os = "linux")]
+const LOCALD_DAEMON_PATH_ENV: &str = "LOCALD_DAEMON_PATH";
+#[cfg(target_os = "linux")]
+const LINUX_TRAY_LOG_PATH: &str = "/tmp/locald-agent.log";
+
+#[cfg(target_os = "linux")]
+fn handle_linux_tray_command(command: &TrayCommands) -> CliResult<()> {
+    match command {
+        TrayCommands::Start => start_linux_tray_agent(),
+        TrayCommands::Stop => {
+            stop_linux_tray_agent(true)?;
+            Ok(())
+        }
+        TrayCommands::Status => status_linux_tray_agent(),
+        TrayCommands::Restart => {
+            stop_linux_tray_agent(false)?;
+            start_linux_tray_agent()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods, unsafe_code)]
+fn start_linux_tray_agent() -> CliResult<()> {
+    use std::os::unix::process::CommandExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return Err(CliError::message(
+            "Do not run `locald tray start` with sudo. The tray agent must run in your desktop user session.",
+        ));
+    }
+
+    if let Some(message) = linux_tray_env_diagnostic() {
+        return Err(CliError::message(message));
+    }
+
+    if let Some(pid) = read_linux_tray_pid()? {
+        if linux_process_is_running(pid) {
+            println!("locald tray agent is already running (pid {pid})");
+            return Ok(());
+        }
+        remove_linux_tray_pidfile()?;
+    }
+
+    let agent_path = resolve_linux_agent_path()?;
+    let daemon_path =
+        std::env::current_exe().context("Failed to resolve current executable path")?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(LINUX_TRAY_LOG_PATH)
+        .context("Failed to open locald tray agent log")?;
+    let stderr = log_file
+        .try_clone()
+        .context("Failed to clone locald tray agent log handle")?;
+
+    let mut command = std::process::Command::new(&agent_path);
+    command
+        .env(LOCALD_DAEMON_PATH_ENV, &daemon_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file)
+        .stderr(stderr);
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command
+        .spawn()
+        .context("Failed to start locald tray agent")?;
+    let pid = i32::try_from(child.id()).map_err(|_| {
+        CliError::message(format!(
+            "locald tray agent pid {} does not fit in pid_t",
+            child.id()
+        ))
+    })?;
+
+    for _ in 0..10 {
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to check locald tray agent startup")?
+        {
+            remove_linux_tray_pidfile()?;
+            let log_excerpt = linux_tray_log_excerpt()
+                .unwrap_or_else(|| format!("No output was written to {LINUX_TRAY_LOG_PATH}."));
+            return Err(CliError::message(format!(
+                "locald tray agent exited during startup with status {status}.\n\n{log_excerpt}\n\nSee {LINUX_TRAY_LOG_PATH} for details."
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    write_linux_tray_pid(pid)?;
+    write_linux_tray_daemon_path(&daemon_path)?;
+
+    println!("{} locald tray agent started (pid {pid})", style::CHECK);
+    println!("Pinned daemon: {}", daemon_path.display());
+    println!("Log: {LINUX_TRAY_LOG_PATH}");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_tray_agent(report_not_running: bool) -> CliResult<bool> {
+    let Some(pid) = read_linux_tray_pid()? else {
+        if report_not_running {
+            println!("locald tray agent is not running");
+        }
+        return Ok(false);
+    };
+
+    if !linux_process_is_running(pid) {
+        remove_linux_tray_pidfile()?;
+        if report_not_running {
+            println!("locald tray agent is not running (removed stale pidfile)");
+        }
+        return Ok(false);
+    }
+
+    linux_send_signal(pid, libc::SIGTERM)?;
+    for _ in 0..50 {
+        if !linux_process_is_running(pid) {
+            remove_linux_tray_pidfile()?;
+            if report_not_running {
+                println!("{} locald tray agent stopped", style::CHECK);
+            }
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    Err(CliError::message(format!(
+        "Timed out waiting for locald tray agent pid {pid} to stop."
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn status_linux_tray_agent() -> CliResult<()> {
+    match read_linux_tray_pid()? {
+        Some(pid) if linux_process_is_running(pid) => {
+            println!("locald tray agent is running (pid {pid})");
+        }
+        Some(_) => {
+            remove_linux_tray_pidfile()?;
+            println!("locald tray agent is not running (removed stale pidfile)");
+            println!("  Start it with: locald tray start");
+        }
+        None => {
+            println!("locald tray agent is not running");
+            println!("  Start it with: locald tray start");
+        }
+    }
+
+    match resolve_linux_agent_path() {
+        Ok(path) => println!("Agent binary: {}", path.display()),
+        Err(error) => println!("Agent binary: not found ({error})"),
+    }
+
+    match read_linux_tray_daemon_path()? {
+        Some(path) => println!("Pinned daemon: {}", path.display()),
+        None => println!("Pinned daemon: not configured"),
+    }
+
+    if let Some(message) = linux_tray_env_diagnostic() {
+        println!("Current shell host: unsupported ({message})");
+    } else {
+        println!("Current shell host: graphical session and D-Bus session bus detected");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_agent_path() -> CliResult<std::path::PathBuf> {
+    let candidates = linux_agent_candidates()?;
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let searched = candidates
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(CliError::message(format!(
+        "locald-agent is not installed. Expected a desktop tray agent binary at:\n{searched}\nReinstall locald, or during development run `cargo build -p locald-agent` so the binary exists next to `locald`."
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_agent_candidates() -> CliResult<Vec<std::path::PathBuf>> {
+    let mut candidates = Vec::new();
+
+    if let Ok(path) = std::env::var(LOCALD_AGENT_PATH_ENV)
+        && !path.trim().is_empty()
+    {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+
+    let exe_path = std::env::current_exe().context("Failed to resolve current executable path")?;
+    if let Some(exe_dir) = exe_path.parent() {
+        candidates.push(exe_dir.join("locald-agent"));
+    }
+
+    candidates.push(locald_utils::agent::agent_path()?);
+    candidates.dedup();
+    Ok(candidates)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_data_file(name: &str) -> CliResult<std::path::PathBuf> {
+    let data_dir = locald_utils::cert::locald_data_dir()?;
+    std::fs::create_dir_all(&data_dir).context("Failed to create locald data directory")?;
+    Ok(data_dir.join(name))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_pid_path() -> CliResult<std::path::PathBuf> {
+    linux_tray_data_file("locald-agent.pid")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_daemon_path_file() -> CliResult<std::path::PathBuf> {
+    linux_tray_data_file("locald-agent.daemon-path")
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_tray_pid() -> CliResult<Option<i32>> {
+    let path = linux_tray_pid_path()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let pid = trimmed.parse::<i32>().map_err(|error| {
+        CliError::message(format!(
+            "Invalid locald tray agent pidfile {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(pid))
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_tray_pid(pid: i32) -> CliResult<()> {
+    std::fs::write(linux_tray_pid_path()?, format!("{pid}\n"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_linux_tray_pidfile() -> CliResult<()> {
+    let path = linux_tray_pid_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_tray_daemon_path(path: &std::path::Path) -> CliResult<()> {
+    std::fs::write(
+        linux_tray_daemon_path_file()?,
+        format!("{}\n", path.display()),
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_tray_daemon_path() -> CliResult<Option<std::path::PathBuf>> {
+    let path = linux_tray_daemon_path_file()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(std::path::PathBuf::from(trimmed)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_process_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_send_signal(pid: i32, signal: i32) -> CliResult<()> {
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+
+    Err(CliError::message(format!(
+        "Failed to signal locald tray agent pid {pid}: {error}"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_env_diagnostic() -> Option<String> {
+    let has_graphical_session = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || std::env::var("DISPLAY")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+    if !has_graphical_session {
+        return Some(
+            "Linux tray support requires a graphical desktop session. Start `locald tray start` from a session with WAYLAND_DISPLAY or DISPLAY set, or use the locald CLI/dashboard instead."
+                .to_string(),
+        );
+    }
+
+    let has_session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_session_bus {
+        return Some(
+            "Linux tray support requires a D-Bus session bus. Start `locald tray start` from a desktop session with DBUS_SESSION_BUS_ADDRESS set, or use the locald CLI/dashboard instead."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_log_excerpt() -> Option<String> {
+    let content = std::fs::read_to_string(LINUX_TRAY_LOG_PATH).ok()?;
+    let lines = content
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = lines.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]

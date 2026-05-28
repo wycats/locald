@@ -67,12 +67,21 @@ jobs:
             cargo build --release --bin locald-shim --target ${{ matrix.target }}
           fi
 
+      - name: Build locald-agent
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --bin locald-agent --target ${{ matrix.target }}
+          else
+            cargo build --release --bin locald-agent --target ${{ matrix.target }}
+          fi
+
       - name: Package binaries
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/locald dist/
           cp target/${{ matrix.target }}/release/locald-shim dist/
-          tar -czvf ${{ matrix.artifact_name }}.tar.gz -C dist locald locald-shim
+          cp target/${{ matrix.target }}/release/locald-agent dist/
+          tar -czvf ${{ matrix.artifact_name }}.tar.gz -C dist locald locald-shim locald-agent
           sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
 
       - name: Smoke test (native only)

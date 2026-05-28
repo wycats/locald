@@ -242,23 +242,23 @@ Candidate Stage 2 changes:
 
 ## 4. Implementation Plan (Stage 2)
 
-- [ ] Extract a shared tray status model from the current macOS agent, preserving the state distinctions defined in this RFC.
-- [ ] Define shared tray action/status semantics in code and verify the Linux backend preserves macOS-equivalent user expectations.
-- [ ] Refactor the macOS backend behind a backend boundary without changing behavior.
+- [x] Extract a shared tray status model from the current macOS agent, preserving the state distinctions defined in this RFC.
+- [x] Define shared tray action/status semantics in code and verify the Linux backend preserves macOS-equivalent user expectations.
+- [x] Refactor the macOS backend behind a backend boundary without changing behavior.
 - [x] Research and select the Rust/Linux StatusNotifier/AppIndicator integration path.
-- [ ] Implement Linux agent startup and visible tray-host detection.
-- [ ] Implement explicit unsupported-host diagnostics for pure GNOME without AppIndicator support, headless Linux sessions, and unsupported operating systems.
-- [ ] Implement GNOME-visible status menu with status, health warning, dashboard, restart, setup, and quit actions.
-- [ ] Update `locald tray status` to report platform support, installation, process, and visible-host state.
-- [ ] Add tests for shared status model and Linux unsupported-environment diagnostics.
-- [ ] Document GNOME requirements and behavior.
+- [x] Implement Linux agent startup and visible tray-host detection.
+- [x] Implement explicit unsupported-host diagnostics for pure GNOME without AppIndicator support, headless Linux sessions, and unsupported operating systems.
+- [x] Implement GNOME-visible status menu with status, health warning, dashboard, restart, setup, and quit actions.
+- [x] Update `locald tray status` to report platform support, installation, process, and visible-host state.
+- [x] Add tests for shared status model and Linux unsupported-environment diagnostics.
+- [x] Document GNOME requirements and behavior.
 
 ## 5. Context Updates (Stage 3)
 
-- [ ] Update `docs/manual/features/cli.md` or the canonical CLI reference to describe `locald tray ...` as a supported desktop integration surface when the platform backend exists.
-- [ ] Add or update a manual feature page for desktop tray/menu-bar status.
-- [ ] Update architecture docs for the agent/backend split.
-- [ ] Update agent context plan/roadmap entries so GNOME tray precedes CNB library extraction.
+- [x] Update `docs/manual/features/cli.md` or the canonical CLI reference to describe `locald tray ...` as a supported desktop integration surface when the platform backend exists.
+- [x] Add or update a manual feature page for desktop tray/menu-bar status.
+- [x] Update architecture docs for the agent/backend split.
+- [x] Update agent context plan/roadmap entries so GNOME tray precedes CNB library extraction.
 
 ## 6. Drawbacks
 
@@ -276,7 +276,6 @@ Candidate Stage 2 changes:
 
 ## 8. Unresolved Questions
 
-- Which Rust crate or DBus implementation should be used for StatusNotifier/AppIndicator?
 - What is the best automated/manual validation strategy for DBus StatusNotifier behavior in CI and developer environments?
 - What exact diagnostic wording should be used for each unsupported-host state?
 - Should locald eventually ship or recommend a GNOME Shell extension for pure GNOME environments?
