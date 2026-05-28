@@ -643,6 +643,25 @@ pub enum TrayCommands {
     Status,
     /// Restart the desktop tray/menu bar agent
     Restart,
+    /// Manage desktop tray autostart at login
+    Autostart {
+        #[command(subcommand)]
+        command: TrayAutostartCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TrayAutostartCommands {
+    /// Enable desktop tray autostart at login
+    Enable {
+        /// Host-visible locald launcher path to pin for the tray agent
+        #[arg(long, value_name = "PATH")]
+        locald_path: Option<std::path::PathBuf>,
+    },
+    /// Disable desktop tray autostart at login
+    Disable,
+    /// Show whether tray autostart is enabled
+    Status,
 }
 
 #[derive(Subcommand)]

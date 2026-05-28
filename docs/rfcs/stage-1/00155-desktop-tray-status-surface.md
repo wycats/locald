@@ -37,7 +37,7 @@ A dedicated Tray RFC avoids treating GNOME support as an implementation detail o
 
 ### Stage 1 contract boundary
 
-Stage 1 decides the user-facing contract for the desktop tray surface. It intentionally does not select the Linux crate, DBus adapter, package format, or autostart implementation.
+Stage 1 decides the user-facing contract for the desktop tray surface. It records the Linux host and autostart contract without making Distrobox, toolbox, bkt, or other development-container environments part of locald's product logic.
 
 The contract is:
 
@@ -46,7 +46,8 @@ The contract is:
 - Unsupported or degraded host environments are explicit states with actionable diagnostics.
 - Linux support in this RFC means desktops with StatusNotifierItem/AppIndicator-compatible tray host support.
 - Pure GNOME without StatusNotifier/AppIndicator support is unsupported by this RFC unless the user installs/enables host support.
-- Linux autostart is explicit-start for now; XDG autostart files and systemd user units are deferred future work.
+- Linux autostart uses user-scoped XDG autostart files via `locald tray autostart ...`; systemd user units remain deferred future work.
+- Linux autostart pins a host-visible `locald` launcher path. The default is the current executable, and `locald tray autostart enable --locald-path <path>` lets users pin an explicit host path when their shell command is a container or environment wrapper.
 
 ### Platform support matrix
 
@@ -283,7 +284,7 @@ Candidate Stage 2 changes:
 ## 9. Future Possibilities
 
 - KDE validation as a first-class acceptance target.
-- Autostart integration through XDG desktop autostart files or systemd user units.
+- Systemd user-unit autostart support.
 - Optional GNOME Shell extension support for pure GNOME environments.
 - Tray menu entries for per-project attach/detach once RFC 0147 attachments land.
 - Editor integration and tray integration sharing a common desktop status model.

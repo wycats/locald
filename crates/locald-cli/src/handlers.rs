@@ -8,14 +8,14 @@ use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::cli::TrayCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
     ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::cli::{TrayAutostartCommands, TrayCommands};
 #[cfg(feature = "experimental-containers")]
 use crate::container;
 use crate::error::{CliError, CliResult, DaemonError};
@@ -1304,6 +1304,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             )));
                         }
                     }
+                    TrayCommands::Autostart { .. } => {
+                        return Err(CliError::message(
+                            "Tray autostart on macOS is managed by `locald admin setup`.",
+                        ));
+                    }
                 }
             }
 
@@ -1971,9 +1976,13 @@ const LOCALD_AGENT_PATH_ENV: &str = "LOCALD_AGENT_PATH";
 #[cfg(target_os = "linux")]
 const LOCALD_DAEMON_PATH_ENV: &str = "LOCALD_DAEMON_PATH";
 #[cfg(target_os = "linux")]
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
+#[cfg(target_os = "linux")]
 const LINUX_TRAY_LOG_PATH: &str = "/tmp/locald-agent.log";
 #[cfg(target_os = "linux")]
 const LINUX_AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+#[cfg(target_os = "linux")]
+const LINUX_TRAY_AUTOSTART_FILENAME: &str = "com.locald.agent.desktop";
 
 #[cfg(target_os = "linux")]
 fn handle_linux_tray_command(command: &TrayCommands) -> CliResult<()> {
@@ -1988,6 +1997,13 @@ fn handle_linux_tray_command(command: &TrayCommands) -> CliResult<()> {
             stop_linux_tray_agent(false)?;
             start_linux_tray_agent()
         }
+        TrayCommands::Autostart { command } => match command {
+            TrayAutostartCommands::Enable { locald_path } => {
+                enable_linux_tray_autostart(locald_path.as_deref())
+            }
+            TrayAutostartCommands::Disable => disable_linux_tray_autostart(),
+            TrayAutostartCommands::Status => status_linux_tray_autostart(),
+        },
     }
 }
 
@@ -2145,6 +2161,21 @@ fn status_linux_tray_agent() -> CliResult<()> {
         None => println!("Pinned daemon: not configured"),
     }
 
+    let autostart_path = linux_tray_autostart_path()?;
+    let autostart_content = read_linux_tray_autostart_desktop(&autostart_path)?;
+    if let Some(content) = autostart_content {
+        println!("Autostart: enabled");
+        println!("Autostart file: {}", autostart_path.display());
+        match linux_tray_autostart_daemon_path(&content) {
+            Some(path) => println!("Autostart daemon: {}", path.display()),
+            None => println!("Autostart daemon: not configured"),
+        }
+    } else {
+        println!("Autostart: disabled");
+        println!("Autostart file: {}", autostart_path.display());
+        println!("Autostart daemon: not configured");
+    }
+
     if let Some(message) = linux_tray_env_diagnostic() {
         println!("Current shell host: unsupported ({message})");
     } else {
@@ -2152,6 +2183,257 @@ fn status_linux_tray_agent() -> CliResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enable_linux_tray_autostart(locald_path: Option<&std::path::Path>) -> CliResult<()> {
+    reject_linux_tray_autostart_root("enable")?;
+
+    let agent_path = resolve_linux_agent_path()?;
+    let daemon_path = resolve_linux_autostart_daemon_path(locald_path)?;
+    let autostart_path = linux_tray_autostart_path()?;
+    if let Some(parent) = autostart_path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create autostart directory")?;
+    }
+
+    let desktop_entry = render_linux_tray_autostart_desktop(&agent_path, &daemon_path);
+    std::fs::write(&autostart_path, desktop_entry)
+        .context("Failed to write tray autostart desktop entry")?;
+
+    write_linux_tray_daemon_path(&daemon_path)?;
+
+    println!("{} Tray autostart enabled", style::CHECK);
+    println!("Autostart file: {}", autostart_path.display());
+    println!("Pinned daemon: {}", daemon_path.display());
+
+    if let Some(message) = linux_tray_env_diagnostic() {
+        eprintln!(
+            "{} Autostart will run at next login. Current shell is not ready for tray startup. {message}",
+            style::WARN
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_autostart_daemon_path(
+    locald_path: Option<&std::path::Path>,
+) -> CliResult<std::path::PathBuf> {
+    let Some(path) = locald_path else {
+        return Ok(std::env::current_exe().context("Failed to resolve current executable path")?);
+    };
+
+    if !path.is_absolute() {
+        return Err(CliError::message(format!(
+            "--locald-path must be an absolute host-visible path: {}",
+            path.display()
+        )));
+    }
+
+    if !path.is_file() {
+        return Err(CliError::message(format!(
+            "--locald-path does not point to a file: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn disable_linux_tray_autostart() -> CliResult<()> {
+    reject_linux_tray_autostart_root("disable")?;
+
+    let autostart_path = linux_tray_autostart_path()?;
+    match std::fs::remove_file(&autostart_path) {
+        Ok(()) => {
+            println!("{} Tray autostart disabled", style::CHECK);
+            println!("Autostart file: {}", autostart_path.display());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("Tray autostart is already disabled");
+            println!("Autostart file: {}", autostart_path.display());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn status_linux_tray_autostart() -> CliResult<()> {
+    reject_linux_tray_autostart_root("status")?;
+
+    let autostart_path = linux_tray_autostart_path()?;
+    let autostart_content = read_linux_tray_autostart_desktop(&autostart_path)?;
+
+    if let Some(content) = autostart_content {
+        println!("Tray autostart: enabled");
+        println!("Autostart file: {}", autostart_path.display());
+        match linux_tray_autostart_daemon_path(&content) {
+            Some(path) => println!("Autostart daemon: {}", path.display()),
+            None => println!("Autostart daemon: not configured"),
+        }
+    } else {
+        println!("Tray autostart: disabled");
+        println!("Autostart file: {}", autostart_path.display());
+        println!("Autostart daemon: not configured");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_linux_tray_autostart_root(command: &str) -> CliResult<()> {
+    if nix::unistd::geteuid().is_root() {
+        return Err(CliError::message(format!(
+            "Do not run `locald tray autostart {command}` with sudo. Autostart is configured in your user profile."
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_path() -> CliResult<std::path::PathBuf> {
+    Ok(linux_tray_autostart_dir()?.join(LINUX_TRAY_AUTOSTART_FILENAME))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_dir() -> CliResult<std::path::PathBuf> {
+    if let Some(dir) = linux_tray_autostart_dir_from_xdg_config_home(
+        std::env::var(XDG_CONFIG_HOME_ENV).ok().as_deref(),
+    )? {
+        return Ok(dir);
+    }
+
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| CliError::message("Could not determine XDG config directory"))?;
+    Ok(config_dir.join("autostart"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_dir_from_xdg_config_home(
+    value: Option<&str>,
+) -> CliResult<Option<std::path::PathBuf>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let config_home = std::path::PathBuf::from(trimmed);
+    if !config_home.is_absolute() {
+        return Err(CliError::message(format!(
+            "{XDG_CONFIG_HOME_ENV} must be an absolute path when set: {}",
+            config_home.display()
+        )));
+    }
+
+    Ok(Some(config_home.join("autostart")))
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_tray_autostart_desktop(path: &std::path::Path) -> CliResult<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn render_linux_tray_autostart_desktop(
+    agent_path: &std::path::Path,
+    daemon_path: &std::path::Path,
+) -> String {
+    let daemon_setting = format!("{LOCALD_DAEMON_PATH_ENV}={}", daemon_path.display());
+    let exec = desktop_entry_exec(&[
+        "env".to_string(),
+        daemon_setting,
+        agent_path.to_string_lossy().into_owned(),
+    ]);
+
+    format!(
+        "[Desktop Entry]\nType=Application\nName=locald tray\nComment=locald desktop tray agent\nExec={exec}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_entry_exec(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| desktop_entry_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_entry_quote_arg(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_daemon_path(content: &str) -> Option<std::path::PathBuf> {
+    let exec_line = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Exec="))?;
+    let args = parse_desktop_entry_exec(exec_line);
+    args.into_iter().find_map(|arg| {
+        arg.strip_prefix(&format!("{LOCALD_DAEMON_PATH_ENV}="))
+            .map(std::path::PathBuf::from)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_desktop_entry_exec(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                escaped = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            _ if ch.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    args.push(current);
+                    current = String::new();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
 }
 
 #[cfg(target_os = "linux")]
@@ -2604,6 +2886,93 @@ mod ux_tests {
     fn up_streams_logs_only_when_verbose() {
         assert!(!should_stream_logs_after_up(false));
         assert!(should_stream_logs_after_up(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_entry_quote_arg_escapes_exec_field_specials() {
+        let quoted =
+            desktop_entry_quote_arg(r#"/home/me/odd path/%build/`agent`/$bin/"quote"/slash\"#);
+
+        assert_eq!(
+            quoted,
+            r#""/home/me/odd path/%%build/\`agent\`/\$bin/\"quote\"/slash\\""#
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_desktop_round_trips_pinned_daemon_path() {
+        let desktop = render_linux_tray_autostart_desktop(
+            std::path::Path::new("/home/me/.locald/locald agent"),
+            std::path::Path::new("/home/me/bin/locald debug"),
+        );
+
+        assert!(desktop.contains("Exec="));
+        assert_eq!(
+            linux_tray_autostart_daemon_path(&desktop),
+            Some(std::path::PathBuf::from("/home/me/bin/locald debug"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_daemon_path_override_preserves_host_visible_path() {
+        let root = tempfile::tempdir().unwrap();
+        let locald_path = root.path().join("locald");
+        std::fs::write(&locald_path, "#!/bin/sh\n").unwrap();
+
+        let resolved = resolve_linux_autostart_daemon_path(Some(&locald_path)).unwrap();
+
+        assert_eq!(resolved, locald_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_daemon_path_override_rejects_relative_path() {
+        let error = resolve_linux_autostart_daemon_path(Some(std::path::Path::new("locald")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--locald-path must be an absolute host-visible path"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_desktop_entry_exec_handles_quoted_spaces_and_escapes() {
+        let args = parse_desktop_entry_exec(
+            r#""env" "LOCALD_DAEMON_PATH=/home/me/bin/locald debug" "/home/me/.locald/locald agent""#,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "env".to_string(),
+                "LOCALD_DAEMON_PATH=/home/me/bin/locald debug".to_string(),
+                "/home/me/.locald/locald agent".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_config_home_resolves_user_autostart_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let dir =
+            linux_tray_autostart_dir_from_xdg_config_home(Some(root.path().to_str().unwrap()))
+                .unwrap();
+
+        assert_eq!(dir, Some(root.path().join("autostart")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_config_home_rejects_relative_paths() {
+        let error = linux_tray_autostart_dir_from_xdg_config_home(Some("relative/config"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("XDG_CONFIG_HOME must be an absolute path"));
     }
 }
 

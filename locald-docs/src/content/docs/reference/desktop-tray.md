@@ -12,6 +12,10 @@ locald tray start
 locald tray stop
 locald tray status
 locald tray restart
+locald tray autostart enable
+locald tray autostart enable --locald-path ~/.cargo/bin/locald
+locald tray autostart disable
+locald tray autostart status
 ```
 
 ## What the tray shows
@@ -61,7 +65,15 @@ Requirements for `locald tray start` on Linux:
 
 Pure GNOME sessions without AppIndicator/StatusNotifier support are unsupported for this tray backend. Install or enable GNOME AppIndicator/StatusNotifier support, then run `locald tray start` again.
 
-Linux startup is explicit for now. XDG autostart files and systemd user units are deferred future work.
+Use `locald tray autostart enable` to write a user-scoped XDG autostart entry at `$XDG_CONFIG_HOME/autostart/com.locald.agent.desktop`, or `~/.config/autostart/com.locald.agent.desktop` when `XDG_CONFIG_HOME` is unset. It runs the tray agent at login without requiring systemd user units or root access.
+
+The autostart entry pins the `locald` launcher path that the tray agent uses for setup and daemon actions. By default, it pins the current executable. If your shell resolves `locald` through a dev-container or Distrobox wrapper, pass an explicit host-visible launcher instead:
+
+```bash
+locald tray autostart enable --locald-path ~/.cargo/bin/locald
+```
+
+Disabling autostart removes the XDG entry but does not stop a currently running tray agent. Use `locald tray stop` for that.
 
 ## Diagnostics
 
@@ -73,6 +85,7 @@ Linux startup is explicit for now. XDG autostart files and systemd user units ar
 - whether a stale PID file was cleaned up,
 - where the agent binary was found,
 - which `locald` daemon path is pinned,
+- whether Linux autostart is enabled and which daemon path it will use,
 - whether the current shell has the graphical session and D-Bus session bus needed for tray startup.
 
 If the Linux agent exits during startup, the CLI prints the recent contents of `/tmp/locald-agent.log` and points at that log for details.
