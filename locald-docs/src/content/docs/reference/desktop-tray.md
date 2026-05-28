@@ -57,7 +57,7 @@ Requirements for `locald tray start` on Linux:
 - a graphical session with `WAYLAND_DISPLAY` or `DISPLAY`,
 - a D-Bus session bus with `DBUS_SESSION_BUS_ADDRESS`,
 - a visible StatusNotifier/AppIndicator tray host,
-- an installed `locald-agent` binary next to `locald`, in locald's data directory, or pointed to by `LOCALD_AGENT_PATH`.
+- a provisioned `locald-agent` in locald's data directory (installed automatically from the embedded agent bytes), or a dev override via `LOCALD_AGENT_PATH`.
 
 Pure GNOME sessions without AppIndicator/StatusNotifier support are unsupported for this tray backend. Install or enable GNOME AppIndicator/StatusNotifier support, then run `locald tray start` again.
 

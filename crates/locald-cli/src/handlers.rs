@@ -1972,6 +1972,8 @@ const LOCALD_AGENT_PATH_ENV: &str = "LOCALD_AGENT_PATH";
 const LOCALD_DAEMON_PATH_ENV: &str = "LOCALD_DAEMON_PATH";
 #[cfg(target_os = "linux")]
 const LINUX_TRAY_LOG_PATH: &str = "/tmp/locald-agent.log";
+#[cfg(target_os = "linux")]
+const LINUX_AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
 
 #[cfg(target_os = "linux")]
 fn handle_linux_tray_command(command: &TrayCommands) -> CliResult<()> {
@@ -2126,8 +2128,15 @@ fn status_linux_tray_agent() -> CliResult<()> {
         }
     }
 
-    match resolve_linux_agent_path() {
-        Ok(path) => println!("Agent binary: {}", path.display()),
+    match linux_agent_override_path() {
+        Ok(Some(path)) => println!(
+            "Agent binary: {} (LOCALD_AGENT_PATH override)",
+            path.display()
+        ),
+        Ok(None) => match linux_embedded_agent_status() {
+            Ok(status) => println!("{status}"),
+            Err(error) => println!("Agent binary: not found ({error})"),
+        },
         Err(error) => println!("Agent binary: not found ({error})"),
     }
 
@@ -2147,41 +2156,64 @@ fn status_linux_tray_agent() -> CliResult<()> {
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_agent_path() -> CliResult<std::path::PathBuf> {
-    let candidates = linux_agent_candidates()?;
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.clone());
-        }
+    if let Some(path) = linux_agent_override_path()? {
+        return Ok(path);
     }
 
-    let searched = candidates
-        .iter()
-        .map(|path| format!("  - {}", path.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(CliError::message(format!(
-        "locald-agent is not installed. Expected a desktop tray agent binary at:\n{searched}\nReinstall locald, or during development run `cargo build -p locald-agent` so the binary exists next to `locald`."
-    )))
+    ensure_linux_embedded_agent_installed(LINUX_AGENT_BYTES)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_agent_candidates() -> CliResult<Vec<std::path::PathBuf>> {
-    let mut candidates = Vec::new();
+fn linux_agent_override_path() -> CliResult<Option<std::path::PathBuf>> {
+    let Ok(path) = std::env::var(LOCALD_AGENT_PATH_ENV) else {
+        return Ok(None);
+    };
 
-    if let Ok(path) = std::env::var(LOCALD_AGENT_PATH_ENV)
-        && !path.trim().is_empty()
-    {
-        candidates.push(std::path::PathBuf::from(path));
+    if path.trim().is_empty() {
+        return Ok(None);
     }
 
-    let exe_path = std::env::current_exe().context("Failed to resolve current executable path")?;
-    if let Some(exe_dir) = exe_path.parent() {
-        candidates.push(exe_dir.join("locald-agent"));
+    let override_path = std::path::PathBuf::from(path);
+    if !override_path.is_file() {
+        return Err(CliError::message(format!(
+            "LOCALD_AGENT_PATH is set but does not point to a file: {}",
+            override_path.display()
+        )));
     }
 
-    candidates.push(locald_utils::agent::agent_path()?);
-    candidates.dedup();
-    Ok(candidates)
+    Ok(Some(override_path))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_embedded_agent_installed(bytes: &[u8]) -> CliResult<std::path::PathBuf> {
+    let agent_path = locald_utils::agent::agent_path()?;
+    let matches = locald_utils::agent::verify_integrity(&agent_path, bytes)
+        .context("Failed to verify embedded locald tray agent")?;
+    if !matches {
+        locald_utils::agent::install(&agent_path, bytes)
+            .context("Failed to install embedded locald tray agent")?;
+    }
+    Ok(agent_path)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_embedded_agent_status() -> CliResult<String> {
+    let agent_path = locald_utils::agent::agent_path()?;
+    let matches = locald_utils::agent::verify_integrity(&agent_path, LINUX_AGENT_BYTES)
+        .context("Failed to verify embedded locald tray agent")?;
+    if matches {
+        Ok(format!("Agent binary: {} (embedded)", agent_path.display()))
+    } else if agent_path.is_file() {
+        Ok(format!(
+            "Agent binary: {} (needs update)",
+            agent_path.display()
+        ))
+    } else {
+        Ok(format!(
+            "Agent binary: {} (not installed)",
+            agent_path.display()
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]
