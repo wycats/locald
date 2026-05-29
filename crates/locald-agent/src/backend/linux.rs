@@ -415,12 +415,55 @@ fn poll_daemon_status() -> DaemonStatus {
 #[cfg(target_os = "linux")]
 fn poll_health() -> HealthStatus {
     HealthStatus {
-        helper_installed: locald_utils::shim::find_privileged()
-            .ok()
-            .flatten()
-            .is_some(),
+        helper_installed: helper_is_installed(),
         port_80_reachable: check_port_reachable(80),
         ca_trusted: is_ca_trusted(),
+    }
+}
+
+/// Detect whether a privileged `locald-shim` is installed.
+///
+/// The tray agent binary lives in locald's data directory, not next to the
+/// `locald` daemon, so `find_privileged()` (which searches relative to the
+/// current executable) would not find the shim installed by `locald admin
+/// setup`. Resolve the shim relative to the pinned `LOCALD_DAEMON_PATH` first,
+/// then fall back to the default search.
+#[cfg(target_os = "linux")]
+fn helper_is_installed() -> bool {
+    if let Some(shim_path) = pinned_daemon_shim_path()
+        && locald_utils::shim::is_privileged(&shim_path).unwrap_or(false)
+    {
+        return true;
+    }
+
+    locald_utils::shim::find_privileged()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Resolve the `locald-shim` path that should sit next to the pinned `locald`
+/// daemon, based on `LOCALD_DAEMON_PATH`.
+///
+/// The pinned daemon path may be a symlink (for example
+/// `~/.local/bin/locald` -> `target/release/locald`), so canonicalize it first
+/// to find the real directory where `locald admin setup` installed the shim.
+#[cfg(target_os = "linux")]
+fn pinned_daemon_shim_path() -> Option<std::path::PathBuf> {
+    let daemon_path = non_empty_env(LOCALD_DAEMON_PATH_ENV)?;
+    Some(shim_path_for_daemon(&daemon_path))
+}
+
+/// Compute the `locald-shim` path that should sit next to the given `locald`
+/// daemon path, canonicalizing symlinks so the result points at the real
+/// directory where `locald admin setup` installed the shim.
+#[cfg(target_os = "linux")]
+fn shim_path_for_daemon(daemon_path: &str) -> std::path::PathBuf {
+    let resolved = std::fs::canonicalize(daemon_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(daemon_path));
+    match resolved.parent() {
+        Some(dir) => dir.join("locald-shim"),
+        None => std::path::PathBuf::from("locald-shim"),
     }
 }
 
@@ -699,6 +742,36 @@ mod tests {
         };
 
         assert!(environment.is_gnome());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shim_path_resolves_next_to_canonical_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let bin_dir = root.path().join("target/release");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let real_daemon = bin_dir.join("locald");
+        std::fs::write(&real_daemon, "binary").unwrap();
+
+        let link_dir = root.path().join(".local/bin");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let symlink = link_dir.join("locald");
+        std::os::unix::fs::symlink(&real_daemon, &symlink).unwrap();
+
+        let shim_path = shim_path_for_daemon(symlink.to_str().unwrap());
+
+        assert_eq!(shim_path, bin_dir.join("locald-shim"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shim_path_falls_back_to_raw_parent_when_not_canonicalizable() {
+        let shim_path = shim_path_for_daemon("/nonexistent/place/locald");
+
+        assert_eq!(
+            shim_path,
+            std::path::PathBuf::from("/nonexistent/place/locald-shim")
+        );
     }
 
     #[test]
