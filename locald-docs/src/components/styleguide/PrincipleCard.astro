@@ -8,11 +8,28 @@
 interface Props {
   title: string;
   /** Glyph key matching the icon set. */
-  icon?: "grid" | "eye" | "dots" | "globe" | "clock";
+  icon?:
+    | "grid"
+    | "eye"
+    | "dots"
+    | "globe"
+    | "clock"
+    | "rack"
+    | "stream"
+    | "deck"
+    | "system-plane";
+  /**
+   * Layout variant:
+   * - "inline" (default): icon left, title + description stacked to its right.
+   *   Used by the right-column interaction principles.
+   * - "stacked": icon + title share the top row on one baseline, description
+   *   sits below full-width. Used by the Overview noun cards (guide.png).
+   */
+  layout?: "inline" | "stacked";
   class?: string;
 }
 
-const { title, icon = "dots", class: className } = Astro.props;
+const { title, icon = "dots", layout = "inline", class: className } = Astro.props;
 
 const icons: Record<string, string> = {
   grid: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
@@ -20,42 +37,58 @@ const icons: Record<string, string> = {
   dots: "M6 7a1.5 1.5 0 1 0 0 .01zM6 17a1.5 1.5 0 1 0 0 .01zM11 12a1.5 1.5 0 1 0 0 .01z",
   globe: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM2 12h20M12 2c3 3 3 17 0 20M12 2c-3 3-3 17 0 20",
   clock: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 7v5l3 2",
+  /* rack — three stacked server shelves */
+  rack: "M3 4h18v4H3zM3 10h18v4H3zM3 16h18v4H3zM6 6h.01M6 12h.01M6 18h.01",
+  /* stream — three flowing waves */
+  stream:
+    "M2 7c2.5-2 4.5-2 7 0s4.5 2 7 0M2 12c2.5-2 4.5-2 7 0s4.5 2 7 0M2 17c2.5-2 4.5-2 7 0s4.5 2 7 0",
+  /* deck — 2×2 grid of panels */
+  deck: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  /* system-plane — dashed bounding square with inner node */
+  "system-plane":
+    "M3 5v3M3 16v3M5 3h3M16 3h3M5 21h3M16 21h3M21 5v3M21 16v3M9 12h6M12 9v6",
 };
 const path = icons[icon] ?? icons.dots;
+const dashed = icon === "system-plane";
 ---
 
-<div class:list={["locald-principle", className]}>
-  <svg
-    class="locald-principle__icon"
-    width="20"
-    height="20"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.5"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-    aria-hidden="true"
-  >
-    <path d={path}></path>
-  </svg>
-  <div class="locald-principle__body">
+<div class:list={["locald-principle", `locald-principle--${layout}`, className]}>
+  <div class="locald-principle__head">
+    <svg
+      class="locald-principle__icon"
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.5"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d={path} stroke-dasharray={dashed ? "3 3" : undefined}></path>
+    </svg>
     <h3 class="locald-principle__title">{title}</h3>
-    <p class="locald-principle__desc"><slot /></p>
   </div>
+  <p class="locald-principle__desc"><slot /></p>
 </div>
 
 <style>
   .locald-principle {
     display: flex;
     gap: var(--locald-gap-md);
-    align-items: flex-start;
+  }
+
+  .locald-principle__head {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    min-width: 0;
   }
 
   .locald-principle__icon {
     color: var(--locald-status-running);
     flex: none;
-    margin-top: 0.1rem;
   }
 
   .locald-principle__title {
@@ -68,12 +101,60 @@ const path = icons[icon] ?? icons.dots;
     color: var(--locald-text-primary);
     border: 0;
     padding: 0;
+    line-height: 1;
   }
 
   .locald-principle__desc {
-    margin: var(--locald-gap-xs) 0 0;
+    margin: 0;
     font-size: 0.8rem;
     line-height: 1.4;
     color: var(--locald-text-muted);
+  }
+
+  /*
+   * Inline layout (right-column interaction principles): icon sits to the left
+   * of a stacked title + description block.
+   */
+  .locald-principle--inline {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .locald-principle--inline .locald-principle__head {
+    /* Title only; icon is rendered as the row's leading element via order. */
+    align-items: center;
+  }
+
+  .locald-principle--inline {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: var(--locald-gap-md);
+    row-gap: var(--locald-gap-xs);
+    align-items: start;
+  }
+
+  .locald-principle--inline .locald-principle__head {
+    display: contents;
+  }
+
+  .locald-principle--inline .locald-principle__icon {
+    margin-top: 0.1rem;
+  }
+
+  .locald-principle--inline .locald-principle__title {
+    align-self: center;
+  }
+
+  .locald-principle--inline .locald-principle__desc {
+    grid-column: 2;
+  }
+
+  /*
+   * Stacked layout (noun cards): icon + title share a baseline-aligned header
+   * row; the description sits below, full width. Matches guide.png noun cards.
+   */
+  .locald-principle--stacked {
+    flex-direction: column;
+    gap: var(--locald-gap-md);
   }
 </style>

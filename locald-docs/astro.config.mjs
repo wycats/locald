@@ -25,6 +25,16 @@ export default defineConfig({
           ],
         },
         {
+          label: "Style Guide",
+          items: [
+            { label: "Overview", link: "/style-guide/overview/" },
+            {
+              label: "Components & Interface Patterns",
+              link: "/style-guide/components-interface-patterns/",
+            },
+          ],
+        },
+        {
           label: "App Builder",
           items: [
             {
