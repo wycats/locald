@@ -1,0 +1,208 @@
+---
+/*
+ * DeckTile — a focused live service in the Deck.
+ *
+ * Anatomy (patterns poster panel 05): header (status dot + name + type hint +
+ * activity sparkline), then a two-column body — left meta rows (domain,
+ * instances, git ref) and right metrics (label / value / mini sparkline).
+ *
+ * The Deck holds what the developer is actively monitoring, so a tile may be
+ * more instrument-like than a Rack row.
+ */
+import UrlPill from "./UrlPill.astro";
+
+type Status = "running" | "building" | "failed" | "active" | "idle" | "warning";
+
+interface Metric {
+  label: string;
+  value: string;
+  /** Spark color role. */
+  tone?: "running" | "failed" | "active" | "network";
+}
+
+interface Props {
+  name: string;
+  typeHint?: string;
+  status?: Status;
+  domain?: string;
+  instances?: string;
+  gitRef?: string;
+  gitSha?: string;
+  metrics?: Metric[];
+  class?: string;
+}
+
+const {
+  name,
+  typeHint = "HTTP API",
+  status = "running",
+  domain,
+  instances,
+  gitRef,
+  gitSha,
+  metrics = [],
+  class: className,
+} = Astro.props;
+---
+
+<div class:list={["locald-deck-tile", className]}>
+  <header class="locald-deck-tile__header">
+    <span class={`locald-deck-tile__dot locald-status--${status}`} aria-hidden="true"></span>
+    <span class="locald-deck-tile__name">{name}</span>
+    <span class="locald-deck-tile__hint">{typeHint}</span>
+    <svg class="locald-deck-tile__spark" width="56" height="16" viewBox="0 0 56 16" fill="none" aria-hidden="true">
+      <path d="M1 12 L9 6 L17 9 L25 3 L33 8 L41 4 L49 7 L55 5" stroke="var(--locald-status-active)" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+  </header>
+
+  <div class="locald-deck-tile__body">
+    <dl class="locald-deck-tile__meta">
+      {
+        domain && (
+          <div class="locald-deck-tile__meta-row">
+            <UrlPill href={domain} status={status} static />
+          </div>
+        )
+      }
+      {
+        instances && (
+          <div class="locald-deck-tile__meta-row">
+            <span class="locald-deck-tile__meta-icon" aria-hidden="true">⌗</span>
+            <span>{instances}</span>
+          </div>
+        )
+      }
+      {
+        gitRef && (
+          <div class="locald-deck-tile__meta-row">
+            <span class="locald-deck-tile__meta-icon" aria-hidden="true">⎇</span>
+            <span class="locald-deck-tile__git-ref">{gitRef}</span>
+            {gitSha && <span class="locald-deck-tile__git-sha">{gitSha}</span>}
+          </div>
+        )
+      }
+    </dl>
+
+    {
+      metrics.length > 0 && (
+        <dl class="locald-deck-tile__metrics">
+          {metrics.map((m) => (
+            <div class="locald-deck-tile__metric">
+              <dt>{m.label}</dt>
+              <dd>{m.value}</dd>
+              <svg class="locald-deck-tile__metric-spark" width="48" height="14" viewBox="0 0 48 14" fill="none" aria-hidden="true">
+                <path
+                  d="M1 10 L8 6 L15 8 L22 4 L29 9 L36 5 L43 7 L47 6"
+                  stroke={`var(--locald-status-${m.tone ?? "running"})`}
+                  stroke-width="1.25"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </div>
+          ))}
+        </dl>
+      )
+    }
+  </div>
+</div>
+
+<style>
+  .locald-deck-tile {
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-1);
+    overflow: hidden;
+    font-family: var(--locald-font-sans);
+  }
+
+  .locald-deck-tile__header {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-md) var(--locald-gap-lg);
+    border-bottom: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-deck-tile__dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    flex: none;
+    background: var(--locald-status-running);
+  }
+
+  .locald-status--running { background: var(--locald-status-running); }
+  .locald-status--building { background: var(--locald-status-building); }
+  .locald-status--failed { background: var(--locald-status-failed); }
+  .locald-status--active { background: var(--locald-status-active); }
+  .locald-status--idle { background: var(--locald-status-idle); }
+  .locald-status--warning { background: var(--locald-status-warning); }
+
+  .locald-deck-tile__name {
+    font-family: var(--locald-font-mono);
+    font-weight: 600;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-deck-tile__hint {
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+
+  .locald-deck-tile__spark {
+    margin-left: auto;
+  }
+
+  .locald-deck-tile__body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--locald-space-2);
+    padding: var(--locald-gap-lg);
+  }
+
+  .locald-deck-tile__meta,
+  .locald-deck-tile__metrics {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-deck-tile__meta-row {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-deck-tile__meta-icon {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-deck-tile__git-sha {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-deck-tile__metric {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-deck-tile__metric dt {
+    color: var(--locald-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .locald-deck-tile__metric dd {
+    margin: 0;
+    color: var(--locald-text-primary);
+  }
+</style>

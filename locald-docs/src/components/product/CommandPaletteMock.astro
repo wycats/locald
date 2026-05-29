@@ -1,0 +1,116 @@
+---
+/*
+ * CommandPaletteMock — the bridge between CLI power and dashboard discoverability.
+ *
+ * Anatomy (patterns poster panel 07): an input row with a leading prompt glyph
+ * and a trailing ⌘K hint, then verb rows that map cleanly to CLI concepts, each
+ * with a keyboard shortcut. One row may be highlighted as the active selection.
+ *
+ * Verbs use searchable CLI-aligned names: start, stop, restart, logs, pin.
+ */
+interface Command {
+  label: string;
+  shortcut: string;
+  /** Mark the active/highlighted row. */
+  active?: boolean;
+}
+
+interface Props {
+  placeholder?: string;
+  commands?: Command[];
+  class?: string;
+}
+
+const DEFAULT_COMMANDS: Command[] = [
+  { label: "Start service", shortcut: "⌘↵" },
+  { label: "Stop service", shortcut: "⌘.", active: true },
+  { label: "Restart service", shortcut: "⌘R" },
+  { label: "View logs", shortcut: "⌘L" },
+  { label: "Pin to deck", shortcut: "⌘P" },
+];
+
+const {
+  placeholder = "Type a command or search…",
+  commands = DEFAULT_COMMANDS,
+  class: className,
+} = Astro.props;
+---
+
+<div class:list={["locald-palette", className]} role="group" aria-label="Command palette">
+  <div class="locald-palette__input">
+    <span class="locald-palette__prompt" aria-hidden="true">&gt;_</span>
+    <span class="locald-palette__placeholder">{placeholder}</span>
+    <kbd class="locald-palette__hint">⌘K</kbd>
+  </div>
+  <ul class="locald-palette__list">
+    {
+      commands.map((cmd) => (
+        <li
+          class="locald-palette__row"
+          data-active={cmd.active ? "true" : undefined}
+        >
+          <span class="locald-palette__label">{cmd.label}</span>
+          <kbd class="locald-palette__shortcut">{cmd.shortcut}</kbd>
+        </li>
+      ))
+    }
+  </ul>
+</div>
+
+<style>
+  .locald-palette {
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-1);
+    overflow: hidden;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-palette__input {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-md) var(--locald-gap-lg);
+    border-bottom: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-palette__prompt {
+    color: var(--locald-status-running);
+  }
+
+  .locald-palette__placeholder {
+    color: var(--locald-text-muted);
+    flex: 1;
+  }
+
+  .locald-palette__hint,
+  .locald-palette__shortcut {
+    font-family: var(--locald-font-mono);
+    font-size: 0.7rem;
+    color: var(--locald-text-secondary);
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-sm);
+    padding: 0.05rem 0.35rem;
+    background: var(--locald-surface-2);
+  }
+
+  .locald-palette__list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .locald-palette__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--locald-gap-md) var(--locald-gap-lg);
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-palette__row[data-active="true"] {
+    background: var(--locald-surface-3);
+    color: var(--locald-text-primary);
+  }
+</style>

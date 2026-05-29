@@ -1,0 +1,79 @@
+---
+/*
+ * PrincipleCard — one interaction principle in the style-guide right column.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-5-patterns.png (right column,
+ * "Interaction Principles"). Each is a small icon, a title, and a short rule.
+ */
+interface Props {
+  title: string;
+  /** Glyph key matching the icon set. */
+  icon?: "grid" | "eye" | "dots" | "globe" | "clock";
+  class?: string;
+}
+
+const { title, icon = "dots", class: className } = Astro.props;
+
+const icons: Record<string, string> = {
+  grid: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
+  eye: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z",
+  dots: "M6 7a1.5 1.5 0 1 0 0 .01zM6 17a1.5 1.5 0 1 0 0 .01zM11 12a1.5 1.5 0 1 0 0 .01z",
+  globe: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM2 12h20M12 2c3 3 3 17 0 20M12 2c-3 3-3 17 0 20",
+  clock: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 7v5l3 2",
+};
+const path = icons[icon] ?? icons.dots;
+---
+
+<div class:list={["locald-principle", className]}>
+  <svg
+    class="locald-principle__icon"
+    width="20"
+    height="20"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d={path}></path>
+  </svg>
+  <div class="locald-principle__body">
+    <h3 class="locald-principle__title">{title}</h3>
+    <p class="locald-principle__desc"><slot /></p>
+  </div>
+</div>
+
+<style>
+  .locald-principle {
+    display: flex;
+    gap: var(--locald-gap-md);
+    align-items: flex-start;
+  }
+
+  .locald-principle__icon {
+    color: var(--locald-status-running);
+    flex: none;
+    margin-top: 0.1rem;
+  }
+
+  .locald-principle__title {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--locald-text-primary);
+    border: 0;
+    padding: 0;
+  }
+
+  .locald-principle__desc {
+    margin: var(--locald-gap-xs) 0 0;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--locald-text-muted);
+  }
+</style>

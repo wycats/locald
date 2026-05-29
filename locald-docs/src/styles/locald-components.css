@@ -1,0 +1,207 @@
+/*
+ * locald shared component/demo layout utilities.
+ *
+ * These are reusable layout helpers for arranging product primitives (chips,
+ * pills, token swatches) on style-guide and docs pages. Component-internal
+ * styling lives inside each .astro component; this file holds only the
+ * cross-component layout utilities that MDX pages need (MDX cannot host raw
+ * <style> blocks).
+ */
+
+.locald-chip-row,
+.locald-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--locald-gap-lg);
+  align-items: center;
+}
+
+.locald-token-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+  gap: var(--locald-gap-md);
+}
+
+.locald-token {
+  display: flex;
+  align-items: center;
+  gap: var(--locald-gap-sm);
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-text-secondary);
+}
+
+.locald-swatch {
+  width: 1rem;
+  height: 1rem;
+  border-radius: var(--locald-radius-sm);
+  border: 1px solid var(--locald-border-strong);
+  flex: none;
+}
+
+/*
+ * Poster layout — two columns: a wide left column of numbered spec rows and a
+ * narrow right column of principle/legend cards. Collapses to one column on
+ * narrow viewports. (Patterns poster guide-5-patterns.png.)
+ */
+.locald-poster {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 1fr);
+  gap: var(--locald-space-4);
+  align-items: start;
+}
+
+@media (max-width: 60rem) {
+  .locald-poster {
+    grid-template-columns: 1fr;
+  }
+}
+
+.locald-poster__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+  min-width: 0;
+}
+
+.locald-poster__side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+  min-width: 0;
+}
+
+/* A vertical stack of rows (e.g. service rows in spec row 01). */
+.locald-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-gap-md);
+}
+
+/* Aside groups (Interaction Principles, Status Color Tokens, Icon System). */
+.locald-side-group {
+  border: 1px solid var(--locald-border-strong);
+  border-radius: var(--locald-radius-md);
+  background: var(--locald-surface-1);
+  padding: var(--locald-space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-gap-md);
+}
+
+.locald-side-group__title {
+  margin: 0;
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--locald-status-running);
+}
+
+/* Status color token legend (one item per status). */
+.locald-legend {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-gap-sm);
+  margin: 0;
+}
+
+.locald-legend__item {
+  display: flex;
+  align-items: center;
+  gap: var(--locald-gap-sm);
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-text-secondary);
+}
+
+.locald-legend__dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  flex: none;
+}
+
+/* Token sub-blocks for the Panel & Spacing Tokens spec row. */
+.locald-token-blocks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--locald-space-3);
+}
+
+.locald-token-block__title {
+  margin: 0 0 var(--locald-gap-sm);
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--locald-text-muted);
+}
+
+.locald-token-list {
+  display: grid;
+  gap: var(--locald-gap-xs);
+  margin: 0;
+}
+
+.locald-token-list__row {
+  display: grid;
+  grid-template-columns: 1rem 1fr auto;
+  align-items: center;
+  gap: var(--locald-gap-sm);
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-text-secondary);
+}
+
+.locald-token-list__hex {
+  color: var(--locald-text-muted);
+}
+
+/* Radius scale specimens. */
+.locald-radius-list {
+  display: grid;
+  gap: var(--locald-gap-sm);
+  margin: 0;
+}
+
+.locald-radius-list__row {
+  display: flex;
+  align-items: center;
+  gap: var(--locald-gap-sm);
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-text-secondary);
+}
+
+.locald-radius-list__chip {
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 1px solid var(--locald-border-strong);
+  background: var(--locald-surface-2);
+  flex: none;
+}
+
+/* Spacing rhythm bars (8pt grid). */
+.locald-spacing-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--locald-gap-sm);
+  height: 4rem;
+}
+
+.locald-spacing-bars__bar {
+  flex: 1;
+  background: var(--locald-surface-3);
+  border-top: 2px solid var(--locald-status-running);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.locald-spacing-bars__label {
+  font-family: var(--locald-font-mono);
+  font-size: 0.6rem;
+  color: var(--locald-text-muted);
+  padding-bottom: 2px;
+}

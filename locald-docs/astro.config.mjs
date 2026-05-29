@@ -8,7 +8,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "locald",
-      customCss: ["./src/styles/custom.css"],
+      customCss: ["./src/styles/locald-theme.css", "./src/styles/custom.css"],
       social: [
         {
           label: "GitHub",
