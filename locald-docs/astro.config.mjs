@@ -36,6 +36,10 @@ export default defineConfig({
               label: "Components & Interface Patterns",
               link: "/style-guide/components-interface-patterns/",
             },
+            {
+              label: "Product Surface Grammar",
+              link: "/style-guide/product-surface-grammar/",
+            },
           ],
         },
         {

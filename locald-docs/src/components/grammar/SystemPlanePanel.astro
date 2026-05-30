@@ -1,0 +1,258 @@
+---
+/*
+ * SystemPlanePanel — the platform-as-virtual-service panel from the Product
+ * Surface Grammar poster (page 03, top band, right column). A dashed amber
+ * bordered panel with: a hexagon header, a Platform overview dot-matrix, a
+ * Health strip, a Resources block (CPU/MEM/FDs with bars), and a Network block
+ * (IN/OUT).
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-3-grammar.png.
+ */
+
+interface ResourceRow {
+  label: string;
+  value: string;
+  /** 0..1 bar fill fraction. */
+  fill: number;
+}
+
+interface Props {
+  resources?: ResourceRow[];
+  netIn?: string;
+  netOut?: string;
+  /** Health-strip dot count. */
+  healthDots?: number;
+  class?: string;
+}
+
+const {
+  resources = [
+    { label: "CPU", value: "11%", fill: 0.11 },
+    { label: "MEM", value: "23%", fill: 0.23 },
+    { label: "FDs", value: "256", fill: 0.4 },
+  ],
+  netIn = "2.3 MB/s",
+  netOut = "1.1 MB/s",
+  healthDots = 8,
+  class: className,
+} = Astro.props;
+
+// Platform-overview dot matrix: 3 rows x 9 cols, mostly running with a few
+// accent dots to read as a live service map.
+const matrixRows = 3;
+const matrixCols = 9;
+const accents: Record<string, string> = {
+  "0-3": "var(--locald-status-active)",
+  "0-6": "var(--locald-status-network)",
+  "1-1": "var(--locald-status-building)",
+  "1-7": "var(--locald-status-active)",
+  "2-4": "var(--locald-status-network)",
+};
+---
+
+<aside class:list={["locald-splane", className]} aria-label="System Plane">
+  <header class="locald-splane__head">
+    <span class="locald-splane__hex" aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <polygon
+          points="9,1.5 15.5,5.25 15.5,12.75 9,16.5 2.5,12.75 2.5,5.25"
+          stroke="var(--locald-status-network)"
+          stroke-width="1.25"
+        ></polygon>
+        <circle cx="9" cy="9" r="1.6" fill="var(--locald-status-network)"></circle>
+      </svg>
+    </span>
+    <span class="locald-splane__title">SYSTEM PLANE</span>
+  </header>
+
+  <section class="locald-splane__section">
+    <p class="locald-splane__label">Platform overview</p>
+    <div class="locald-splane__matrix" aria-hidden="true">
+      {
+        Array.from({ length: matrixRows }).map((_, r) => (
+          <div class="locald-splane__matrix-row">
+            {Array.from({ length: matrixCols }).map((_, c) => (
+              <span
+                class="locald-splane__matrix-dot"
+                style={`background:${accents[`${r}-${c}`] ?? "var(--locald-status-running)"}`}
+              />
+            ))}
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="locald-splane__section">
+    <p class="locald-splane__label">Health</p>
+    <div class="locald-splane__health" aria-hidden="true">
+      {
+        Array.from({ length: healthDots }).map(() => (
+          <span class="locald-splane__health-dot" />
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="locald-splane__section">
+    <p class="locald-splane__label">Resources</p>
+    <dl class="locald-splane__resources">
+      {
+        resources.map((row) => (
+          <div class="locald-splane__resource">
+            <dt>{row.label}</dt>
+            <dd class="locald-splane__resource-value">{row.value}</dd>
+            <span class="locald-splane__bar" aria-hidden="true">
+              <span
+                class="locald-splane__bar-fill"
+                style={`width:${Math.round(row.fill * 100)}%`}
+              />
+            </span>
+          </div>
+        ))
+      }
+    </dl>
+  </section>
+
+  <section class="locald-splane__section">
+    <p class="locald-splane__label">Network</p>
+    <dl class="locald-splane__network">
+      <div class="locald-splane__net-row">
+        <dt>IN</dt>
+        <dd>{netIn}</dd>
+      </div>
+      <div class="locald-splane__net-row">
+        <dt>OUT</dt>
+        <dd>{netOut}</dd>
+      </div>
+    </dl>
+  </section>
+</aside>
+
+<style>
+  .locald-splane {
+    border: 1.5px dashed var(--locald-status-network);
+    border-radius: var(--locald-radius-md);
+    background: color-mix(in oklab, var(--locald-status-network) 4%, var(--locald-surface-1));
+    padding: var(--locald-space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-2);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+  }
+
+  .locald-splane__head {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-splane__hex {
+    display: inline-flex;
+  }
+
+  .locald-splane__title {
+    color: var(--locald-status-network);
+    letter-spacing: 0.1em;
+    font-weight: 600;
+  }
+
+  .locald-splane__section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-splane__label {
+    margin: 0;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-splane__matrix {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .locald-splane__matrix-row {
+    display: flex;
+    gap: 0.3rem;
+  }
+
+  .locald-splane__matrix-dot {
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+  }
+
+  .locald-splane__health {
+    display: flex;
+    gap: 0.4rem;
+  }
+
+  .locald-splane__health-dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: var(--locald-status-running);
+  }
+
+  .locald-splane__resources {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-splane__resource {
+    display: grid;
+    grid-template-columns: 2.5rem 2.5rem 1fr;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-splane__resource dt {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-splane__resource-value {
+    margin: 0;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-splane__bar {
+    height: 0.4rem;
+    border-radius: 2px;
+    background: var(--locald-surface-3);
+    overflow: hidden;
+  }
+
+  .locald-splane__bar-fill {
+    display: block;
+    height: 100%;
+    background: var(--locald-status-running);
+  }
+
+  .locald-splane__network {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .locald-splane__net-row {
+    display: grid;
+    grid-template-columns: 2.5rem 1fr;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-splane__net-row dt {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-splane__net-row dd {
+    margin: 0;
+    color: var(--locald-text-secondary);
+  }
+</style>
