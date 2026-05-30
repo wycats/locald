@@ -1,0 +1,201 @@
+---
+/*
+ * TypeSpecimen — the typography panel from the Brand Foundations poster.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-2-foundations.png (panel 02
+ * TYPOGRAPHY). A family header ("Primary Sans -> Inter") followed by specimen
+ * rows showing a sample rendered at its real role size, plus a size/line and
+ * weight column. A second family header introduces the monospace sample.
+ *
+ * The sample text is rendered at the role's actual type-scale token so the
+ * page doubles as a live specimen, not a description of one.
+ */
+
+interface Specimen {
+  /** Sample text, rendered at the role size. */
+  sample: string;
+  /** Role token name: display | heading | body | caption | code. */
+  role: "display" | "heading" | "body" | "caption" | "code";
+  /** Size/line metrics column, e.g. "72/80". */
+  metrics: string;
+  /** Weight column, e.g. "Bold". */
+  weight: string;
+  /** Render the sample in the mono family (code role). */
+  mono?: boolean;
+}
+
+interface Props {
+  class?: string;
+}
+
+const { class: className } = Astro.props;
+
+const sansSpecimens: Specimen[] = [
+  { sample: "Display", role: "display", metrics: "72/80", weight: "Bold" },
+  { sample: "Heading", role: "heading", metrics: "32/40", weight: "Semibold" },
+  { sample: "Body", role: "body", metrics: "16/24", weight: "Regular" },
+  { sample: "Caption", role: "caption", metrics: "12/16", weight: "Regular" },
+  {
+    sample: "Code",
+    role: "code",
+    metrics: "12/16",
+    weight: "Medium",
+    mono: true,
+  },
+];
+
+const monoSpecimen: Specimen = {
+  sample: "$ locald serve --port 3000",
+  role: "code",
+  metrics: "12/16",
+  weight: "Medium",
+  mono: true,
+};
+---
+
+<div class:list={["locald-typespec", className]}>
+  <div class="locald-typespec__family">
+    <span class="locald-typespec__family-label">Primary Sans</span>
+    <span class="locald-typespec__family-arrow" aria-hidden="true">&rarr;</span>
+    <span class="locald-typespec__family-name">Inter</span>
+  </div>
+
+  <ul class="locald-typespec__rows">
+    {
+      sansSpecimens.map((spec) => (
+        <li class="locald-typespec__row">
+          <span
+            class:list={[
+              "locald-typespec__sample",
+              `locald-typespec__sample--${spec.role}`,
+              spec.mono && "locald-typespec__sample--mono",
+            ]}
+          >
+            {spec.sample}
+          </span>
+          <span class="locald-typespec__metrics">{spec.metrics}</span>
+          <span class="locald-typespec__weight">{spec.weight}</span>
+        </li>
+      ))
+    }
+  </ul>
+
+  <div class="locald-typespec__family locald-typespec__family--mono">
+    <span class="locald-typespec__family-label">Monospace</span>
+    <span class="locald-typespec__family-arrow" aria-hidden="true">&rarr;</span>
+    <span class="locald-typespec__family-name">JetBrains Mono</span>
+  </div>
+
+  <ul class="locald-typespec__rows">
+    <li class="locald-typespec__row">
+      <span class="locald-typespec__sample locald-typespec__sample--codesample">
+        {monoSpecimen.sample}
+      </span>
+      <span class="locald-typespec__metrics">{monoSpecimen.metrics}</span>
+      <span class="locald-typespec__weight">{monoSpecimen.weight}</span>
+    </li>
+  </ul>
+</div>
+
+<style>
+  .locald-typespec {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-3);
+  }
+
+  .locald-typespec__family {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+
+  .locald-typespec__family-arrow {
+    color: var(--locald-text-muted);
+  }
+
+  .locald-typespec__family-name {
+    color: var(--locald-status-building);
+  }
+
+  .locald-typespec__rows {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-typespec__row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: baseline;
+    gap: var(--locald-space-3);
+  }
+
+  .locald-typespec__sample {
+    color: var(--locald-text-primary);
+    font-family: var(--locald-font-sans);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .locald-typespec__sample--display {
+    font-size: 2.75rem;
+    line-height: 1;
+    font-weight: var(--locald-type-display-weight);
+    letter-spacing: -0.02em;
+  }
+
+  .locald-typespec__sample--heading {
+    font-size: 1.75rem;
+    line-height: 1.1;
+    font-weight: var(--locald-type-heading-weight);
+  }
+
+  .locald-typespec__sample--body {
+    font-size: var(--locald-type-body-size);
+    line-height: var(--locald-type-body-line);
+    font-weight: var(--locald-type-body-weight);
+  }
+
+  .locald-typespec__sample--caption {
+    font-size: var(--locald-type-caption-size);
+    line-height: var(--locald-type-caption-line);
+    font-weight: var(--locald-type-caption-weight);
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-typespec__sample--code {
+    font-family: var(--locald-font-mono);
+    font-size: 0.95rem;
+    font-weight: var(--locald-type-code-weight);
+    color: var(--locald-status-running);
+  }
+
+  .locald-typespec__sample--codesample {
+    font-family: var(--locald-font-mono);
+    font-size: 0.95rem;
+    font-weight: var(--locald-type-code-weight);
+    color: var(--locald-status-running);
+  }
+
+  .locald-typespec__metrics,
+  .locald-typespec__weight {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+    white-space: nowrap;
+  }
+
+  .locald-typespec__weight {
+    min-width: 4.5rem;
+    text-align: left;
+  }
+</style>

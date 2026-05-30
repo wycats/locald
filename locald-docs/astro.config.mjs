@@ -29,6 +29,10 @@ export default defineConfig({
           items: [
             { label: "Overview", link: "/style-guide/overview/" },
             {
+              label: "Brand Foundations",
+              link: "/style-guide/brand-foundations/",
+            },
+            {
               label: "Components & Interface Patterns",
               link: "/style-guide/components-interface-patterns/",
             },

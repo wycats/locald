@@ -329,3 +329,179 @@
     grid-template-columns: 1fr;
   }
 }
+
+/*
+ * Brand Foundations poster (guide-2-foundations.png, page 02) layout utilities.
+ *
+ * The poster is five numbered sections. Sections 01/02 sit side by side, 03/04/05
+ * span full width. Each section is a bordered panel with a numbered lime header.
+ */
+
+/* Vertical rhythm between the Foundations page's section panels. */
+.locald-foundations {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+}
+
+/*
+ * Two-up row: Color System (left) + Typography (right). Panels size to their
+ * own content (align-items: start) so the taller swatch grid doesn't stretch
+ * the typography panel and open a dead band in its middle.
+ */
+.locald-foundations__pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--locald-space-3);
+  align-items: start;
+}
+
+@media (max-width: 60rem) {
+  .locald-foundations__pair {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* A numbered section panel. */
+.locald-fsection {
+  border: 1px solid var(--locald-border-subtle);
+  border-radius: var(--locald-radius-lg);
+  background: var(--locald-surface-1);
+  padding: var(--locald-space-3);
+  min-width: 0;
+}
+
+/* Reset Starlight's markdown-flow `* + *` top margin on MDX-embedded panels. */
+.locald-foundations > *,
+.locald-foundations__pair > * {
+  margin: 0;
+}
+
+.locald-fsection__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--locald-gap-md);
+  margin-bottom: var(--locald-space-3);
+}
+
+.locald-fsection__num {
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  font-weight: 700;
+  color: var(--locald-status-running);
+}
+
+.locald-fsection__title {
+  margin: 0;
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--locald-text-secondary);
+}
+
+/*
+ * Color swatch grid (two visual rows: surfaces/text, then status).
+ *
+ * Uses auto-fit with a comfortable min column width so swatch captions never
+ * wrap mid-label or collide — the grid reflows the number of columns to fit
+ * rather than cramming a fixed count into too little width.
+ */
+.locald-swatch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
+  gap: var(--locald-space-2);
+}
+
+.locald-swatch-grid--status {
+  margin-top: var(--locald-space-3);
+}
+
+/* Brand-mark lockup strip (panel 03): three lockups separated by hairlines. */
+.locald-brandmark-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--locald-space-3);
+  align-items: stretch;
+}
+
+.locald-brandmark-strip > * {
+  margin: 0;
+}
+
+.locald-brandmark-strip > * + * {
+  border-left: 1px solid var(--locald-border-subtle);
+  padding-left: var(--locald-space-3);
+}
+
+@media (max-width: 48rem) {
+  .locald-brandmark-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .locald-brandmark-strip > * + * {
+    border-left: none;
+    padding-left: 0;
+    border-top: 1px solid var(--locald-border-subtle);
+    padding-top: var(--locald-space-3);
+  }
+}
+
+/*
+ * Design-principles strip (panel 05): glyph + text cells.
+ *
+ * Uses auto-fit with a min cell width so cells reflow evenly at any width
+ * (5-up → 3-up → 2-up → 1-up) instead of jumping between fixed column counts
+ * that leave a ragged orphan row. Each cell is a bordered card so the wrapped
+ * layout still reads as a deliberate grid rather than loose floating text.
+ */
+.locald-principles-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--locald-space-2);
+}
+
+.locald-principles-strip > * {
+  margin: 0;
+}
+
+/*
+ * A single design-principle cell (panel 05): an accent glyph, a bold title,
+ * and a short rule. The accent color is per-cell and set via the
+ * --locald-fprinciple-accent custom property (status semantics: the glyph
+ * color carries meaning, matching the poster). Left-aligned inside a bordered
+ * card so it stays tidy when the strip wraps.
+ */
+.locald-fprinciple {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-gap-sm);
+  min-width: 0;
+  padding: var(--locald-space-2);
+  border: 1px solid var(--locald-border-subtle);
+  border-radius: var(--locald-radius-md);
+  background: var(--locald-surface-2);
+}
+
+.locald-fprinciple__icon {
+  color: var(--locald-fprinciple-accent, var(--locald-status-running));
+  flex: none;
+}
+
+.locald-fprinciple__title {
+  margin: 0;
+  font-family: var(--locald-font-sans);
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--locald-text-primary);
+  border: 0;
+  padding: 0;
+}
+
+.locald-fprinciple__rule {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--locald-text-muted);
+}

@@ -58,8 +58,18 @@ const {
       <LocaldMark size={28} label="locald" />
       <div class="locald-sg__titles">
         <h1 class="locald-sg__wordmark">{title ?? "locald"}</h1>
-        {subtitle && <p class="locald-sg__subtitle">{subtitle}</p>}
-        {version && <p class="locald-sg__version">_ {version}</p>}
+        {
+          (subtitle || version) && (
+            <p class="locald-sg__tagline">
+              {subtitle && (
+                <span class="locald-sg__subtitle">{subtitle}</span>
+              )}
+              {version && (
+                <span class="locald-sg__version">_ {version}</span>
+              )}
+            </p>
+          )
+        }
       </div>
     </div>
 
@@ -156,6 +166,14 @@ const {
     line-height: 1;
     letter-spacing: -0.03em;
     color: var(--locald-text-primary);
+  }
+
+  .locald-sg__tagline {
+    margin: 0;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--locald-gap-sm) var(--locald-space-2);
   }
 
   .locald-sg__subtitle {
