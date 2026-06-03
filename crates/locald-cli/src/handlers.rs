@@ -96,6 +96,13 @@ fn print_project_up_summary(info: &ProjectStatusInfo) {
     println!("Stop: locald stop");
 }
 
+fn detach_runtime_hold(project_path: &std::path::Path) {
+    let _ = client::send_request(&IpcRequest::ProjectDetach {
+        project_path: project_path.to_path_buf(),
+        source: Some(AttachmentSource::Runtime),
+    });
+}
+
 const fn section_label(section: ProjectSection) -> &'static str {
     match section {
         ProjectSection::Active => "active",
@@ -496,12 +503,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             || err_str.contains("No such file or directory")
                         {
                             if attempts > 50 {
+                                detach_runtime_hold(&abs_path);
                                 return Err(e);
                             }
                             attempts += 1;
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         } else {
                             cliclack::outro(format!("Failed to register project: {e}"))?;
+                            detach_runtime_hold(&abs_path);
                             return Err(e);
                         }
                     }
@@ -517,17 +526,24 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             match client::send_request(&IpcRequest::ProjectStatus {
-                project_path: abs_path,
+                project_path: abs_path.clone(),
             }) {
                 Ok(IpcResponse::ProjectStatus(info)) => print_project_up_summary(&info),
                 Ok(IpcResponse::Error(msg)) => {
+                    detach_runtime_hold(&abs_path);
                     return Err(CliError::message(format!(
                         "{} Failed to read project status: {msg}",
                         style::CROSS
                     )));
                 }
-                Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
-                Err(e) => return Err(e),
+                Ok(r) => {
+                    detach_runtime_hold(&abs_path);
+                    return Err(CliError::message(format!("Unexpected response: {r:?}")));
+                }
+                Err(e) => {
+                    detach_runtime_hold(&abs_path);
+                    return Err(e);
+                }
             }
 
             if *follow {
