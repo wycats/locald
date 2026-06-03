@@ -103,6 +103,28 @@ fn detach_runtime_hold(project_path: &std::path::Path) {
     });
 }
 
+fn force_stop_project(project_path: &std::path::Path) {
+    let _ = client::send_request(&IpcRequest::ProjectForceStop {
+        project_path: project_path.to_path_buf(),
+    });
+}
+
+fn attach_runtime_hold(project_path: &std::path::Path) -> CliResult<()> {
+    match client::send_request(&IpcRequest::ProjectAttach {
+        project_path: project_path.to_path_buf(),
+        source: AttachmentSource::Runtime,
+        start_services: false,
+    }) {
+        Ok(IpcResponse::Ok) => Ok(()),
+        Ok(IpcResponse::Error(msg)) => Err(CliError::message(format!(
+            "{} Failed to attach project: {msg}",
+            style::CROSS
+        ))),
+        Ok(r) => Err(CliError::message(format!("Unexpected response: {r:?}"))),
+        Err(e) => Err(e),
+    }
+}
+
 const fn section_label(section: ProjectSection) -> &'static str {
     match section {
         ProjectSection::Active => "active",
@@ -470,22 +492,6 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
 
-            // Register a runtime hold so the project stays up after this command exits.
-            match client::send_request(&IpcRequest::ProjectAttach {
-                project_path: abs_path.clone(),
-                source: AttachmentSource::Runtime,
-            }) {
-                Ok(IpcResponse::Ok) => {}
-                Ok(IpcResponse::Error(msg)) => {
-                    return Err(CliError::message(format!(
-                        "{} Failed to attach project: {msg}",
-                        style::CROSS
-                    )));
-                }
-                Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
-                Err(e) => return Err(e),
-            }
-
             // Start services with progress output.
             let mut attempts = 0;
             loop {
@@ -503,18 +509,21 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             || err_str.contains("No such file or directory")
                         {
                             if attempts > 50 {
-                                detach_runtime_hold(&abs_path);
                                 return Err(e);
                             }
                             attempts += 1;
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         } else {
                             cliclack::outro(format!("Failed to register project: {e}"))?;
-                            detach_runtime_hold(&abs_path);
                             return Err(e);
                         }
                     }
                 }
+            }
+
+            if let Err(e) = attach_runtime_hold(&abs_path) {
+                force_stop_project(&abs_path);
+                return Err(e);
             }
 
             report_update(&update_rx);
@@ -1594,6 +1603,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 match client::send_request(&IpcRequest::ProjectAttach {
                     project_path: abs_path,
                     source,
+                    start_services: true,
                 }) {
                     Ok(IpcResponse::Ok) => {
                         if *json {

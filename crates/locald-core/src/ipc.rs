@@ -5,6 +5,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const fn default_project_attach_start_services() -> bool {
+    true
+}
+
 /// Represents the stream a log message came from.
 ///
 /// # Example
@@ -321,6 +325,9 @@ pub enum IpcRequest {
         project_path: PathBuf,
         /// The source of the attachment.
         source: AttachmentSource,
+        /// Whether a first attachment should start the project services.
+        #[serde(default = "default_project_attach_start_services")]
+        start_services: bool,
     },
     /// Remove a project attachment.
     ///

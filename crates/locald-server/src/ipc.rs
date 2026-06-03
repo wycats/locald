@@ -283,7 +283,11 @@ async fn handle_connection(
         IpcRequest::ProjectAttach {
             project_path,
             source,
-        } => match manager.project_attach(project_path, source).await {
+            start_services,
+        } => match manager
+            .project_attach(project_path, source, start_services)
+            .await
+        {
             Ok(()) => IpcResponse::Ok,
             Err(e) => IpcResponse::Error(e.to_string()),
         },

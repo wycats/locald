@@ -1660,6 +1660,7 @@ impl ProcessManager {
         &self,
         project_path: PathBuf,
         source: AttachmentSource,
+        start_services: bool,
     ) -> Result<()> {
         // Canonicalize to prevent duplicate attachments from different relative paths.
         let canonical =
@@ -1681,7 +1682,7 @@ impl ProcessManager {
             first
         };
 
-        if is_first {
+        if is_first && start_services {
             info!(
                 "First attachment for {}, starting services",
                 canonical.display()
@@ -2618,6 +2619,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_project_attach_can_skip_auto_start() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry,
+            attachments.clone(),
+            None,
+        )
+        .expect("Failed to create ProcessManager");
+
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).unwrap();
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "runtime-hold"
+
+[services.web]
+command = "sleep 30"
+"#,
+        )
+        .unwrap();
+
+        manager
+            .project_attach(project_path.clone(), AttachmentSource::Runtime, false)
+            .await
+            .unwrap();
+
+        let services = manager.services.lock().await;
+        assert!(
+            !services.contains_key("runtime-hold:web"),
+            "record-only attach should not start project services"
+        );
+        drop(services);
+
+        let store = attachments.lock().await;
+        let remaining = store.attachments_for(&project_path);
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(remaining[0].source, AttachmentSource::Runtime));
+    }
+
+    #[tokio::test]
     async fn test_project_attach_reaps_stale_editor_before_first_attach() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
@@ -2672,6 +2724,7 @@ command = "sleep 30"
                     id: "fresh".to_string(),
                     pid: Some(std::process::id()),
                 },
+                true,
             )
             .await
             .unwrap();
