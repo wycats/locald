@@ -26,7 +26,10 @@ impl TestContext {
     /// Create a new test context.
     /// This will compile the binaries if they are not up to date (handled by cargo test).
     pub fn new() -> Self {
-        let root = tempfile::tempdir().expect("failed to create temp dir");
+        let root = tempfile::Builder::new()
+            .prefix("ld-e2e-")
+            .tempdir_in("/tmp")
+            .expect("failed to create temp dir");
 
         let tmp_name = root
             .path()
@@ -250,6 +253,142 @@ command = "python3 -m http.server $PORT"
         .success()
         .stdout(predicates::str::contains("web"))
         .stdout(predicates::str::contains("Running"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_up_exits_quietly_and_keeps_runtime_hold() {
+    let mut ctx = TestContext::new();
+    ctx.start_daemon();
+
+    let project_dir = ctx.root.path().join("quiet-up-test");
+    fs::create_dir(&project_dir).unwrap();
+
+    let config = r#"
+[project]
+name = "quiet-up-test"
+
+[services.worker]
+type = "worker"
+command = "sleep 60"
+"#;
+    fs::write(project_dir.join("locald.toml"), config).unwrap();
+
+    let output = ctx
+        .command()
+        .arg("up")
+        .arg(&project_dir)
+        .output()
+        .expect("failed to run locald up");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "locald up failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Streaming logs") && !stderr.contains("Streaming logs"),
+        "default locald up should not stream logs\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Logs: locald logs --follow"),
+        "expected logs hint in summary\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Stop: locald stop"),
+        "expected stop hint in summary\nstdout:\n{stdout}"
+    );
+
+    let status_output = ctx
+        .command()
+        .arg("project")
+        .arg("status")
+        .arg(&project_dir)
+        .arg("--json")
+        .output()
+        .expect("failed to run project status");
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+    let status_stderr = String::from_utf8_lossy(&status_output.stderr);
+    assert!(
+        status_output.status.success(),
+        "project status failed\nstdout:\n{status_stdout}\nstderr:\n{status_stderr}"
+    );
+    assert!(
+        status_stdout.contains("\"Runtime\""),
+        "expected runtime attachment after locald up\nstdout:\n{status_stdout}"
+    );
+    assert!(
+        status_stdout.contains("\"is_running\": true"),
+        "expected project to remain running after locald up exits\nstdout:\n{status_stdout}"
+    );
+
+    ctx.command()
+        .current_dir(&project_dir)
+        .arg("stop")
+        .assert()
+        .success();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_up_follow_streams_explicitly_without_releasing_runtime_hold() {
+    let mut ctx = TestContext::new();
+    ctx.start_daemon();
+
+    let project_dir = ctx.root.path().join("follow-up-test");
+    fs::create_dir(&project_dir).unwrap();
+
+    let config = r#"
+[project]
+name = "follow-up-test"
+
+[services.worker]
+type = "worker"
+command = "sleep 60"
+"#;
+    fs::write(project_dir.join("locald.toml"), config).unwrap();
+
+    let mut cmd = StdCommand::new(&ctx.locald_bin);
+    cmd.envs(ctx.env());
+    cmd.arg(format!("--sandbox={}", ctx.sandbox));
+    cmd.arg("up");
+    cmd.arg("--follow");
+    cmd.arg(&project_dir);
+
+    let mut p = rexpect::session::spawn_command(cmd, Some(30000)).expect("failed to spawn rexpect");
+    p.exp_string("Streaming logs (Ctrl+C to stop following)")
+        .expect("failed to find explicit streaming message");
+    p.send_control('c').expect("failed to send Ctrl-C");
+    p.process
+        .wait()
+        .expect("failed to wait for locald up --follow");
+
+    let status_output = ctx
+        .command()
+        .arg("project")
+        .arg("status")
+        .arg(&project_dir)
+        .arg("--json")
+        .output()
+        .expect("failed to run project status");
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        status_output.status.success(),
+        "project status failed after --follow\nstdout:\n{}\nstderr:\n{}",
+        status_stdout,
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    assert!(
+        status_stdout.contains("\"Runtime\""),
+        "expected runtime attachment to survive Ctrl-C from --follow\nstdout:\n{status_stdout}"
+    );
+
+    ctx.command()
+        .current_dir(&project_dir)
+        .arg("stop")
+        .assert()
+        .success();
 }
 
 #[test]

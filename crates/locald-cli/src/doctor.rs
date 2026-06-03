@@ -92,6 +92,22 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         }
 
         if !json {
+            match launch_agent_running() {
+                Ok(true) => {
+                    let _ = cliclack::log::success("Menu bar agent: loaded and running");
+                }
+                Ok(false) => {
+                    let _ = cliclack::log::warning(
+                        "Menu bar agent: not loaded (run `locald admin setup`)",
+                    );
+                }
+                Err(e) => {
+                    let _ = cliclack::log::warning(format!(
+                        "Menu bar agent: launchd status unavailable ({e})"
+                    ));
+                }
+            }
+
             // Check if the privileged helper is installed and reachable.
             let helper_path =
                 std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
@@ -125,6 +141,22 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
     }
 
     Ok(i32::from(report.has_critical_failures()))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_running() -> Result<bool> {
+    let uid = nix::unistd::Uid::current().as_raw();
+    let service_target = format!("gui/{uid}/com.locald.agent");
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &service_target])
+        .output()?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.contains("pid ="))
 }
 
 fn render_command(cmd: &str) -> Cow<'_, str> {

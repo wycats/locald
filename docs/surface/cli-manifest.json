@@ -2764,6 +2764,14 @@
             "positional": false
           },
           {
+            "long": "follow",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "help",
             "short": "h",
             "aliases": [],

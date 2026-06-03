@@ -42,6 +42,7 @@ Arguments:
 Options:
       --sandbox <SANDBOX>  Run in a sandbox environment
   -v, --verbose            Show verbose output
+      --follow             Follow service logs after startup
   -h, --help               Print help
 
 ```
