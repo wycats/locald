@@ -8,6 +8,7 @@
 		stopServiceWithFeedback,
 		restartServiceWithFeedback
 	} from '$lib/actions/service';
+	import { displayServiceEndpoint } from '$lib/utils/service-display';
 	import { cleanLog } from '$lib/utils/logs';
 	import Spinner from './Spinner.svelte';
 	import StatusDot from './StatusDot.svelte';
@@ -65,25 +66,7 @@
 		await restartServiceWithFeedback(service.name);
 	}
 
-	function getDisplayUrl(service: ServiceStatus) {
-		if (service.domain) return service.domain;
-		if (service.url) {
-			try {
-				const url = new URL(service.url);
-				if (url.hostname.endsWith('.localhost')) {
-					return url.hostname;
-				}
-				// If it's localhost, just return the host:port
-				if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
-					return url.host;
-				}
-			} catch {
-				/* empty */
-			}
-			return service.url.replace(/^https?:\/\//, '');
-		}
-		return '';
-	}
+	let endpoint = $derived(displayServiceEndpoint(service));
 </script>
 
 <div
@@ -105,12 +88,14 @@
 				{service.name.split(':').pop()}
 			</span>
 		</div>
-		{#if service.url}
+		{#if endpoint?.kind === 'public'}
 			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
-			<a href={service.url} target="_blank" onclick={(e) => e.stopPropagation()} class="link">
-				{getDisplayUrl(service)}
+			<a href={endpoint.value} target="_blank" onclick={(e) => e.stopPropagation()} class="link">
+				{endpoint.label}
 				<ExternalLink size={12} />
 			</a>
+		{:else if endpoint?.kind === 'connection'}
+			<span class="link connection-url" title={endpoint.value}>{endpoint.label}</span>
 		{/if}
 	</div>
 

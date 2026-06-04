@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
+use crate::error::CliResult;
+use anyhow::Context;
 use locald_core::config::{
     CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, LocaldConfig,
     PostgresServiceConfig, ProjectConfig, ServiceConfig, SiteServiceConfig, TypedServiceConfig,
 };
 use std::collections::HashMap;
 
-fn load_or_create_config() -> Result<(std::path::PathBuf, LocaldConfig)> {
+fn load_or_create_config() -> CliResult<(std::path::PathBuf, LocaldConfig)> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join("locald.toml");
 
@@ -35,23 +36,43 @@ fn load_or_create_config() -> Result<(std::path::PathBuf, LocaldConfig)> {
     Ok((config_path, config))
 }
 
-fn save_config(path: &std::path::Path, config: &LocaldConfig) -> Result<()> {
+fn save_config(path: &std::path::Path, config: &LocaldConfig) -> CliResult<()> {
     let toml_string = toml::to_string_pretty(config)?;
     std::fs::write(path, toml_string)?;
     Ok(())
 }
 
-fn start_project() -> Result<()> {
+fn start_project() -> CliResult<()> {
     let cwd = std::env::current_dir()?;
     crate::client::stream_boot_events(&locald_core::IpcRequest::Start {
         project_path: cwd,
+        inherited_env: crate::handlers::inherited_service_env(),
         verbose: false,
     })?;
     println!("Project started successfully.");
     Ok(())
 }
 
-pub fn add_exec(command: String, name: Option<String>, port: Option<u16>) -> Result<()> {
+fn postgres_service_config(version: Option<String>) -> ServiceConfig {
+    ServiceConfig::Typed(TypedServiceConfig::Postgres(PostgresServiceConfig {
+        common: CommonServiceConfig {
+            port: None,
+            env: HashMap::new(),
+            depends_on: Vec::new(),
+            health_check: None,
+            stop_signal: None,
+        },
+        version,
+    }))
+}
+
+fn insert_postgres_service(config: &mut LocaldConfig, name: &str, version: Option<String>) {
+    config
+        .services
+        .insert(name.to_string(), postgres_service_config(version));
+}
+
+pub fn add_exec(command: String, name: Option<String>, port: Option<u16>) -> CliResult<()> {
     let (config_path, mut config) = load_or_create_config()?;
     let service_name = name.unwrap_or_else(|| "web".to_string());
 
@@ -82,7 +103,7 @@ pub fn add_container(
     name: Option<String>,
     container_port: Option<u16>,
     command: Option<String>,
-) -> Result<()> {
+) -> CliResult<()> {
     let (config_path, mut config) = load_or_create_config()?;
     let service_name = name.unwrap_or_else(|| "redis".to_string());
 
@@ -110,22 +131,9 @@ pub fn add_container(
     Ok(())
 }
 
-pub fn add_postgres(name: &str, version: Option<String>) -> Result<()> {
+pub fn add_postgres(name: &str, version: Option<String>) -> CliResult<()> {
     let (config_path, mut config) = load_or_create_config()?;
-
-    let service_config =
-        ServiceConfig::Typed(TypedServiceConfig::Postgres(PostgresServiceConfig {
-            common: CommonServiceConfig {
-                port: None,
-                env: HashMap::new(),
-                depends_on: Vec::new(),
-                health_check: None,
-                stop_signal: None,
-            },
-            version,
-        }));
-
-    config.services.insert(name.to_string(), service_config);
+    insert_postgres_service(&mut config, name, version);
     save_config(&config_path, &config)?;
 
     println!("Updated locald.toml with postgres service '{name}'");
@@ -134,12 +142,81 @@ pub fn add_postgres(name: &str, version: Option<String>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_config() -> LocaldConfig {
+        LocaldConfig {
+            project: ProjectConfig {
+                name: "pg-test".to_string(),
+                domain: Some("pg-test.localhost".to_string()),
+                workspace: None,
+                constellation: None,
+            },
+            plugins: HashMap::new(),
+            services: HashMap::new(),
+            worktrees: None,
+        }
+    }
+
+    #[test]
+    fn insert_postgres_service_generates_typed_postgres_service() {
+        let mut config = empty_config();
+
+        insert_postgres_service(&mut config, "db", None);
+
+        let service = config.services.get("db").expect("db service exists");
+        match service {
+            ServiceConfig::Typed(TypedServiceConfig::Postgres(pg)) => {
+                assert_eq!(pg.version, None);
+                assert_eq!(pg.common.port, None);
+                assert!(pg.common.env.is_empty());
+                assert!(pg.common.depends_on.is_empty());
+                assert!(pg.common.health_check.is_none());
+                assert!(pg.common.stop_signal.is_none());
+            }
+            other => panic!("expected typed postgres service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_postgres_service_preserves_requested_version() {
+        let mut config = empty_config();
+
+        insert_postgres_service(&mut config, "database", Some("15".to_string()));
+
+        let service = config
+            .services
+            .get("database")
+            .expect("database service exists");
+        match service {
+            ServiceConfig::Typed(TypedServiceConfig::Postgres(pg)) => {
+                assert_eq!(pg.version.as_deref(), Some("15"));
+            }
+            other => panic!("expected typed postgres service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postgres_service_serializes_as_typed_postgres_config() {
+        let mut config = empty_config();
+        insert_postgres_service(&mut config, "db", Some("15".to_string()));
+
+        let toml = toml::to_string_pretty(&config).expect("config serializes");
+
+        assert!(toml.contains("[services.db]"), "{toml}");
+        assert!(toml.contains("type = \"postgres\""), "{toml}");
+        assert!(toml.contains("version = \"15\""), "{toml}");
+    }
+}
+
 pub fn add_site(
     path: &std::path::Path,
     name: Option<String>,
     port: Option<u16>,
     build: Option<String>,
-) -> Result<()> {
+) -> CliResult<()> {
     let (config_path, mut config) = load_or_create_config()?;
     let service_name = name.unwrap_or_else(|| "site".to_string());
 

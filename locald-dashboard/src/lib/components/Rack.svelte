@@ -10,6 +10,8 @@
 	import { removeProject, type ProjectListEntry } from '$lib/api';
 	import { pendingActions } from '$lib/stores/actions';
 	import { toasts } from '$lib/stores/toasts';
+	import { copyToClipboard } from '$lib/utils/clipboard';
+	import { displayServiceEndpoint } from '$lib/utils/service-display';
 	import {
 		startServiceWithFeedback,
 		stopServiceWithFeedback,
@@ -320,17 +322,6 @@
 		return serviceName;
 	}
 
-	function displayUrl(service: ServiceStatus): string {
-		if (service.domain) return service.domain;
-		if (!service.url) return '';
-		try {
-			const parsed = new URL(service.url);
-			return parsed.hostname.endsWith('.localhost') ? parsed.hostname : parsed.host;
-		} catch {
-			return service.url.replace(/^https?:\/\//, '');
-		}
-	}
-
 	function projectCountLabel(count: number): string {
 		return `${count} project${count === 1 ? '' : 's'}`;
 	}
@@ -508,7 +499,7 @@
 						{#each project.services as service (service.name)}
 							{@const type = getServiceType(service)}
 							{@const displayName = getDisplayName(service.name, project.name)}
-							{@const urlLabel = displayUrl(service)}
+							{@const endpoint = displayServiceEndpoint(service)}
 							{@const inDeck = monitored.includes(service.name)}
 
 							<div
@@ -537,17 +528,28 @@
 										<span class="deck-chip">In Deck</span>
 									{/if}
 
-									{#if service.url && service.status === 'running'}
-										<a
-											href={service.url}
-											target="_blank"
-											class="service-url"
-											title="Open {service.url}"
-											on:click={(e) => e.stopPropagation()}
-										>
-											<span>{urlLabel}</span>
-											<ExternalLink size={10} />
-										</a>
+									{#if endpoint && service.status === 'running'}
+										{#if endpoint.kind === 'public'}
+											<a
+												href={endpoint.value}
+												target="_blank"
+												class="service-url"
+												title="Open {endpoint.value}"
+												on:click={(e) => e.stopPropagation()}
+											>
+												<span>{endpoint.label}</span>
+												<ExternalLink size={10} />
+											</a>
+										{:else}
+											<button
+												class="service-url connection-url"
+												title="Connection URL (click to copy)"
+												on:click|stopPropagation={() =>
+													copyToClipboard(endpoint.value, 'connection URL')}
+											>
+												<span>{endpoint.label}</span>
+											</button>
+										{/if}
 									{/if}
 								</div>
 
@@ -1082,6 +1084,17 @@
 		color: #f8fafc;
 		background: rgba(34, 211, 238, 0.12);
 		border-color: rgba(34, 211, 238, 0.35);
+	}
+	.service-url.connection-url {
+		color: #ddd6fe;
+		background: rgba(167, 139, 250, 0.07);
+		border-color: rgba(167, 139, 250, 0.2);
+		cursor: copy;
+	}
+	.service-url.connection-url:hover {
+		color: #f5f3ff;
+		background: rgba(167, 139, 250, 0.12);
+		border-color: rgba(167, 139, 250, 0.35);
 	}
 	.service-url span {
 		overflow: hidden;

@@ -1,5 +1,5 @@
+use crate::error::CliResult;
 use crate::style;
-use anyhow::Result;
 use crossterm::style::Stylize;
 use locald_utils::privileged::{AcquireConfig, CleanupMode, DoctorReport, Severity, Status};
 use std::borrow::Cow;
@@ -32,7 +32,7 @@ impl Drop for DoctorThemeGuard {
     }
 }
 
-pub fn run(json: bool, verbose: bool) -> Result<i32> {
+pub fn run(json: bool, verbose: bool) -> CliResult<i32> {
     #[cfg(target_os = "linux")]
     let (shim_bytes, expected_version): (Option<&[u8]>, Option<&str>) = {
         const SHIM_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_SHIM_PATH"));

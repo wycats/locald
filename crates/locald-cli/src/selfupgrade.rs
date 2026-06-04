@@ -2,7 +2,8 @@
 //!
 //! Downloads and installs updates from GitHub Releases.
 
-use anyhow::{Context, Result};
+use crate::error::{CliError, CliResult};
+use anyhow::Context;
 use std::path::Path;
 
 const REPO: &str = "wycats/locald";
@@ -15,7 +16,7 @@ struct Release {
 }
 
 /// Check for available updates
-pub fn check() -> Result<Option<String>> {
+pub fn check() -> CliResult<Option<String>> {
     let release = fetch_latest_release()?;
     let latest = normalize_version(&release.tag_name);
 
@@ -27,7 +28,7 @@ pub fn check() -> Result<Option<String>> {
 }
 
 /// Perform self-upgrade
-pub fn upgrade(version: Option<&str>) -> Result<()> {
+pub fn upgrade(version: Option<&str>) -> CliResult<()> {
     // 1. Determine target version
     let target_version = match version {
         Some(v) => {
@@ -82,10 +83,10 @@ pub fn upgrade(version: Option<&str>) -> Result<()> {
     let new_exe = extract_dir.join("locald");
 
     if !new_exe.is_file() {
-        return Err(anyhow::anyhow!(
+        return Err(CliError::message(format!(
             "Downloaded archive does not contain expected 'locald' binary at {}",
             new_exe.display()
-        ));
+        )));
     }
 
     println!("Installing to {}...", current_exe.display());
@@ -100,7 +101,7 @@ pub fn upgrade(version: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn fetch_latest_release() -> Result<Release> {
+fn fetch_latest_release() -> CliResult<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -110,13 +111,19 @@ fn fetch_latest_release() -> Result<Release> {
         .context("Failed to fetch release info")?;
 
     if !response.status().is_success() {
-        anyhow::bail!("Failed to fetch release: HTTP {}", response.status());
+        return Err(CliError::message(format!(
+            "Failed to fetch release: HTTP {}",
+            response.status()
+        )));
     }
 
-    response.json().context("Failed to parse release info")
+    response
+        .json()
+        .context("Failed to parse release info")
+        .map_err(Into::into)
 }
 
-fn fetch_release_by_tag(tag: &str) -> Result<Release> {
+fn fetch_release_by_tag(tag: &str) -> CliResult<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}");
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -126,17 +133,25 @@ fn fetch_release_by_tag(tag: &str) -> Result<Release> {
         .context("Failed to fetch release info")?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        anyhow::bail!("Version {tag} not found in releases");
+        return Err(CliError::message(format!(
+            "Version {tag} not found in releases"
+        )));
     }
 
     if !response.status().is_success() {
-        anyhow::bail!("Failed to fetch release {tag}: HTTP {}", response.status());
+        return Err(CliError::message(format!(
+            "Failed to fetch release {tag}: HTTP {}",
+            response.status()
+        )));
     }
 
-    response.json().context("Failed to parse release info")
+    response
+        .json()
+        .context("Failed to parse release info")
+        .map_err(Into::into)
 }
 
-fn download_file(url: &str, path: &Path) -> Result<()> {
+fn download_file(url: &str, path: &Path) -> CliResult<()> {
     let client = reqwest::blocking::Client::new();
     let response = client
         .get(url)
@@ -145,7 +160,10 @@ fn download_file(url: &str, path: &Path) -> Result<()> {
         .context("Failed to download file")?;
 
     if !response.status().is_success() {
-        anyhow::bail!("Download failed: HTTP {}", response.status());
+        return Err(CliError::message(format!(
+            "Download failed: HTTP {}",
+            response.status()
+        )));
     }
 
     let bytes = response.bytes()?;
@@ -153,7 +171,7 @@ fn download_file(url: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_checksum(tarball: &Path, checksum_file: &Path) -> Result<()> {
+fn verify_checksum(tarball: &Path, checksum_file: &Path) -> CliResult<()> {
     use sha2::{Digest, Sha256};
 
     let expected = std::fs::read_to_string(checksum_file)?;
@@ -168,13 +186,15 @@ fn verify_checksum(tarball: &Path, checksum_file: &Path) -> Result<()> {
     let actual = format!("{:x}", hasher.finalize());
 
     if actual != expected {
-        anyhow::bail!("Checksum mismatch!\nExpected: {expected}\nActual:   {actual}");
+        return Err(CliError::message(format!(
+            "Checksum mismatch!\nExpected: {expected}\nActual:   {actual}"
+        )));
     }
 
     Ok(())
 }
 
-fn extract_tarball(tarball: &Path, dest: &Path) -> Result<()> {
+fn extract_tarball(tarball: &Path, dest: &Path) -> CliResult<()> {
     use flate2::read::GzDecoder;
     use std::path::Component;
     use tar::Archive;
@@ -191,10 +211,10 @@ fn extract_tarball(tarball: &Path, dest: &Path) -> Result<()> {
             .components()
             .any(|component| matches!(component, Component::ParentDir))
         {
-            anyhow::bail!(
+            return Err(CliError::message(format!(
                 "Tarball contains an entry with a parent directory component: {}",
                 path.display()
-            );
+            )));
         }
 
         entry.unpack_in(dest)?;
@@ -206,7 +226,7 @@ fn is_daemon_running() -> bool {
     crate::client::send_request(&locald_core::IpcRequest::Ping).is_ok()
 }
 
-fn stop_daemon() -> Result<()> {
+fn stop_daemon() -> CliResult<()> {
     let _ = crate::client::send_request(&locald_core::IpcRequest::Shutdown);
 
     for _ in 0..20 {
@@ -216,13 +236,13 @@ fn stop_daemon() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    anyhow::bail!(
+    Err(CliError::message(
         "locald daemon appears to still be running after shutdown timeout; \
-proceeding with self-upgrade may fail if the binary is still in use."
-    );
+proceeding with self-upgrade may fail if the binary is still in use.",
+    ))
 }
 
-fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
+fn atomic_replace(src: &Path, dst: &Path) -> CliResult<()> {
     let backup = dst.with_extension("old");
     let tmp = dst.with_extension("new");
 
@@ -260,15 +280,19 @@ fn check_shim_version() {
     println!("  sudo locald admin setup");
 }
 
-fn detect_arch() -> Result<&'static str> {
+fn detect_arch() -> CliResult<&'static str> {
     if std::env::consts::OS != "linux" {
-        anyhow::bail!("Self-upgrade is only supported on Linux.");
+        return Err(CliError::message(
+            "Self-upgrade is only supported on Linux.",
+        ));
     }
 
     match std::env::consts::ARCH {
         "x86_64" => Ok("x86_64"),
         "aarch64" => Ok("aarch64"),
-        arch => anyhow::bail!("Unsupported architecture: {arch}"),
+        arch => Err(CliError::message(format!(
+            "Unsupported architecture: {arch}"
+        ))),
     }
 }
 
@@ -276,7 +300,7 @@ fn normalize_version(version: &str) -> &str {
     version.trim_start_matches('v')
 }
 
-fn is_newer(latest: &str, current: &str) -> Result<bool> {
+fn is_newer(latest: &str, current: &str) -> CliResult<bool> {
     let latest = semver::Version::parse(latest)
         .with_context(|| format!("Invalid latest version '{latest}'"))?;
     let current = semver::Version::parse(current)

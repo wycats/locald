@@ -175,14 +175,18 @@ async fn handle_connection(
 
     if let IpcRequest::Start {
         project_path,
+        inherited_env,
         verbose,
     } = request
     {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let manager = manager.clone();
 
-        let handle =
-            tokio::spawn(async move { manager.start(project_path, Some(tx), verbose).await });
+        let handle = tokio::spawn(async move {
+            manager
+                .start(project_path, Some(tx), verbose, inherited_env)
+                .await
+        });
 
         while let Some(event) = rx.recv().await {
             let mut bytes = serde_json::to_vec(&event)?;
@@ -223,7 +227,10 @@ async fn handle_connection(
             if let Err(e) = manager.stop(&name).await {
                 IpcResponse::Error(e.to_string())
             } else if let Some(path) = manager.get_service_path(&name).await {
-                match manager.start(path, None, false).await {
+                match manager
+                    .start(path, None, false, std::collections::HashMap::new())
+                    .await
+                {
                     Ok(()) => IpcResponse::Ok,
                     Err(e) => IpcResponse::Error(format!("{e:#}")),
                 }
@@ -284,8 +291,9 @@ async fn handle_connection(
             project_path,
             source,
             start_services,
+            inherited_env,
         } => match manager
-            .project_attach(project_path, source, start_services)
+            .project_attach(project_path, source, start_services, inherited_env)
             .await
         {
             Ok(()) => IpcResponse::Ok,

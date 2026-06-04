@@ -3,5 +3,5 @@ locald = "run --bin locald --"
 server = "run --bin locald -- server start"
 # For XDG-aware install, use: ./scripts/install-locald
 # This alias installs to ~/.cargo/bin (cargo default).
-install-locald = "install --path crates/locald-cli --locked"
+install-locald = "install --path crates/locald-cli --locked --force"
 xtask = "run --package xtask --"

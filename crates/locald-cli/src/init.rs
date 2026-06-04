@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use crate::error::CliResult;
+use anyhow::Context;
 use dialoguer::{Confirm, Input};
 use locald_core::config::{
     CommonServiceConfig, ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig,
@@ -6,7 +7,7 @@ use locald_core::config::{
 };
 use std::collections::HashMap;
 
-pub fn run() -> Result<()> {
+pub fn run() -> CliResult<()> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join("locald.toml");
 

@@ -62,6 +62,30 @@ impl From<toml::ser::Error> for CliError {
     }
 }
 
+impl From<dialoguer::Error> for CliError {
+    fn from(err: dialoguer::Error) -> Self {
+        Self::message(err.to_string())
+    }
+}
+
+impl From<locald_utils::ipc::IpcError> for CliError {
+    fn from(err: locald_utils::ipc::IpcError) -> Self {
+        DaemonError::from(err).into()
+    }
+}
+
+impl From<reqwest::Error> for CliError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::message(err.to_string())
+    }
+}
+
+impl From<semver::Error> for CliError {
+    fn from(err: semver::Error) -> Self {
+        Self::message(err.to_string())
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Error, Debug, Diagnostic)]
 pub enum ConfigError {

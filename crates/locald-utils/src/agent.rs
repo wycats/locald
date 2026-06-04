@@ -1,4 +1,4 @@
-//! Menu bar agent management utilities (macOS).
+//! Desktop tray/menu bar agent management utilities.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -70,8 +70,6 @@ pub fn verify_integrity(agent_path: &Path, expected_bytes: &[u8]) -> Result<bool
 }
 
 /// Returns the expected agent binary path inside the locald data directory.
-///
-/// On macOS: `~/Library/Application Support/locald/locald-agent`
 ///
 /// # Errors
 ///
