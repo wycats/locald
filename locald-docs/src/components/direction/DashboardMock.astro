@@ -1,0 +1,338 @@
+---
+/*
+ * DashboardMock — the dashboard centerpiece from the Public Site Direction
+ * poster (page 04, center-right). A two-pane app frame:
+ *   - Left: a SYSTEM PLANE sidebar with the `[ld` mark and nav items
+ *     (Rack [active], Stream, Deck), each a glyph + label.
+ *   - Right: the Rack view — a title + subtitle, a tab strip
+ *     (Services [active] / Domains / Routing / TLS), and service rows
+ *     (cube + name + RUNNING + stable domain).
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-4-direction.png. Domains use
+ * *.localhost (written-guide rule), not the poster's .test.
+ */
+import LocaldMark from "../brand/LocaldMark.astro";
+
+interface ServiceRow {
+  name: string;
+  domain: string;
+}
+
+interface Props {
+  services?: ServiceRow[];
+  tabs?: string[];
+  class?: string;
+}
+
+const {
+  services = [
+    { name: "web", domain: "https://web.localhost" },
+    { name: "api", domain: "https://api.localhost" },
+    { name: "worker", domain: "https://worker.localhost" },
+    { name: "db", domain: "https://db.localhost" },
+  ],
+  tabs = ["Services", "Domains", "Routing", "TLS"],
+  class: className,
+} = Astro.props;
+
+const navItems = [
+  { key: "rack", label: "Rack", active: true },
+  { key: "stream", label: "Stream", active: false },
+  { key: "deck", label: "Deck", active: false },
+];
+
+const navIcons: Record<string, string> = {
+  rack: "M10 2.5 16.5 6v8L10 17.5 3.5 14V6zM10 2.5 16.5 6 10 9.5 3.5 6zM10 9.5v8",
+  stream:
+    "M2 6c2-1.5 3.5-1.5 5 0s3.5 1.5 5 0M2 10c2-1.5 3.5-1.5 5 0s3.5 1.5 5 0M2 14c2-1.5 3.5-1.5 5 0s3.5 1.5 5 0",
+  deck: "M3 3h6v6H3zM11 3h6v6h-6zM3 11h6v6H3zM11 11h6v6h-6z",
+};
+---
+
+<div class:list={["locald-dash", className]}>
+  <aside class="locald-dash__sidebar">
+    <div class="locald-dash__brand">
+      <LocaldMark size={22} label="locald" />
+    </div>
+    <p class="locald-dash__sidebar-label">SYSTEM PLANE</p>
+    <ul class="locald-dash__nav">
+      {
+        navItems.map((item) => (
+          <li
+            class:list={[
+              "locald-dash__nav-item",
+              item.active && "locald-dash__nav-item--active",
+            ]}
+          >
+            <svg
+              class="locald-dash__nav-icon"
+              width="16"
+              height="16"
+              viewBox="0 0 20 20"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.25"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d={navIcons[item.key]} />
+            </svg>
+            <span class="locald-dash__nav-text">{item.label}</span>
+            {item.active && (
+              <span class="locald-dash__nav-dot" aria-hidden="true" />
+            )}
+          </li>
+        ))
+      }
+    </ul>
+  </aside>
+
+  <section class="locald-dash__main">
+    <header class="locald-dash__head">
+      <h3 class="locald-dash__title">Rack</h3>
+      <p class="locald-dash__subtitle">Services. Routing. Local domains.</p>
+    </header>
+
+    <div class="locald-dash__tabs">
+      {
+        tabs.map((tab, i) => (
+          <span
+            class:list={[
+              "locald-dash__tab",
+              i === 0 && "locald-dash__tab--active",
+            ]}
+          >
+            {tab}
+          </span>
+        ))
+      }
+    </div>
+
+    <ul class="locald-dash__rows">
+      {
+        services.map((s) => (
+          <li class="locald-dash__row">
+            <span class="locald-dash__cube" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+                <path
+                  d="M10 2.5 16.5 6v8L10 17.5 3.5 14V6z"
+                  stroke="currentColor"
+                  stroke-width="1.25"
+                  stroke-linejoin="round"
+                />
+                <path
+                  d="M10 2.5 16.5 6 10 9.5 3.5 6zM10 9.5v8"
+                  stroke="currentColor"
+                  stroke-width="1.25"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+            <span class="locald-dash__row-id">
+              <span class="locald-dash__row-name">{s.name}</span>
+              <span class="locald-dash__row-state">RUNNING</span>
+            </span>
+            <span class="locald-dash__row-domain">{s.domain}</span>
+          </li>
+        ))
+      }
+    </ul>
+  </section>
+</div>
+
+<style>
+  .locald-dash {
+    display: grid;
+    grid-template-columns: minmax(0, 0.4fr) minmax(0, 1fr);
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-lg);
+    background: var(--locald-surface-1);
+    overflow: hidden;
+  }
+
+  /* Sidebar */
+  .locald-dash__sidebar {
+    border-right: 1px solid var(--locald-border-subtle);
+    padding: var(--locald-space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-2);
+    background: var(--locald-surface-2);
+  }
+
+  .locald-dash__brand {
+    padding-bottom: var(--locald-gap-sm);
+  }
+
+  .locald-dash__sidebar-label {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.6rem;
+    letter-spacing: 0.12em;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-dash__nav {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-xs);
+  }
+
+  .locald-dash__nav-item {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-sm);
+    border-radius: var(--locald-radius-sm);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-dash__nav-item--active {
+    background: var(--locald-surface-3);
+    color: var(--locald-text-primary);
+  }
+
+  .locald-dash__nav-icon {
+    flex: none;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-dash__nav-item--active .locald-dash__nav-icon {
+    color: var(--locald-status-running);
+  }
+
+  .locald-dash__nav-text {
+    flex: 1;
+  }
+
+  .locald-dash__nav-dot {
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+    background: var(--locald-status-running);
+    flex: none;
+  }
+
+  /* Main pane */
+  .locald-dash__main {
+    padding: var(--locald-space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-2);
+    min-width: 0;
+  }
+
+  .locald-dash__head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .locald-dash__title {
+    margin: 0;
+    font-family: var(--locald-font-sans);
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--locald-text-primary);
+    border: 0;
+    padding: 0;
+    line-height: 1.1;
+  }
+
+  .locald-dash__subtitle {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+  }
+
+  .locald-dash__tabs {
+    display: flex;
+    gap: var(--locald-space-2);
+    border-bottom: 1px solid var(--locald-border-subtle);
+    padding-bottom: var(--locald-gap-sm);
+  }
+
+  .locald-dash__tab {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+    padding-bottom: var(--locald-gap-sm);
+    position: relative;
+  }
+
+  .locald-dash__tab--active {
+    color: var(--locald-text-primary);
+  }
+
+  .locald-dash__tab--active::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(-1 * var(--locald-gap-sm) - 1px);
+    height: 2px;
+    background: var(--locald-status-running);
+  }
+
+  .locald-dash__rows {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-dash__row {
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    align-items: center;
+    gap: var(--locald-gap-md);
+    padding: var(--locald-gap-sm) var(--locald-gap-md);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+  }
+
+  .locald-dash__cube {
+    color: var(--locald-text-secondary);
+    display: inline-flex;
+    flex: none;
+  }
+
+  .locald-dash__row-id {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .locald-dash__row-name {
+    font-family: var(--locald-font-mono);
+    font-size: 0.8rem;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-dash__row-state {
+    font-family: var(--locald-font-mono);
+    font-size: 0.55rem;
+    letter-spacing: 0.08em;
+    color: var(--locald-status-running);
+  }
+
+  .locald-dash__row-domain {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-text-muted);
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+</style>

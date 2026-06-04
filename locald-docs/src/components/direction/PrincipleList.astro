@@ -1,0 +1,91 @@
+---
+/*
+ * PrincipleList — the "PUBLIC SITE PRINCIPLES" rows from the Public Site
+ * Direction poster (page 04, bottom-right). Each row is a `>` marker, a term,
+ * and a short rule. Rendered above the page CTAs.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-4-direction.png.
+ */
+
+interface Principle {
+  term: string;
+  rule: string;
+}
+
+interface Props {
+  principles?: Principle[];
+  class?: string;
+}
+
+const {
+  principles = [
+    { term: "Screenshot-led", rule: "Show the product early and often." },
+    { term: "Diagrammatic", rule: "Explain how it works with simple, clear visuals." },
+    { term: "Terminalcore, not terminal-dense", rule: "Use the terminal as texture, not clutter." },
+    { term: "Calm authority", rule: "Confident, minimal, and developer-respectful." },
+    { term: "Product-first", rule: 'Every page answers: "What\u2019s in it for me?"' },
+  ],
+  class: className,
+} = Astro.props;
+---
+
+<ul class:list={["locald-principle-list", className]}>
+  {
+    principles.map((p) => (
+      <li class="locald-principle-list__item">
+        <span class="locald-principle-list__marker" aria-hidden="true">
+          &gt;
+        </span>
+        <span class="locald-principle-list__body">
+          <span class="locald-principle-list__term">{p.term}</span>
+          <span class="locald-principle-list__rule">{p.rule}</span>
+        </span>
+      </li>
+    ))
+  }
+</ul>
+
+<style>
+  .locald-principle-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-2);
+  }
+
+  .locald-principle-list__item {
+    display: grid;
+    grid-template-columns: 1rem minmax(0, 1fr);
+    gap: var(--locald-gap-md);
+    align-items: baseline;
+  }
+
+  .locald-principle-list__marker {
+    font-family: var(--locald-font-mono);
+    font-weight: 700;
+    color: var(--locald-status-running);
+  }
+
+  .locald-principle-list__body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .locald-principle-list__term {
+    font-family: var(--locald-font-sans);
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-principle-list__rule {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    line-height: 1.5;
+    color: var(--locald-text-muted);
+  }
+</style>

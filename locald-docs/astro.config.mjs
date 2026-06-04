@@ -40,6 +40,10 @@ export default defineConfig({
               label: "Product Surface Grammar",
               link: "/style-guide/product-surface-grammar/",
             },
+            {
+              label: "Public Site Direction",
+              link: "/style-guide/public-site-direction/",
+            },
           ],
         },
         {

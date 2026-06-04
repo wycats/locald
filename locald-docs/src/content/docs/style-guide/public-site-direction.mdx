@@ -1,0 +1,114 @@
+---
+title: Public Site Direction
+description: How the public site presents locald — screenshot-led, diagrammatic, terminalcore, and product-first, with the dashboard model and stable-URL story front and center.
+template: splash
+tableOfContents: false
+---
+
+import StyleGuidePage from "../../../components/styleguide/StyleGuidePage.astro";
+import BootSequence from "../../../components/direction/BootSequence.astro";
+import StorySteps from "../../../components/direction/StorySteps.astro";
+import DashboardMock from "../../../components/direction/DashboardMock.astro";
+import PrincipleList from "../../../components/direction/PrincipleList.astro";
+import CtaButton from "../../../components/direction/CtaButton.astro";
+import ServiceTopology from "../../../components/diagrams/ServiceTopology.astro";
+
+<StyleGuidePage
+  title="locald"
+  subtitle="Public Site Direction"
+  version="v0.1"
+  page="04"
+>
+
+<div class="locald-direction">
+
+{/* ---- Hero: headline + story (left) · boot sequence (right) ---- */}
+
+<div class="locald-direction-hero">
+  <div class="locald-direction-hero__lead">
+    <h2 class="locald-direction-hero__headline">
+      Run your local app like it's already on a platform.
+    </h2>
+    <p class="locald-direction-hero__lede">
+      Stable local domains. HTTPS by default. Services that route. Observability
+      that explains.
+    </p>
+
+    <section class="locald-direction-story">
+      <p class="locald-section-label">The Story of Your Platform</p>
+      <StorySteps />
+      <div class="locald-direction-storybox">
+        <span class="locald-direction-storybox__text">
+          Explore the model behind the dashboard.
+        </span>
+        <span class="locald-direction-storybox__link">&rarr; Open the Dashboard Model</span>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="locald-direction-hero__aside">
+    <BootSequence />
+  </div>
+</div>
+
+{/* ---- Dashboard mock + annotations ---- */}
+
+<div class="locald-direction-dash">
+  <DashboardMock />
+  <ul class="locald-direction-annotations">
+    <li class="locald-direction-annotation">
+      <span
+        class="locald-direction-annotation__dot locald-demodot--running"
+        aria-hidden="true"
+      ></span>
+      <span class="locald-direction-annotation__text">
+        Start with services and stable local domains.
+      </span>
+    </li>
+    <li class="locald-direction-annotation">
+      <span
+        class="locald-direction-annotation__dot locald-demodot--building"
+        aria-hidden="true"
+      ></span>
+      <span class="locald-direction-annotation__text">
+        Reveal real-time signals and events.
+      </span>
+    </li>
+    <li class="locald-direction-annotation">
+      <span
+        class="locald-direction-annotation__dot locald-demodot--active"
+        aria-hidden="true"
+      ></span>
+      <span class="locald-direction-annotation__text">
+        Surface system health and recent activity.
+      </span>
+    </li>
+  </ul>
+</div>
+
+{/* ---- URL topology (left) · principles + CTAs (right) ---- */}
+
+<div class="locald-direction-foot">
+  <section class="locald-direction-urls">
+    <p class="locald-section-label">From Services to Stable Local URLs</p>
+    <ServiceTopology />
+    <p class="locald-direction-urls__caption">
+      One command. One control plane. Many stable URLs.
+    </p>
+  </section>
+
+  <section class="locald-direction-principles">
+    <p class="locald-section-label">Public Site Principles</p>
+    <PrincipleList />
+    <div class="locald-direction-ctas">
+      <CtaButton variant="primary" label="Get Started" sigil />
+      <CtaButton variant="secondary" label="Read the Concepts" />
+    </div>
+    <CtaButton variant="plane" label="Open the Dashboard Model" class="locald-direction-cta-wide" />
+  </section>
+</div>
+
+</div>
+
+</StyleGuidePage>

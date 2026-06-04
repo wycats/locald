@@ -600,10 +600,9 @@
 /* Four-column mockup grid: Rack | Stream | Deck | System Plane. */
 .locald-grammar-mockup {
   display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.15fr) minmax(
-      0,
-      1fr
-    ) minmax(0, 0.95fr);
+  grid-template-columns:
+    minmax(0, 1.05fr) minmax(0, 1.15fr) minmax(0, 1fr)
+    minmax(0, 0.95fr);
   gap: var(--locald-space-3);
   align-items: start;
 }
@@ -829,4 +828,205 @@
 .locald-demospark {
   display: inline-block;
   vertical-align: middle;
+}
+
+/*
+ * Public Site Direction poster (guide-4-direction.png, page 04) layout
+ * utilities. The page is the most paced of the set: a hero two-column (display
+ * headline + story steps on the left, a boot-sequence terminal on the right),
+ * a dashboard band (mockup + annotation callouts), a services-to-URLs topology
+ * band, and a principles + CTA column.
+ */
+
+/* Vertical rhythm between the Direction page's major bands. */
+.locald-direction {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-6);
+}
+
+.locald-direction > * {
+  margin: 0;
+}
+
+/* ---- Hero band: left narrative, right boot terminal --------------------- */
+.locald-direction-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  gap: var(--locald-space-4);
+  align-items: start;
+}
+
+.locald-direction-hero > * {
+  margin: 0;
+}
+
+@media (max-width: 60rem) {
+  .locald-direction-hero {
+    grid-template-columns: 1fr;
+  }
+}
+
+.locald-direction-hero__lead {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+}
+
+/* The big display headline. */
+.locald-direction-hero__headline {
+  margin: 0;
+  font-family: var(--locald-font-sans);
+  font-weight: var(--locald-type-display-weight);
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  color: var(--locald-text-primary);
+}
+
+.locald-direction-hero__lede {
+  margin: 0;
+  font-family: var(--locald-font-mono);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--locald-text-secondary);
+}
+
+/* The right hero column stacks the boot terminal. */
+.locald-direction-hero__aside {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+}
+
+/* The "The Story of Your Platform" section: label + steps + CTA box. */
+.locald-direction-story {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+}
+
+/* The "Explore the model behind the dashboard" CTA box. */
+.locald-direction-storybox {
+  border: 1px solid var(--locald-border-strong);
+  border-radius: var(--locald-radius-md);
+  background: var(--locald-surface-1);
+  padding: var(--locald-space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-gap-sm);
+}
+
+.locald-direction-storybox__text {
+  margin: 0;
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-text-secondary);
+}
+
+.locald-direction-storybox__link {
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-status-running);
+  text-decoration: none;
+}
+
+/* ---- Dashboard band: mockup + annotation callouts ----------------------- */
+.locald-direction-dash {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 14rem);
+  gap: var(--locald-space-4);
+  align-items: center;
+}
+
+.locald-direction-dash > * {
+  margin: 0;
+}
+
+@media (max-width: 64rem) {
+  .locald-direction-dash {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* The annotation callouts beside the dashboard. */
+.locald-direction-annotations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+}
+
+.locald-direction-annotation {
+  display: grid;
+  grid-template-columns: 0.8rem minmax(0, 1fr);
+  gap: var(--locald-gap-md);
+  align-items: start;
+}
+
+.locald-direction-annotation__dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  margin-top: 0.35em;
+}
+
+.locald-direction-annotation__text {
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  line-height: 1.5;
+  color: var(--locald-text-secondary);
+}
+
+/* ---- Foot band: URL topology (left) + principles/CTA (right) ------------ */
+.locald-direction-foot {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: var(--locald-space-4);
+  align-items: start;
+}
+
+.locald-direction-foot > * {
+  margin: 0;
+}
+
+@media (max-width: 60rem) {
+  .locald-direction-foot {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Services-to-URLs topology column. */
+.locald-direction-urls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+  min-width: 0;
+}
+
+.locald-direction-urls__caption {
+  margin: 0;
+  font-family: var(--locald-font-mono);
+  font-size: var(--locald-type-caption-size);
+  color: var(--locald-text-muted);
+}
+
+/* Principles + CTA column. */
+.locald-direction-principles {
+  display: flex;
+  flex-direction: column;
+  gap: var(--locald-space-3);
+  min-width: 0;
+}
+
+.locald-direction-ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--locald-gap-md);
+}
+
+.locald-direction-cta-wide {
+  width: 100%;
 }
