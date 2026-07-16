@@ -91,8 +91,8 @@ Both stashes remain untouched.
 
 ## Open pull requests
 
-All three pull requests are open, ready for review, and currently mergeable,
-but none is a suitable productization baseline.
+At snapshot time, all three pull requests were open, ready for review, and
+mergeable, but none was a suitable productization baseline.
 
 ### [PR #103 — Implement quiet locald up with runtime holds](https://github.com/wycats/locald/pull/103)
 
@@ -185,7 +185,7 @@ Completed history remains valuable and must survive bankruptcy:
 
 The unfinished epochs targeted by the approved reset are:
 
-| Exact text ID | Epoch | Derived state | Unfinished phases |
+| Recorded primary ID at snapshot time | Epoch | Derived state | Unfinished phases |
 | --- | --- | --- | --- |
 | `01ktawhredn9zcgw9evswwcpny` | Product Surface Realization | pending | 4 |
 | `01ktawhw51f29zj745jbbc63vc` | VMM Runtime Maturity | pending | 1 |
@@ -195,9 +195,11 @@ The unfinished epochs targeted by the approved reset are:
 
 Exo also contains completed rows named `E3-completed` and `E5-completed`.
 Read-side `epoch status E3/E5` currently resolves those completed aliases, while
-the underlying project state distinguishes the unfinished exact text IDs above.
-Any bankruptcy command must use the exact IDs, preserve the completed rows, and
-honor Exo's confirmation prompt.
+the underlying project state distinguishes the unfinished primary IDs recorded
+above. These literals are historical evidence, not authorization to use them as
+writer inputs without live verification. The bankruptcy contract below
+requires resolving every writer target against current authoritative Exo state,
+preserving the completed rows, and honoring Exo's confirmation prompt.
 
 ### Every unfinished phase and goal
 
@@ -510,7 +512,9 @@ retained while making the intended pilot cohort explicit.
 
 ## Bankruptcy contract
 
-After this dossier is merged, bankrupt in this order:
+After this dossier is merged, resolve every target against live authoritative
+Exo state, then bankrupt in this order. Every literal ID below is a snapshot
+value that must still be reverified before use:
 
 1. `01ktawhredn9zcgw9evswwcpny`
 2. `01ktawhw51f29zj745jbbc63vc`
@@ -546,6 +550,7 @@ For each command:
 
 After bankruptcy, verify:
 
+- All five targeted epochs derive as bankrupt/abandoned.
 - All unfinished phases/goals above are abandoned.
 - Completed phases/goals and the five completed epochs remain completed.
 - RFC counts/stages are unchanged.
@@ -567,5 +572,12 @@ This dossier completes preservation, not implementation. The next irreversible
 action is Exo bankruptcy, and it remains gated on:
 
 1. this docs-only PR merging;
-2. current Exo binary and sidecar ownership verification;
-3. explicit confirmation of each bankruptcy command.
+2. verifying that the installed Exo binary contains the current sidecar-safety
+   behavior;
+3. running Exo project resolution and sidecar-status checks;
+4. identifying the canonical writer for the machine/repository state;
+5. verifying that the remote sidecar contains the current `projects/locald`
+   state before any link or import;
+6. stopping if writer ownership, remote state, or any writer-target mapping is
+   ambiguous; and
+7. explicit confirmation of each bankruptcy command.
