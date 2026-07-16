@@ -55,7 +55,7 @@ phases plus a separate RFC/docs canonization epoch.
 
 | Item | Observed state |
 | --- | --- |
-| Checkout | `<user-home>/Code/locald` (home directory anonymized) |
+| Checkout | `~/Code/locald` (home directory anonymized) |
 | Branch | `main` |
 | Local HEAD | `65658089a61150e6cbfc33775af559bd3f38e658` |
 | GitHub/default `main` | `5a2caac5c1364d3573d825186fa197143e4af0df` |
@@ -415,7 +415,7 @@ Observed:
 - No repository, worktree, logical-project, or project-instance IDs exist.
 - Registry and attachment authority are path-keyed.
 - Worktree support derives branch-templated domains; it has no persistent slug.
-- Services, health, logs, and sticky ports use `<project-name>:<service>` string
+- Services, health, logs, and sticky ports use `project-name:service` string
   keys, so same-named worktrees collide.
 - Postgres storage is derived from the same global service string.
 - Generated build/container state is path-hash based.
