@@ -98,7 +98,7 @@ but none is a suitable productization baseline.
 
 - Head: `fc09a4187c09a8a7d595d2f19d205fdab76ea2bd`
 - Scope: 12 files, `+756/-112`
-- Checks: eight green at snapshot time
+- Checks: all recorded checks successful at snapshot time
 - Review debt: three unresolved Copilot threads, including a current finding
   that root setup writes/chowns user-controlled LaunchAgent/log paths without
   sufficient symlink containment.
@@ -121,7 +121,7 @@ Reject:
 
 - Head: `75c3e4a38943b1652d59b6e28ca337ab6e3fdf08`
 - Scope: 46 files, `+7881/-1`
-- Checks: eight green at snapshot time
+- Checks: all recorded checks successful at snapshot time
 - Review debt: 11 unresolved current threads covering component prop
   mismatches, bare-domain links, inert-button accessibility, token drift, and a
   deprecated dependency.
@@ -142,7 +142,8 @@ Disposition: park for the RFC Canon and Public Docs lane.
 
 - Head: `b4f5359b2da23f7fa178a719c75d35ded0cfb3d3`
 - Scope: 80 files, `+6679/-1856`; contains PR #103 plus a Linux tray/UX stack
-- Checks: seven green and the macOS Build failing at snapshot time
+- Checks: macOS Build failed while all other recorded checks succeeded at
+  snapshot time
 - Review debt: unresolved findings include a missing macOS import, inherited
   PATH loss during watched config reload, autostart bypassing PID tracking,
   reused-PID risk, and creation of a runtime hold only after successful startup.
