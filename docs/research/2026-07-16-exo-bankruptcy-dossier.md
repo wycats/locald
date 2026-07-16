@@ -318,14 +318,17 @@ Concrete canon divergences include:
 - Stage 4 RFC 0010 describes the Linux setuid-shim/SCM_RIGHTS architecture but
   does not describe the current macOS LaunchDaemon/XPC helper.
 
-The public site also has stale `ykatz/dotlocal` and `wycats/dotlocal` links, a
-development-only `http://docs.localhost` canonical URL, no production
-deployment URL or Vercel configuration recorded in the repository, and
-Linux/WSL claims inconsistent with the approved macOS-only beta.
+The public site links to `ykatz/dotlocal` and `wycats/dotlocal`, while this
+repository is `wycats/locald`. It also records a development-only
+`http://docs.localhost` canonical URL, no production deployment URL or Vercel
+configuration in the repository, and Linux/WSL claims inconsistent with the
+approved macOS-only beta.
 
-The existing docs verifier runs in CI but misses staged RFC directories and
-does not enforce RFC metadata, external links, manual retirement, or stale
-manual references.
+`cargo xtask verify docs` runs in CI. Its RFC-stage check inspects only
+top-level `docs/rfcs/*.md` files for `stage: 2`, rather than traversing the
+`docs/rfcs/stage-*` directories; its other checks cover screenshots, sidebar
+links, and CLI-surface documentation. It does not enforce RFC metadata,
+external links, manual retirement, or obsolete manual references.
 
 ## Implementation reality at the reset boundary
 
