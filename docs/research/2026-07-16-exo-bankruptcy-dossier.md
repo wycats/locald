@@ -514,8 +514,10 @@ After this dossier is merged, bankrupt in this order:
 
 1. `01ktawhredn9zcgw9evswwcpny`
 2. `01ktawhw51f29zj745jbbc63vc`
-3. `<unfinished Hybrid Development & Advanced Features primary writer ID>`
-4. `<unfinished The Perfect Demo primary writer ID>`
+3. **Resolve live:** primary writer ID for the unfinished
+   `Hybrid Development & Advanced Features` row
+4. **Resolve live:** primary writer ID for the unfinished `The Perfect Demo`
+   row
 5. `E4`
 
 The recovery snapshot recorded `E3` and `E5` as the two unfinished rows'
