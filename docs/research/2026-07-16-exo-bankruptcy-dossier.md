@@ -513,18 +513,30 @@ After this dossier is merged, bankrupt in this order:
 
 1. `01ktawhredn9zcgw9evswwcpny`
 2. `01ktawhw51f29zj745jbbc63vc`
-3. `E3`
-4. `E5`
+3. `<unfinished Hybrid Development & Advanced Features primary writer ID>`
+4. `<unfinished The Perfect Demo primary writer ID>`
 5. `E4`
+
+The recovery snapshot recorded `E3` and `E5` as the two unfinished rows'
+primary writer IDs, but those values are intentionally not presented as
+copyable run-list entries. The inspected write path matches the command input
+directly against the epoch primary ID and then against
+`epochs_data.text_id`; that path is separate from the read-side alias lookup
+that currently misresolves `epoch status E3/E5`. Immediately before execution,
+reverify that writer contract in the installed Exo build and bind each
+placeholder to the corresponding live unfinished row. If an authoritative Exo
+surface cannot demonstrate that mapping, stop rather than using the snapshot
+value by assumption.
 
 For each command:
 
-- Use Exo's exact text ID.
+- Use the live unfinished row's verified primary writer ID, not a read-side
+  alias or an unverified value copied from this dossier.
 - Review and approve the Exo confirmation prompt explicitly.
-- For `E3` and `E5`, compare the prompt's epoch ID, title, and current status
-  against the unfinished rows from `epoch list`; it must target the unfinished
-  `Hybrid Development & Advanced Features` or `The Perfect Demo` row, never
-  the completed `E3-completed` or `E5-completed` alias.
+- For the two placeholders, compare the prompt's epoch ID, title, and current
+  status against the unfinished rows from `epoch list`; it must target the
+  unfinished `Hybrid Development & Advanced Features` or `The Perfect Demo`
+  row, never the completed `E3-completed` or `E5-completed` alias.
 - Do not bypass Exo or edit SQLite/projections.
 - Stop if Exo resolves either writer target ambiguously or appears to target a
   completed alias; do not guess or substitute a different ID.
