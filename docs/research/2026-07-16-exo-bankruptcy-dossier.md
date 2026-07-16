@@ -300,6 +300,10 @@ Exo reports 135 RFCs:
 | Superseded | 2 |
 | Withdrawn | 9 |
 
+Exo metadata marks RFCs 0075 and 0077 as Superseded. Their files remain under
+`docs/rfcs/stage-3`, so that directory contains 63 files while the effective
+Stage 3 count above is 61; there is no separate on-disk `superseded` directory.
+
 The Stage 4 set is RFCs 0001–0012, 0023, 0087, and 0148. No RFC stage changes
 as part of bankruptcy.
 
