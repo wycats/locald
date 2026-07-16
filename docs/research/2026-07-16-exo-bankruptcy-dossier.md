@@ -170,8 +170,25 @@ No pull request will be closed or commented on without user-approved wording.
 - Phase: **UX Polish: User-Visible Improvements**
 - Mode: executing
 - Goals: zero completed, six pending
-- Tasks: zero
+- Tasks in the active phase: zero
 - Git projection: one untracked item
+
+### Legacy task inventory
+
+The project-wide Exo task table contains six task rows, all completed. They
+belong to goal `macos-setup-reliability-and-quiet-locald-up` in unfinished
+phase `01kt7fa0pwbb8tcqtct28gmm1s` of the unfinished `E5` epoch:
+
+- `add-runtime-hold-semantics-for-locald-up`
+- `make-macos-launchagent-setup-converge`
+- `make-locald-up-quiet-by-default-and-add-follow`
+- `verify-admin-setup-and-quiet-up-behavior`
+- `curate-locald-doctor-output`
+- `curate-locald-up-output`
+
+These completed task rows are historical evidence. Bankruptcy must preserve
+their IDs and completed status even though their containing phase and epoch are
+unfinished.
 
 ### Epoch inventory
 
@@ -556,6 +573,8 @@ After bankruptcy, verify:
 - All five targeted epochs derive as bankrupt/abandoned.
 - All unfinished phases/goals above are abandoned.
 - Completed phases/goals and the five completed epochs remain completed.
+- All six legacy tasks above retain their IDs and completed status; no task row
+  is deleted or rewritten.
 - RFC counts/stages are unchanged.
 - Git, local commits, stashes, and `.context/` are unchanged.
 - No stale phase/goal remains pending or in progress.
