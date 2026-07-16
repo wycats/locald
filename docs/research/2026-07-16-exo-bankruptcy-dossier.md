@@ -55,7 +55,7 @@ phases plus a separate RFC/docs canonization epoch.
 
 | Item | Observed state |
 | --- | --- |
-| Checkout | `/Users/wycats/Code/locald` |
+| Checkout | `<user-home>/Code/locald` (home directory anonymized) |
 | Branch | `main` |
 | Local HEAD | `65658089a61150e6cbfc33775af559bd3f38e658` |
 | GitHub/default `main` | `5a2caac5c1364d3573d825186fa197143e4af0df` |
@@ -488,6 +488,9 @@ These are mechanisms, not proof that their current contracts are canonical.
 
 ### Milestone C — Vercelian Pilot and Public Beta
 
+Here, **Vercelian** means a Vercel employee; the approved milestone name is
+retained while making the intended pilot cohort explicit.
+
 - Dual MIT/Apache-2.0 license.
 - Signed/notarized Apple Silicon and Intel macOS beta artifacts.
 - Verified installer, beta upgrade, uninstall, checksums, and provenance.
@@ -518,8 +521,13 @@ For each command:
 
 - Use Exo's exact text ID.
 - Review and approve the Exo confirmation prompt explicitly.
+- For `E3` and `E5`, compare the prompt's epoch ID, title, and current status
+  against the unfinished rows from `epoch list`; it must target the unfinished
+  `Hybrid Development & Advanced Features` or `The Perfect Demo` row, never
+  the completed `E3-completed` or `E5-completed` alias.
 - Do not bypass Exo or edit SQLite/projections.
-- Stop if the command appears to target a completed alias.
+- Stop if Exo resolves either writer target ambiguously or appears to target a
+  completed alias; do not guess or substitute a different ID.
 
 After bankruptcy, verify:
 
