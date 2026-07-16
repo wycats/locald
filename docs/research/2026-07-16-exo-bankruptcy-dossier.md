@@ -452,9 +452,10 @@ Decision:
 Observed:
 
 - `install.sh` explicitly rejects macOS and installs Linux tarballs only.
-- `selfupgrade` selects Linux artifact names from GitHub `releases/latest` and
-  has no beta channel, macOS embedded-component refresh, safe restart, or
-  post-replacement rollback.
+- `selfupgrade` discovers the newest version through GitHub `releases/latest`,
+  then selects Linux artifact names and downloads from that version's tagged
+  release. It has no beta channel, macOS embedded-component refresh, safe
+  restart, or post-replacement rollback.
 - The release workflow builds unsigned Linux x86_64/ARM64 archives only.
 - No GitHub Releases exist.
 - Tags `v0.1.0` and `v0.1.0-test.1` both produced failed Linux ARM64 release
