@@ -171,6 +171,9 @@ pub enum Commands {
         /// Show verbose output
         #[arg(long, short)]
         verbose: bool,
+        /// Follow service logs after startup
+        #[arg(long)]
+        follow: bool,
         /// Exit after project registration instead of attaching to service logs
         #[arg(long, hide = true)]
         exit_after_register: bool,
@@ -495,10 +498,10 @@ pub enum RegistryCommands {
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
-    /// Register an attachment (editor, CLI, or pin).
+    /// Register an attachment (editor, CLI, or runtime).
     Attach {
         path: std::path::PathBuf,
-        /// Attachment source: editor or cli.
+        /// Attachment source: editor, cli, or runtime.
         #[arg(long)]
         source: Option<String>,
         /// Editor name (required when source=editor).
@@ -517,7 +520,7 @@ pub enum ProjectCommands {
     /// Remove an attachment.
     Detach {
         path: std::path::PathBuf,
-        /// Attachment source: editor or cli.
+        /// Attachment source: editor, cli, or runtime.
         #[arg(long)]
         source: Option<String>,
         /// Editor id (required when source=editor).

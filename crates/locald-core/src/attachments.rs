@@ -18,6 +18,7 @@ pub enum AttachmentSource {
     CLI {
         pid: u32,
     },
+    Runtime,
     Pin,
 }
 
@@ -303,7 +304,7 @@ impl AttachmentStore {
             AttachmentSource::Editor { pid: None, .. } => now
                 .duration_since(attachment.created_at)
                 .map_or(true, |age| age <= LEGACY_EDITOR_TTL),
-            AttachmentSource::Pin => true,
+            AttachmentSource::Runtime | AttachmentSource::Pin => true,
         }
     }
 
@@ -389,6 +390,24 @@ mod tests {
     }
 
     #[test]
+    fn runtime_hold_is_active_and_not_stale() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Runtime,
+            created_at: SystemTime::now() - Duration::from_secs(31 * 60),
+        });
+
+        assert_eq!(store.section_for(&project), ProjectSection::Active);
+        let removed = store.reap_stale_attachments();
+        assert!(removed.is_empty());
+        assert_eq!(store.attachments_for(&project).len(), 1);
+    }
+
+    #[test]
     fn detach_all_non_pin_keeps_pin() {
         let dir = tempdir().unwrap();
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
@@ -402,6 +421,11 @@ mod tests {
         store.attach(Attachment {
             project_path: project.clone(),
             source: AttachmentSource::CLI { pid: 42 },
+            created_at: SystemTime::now(),
+        });
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Runtime,
             created_at: SystemTime::now(),
         });
 
@@ -577,6 +601,27 @@ mod tests {
         let mut reloaded = AttachmentStore::new(store_path);
         reloaded.load().await.unwrap();
         assert!(!reloaded.is_stopped(&project));
+    }
+
+    #[tokio::test]
+    async fn runtime_hold_persists() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.attach(Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Runtime,
+            created_at: SystemTime::now(),
+        });
+        store.save().await.unwrap();
+
+        let mut loaded = AttachmentStore::new(store_path);
+        loaded.load().await.unwrap();
+        let attachments = loaded.attachments_for(&project);
+        assert_eq!(attachments.len(), 1);
+        assert!(matches!(attachments[0].source, AttachmentSource::Runtime));
     }
 
     #[test]

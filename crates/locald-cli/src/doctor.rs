@@ -92,6 +92,22 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         }
 
         if !json {
+            match launch_agent_running() {
+                Ok(true) => {
+                    let _ = cliclack::log::success("Menu bar agent: loaded and running");
+                }
+                Ok(false) => {
+                    let _ = cliclack::log::warning(
+                        "Menu bar agent: not loaded (run `locald admin setup`)",
+                    );
+                }
+                Err(e) => {
+                    let _ = cliclack::log::warning(format!(
+                        "Menu bar agent: launchd status unavailable ({e})"
+                    ));
+                }
+            }
+
             // Check if the privileged helper is installed and reachable.
             let helper_path =
                 std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
@@ -125,6 +141,46 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
     }
 
     Ok(i32::from(report.has_critical_failures()))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_running() -> Result<bool> {
+    let uid = launch_agent_uid()?;
+    let service_target = format!("gui/{uid}/com.locald.agent");
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &service_target])
+        .output()?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.contains("pid ="))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_uid() -> Result<u32> {
+    launch_agent_uid_from_parts(
+        nix::unistd::geteuid().is_root(),
+        nix::unistd::Uid::current().as_raw(),
+        std::env::var("SUDO_UID").ok().as_deref(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_uid_from_parts(
+    root_effective: bool,
+    fallback_id: u32,
+    sudo_id_text: Option<&str>,
+) -> Result<u32> {
+    if root_effective && let Some(raw) = sudo_id_text {
+        return raw
+            .parse::<u32>()
+            .map_err(|e| anyhow::anyhow!("SUDO_UID is invalid: {e}"));
+    }
+
+    Ok(fallback_id)
 }
 
 fn render_command(cmd: &str) -> Cow<'_, str> {
@@ -657,6 +713,32 @@ fn render_optional_integrations() -> OptionalIntegrationsRollup {
     {}
 
     rollup
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_agent_uid_prefers_sudo_uid_when_root() {
+        assert_eq!(
+            launch_agent_uid_from_parts(true, 0, Some("501")).unwrap(),
+            501
+        );
+    }
+
+    #[test]
+    fn launch_agent_uid_uses_current_uid_without_sudo() {
+        assert_eq!(
+            launch_agent_uid_from_parts(false, 501, Some("0")).unwrap(),
+            501
+        );
+    }
+
+    #[test]
+    fn launch_agent_uid_errors_on_invalid_sudo_uid() {
+        assert!(launch_agent_uid_from_parts(true, 0, Some("nope")).is_err());
+    }
 }
 
 fn render_optional_integrations_cliclack(
