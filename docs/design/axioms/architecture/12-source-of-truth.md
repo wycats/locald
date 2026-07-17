@@ -31,7 +31,7 @@ When `locald` runs a container (via `[service.build]`), the **OCI Image Config**
 
 ## 3. Configuration, Identity, and Runtime State
 
-We keep three authorities distinct:
+We keep configuration, identity, and runtime authorities distinct and enforce the following boundaries:
 
 - **Configuration**: Lives in the workspace and describes what the user wants to run.
 - **Identity Catalog**: Lives in locald's platform data directory and records opaque project identities, current and historical path locators, and display metadata. It never shadows service configuration.
