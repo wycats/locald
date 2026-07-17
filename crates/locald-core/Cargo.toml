@@ -23,6 +23,7 @@ thiserror = "2.0.17"
 tokio = { version = "1", features = ["io-util", "process", "fs", "sync"] }
 tokio-stream = { version = "0.1", features = ["io-util"] }
 toml = "0.9.8"
+uuid = { version = "1.19.0", features = ["serde", "v4", "v5"] }
 
 [lints]
 workspace = true

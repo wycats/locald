@@ -78,8 +78,14 @@ pub mod registry;
 #[doc(inline)]
 pub use registry::Registry;
 pub mod attachments;
+pub mod identity;
 pub mod resolver;
 pub mod worktree;
+#[doc(inline)]
+pub use identity::{
+    IdentityError, ProjectId, ProjectIdentity, ProjectInstanceId, RepositoryId,
+    ResolvedProjectIdentity, WorktreeId, resolve_git_project_identity,
+};
 #[doc(inline)]
 pub use resolver::ServiceResolver;
 pub mod buildpack;

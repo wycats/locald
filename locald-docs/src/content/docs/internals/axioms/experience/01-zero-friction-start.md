@@ -16,8 +16,8 @@ Centralized configuration (like `/etc/hosts` or a global `nginx.conf`) is brittl
 ## Implications
 
 - **Discovery**: `locald` must be able to "discover" a project. This usually happens when the user runs a command _inside_ the repo.
-- **Registration**: When a user runs `locald up` in a new repo, `locald` "registers" it. This registration is essentially a pointer: `Project Name -> /path/to/repo`.
-- **Staleness**: If the repo is moved or deleted, the registration becomes stale. `locald` needs a way to prune these (e.g., on startup or via `locald prune`).
+- **Registration**: When a user runs `locald up` in a new repo, `locald` records stable repository, project, worktree, and project-instance identities. Current and last-known paths are locators for those identities, not the identities themselves.
+- **Moves and Removal**: Moving a Git repository or worktree preserves its identity and updates its locator when rediscovered. A removed worktree becomes missing until the user forgets it; removal never silently transfers its identity or deletes mutable resources.
 - **Hot Reloading**: If `locald.toml` changes, the daemon should ideally detect it (file watcher) and reload the service.
 
 ## Sensible Defaults
