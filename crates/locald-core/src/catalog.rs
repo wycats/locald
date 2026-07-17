@@ -136,7 +136,7 @@ pub enum LegacyLocatorSource {
     RuntimeState,
 }
 
-/// Preserved evidence for a missing legacy path whose identity cannot be read.
+/// Preserved evidence for a legacy path whose identity cannot currently be read.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UnresolvedLegacyProject {
@@ -313,15 +313,8 @@ impl ProjectCatalog {
                         Some(path),
                     )?;
                 }
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                Err(_) => {
                     candidate.unresolved_legacy.insert(path, legacy);
-                }
-                Err(source) => {
-                    return Err(CatalogError::Io {
-                        operation: "resolve legacy project path",
-                        path,
-                        source,
-                    });
                 }
             }
         }
@@ -2005,6 +1998,44 @@ mod tests {
             .expect("preserve dangling legacy evidence");
 
         assert!(catalog.unresolved_legacy.contains_key(&dangling));
+        assert!(catalog.instances.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_locator_resolution_errors_remain_unresolved_evidence() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let looped = fixture._temp.path().join("looped-project");
+        std::os::unix::fs::symlink(&looped, &looped).expect("create symlink loop");
+        let resolution_error = tokio::fs::canonicalize(&looped)
+            .await
+            .expect_err("symlink loop must not resolve");
+        assert_ne!(resolution_error.kind(), io::ErrorKind::NotFound);
+
+        let looped_text = looped.to_string_lossy();
+        let registry = serde_json::json!({
+            "projects": {
+                looped_text.as_ref(): {
+                    "path": looped,
+                    "name": "looped",
+                    "pinned": false,
+                    "last_seen": UNIX_EPOCH
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize registry"),
+        )
+        .await
+        .expect("write registry");
+
+        let catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("preserve unresolvable legacy evidence");
+
+        assert!(catalog.unresolved_legacy.contains_key(&looped));
         assert!(catalog.instances.is_empty());
     }
 
