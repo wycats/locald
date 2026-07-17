@@ -121,10 +121,10 @@ use crate::manager::ProcessManager;
 use crate::proxy::ProxyManager;
 use anyhow::{Context, Result};
 use daemonize::Daemonize;
-use nix::unistd::execv;
-use std::ffi::CString;
+use nix::unistd::execve;
+use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -139,12 +139,15 @@ pub enum ShutdownReason {
 
 #[derive(Debug)]
 struct CatalogWriterLock {
-    _file: File,
+    file: File,
 }
 
+const INHERITED_CATALOG_WRITER_LOCK_FD: &str = "LOCALD_INTERNAL_CATALOG_WRITER_LOCK_FD";
+
 impl CatalogWriterLock {
-    fn acquire() -> Result<Self> {
-        Self::acquire_at(&locald_core::storage::data_dir().join("catalog.writer.lock"))
+    fn acquire(inherited_fd: Option<RawFd>) -> Result<Self> {
+        let path = locald_core::storage::data_dir().join("catalog.writer.lock");
+        inherited_fd.map_or_else(|| Self::acquire_at(&path), |fd| Self::adopt_at(&path, fd))
     }
 
     #[allow(unsafe_code)]
@@ -178,12 +181,166 @@ impl CatalogWriterLock {
                 format!("failed to acquire catalog writer lock `{}`", path.display())
             });
         }
-        Ok(Self { _file: file })
+        Self::set_close_on_exec(file.as_raw_fd(), true).with_context(|| {
+            format!(
+                "failed to set close-on-exec for catalog writer lock `{}`",
+                path.display()
+            )
+        })?;
+        Ok(Self { file })
     }
+
+    /// Adopt the open file description preserved by a restarting daemon.
+    ///
+    /// `flock` ownership follows the open file description, so reopening the
+    /// path after `execve` would conflict with the daemon's own inherited lock.
+    /// Validate and reuse that descriptor, then restore close-on-exec for all
+    /// ordinary child processes launched by the new daemon image.
+    #[allow(unsafe_code)]
+    fn adopt_at(path: &std::path::Path, fd: RawFd) -> Result<Self> {
+        if fd < 0 {
+            anyhow::bail!("inherited catalog writer lock descriptor must be non-negative");
+        }
+
+        let inherited = Self::descriptor_metadata(fd).with_context(|| {
+            format!("failed to inspect inherited catalog writer lock descriptor {fd}")
+        })?;
+        let expected = Self::path_metadata(path).with_context(|| {
+            format!(
+                "failed to inspect catalog writer lock `{}` for inherited descriptor {fd}",
+                path.display()
+            )
+        })?;
+        if inherited.st_dev != expected.st_dev || inherited.st_ino != expected.st_ino {
+            anyhow::bail!(
+                "inherited catalog writer lock descriptor {fd} does not match `{}`",
+                path.display()
+            );
+        }
+
+        let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let source = std::io::Error::last_os_error();
+            return Err(source).with_context(|| {
+                format!(
+                    "failed to adopt inherited catalog writer lock `{}` from descriptor {fd}",
+                    path.display()
+                )
+            });
+        }
+
+        // SAFETY: The private restart contract transfers ownership of this
+        // validated, open descriptor to the new process image exactly once.
+        let file = unsafe { File::from_raw_fd(fd) };
+        Self::set_close_on_exec(file.as_raw_fd(), true).with_context(|| {
+            format!(
+                "failed to restore close-on-exec for catalog writer lock `{}`",
+                path.display()
+            )
+        })?;
+        Ok(Self { file })
+    }
+
+    #[allow(unsafe_code)]
+    fn descriptor_metadata(fd: RawFd) -> Result<libc::stat> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe { libc::fstat(fd, metadata.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: A successful `fstat` initialized the complete structure.
+        Ok(unsafe { metadata.assume_init() })
+    }
+
+    #[allow(unsafe_code)]
+    fn path_metadata(path: &std::path::Path) -> Result<libc::stat> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .context("catalog writer lock path contained an interior NUL")?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe { libc::stat(path.as_ptr(), metadata.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: A successful `stat` initialized the complete structure.
+        Ok(unsafe { metadata.assume_init() })
+    }
+
+    #[allow(unsafe_code)]
+    fn set_close_on_exec(fd: RawFd, enabled: bool) -> Result<()> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let flags = if enabled {
+            flags | libc::FD_CLOEXEC
+        } else {
+            flags & !libc::FD_CLOEXEC
+        };
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    fn prepare_for_exec(&self) -> Result<RawFd> {
+        let fd = self.file.as_raw_fd();
+        Self::set_close_on_exec(fd, false)
+            .context("failed to preserve catalog writer lock across restart")?;
+        Ok(fd)
+    }
+
+    fn cancel_exec(&self) -> Result<()> {
+        Self::set_close_on_exec(self.file.as_raw_fd(), true)
+            .context("failed to restore catalog writer lock close-on-exec state")
+    }
+}
+
+/// Consume the private descriptor marker before the daemon creates worker
+/// threads. The descriptor itself remains open until it is adopted below.
+#[allow(unsafe_code)]
+fn take_inherited_catalog_writer_lock_fd() -> Result<Option<RawFd>> {
+    let Some(value) = std::env::var_os(INHERITED_CATALOG_WRITER_LOCK_FD) else {
+        return Ok(None);
+    };
+
+    // SAFETY: `run` calls this at daemon entry, before daemonization, logging,
+    // or the Tokio runtime creates any worker threads.
+    unsafe { std::env::remove_var(INHERITED_CATALOG_WRITER_LOCK_FD) };
+
+    let value = value
+        .to_str()
+        .context("inherited catalog writer lock descriptor is not valid UTF-8")?;
+    let fd = value
+        .parse::<RawFd>()
+        .context("inherited catalog writer lock descriptor is not an integer")?;
+    if fd < 0 {
+        anyhow::bail!("inherited catalog writer lock descriptor must be non-negative");
+    }
+    Ok(Some(fd))
+}
+
+fn restart_environment(inherited_fd: RawFd) -> Result<Vec<CString>> {
+    let marker_name = OsStr::new(INHERITED_CATALOG_WRITER_LOCK_FD);
+    let mut environment = std::env::vars_os()
+        .filter(|(name, _)| name != marker_name)
+        .map(|(name, value)| {
+            let mut entry = name.as_os_str().as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_os_str().as_bytes());
+            CString::new(entry).context("environment variable contained an interior NUL")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    environment.push(
+        CString::new(format!("{INHERITED_CATALOG_WRITER_LOCK_FD}={inherited_fd}"))
+            .context("catalog writer lock environment marker contained an interior NUL")?,
+    );
+    Ok(environment)
 }
 
 #[allow(clippy::disallowed_methods)]
 pub fn run(foreground: bool, version: String) -> Result<()> {
+    let inherited_catalog_writer_lock_fd = take_inherited_catalog_writer_lock_fd()?;
+
     // Idempotency check: if already running, exit successfully
     if is_already_running() {
         println!("locald is already running.");
@@ -210,6 +367,8 @@ pub fn run(foreground: bool, version: String) -> Result<()> {
         }
     }
 
+    let catalog_writer_lock = CatalogWriterLock::acquire(inherited_catalog_writer_lock_fd)?;
+
     // Initialize logging
     let (log_tx, _) = tokio::sync::broadcast::channel(100);
 
@@ -230,7 +389,7 @@ pub fn run(foreground: bool, version: String) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main(version, log_tx))
+        .block_on(async_main(version, log_tx, catalog_writer_lock))
 }
 
 fn is_already_running() -> bool {
@@ -241,6 +400,7 @@ fn is_already_running() -> bool {
 async fn async_main(
     version: String,
     log_tx: tokio::sync::broadcast::Sender<locald_core::ipc::LogEntry>,
+    catalog_writer_lock: CatalogWriterLock,
 ) -> Result<()> {
     let executable = std::env::current_exe().ok();
     info!(
@@ -266,10 +426,6 @@ async fn async_main(
     let notify_path = locald_utils::ipc::socket_path()
         .map(|p| p.with_file_name("locald-notify.sock"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/locald-notify.sock"));
-
-    // The daemon owns the catalog writer lock for its complete stateful
-    // lifetime, including initial import and restart reconciliation.
-    let _catalog_writer_lock = CatalogWriterLock::acquire()?;
 
     let state_manager = std::sync::Arc::new(
         crate::state::StateManager::new().context("Failed to initialize state manager")?,
@@ -550,9 +706,17 @@ async fn async_main(
             argv.push(CString::new(arg).context("Argument contained an interior NUL")?);
         }
 
-        let err = execv(&exe, &argv)
+        let inherited_fd = catalog_writer_lock.file.as_raw_fd();
+        let environment = restart_environment(inherited_fd)?;
+        catalog_writer_lock.prepare_for_exec()?;
+        let err = execve(&exe, &argv, &environment)
             .err()
-            .context("execv unexpectedly returned Ok")?;
+            .context("execve unexpectedly returned Ok")?;
+        if let Err(restore_error) = catalog_writer_lock.cancel_exec() {
+            error!(
+                "Failed to restore catalog writer lock descriptor after exec error: {restore_error}"
+            );
+        }
         error!("Failed to exec: {}", err);
         return Err(err.into());
     }
@@ -607,7 +771,15 @@ async fn watch_for_upgrade(
 
 #[cfg(test)]
 mod catalog_writer_lock_tests {
-    use super::CatalogWriterLock;
+    use super::{CatalogWriterLock, INHERITED_CATALOG_WRITER_LOCK_FD, restart_environment};
+    use std::os::fd::AsRawFd;
+
+    #[allow(unsafe_code)]
+    fn close_on_exec(fd: std::os::fd::RawFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(flags, -1, "read descriptor flags");
+        flags & libc::FD_CLOEXEC != 0
+    }
 
     #[test]
     fn catalog_writer_lock_has_one_live_owner() {
@@ -621,5 +793,65 @@ mod catalog_writer_lock_tests {
 
         drop(first);
         CatalogWriterLock::acquire_at(&path).expect("reacquire released writer lock");
+    }
+
+    #[test]
+    fn restart_handoff_adopts_the_same_lock_and_preserves_exclusion() {
+        let directory = tempfile::tempdir().expect("create lock test directory");
+        let path = directory.path().join("catalog.writer.lock");
+        let first = CatalogWriterLock::acquire_at(&path).expect("acquire writer lock");
+        let fd = first.file.as_raw_fd();
+        assert!(close_on_exec(fd));
+
+        assert_eq!(first.prepare_for_exec().expect("prepare lock handoff"), fd);
+        assert!(!close_on_exec(fd));
+
+        // A successful exec transfers ownership of the still-open descriptor
+        // to the replacement image, so model that ownership transfer here.
+        std::mem::forget(first);
+        let adopted = CatalogWriterLock::adopt_at(&path, fd).expect("adopt inherited lock");
+        assert!(close_on_exec(adopted.file.as_raw_fd()));
+
+        let error = CatalogWriterLock::acquire_at(&path)
+            .expect_err("adopted writer lock must exclude another owner");
+        assert!(error.to_string().contains("another locald daemon"));
+
+        drop(adopted);
+        CatalogWriterLock::acquire_at(&path).expect("reacquire released adopted lock");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn restart_handoff_rejects_a_descriptor_for_another_file() {
+        let directory = tempfile::tempdir().expect("create lock test directory");
+        let path = directory.path().join("catalog.writer.lock");
+        let other_path = directory.path().join("other.lock");
+        std::fs::write(&other_path, []).expect("create other lock file");
+
+        let first = CatalogWriterLock::acquire_at(&path).expect("acquire writer lock");
+        let fd = first.prepare_for_exec().expect("prepare lock handoff");
+        std::mem::forget(first);
+
+        let error = CatalogWriterLock::adopt_at(&other_path, fd)
+            .expect_err("descriptor identity mismatch must fail");
+        assert!(error.to_string().contains("does not match"));
+        CatalogWriterLock::acquire_at(&path)
+            .expect_err("rejected descriptor continues to own the original lock");
+
+        assert_eq!(unsafe { libc::close(fd) }, 0, "close rejected descriptor");
+        CatalogWriterLock::acquire_at(&path).expect("reacquire lock after descriptor closes");
+    }
+
+    #[test]
+    fn restart_environment_contains_one_private_lock_marker() {
+        let environment = restart_environment(42).expect("build restart environment");
+        let prefix = format!("{INHERITED_CATALOG_WRITER_LOCK_FD}=");
+        let markers: Vec<_> = environment
+            .iter()
+            .filter_map(|entry| entry.to_str().ok())
+            .filter(|entry| entry.starts_with(&prefix))
+            .collect();
+
+        assert_eq!(markers, vec![format!("{prefix}42")]);
     }
 }
