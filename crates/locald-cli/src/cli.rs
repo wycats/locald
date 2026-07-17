@@ -489,7 +489,7 @@ pub enum RegistryCommands {
         #[arg(default_value = ".")]
         path: std::path::PathBuf,
     },
-    /// Remove non-existent projects from the registry
+    /// Forget missing catalog records while preserving project data
     Clean,
 }
 

@@ -18,6 +18,11 @@ pub enum AttachmentSource {
     CLI {
         pid: u32,
     },
+    /// Parked quiet-up hold retained for the availability-store migration.
+    ///
+    /// It is preserved as legacy evidence and does not count as a current live
+    /// attachment in this compatibility model.
+    Runtime,
     Pin,
 }
 
@@ -75,7 +80,7 @@ struct AttachmentStoreData {
     manually_stopped: HashSet<PathBuf>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AttachmentStore {
     path: PathBuf,
     attachments: HashMap<PathBuf, Vec<Attachment>>,
@@ -92,10 +97,7 @@ impl AttachmentStore {
     }
 
     pub fn path() -> PathBuf {
-        directories::ProjectDirs::from("com", "locald", "locald").map_or_else(
-            || PathBuf::from("locald-attachments.json"),
-            |dirs| dirs.data_local_dir().join("attachments.json"),
-        )
+        crate::storage::data_dir().join("attachments.json")
     }
 
     #[allow(clippy::disallowed_methods)]
@@ -128,34 +130,43 @@ impl AttachmentStore {
         Ok(())
     }
 
-    pub fn attach(&mut self, mut attachment: Attachment) -> bool {
+    pub fn attach(&mut self, mut attachment: Attachment) -> Result<bool> {
+        if matches!(attachment.source, AttachmentSource::Runtime) {
+            anyhow::bail!(
+                "Runtime attachment evidence is loaded from legacy state and cannot be created"
+            );
+        }
         let path = Self::canonicalize_path(&attachment.project_path);
         attachment.project_path.clone_from(&path);
 
         let entry = self.attachments.entry(path).or_default();
-        let is_first = entry.is_empty();
+        let is_first = entry
+            .iter()
+            .all(|existing| matches!(existing.source, AttachmentSource::Runtime));
 
         entry.retain(|existing| !Self::matches_source(&attachment.source, &existing.source));
         entry.push(attachment);
 
-        is_first
+        Ok(is_first)
     }
 
     pub fn detach(&mut self, project_path: &Path, source: &AttachmentSource) -> bool {
+        if matches!(source, AttachmentSource::Runtime) {
+            return false;
+        }
         let path = Self::canonicalize_path(project_path);
         let Some(entry) = self.attachments.get_mut(&path) else {
             return false;
         };
 
-        let before = entry.len();
+        let live_before = Self::has_live_attachment(entry);
         entry.retain(|existing| !Self::matches_source(source, &existing.source));
+        let live_after = Self::has_live_attachment(entry);
 
         if entry.is_empty() {
             self.attachments.remove(&path);
-            return before > 0;
         }
-
-        false
+        live_before && !live_after
     }
 
     pub fn detach_all_non_pin(&mut self, project_path: &Path) -> bool {
@@ -164,15 +175,19 @@ impl AttachmentStore {
             return false;
         };
 
-        let before = entry.len();
-        entry.retain(|attachment| matches!(attachment.source, AttachmentSource::Pin));
+        let live_before = Self::has_live_attachment(entry);
+        entry.retain(|attachment| {
+            matches!(
+                attachment.source,
+                AttachmentSource::Pin | AttachmentSource::Runtime
+            )
+        });
+        let live_after = Self::has_live_attachment(entry);
 
         if entry.is_empty() {
             self.attachments.remove(&path);
-            return before > 0;
         }
-
-        false
+        live_before && !live_after
     }
 
     pub fn mark_stopped(&mut self, project_path: &Path) {
@@ -201,22 +216,35 @@ impl AttachmentStore {
         self.attachments.keys().cloned().collect()
     }
 
+    /// Remove every compatibility attachment and manual-stop marker owned by a
+    /// project that is being explicitly removed.
+    pub fn forget_project(&mut self, project_path: &Path) -> bool {
+        let path = Self::canonicalize_path(project_path);
+        let removed_attachments = self.attachments.remove(&path).is_some();
+        let removed_stop = self.manually_stopped.remove(&path);
+        removed_attachments || removed_stop
+    }
+
     pub fn reap_stale_attachments(&mut self) -> Vec<PathBuf> {
         let mut emptied = Vec::new();
         let now = SystemTime::now();
 
         let mut to_remove = Vec::new();
         for (path, attachments) in &mut self.attachments {
+            let live_before = Self::has_live_attachment(attachments);
             attachments.retain(|attachment| Self::attachment_alive(attachment, now));
+            let live_after = Self::has_live_attachment(attachments);
 
             if attachments.is_empty() {
                 to_remove.push(path.clone());
+            }
+            if live_before && !live_after {
+                emptied.push(path.clone());
             }
         }
 
         for path in to_remove {
             self.attachments.remove(&path);
-            emptied.push(path);
         }
 
         emptied
@@ -229,14 +257,14 @@ impl AttachmentStore {
         };
 
         let now = SystemTime::now();
+        let live_before = Self::has_live_attachment(attachments);
         attachments.retain(|attachment| Self::attachment_alive(attachment, now));
+        let live_after = Self::has_live_attachment(attachments);
 
         if attachments.is_empty() {
             self.attachments.remove(&path);
-            true
-        } else {
-            false
         }
+        live_before && !live_after
     }
 
     pub fn reap_stale_pids(&mut self) -> Vec<PathBuf> {
@@ -258,7 +286,7 @@ impl AttachmentStore {
             .any(|a| matches!(a.source, AttachmentSource::Pin));
         let has_active = attachments
             .iter()
-            .any(|a| !matches!(a.source, AttachmentSource::Pin));
+            .any(|a| !matches!(a.source, AttachmentSource::Pin | AttachmentSource::Runtime));
 
         // Active takes priority: if there are non-Pin attachments, it's Active
         // even if also pinned.
@@ -295,6 +323,12 @@ impl AttachmentStore {
         }
     }
 
+    fn has_live_attachment(attachments: &[Attachment]) -> bool {
+        attachments
+            .iter()
+            .any(|attachment| !matches!(attachment.source, AttachmentSource::Runtime))
+    }
+
     fn attachment_alive(attachment: &Attachment, now: SystemTime) -> bool {
         match attachment.source {
             AttachmentSource::CLI { pid } | AttachmentSource::Editor { pid: Some(pid), .. } => {
@@ -303,7 +337,7 @@ impl AttachmentStore {
             AttachmentSource::Editor { pid: None, .. } => now
                 .duration_since(attachment.created_at)
                 .map_or(true, |age| age <= LEGACY_EDITOR_TTL),
-            AttachmentSource::Pin => true,
+            AttachmentSource::Runtime | AttachmentSource::Pin => true,
         }
     }
 
@@ -335,19 +369,23 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        let first = store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Pin,
-            created_at: SystemTime::now(),
-        });
+        let first = store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            })
+            .expect("attach pin");
         assert!(first);
         assert_eq!(store.attachments_for(&project).len(), 1);
 
-        let second = store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::CLI { pid: 1234 },
-            created_at: SystemTime::now(),
-        });
+        let second = store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::CLI { pid: 1234 },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach CLI");
         assert!(!second);
         assert_eq!(store.attachments_for(&project).len(), 2);
 
@@ -368,18 +406,22 @@ mod tests {
 
         assert_eq!(store.section_for(&project), ProjectSection::Recent);
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::CLI { pid: 42 },
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::CLI { pid: 42 },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach CLI");
         assert_eq!(store.section_for(&project), ProjectSection::Active);
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Pin,
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            })
+            .expect("attach pin");
         // Active takes priority: pinned + CLI attachment = Active.
         assert_eq!(store.section_for(&project), ProjectSection::Active);
 
@@ -394,16 +436,20 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Pin,
-            created_at: SystemTime::now(),
-        });
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::CLI { pid: 42 },
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            })
+            .expect("attach pin");
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::CLI { pid: 42 },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach CLI");
 
         let last_removed = store.detach_all_non_pin(&project);
         assert!(!last_removed);
@@ -422,16 +468,20 @@ mod tests {
         let mut child = Command::new("sleep").arg("5").spawn().unwrap();
         let alive_pid = child.id();
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::CLI { pid: alive_pid },
-            created_at: SystemTime::now(),
-        });
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::CLI { pid: u32::MAX },
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::CLI { pid: alive_pid },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach live CLI");
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::CLI { pid: u32::MAX },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach dead CLI");
 
         let removed = store.reap_stale_pids();
         assert!(removed.is_empty());
@@ -452,15 +502,17 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Editor {
-                name: "vscode".to_string(),
-                id: "abc".to_string(),
-                pid: None,
-            },
-            created_at: SystemTime::now() - Duration::from_secs(31 * 60),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_string(),
+                    id: "abc".to_string(),
+                    pid: None,
+                },
+                created_at: SystemTime::now() - Duration::from_secs(31 * 60),
+            })
+            .expect("attach old editor");
 
         let removed = store.reap_stale_attachments();
         let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
@@ -474,15 +526,17 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Editor {
-                name: "vscode".to_string(),
-                id: "abc".to_string(),
-                pid: None,
-            },
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_string(),
+                    id: "abc".to_string(),
+                    pid: None,
+                },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach fresh editor");
 
         let removed = store.reap_stale_attachments();
         assert!(removed.is_empty());
@@ -495,15 +549,17 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Editor {
-                name: "vscode".to_string(),
-                id: "abc".to_string(),
-                pid: Some(u32::MAX),
-            },
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_string(),
+                    id: "abc".to_string(),
+                    pid: Some(u32::MAX),
+                },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach dead editor");
 
         let removed = store.reap_stale_attachments();
         let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
@@ -517,11 +573,13 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Pin,
-            created_at: SystemTime::now() - Duration::from_secs(31 * 60),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now() - Duration::from_secs(31 * 60),
+            })
+            .expect("attach pin");
 
         let removed = store.reap_stale_attachments();
         assert!(removed.is_empty());
@@ -534,15 +592,17 @@ mod tests {
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
         let project = dir.path().join("project");
 
-        store.attach(Attachment {
-            project_path: project.clone(),
-            source: AttachmentSource::Editor {
-                name: "vscode".to_string(),
-                id: "abc".to_string(),
-                pid: Some(1234),
-            },
-            created_at: SystemTime::now(),
-        });
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_string(),
+                    id: "abc".to_string(),
+                    pid: Some(1234),
+                },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach editor");
 
         let last_removed = store.detach(
             &project,
@@ -577,6 +637,169 @@ mod tests {
         let mut reloaded = AttachmentStore::new(store_path);
         reloaded.load().await.unwrap();
         assert!(!reloaded.is_stopped(&project));
+    }
+
+    #[tokio::test]
+    async fn parked_runtime_hold_survives_load_and_save_without_blocking_attach() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+        let project_text = project.to_string_lossy();
+        let legacy = serde_json::json!({
+            "attachments": {
+                project_text.as_ref(): [{
+                    "project_path": project,
+                    "source": "Runtime",
+                    "created_at": {
+                        "secs_since_epoch": 1,
+                        "nanos_since_epoch": 0
+                    }
+                }]
+            },
+            "manually_stopped": []
+        });
+        tokio::fs::write(
+            &store_path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy attachment"),
+        )
+        .await
+        .expect("write legacy attachment store");
+
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.load().await.expect("load legacy runtime hold");
+        assert_eq!(store.section_for(&project), ProjectSection::Recent);
+        assert!(matches!(
+            store.attachments_for(&project)[0].source,
+            AttachmentSource::Runtime
+        ));
+        assert!(
+            store
+                .attach(Attachment {
+                    project_path: project.clone(),
+                    source: AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    },
+                    created_at: SystemTime::now(),
+                })
+                .expect("attach CLI beside parked Runtime evidence")
+        );
+        store.save().await.expect("save compatible store");
+
+        let mut reloaded = AttachmentStore::new(store_path);
+        reloaded.load().await.expect("reload compatible store");
+        let sources: Vec<_> = reloaded
+            .attachments_for(&project)
+            .into_iter()
+            .map(|attachment| &attachment.source)
+            .collect();
+        assert!(
+            sources
+                .iter()
+                .any(|source| matches!(source, AttachmentSource::Runtime))
+        );
+        assert!(sources.iter().any(|source| matches!(
+            source,
+            AttachmentSource::CLI { pid } if *pid == std::process::id()
+        )));
+
+        assert!(reloaded.detach(
+            &project,
+            &AttachmentSource::CLI {
+                pid: std::process::id(),
+            },
+        ));
+        assert_eq!(reloaded.attachments_for(&project).len(), 1);
+        assert!(matches!(
+            reloaded.attachments_for(&project)[0].source,
+            AttachmentSource::Runtime
+        ));
+
+        assert!(
+            reloaded
+                .attach(Attachment {
+                    project_path: project.clone(),
+                    source: AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    },
+                    created_at: SystemTime::now(),
+                })
+                .expect("reattach CLI beside parked Runtime evidence")
+        );
+        assert!(reloaded.detach_all_non_pin(&project));
+        assert!(matches!(
+            reloaded.attachments_for(&project)[0].source,
+            AttachmentSource::Runtime
+        ));
+
+        let error = reloaded
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Runtime,
+                created_at: SystemTime::now(),
+            })
+            .expect_err("live Runtime attachments are migration-owned");
+        assert!(error.to_string().contains("cannot be created"));
+
+        assert!(
+            reloaded
+                .attach(Attachment {
+                    project_path: project.clone(),
+                    source: AttachmentSource::Pin,
+                    created_at: SystemTime::now(),
+                })
+                .expect("attach pin beside parked Runtime evidence")
+        );
+        reloaded.mark_stopped(&project);
+        assert!(reloaded.forget_project(&project));
+        assert!(reloaded.attachments_for(&project).is_empty());
+        assert!(!reloaded.is_stopped(&project));
+        assert!(!reloaded.all_projects().contains(&project));
+    }
+
+    #[tokio::test]
+    async fn parked_runtime_evidence_does_not_mask_a_reaped_last_owner() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+        let project_text = project.to_string_lossy();
+        let legacy = serde_json::json!({
+            "attachments": {
+                project_text.as_ref(): [{
+                    "project_path": project,
+                    "source": "Runtime",
+                    "created_at": {
+                        "secs_since_epoch": 1,
+                        "nanos_since_epoch": 0
+                    }
+                }]
+            },
+            "manually_stopped": []
+        });
+        tokio::fs::write(
+            &store_path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy attachment"),
+        )
+        .await
+        .expect("write legacy attachment store");
+
+        let mut store = AttachmentStore::new(store_path);
+        store.load().await.expect("load legacy Runtime evidence");
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::CLI { pid: u32::MAX },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach dead CLI");
+
+        let orphaned = store.reap_stale_attachments();
+
+        assert_eq!(orphaned, vec![project.clone()]);
+        assert_eq!(store.attachments_for(&project).len(), 1);
+        assert!(matches!(
+            store.attachments_for(&project)[0].source,
+            AttachmentSource::Runtime
+        ));
     }
 
     #[test]

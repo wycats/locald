@@ -123,7 +123,8 @@ use anyhow::{Context, Result};
 use daemonize::Daemonize;
 use nix::unistd::execv;
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -134,6 +135,51 @@ use tracing_subscriber::prelude::*;
 pub enum ShutdownReason {
     Stop,
     Restart,
+}
+
+#[derive(Debug)]
+struct CatalogWriterLock {
+    _file: File,
+}
+
+impl CatalogWriterLock {
+    fn acquire() -> Result<Self> {
+        Self::acquire_at(&locald_core::storage::data_dir().join("catalog.writer.lock"))
+    }
+
+    #[allow(unsafe_code)]
+    fn acquire_at(path: &std::path::Path) -> Result<Self> {
+        let parent = path
+            .parent()
+            .context("catalog writer lock path has no parent directory")?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create catalog writer lock directory `{}`",
+                parent.display()
+            )
+        })?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("failed to open catalog writer lock `{}`", path.display()))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let source = std::io::Error::last_os_error();
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another locald daemon owns the project catalog writer lock `{}`",
+                    path.display()
+                );
+            }
+            return Err(source).with_context(|| {
+                format!("failed to acquire catalog writer lock `{}`", path.display())
+            });
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -221,6 +267,10 @@ async fn async_main(
         .map(|p| p.with_file_name("locald-notify.sock"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/locald-notify.sock"));
 
+    // The daemon owns the catalog writer lock for its complete stateful
+    // lifetime, including initial import and restart reconciliation.
+    let _catalog_writer_lock = CatalogWriterLock::acquire()?;
+
     let state_manager = std::sync::Arc::new(
         crate::state::StateManager::new().context("Failed to initialize state manager")?,
     );
@@ -228,7 +278,7 @@ async fn async_main(
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(
         locald_core::registry::Registry::load()
             .await
-            .unwrap_or_default(),
+            .context("Failed to initialize project identity catalog")?,
     ));
 
     let mut attachment_store = locald_core::attachments::AttachmentStore::new(
@@ -552,5 +602,24 @@ async fn watch_for_upgrade(
             }
             info!("Deferring restart: {} active ephemeral tasks.", active);
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_writer_lock_tests {
+    use super::CatalogWriterLock;
+
+    #[test]
+    fn catalog_writer_lock_has_one_live_owner() {
+        let directory = tempfile::tempdir().expect("create lock test directory");
+        let path = directory.path().join("catalog.writer.lock");
+        let first = CatalogWriterLock::acquire_at(&path).expect("acquire first writer lock");
+
+        let error =
+            CatalogWriterLock::acquire_at(&path).expect_err("second live writer must be rejected");
+        assert!(error.to_string().contains("another locald daemon"));
+
+        drop(first);
+        CatalogWriterLock::acquire_at(&path).expect("reacquire released writer lock");
     }
 }
