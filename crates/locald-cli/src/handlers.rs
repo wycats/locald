@@ -242,10 +242,10 @@ pub fn run(cli: Cli) -> CliResult<()> {
             utils::ensure_daemon_running()?;
             monitor::run()?;
         }
-        Commands::Ping => match client::send_request(&IpcRequest::Ping) {
-            Ok(response) => println!("Received: {response:?}"),
-            Err(e) => return Err(e),
-        },
+        Commands::Ping => {
+            let response = client::send_request(&IpcRequest::Ping)?;
+            println!("Received: {response:?}");
+        }
         Commands::Trust => {
             trust::run()?;
         }
@@ -256,10 +256,10 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 let version = env!("LOCALD_BUILD_VERSION").to_string();
                 locald_server::run(true, version)?;
             }
-            ServerCommands::Shutdown => match client::send_request(&IpcRequest::Shutdown) {
-                Ok(response) => println!("{response:?}"),
-                Err(e) => return Err(e),
-            },
+            ServerCommands::Shutdown => {
+                let response = client::send_request(&IpcRequest::Shutdown)?;
+                println!("{response:?}");
+            }
             ServerCommands::Restart => {
                 match client::send_request(&IpcRequest::Shutdown) {
                     Ok(_) => println!("Shutting down locald..."),

@@ -62,7 +62,7 @@ pub fn daemon_identity_mismatch_warning(
         "WARNING: locald CLI and daemon identity differ ({reasons}).\n  CLI: version {cli_version}, executable {cli_executable}\n  Daemon: version {daemon_version}, executable {daemon_executable}, pid {daemon_pid}\nRun `locald debug identity` for details; run `locald server restart` to restart the daemon from this CLI binary.",
         reasons = reasons.join(", "),
         cli_executable = cli_executable.display(),
-        daemon_version = &daemon.version,
+        daemon_version = daemon.version,
         daemon_executable = daemon.executable.display(),
         daemon_pid = daemon.pid,
     ))
@@ -131,6 +131,24 @@ mod tests {
         assert!(warning.contains("pid 1234"));
         assert!(warning.contains("locald debug identity"));
         assert!(warning.contains("locald server restart"));
+    }
+
+    #[test]
+    fn daemon_identity_mismatch_warning_preserves_the_complete_identity_message() {
+        let cli_executable = fixture_path("Cargo.toml");
+        let daemon = daemon_identity("1.2.2", cli_executable.clone());
+
+        let warning = daemon_identity_mismatch_warning("1.2.3", &cli_executable, &daemon)
+            .expect("version mismatch should warn");
+
+        assert_eq!(
+            warning,
+            format!(
+                "WARNING: locald CLI and daemon identity differ (version mismatch).\n  CLI: version 1.2.3, executable {}\n  Daemon: version 1.2.2, executable {}, pid 1234\nRun `locald debug identity` for details; run `locald server restart` to restart the daemon from this CLI binary.",
+                cli_executable.display(),
+                daemon.executable.display(),
+            )
+        );
     }
 
     #[test]
