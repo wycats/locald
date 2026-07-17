@@ -445,8 +445,14 @@ fn parse_marker(path: &Path, contents: &str) -> Result<Uuid, IdentityError> {
     if payload.contains('\n') || payload.contains('\r') {
         return Err(invalid_marker(path, "marker must contain exactly one line"));
     }
-    let Some(value) = payload.strip_prefix("v1 ") else {
-        return Err(invalid_marker(path, "expected `v1 <uuid>`"));
+    let Some(value) = payload
+        .strip_prefix(MARKER_VERSION)
+        .and_then(|value| value.strip_prefix(' '))
+    else {
+        return Err(invalid_marker(
+            path,
+            format!("expected `{MARKER_VERSION} <uuid>`"),
+        ));
     };
     let uuid = Uuid::parse_str(value)
         .map_err(|source| invalid_marker(path, format!("invalid UUID: {source}")))?;
@@ -796,6 +802,18 @@ mod tests {
         assert_eq!(
             fs::read_to_string(marker).expect("read corruption"),
             malformed
+        );
+    }
+
+    #[test]
+    fn marker_parser_uses_the_shared_format_version() {
+        let marker = Path::new("repository-id");
+        let expected = Uuid::new_v4();
+        let contents = format!("{MARKER_VERSION} {expected}\n");
+
+        assert_eq!(
+            parse_marker(marker, &contents).expect("parse current marker format"),
+            expected
         );
     }
 
