@@ -1667,11 +1667,41 @@ async fn file_exists(path: &Path) -> Result<bool, CatalogError> {
 }
 
 async fn publish_new_catalog(catalog: &ProjectCatalog, path: &Path) -> Result<bool, CatalogError> {
+    publish_new_catalog_with_parent_sync(
+        catalog,
+        path,
+        |path| async move { sync_parent(&path).await },
+    )
+    .await
+}
+
+async fn publish_new_catalog_with_parent_sync<Sync, SyncFuture>(
+    catalog: &ProjectCatalog,
+    path: &Path,
+    parent_sync: Sync,
+) -> Result<bool, CatalogError>
+where
+    Sync: FnOnce(PathBuf) -> SyncFuture,
+    SyncFuture: std::future::Future<Output = Result<(), CatalogError>>,
+{
     let temporary = write_temporary_catalog(catalog, path).await?;
     match tokio::fs::hard_link(&temporary, path).await {
         Ok(()) => {
-            sync_parent(path).await?;
-            remove_temporary(&temporary).await?;
+            let sync_result = parent_sync(path.to_path_buf()).await;
+            let cleanup_result = remove_temporary(&temporary).await;
+            if let Err(error) = sync_result {
+                let reason = match cleanup_result {
+                    Ok(()) => error.to_string(),
+                    Err(cleanup_error) => {
+                        format!("{error}; temporary catalog cleanup also failed: {cleanup_error}")
+                    }
+                };
+                return Err(CatalogError::PublishedNotDurable {
+                    path: path.to_path_buf(),
+                    reason,
+                });
+            }
+            cleanup_result?;
             Ok(true)
         }
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -2583,6 +2613,45 @@ mod tests {
             .expect_err("catalog replacement must fail");
 
         assert_eq!(catalog, before);
+    }
+
+    #[tokio::test]
+    async fn first_publish_sync_failure_reports_published_state_and_cleans_temporary() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let catalog = ProjectCatalog::with_path(paths.catalog.clone());
+
+        let error =
+            publish_new_catalog_with_parent_sync(&catalog, &paths.catalog, |path| async move {
+                Err(CatalogError::Io {
+                    operation: "perform injected parent sync",
+                    path,
+                    source: io::Error::other("injected parent sync failure"),
+                })
+            })
+            .await
+            .expect_err("injected parent sync failure must be reported");
+
+        let CatalogError::PublishedNotDurable { reason, .. } = error else {
+            panic!("expected published-not-durable error");
+        };
+        assert!(reason.contains("injected parent sync failure"));
+        let published = ProjectCatalog::load_existing(&paths.catalog)
+            .await
+            .expect("load newly published catalog");
+        assert_eq!(published, catalog);
+
+        let parent = paths.catalog.parent().expect("catalog parent");
+        let temporary_files = std::fs::read_dir(parent)
+            .expect("read catalog directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(".catalog.json.") && name.ends_with(".tmp")
+                })
+            })
+            .count();
+        assert_eq!(temporary_files, 0);
     }
 
     #[tokio::test]
