@@ -317,8 +317,7 @@ pub fn is_ca_trusted() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Returns the platform-appropriate data directory for locald.
