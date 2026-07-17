@@ -171,6 +171,9 @@ pub enum Commands {
         /// Show verbose output
         #[arg(long, short)]
         verbose: bool,
+        /// Follow service logs after startup
+        #[arg(long)]
+        follow: bool,
         /// Exit after project registration instead of attaching to service logs
         #[arg(long, hide = true)]
         exit_after_register: bool,
@@ -225,7 +228,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
-    /// Manage the menu bar agent
+    /// Manage the desktop tray/menu bar agent
     Tray {
         #[command(subcommand)]
         command: TrayCommands,
@@ -495,10 +498,10 @@ pub enum RegistryCommands {
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
-    /// Register an attachment (editor, CLI, or pin).
+    /// Register an attachment (editor, CLI, or runtime).
     Attach {
         path: std::path::PathBuf,
-        /// Attachment source: editor or cli.
+        /// Attachment source: editor, cli, or runtime.
         #[arg(long)]
         source: Option<String>,
         /// Editor name (required when source=editor).
@@ -517,7 +520,7 @@ pub enum ProjectCommands {
     /// Remove an attachment.
     Detach {
         path: std::path::PathBuf,
-        /// Attachment source: editor or cli.
+        /// Attachment source: editor, cli, or runtime.
         #[arg(long)]
         source: Option<String>,
         /// Editor id (required when source=editor).
@@ -635,14 +638,33 @@ pub enum AdminCommands {
 
 #[derive(Subcommand)]
 pub enum TrayCommands {
-    /// Start the menu bar agent
+    /// Start the desktop tray/menu bar agent
     Start,
-    /// Stop the menu bar agent
+    /// Stop the desktop tray/menu bar agent
     Stop,
-    /// Check whether the menu bar agent is running
+    /// Check whether the desktop tray/menu bar agent is running
     Status,
-    /// Restart the menu bar agent
+    /// Restart the desktop tray/menu bar agent
     Restart,
+    /// Manage desktop tray autostart at login
+    Autostart {
+        #[command(subcommand)]
+        command: TrayAutostartCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TrayAutostartCommands {
+    /// Enable desktop tray autostart at login
+    Enable {
+        /// Host-visible locald launcher path to pin for the tray agent
+        #[arg(long, value_name = "PATH")]
+        locald_path: Option<std::path::PathBuf>,
+    },
+    /// Disable desktop tray autostart at login
+    Disable,
+    /// Show whether tray autostart is enabled
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -695,6 +717,51 @@ mod tests {
                 assert_eq!(command, vec!["echo".to_string(), "hi".to_string()]);
             }
             _ => panic!("expected Commands::Exec"),
+        }
+    }
+
+    #[test]
+    fn parse_add_postgres_shortcut_preserves_service_name() {
+        let cli = Cli::try_parse_from(["locald", "add", "postgres", "db"]).unwrap();
+
+        match cli.command {
+            Commands::Add {
+                command,
+                name,
+                port,
+            } => {
+                assert_eq!(command, vec!["postgres".to_string(), "db".to_string()]);
+                assert_eq!(name, None);
+                assert_eq!(port, None);
+            }
+            _ => panic!("expected Commands::Add"),
+        }
+    }
+
+    #[test]
+    fn parse_service_add_postgres_preserves_name_and_version() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "service",
+            "add",
+            "postgres",
+            "--version",
+            "15",
+            "db",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Service {
+                command:
+                    ServiceCommands::Add {
+                        service_type: AddServiceType::Postgres { name, version },
+                    },
+            } => {
+                assert_eq!(name, "db");
+                assert_eq!(version.as_deref(), Some("15"));
+            }
+            _ => panic!("expected postgres service add command"),
         }
     }
 }

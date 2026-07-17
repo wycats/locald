@@ -3,7 +3,12 @@ use crate::config::{ServiceConfig, TypedServiceConfig};
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+const fn default_project_attach_start_services() -> bool {
+    true
+}
 
 /// Represents the stream a log message came from.
 ///
@@ -241,6 +246,9 @@ pub enum IpcRequest {
     Start {
         /// The path to the project root or configuration file.
         project_path: PathBuf,
+        /// Environment inherited from the CLI process for service startup.
+        #[serde(default)]
+        inherited_env: HashMap<String, String>,
         /// Enable verbose output for build steps.
         #[serde(default)]
         verbose: bool,
@@ -321,6 +329,12 @@ pub enum IpcRequest {
         project_path: PathBuf,
         /// The source of the attachment.
         source: AttachmentSource,
+        /// Whether a first attachment should start the project services.
+        #[serde(default = "default_project_attach_start_services")]
+        start_services: bool,
+        /// Environment inherited from the attaching process for service startup.
+        #[serde(default)]
+        inherited_env: HashMap<String, String>,
     },
     /// Remove a project attachment.
     ///

@@ -1,12 +1,13 @@
+use crate::error::{CliError, CliResult};
 use crate::history;
-use anyhow::{Context, Result};
+use anyhow::Context;
 use dialoguer::Confirm;
 use std::io::IsTerminal;
 use std::process::Command;
 
-pub fn run_adhoc(command: String) -> Result<()> {
+pub fn run_adhoc(command: String) -> CliResult<()> {
     if command.trim().is_empty() {
-        anyhow::bail!("Empty command");
+        return Err(CliError::message("Empty command"));
     }
 
     // Simple free port finder

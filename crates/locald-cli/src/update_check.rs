@@ -4,7 +4,7 @@
 //! when `locald up` is executed. The check is rate-limited to once per 24 hours
 //! and persists state to avoid redundant network requests.
 
-use anyhow::Result;
+use crate::error::CliResult;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -36,7 +36,7 @@ pub fn load_state() -> UpdateState {
 }
 
 /// Save state atomically using write-to-temp + rename pattern.
-pub fn save_state(state: &UpdateState) -> Result<()> {
+pub fn save_state(state: &UpdateState) -> CliResult<()> {
     let Some(path) = state_file_path() else {
         return Ok(());
     };

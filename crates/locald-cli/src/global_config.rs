@@ -1,3 +1,4 @@
+use crate::error::{CliError, CliResult};
 use directories::BaseDirs;
 use locald_core::config::GlobalConfig;
 use std::path::PathBuf;
@@ -15,9 +16,9 @@ pub fn load() -> GlobalConfig {
 
 /// Save the global config to disk, creating the directory if needed.
 #[allow(dead_code)]
-pub fn save(config: GlobalConfig) -> anyhow::Result<()> {
+pub fn save(config: GlobalConfig) -> CliResult<()> {
     let path = global_config_path()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine global config path"))?;
+        .ok_or_else(|| CliError::message("Could not determine global config path"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

@@ -15,6 +15,11 @@ pub struct PostgresController {
     runner: Arc<PostgresRunner>,
 }
 
+#[must_use]
+pub(crate) fn postgres_connection_url(port: u16) -> String {
+    format!("postgres://postgres@localhost:{port}/postgres")
+}
+
 impl PostgresController {
     #[must_use]
     pub fn new(id: String, runner: Arc<PostgresRunner>) -> Self {
@@ -79,10 +84,7 @@ impl ServiceController for PostgresController {
     fn get_metadata(&self, key: &str) -> Option<String> {
         match key {
             "port" => Some(self.runner.port().to_string()),
-            "url" | "connection_string" => Some(format!(
-                "postgres://postgres@localhost:{}/postgres",
-                self.runner.port()
-            )),
+            "url" | "connection_string" => Some(postgres_connection_url(self.runner.port())),
             _ => None,
         }
     }

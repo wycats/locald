@@ -1,9 +1,10 @@
 use crate::client;
-use anyhow::{Context, Result};
+use crate::error::{CliError, CliResult};
+use anyhow::Context;
 use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
 use std::process::Command;
 
-pub fn run_task(service_name: &str, command: &[String]) -> Result<()> {
+pub fn run_task(service_name: &str, command: &[String]) -> CliResult<()> {
     // Resolve full name if needed
     let full_name = {
         let config_path = std::env::current_dir()?.join("locald.toml");
@@ -38,9 +39,11 @@ pub fn run_task(service_name: &str, command: &[String]) -> Result<()> {
                     command.join(" ")
                 );
             }
-            anyhow::bail!("Failed to get environment for {full_name}: {msg}")
+            return Err(CliError::message(format!(
+                "Failed to get environment for {full_name}: {msg}"
+            )));
         }
-        r => anyhow::bail!("Unexpected response: {r:?}"),
+        r => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
     };
 
     // Run command

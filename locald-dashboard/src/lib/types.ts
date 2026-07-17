@@ -38,7 +38,7 @@ export interface ServiceInspectResponse {
 	pid: number | null;
 	port: number | null;
 	url: string | null;
-	connection_url?: string;
+	connection_url: string | null;
 	health_status: string;
 	health_source: string;
 	path: string | null;

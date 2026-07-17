@@ -118,13 +118,8 @@ port = {}
         anyhow::bail!("Service did not become healthy within timeout");
     }
 
-    // 4. Connect to DB
-    // Default credentials for postgresql_embedded?
-    // Usually it creates a default user/db.
-    // We need to check what `PostgresRunner` will do.
-    // Assuming it sets up `postgres` user with no password or `postgres` password.
-    // Let's assume `postgres:postgres` for now.
-    let url = format!("postgres://postgres:postgres@localhost:{}/postgres", port);
+    // 4. Connect to DB using the same passwordless URL shape surfaced by locald.
+    let url = format!("postgres://postgres@localhost:{}/postgres", port);
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)

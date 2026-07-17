@@ -1,21 +1,23 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
-use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
+use locald_core::attachments::{
+    AttachmentSource, ProjectFilter, ProjectSection, ProjectStatusInfo,
+};
 use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
 use crate::build;
-#[cfg(target_os = "macos")]
-use crate::cli::TrayCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
     ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::cli::{TrayAutostartCommands, TrayCommands};
 #[cfg(feature = "experimental-containers")]
 use crate::container;
 use crate::error::{CliError, CliResult, DaemonError};
@@ -59,7 +61,68 @@ fn format_attachment_source(source: &AttachmentSource) -> String {
     match source {
         AttachmentSource::Editor { name, id, .. } => format!("editor:{name} ({id})"),
         AttachmentSource::CLI { pid } => format!("cli:{pid}"),
+        AttachmentSource::Runtime => "runtime".to_string(),
         AttachmentSource::Pin => "pin".to_string(),
+    }
+}
+
+fn print_project_up_summary(info: &ProjectStatusInfo) {
+    let project_label = info.project_name.as_deref().map_or_else(
+        || info.project_path.display().to_string(),
+        std::string::ToString::to_string,
+    );
+
+    println!("{} {} is running.", style::CHECK, project_label.bold());
+
+    if info.service_details.is_empty() {
+        println!("No services reported yet.");
+    } else {
+        for service in &info.service_details {
+            let endpoint = service
+                .url
+                .as_deref()
+                .or(service.connection_url.as_deref())
+                .unwrap_or("-");
+            println!(
+                "  {} {} {}",
+                service.name.as_str().bold(),
+                service.status.to_string().dim(),
+                endpoint
+            );
+        }
+    }
+
+    println!("Logs: locald logs --follow");
+    println!("Stop: locald stop");
+}
+
+fn detach_runtime_hold(project_path: &std::path::Path) {
+    let _ = client::send_request(&IpcRequest::ProjectDetach {
+        project_path: project_path.to_path_buf(),
+        source: Some(AttachmentSource::Runtime),
+    });
+}
+
+fn force_stop_project(project_path: &std::path::Path) {
+    let _ = client::send_request(&IpcRequest::ProjectForceStop {
+        project_path: project_path.to_path_buf(),
+    });
+}
+
+fn attach_runtime_hold(project_path: &std::path::Path) -> CliResult<()> {
+    match client::send_request(&IpcRequest::ProjectAttach {
+        project_path: project_path.to_path_buf(),
+        source: AttachmentSource::Runtime,
+        start_services: false,
+        inherited_env: HashMap::new(),
+    }) {
+        Ok(IpcResponse::Ok) => Ok(()),
+        Ok(IpcResponse::Error(msg)) => Err(CliError::message(format!(
+            "{} Failed to attach project: {msg}",
+            style::CROSS
+        ))),
+        Ok(r) => Err(CliError::message(format!("Unexpected response: {r:?}"))),
+        Err(e) => Err(e),
     }
 }
 
@@ -69,6 +132,20 @@ const fn section_label(section: ProjectSection) -> &'static str {
         ProjectSection::AlwaysOn => "always-on",
         ProjectSection::Recent => "recent",
     }
+}
+
+pub fn inherited_service_env() -> HashMap<String, String> {
+    inherited_service_env_from(std::env::vars())
+}
+
+fn inherited_service_env_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    vars.into_iter().filter(|(key, _)| key == "PATH").collect()
+}
+
+const fn should_stream_logs_after_up(verbose: bool) -> bool {
+    verbose
 }
 
 fn warn_if_daemon_identity_mismatch() {
@@ -310,6 +387,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
         Commands::Up {
             path,
             verbose,
+            follow,
             exit_after_register,
         } => {
             let config = global_config::load();
@@ -429,22 +507,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
 
-            // Register a CLI attachment so the project's lifecycle is tracked.
-            // The attachment is tied to this process's PID — when the CLI exits,
-            // the daemon's periodic reaper will detect the PID is gone and
-            // detach (stopping services if no other attachments remain).
-            let _ = client::send_request(&IpcRequest::ProjectAttach {
-                project_path: abs_path.clone(),
-                source: locald_core::attachments::AttachmentSource::CLI {
-                    pid: std::process::id(),
-                },
-            });
+            let inherited_env = inherited_service_env();
 
-            // Start services with streaming output.
+            // Start services with progress output.
             let mut attempts = 0;
             loop {
                 match client::stream_boot_events(&IpcRequest::Start {
                     project_path: abs_path.clone(),
+                    inherited_env: inherited_env.clone(),
                     verbose: *verbose,
                 }) {
                     Ok(()) => {
@@ -469,6 +539,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 }
             }
 
+            if let Err(e) = attach_runtime_hold(&abs_path) {
+                force_stop_project(&abs_path);
+                return Err(e);
+            }
+
             report_update(&update_rx);
 
             // Test harnesses use the hidden flag so `locald up` can assert that
@@ -477,20 +552,37 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let detach_path = abs_path;
-            let _ = ctrlc::set_handler(move || {
-                // Best-effort detach on Ctrl+C
-                let _ = client::send_request(&IpcRequest::ProjectDetach {
-                    project_path: detach_path.clone(),
-                    source: Some(AttachmentSource::CLI {
-                        pid: std::process::id(),
-                    }),
-                });
-                std::process::exit(0);
-            });
+            match client::send_request(&IpcRequest::ProjectStatus {
+                project_path: abs_path.clone(),
+            }) {
+                Ok(IpcResponse::ProjectStatus(info)) => print_project_up_summary(&info),
+                Ok(IpcResponse::Error(msg)) => {
+                    detach_runtime_hold(&abs_path);
+                    return Err(CliError::message(format!(
+                        "{} Failed to read project status: {msg}",
+                        style::CROSS
+                    )));
+                }
+                Ok(r) => {
+                    detach_runtime_hold(&abs_path);
+                    return Err(CliError::message(format!("Unexpected response: {r:?}")));
+                }
+                Err(e) => {
+                    detach_runtime_hold(&abs_path);
+                    return Err(e);
+                }
+            }
 
-            println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
-            client::stream_logs(None, true)?;
+            if *follow {
+                println!(
+                    "{} Streaming logs (Ctrl+C to stop following)...",
+                    style::INFO
+                );
+                client::stream_logs(None, true)?;
+            } else if should_stream_logs_after_up(*verbose) {
+                println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
+                client::stream_logs(None, true)?;
+            }
         }
         Commands::Stop { name, json } => {
             let names = if let Some(n) = name {
@@ -908,6 +1000,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     #[cfg(target_os = "macos")]
                     {
                         cliclack::intro("locald admin setup (macOS)")?;
+                        let mut failures = Vec::new();
 
                         // Step 1: Generate and trust the Root CA certificate.
                         {
@@ -919,11 +1012,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 }
                                 Err(e) => {
                                     s.error(format!("HTTPS trust failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "HTTPS trust setup failed: {e}\n\
-                                         This is required for browsers to trust locald's HTTPS certificates.\n\
-                                         Run `locald admin setup` to retry."
-                                    )));
+                                    failures.push(format!("HTTPS trust setup failed: {e}"));
                                 }
                             }
                         }
@@ -936,18 +1025,19 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             let s = cliclack::spinner();
                             s.start("Installing menu bar agent...");
 
-                            let agent_path = locald_utils::agent::agent_path()?;
-                            locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
+                            let result = (|| -> anyhow::Result<()> {
+                                let agent_path = locald_utils::agent::agent_path()?;
+                                locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
+                                install_launch_agent(&agent_path)
+                            })();
 
-                            match install_launch_agent(&agent_path) {
+                            match result {
                                 Ok(()) => {
-                                    s.stop("Menu bar agent installed (starts at login)");
+                                    s.stop("Menu bar agent installed and running");
                                 }
                                 Err(e) => {
                                     s.error(format!("Menu bar agent install failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Failed to install LaunchAgent: {e}"
-                                    )));
+                                    failures.push(format!("Menu bar agent setup failed: {e}"));
                                 }
                             }
                         }
@@ -966,17 +1056,23 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 }
                                 Err(e) => {
                                     s.error(format!("Privileged helper install failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Failed to install privileged helper: {e}\n\
-                                         The helper is required for locald to serve on ports 80/443.\n\
-                                         Run `locald admin setup` to retry."
-                                    )));
+                                    failures.push(format!("Privileged helper setup failed: {e}"));
                                 }
                             }
                         }
 
-                        cliclack::outro("Setup complete")?;
-                        println!("Next: run `locald up`.");
+                        if failures.is_empty() {
+                            cliclack::outro("Setup complete")?;
+                            println!("Next: run `locald up`.");
+                        } else {
+                            cliclack::outro("Setup incomplete")?;
+                            let mut message = String::from("macOS admin setup failed:");
+                            for failure in failures {
+                                message.push_str("\n- ");
+                                message.push_str(&failure);
+                            }
+                            return Err(CliError::message(message));
+                        }
                     }
 
                     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1279,14 +1375,24 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             )));
                         }
                     }
+                    TrayCommands::Autostart { .. } => {
+                        return Err(CliError::message(
+                            "Tray autostart on macOS is managed by `locald admin setup`.",
+                        ));
+                    }
                 }
             }
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            {
+                handle_linux_tray_command(command)?;
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = command;
                 return Err(CliError::message(
-                    "Tray commands are only supported on macOS.",
+                    "Tray commands are only supported on macOS and Linux desktop sessions.",
                 ));
             }
         }
@@ -1517,6 +1623,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     Some("cli") | None => AttachmentSource::CLI {
                         pid: std::process::id(),
                     },
+                    Some("runtime") => AttachmentSource::Runtime,
                     Some(other) => {
                         return Err(CliError::message(format!(
                             "Unknown attachment source: {other}"
@@ -1527,6 +1634,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 match client::send_request(&IpcRequest::ProjectAttach {
                     project_path: abs_path,
                     source,
+                    start_services: true,
+                    inherited_env: inherited_service_env(),
                 }) {
                     Ok(IpcResponse::Ok) => {
                         if *json {
@@ -1570,6 +1679,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     Some("cli") => Some(AttachmentSource::CLI {
                         pid: std::process::id(),
                     }),
+                    Some("runtime") => Some(AttachmentSource::Runtime),
                     Some(other) => {
                         return Err(CliError::message(format!(
                             "Unknown attachment source: {other}"
@@ -1935,77 +2045,920 @@ pub fn run(cli: Cli) -> CliResult<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
-    let label = "com.locald.agent";
+#[cfg(target_os = "linux")]
+const LOCALD_AGENT_PATH_ENV: &str = "LOCALD_AGENT_PATH";
+#[cfg(target_os = "linux")]
+const LOCALD_DAEMON_PATH_ENV: &str = "LOCALD_DAEMON_PATH";
+#[cfg(target_os = "linux")]
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
+#[cfg(target_os = "linux")]
+const LINUX_TRAY_LOG_PATH: &str = "/tmp/locald-agent.log";
+#[cfg(target_os = "linux")]
+const LINUX_AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
+#[cfg(target_os = "linux")]
+const LINUX_TRAY_AUTOSTART_FILENAME: &str = "com.locald.agent.desktop";
 
-    // When running under sudo, resolve the real user's home and UID for
-    // correct plist placement and launchctl domain targeting.
-    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
-        if let Ok(sudo_user) = std::env::var("SUDO_USER")
-            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
+#[cfg(target_os = "linux")]
+fn handle_linux_tray_command(command: &TrayCommands) -> CliResult<()> {
+    match command {
+        TrayCommands::Start => start_linux_tray_agent(),
+        TrayCommands::Stop => {
+            stop_linux_tray_agent(true)?;
+            Ok(())
+        }
+        TrayCommands::Status => status_linux_tray_agent(),
+        TrayCommands::Restart => {
+            stop_linux_tray_agent(false)?;
+            start_linux_tray_agent()
+        }
+        TrayCommands::Autostart { command } => match command {
+            TrayAutostartCommands::Enable { locald_path } => {
+                enable_linux_tray_autostart(locald_path.as_deref())
+            }
+            TrayAutostartCommands::Disable => disable_linux_tray_autostart(),
+            TrayAutostartCommands::Status => status_linux_tray_autostart(),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods, unsafe_code)]
+fn start_linux_tray_agent() -> CliResult<()> {
+    use std::os::unix::process::CommandExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return Err(CliError::message(
+            "Do not run `locald tray start` with sudo. The tray agent must run in your desktop user session.",
+        ));
+    }
+
+    if let Some(message) = linux_tray_env_diagnostic() {
+        return Err(CliError::message(message));
+    }
+
+    if let Some(pid) = read_linux_tray_pid()? {
+        if linux_process_is_running(pid) {
+            println!("locald tray agent is already running (pid {pid})");
+            return Ok(());
+        }
+        remove_linux_tray_pidfile()?;
+    }
+
+    let agent_path = resolve_linux_agent_path()?;
+    let daemon_path =
+        std::env::current_exe().context("Failed to resolve current executable path")?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(LINUX_TRAY_LOG_PATH)
+        .context("Failed to open locald tray agent log")?;
+    let stderr = log_file
+        .try_clone()
+        .context("Failed to clone locald tray agent log handle")?;
+
+    let mut command = std::process::Command::new(&agent_path);
+    command
+        .env(LOCALD_DAEMON_PATH_ENV, &daemon_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file)
+        .stderr(stderr);
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command
+        .spawn()
+        .context("Failed to start locald tray agent")?;
+    let pid = i32::try_from(child.id()).map_err(|_| {
+        CliError::message(format!(
+            "locald tray agent pid {} does not fit in pid_t",
+            child.id()
+        ))
+    })?;
+
+    for _ in 0..10 {
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to check locald tray agent startup")?
         {
-            (Some(user.dir), Some(user.uid.as_raw()))
-        } else {
-            (None, None)
+            remove_linux_tray_pidfile()?;
+            let log_excerpt = linux_tray_log_excerpt()
+                .unwrap_or_else(|| format!("No output was written to {LINUX_TRAY_LOG_PATH}."));
+            return Err(CliError::message(format!(
+                "locald tray agent exited during startup with status {status}.\n\n{log_excerpt}\n\nSee {LINUX_TRAY_LOG_PATH} for details."
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    write_linux_tray_pid(pid)?;
+    write_linux_tray_daemon_path(&daemon_path)?;
+
+    println!("{} locald tray agent started (pid {pid})", style::CHECK);
+    println!("Pinned daemon: {}", daemon_path.display());
+    println!("Log: {LINUX_TRAY_LOG_PATH}");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_tray_agent(report_not_running: bool) -> CliResult<bool> {
+    let Some(pid) = read_linux_tray_pid()? else {
+        if report_not_running {
+            println!("locald tray agent is not running");
+        }
+        return Ok(false);
+    };
+
+    if !linux_process_is_running(pid) {
+        remove_linux_tray_pidfile()?;
+        if report_not_running {
+            println!("locald tray agent is not running (removed stale pidfile)");
+        }
+        return Ok(false);
+    }
+
+    linux_send_signal(pid, libc::SIGTERM)?;
+    for _ in 0..50 {
+        if !linux_process_is_running(pid) {
+            remove_linux_tray_pidfile()?;
+            if report_not_running {
+                println!("{} locald tray agent stopped", style::CHECK);
+            }
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    Err(CliError::message(format!(
+        "Timed out waiting for locald tray agent pid {pid} to stop."
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn status_linux_tray_agent() -> CliResult<()> {
+    match read_linux_tray_pid()? {
+        Some(pid) if linux_process_is_running(pid) => {
+            println!("locald tray agent is running (pid {pid})");
+        }
+        Some(_) => {
+            remove_linux_tray_pidfile()?;
+            println!("locald tray agent is not running (removed stale pidfile)");
+            println!("  Start it with: locald tray start");
+        }
+        None => {
+            println!("locald tray agent is not running");
+            println!("  Start it with: locald tray start");
+        }
+    }
+
+    match linux_agent_override_path() {
+        Ok(Some(path)) => println!(
+            "Agent binary: {} (LOCALD_AGENT_PATH override)",
+            path.display()
+        ),
+        Ok(None) => match linux_embedded_agent_status() {
+            Ok(status) => println!("{status}"),
+            Err(error) => println!("Agent binary: not found ({error})"),
+        },
+        Err(error) => println!("Agent binary: not found ({error})"),
+    }
+
+    match read_linux_tray_daemon_path()? {
+        Some(path) => println!("Pinned daemon: {}", path.display()),
+        None => println!("Pinned daemon: not configured"),
+    }
+
+    let autostart_path = linux_tray_autostart_path()?;
+    let autostart_content = read_linux_tray_autostart_desktop(&autostart_path)?;
+    if let Some(content) = autostart_content {
+        println!("Autostart: enabled");
+        println!("Autostart file: {}", autostart_path.display());
+        match linux_tray_autostart_daemon_path(&content) {
+            Some(path) => println!("Autostart daemon: {}", path.display()),
+            None => println!("Autostart daemon: not configured"),
         }
     } else {
-        (None, None)
-    };
+        println!("Autostart: disabled");
+        println!("Autostart file: {}", autostart_path.display());
+        println!("Autostart daemon: not configured");
+    }
 
-    // Write the plist directly to the correct user's LaunchAgents directory.
-    let plist_dir = if let Some(ref home) = user_home {
-        home.join("Library/LaunchAgents")
+    if let Some(message) = linux_tray_env_diagnostic() {
+        println!("Current shell host: unsupported ({message})");
     } else {
-        dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-            .join("Library/LaunchAgents")
-    };
-    std::fs::create_dir_all(&plist_dir)?;
+        println!("Current shell host: graphical session and D-Bus session bus detected");
+    }
 
-    let plist_path = plist_dir.join(format!("{label}.plist"));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enable_linux_tray_autostart(locald_path: Option<&std::path::Path>) -> CliResult<()> {
+    reject_linux_tray_autostart_root("enable")?;
+
+    let agent_path = resolve_linux_agent_path()?;
+    let daemon_path = resolve_linux_autostart_daemon_path(locald_path)?;
+    let autostart_path = linux_tray_autostart_path()?;
+    if let Some(parent) = autostart_path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create autostart directory")?;
+    }
+
+    let desktop_entry = render_linux_tray_autostart_desktop(&agent_path, &daemon_path);
+    std::fs::write(&autostart_path, desktop_entry)
+        .context("Failed to write tray autostart desktop entry")?;
+
+    write_linux_tray_daemon_path(&daemon_path)?;
+
+    println!("{} Tray autostart enabled", style::CHECK);
+    println!("Autostart file: {}", autostart_path.display());
+    println!("Pinned daemon: {}", daemon_path.display());
+
+    if let Some(message) = linux_tray_env_diagnostic() {
+        eprintln!(
+            "{} Autostart will run at next login. Current shell is not ready for tray startup. {message}",
+            style::WARN
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_autostart_daemon_path(
+    locald_path: Option<&std::path::Path>,
+) -> CliResult<std::path::PathBuf> {
+    let Some(path) = locald_path else {
+        return Ok(std::env::current_exe().context("Failed to resolve current executable path")?);
+    };
+
+    if !path.is_absolute() {
+        return Err(CliError::message(format!(
+            "--locald-path must be an absolute host-visible path: {}",
+            path.display()
+        )));
+    }
+
+    if !path.is_file() {
+        return Err(CliError::message(format!(
+            "--locald-path does not point to a file: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn disable_linux_tray_autostart() -> CliResult<()> {
+    reject_linux_tray_autostart_root("disable")?;
+
+    let autostart_path = linux_tray_autostart_path()?;
+    match std::fs::remove_file(&autostart_path) {
+        Ok(()) => {
+            println!("{} Tray autostart disabled", style::CHECK);
+            println!("Autostart file: {}", autostart_path.display());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("Tray autostart is already disabled");
+            println!("Autostart file: {}", autostart_path.display());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn status_linux_tray_autostart() -> CliResult<()> {
+    reject_linux_tray_autostart_root("status")?;
+
+    let autostart_path = linux_tray_autostart_path()?;
+    let autostart_content = read_linux_tray_autostart_desktop(&autostart_path)?;
+
+    if let Some(content) = autostart_content {
+        println!("Tray autostart: enabled");
+        println!("Autostart file: {}", autostart_path.display());
+        match linux_tray_autostart_daemon_path(&content) {
+            Some(path) => println!("Autostart daemon: {}", path.display()),
+            None => println!("Autostart daemon: not configured"),
+        }
+    } else {
+        println!("Tray autostart: disabled");
+        println!("Autostart file: {}", autostart_path.display());
+        println!("Autostart daemon: not configured");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_linux_tray_autostart_root(command: &str) -> CliResult<()> {
+    if nix::unistd::geteuid().is_root() {
+        return Err(CliError::message(format!(
+            "Do not run `locald tray autostart {command}` with sudo. Autostart is configured in your user profile."
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_path() -> CliResult<std::path::PathBuf> {
+    Ok(linux_tray_autostart_dir()?.join(LINUX_TRAY_AUTOSTART_FILENAME))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_dir() -> CliResult<std::path::PathBuf> {
+    if let Some(dir) = linux_tray_autostart_dir_from_xdg_config_home(
+        std::env::var(XDG_CONFIG_HOME_ENV).ok().as_deref(),
+    )? {
+        return Ok(dir);
+    }
+
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| CliError::message("Could not determine XDG config directory"))?;
+    Ok(config_dir.join("autostart"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_dir_from_xdg_config_home(
+    value: Option<&str>,
+) -> CliResult<Option<std::path::PathBuf>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let config_home = std::path::PathBuf::from(trimmed);
+    if !config_home.is_absolute() {
+        return Err(CliError::message(format!(
+            "{XDG_CONFIG_HOME_ENV} must be an absolute path when set: {}",
+            config_home.display()
+        )));
+    }
+
+    Ok(Some(config_home.join("autostart")))
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_tray_autostart_desktop(path: &std::path::Path) -> CliResult<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn render_linux_tray_autostart_desktop(
+    agent_path: &std::path::Path,
+    daemon_path: &std::path::Path,
+) -> String {
+    let daemon_setting = format!("{LOCALD_DAEMON_PATH_ENV}={}", daemon_path.display());
+    let exec = desktop_entry_exec(&[
+        "env".to_string(),
+        daemon_setting,
+        agent_path.to_string_lossy().into_owned(),
+    ]);
+
+    format!(
+        "[Desktop Entry]\nType=Application\nName=locald tray\nComment=locald desktop tray agent\nExec={exec}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_entry_exec(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| desktop_entry_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_entry_quote_arg(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_autostart_daemon_path(content: &str) -> Option<std::path::PathBuf> {
+    let exec_line = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Exec="))?;
+    let args = parse_desktop_entry_exec(exec_line);
+    args.into_iter().find_map(|arg| {
+        arg.strip_prefix(&format!("{LOCALD_DAEMON_PATH_ENV}="))
+            .map(std::path::PathBuf::from)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_desktop_entry_exec(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                escaped = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            _ if ch.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    args.push(current);
+                    current = String::new();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_agent_path() -> CliResult<std::path::PathBuf> {
+    if let Some(path) = linux_agent_override_path()? {
+        return Ok(path);
+    }
+
+    ensure_linux_embedded_agent_installed(LINUX_AGENT_BYTES)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_agent_override_path() -> CliResult<Option<std::path::PathBuf>> {
+    let Ok(path) = std::env::var(LOCALD_AGENT_PATH_ENV) else {
+        return Ok(None);
+    };
+
+    if path.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let override_path = std::path::PathBuf::from(path);
+    if !override_path.is_file() {
+        return Err(CliError::message(format!(
+            "LOCALD_AGENT_PATH is set but does not point to a file: {}",
+            override_path.display()
+        )));
+    }
+
+    Ok(Some(override_path))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_embedded_agent_installed(bytes: &[u8]) -> CliResult<std::path::PathBuf> {
+    let agent_path = locald_utils::agent::agent_path()?;
+    let matches = locald_utils::agent::verify_integrity(&agent_path, bytes)
+        .context("Failed to verify embedded locald tray agent")?;
+    if !matches {
+        locald_utils::agent::install(&agent_path, bytes)
+            .context("Failed to install embedded locald tray agent")?;
+    }
+    Ok(agent_path)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_embedded_agent_status() -> CliResult<String> {
+    let agent_path = locald_utils::agent::agent_path()?;
+    let matches = locald_utils::agent::verify_integrity(&agent_path, LINUX_AGENT_BYTES)
+        .context("Failed to verify embedded locald tray agent")?;
+    if matches {
+        Ok(format!("Agent binary: {} (embedded)", agent_path.display()))
+    } else if agent_path.is_file() {
+        Ok(format!(
+            "Agent binary: {} (needs update)",
+            agent_path.display()
+        ))
+    } else {
+        Ok(format!(
+            "Agent binary: {} (not installed)",
+            agent_path.display()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_data_file(name: &str) -> CliResult<std::path::PathBuf> {
+    let data_dir = locald_utils::cert::locald_data_dir()?;
+    std::fs::create_dir_all(&data_dir).context("Failed to create locald data directory")?;
+    Ok(data_dir.join(name))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_pid_path() -> CliResult<std::path::PathBuf> {
+    linux_tray_data_file("locald-agent.pid")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_daemon_path_file() -> CliResult<std::path::PathBuf> {
+    linux_tray_data_file("locald-agent.daemon-path")
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_tray_pid() -> CliResult<Option<i32>> {
+    let path = linux_tray_pid_path()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let pid = trimmed.parse::<i32>().map_err(|error| {
+        CliError::message(format!(
+            "Invalid locald tray agent pidfile {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(pid))
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_tray_pid(pid: i32) -> CliResult<()> {
+    std::fs::write(linux_tray_pid_path()?, format!("{pid}\n"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_linux_tray_pidfile() -> CliResult<()> {
+    let path = linux_tray_pid_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_tray_daemon_path(path: &std::path::Path) -> CliResult<()> {
+    std::fs::write(
+        linux_tray_daemon_path_file()?,
+        format!("{}\n", path.display()),
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_tray_daemon_path() -> CliResult<Option<std::path::PathBuf>> {
+    let path = linux_tray_daemon_path_file()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(std::path::PathBuf::from(trimmed)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_process_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_send_signal(pid: i32, signal: i32) -> CliResult<()> {
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+
+    Err(CliError::message(format!(
+        "Failed to signal locald tray agent pid {pid}: {error}"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_env_diagnostic() -> Option<String> {
+    let has_graphical_session = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || std::env::var("DISPLAY")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+    if !has_graphical_session {
+        return Some(
+            "Linux tray support requires a graphical desktop session. Start `locald tray start` from a session with WAYLAND_DISPLAY or DISPLAY set, or use the locald CLI/dashboard instead."
+                .to_string(),
+        );
+    }
+
+    let has_session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_session_bus {
+        return Some(
+            "Linux tray support requires a D-Bus session bus. Start `locald tray start` from a desktop session with DBUS_SESSION_BUS_ADDRESS set, or use the locald CLI/dashboard instead."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tray_log_excerpt() -> Option<String> {
+    let content = std::fs::read_to_string(LINUX_TRAY_LOG_PATH).ok()?;
+    let lines = content
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = lines.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosLaunchUser {
+    home: std::path::PathBuf,
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosLaunchUserInput<'a> {
+    is_root: bool,
+    sudo_user: Option<&'a str>,
+    sudo_user_id: Option<&'a str>,
+    sudo_group_id: Option<&'a str>,
+    sudo_home: Option<std::path::PathBuf>,
+    current_home: Option<std::path::PathBuf>,
+    current_user_id: u32,
+    current_group_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_user_from_parts(
+    input: MacosLaunchUserInput<'_>,
+) -> anyhow::Result<MacosLaunchUser> {
+    if input.is_root {
+        let sudo_user = input
+            .sudo_user
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "macOS admin setup must be run via sudo from the logged-in user account; SUDO_USER is missing"
+                )
+            })?;
+        let resolved_uid = input
+            .sudo_user_id
+            .ok_or_else(|| anyhow::anyhow!("SUDO_UID is missing for {sudo_user}"))?
+            .parse::<u32>()
+            .with_context(|| format!("SUDO_UID is invalid for {sudo_user}"))?;
+        let resolved_group = input
+            .sudo_group_id
+            .ok_or_else(|| anyhow::anyhow!("SUDO_GID is missing for {sudo_user}"))?
+            .parse::<u32>()
+            .with_context(|| format!("SUDO_GID is invalid for {sudo_user}"))?;
+        let home = input
+            .sudo_home
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory for {sudo_user}"))?;
+        Ok(MacosLaunchUser {
+            home,
+            uid: resolved_uid,
+            gid: resolved_group,
+        })
+    } else {
+        let home = input
+            .current_home
+            .ok_or_else(|| anyhow::anyhow!("Could not determine current user home directory"))?;
+        Ok(MacosLaunchUser {
+            home,
+            uid: input.current_user_id,
+            gid: input.current_group_id,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_launch_user() -> anyhow::Result<MacosLaunchUser> {
+    let is_root = nix::unistd::geteuid().is_root();
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let sudo_home = match sudo_user.as_deref() {
+        Some(name) if !name.trim().is_empty() => nix::unistd::User::from_name(name)
+            .with_context(|| format!("Failed to resolve sudo user {name}"))?
+            .map(|user| user.dir),
+        _ => None,
+    };
+
+    macos_launch_user_from_parts(MacosLaunchUserInput {
+        is_root,
+        sudo_user: sudo_user.as_deref(),
+        sudo_user_id: std::env::var("SUDO_UID").ok().as_deref(),
+        sudo_group_id: std::env::var("SUDO_GID").ok().as_deref(),
+        sudo_home,
+        current_home: dirs::home_dir(),
+        current_user_id: nix::unistd::Uid::current().as_raw(),
+        current_group_id: nix::unistd::Gid::current().as_raw(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_paths(
+    home: &std::path::Path,
+    label: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        home.join("Library/LaunchAgents")
+            .join(format!("{label}.plist")),
+        home.join("Library/Logs/locald/locald-agent.log"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn chown_to_launch_user(path: &std::path::Path, user: &MacosLaunchUser) -> anyhow::Result<()> {
+    if !nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+
+    nix::unistd::chown(
+        path,
+        Some(nix::unistd::Uid::from_raw(user.uid)),
+        Some(nix::unistd::Gid::from_raw(user.gid)),
+    )
+    .with_context(|| format!("Failed to chown {}", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_failure(action: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut message = format!("{action} failed with status {}", output.status);
+    if !stdout.trim().is_empty() {
+        message.push_str("\nstdout:\n");
+        message.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        message.push_str("\nstderr:\n");
+        message.push_str(stderr.trim());
+    }
+    message
+}
+
+#[cfg(target_os = "macos")]
+fn require_launchctl_success(
+    action: &str,
+    output: std::process::Output,
+) -> anyhow::Result<std::process::Output> {
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(anyhow::anyhow!(launchctl_failure(action, &output)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn require_aqua_session(uid: u32) -> anyhow::Result<()> {
+    let domain = format!("gui/{uid}");
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &domain])
+        .output()
+        .with_context(|| format!("Failed to run launchctl print {domain}"))?;
+    let output = require_launchctl_success(&format!("launchctl print {domain}"), output)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("session = Aqua") {
+        Ok(())
+    } else {
+        anyhow::bail!("macOS menu bar setup requires an active Aqua login session for {domain}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let label = "com.locald.agent";
+    let launch_user = resolve_macos_launch_user()?;
+    require_aqua_session(launch_user.uid)?;
+
+    let (plist_path, log_path) = launch_agent_paths(&launch_user.home, label);
+    let plist_dir = plist_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid LaunchAgent plist path"))?;
+    let log_dir = log_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid LaunchAgent log path"))?;
+    std::fs::create_dir_all(plist_dir)?;
+    std::fs::create_dir_all(log_dir)?;
+    chown_to_launch_user(plist_dir, &launch_user)?;
+    chown_to_launch_user(log_dir, &launch_user)?;
 
     let daemon_path =
         std::env::current_exe().context("Failed to resolve current executable path")?;
-    let plist_content = render_launch_agent_plist(label, agent_path, &daemon_path);
+    let plist_content = render_launch_agent_plist(label, agent_path, &daemon_path, &log_path);
     std::fs::write(&plist_path, plist_content)?;
+    std::fs::set_permissions(&plist_path, std::fs::Permissions::from_mode(0o644))?;
+    chown_to_launch_user(&plist_path, &launch_user)?;
 
-    // Load into the correct user's GUI domain.
-    // Under sudo, `launchctl load` targets root's domain — use
-    // `launchctl bootstrap gui/<uid>` to load into the invoking user's domain.
-    #[allow(clippy::disallowed_methods)]
-    if let Some(uid) = target_uid {
-        let service_target = format!("gui/{uid}/{label}");
-        // Unload any existing (ignore errors — "not found" is fine).
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &service_target])
-            .output();
+    let domain = format!("gui/{}", launch_user.uid);
+    let service_target = format!("{domain}/{label}");
 
-        let status = std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}")])
-            .arg(&plist_path)
-            .status()
-            .context("Failed to run launchctl bootstrap")?;
+    // Ignore bootout failures; the service may not be loaded yet.
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &service_target])
+        .output();
 
-        if !status.success() {
-            anyhow::bail!("launchctl bootstrap gui/{uid} failed with status: {status}");
-        }
-    } else {
-        // Not running as root — load into current user's domain (legacy syntax).
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&plist_path)
-            .output();
+    let output = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist_path)
+        .output()
+        .context("Failed to run launchctl bootstrap")?;
+    require_launchctl_success(&format!("launchctl bootstrap {domain}"), output)?;
 
-        let status = std::process::Command::new("launchctl")
-            .args(["load", "-w"])
-            .arg(&plist_path)
-            .status()
-            .context("Failed to run launchctl load")?;
+    let output = std::process::Command::new("launchctl")
+        .args(["enable", &service_target])
+        .output()
+        .context("Failed to run launchctl enable")?;
+    require_launchctl_success(&format!("launchctl enable {service_target}"), output)?;
 
-        if !status.success() {
-            anyhow::bail!("launchctl load failed with status: {status}");
-        }
+    let output = std::process::Command::new("launchctl")
+        .args(["kickstart", "-kp", &service_target])
+        .output()
+        .context("Failed to run launchctl kickstart")?;
+    require_launchctl_success(&format!("launchctl kickstart -kp {service_target}"), output)?;
+
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &service_target])
+        .output()
+        .context("Failed to run launchctl print for locald agent")?;
+    let output = require_launchctl_success(&format!("launchctl print {service_target}"), output)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("pid =") {
+        anyhow::bail!(
+            "LaunchAgent loaded but no running locald-agent PID was reported. Check {}.",
+            log_path.display()
+        );
     }
 
     Ok(())
@@ -2016,10 +2969,12 @@ fn render_launch_agent_plist(
     label: &str,
     agent_path: &std::path::Path,
     daemon_path: &std::path::Path,
+    log_path: &std::path::Path,
 ) -> String {
     let label = escape_xml(label);
     let program = escape_xml(&agent_path.display().to_string());
     let daemon = escape_xml(&daemon_path.display().to_string());
+    let log_path = escape_xml(&log_path.display().to_string());
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2043,6 +2998,10 @@ fn render_launch_agent_plist(
     <true/>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
 </dict>
 </plist>"#,
     )
@@ -2067,11 +3026,15 @@ fn escape_xml(value: &str) -> String {
 #[cfg(target_os = "macos")]
 fn read_launch_agent_daemon_path(
     plist_path: &std::path::Path,
-) -> anyhow::Result<Option<std::path::PathBuf>> {
+) -> CliResult<Option<std::path::PathBuf>> {
     let content = match std::fs::read_to_string(plist_path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("Failed to read LaunchAgent plist"),
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context("Failed to read LaunchAgent plist")
+                .into());
+        }
     };
     Ok(parse_launch_agent_daemon_path(&content).map(std::path::PathBuf::from))
 }
@@ -2126,8 +3089,121 @@ fn unescape_xml(value: &str) -> String {
     unescaped
 }
 
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_service_env_from_keeps_only_path() {
+        let env = inherited_service_env_from([
+            ("PATH".to_string(), "/cli/bin:/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/me".to_string()),
+            ("SHELL".to_string(), "/bin/zsh".to_string()),
+        ]);
+
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/cli/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn up_streams_logs_only_when_verbose() {
+        assert!(!should_stream_logs_after_up(false));
+        assert!(should_stream_logs_after_up(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_entry_quote_arg_escapes_exec_field_specials() {
+        let quoted =
+            desktop_entry_quote_arg(r#"/home/me/odd path/%build/`agent`/$bin/"quote"/slash\"#);
+
+        assert_eq!(
+            quoted,
+            r#""/home/me/odd path/%%build/\`agent\`/\$bin/\"quote\"/slash\\""#
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_desktop_round_trips_pinned_daemon_path() {
+        let desktop = render_linux_tray_autostart_desktop(
+            std::path::Path::new("/home/me/.locald/locald agent"),
+            std::path::Path::new("/home/me/bin/locald debug"),
+        );
+
+        assert!(desktop.contains("Exec="));
+        assert_eq!(
+            linux_tray_autostart_daemon_path(&desktop),
+            Some(std::path::PathBuf::from("/home/me/bin/locald debug"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_daemon_path_override_preserves_host_visible_path() {
+        let root = tempfile::tempdir().unwrap();
+        let locald_path = root.path().join("locald");
+        std::fs::write(&locald_path, "#!/bin/sh\n").unwrap();
+
+        let resolved = resolve_linux_autostart_daemon_path(Some(&locald_path)).unwrap();
+
+        assert_eq!(resolved, locald_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_daemon_path_override_rejects_relative_path() {
+        let error = resolve_linux_autostart_daemon_path(Some(std::path::Path::new("locald")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--locald-path must be an absolute host-visible path"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_desktop_entry_exec_handles_quoted_spaces_and_escapes() {
+        let args = parse_desktop_entry_exec(
+            r#""env" "LOCALD_DAEMON_PATH=/home/me/bin/locald debug" "/home/me/.locald/locald agent""#,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "env".to_string(),
+                "LOCALD_DAEMON_PATH=/home/me/bin/locald debug".to_string(),
+                "/home/me/.locald/locald agent".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_config_home_resolves_user_autostart_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let dir =
+            linux_tray_autostart_dir_from_xdg_config_home(Some(root.path().to_str().unwrap()))
+                .unwrap();
+
+        assert_eq!(dir, Some(root.path().join("autostart")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_config_home_rejects_relative_paths() {
+        let error = linux_tray_autostart_dir_from_xdg_config_home(Some("relative/config"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("XDG_CONFIG_HOME must be an absolute path"));
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+mod macos_tests {
     use super::*;
 
     #[test]
@@ -2136,10 +3212,14 @@ mod tests {
             "com.locald.agent",
             std::path::Path::new("/Applications/locald agent/locald-agent"),
             std::path::Path::new("/Users/me/bin/locald"),
+            std::path::Path::new("/Users/me/Library/Logs/locald/locald-agent.log"),
         );
 
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains("<key>LOCALD_DAEMON_PATH</key>"));
+        assert!(plist.contains("<key>StandardOutPath</key>"));
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("/Users/me/Library/Logs/locald/locald-agent.log"));
         assert_eq!(
             parse_launch_agent_daemon_path(&plist),
             Some("/Users/me/bin/locald".to_string())
@@ -2152,6 +3232,7 @@ mod tests {
             "com.locald.agent",
             std::path::Path::new("/Applications/A&B/locald-agent"),
             std::path::Path::new("/Users/me/<debug>/locald"),
+            std::path::Path::new("/Users/me/Library/Logs/locald/locald-agent.log"),
         );
 
         assert!(plist.contains("/Applications/A&amp;B/locald-agent"));
@@ -2182,10 +3263,73 @@ mod tests {
     fn launch_agent_daemon_path_is_absent_when_key_missing() {
         assert_eq!(parse_launch_agent_daemon_path("<plist></plist>"), None);
     }
+
+    #[test]
+    fn macos_launch_user_uses_sudo_identity_when_root() {
+        let user = macos_launch_user_from_parts(MacosLaunchUserInput {
+            is_root: true,
+            sudo_user: Some("wycats"),
+            sudo_user_id: Some("501"),
+            sudo_group_id: Some("20"),
+            sudo_home: Some(std::path::PathBuf::from("/Users/wycats")),
+            current_home: Some(std::path::PathBuf::from("/var/root")),
+            current_user_id: 0,
+            current_group_id: 0,
+        })
+        .unwrap();
+
+        assert_eq!(
+            user,
+            MacosLaunchUser {
+                home: std::path::PathBuf::from("/Users/wycats"),
+                uid: 501,
+                gid: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn macos_launch_user_uses_current_identity_when_not_root() {
+        let user = macos_launch_user_from_parts(MacosLaunchUserInput {
+            is_root: false,
+            sudo_user: None,
+            sudo_user_id: None,
+            sudo_group_id: None,
+            sudo_home: None,
+            current_home: Some(std::path::PathBuf::from("/Users/wycats")),
+            current_user_id: 501,
+            current_group_id: 20,
+        })
+        .unwrap();
+
+        assert_eq!(
+            user,
+            MacosLaunchUser {
+                home: std::path::PathBuf::from("/Users/wycats"),
+                uid: 501,
+                gid: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn launch_agent_paths_use_user_library() {
+        let (plist_path, log_path) =
+            launch_agent_paths(std::path::Path::new("/Users/wycats"), "com.locald.agent");
+
+        assert_eq!(
+            plist_path,
+            std::path::PathBuf::from("/Users/wycats/Library/LaunchAgents/com.locald.agent.plist")
+        );
+        assert_eq!(
+            log_path,
+            std::path::PathBuf::from("/Users/wycats/Library/Logs/locald/locald-agent.log")
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_launch_agent() -> anyhow::Result<()> {
+fn uninstall_launch_agent() -> CliResult<()> {
     let label = "com.locald.agent";
 
     // Under sudo, resolve the real user's plist location and UID.
@@ -2205,7 +3349,7 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
         home.join("Library/LaunchAgents")
     } else {
         dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .ok_or_else(|| CliError::message("Could not determine home directory"))?
             .join("Library/LaunchAgents")
     };
 
@@ -2237,14 +3381,14 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
 /// registers it as a `LaunchDaemon` with a Mach service endpoint.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
-fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
+fn install_privileged_helper(helper_bytes: &[u8]) -> CliResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let helper_path = std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
     std::fs::create_dir_all(
         helper_path
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid helper path"))?,
+            .ok_or_else(|| CliError::message("invalid helper path"))?,
     )?;
     std::fs::write(helper_path, helper_bytes)?;
     std::fs::set_permissions(helper_path, std::fs::Permissions::from_mode(0o755))?;
@@ -2287,7 +3431,9 @@ fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
         .context("Failed to run launchctl load for helper")?;
 
     if !status.success() {
-        anyhow::bail!("launchctl load for helper failed with status: {status}");
+        return Err(CliError::message(format!(
+            "launchctl load for helper failed with status: {status}"
+        )));
     }
 
     Ok(())
