@@ -72,10 +72,18 @@ pub enum ProjectSection {
     Recent,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize)]
 struct AttachmentStoreData {
     #[serde(default)]
     attachments: HashMap<PathBuf, Vec<Attachment>>,
+    #[serde(default)]
+    manually_stopped: HashSet<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyAttachmentStoreData {
+    #[serde(default)]
+    attachments: HashMap<PathBuf, Vec<serde_json::Value>>,
     #[serde(default)]
     manually_stopped: HashSet<PathBuf>,
 }
@@ -109,8 +117,18 @@ impl AttachmentStore {
                 self.manually_stopped.clear();
                 return Ok(());
             }
-            let data: AttachmentStoreData = serde_json::from_str(&content)?;
-            self.attachments = data.attachments;
+            let data: LegacyAttachmentStoreData = serde_json::from_str(&content)?;
+            self.attachments = data
+                .attachments
+                .into_iter()
+                .map(|(path, attachments)| {
+                    let attachments = attachments
+                        .into_iter()
+                        .filter_map(Self::parse_legacy_attachment)
+                        .collect::<Result<Vec<_>>>();
+                    attachments.map(|attachments| (path, attachments))
+                })
+                .collect::<Result<_>>()?;
             self.manually_stopped = data.manually_stopped;
         }
         Ok(())
@@ -301,6 +319,50 @@ impl AttachmentStore {
 
     fn canonicalize_path(path: &Path) -> PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Decode a persisted attachment while keeping lifecycle decisions tied to
+    /// source variants understood by this compatibility model.
+    ///
+    /// Quiet-up builds wrote `Runtime` as a unit string. The catalog importer
+    /// also recognizes earlier object-shaped evidence, so normalize that shape
+    /// here as the same parked Runtime hold. Other legacy source variants remain
+    /// catalog locator evidence and are omitted from current lifecycle state.
+    fn parse_legacy_attachment(mut value: serde_json::Value) -> Option<Result<Attachment>> {
+        let Some(source) = value.get_mut("source") else {
+            return Some(Err(anyhow::anyhow!(
+                "legacy attachment is missing its source"
+            )));
+        };
+        let variant = match source {
+            serde_json::Value::String(variant) => variant.clone(),
+            serde_json::Value::Object(source) if source.len() == 1 => {
+                let Some(variant) = source.keys().next().cloned() else {
+                    return Some(Err(anyhow::anyhow!(
+                        "legacy attachment source object is empty"
+                    )));
+                };
+                variant
+            }
+            _ => {
+                return Some(Err(anyhow::anyhow!(
+                    "legacy attachment source must be a string or single-variant object"
+                )));
+            }
+        };
+
+        match variant.as_str() {
+            "Runtime" | "Pin" if source.is_object() => {
+                *source = serde_json::Value::String(variant.clone());
+            }
+            "Editor" | "CLI" | "Runtime" | "Pin" => {}
+            _ => return None,
+        }
+
+        Some(
+            serde_json::from_value(value)
+                .map_err(|error| anyhow::anyhow!("invalid legacy {variant} attachment: {error}")),
+        )
     }
 
     fn matches_source(needle: &AttachmentSource, existing: &AttachmentSource) -> bool {
@@ -649,7 +711,7 @@ mod tests {
             "attachments": {
                 project_text.as_ref(): [{
                     "project_path": project,
-                    "source": "Runtime",
+                    "source": { "Runtime": { "token": "opaque" } },
                     "created_at": {
                         "secs_since_epoch": 1,
                         "nanos_since_epoch": 0
@@ -754,6 +816,46 @@ mod tests {
         assert!(reloaded.attachments_for(&project).is_empty());
         assert!(!reloaded.is_stopped(&project));
         assert!(!reloaded.all_projects().contains(&project));
+    }
+
+    #[tokio::test]
+    async fn unknown_legacy_source_is_ignored_for_lifecycle_state() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+        let project_text = project.to_string_lossy();
+        let legacy = serde_json::json!({
+            "attachments": {
+                project_text.as_ref(): [{
+                    "project_path": project,
+                    "source": { "ExperimentalOwner": { "token": "opaque" } },
+                    "created_at": {
+                        "secs_since_epoch": 1,
+                        "nanos_since_epoch": 0
+                    }
+                }]
+            },
+            "manually_stopped": [project]
+        });
+        tokio::fs::write(
+            &store_path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy attachment"),
+        )
+        .await
+        .expect("write legacy attachment store");
+
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.load().await.expect("load unknown legacy source");
+
+        assert!(store.attachments_for(&project).is_empty());
+        assert_eq!(store.section_for(&project), ProjectSection::Recent);
+        assert!(store.is_stopped(&project));
+
+        store.save().await.expect("save compatible store");
+        let mut reloaded = AttachmentStore::new(store_path);
+        reloaded.load().await.expect("reload compatible store");
+        assert!(reloaded.attachments_for(&project).is_empty());
+        assert!(reloaded.is_stopped(&project));
     }
 
     #[tokio::test]
