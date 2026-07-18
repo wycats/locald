@@ -84,6 +84,18 @@ identity_type!(
     "The stable identity of one locald project in one physical worktree."
 );
 
+impl ProjectId {
+    pub(crate) fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl ProjectInstanceId {
+    pub(crate) fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 /// The four identity levels associated with a Git-backed locald project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectIdentity {
@@ -184,6 +196,80 @@ pub enum IdentityError {
 pub fn resolve_git_project_identity(
     project_root: &Path,
 ) -> Result<ResolvedProjectIdentity, IdentityError> {
+    let layout = resolve_git_layout(project_root)?;
+    let repository_id = RepositoryId(read_or_create_marker(
+        &layout
+            .common_git_dir
+            .join(MARKER_DIRECTORY)
+            .join(REPOSITORY_MARKER),
+    )?);
+    let worktree_id = WorktreeId(read_or_create_marker(
+        &layout
+            .worktree_git_dir
+            .join(MARKER_DIRECTORY)
+            .join(WORKTREE_MARKER),
+    )?);
+    resolved_identity(layout, repository_id, worktree_id)
+}
+
+pub(crate) fn inspect_repository_id(
+    common_git_dir: &Path,
+) -> Result<Option<RepositoryId>, IdentityError> {
+    match fs::metadata(common_git_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(IdentityError::MarkerIo {
+                operation: "inspect repository directory for",
+                path: common_git_dir.to_path_buf(),
+                source,
+            });
+        }
+    }
+    read_optional_marker(
+        &common_git_dir
+            .join(MARKER_DIRECTORY)
+            .join(REPOSITORY_MARKER),
+    )
+    .map(|identity| identity.map(RepositoryId))
+}
+
+pub(crate) fn inspect_git_project_identity(
+    project_root: &Path,
+) -> Result<Option<ProjectIdentity>, IdentityError> {
+    let layout = match resolve_git_layout(project_root) {
+        Ok(layout) => layout,
+        Err(IdentityError::NotGit { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(repository_id) = inspect_repository_id(&layout.common_git_dir)? else {
+        return Ok(None);
+    };
+    let Some(worktree_id) = read_optional_marker(
+        &layout
+            .worktree_git_dir
+            .join(MARKER_DIRECTORY)
+            .join(WORKTREE_MARKER),
+    )?
+    .map(WorktreeId) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        resolved_identity(layout, repository_id, worktree_id)?.identity,
+    ))
+}
+
+#[derive(Debug)]
+struct GitLayout {
+    common_git_dir: PathBuf,
+    worktree_git_dir: PathBuf,
+    worktree_root: PathBuf,
+    project_root: PathBuf,
+    repository_relative_project_root: PathBuf,
+}
+
+fn resolve_git_layout(project_root: &Path) -> Result<GitLayout, IdentityError> {
     let project_root = fs::canonicalize(project_root).map_err(|source| {
         IdentityError::CanonicalizeProjectRoot {
             path: project_root.to_path_buf(),
@@ -238,20 +324,24 @@ pub fn resolve_git_project_identity(
             worktree_root: worktree_root.clone(),
         })?;
 
-    let repository_id = RepositoryId(read_or_create_marker(
-        &common_git_dir
-            .join(MARKER_DIRECTORY)
-            .join(REPOSITORY_MARKER),
-    )?);
-    let worktree_id = WorktreeId(read_or_create_marker(
-        &worktree_git_dir
-            .join(MARKER_DIRECTORY)
-            .join(WORKTREE_MARKER),
-    )?);
+    Ok(GitLayout {
+        common_git_dir,
+        worktree_git_dir,
+        worktree_root,
+        project_root,
+        repository_relative_project_root,
+    })
+}
+
+fn resolved_identity(
+    layout: GitLayout,
+    repository_id: RepositoryId,
+    worktree_id: WorktreeId,
+) -> Result<ResolvedProjectIdentity, IdentityError> {
     let project_id = derive_project_id(
         repository_id,
-        &repository_relative_project_root,
-        &project_root,
+        &layout.repository_relative_project_root,
+        &layout.project_root,
     )?;
     let project_instance_id = derive_project_instance_id(worktree_id, project_id);
 
@@ -262,11 +352,11 @@ pub fn resolve_git_project_identity(
             project_id,
             project_instance_id,
         },
-        common_git_dir,
-        worktree_git_dir,
-        worktree_root,
-        project_root,
-        repository_relative_project_root,
+        common_git_dir: layout.common_git_dir,
+        worktree_git_dir: layout.worktree_git_dir,
+        worktree_root: layout.worktree_root,
+        project_root: layout.project_root,
+        repository_relative_project_root: layout.repository_relative_project_root,
     })
 }
 
@@ -287,7 +377,7 @@ fn nearest_git_locator(project_root: &Path) -> Option<(PathBuf, PathBuf)> {
     })
 }
 
-fn derive_project_id(
+pub(crate) fn derive_project_id(
     repository_id: RepositoryId,
     relative_root: &Path,
     project_root: &Path,
@@ -324,7 +414,10 @@ fn derive_project_id(
     Ok(ProjectId(Uuid::new_v5(&repository_id.0, &name)))
 }
 
-fn derive_project_instance_id(worktree_id: WorktreeId, project_id: ProjectId) -> ProjectInstanceId {
+pub(crate) fn derive_project_instance_id(
+    worktree_id: WorktreeId,
+    project_id: ProjectId,
+) -> ProjectInstanceId {
     let mut name = Vec::with_capacity(PROJECT_INSTANCE_ID_DOMAIN.len() + 16);
     name.extend_from_slice(PROJECT_INSTANCE_ID_DOMAIN);
     name.extend_from_slice(project_id.0.as_bytes());
@@ -473,6 +566,19 @@ fn read_existing_marker(path: &Path, operation: &'static str) -> Result<Uuid, Id
         source,
     })?;
     parse_marker_bytes(path, contents)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn read_optional_marker(path: &Path) -> Result<Option<Uuid>, IdentityError> {
+    match fs::read(path) {
+        Ok(contents) => parse_marker_bytes(path, contents).map(Some),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(IdentityError::MarkerIo {
+            operation: "read",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn parse_marker_bytes(path: &Path, contents: Vec<u8>) -> Result<Uuid, IdentityError> {

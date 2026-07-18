@@ -21,20 +21,20 @@ The primary configuration lives in `locald.toml` within the project root. This e
 
 Service configuration uses a typed enum approach (e.g., `type = "exec"`, `type = "postgres"`) to allow different schemas for different service types.
 
-## 2. State Persistence
+## 2. Durable Local State
 
-The daemon persists its runtime state to disk to survive restarts.
+The daemon keeps durable identity metadata separate from runtime observations.
 
-- **Location**: `~/.local/share/locald/state.json` (XDG Data Home).
-- **Content**: List of running services, their PIDs, and their last known status.
-- **Usage**: On startup, the daemon reads this file to identify "zombie" processes that need to be cleaned up before restarting services.
+- **`catalog.json`**: Versioned repository, worktree, project, and project-instance identities; current and historical path locators; Git display metadata; and coarse present/missing state.
+- **`state.json`**: Runtime snapshots used to identify stale processes during daemon recovery.
+- **Location**: locald's platform data directory (the XDG data directory on Linux and the corresponding application-data directory on macOS).
 
-## 3. Project Registry
+The identity catalog is daemon-owned metadata. `locald.toml` and discovered workspace files remain authoritative for service configuration.
+The daemon holds an exclusive catalog writer lock from startup import through shutdown, so one daemon owns catalog mutation at a time.
 
-`locald` maintains a centralized registry of known projects.
+## 3. Legacy Project Compatibility
 
-- **Location**: `~/.local/share/locald/registry.json`.
-- **Purpose**: Tracks all projects that have been registered with `locald`, allowing for features like "Always Up" (starting services automatically on daemon boot) and a global dashboard view.
+Earlier locald versions recorded paths in `registry.json`, `attachments.json`, and `state.json`. On first catalog creation, locald preserves those files and imports their path locators as compatibility evidence. A present project is resolved to its stable identity; a missing path remains inspectable until the project is rediscovered or explicitly forgotten.
 
 ## 4. Gitignore Automation
 

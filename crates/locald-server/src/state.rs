@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use locald_core::state::ServerState;
 use std::path::PathBuf;
 use tokio::fs;
@@ -14,10 +13,7 @@ pub struct StateManager {
 
 impl StateManager {
     pub fn new() -> Result<Self> {
-        let dirs = ProjectDirs::from("com", "locald", "locald")
-            .context("Could not determine project directories")?;
-        let data_dir = dirs.data_dir();
-        let state_path = data_dir.join("state.json");
+        let state_path = locald_core::storage::data_dir().join("state.json");
 
         info!("State file configured at: {:?}", state_path);
 

@@ -9,6 +9,7 @@ use crate::state::StateManager;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
+use locald_core::CatalogError;
 use locald_core::attachments::{
     Attachment, AttachmentSource, AttachmentStore, ProjectFilter, ProjectListEntry, ProjectSection,
     ProjectStatusInfo,
@@ -966,6 +967,16 @@ impl ProcessManager {
 
         let (mut config, dot_env_vars) = ConfigLoader::load_project_config(&path).await?;
 
+        // Resolve and durably record identity before any service mutation. Reload,
+        // restore, attach, and explicit start all converge through this boundary.
+        let discovery = Registry::discover(path.clone()).await?;
+        {
+            let mut registry = self.registry.lock().await;
+            registry
+                .register_project_and_save(discovery, Some(config.project.name.clone()))
+                .await?;
+        }
+
         // Apply plugins to configuration
         // Plugin discovery and application failures are logged but do not fail startup
         // The returned guards keep plugin-allocated ports reserved until services bind
@@ -991,15 +1002,6 @@ impl ProcessManager {
                     result: Ok(()),
                 })
                 .await;
-        }
-
-        // Update registry
-        {
-            let mut registry = self.registry.lock().await;
-            registry.register_project(&path, Some(config.project.name.clone()));
-            if let Err(e) = registry.save().await {
-                error!("Failed to save registry: {}", e);
-            }
         }
 
         // Auto-sync hosts if needed
@@ -1652,7 +1654,7 @@ impl ProcessManager {
 
     pub async fn registry_list(&self) -> Vec<locald_core::registry::ProjectEntry> {
         let registry = self.registry.lock().await;
-        registry.projects.values().cloned().collect()
+        registry.project_entries()
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -1661,6 +1663,10 @@ impl ProcessManager {
         project_path: PathBuf,
         source: AttachmentSource,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !matches!(&source, AttachmentSource::Runtime),
+            "Runtime attachment evidence is accepted only from persisted legacy state"
+        );
         // Canonicalize to prevent duplicate attachments from different relative paths.
         let canonical =
             std::fs::canonicalize(&project_path).unwrap_or_else(|_| project_path.clone());
@@ -1673,7 +1679,7 @@ impl ProcessManager {
                 source,
                 created_at: SystemTime::now(),
             };
-            let first = attachments.attach(attachment);
+            let first = attachments.attach(attachment)?;
             attachments.clear_stopped(&canonical);
             if let Err(e) = attachments.save().await {
                 error!("Failed to save attachments: {e}");
@@ -1704,25 +1710,30 @@ impl ProcessManager {
         project_path: PathBuf,
         source: Option<AttachmentSource>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !matches!(&source, Some(AttachmentSource::Runtime)),
+            "Runtime attachment evidence is retained for the availability migration"
+        );
+        let canonical = Self::canonicalize_path(&project_path);
         let should_stop = {
             let mut attachments = self.attachments.lock().await;
             let is_last = if let Some(source) = &source {
-                attachments.detach(&project_path, source)
+                attachments.detach(&canonical, source)
             } else {
-                attachments.detach_all_non_pin(&project_path)
+                attachments.detach_all_non_pin(&canonical)
             };
             if let Err(e) = attachments.save().await {
                 error!("Failed to save attachments: {e}");
             }
-            is_last && !attachments.is_stopped(&project_path)
+            is_last && !attachments.is_stopped(&canonical)
         };
 
         if should_stop {
             info!(
                 "Last attachment removed for {}, stopping services",
-                project_path.display()
+                canonical.display()
             );
-            self.stop_project(&project_path).await?;
+            self.stop_project(&canonical).await?;
         }
         Ok(())
     }
@@ -1751,18 +1762,35 @@ impl ProcessManager {
         // Stop services.
         let _ = self.stop_project(&canonical).await;
 
-        // Remove all attachments.
-        {
-            let mut attachments = self.attachments.lock().await;
-            attachments.detach_all_non_pin(&canonical);
-            let _ = attachments.save().await;
-        }
+        // Keep both compatibility stores stable until each candidate is ready.
+        // Catalog removal is the authoritative commit point; recoverable
+        // failures before it restore the attachment file before releasing either
+        // store lock.
+        let mut registry = self.registry.lock().await;
+        let mut attachments = self.attachments.lock().await;
+        let original_attachments = attachments.clone();
+        let mut attachment_candidate = original_attachments.clone();
+        attachment_candidate.forget_project(&canonical);
+        let mut catalog_candidate = registry.clone();
+        catalog_candidate.unregister_project(&canonical);
 
-        // Remove from registry.
-        {
-            let mut registry = self.registry.lock().await;
-            registry.unregister_project(&canonical);
-            let _ = registry.save().await;
+        attachment_candidate.save().await?;
+        match registry.commit_candidate(catalog_candidate).await {
+            Ok(()) => {
+                *attachments = attachment_candidate;
+            }
+            Err(error @ CatalogError::PublishedNotDurable { .. }) => {
+                *attachments = attachment_candidate;
+                return Err(error.into());
+            }
+            Err(catalog_error) => {
+                original_attachments.save().await.with_context(|| {
+                    format!(
+                        "catalog removal failed ({catalog_error}); failed to restore attachment state"
+                    )
+                })?;
+                return Err(catalog_error.into());
+            }
         }
 
         Ok(())
@@ -1775,9 +1803,8 @@ impl ProcessManager {
         let project_name = {
             let registry = self.registry.lock().await;
             registry
-                .projects
-                .get(&canonical)
-                .and_then(|entry| entry.name.clone())
+                .get_project(&canonical)
+                .and_then(|entry| entry.name)
         };
 
         let attachments = {
@@ -1822,7 +1849,7 @@ impl ProcessManager {
 
         let registry_projects = {
             let registry = self.registry.lock().await;
-            registry.projects.clone()
+            registry.project_entries_by_path()
         };
 
         let attachment_projects = {
@@ -1892,8 +1919,9 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_pin(&self, path: &std::path::Path) -> Result<()> {
         let mut registry = self.registry.lock().await;
-        if registry.pin_project(path) {
-            registry.save().await?;
+        let mut updated = registry.clone();
+        if updated.pin_project(path) {
+            registry.commit_candidate(updated).await?;
             Ok(())
         } else {
             anyhow::bail!("Project not found in registry")
@@ -1903,8 +1931,9 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_unpin(&self, path: &std::path::Path) -> Result<()> {
         let mut registry = self.registry.lock().await;
-        if registry.unpin_project(path) {
-            registry.save().await?;
+        let mut updated = registry.clone();
+        if updated.unpin_project(path) {
+            registry.commit_candidate(updated).await?;
             Ok(())
         } else {
             anyhow::bail!("Project not found in registry")
@@ -1914,47 +1943,10 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_clean(&self) -> Result<usize> {
         let mut registry = self.registry.lock().await;
-
-        // Identify missing projects
-        let mut to_remove = Vec::new();
-        for (path, entry) in &registry.projects {
-            // If pinned, we might want to keep it even if missing?
-            // But current implementation of prune_missing_projects didn't check pinned.
-            // Let's respect pinned if the user intended it to prevent cleanup.
-            // However, if the directory is gone, it's broken.
-            // Let's stick to "if it's gone, it's gone" for now to match existing behavior,
-            // unless we want to fix the "pinned" behavior too.
-            // Given the user asked about "pruning", let's assume they want to clean up garbage.
-            if !path.exists() && !entry.pinned {
-                to_remove.push(path.clone());
-            }
-        }
-
-        let count = to_remove.len();
-
-        for path in to_remove {
-            // Remove from registry
-            registry.projects.remove(&path);
-
-            // Clean up global state directory
-            let state_dir = locald_utils::project::get_state_dir(&path);
-            // The state_dir is .../projects/<name>-<hash>/.locald
-            // We want to remove the parent directory .../projects/<name>-<hash>
-            if let Some(project_container) = state_dir.parent() {
-                if project_container.exists() {
-                    info!("Removing orphaned state directory: {:?}", project_container);
-                    if let Err(e) = tokio::fs::remove_dir_all(project_container).await {
-                        warn!(
-                            "Failed to remove orphaned state directory {:?}: {}",
-                            project_container, e
-                        );
-                    }
-                }
-            }
-        }
-
-        if count > 0 {
-            registry.save().await?;
+        let mut updated = registry.clone();
+        let count = updated.prune_missing_projects()?;
+        if updated != *registry {
+            registry.commit_candidate(updated).await?;
         }
         Ok(count)
     }
@@ -2570,11 +2562,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_registry_clean_skips_persistence_when_catalog_is_unchanged() {
+        let dir = tempdir().expect("create temporary directory");
+        let catalog_path = dir.path().join("catalog.json");
+        std::fs::create_dir(&catalog_path).expect("reserve catalog path as a directory");
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path.clone())));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("create process manager");
+
+        assert_eq!(
+            manager
+                .registry_clean()
+                .await
+                .expect("unchanged clean does not write the catalog"),
+            0
+        );
+        assert!(catalog_path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_registry_clean_persists_reconciliation_without_pruning() {
+        let dir = tempdir().expect("create temporary directory");
+        let catalog_path = dir.path().join("catalog.json");
+        let project_path = dir.path().join("pinned-project");
+        std::fs::create_dir(&project_path).expect("create pinned project");
+        let mut catalog = Registry::with_path(catalog_path.clone());
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover pinned project");
+        let instance_id = catalog
+            .register_project(discovery, Some("pinned".to_owned()))
+            .expect("register pinned project");
+        assert!(catalog.pin_project(&project_path));
+        catalog.save().await.expect("persist active pinned project");
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        std::fs::remove_dir(&project_path).expect("remove pinned project");
+
+        assert_eq!(
+            manager
+                .registry_clean()
+                .await
+                .expect("persist reconciled presence"),
+            0
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).expect("read reconciled catalog"))
+                .expect("parse reconciled catalog");
+        assert_eq!(
+            persisted["instances"][instance_id.to_string()]["presence"],
+            "missing"
+        );
+    }
+
+    #[tokio::test]
     async fn test_stop_project_targets_matching_paths() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
-        let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
@@ -2618,11 +2682,252 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_project_detach_normalizes_the_path_before_stopping_services() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry,
+            attachments.clone(),
+            None,
+        )
+        .expect("create process manager");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let canonical = std::fs::canonicalize(&project_path).expect("canonical project path");
+        let noncanonical = project_path.join("..").join("project");
+        let source = AttachmentSource::Editor {
+            name: "vscode".to_owned(),
+            id: "window".to_owned(),
+            pid: Some(std::process::id()),
+        };
+        attachments
+            .lock()
+            .await
+            .attach(Attachment {
+                project_path: canonical.clone(),
+                source: source.clone(),
+                created_at: SystemTime::now(),
+            })
+            .expect("attach editor");
+
+        manager.services.lock().await.insert(
+            "project:web".to_owned(),
+            Service {
+                config: LocaldConfig::default(),
+                service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::None,
+                sticky_port: None,
+                path: canonical,
+                health_status: HealthStatus::Healthy,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+
+        manager
+            .project_detach(noncanonical, Some(source))
+            .await
+            .expect("detach last owner");
+
+        assert!(
+            attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty()
+        );
+        assert_eq!(
+            manager.services.lock().await["project:web"].health_status,
+            HealthStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_persistence_failure_prevents_service_mutation() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let catalog_path = dir.path().join("catalog.json");
+        std::fs::create_dir(&catalog_path).expect("create blocking catalog directory");
+        let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path)));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "catalog-failure"
+
+[services.worker]
+type = "worker"
+command = "sleep 30"
+"#,
+        )
+        .expect("write project config");
+
+        manager
+            .start(project_path, None, false)
+            .await
+            .expect_err("catalog persistence must block startup");
+
+        assert!(manager.services.lock().await.is_empty());
+        assert!(registry.lock().await.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_attachment_persistence_failure_preserves_catalog_on_remove() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        catalog
+            .register_project(discovery, Some("project".to_owned()))
+            .expect("register project");
+        let registry = Arc::new(Mutex::new(catalog));
+
+        let attachment_path = dir.path().join("attachments.json");
+        std::fs::create_dir(&attachment_path).expect("create blocking attachment directory");
+        let mut attachment_store = AttachmentStore::new(attachment_path);
+        attachment_store
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            })
+            .expect("attach pin");
+        let attachments = Arc::new(Mutex::new(attachment_store));
+
+        let mut manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry.clone(),
+            attachments.clone(),
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect_err("attachment persistence must block catalog removal");
+
+        assert!(registry.lock().await.get_project(&project_path).is_some());
+        let stored = attachments.lock().await;
+        assert_eq!(stored.attachments_for(&project_path).len(), 1);
+        assert!(matches!(
+            stored.attachments_for(&project_path)[0].source,
+            AttachmentSource::Pin
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_catalog_persistence_failure_restores_attachments_on_remove() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+
+        let catalog_path = dir.path().join("catalog.json");
+        std::fs::create_dir(&catalog_path).expect("create blocking catalog directory");
+        let mut catalog = Registry::with_path(catalog_path);
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        catalog
+            .register_project(discovery, Some("project".to_owned()))
+            .expect("register project");
+        let registry = Arc::new(Mutex::new(catalog));
+
+        let attachment_path = dir.path().join("attachments.json");
+        let mut attachment_store = AttachmentStore::new(attachment_path.clone());
+        attachment_store
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            })
+            .expect("attach pin");
+        attachment_store.mark_stopped(&project_path);
+        attachment_store
+            .save()
+            .await
+            .expect("persist original attachments");
+        let attachments = Arc::new(Mutex::new(attachment_store));
+
+        let mut manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry.clone(),
+            attachments.clone(),
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect_err("catalog persistence must restore attachment state");
+
+        assert!(registry.lock().await.get_project(&project_path).is_some());
+        let stored = attachments.lock().await;
+        assert_eq!(stored.attachments_for(&project_path).len(), 1);
+        assert!(matches!(
+            stored.attachments_for(&project_path)[0].source,
+            AttachmentSource::Pin
+        ));
+        assert!(stored.is_stopped(&project_path));
+        drop(stored);
+
+        let mut reloaded = AttachmentStore::new(attachment_path);
+        reloaded.load().await.expect("reload restored attachments");
+        assert_eq!(reloaded.attachments_for(&project_path).len(), 1);
+        assert!(matches!(
+            reloaded.attachments_for(&project_path)[0].source,
+            AttachmentSource::Pin
+        ));
+        assert!(reloaded.is_stopped(&project_path));
+    }
+
+    #[tokio::test]
     async fn test_project_attach_reaps_stale_editor_before_first_attach() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
-        let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
@@ -2653,15 +2958,17 @@ command = "sleep 30"
 
         {
             let mut store = attachments.lock().await;
-            store.attach(Attachment {
-                project_path: project_path.clone(),
-                source: AttachmentSource::Editor {
-                    name: "vscode".to_string(),
-                    id: "stale".to_string(),
-                    pid: None,
-                },
-                created_at: SystemTime::now() - std::time::Duration::from_secs(31 * 60),
-            });
+            store
+                .attach(Attachment {
+                    project_path: project_path.clone(),
+                    source: AttachmentSource::Editor {
+                        name: "vscode".to_string(),
+                        id: "stale".to_string(),
+                        pid: None,
+                    },
+                    created_at: SystemTime::now() - std::time::Duration::from_secs(31 * 60),
+                })
+                .expect("attach stale editor");
         }
 
         manager

@@ -59,6 +59,7 @@ fn format_attachment_source(source: &AttachmentSource) -> String {
     match source {
         AttachmentSource::Editor { name, id, .. } => format!("editor:{name} ({id})"),
         AttachmentSource::CLI { pid } => format!("cli:{pid}"),
+        AttachmentSource::Runtime => "runtime (legacy)".to_string(),
         AttachmentSource::Pin => "pin".to_string(),
     }
 }
@@ -1781,7 +1782,11 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::RegistryClean) {
                     Ok(IpcResponse::RegistryCleaned(count)) => {
-                        println!("{} Removed {} non-existent projects.", style::CHECK, count);
+                        println!(
+                            "{} Forgot {} missing projects; project data was preserved.",
+                            style::CHECK,
+                            count
+                        );
                     }
                     Ok(IpcResponse::Error(msg)) => {
                         return Err(CliError::message(format!(

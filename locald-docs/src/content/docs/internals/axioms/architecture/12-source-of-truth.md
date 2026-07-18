@@ -32,11 +32,13 @@ When `locald` runs a container (via `[service.build]`), the **OCI Image Config**
 - **Respect the Environment**: We preserve the `Env` defined in the image (e.g., `PATH`, `LD_LIBRARY_PATH`). We append to it, but we never blindly overwrite it.
 - **Respect the User**: We run as the user defined in the image (or the buildpack lifecycle's requirement), not an arbitrary default.
 
-## 3. State vs. Configuration
+## 3. Configuration, Identity, and Runtime State
 
-We strictly distinguish between **Configuration** (what the user wants) and **State** (what is currently happening).
+We keep configuration, identity, and runtime authorities distinct and enforce the following boundaries:
 
-- **Configuration**: Lives in the repository (Git). Immutable during a run.
-- **State**: Lives in `.locald/` or memory. Ephemeral.
-- **No Bleed**: We never store configuration in state files. We never rely on state to determine the desired configuration.
+- **Configuration**: Lives in the workspace and describes what the user wants to run.
+- **Identity Catalog**: Lives in locald's platform data directory and records opaque project identities, current and historical path locators, and display metadata. It never shadows service configuration.
+- **Single Writer**: The daemon holds an exclusive catalog writer lock for its complete stateful lifetime, including startup import and restart reconciliation.
+- **Availability and Runtime State**: Lives in separate daemon-owned stores or memory and describes current demand, processes, and health.
+- **No Bleed**: The daemon rereads workspace configuration when converging services. Catalog and runtime records identify the project and explain current state; they do not replace the project's configuration.
 

@@ -309,7 +309,7 @@ pub enum IpcRequest {
         /// The path to the project to unpin.
         project_path: PathBuf,
     },
-    /// Clean up the registry (remove non-existent projects).
+    /// Forget missing catalog records while preserving project data.
     ///
     /// **Response:** `IpcResponse::RegistryCleaned(usize)`
     RegistryClean,

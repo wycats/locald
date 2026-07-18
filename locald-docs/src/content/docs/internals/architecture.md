@@ -81,16 +81,17 @@ To ensure data integrity, `locald` implements a robust shutdown protocol:
 2.  Client checks if Daemon is running. If not, it spawns `locald server start` detached.
 3.  Client resolves the absolute path and sends `Start { path }` message to Daemon.
 4.  Daemon reads `locald.toml` from the provided path.
-5.  **Dependency Resolution**: Daemon builds a dependency graph and performs a topological sort.
-6.  **Sequential Startup**: For each service in order:
+5.  Daemon resolves the path to a stable project-instance identity and persists its current locator before changing services.
+6.  **Dependency Resolution**: Daemon builds a dependency graph and performs a topological sort.
+7.  **Sequential Startup**: For each service in order:
     - **Build (Optional)**: If configured, the Daemon triggers a CNB build (via `locald-builder`).
     - **Provisioning**: For builtin services (e.g., Postgres), the Daemon ensures binaries and data directories exist.
     - **Port Assignment**: Daemon assigns a free port.
     - **Execution**: Daemon spawns the command (or builtin process) with `PORT` env var.
     - **Health Check**: Daemon waits for the service to be healthy (via `sd_notify`, TCP, or HTTP).
     - **State Update**: Daemon updates internal state.
-7.  Daemon persists state to `state.json`.
-8.  Daemon returns success to Client.
+8.  Daemon persists state to `state.json`.
+9.  Daemon returns success to Client.
 
 ### Request Routing
 

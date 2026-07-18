@@ -74,6 +74,14 @@ pub use hosts::HostsFileSection;
 pub mod state;
 #[doc(inline)]
 pub use state::{ServerState, ServiceState};
+pub mod catalog;
+pub mod storage;
+#[doc(inline)]
+pub use catalog::{
+    CatalogError, CatalogPaths, CatalogPresence, ProjectCatalog, ProjectDiscovery, ProjectEntry,
+    ProjectInstanceOrigin, ProjectInstanceRecord, ProjectOrigin, ProjectRecord, RepositoryRecord,
+    UnresolvedLegacyProject, WorktreeRecord,
+};
 pub mod registry;
 #[doc(inline)]
 pub use registry::Registry;
