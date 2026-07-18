@@ -474,6 +474,43 @@ impl ProcessManager {
             .map_err(Into::into)
     }
 
+    fn effective_service_env(
+        config: &LocaldConfig,
+        dot_env_vars: &HashMap<String, String>,
+        service_config: &ServiceConfig,
+    ) -> (HashMap<String, String>, Option<String>) {
+        let mut combined_env = dot_env_vars.clone();
+        combined_env.extend(service_config.env().clone());
+
+        let injected_database = if combined_env.contains_key("DATABASE_URL") {
+            None
+        } else {
+            service_config.depends_on().iter().find_map(|dependency| {
+                matches!(
+                    config.services.get(dependency),
+                    Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_)))
+                )
+                .then(|| dependency.clone())
+            })
+        };
+
+        if let Some(dependency) = &injected_database {
+            combined_env.insert(
+                "DATABASE_URL".to_owned(),
+                format!("${{services.{dependency}.url}}"),
+            );
+        }
+
+        (combined_env, injected_database)
+    }
+
+    fn configured_service_name<'a>(full_name: &'a str, config: &LocaldConfig) -> &'a str {
+        full_name
+            .strip_prefix(config.project.name.as_str())
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .unwrap_or(full_name)
+    }
+
     fn domain_for_service(&self, name: &str) -> Option<String> {
         self.domain_index
             .snapshot()
@@ -754,7 +791,7 @@ impl ProcessManager {
                 .to_string()),
             "host" => Ok("localhost".to_string()),
             "url" => {
-                let short_name = name.split(':').nth(1).unwrap_or(name);
+                let short_name = Self::configured_service_name(name, &service_config);
                 let svc_config = service_config
                     .services
                     .get(short_name)
@@ -961,6 +998,14 @@ impl ProcessManager {
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
+        for (service_name, service_config) in &config.services {
+            let (effective_env, _) =
+                Self::effective_service_env(&config, &dot_env_vars, service_config);
+            ConfigLoader::validate_env_references(&effective_env, &config, service_name)
+                .with_context(|| {
+                    format!("service `{service_name}` contains an invalid environment reference")
+                })?;
+        }
         let discovery = Registry::discover(path.clone()).await?;
         let commit_result = {
             let mut registry = self.registry.lock().await;
@@ -1011,34 +1056,12 @@ impl ProcessManager {
             let name = format!("{}:{}", config.project.name, service_name);
             active_services.insert(name.clone());
 
-            let mut combined_env = dot_env_vars.clone();
-            for (k, v) in service_config.env() {
-                combined_env.insert(k.clone(), v.clone());
-            }
-
-            // Auto-inject DATABASE_URL for services that depend on Postgres
-            if !combined_env.contains_key("DATABASE_URL") {
-                for dep in service_config.depends_on() {
-                    if let Some(dep_config) = config.services.get(dep) {
-                        if matches!(
-                            dep_config,
-                            ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
-                        ) {
-                            // Use interpolation syntax so it resolves at runtime
-                            // Use the local service name (without project prefix) because
-                            // resolve_env adds the project prefix when looking up services
-                            combined_env.insert(
-                                "DATABASE_URL".to_string(),
-                                format!("${{services.{}.url}}", dep),
-                            );
-                            info!(
-                                "Auto-injected DATABASE_URL for {} from Postgres dependency {}",
-                                name, dep
-                            );
-                            break; // Only inject from first Postgres dependency
-                        }
-                    }
-                }
+            let (combined_env, injected_database) =
+                Self::effective_service_env(&config, &dot_env_vars, service_config);
+            if let Some(dependency) = injected_database {
+                info!(
+                    "Auto-injected DATABASE_URL for {name} from Postgres dependency {dependency}"
+                );
             }
 
             let manager = self.clone();
@@ -1585,13 +1608,10 @@ impl ProcessManager {
                     service_name: Some(service_name),
                     ..
                 }) => service_name.clone(),
-                Some(
-                    DomainTarget::Platform { .. }
-                    | DomainTarget::Service {
-                        service_name: None, ..
-                    },
-                )
-                | None => return None,
+                Some(DomainTarget::Service {
+                    service_name: None, ..
+                }) => return Some(locald_core::resolver::DomainResolution::OwnershipOnly),
+                Some(DomainTarget::Platform { .. }) | None => return None,
             }
         };
         let runtime = {
@@ -1601,17 +1621,19 @@ impl ProcessManager {
                 .map(|service| service.runtime_state.clone())
         };
         match runtime {
-            None | Some(ServiceRuntime::None) => Some(locald_core::resolver::DomainResolution {
-                name: service_name,
-                port: None,
-                status: locald_core::state::ServiceState::Stopped,
-            }),
+            None | Some(ServiceRuntime::None) => {
+                Some(locald_core::resolver::DomainResolution::Service {
+                    name: service_name,
+                    port: None,
+                    status: locald_core::state::ServiceState::Stopped,
+                })
+            }
             Some(ServiceRuntime::Controller(controller)) => {
                 let runtime = controller.lock().await.read_state().await;
                 let port = (runtime.status == locald_core::state::ServiceState::Running)
                     .then_some(runtime.port)
                     .flatten();
-                Some(locald_core::resolver::DomainResolution {
+                Some(locald_core::resolver::DomainResolution::Service {
                     name: service_name,
                     port,
                     status: runtime.status,
@@ -2102,7 +2124,7 @@ impl ProcessManager {
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("Service not found"))?;
 
-            let short_name = name.split(':').nth(1).unwrap_or(name);
+            let short_name = Self::configured_service_name(name, &service.config);
             let config = service.config.services.get(short_name).cloned();
 
             let runtime_info = match &service.runtime_state {
@@ -2401,6 +2423,72 @@ mod tests {
             )
             .expect("install test claim");
         manager.domain_index.store(replacement);
+    }
+
+    fn install_legacy_test_claim(manager: &ProcessManager, domain: &str) {
+        let current = manager.domain_index.snapshot();
+        let replacement = current
+            .replacing_instance(
+                test_instance_id(),
+                [DomainClaim::legacy(
+                    domain.parse().expect("valid test domain"),
+                    test_instance_id(),
+                )],
+            )
+            .expect("install legacy test claim");
+        manager.domain_index.store(replacement);
+    }
+
+    #[test]
+    fn effective_service_env_applies_overrides_before_reference_validation() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+type = "worker"
+command = "run-web"
+
+[services.web.env]
+API_URL = "https://api.example"
+"#,
+        )
+        .expect("parse test config");
+        let dot_env_vars =
+            HashMap::from([("API_URL".to_owned(), "${services.missing.url}".to_owned())]);
+
+        let (effective_env, injected_database) =
+            ProcessManager::effective_service_env(&config, &dot_env_vars, &config.services["web"]);
+
+        assert_eq!(
+            effective_env.get("API_URL").map(String::as_str),
+            Some("https://api.example")
+        );
+        assert!(injected_database.is_none());
+        ConfigLoader::validate_env_references(&effective_env, &config, "web")
+            .expect("shadowed project value is not active config");
+    }
+
+    #[test]
+    fn configured_service_name_uses_the_exact_project_prefix() {
+        let config = LocaldConfig {
+            project: ProjectConfig {
+                name: "team:app".to_owned(),
+                domain: Some("app.localhost".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ProcessManager::configured_service_name("team:app:db", &config),
+            "db"
+        );
+        assert_eq!(
+            ProcessManager::configured_service_name("another:web", &config),
+            "another:web"
+        );
     }
 
     #[test]
@@ -3120,6 +3208,123 @@ command = "sleep 30"
     }
 
     #[tokio::test]
+    async fn invalid_reload_preserves_previous_domain_and_runtime() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "reload"
+domain = "first.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+        )
+        .expect("write initial config");
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("start initial config");
+        let catalog_before =
+            std::fs::read(dir.path().join("catalog.json")).expect("read initial catalog");
+        let first_controller = manager
+            .get_service_controller("reload:web")
+            .await
+            .expect("initial controller");
+
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "reload"
+domain = "second.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+
+[services.web.env]
+BROKEN_URL = "${services.missing.url}"
+"#,
+        )
+        .expect("write invalid reload");
+        let error = manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect_err("invalid reload must fail before publication");
+
+        assert!(format!("{error:#}").contains("unknown service `missing`"));
+        assert!(Arc::ptr_eq(
+            &first_controller,
+            &manager
+                .get_service_controller("reload:web")
+                .await
+                .expect("initial controller remains")
+        ));
+        assert!(
+            manager
+                .resolve_service_by_domain("first.localhost")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .resolve_service_by_domain("second.localhost")
+                .await
+                .is_none()
+        );
+        assert!(
+            registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("first.localhost")
+                .is_some()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("catalog.json"))
+                .expect("read catalog after rejected reload"),
+            catalog_before
+        );
+        assert_eq!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[vec!["first.localhost".to_owned()]]
+        );
+
+        manager
+            .stop_project(&project_path)
+            .await
+            .expect("stop initial project");
+    }
+
+    #[tokio::test]
     async fn removing_project_synchronizes_released_domain_claims() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("removed-project");
@@ -3322,14 +3527,14 @@ command = "sleep 30"
                 .expect("first controller remains")
         ));
         assert_eq!(registry.lock().await.instances.len(), 1);
-        assert_eq!(
+        assert!(matches!(
             manager
                 .resolve_service_by_domain("shared.localhost")
                 .await
-                .expect("first route remains")
-                .name,
-            "first:web"
-        );
+                .expect("first route remains"),
+            locald_core::resolver::DomainResolution::Service { ref name, .. }
+                if name == "first:web"
+        ));
 
         manager
             .stop_project(&first_path)
@@ -3667,8 +3872,14 @@ command = "sleep 30"
             .resolve_service_by_domain("CURRENT.LOCALHOST.")
             .await
             .expect("resolve normalized claim");
-        assert_eq!(resolution.name, "app:web");
-        assert_eq!(resolution.status, ServiceState::Stopped);
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::Service {
+                ref name,
+                status: ServiceState::Stopped,
+                ..
+            } if name == "app:web"
+        ));
 
         manager.sync_hosts().await.expect("synchronize hosts");
         assert_eq!(
@@ -3730,9 +3941,14 @@ command = "sleep 30"
             .await
             .expect("Expected resolution");
 
-        assert_eq!(resolution.name, "active:web");
-        assert_eq!(resolution.port, Some(3000));
-        assert_eq!(resolution.status, ServiceState::Running);
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: Some(3000),
+                status: ServiceState::Running,
+            } if name == "active:web"
+        ));
     }
 
     #[tokio::test]
@@ -3793,9 +4009,14 @@ command = "sleep 30"
             .await
             .expect("Expected resolution");
 
-        assert_eq!(resolution.name, "active:web");
-        assert_eq!(resolution.port, Some(4000));
-        assert_eq!(resolution.status, ServiceState::Running);
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: Some(4000),
+                status: ServiceState::Running,
+            } if name == "active:web"
+        ));
     }
 
     #[tokio::test]
@@ -3850,9 +4071,14 @@ command = "sleep 30"
             .await
             .expect("Expected resolution");
 
-        assert_eq!(resolution.name, "builder:web");
-        assert_eq!(resolution.port, None);
-        assert_eq!(resolution.status, ServiceState::Building);
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: None,
+                status: ServiceState::Building,
+            } if name == "builder:web"
+        ));
     }
 
     #[tokio::test]
@@ -3889,8 +4115,38 @@ command = "sleep 30"
             .await
             .expect("Expected resolution");
 
-        assert_eq!(resolution.name, "stale:web");
-        assert_eq!(resolution.port, None);
-        assert_eq!(resolution.status, ServiceState::Stopped);
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: None,
+                status: ServiceState::Stopped,
+            } if name == "stale:web"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_preserves_legacy_ownership() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("create process manager");
+        install_legacy_test_claim(&manager, "legacy.localhost");
+
+        let resolution = manager
+            .resolve_service_by_domain("LEGACY.LOCALHOST.")
+            .await
+            .expect("resolve persisted legacy ownership");
+
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::OwnershipOnly
+        ));
     }
 }

@@ -121,7 +121,7 @@ struct MockResolver {
 #[async_trait::async_trait]
 impl locald_core::resolver::ServiceResolver for MockResolver {
     async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
-        Some(DomainResolution {
+        Some(DomainResolution::Service {
             name: "mock-service".to_string(),
             port: self.port,
             status: self.status,
@@ -187,6 +187,45 @@ async fn test_disabled_service_page() {
 
     let content_type = response.headers().get("content-type").unwrap();
     assert_eq!(content_type, "text/html; charset=utf-8");
+}
+
+#[derive(Debug)]
+struct OwnershipOnlyResolver;
+
+#[async_trait::async_trait]
+impl locald_core::resolver::ServiceResolver for OwnershipOnlyResolver {
+    async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
+        Some(DomainResolution::OwnershipOnly)
+    }
+
+    async fn set_http_port(&self, _port: Option<u16>) {}
+    async fn set_https_port(&self, _port: Option<u16>) {}
+}
+
+#[tokio::test]
+async fn test_legacy_owned_domain_has_a_non_actionable_stopped_surface() {
+    let proxy = ProxyManager::new(Arc::new(OwnershipOnlyResolver), Router::new(), None);
+    let app = proxy.make_app();
+
+    for host in ["legacy.localhost", "docs.localhost"] {
+        let req = Request::builder()
+            .uri("/")
+            .header("Host", host)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{host}");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("locald has preserved this project domain"));
+        assert!(body.contains("locald up"));
+        assert!(!body.contains("/api/services/"));
+        assert!(!body.contains("Enable &amp; open logs"));
+    }
 }
 
 #[tokio::test]
