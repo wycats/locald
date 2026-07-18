@@ -53,9 +53,9 @@ fn fallback_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> P
 }
 
 fn sandbox_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>, name: &str) -> PathBuf {
-    xdg_data_home.map_or_else(
+    xdg_data_home.filter(|path| path.is_absolute()).map_or_else(
         || {
-            home.map_or_else(
+            home.filter(|path| path.is_absolute()).map_or_else(
                 || {
                     PathBuf::from(".locald/sandboxes")
                         .join(name)
@@ -105,6 +105,26 @@ mod tests {
     fn sandbox_relative_fallback_keeps_the_locald_data_component() {
         assert_eq!(
             sandbox_data_dir(None, None, "alpha"),
+            PathBuf::from(".locald/sandboxes/alpha/data/locald")
+        );
+    }
+
+    #[test]
+    fn sandbox_fallback_rejects_relative_candidates() {
+        assert_eq!(
+            sandbox_data_dir(
+                Some(PathBuf::from("relative-xdg")),
+                Some(PathBuf::from("/Users/test")),
+                "alpha",
+            ),
+            PathBuf::from("/Users/test/.local/share/locald/sandboxes/alpha/data/locald")
+        );
+        assert_eq!(
+            sandbox_data_dir(
+                Some(PathBuf::from("relative-xdg")),
+                Some(PathBuf::from("relative-home")),
+                "alpha",
+            ),
             PathBuf::from(".locald/sandboxes/alpha/data/locald")
         );
     }

@@ -1945,7 +1945,9 @@ impl ProcessManager {
         let mut registry = self.registry.lock().await;
         let mut updated = registry.clone();
         let count = updated.prune_missing_projects()?;
-        registry.commit_candidate(updated).await?;
+        if updated != *registry {
+            registry.commit_candidate(updated).await?;
+        }
         Ok(count)
     }
 
@@ -2557,6 +2559,76 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].message, "2");
         assert_eq!(logs[1].message, "3");
+    }
+
+    #[tokio::test]
+    async fn test_registry_clean_skips_persistence_when_catalog_is_unchanged() {
+        let dir = tempdir().expect("create temporary directory");
+        let catalog_path = dir.path().join("catalog.json");
+        std::fs::create_dir(&catalog_path).expect("reserve catalog path as a directory");
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path.clone())));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("create process manager");
+
+        assert_eq!(
+            manager
+                .registry_clean()
+                .await
+                .expect("unchanged clean does not write the catalog"),
+            0
+        );
+        assert!(catalog_path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_registry_clean_persists_reconciliation_without_pruning() {
+        let dir = tempdir().expect("create temporary directory");
+        let catalog_path = dir.path().join("catalog.json");
+        let project_path = dir.path().join("pinned-project");
+        std::fs::create_dir(&project_path).expect("create pinned project");
+        let mut catalog = Registry::with_path(catalog_path.clone());
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover pinned project");
+        let instance_id = catalog
+            .register_project(discovery, Some("pinned".to_owned()))
+            .expect("register pinned project");
+        assert!(catalog.pin_project(&project_path));
+        catalog.save().await.expect("persist active pinned project");
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        std::fs::remove_dir(&project_path).expect("remove pinned project");
+
+        assert_eq!(
+            manager
+                .registry_clean()
+                .await
+                .expect("persist reconciled presence"),
+            0
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).expect("read reconciled catalog"))
+                .expect("parse reconciled catalog");
+        assert_eq!(
+            persisted["instances"][instance_id.to_string()]["presence"],
+            "missing"
+        );
     }
 
     #[tokio::test]
