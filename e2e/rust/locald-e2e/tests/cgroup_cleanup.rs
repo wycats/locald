@@ -111,7 +111,7 @@ command = "sleep 300"
 "#;
     let project_path = ctx.create_project("test-proj", config).await?;
 
-    let output = ctx.run_cli(&["up", project_path.to_str().unwrap()]).await?;
+    let output = ctx.run_up_with_test_owner(&project_path).await?;
     if !output.status.success() {
         ctx.dump_logs().await?;
         anyhow::bail!(

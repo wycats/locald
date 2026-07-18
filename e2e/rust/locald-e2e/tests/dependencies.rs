@@ -28,7 +28,7 @@ depends_on = ["db"]
     let project_path = ctx.create_project("dep-test", config).await?;
 
     // 2. Run `locald up`
-    let output = ctx.run_cli(&["up", project_path.to_str().unwrap()]).await?;
+    let output = ctx.run_up_with_test_owner(&project_path).await?;
     assert!(output.status.success());
 
     // 3. Verify output order
