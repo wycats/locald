@@ -303,16 +303,24 @@ impl ProjectCatalog {
 
         for (path, legacy) in evidence {
             match tokio::fs::canonicalize(&path).await {
-                Ok(_) => {
-                    let discovery = Self::discover(path.clone()).await?;
-                    candidate.apply_discovery(
-                        discovery,
-                        legacy.display_name,
-                        legacy.pinned,
-                        legacy.last_seen.unwrap_or(UNIX_EPOCH),
-                        Some(path),
-                    )?;
-                }
+                Ok(_) => match Self::discover(path.clone()).await {
+                    Ok(discovery) => {
+                        candidate.apply_discovery(
+                            discovery,
+                            legacy.display_name,
+                            legacy.pinned,
+                            legacy.last_seen.unwrap_or(UNIX_EPOCH),
+                            Some(path),
+                        )?;
+                    }
+                    Err(CatalogError::Io { .. }) => {
+                        candidate.unresolved_legacy.insert(path, legacy);
+                    }
+                    Err(CatalogError::Identity(error)) if unavailable_git_locator(&error) => {
+                        candidate.unresolved_legacy.insert(path, legacy);
+                    }
+                    Err(error) => return Err(error),
+                },
                 Err(_) => {
                     candidate.unresolved_legacy.insert(path, legacy);
                 }
@@ -981,11 +989,11 @@ impl ProjectCatalog {
                 if record.pinned {
                     return None;
                 }
-                Some(try_exists(path).map(|exists| (!exists).then_some(path.clone())))
+                match try_exists(path) {
+                    Ok(false) => Some(path.clone()),
+                    Ok(true) | Err(_) => None,
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
             .collect();
         for instance_id in missing.iter().copied() {
             self.remove_instance(instance_id);
@@ -2218,6 +2226,153 @@ mod tests {
 
         assert!(catalog.unresolved_legacy.contains_key(&looped));
         assert!(catalog.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_git_identity_during_legacy_import_remains_unresolved_evidence() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let root = fixture.git_project("legacy-linked-root");
+        let linked = fixture._temp.path().join("legacy-linked-broken");
+        let linked_text = linked.to_str().expect("UTF-8 linked worktree path");
+        git(
+            &root,
+            &["worktree", "add", "-b", "legacy-linked", linked_text],
+        );
+        let discovery = ProjectCatalog::discover(linked.clone())
+            .await
+            .expect("discover linked worktree before breaking it");
+        let resolved = match discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved,
+            ProjectDiscovery::NonGit { .. } => panic!("expected Git discovery"),
+        };
+        let linked_text = linked.to_string_lossy();
+        let registry = serde_json::json!({
+            "projects": {
+                linked_text.as_ref(): {
+                    "path": linked,
+                    "name": "legacy-linked",
+                    "pinned": true,
+                    "last_seen": UNIX_EPOCH
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize registry"),
+        )
+        .await
+        .expect("write registry");
+        let unavailable_admin = fixture._temp.path().join("unavailable-legacy-admin");
+        std::fs::rename(&resolved.worktree_git_dir, &unavailable_admin)
+            .expect("make linked Git metadata unavailable");
+
+        let catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("preserve unavailable Git identity as legacy evidence");
+        let record = catalog
+            .unresolved_legacy
+            .get(&linked)
+            .expect("unavailable linked worktree remains unresolved");
+
+        assert_eq!(record.display_name.as_deref(), Some("legacy-linked"));
+        assert!(record.pinned);
+        assert_eq!(
+            record.sources,
+            BTreeSet::from([LegacyLocatorSource::Registry])
+        );
+        assert!(catalog.instances.is_empty());
+        let error = ProjectCatalog::discover(linked)
+            .await
+            .expect_err("direct discovery still reports the broken worktree");
+        assert!(matches!(
+            error,
+            CatalogError::Identity(IdentityError::BrokenWorktree { .. })
+        ));
+        assert!(error.to_string().contains("git worktree repair"));
+    }
+
+    #[tokio::test]
+    async fn invalid_marker_still_blocks_initial_legacy_import() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.git_project("invalid-legacy-marker");
+        let resolved = resolve_git_project_identity(&project).expect("create identity markers");
+        let marker = resolved.worktree_git_dir.join("locald/worktree-id");
+        std::fs::write(&marker, "v1 definitely-not-a-uuid\n").expect("corrupt worktree marker");
+        let project_text = project.to_string_lossy();
+        let registry = serde_json::json!({
+            "projects": {
+                project_text.as_ref(): {
+                    "path": project,
+                    "name": "invalid-marker",
+                    "pinned": false,
+                    "last_seen": UNIX_EPOCH
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize registry"),
+        )
+        .await
+        .expect("write registry");
+
+        let error = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect_err("invalid marker must block initial import");
+
+        assert!(matches!(
+            error,
+            CatalogError::Identity(IdentityError::InvalidMarker { .. })
+        ));
+        assert!(!paths.catalog.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_preserves_uninspectable_legacy_evidence_and_forgets_missing_peer() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let looped = fixture._temp.path().join("looped-during-clean");
+        let missing = fixture._temp.path().join("missing-during-clean");
+        std::os::unix::fs::symlink(&looped, &looped).expect("create symlink loop");
+        let looped_text = looped.to_string_lossy();
+        let missing_text = missing.to_string_lossy();
+        let registry = serde_json::json!({
+            "projects": {
+                looped_text.as_ref(): {
+                    "path": looped,
+                    "name": "looped",
+                    "pinned": false,
+                    "last_seen": UNIX_EPOCH
+                },
+                missing_text.as_ref(): {
+                    "path": missing,
+                    "name": "missing",
+                    "pinned": false,
+                    "last_seen": UNIX_EPOCH
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize registry"),
+        )
+        .await
+        .expect("write registry");
+        let mut catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("import unresolved legacy evidence");
+
+        assert_eq!(
+            catalog
+                .prune_missing_projects()
+                .expect("clean other records while preserving uninspectable evidence"),
+            1
+        );
+        assert!(catalog.unresolved_legacy.contains_key(&looped));
+        assert!(!catalog.unresolved_legacy.contains_key(&missing));
     }
 
     #[tokio::test]
