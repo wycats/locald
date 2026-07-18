@@ -101,6 +101,45 @@ impl TestContext {
         Ok(output)
     }
 
+    /// Run the hidden test-harness `up` path while a PID-backed editor owner
+    /// keeps the project alive for the assertions that follow.
+    pub async fn run_up_with_test_owner(
+        &self,
+        project_path: &std::path::Path,
+    ) -> Result<std::process::Output> {
+        let project_path = project_path
+            .to_str()
+            .context("Project path is not valid UTF-8")?;
+        let editor_pid = std::process::id().to_string();
+
+        let output = self
+            .run_cli(&[
+                "project",
+                "attach",
+                "--source",
+                "editor",
+                "--editor-name",
+                "locald-e2e",
+                "--editor-id",
+                self.sandbox.as_str(),
+                "--editor-pid",
+                editor_pid.as_str(),
+                project_path,
+            ])
+            .await?;
+        if !output.status.success() {
+            let _ = self.dump_logs().await;
+            anyhow::bail!(
+                "locald project attach failed (status: {}). stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        self.run_cli(&["up", "--exit-after-register", project_path])
+            .await
+    }
+
     pub async fn create_project(&self, name: &str, config_content: &str) -> Result<PathBuf> {
         let project_path = self.root.path().join(name);
         tokio::fs::create_dir_all(&project_path).await?;
