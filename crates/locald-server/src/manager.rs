@@ -9,6 +9,7 @@ use crate::state::StateManager;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
+use locald_core::CatalogError;
 use locald_core::attachments::{
     Attachment, AttachmentSource, AttachmentStore, ProjectFilter, ProjectListEntry, ProjectSection,
     ProjectStatusInfo,
@@ -1760,21 +1761,35 @@ impl ProcessManager {
         // Stop services.
         let _ = self.stop_project(&canonical).await;
 
-        // Remove all project-owned compatibility attachment state.
-        {
-            let mut attachments = self.attachments.lock().await;
-            let mut updated = attachments.clone();
-            updated.forget_project(&canonical);
-            updated.save().await?;
-            *attachments = updated;
-        }
+        // Keep both compatibility stores stable until each candidate is ready.
+        // Catalog removal is the authoritative commit point; recoverable
+        // failures before it restore the attachment file before releasing either
+        // store lock.
+        let mut registry = self.registry.lock().await;
+        let mut attachments = self.attachments.lock().await;
+        let original_attachments = attachments.clone();
+        let mut attachment_candidate = original_attachments.clone();
+        attachment_candidate.forget_project(&canonical);
+        let mut catalog_candidate = registry.clone();
+        catalog_candidate.unregister_project(&canonical);
 
-        // Remove from registry.
-        {
-            let mut registry = self.registry.lock().await;
-            let mut updated = registry.clone();
-            updated.unregister_project(&canonical);
-            registry.commit_candidate(updated).await?;
+        attachment_candidate.save().await?;
+        match registry.commit_candidate(catalog_candidate).await {
+            Ok(()) => {
+                *attachments = attachment_candidate;
+            }
+            Err(error @ CatalogError::PublishedNotDurable { .. }) => {
+                *attachments = attachment_candidate;
+                return Err(error.into());
+            }
+            Err(catalog_error) => {
+                original_attachments.save().await.with_context(|| {
+                    format!(
+                        "catalog removal failed ({catalog_error}); failed to restore attachment state"
+                    )
+                })?;
+                return Err(catalog_error.into());
+            }
         }
 
         Ok(())
@@ -2689,6 +2704,76 @@ command = "sleep 30"
             stored.attachments_for(&project_path)[0].source,
             AttachmentSource::Pin
         ));
+    }
+
+    #[tokio::test]
+    async fn test_catalog_persistence_failure_restores_attachments_on_remove() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+
+        let catalog_path = dir.path().join("catalog.json");
+        std::fs::create_dir(&catalog_path).expect("create blocking catalog directory");
+        let mut catalog = Registry::with_path(catalog_path);
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        catalog
+            .register_project(discovery, Some("project".to_owned()))
+            .expect("register project");
+        let registry = Arc::new(Mutex::new(catalog));
+
+        let attachment_path = dir.path().join("attachments.json");
+        let mut attachment_store = AttachmentStore::new(attachment_path.clone());
+        attachment_store
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            })
+            .expect("attach pin");
+        attachment_store.mark_stopped(&project_path);
+        attachment_store
+            .save()
+            .await
+            .expect("persist original attachments");
+        let attachments = Arc::new(Mutex::new(attachment_store));
+
+        let mut manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry.clone(),
+            attachments.clone(),
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect_err("catalog persistence must restore attachment state");
+
+        assert!(registry.lock().await.get_project(&project_path).is_some());
+        let stored = attachments.lock().await;
+        assert_eq!(stored.attachments_for(&project_path).len(), 1);
+        assert!(matches!(
+            stored.attachments_for(&project_path)[0].source,
+            AttachmentSource::Pin
+        ));
+        assert!(stored.is_stopped(&project_path));
+        drop(stored);
+
+        let mut reloaded = AttachmentStore::new(attachment_path);
+        reloaded.load().await.expect("reload restored attachments");
+        assert_eq!(reloaded.attachments_for(&project_path).len(), 1);
+        assert!(matches!(
+            reloaded.attachments_for(&project_path)[0].source,
+            AttachmentSource::Pin
+        ));
+        assert!(reloaded.is_stopped(&project_path));
     }
 
     #[tokio::test]

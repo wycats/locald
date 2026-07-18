@@ -1596,13 +1596,36 @@ async fn collect_legacy_evidence(
     if let Some(value) = read_optional_json(&paths.legacy_registry).await? {
         collect_registry_evidence(&paths.legacy_registry, &value, &mut evidence)?;
     }
-    if let Some(value) = read_optional_json(&paths.legacy_attachments).await? {
-        collect_attachment_evidence(&paths.legacy_attachments, &value, &mut evidence)?;
-    }
-    if let Some(value) = read_optional_json(&paths.legacy_runtime_state).await? {
-        collect_runtime_evidence(&paths.legacy_runtime_state, &value, &mut evidence)?;
-    }
+    collect_best_effort_compatibility_evidence(
+        &paths.legacy_attachments,
+        &mut evidence,
+        collect_attachment_evidence,
+    )
+    .await;
+    collect_best_effort_compatibility_evidence(
+        &paths.legacy_runtime_state,
+        &mut evidence,
+        collect_runtime_evidence,
+    )
+    .await;
     Ok(evidence)
+}
+
+type CompatibilityEvidenceCollector =
+    fn(&Path, &Value, &mut BTreeMap<PathBuf, UnresolvedLegacyProject>) -> Result<(), CatalogError>;
+
+async fn collect_best_effort_compatibility_evidence(
+    path: &Path,
+    evidence: &mut BTreeMap<PathBuf, UnresolvedLegacyProject>,
+    collector: CompatibilityEvidenceCollector,
+) {
+    let Ok(Some(value)) = read_optional_json(path).await else {
+        return;
+    };
+    let mut candidate = evidence.clone();
+    if collector(path, &value, &mut candidate).is_ok() {
+        *evidence = candidate;
+    }
 }
 
 async fn read_optional_json(path: &Path) -> Result<Option<Value>, CatalogError> {
@@ -3066,6 +3089,104 @@ mod tests {
 
         assert!(matches!(error, CatalogError::InvalidData { .. }));
         assert!(!paths.catalog.exists());
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_compatibility_json_does_not_block_catalog_creation() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let registry_path = fixture._temp.path().join("registry-project");
+        let registry_path_text = registry_path.to_string_lossy();
+        let registry = serde_json::json!({
+            "projects": {
+                registry_path_text.as_ref(): {
+                    "path": registry_path,
+                    "name": "registry project",
+                    "pinned": false,
+                    "last_seen": UNIX_EPOCH
+                }
+            }
+        });
+        let malformed_attachments = b"{\"attachments\":";
+        let malformed_runtime = b"{\"services\":[";
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize registry"),
+        )
+        .await
+        .expect("write registry");
+        tokio::fs::write(&paths.legacy_attachments, malformed_attachments)
+            .await
+            .expect("write malformed attachments");
+        tokio::fs::write(&paths.legacy_runtime_state, malformed_runtime)
+            .await
+            .expect("write malformed runtime state");
+
+        let catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("create catalog from valid registry evidence");
+
+        let record = catalog
+            .unresolved_legacy
+            .get(&registry_path)
+            .expect("preserve registry evidence");
+        assert_eq!(
+            record.sources,
+            BTreeSet::from([LegacyLocatorSource::Registry])
+        );
+        assert_eq!(
+            tokio::fs::read(&paths.legacy_attachments)
+                .await
+                .expect("read malformed attachments"),
+            malformed_attachments
+        );
+        assert_eq!(
+            tokio::fs::read(&paths.legacy_runtime_state)
+                .await
+                .expect("read malformed runtime state"),
+            malformed_runtime
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_compatibility_schema_is_discarded_atomically() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let attachment_path = fixture._temp.path().join("partial-attachment");
+        let runtime_path = fixture._temp.path().join("partial-runtime");
+        let attachment_path_text = attachment_path.to_string_lossy();
+        let runtime_path_text = runtime_path.to_string_lossy();
+        let attachments = serde_json::json!({
+            "attachments": {
+                attachment_path_text.as_ref(): []
+            },
+            "manually_stopped": "invalid"
+        });
+        let runtime = serde_json::json!({
+            "services": [
+                { "path": runtime_path_text.as_ref() },
+                { "path": false }
+            ]
+        });
+        tokio::fs::write(
+            &paths.legacy_attachments,
+            serde_json::to_vec_pretty(&attachments).expect("serialize attachments"),
+        )
+        .await
+        .expect("write attachments");
+        tokio::fs::write(
+            &paths.legacy_runtime_state,
+            serde_json::to_vec_pretty(&runtime).expect("serialize runtime state"),
+        )
+        .await
+        .expect("write runtime state");
+
+        let catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("discard malformed compatibility evidence");
+
+        assert!(!catalog.unresolved_legacy.contains_key(&attachment_path));
+        assert!(!catalog.unresolved_legacy.contains_key(&runtime_path));
     }
 
     #[tokio::test]
