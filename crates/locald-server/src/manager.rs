@@ -1714,25 +1714,26 @@ impl ProcessManager {
             !matches!(&source, Some(AttachmentSource::Runtime)),
             "Runtime attachment evidence is retained for the availability migration"
         );
+        let canonical = Self::canonicalize_path(&project_path);
         let should_stop = {
             let mut attachments = self.attachments.lock().await;
             let is_last = if let Some(source) = &source {
-                attachments.detach(&project_path, source)
+                attachments.detach(&canonical, source)
             } else {
-                attachments.detach_all_non_pin(&project_path)
+                attachments.detach_all_non_pin(&canonical)
             };
             if let Err(e) = attachments.save().await {
                 error!("Failed to save attachments: {e}");
             }
-            is_last && !attachments.is_stopped(&project_path)
+            is_last && !attachments.is_stopped(&canonical)
         };
 
         if should_stop {
             info!(
                 "Last attachment removed for {}, stopping services",
-                project_path.display()
+                canonical.display()
             );
-            self.stop_project(&project_path).await?;
+            self.stop_project(&canonical).await?;
         }
         Ok(())
     }
@@ -2605,6 +2606,77 @@ mod tests {
         assert_eq!(
             services.get("other:web").unwrap().health_status,
             HealthStatus::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn test_project_detach_normalizes_the_path_before_stopping_services() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            notify_path,
+            state_manager,
+            registry,
+            attachments.clone(),
+            None,
+        )
+        .expect("create process manager");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let canonical = std::fs::canonicalize(&project_path).expect("canonical project path");
+        let noncanonical = project_path.join("..").join("project");
+        let source = AttachmentSource::Editor {
+            name: "vscode".to_owned(),
+            id: "window".to_owned(),
+            pid: Some(std::process::id()),
+        };
+        attachments
+            .lock()
+            .await
+            .attach(Attachment {
+                project_path: canonical.clone(),
+                source: source.clone(),
+                created_at: SystemTime::now(),
+            })
+            .expect("attach editor");
+
+        manager.services.lock().await.insert(
+            "project:web".to_owned(),
+            Service {
+                config: LocaldConfig::default(),
+                service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::None,
+                sticky_port: None,
+                path: canonical,
+                health_status: HealthStatus::Healthy,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+
+        manager
+            .project_detach(noncanonical, Some(source))
+            .await
+            .expect("detach last owner");
+
+        assert!(
+            attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty()
+        );
+        assert_eq!(
+            manager.services.lock().await["project:web"].health_status,
+            HealthStatus::Unknown
         );
     }
 

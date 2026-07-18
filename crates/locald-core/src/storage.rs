@@ -56,7 +56,11 @@ fn sandbox_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>, name:
     xdg_data_home.map_or_else(
         || {
             home.map_or_else(
-                || PathBuf::from(".locald/sandboxes").join(name).join("data"),
+                || {
+                    PathBuf::from(".locald/sandboxes")
+                        .join(name)
+                        .join("data/locald")
+                },
                 |home| {
                     home.join(".local/share/locald/sandboxes")
                         .join(name)
@@ -94,6 +98,14 @@ mod tests {
         assert_eq!(
             sandbox_data_dir(None, Some(PathBuf::from("/Users/test")), "alpha"),
             PathBuf::from("/Users/test/.local/share/locald/sandboxes/alpha/data/locald")
+        );
+    }
+
+    #[test]
+    fn sandbox_relative_fallback_keeps_the_locald_data_component() {
+        assert_eq!(
+            sandbox_data_dir(None, None, "alpha"),
+            PathBuf::from(".locald/sandboxes/alpha/data/locald")
         );
     }
 
