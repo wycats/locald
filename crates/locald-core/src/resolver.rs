@@ -10,9 +10,9 @@ pub enum DomainResolution {
         port: Option<u16>,
         status: ServiceState,
     },
-    /// A persisted project claim whose legacy catalog data does not identify a
-    /// concrete service. The domain remains owned and must not fall through to
-    /// a platform surface or an unknown-domain response.
+    /// A persisted project claim that cannot currently be mapped to loaded
+    /// service context. The domain remains owned and must not fall through to a
+    /// platform surface or an unknown-domain response.
     OwnershipOnly,
 }
 
@@ -29,7 +29,7 @@ pub trait ServiceResolver: Send + Sync + std::fmt::Debug {
     /// Find the service associated with a given domain.
     ///
     /// Returns `Some(DomainResolution)` if locald owns the domain, including
-    /// legacy ownership-only claims, or `None` if the domain is unclaimed.
+    /// ownership-only claims, or `None` if the domain is unclaimed.
     async fn resolve_service_by_domain(&self, domain: &str) -> Option<DomainResolution>;
 
     /// Update the port the HTTP proxy is bound to.

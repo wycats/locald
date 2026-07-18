@@ -23,6 +23,7 @@ use locald_core::state::{
 };
 use locald_core::{
     CatalogError, DomainClaim, DomainName, DomainTarget, ProjectInstanceId, SharedDomainIndex,
+    sanitize_project_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -442,11 +443,12 @@ impl ProcessManager {
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
     ) -> Result<Vec<DomainClaim>> {
-        let base_domain = config
-            .project
-            .domain
-            .clone()
-            .unwrap_or_else(|| format!("{}.localhost", config.project.name));
+        let base_domain = config.project.domain.clone().unwrap_or_else(|| {
+            format!(
+                "{}.localhost",
+                sanitize_project_name_for_dns(&config.project.name)
+            )
+        });
         let base_domain = base_domain.parse::<DomainName>().with_context(|| {
             format!(
                 "project `{}` has an invalid exact base domain `{base_domain}`",
@@ -456,22 +458,22 @@ impl ProcessManager {
         let mut service_names = config.services.keys().cloned().collect::<Vec<_>>();
         service_names.sort();
 
-        service_names
-            .into_iter()
-            .map(|service_name| {
-                let domain = if service_name == "web" {
-                    base_domain.clone()
-                } else {
-                    base_domain.with_prefix(&service_name)?
-                };
-                Ok(DomainClaim::service(
-                    domain,
-                    instance_id,
-                    format!("{}:{service_name}", config.project.name),
-                ))
-            })
-            .collect::<Result<Vec<_>, locald_core::DomainError>>()
-            .map_err(Into::into)
+        let mut claims = Vec::with_capacity(service_names.len());
+        for service_name in service_names {
+            let domain = if service_name == "web" {
+                base_domain.clone()
+            } else {
+                base_domain.with_prefix(&service_name).with_context(|| {
+                    format!("service `{service_name}` has an invalid exact domain label")
+                })?
+            };
+            claims.push(DomainClaim::service(
+                domain,
+                instance_id,
+                format!("{}:{service_name}", config.project.name),
+            ));
+        }
+        Ok(claims)
     }
 
     fn effective_service_env(
@@ -1006,8 +1008,13 @@ impl ProcessManager {
                     format!("service `{service_name}` contains an invalid environment reference")
                 })?;
         }
+        let desired_service_names = config
+            .services
+            .keys()
+            .map(|service_name| format!("{}:{service_name}", config.project.name))
+            .collect::<HashSet<_>>();
         let discovery = Registry::discover(path.clone()).await?;
-        let commit_result = {
+        let (commit_result, removed_service_names, published_domain_index) = {
             let mut registry = self.registry.lock().await;
             let mut candidate = registry.clone();
             let instance_id =
@@ -1015,23 +1022,50 @@ impl ProcessManager {
             let claims = Self::build_domain_claims(instance_id, &config)?;
             candidate.replace_domain_claims(instance_id, claims)?;
 
+            // Keep the previous claim set published until every service removed
+            // by this reload has stopped. A failed stop retains both ownership
+            // and the retryable service record.
+            let mut removed_service_names = {
+                let services = self.services.lock().await;
+                services
+                    .iter()
+                    .filter(|(name, service)| {
+                        service.path == path && !desired_service_names.contains(name.as_str())
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>()
+            };
+            removed_service_names.sort();
+            for name in &removed_service_names {
+                info!("Service {name} removed from config, stopping before domain publication...");
+                self.stop(name).await?;
+            }
+
             // `commit_candidate` advances the in-memory catalog at the atomic
-            // rename commit point, including PublishedNotDurable. Always mirror
-            // that exact state into the live immutable routing snapshot.
+            // rename commit point, including PublishedNotDurable.
             let commit_result = registry.commit_candidate(candidate).await;
-            self.domain_index.store(registry.domain_index().clone());
-            commit_result
+            let catalog_published = commit_result.is_ok()
+                || matches!(
+                    &commit_result,
+                    Err(CatalogError::PublishedNotDurable { .. })
+                );
+            let published_domain_index = catalog_published.then(|| registry.domain_index().clone());
+            (commit_result, removed_service_names, published_domain_index)
         };
 
         // The catalog rename is the ownership commit point. Synchronize hosts
         // from that exact snapshot even when the parent-directory fsync reports
-        // PublishedNotDurable, then surface the durability result.
-        let catalog_published = commit_result.is_ok()
-            || matches!(
-                &commit_result,
-                Err(CatalogError::PublishedNotDurable { .. })
-            );
-        if catalog_published {
+        // PublishedNotDurable, then surface the durability result. Removed
+        // service records leave runtime state at the same publication point.
+        if let Some(published_domain_index) = published_domain_index {
+            self.domain_index.store(published_domain_index);
+            {
+                let mut services = self.services.lock().await;
+                for name in &removed_service_names {
+                    services.remove(name);
+                }
+            }
+            self.persist_state().await;
             self.sync_hosts_after_catalog_publish().await;
         }
         commit_result?;
@@ -1045,8 +1079,6 @@ impl ProcessManager {
                 .await;
         }
 
-        let mut active_services = HashSet::new();
-
         for service_name in sorted_services {
             let service_config = &config.services[&service_name];
             info!(
@@ -1054,7 +1086,6 @@ impl ProcessManager {
                 config.project.name, service_name, service_config
             );
             let name = format!("{}:{}", config.project.name, service_name);
-            active_services.insert(name.clone());
 
             let (combined_env, injected_database) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config);
@@ -1292,22 +1323,6 @@ impl ProcessManager {
                     })
                     .await;
             }
-        }
-
-        // Stop removed services
-        let to_stop = {
-            let services = self.services.lock().await;
-            services
-                .iter()
-                .filter(|(n, s)| s.path == path && !active_services.contains(n.as_str()))
-                .map(|(n, _)| n.clone())
-                .collect::<Vec<_>>()
-        };
-
-        for name in to_stop {
-            info!("Service {name} removed from config, stopping...");
-            self.stop(&name).await?;
-            self.services.lock().await.remove(&name);
         }
 
         self.persist_state().await;
@@ -1621,13 +1636,12 @@ impl ProcessManager {
                 .map(|service| service.runtime_state.clone())
         };
         match runtime {
-            None | Some(ServiceRuntime::None) => {
-                Some(locald_core::resolver::DomainResolution::Service {
-                    name: service_name,
-                    port: None,
-                    status: locald_core::state::ServiceState::Stopped,
-                })
-            }
+            None => Some(locald_core::resolver::DomainResolution::OwnershipOnly),
+            Some(ServiceRuntime::None) => Some(locald_core::resolver::DomainResolution::Service {
+                name: service_name,
+                port: None,
+                status: locald_core::state::ServiceState::Stopped,
+            }),
             Some(ServiceRuntime::Controller(controller)) => {
                 let runtime = controller.lock().await.read_state().await;
                 let port = (runtime.status == locald_core::state::ServiceState::Running)
@@ -2509,6 +2523,74 @@ API_URL = "https://api.example"
     }
 
     #[test]
+    fn test_get_service_domain_sanitizes_only_implicit_project_names() {
+        let config = config_with_services(
+            ProjectConfig {
+                name: "My_App v2!".to_owned(),
+                domain: None,
+                ..Default::default()
+            },
+            &["web", "api"],
+        );
+        let claims = claim_domains(&config);
+
+        assert_eq!(
+            claims.get("My_App v2!:web"),
+            Some(&"my-app-v2.localhost".to_owned())
+        );
+        assert_eq!(
+            claims.get("My_App v2!:api"),
+            Some(&"api.my-app-v2.localhost".to_owned())
+        );
+
+        let colliding = config_with_services(
+            ProjectConfig {
+                name: "My App v2".to_owned(),
+                domain: None,
+                ..Default::default()
+            },
+            &["web"],
+        );
+        assert_eq!(
+            claim_domains(&colliding).get("My App v2:web"),
+            Some(&"my-app-v2.localhost".to_owned())
+        );
+    }
+
+    #[test]
+    fn explicit_project_and_service_domains_remain_strict() {
+        let invalid_project_domain = config_with_services(
+            ProjectConfig {
+                name: "project".to_owned(),
+                domain: Some("My_Project.localhost".to_owned()),
+                ..Default::default()
+            },
+            &["web"],
+        );
+        assert!(
+            ProcessManager::build_domain_claims(test_instance_id(), &invalid_project_domain)
+                .expect_err("explicit project domains are not rewritten")
+                .to_string()
+                .contains("invalid exact base domain")
+        );
+
+        let invalid_service_domain = config_with_services(
+            ProjectConfig {
+                name: "project".to_owned(),
+                domain: None,
+                ..Default::default()
+            },
+            &["web", "api_v2"],
+        );
+        assert!(
+            ProcessManager::build_domain_claims(test_instance_id(), &invalid_service_domain)
+                .expect_err("service labels are not rewritten")
+                .to_string()
+                .contains("invalid exact domain label")
+        );
+    }
+
+    #[test]
     fn test_get_service_domain_explicit() {
         let config = config_with_services(
             ProjectConfig {
@@ -3322,6 +3404,242 @@ BROKEN_URL = "${services.missing.url}"
             .stop_project(&project_path)
             .await
             .expect("stop initial project");
+    }
+
+    #[tokio::test]
+    async fn removed_service_stop_failure_preserves_all_domain_claims() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "reload"
+domain = "reload.localhost"
+"#,
+        )
+        .expect("write replacement config");
+        let canonical_path = std::fs::canonicalize(&project_path).expect("canonical project path");
+        let catalog_path = dir.path().join("catalog.json");
+        let mut catalog = Registry::with_path(catalog_path.clone());
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("reload".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [
+                    DomainClaim::service(
+                        "a.reload.localhost".parse().expect("valid domain"),
+                        instance_id,
+                        "reload:a".to_owned(),
+                    ),
+                    DomainClaim::service(
+                        "z.reload.localhost".parse().expect("valid domain"),
+                        instance_id,
+                        "reload:z".to_owned(),
+                    ),
+                ],
+            )
+            .expect("record existing claims");
+        catalog.save().await.expect("persist existing catalog");
+        let catalog_before = std::fs::read(&catalog_path).expect("read existing catalog");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let running_state = RuntimeState {
+            pid: Some(42),
+            port: Some(3000),
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        let successful_controller = Arc::new(Mutex::new(TestController::new(
+            "reload:a",
+            running_state.clone(),
+        )));
+        let failing_controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(
+            TestController::failing_stop("reload:z", running_state),
+        ));
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let previous_config = test_config_with_domain("reload", "reload.localhost");
+        {
+            let mut services = manager.services.lock().await;
+            services.insert(
+                "reload:a".to_owned(),
+                test_service(
+                    previous_config.clone(),
+                    service_config.clone(),
+                    ServiceRuntime::Controller(successful_controller),
+                    canonical_path.clone(),
+                ),
+            );
+            services.insert(
+                "reload:z".to_owned(),
+                test_service(
+                    previous_config,
+                    service_config,
+                    ServiceRuntime::Controller(failing_controller.clone()),
+                    canonical_path,
+                ),
+            );
+        }
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+
+        let error = manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect_err("a removed service stop failure must block publication");
+
+        assert!(format!("{error:#}").contains("injected stop failure"));
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read catalog after failed reload"),
+            catalog_before
+        );
+        for domain in ["a.reload.localhost", "z.reload.localhost"] {
+            assert!(
+                registry
+                    .lock()
+                    .await
+                    .domain_index()
+                    .resolve(domain)
+                    .is_some()
+            );
+            assert!(manager.domain_index().snapshot().resolve(domain).is_some());
+        }
+        let services = manager.services.lock().await;
+        assert!(matches!(
+            &services["reload:a"].runtime_state,
+            ServiceRuntime::None
+        ));
+        let ServiceRuntime::Controller(restored_controller) = &services["reload:z"].runtime_state
+        else {
+            panic!("failing controller must remain installed");
+        };
+        assert!(Arc::ptr_eq(restored_controller, &failing_controller));
+        drop(services);
+        assert!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_service_releases_claim_after_successful_stop() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "reload"
+domain = "reload.localhost"
+"#,
+        )
+        .expect("write replacement config");
+        let canonical_path = std::fs::canonicalize(&project_path).expect("canonical project path");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("reload".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "reload.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "reload:web".to_owned(),
+                )],
+            )
+            .expect("record existing claim");
+        catalog.save().await.expect("persist existing catalog");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        manager.services.lock().await.insert(
+            "reload:web".to_owned(),
+            test_service(
+                test_config_with_domain("reload", "reload.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(Arc::new(Mutex::new(TestController::new(
+                    "reload:web",
+                    RuntimeState {
+                        pid: Some(42),
+                        port: Some(3000),
+                        status: ServiceState::Running,
+                        health_status: HealthStatus::Healthy,
+                    },
+                )))),
+                canonical_path,
+            ),
+        );
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("publish removal after stop");
+
+        assert!(manager.services.lock().await.get("reload:web").is_none());
+        assert!(
+            registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("reload.localhost")
+                .is_none()
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("reload.localhost")
+                .is_none()
+        );
+        assert_eq!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[Vec::<String>::new()]
+        );
     }
 
     #[tokio::test]
@@ -4143,6 +4461,31 @@ command = "sleep 30"
             .resolve_service_by_domain("LEGACY.LOCALHOST.")
             .await
             .expect("resolve persisted legacy ownership");
+
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::OwnershipOnly
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_requires_loaded_service_context() {
+        let dir = tempdir().unwrap();
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+
+        let manager = ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+            .expect("create process manager");
+        install_test_claim(&manager, "restored.localhost", "restored:web");
+
+        let resolution = manager
+            .resolve_service_by_domain("restored.localhost")
+            .await
+            .expect("persisted claim remains owned");
 
         assert!(matches!(
             resolution,

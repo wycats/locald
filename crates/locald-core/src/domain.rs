@@ -8,6 +8,42 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
+/// Convert a project display name into a deterministic DNS label for its
+/// implicit `.localhost` domain.
+///
+/// Explicitly configured domains remain strict and are never rewritten.
+#[must_use]
+pub fn sanitize_project_name_for_dns(project_name: &str) -> String {
+    sanitize_dns_label(project_name, "project")
+}
+
+pub(crate) fn sanitize_dns_label(value: &str, empty_fallback: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+
+    for character in value.chars() {
+        let normalized = if character.is_ascii_alphanumeric() {
+            character.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+
+        if normalized == '-' && (result.is_empty() || result.ends_with('-')) {
+            continue;
+        }
+        if result.len() == 63 {
+            break;
+        }
+        result.push(normalized);
+    }
+
+    let result = result.trim_matches('-');
+    if result.is_empty() {
+        return empty_fallback.to_owned();
+    }
+
+    result.to_owned()
+}
+
 /// A normalized exact DNS hostname.
 ///
 /// Names are ASCII lowercase and omit the optional trailing root dot. Wildcard
@@ -567,6 +603,27 @@ mod tests {
         assert_eq!(
             domain,
             "api.example.localhost".parse().expect("valid domain")
+        );
+    }
+
+    #[test]
+    fn project_names_receive_deterministic_dns_labels() {
+        assert_eq!(sanitize_project_name_for_dns("My_App v2!"), "my-app-v2");
+        assert_eq!(
+            sanitize_project_name_for_dns("--My___App // v2--"),
+            "my-app-v2"
+        );
+        assert_eq!(sanitize_project_name_for_dns("préview"), "pr-view");
+        assert_eq!(sanitize_project_name_for_dns("東京_App"), "app");
+        assert_eq!(sanitize_project_name_for_dns(""), "project");
+        assert_eq!(sanitize_project_name_for_dns("---"), "project");
+
+        let boundary = "a".repeat(63);
+        assert_eq!(sanitize_project_name_for_dns(&boundary), boundary);
+        assert_eq!(sanitize_project_name_for_dns(&"a".repeat(64)).len(), 63);
+        assert_eq!(
+            sanitize_project_name_for_dns(&format!("{}-suffix", "a".repeat(62))),
+            "a".repeat(62)
         );
     }
 
