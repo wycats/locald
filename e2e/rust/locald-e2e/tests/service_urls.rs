@@ -22,7 +22,13 @@ command = "while true; do sleep 1; done"
     let project_path = ctx.create_project("url-test", config).await?;
 
     // 2. Run `locald up`
-    let output = ctx.run_cli(&["up", project_path.to_str().unwrap()]).await?;
+    let output = ctx
+        .run_cli(&[
+            "up",
+            "--exit-after-register",
+            project_path.to_str().unwrap(),
+        ])
+        .await?;
     assert!(output.status.success());
 
     // 3. Check status
