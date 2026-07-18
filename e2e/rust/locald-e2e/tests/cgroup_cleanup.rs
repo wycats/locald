@@ -110,13 +110,34 @@ image = "alpine:latest"
 command = "sleep 300"
 "#;
     let project_path = ctx.create_project("test-proj", config).await?;
+    let project_path = project_path.to_str().unwrap();
 
+    // Keep the project owned while the CLI `up` attachment exits so the
+    // periodic stale-attachment reaper cannot win the explicit stop race.
     let output = ctx
         .run_cli(&[
-            "up",
-            "--exit-after-register",
-            project_path.to_str().unwrap(),
+            "project",
+            "attach",
+            project_path,
+            "--source",
+            "editor",
+            "--editor-name",
+            "locald-e2e",
+            "--editor-id",
+            "cgroup-cleanup",
         ])
+        .await?;
+    if !output.status.success() {
+        ctx.dump_logs().await?;
+        anyhow::bail!(
+            "locald project attach failed (status: {}). stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = ctx
+        .run_cli(&["up", "--exit-after-register", project_path])
         .await?;
     if !output.status.success() {
         ctx.dump_logs().await?;
