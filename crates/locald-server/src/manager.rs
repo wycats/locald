@@ -9,7 +9,6 @@ use crate::state::StateManager;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use locald_core::CatalogError;
 use locald_core::attachments::{
     Attachment, AttachmentSource, AttachmentStore, ProjectFilter, ProjectListEntry, ProjectSection,
     ProjectStatusInfo,
@@ -22,12 +21,14 @@ use locald_core::service::{ServiceContext, ServiceController, ServiceFactory};
 use locald_core::state::{
     HealthSource, HealthStatus, PersistedServiceState, ServerState, ServiceState,
 };
+use locald_core::{
+    CatalogError, DomainClaim, DomainName, DomainTarget, ProjectInstanceId, SharedDomainIndex,
+};
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::{Mutex, broadcast};
@@ -136,24 +137,15 @@ impl Drop for TaskGuard {
     }
 }
 
-struct RunGuard(Arc<AtomicBool>);
-impl Drop for RunGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
 #[derive(Clone, Debug)]
 struct ConcurrencyGuard {
-    running: Arc<AtomicBool>,
-    pending: Arc<AtomicBool>,
+    lock: Arc<Mutex<()>>,
 }
 
 impl ConcurrencyGuard {
     fn new() -> Self {
         Self {
-            running: Arc::new(AtomicBool::new(false)),
-            pending: Arc::new(AtomicBool::new(false)),
+            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -162,42 +154,8 @@ impl ConcurrencyGuard {
         F: Fn() -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
-        // Try to acquire the running lock
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            // Already running, mark as pending
-            self.pending.store(true, Ordering::SeqCst);
-            info!("Host sync already in progress, queued for next run");
-            return Ok(());
-        }
-
-        // We are the runner.
-        // We need to ensure we clear the running flag when we are done.
-        let _guard = RunGuard(self.running.clone());
-
-        loop {
-            // Clear pending flag *before* running.
-            // If a new request comes in *while* we are running, it will set pending=true again.
-            self.pending.store(false, Ordering::SeqCst);
-
-            // Run the task
-            if let Err(e) = f().await {
-                error!("Host sync failed: {}", e);
-            }
-
-            // Check if we need to run again
-            if !self.pending.load(Ordering::SeqCst) {
-                break;
-            }
-            info!("Pending host sync detected, re-running...");
-            // Throttle to prevent busy loops
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-
-        Ok(())
+        let _guard = self.lock.lock().await;
+        f().await
     }
 }
 
@@ -259,6 +217,7 @@ pub struct ProcessManager {
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
     watchers: Arc<Mutex<HashMap<PathBuf, RecommendedWatcher>>>,
     registry: Arc<Mutex<Registry>>,
+    domain_index: SharedDomainIndex,
     attachments: Arc<Mutex<AttachmentStore>>,
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
@@ -311,8 +270,19 @@ impl ProcessManager {
         let services = Arc::new(Mutex::new(HashMap::new()));
         let proxy_ports = Arc::new(Mutex::new((None, None)));
 
-        let health_monitor =
-            HealthMonitor::new(services.clone(), event_tx.clone(), proxy_ports.clone());
+        let domain_index = {
+            let registry_snapshot = registry
+                .try_lock()
+                .context("project identity catalog is busy during manager initialization")?;
+            SharedDomainIndex::new(registry_snapshot.domain_index().clone())
+        };
+
+        let health_monitor = HealthMonitor::new(
+            services.clone(),
+            event_tx.clone(),
+            proxy_ports.clone(),
+            domain_index.clone(),
+        );
 
         let runtime = Arc::new(Runtime::new(notify_socket_path));
 
@@ -334,6 +304,7 @@ impl ProcessManager {
             proxy_ports,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             registry,
+            domain_index,
             attachments,
             health_monitor,
             factories,
@@ -461,50 +432,53 @@ impl ProcessManager {
         // Controllers handle their own reaping/status updates
     }
 
-    /// Resolve domain for a service. Shorthand that skips worktree resolution.
-    pub(crate) fn get_service_domain(
-        name: &str,
-        project_config: &locald_core::config::ProjectConfig,
-    ) -> String {
-        let config = locald_core::LocaldConfig {
-            project: project_config.clone(),
-            ..Default::default()
-        };
-        Self::get_service_domain_worktree(name, &config, None)
+    /// Return a cloneable exact-domain snapshot handle for routing and TLS.
+    #[must_use]
+    pub fn domain_index(&self) -> SharedDomainIndex {
+        self.domain_index.clone()
     }
 
-    /// Resolve domain for a service with worktree awareness.
-    pub(crate) fn get_service_domain_worktree(
-        name: &str,
-        config: &locald_core::LocaldConfig,
-        project_path: Option<&std::path::Path>,
-    ) -> String {
+    fn build_domain_claims(
+        instance_id: ProjectInstanceId,
+        config: &LocaldConfig,
+    ) -> Result<Vec<DomainClaim>> {
         let base_domain = config
             .project
             .domain
             .clone()
             .unwrap_or_else(|| format!("{}.localhost", config.project.name));
-
-        // Resolve worktree-aware domain if applicable.
-        let domain = if let Some(path) = project_path {
-            resolve_worktree_domain(
-                &base_domain,
-                &config.project.name,
-                config.worktrees.as_ref(),
-                path,
+        let base_domain = base_domain.parse::<DomainName>().with_context(|| {
+            format!(
+                "project `{}` has an invalid exact base domain `{base_domain}`",
+                config.project.name
             )
-        } else {
-            base_domain
-        };
+        })?;
+        let mut service_names = config.services.keys().cloned().collect::<Vec<_>>();
+        service_names.sort();
 
-        let short_name = name.split(':').nth(1).unwrap_or(name);
+        service_names
+            .into_iter()
+            .map(|service_name| {
+                let domain = if service_name == "web" {
+                    base_domain.clone()
+                } else {
+                    base_domain.with_prefix(&service_name)?
+                };
+                Ok(DomainClaim::service(
+                    domain,
+                    instance_id,
+                    format!("{}:{service_name}", config.project.name),
+                ))
+            })
+            .collect::<Result<Vec<_>, locald_core::DomainError>>()
+            .map_err(Into::into)
+    }
 
-        // If the service is named "web" or matches the project name, map it to the root domain.
-        if short_name == "web" || short_name == config.project.name {
-            domain
-        } else {
-            format!("{short_name}.{domain}")
-        }
+    fn domain_for_service(&self, name: &str) -> Option<String> {
+        self.domain_index
+            .snapshot()
+            .domain_for_service(name)
+            .map(ToString::to_string)
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -536,7 +510,7 @@ impl ProcessManager {
             };
 
             (
-                Some(Self::get_service_domain(name, &service.config.project)),
+                self.domain_for_service(name),
                 Some(service.path.clone()),
                 service.health_status,
                 service.health_source,
@@ -810,20 +784,17 @@ impl ProcessManager {
                 let manager = manager.clone();
                 let syncer = syncer.clone();
                 async move {
-                    let domains = {
-                        let services = manager.services.lock().await;
-                        let mut domains = HashSet::new();
-                        for (name, service) in services.iter() {
-                            domains.insert(Self::get_service_domain(name, &service.config.project));
-                        }
-                        let mut list: Vec<String> = domains.into_iter().collect();
-                        list.sort();
-                        list
-                    };
+                    let domains = manager.domain_index.snapshot().service_domains();
                     syncer.sync(domains).await
                 }
             })
             .await
+    }
+
+    async fn sync_hosts_after_catalog_publish(&self) {
+        if let Err(error) = self.sync_hosts().await {
+            warn!("Failed to synchronize published domain claims: {error}");
+        }
     }
 
     /// Starts a project from the given path.
@@ -935,6 +906,8 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
     ) -> Result<()> {
+        let path = Self::canonicalize_path(&path);
+
         // Setup log forwarding if verbose
         let _log_guard = if verbose {
             event_tx.as_ref().map(|tx| {
@@ -967,16 +940,6 @@ impl ProcessManager {
 
         let (mut config, dot_env_vars) = ConfigLoader::load_project_config(&path).await?;
 
-        // Resolve and durably record identity before any service mutation. Reload,
-        // restore, attach, and explicit start all converge through this boundary.
-        let discovery = Registry::discover(path.clone()).await?;
-        {
-            let mut registry = self.registry.lock().await;
-            registry
-                .register_project_and_save(discovery, Some(config.project.name.clone()))
-                .await?;
-        }
-
         // Apply plugins to configuration
         // Plugin discovery and application failures are logged but do not fail startup
         // The returned guards keep plugin-allocated ports reserved until services bind
@@ -995,6 +958,39 @@ impl ProcessManager {
             guard.release_listener();
         }
 
+        // Validate the complete post-plugin configuration before publishing
+        // identity or domain ownership.
+        let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
+        let discovery = Registry::discover(path.clone()).await?;
+        let commit_result = {
+            let mut registry = self.registry.lock().await;
+            let mut candidate = registry.clone();
+            let instance_id =
+                candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            let claims = Self::build_domain_claims(instance_id, &config)?;
+            candidate.replace_domain_claims(instance_id, claims)?;
+
+            // `commit_candidate` advances the in-memory catalog at the atomic
+            // rename commit point, including PublishedNotDurable. Always mirror
+            // that exact state into the live immutable routing snapshot.
+            let commit_result = registry.commit_candidate(candidate).await;
+            self.domain_index.store(registry.domain_index().clone());
+            commit_result
+        };
+
+        // The catalog rename is the ownership commit point. Synchronize hosts
+        // from that exact snapshot even when the parent-directory fsync reports
+        // PublishedNotDurable, then surface the durability result.
+        let catalog_published = commit_result.is_ok()
+            || matches!(
+                &commit_result,
+                Err(CatalogError::PublishedNotDurable { .. })
+            );
+        if catalog_published {
+            self.sync_hosts_after_catalog_publish().await;
+        }
+        commit_result?;
+
         if let Some(tx) = &event_tx {
             let _ = tx
                 .send(BootEvent::StepFinished {
@@ -1004,17 +1000,6 @@ impl ProcessManager {
                 .await;
         }
 
-        // Auto-sync hosts if needed
-        // We do this in a background task to avoid blocking startup
-        // and to handle the fact that we might not have permissions (though shim should handle it)
-        let manager = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = manager.sync_hosts().await {
-                warn!("Failed to auto-sync hosts: {}", e);
-            }
-        });
-
-        let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
         let mut active_services = HashSet::new();
 
         for service_name in sorted_services {
@@ -1064,8 +1049,9 @@ impl ProcessManager {
 
             let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
 
-            // Check if already running and config matches
-            {
+            // A domain-only reload updates the shared claim snapshot and the
+            // service's display configuration without restarting its process.
+            let is_up_to_date = {
                 let mut services = self.services.lock().await;
                 if let Some(service) = services.get_mut(&name) {
                     // Check if actually running
@@ -1081,27 +1067,40 @@ impl ProcessManager {
                         if &service.service_config == service_config
                             && service.resolved_env == resolved_env
                         {
-                            info!("Service {name} is already running and up to date");
-                            if let Some(tx) = &event_tx {
-                                let _ = tx
-                                    .send(BootEvent::StepStarted {
-                                        id: name.clone(),
-                                        description: format!("Service {} up to date", name),
-                                    })
-                                    .await;
-                                let _ = tx
-                                    .send(BootEvent::StepFinished {
-                                        id: name.clone(),
-                                        result: Ok(()),
-                                    })
-                                    .await;
-                            }
-                            continue;
+                            service.config = config.clone();
+                            service.path.clone_from(&path);
+                            true
+                        } else {
+                            info!("Service {name} config changed, restarting...");
+                            false
                         }
-                        info!("Service {name} config changed, restarting...");
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
-            } // Drop lock before stopping/starting
+            };
+
+            if is_up_to_date {
+                info!("Service {name} is already running and up to date");
+                if let Some(tx) = &event_tx {
+                    let _ = tx
+                        .send(BootEvent::StepStarted {
+                            id: name.clone(),
+                            description: format!("Service {name} up to date"),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(BootEvent::StepFinished {
+                            id: name.clone(),
+                            result: Ok(()),
+                        })
+                        .await;
+                }
+                self.broadcast_service_update(&name).await;
+                continue;
+            }
 
             // Stop if running (restarting)
             self.stop(&name).await?;
@@ -1285,6 +1284,7 @@ impl ProcessManager {
         for name in to_stop {
             info!("Service {name} removed from config, stopping...");
             self.stop(&name).await?;
+            self.services.lock().await.remove(&name);
         }
 
         self.persist_state().await;
@@ -1323,7 +1323,7 @@ impl ProcessManager {
                     if let Some(service) = services.get_mut(name) {
                         service.runtime_state = ServiceRuntime::Controller(c);
                     }
-                    return Ok(());
+                    return Err(e).with_context(|| format!("failed to stop service `{name}`"));
                 }
             }
             ServiceRuntime::None => {}
@@ -1368,9 +1368,7 @@ impl ProcessManager {
         };
 
         for name in service_names {
-            if let Err(e) = self.stop(&name).await {
-                warn!("Failed to stop service {name}: {e}");
-            }
+            self.stop(&name).await?;
         }
         Ok(())
     }
@@ -1497,7 +1495,7 @@ impl ProcessManager {
 
                 snapshots.push((
                     name.clone(),
-                    Some(Self::get_service_domain(name, &service.config.project)),
+                    self.domain_for_service(name),
                     Some(service.path.clone()),
                     service.health_status,
                     service.health_source,
@@ -1580,76 +1578,46 @@ impl ProcessManager {
         &self,
         domain: &str,
     ) -> Option<locald_core::resolver::DomainResolution> {
-        struct Candidate {
-            name: String,
-            runtime: ServiceRuntime,
-        }
-
-        let candidates = {
+        let service_name = {
+            let index = self.domain_index.snapshot();
+            match index.resolve(domain) {
+                Some(DomainTarget::Service {
+                    service_name: Some(service_name),
+                    ..
+                }) => service_name.clone(),
+                Some(
+                    DomainTarget::Platform { .. }
+                    | DomainTarget::Service {
+                        service_name: None, ..
+                    },
+                )
+                | None => return None,
+            }
+        };
+        let runtime = {
             let services = self.services.lock().await;
             services
-                .iter()
-                .filter_map(|(name, service)| {
-                    let d = Self::get_service_domain(name, &service.config.project);
-                    if d == domain {
-                        Some(Candidate {
-                            name: name.clone(),
-                            runtime: service.runtime_state.clone(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
+                .get(&service_name)
+                .map(|service| service.runtime_state.clone())
         };
-
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let mut resolved = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            match candidate.runtime {
-                ServiceRuntime::None => resolved.push(locald_core::resolver::DomainResolution {
-                    name: candidate.name,
-                    port: None,
-                    status: locald_core::state::ServiceState::Stopped,
-                }),
-                ServiceRuntime::Controller(c) => {
-                    let runtime = c.lock().await.read_state().await;
-                    let port = if runtime.status == locald_core::state::ServiceState::Running {
-                        runtime.port
-                    } else {
-                        None
-                    };
-                    resolved.push(locald_core::resolver::DomainResolution {
-                        name: candidate.name,
-                        port,
-                        status: runtime.status,
-                    });
-                }
+        match runtime {
+            None | Some(ServiceRuntime::None) => Some(locald_core::resolver::DomainResolution {
+                name: service_name,
+                port: None,
+                status: locald_core::state::ServiceState::Stopped,
+            }),
+            Some(ServiceRuntime::Controller(controller)) => {
+                let runtime = controller.lock().await.read_state().await;
+                let port = (runtime.status == locald_core::state::ServiceState::Running)
+                    .then_some(runtime.port)
+                    .flatten();
+                Some(locald_core::resolver::DomainResolution {
+                    name: service_name,
+                    port,
+                    status: runtime.status,
+                })
             }
         }
-
-        resolved.sort_by(|left, right| {
-            let left_rank = match (left.port, left.status) {
-                (Some(_), locald_core::state::ServiceState::Running) => 0,
-                (None, locald_core::state::ServiceState::Building) => 1,
-                (None, locald_core::state::ServiceState::Running) => 2,
-                _ => 3,
-            };
-            let right_rank = match (right.port, right.status) {
-                (Some(_), locald_core::state::ServiceState::Running) => 0,
-                (None, locald_core::state::ServiceState::Building) => 1,
-                (None, locald_core::state::ServiceState::Running) => 2,
-                _ => 3,
-            };
-            left_rank
-                .cmp(&right_rank)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-
-        resolved.into_iter().next()
     }
 
     pub async fn registry_list(&self) -> Vec<locald_core::registry::ProjectEntry> {
@@ -1760,7 +1728,7 @@ impl ProcessManager {
         let canonical = Self::canonicalize_path(project_path);
 
         // Stop services.
-        let _ = self.stop_project(&canonical).await;
+        self.stop_project(&canonical).await?;
 
         // Keep both compatibility stores stable until each candidate is ready.
         // Catalog removal is the authoritative commit point; recoverable
@@ -1772,16 +1740,19 @@ impl ProcessManager {
         let mut attachment_candidate = original_attachments.clone();
         attachment_candidate.forget_project(&canonical);
         let mut catalog_candidate = registry.clone();
-        catalog_candidate.unregister_project(&canonical);
+        catalog_candidate.unregister_project(&canonical)?;
 
         attachment_candidate.save().await?;
-        match registry.commit_candidate(catalog_candidate).await {
+        let commit_result = registry.commit_candidate(catalog_candidate).await;
+        self.domain_index.store(registry.domain_index().clone());
+        let durability_error = match commit_result {
             Ok(()) => {
                 *attachments = attachment_candidate;
+                None
             }
             Err(error @ CatalogError::PublishedNotDurable { .. }) => {
                 *attachments = attachment_candidate;
-                return Err(error.into());
+                Some(error)
             }
             Err(catalog_error) => {
                 original_attachments.save().await.with_context(|| {
@@ -1791,6 +1762,19 @@ impl ProcessManager {
                 })?;
                 return Err(catalog_error.into());
             }
+        };
+
+        drop(attachments);
+        drop(registry);
+
+        self.services
+            .lock()
+            .await
+            .retain(|_, service| service.path != canonical);
+        self.sync_hosts_after_catalog_publish().await;
+
+        if let Some(error) = durability_error {
+            return Err(error.into());
         }
 
         Ok(())
@@ -1942,11 +1926,44 @@ impl ProcessManager {
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_clean(&self) -> Result<usize> {
-        let mut registry = self.registry.lock().await;
-        let mut updated = registry.clone();
-        let count = updated.prune_missing_projects()?;
-        if updated != *registry {
-            registry.commit_candidate(updated).await?;
+        let (count, removed_paths, commit_result) = {
+            let mut registry = self.registry.lock().await;
+            let mut updated = registry.clone();
+            let count = updated.prune_missing_projects()?;
+            let removed_paths = registry
+                .instances
+                .iter()
+                .filter(|(instance_id, _)| !updated.instances.contains_key(instance_id))
+                .map(|(_, record)| record.last_known_path.clone())
+                .collect::<HashSet<_>>();
+
+            for path in &removed_paths {
+                self.stop_project(path).await?;
+            }
+
+            let commit_result = if updated == *registry {
+                None
+            } else {
+                let commit_result = registry.commit_candidate(updated).await;
+                self.domain_index.store(registry.domain_index().clone());
+                Some(commit_result)
+            };
+            (count, removed_paths, commit_result)
+        };
+        if let Some(commit_result) = commit_result {
+            let catalog_published = commit_result.is_ok()
+                || matches!(
+                    &commit_result,
+                    Err(CatalogError::PublishedNotDurable { .. })
+                );
+            if catalog_published {
+                self.services
+                    .lock()
+                    .await
+                    .retain(|_, service| !removed_paths.contains(&service.path));
+                self.sync_hosts_after_catalog_publish().await;
+            }
+            commit_result?;
         }
         Ok(count)
     }
@@ -2099,7 +2116,7 @@ impl ProcessManager {
                 service.health_status,
                 service.health_source,
                 runtime_info,
-                Some(Self::get_service_domain(name, &service.config.project)),
+                self.domain_for_service(name),
                 service.warnings.clone(),
             )
         };
@@ -2156,6 +2173,7 @@ impl ProcessManager {
             "path": path,
             "health_status": health_status,
             "health_source": health_source,
+            "domain": domain,
             "url": url,
             "warnings": warnings,
         });
@@ -2218,45 +2236,6 @@ impl ServiceResolver for ProcessManager {
     }
 }
 
-/// Resolve the domain for a project, applying worktree branch qualification
-/// if the project is in a git worktree and has a `[worktrees]` config.
-fn resolve_worktree_domain(
-    base_domain: &str,
-    project_name: &str,
-    worktrees_config: Option<&locald_core::config::WorktreesConfig>,
-    project_path: &Path,
-) -> String {
-    let Some(git_ctx) = locald_core::worktree::detect(project_path) else {
-        return base_domain.to_string();
-    };
-
-    // Only apply branch-qualified domains to actual worktrees.
-    // A normal repo on a feature branch keeps the base domain.
-    if !git_ctx.is_worktree {
-        return base_domain.to_string();
-    }
-
-    // Default branch always gets the base domain (no prefix).
-    if git_ctx.is_default_branch {
-        return base_domain.to_string();
-    }
-
-    // Worktrees without [worktrees] config: use base domain (only one can run).
-    let Some(wt_config) = worktrees_config else {
-        return base_domain.to_string();
-    };
-
-    let Some(ref template) = wt_config.domain else {
-        return base_domain.to_string();
-    };
-
-    let Some(ref branch) = git_ctx.branch else {
-        return base_domain.to_string();
-    };
-
-    locald_core::worktree::resolve_domain_template(template, project_name, branch, base_domain)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2246,7 @@ mod tests {
     use locald_core::service::{RuntimeState, ServiceCommand};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -2274,6 +2254,7 @@ mod tests {
     struct TestController {
         id: String,
         state: RuntimeState,
+        fail_stop: bool,
     }
 
     impl TestController {
@@ -2281,6 +2262,15 @@ mod tests {
             Self {
                 id: id.into(),
                 state,
+                fail_stop: false,
+            }
+        }
+
+        fn failing_stop(id: impl Into<String>, state: RuntimeState) -> Self {
+            Self {
+                id: id.into(),
+                state,
+                fail_stop: true,
             }
         }
     }
@@ -2300,6 +2290,9 @@ mod tests {
         }
 
         async fn stop(&mut self) -> Result<()> {
+            if self.fail_stop {
+                anyhow::bail!("injected stop failure");
+            }
             Ok(())
         }
 
@@ -2341,50 +2334,124 @@ mod tests {
         }
     }
 
+    struct RecordingHostSyncer {
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl HostSyncer for RecordingHostSyncer {
+        async fn sync(&self, domains: Vec<String>) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .push(domains);
+            Ok(())
+        }
+    }
+
+    fn test_instance_id() -> ProjectInstanceId {
+        "00000000-0000-4000-8000-000000000001"
+            .parse()
+            .expect("valid project instance ID")
+    }
+
+    fn config_with_services(project: ProjectConfig, service_names: &[&str]) -> LocaldConfig {
+        LocaldConfig {
+            project,
+            services: service_names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        ServiceConfig::Legacy(ExecServiceConfig::default()),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn claim_domains(config: &LocaldConfig) -> HashMap<String, String> {
+        ProcessManager::build_domain_claims(test_instance_id(), config)
+            .expect("valid claims")
+            .into_iter()
+            .filter_map(|claim| match claim.target {
+                DomainTarget::Service {
+                    service_name: Some(service_name),
+                    ..
+                } => Some((service_name, claim.domain.to_string())),
+                DomainTarget::Platform { .. }
+                | DomainTarget::Service {
+                    service_name: None, ..
+                } => None,
+            })
+            .collect()
+    }
+
+    fn install_test_claim(manager: &ProcessManager, domain: &str, service_name: &str) {
+        let current = manager.domain_index.snapshot();
+        let replacement = current
+            .replacing_instance(
+                test_instance_id(),
+                [DomainClaim::service(
+                    domain.parse().expect("valid test domain"),
+                    test_instance_id(),
+                    service_name.to_owned(),
+                )],
+            )
+            .expect("install test claim");
+        manager.domain_index.store(replacement);
+    }
+
     #[test]
     fn test_get_service_domain_default() {
-        let project_config = ProjectConfig {
-            name: "myproject".to_string(),
-            domain: None,
-            ..Default::default()
-        };
+        let config = config_with_services(
+            ProjectConfig {
+                name: "myproject".to_string(),
+                domain: None,
+                ..Default::default()
+            },
+            &["web"],
+        );
 
-        let domain = ProcessManager::get_service_domain("myproject:web", &project_config);
-        // "web" service should map to the root domain
-        assert_eq!(domain, "myproject.localhost".to_string());
+        assert_eq!(
+            claim_domains(&config).get("myproject:web"),
+            Some(&"myproject.localhost".to_owned())
+        );
     }
 
     #[test]
     fn test_get_service_domain_explicit() {
-        let project_config = ProjectConfig {
-            name: "myproject".to_string(),
-            domain: Some("example.com".to_string()),
-            ..Default::default()
-        };
+        let config = config_with_services(
+            ProjectConfig {
+                name: "myproject".to_string(),
+                domain: Some("example.com".to_string()),
+                ..Default::default()
+            },
+            &["api"],
+        );
 
-        let domain = ProcessManager::get_service_domain("myproject:api", &project_config);
-        assert_eq!(domain, "api.example.com".to_string());
+        assert_eq!(
+            claim_domains(&config).get("myproject:api"),
+            Some(&"api.example.com".to_owned())
+        );
     }
 
     #[test]
     fn test_get_service_domain_main_service() {
-        let project_config = ProjectConfig {
-            name: "shop".to_string(),
-            domain: Some("shop.local".to_string()),
-            ..Default::default()
-        };
+        let config = config_with_services(
+            ProjectConfig {
+                name: "shop".to_string(),
+                domain: Some("shop.local".to_string()),
+                ..Default::default()
+            },
+            &["web", "shop", "api"],
+        );
+        let claims = claim_domains(&config);
 
-        // "web" service -> root domain
-        let domain = ProcessManager::get_service_domain("shop:web", &project_config);
-        assert_eq!(domain, "shop.local".to_string());
-
-        // Service matching project name -> root domain
-        let domain = ProcessManager::get_service_domain("shop:shop", &project_config);
-        assert_eq!(domain, "shop.local".to_string());
-
-        // Other service -> subdomain
-        let domain = ProcessManager::get_service_domain("shop:api", &project_config);
-        assert_eq!(domain, "api.shop.local".to_string());
+        assert_eq!(claims.get("shop:web"), Some(&"shop.local".to_owned()));
+        assert_eq!(claims.get("shop:shop"), Some(&"shop.shop.local".to_owned()));
+        assert_eq!(claims.get("shop:api"), Some(&"api.shop.local".to_owned()));
     }
 
     #[test]
@@ -2632,6 +2699,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_clean_synchronizes_released_domain_claims() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("missing-project");
+        std::fs::create_dir(&project_path).expect("create project");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("missing".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "missing.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "missing:web".to_owned(),
+                )],
+            )
+            .expect("record claim");
+        catalog.save().await.expect("persist catalog");
+        std::fs::remove_dir(&project_path).expect("remove project");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        assert_eq!(manager.registry_clean().await.expect("clean registry"), 1);
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[Vec::<String>::new()]
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("missing.localhost")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_clean_preserves_claim_and_controller_when_stop_fails() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("busy-missing-project");
+        std::fs::create_dir(&project_path).expect("create project");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("busy-missing".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "busy-missing.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "busy-missing:web".to_owned(),
+                )],
+            )
+            .expect("record claim");
+        catalog.save().await.expect("persist catalog");
+        let canonical_path = std::fs::canonicalize(&project_path).expect("canonical project path");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let controller = Arc::new(Mutex::new(TestController::failing_stop(
+            "busy-missing:web",
+            RuntimeState {
+                pid: Some(42),
+                port: Some(3000),
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+        )));
+        manager.services.lock().await.insert(
+            "busy-missing:web".to_owned(),
+            test_service(
+                test_config_with_domain("busy-missing", "busy-missing.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                canonical_path,
+            ),
+        );
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+        std::fs::remove_dir(&project_path).expect("remove project");
+
+        let error = manager
+            .registry_clean()
+            .await
+            .expect_err("stop failure must block cleanup");
+
+        assert!(format!("{error:#}").contains("injected stop failure"));
+        assert!(registry.lock().await.instances.contains_key(&instance_id));
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("busy-missing.localhost")
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_service_controller("busy-missing:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn test_stop_project_targets_matching_paths() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
@@ -2795,6 +3012,329 @@ command = "sleep 30"
 
         assert!(manager.services.lock().await.is_empty());
         assert!(registry.lock().await.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn domain_only_reload_reuses_runtime_and_updates_exact_projections() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+        let write_config = |domain: &str| {
+            std::fs::write(
+                project_path.join("locald.toml"),
+                format!(
+                    r#"
+[project]
+name = "reload"
+domain = "{domain}"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+                ),
+            )
+            .expect("write project config");
+        };
+
+        write_config("first.localhost");
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("start first domain");
+        let first_controller = manager
+            .get_service_controller("reload:web")
+            .await
+            .expect("first controller");
+
+        write_config("second.localhost");
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("reload second domain");
+        let second_controller = manager
+            .get_service_controller("reload:web")
+            .await
+            .expect("second controller");
+
+        assert!(Arc::ptr_eq(&first_controller, &second_controller));
+        assert!(
+            manager
+                .resolve_service_by_domain("first.localhost")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            manager.list().await[0].domain.as_deref(),
+            Some("second.localhost")
+        );
+        assert_eq!(
+            manager
+                .inspect("reload:web")
+                .await
+                .expect("inspect reloaded service")["domain"],
+            "second.localhost"
+        );
+        assert!(
+            registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("second.localhost")
+                .is_some()
+        );
+        assert_eq!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[
+                vec!["first.localhost".to_owned()],
+                vec!["second.localhost".to_owned()]
+            ]
+        );
+
+        manager
+            .stop_project(&project_path)
+            .await
+            .expect("stop reloaded project");
+    }
+
+    #[tokio::test]
+    async fn removing_project_synchronizes_released_domain_claims() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("removed-project");
+        std::fs::create_dir(&project_path).expect("create project");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("removed".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "removed.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "removed:web".to_owned(),
+                )],
+            )
+            .expect("record claim");
+        catalog.save().await.expect("persist catalog");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove project");
+
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[Vec::<String>::new()]
+        );
+        assert!(registry.lock().await.get_project(&project_path).is_none());
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("removed.localhost")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_project_preserves_claim_and_controller_when_stop_fails() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("busy-project");
+        std::fs::create_dir(&project_path).expect("create project");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("busy".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "busy.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "busy:web".to_owned(),
+                )],
+            )
+            .expect("record claim");
+        catalog.save().await.expect("persist catalog");
+        let canonical_path = std::fs::canonicalize(&project_path).expect("canonical project path");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let controller = Arc::new(Mutex::new(TestController::failing_stop(
+            "busy:web",
+            RuntimeState {
+                pid: Some(43),
+                port: Some(3001),
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+        )));
+        manager.services.lock().await.insert(
+            "busy:web".to_owned(),
+            test_service(
+                test_config_with_domain("busy", "busy.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                canonical_path,
+            ),
+        );
+
+        let error = manager
+            .remove_project(&project_path)
+            .await
+            .expect_err("stop failure must block removal");
+
+        assert!(format!("{error:#}").contains("injected stop failure"));
+        assert!(registry.lock().await.instances.contains_key(&instance_id));
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("busy.localhost")
+                .is_some()
+        );
+        assert!(manager.get_service_controller("busy:web").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn conflicting_project_claim_fails_before_service_mutation() {
+        let dir = tempdir().expect("create temporary directory");
+        let first_path = dir.path().join("first-project");
+        let second_path = dir.path().join("second-project");
+        std::fs::create_dir(&first_path).expect("create first project");
+        std::fs::create_dir(&second_path).expect("create second project");
+        let project_config = |name: &str| {
+            format!(
+                r#"
+[project]
+name = "{name}"
+domain = "shared.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+            )
+        };
+        std::fs::write(first_path.join("locald.toml"), project_config("first"))
+            .expect("write first config");
+        std::fs::write(second_path.join("locald.toml"), project_config("second"))
+            .expect("write second config");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .apply_config(first_path.clone(), None, false)
+            .await
+            .expect("start first project");
+        let first_controller = manager
+            .get_service_controller("first:web")
+            .await
+            .expect("first controller");
+        let error = manager
+            .apply_config(second_path, None, false)
+            .await
+            .expect_err("conflicting project must fail");
+
+        assert!(error.to_string().contains("first:web"));
+        assert!(error.to_string().contains("second:web"));
+        assert!(manager.services.lock().await.get("second:web").is_none());
+        assert!(Arc::ptr_eq(
+            &first_controller,
+            &manager
+                .get_service_controller("first:web")
+                .await
+                .expect("first controller remains")
+        ));
+        assert_eq!(registry.lock().await.instances.len(), 1);
+        assert_eq!(
+            manager
+                .resolve_service_by_domain("shared.localhost")
+                .await
+                .expect("first route remains")
+                .name,
+            "first:web"
+        );
+
+        manager
+            .stop_project(&first_path)
+            .await
+            .expect("stop first project");
     }
 
     #[tokio::test]
@@ -3036,7 +3576,7 @@ command = "sleep 30"
         // 2. Trigger a second run (should be queued)
         let guard_clone2 = guard.clone();
         let task_clone2 = task.clone();
-        tokio::spawn(async move { guard_clone2.run(task_clone2).await });
+        let second_handle = tokio::spawn(async move { guard_clone2.run(task_clone2).await });
 
         // Give it a moment to queue
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3057,6 +3597,7 @@ command = "sleep 30"
 
         // Wait for handle to finish
         handle.await.unwrap().unwrap();
+        second_handle.await.unwrap().unwrap();
     }
 
     fn test_config_with_domain(name: &str, domain: &str) -> LocaldConfig {
@@ -3090,7 +3631,57 @@ command = "sleep 30"
     }
 
     #[tokio::test]
-    async fn test_resolve_service_by_domain_prefers_portful_running() {
+    async fn exact_index_drives_status_inspection_routing_and_hosts() {
+        let dir = tempdir().expect("create temporary directory");
+        let notify_path = dir.path().join("notify.sock");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager =
+            ProcessManager::new(notify_path, state_manager, registry, attachments, None)
+                .expect("create process manager");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager.services.lock().await.insert(
+            "app:web".to_owned(),
+            test_service(
+                test_config_with_domain("app", "stale.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::None,
+                dir.path().join("app"),
+            ),
+        );
+        install_test_claim(&manager, "current.localhost", "app:web");
+
+        let statuses = manager.list().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].domain.as_deref(), Some("current.localhost"));
+        let inspection = manager.inspect("app:web").await.expect("inspect service");
+        assert_eq!(inspection["domain"], "current.localhost");
+        let resolution = manager
+            .resolve_service_by_domain("CURRENT.LOCALHOST.")
+            .await
+            .expect("resolve normalized claim");
+        assert_eq!(resolution.name, "app:web");
+        assert_eq!(resolution.status, ServiceState::Stopped);
+
+        manager.sync_hosts().await.expect("synchronize hosts");
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[vec!["current.localhost".to_owned()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_uses_the_exact_index_owner() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
@@ -3132,6 +3723,7 @@ command = "sleep 30"
             services.insert("stale:web".to_string(), stopped);
             services.insert("active:web".to_string(), running);
         }
+        install_test_claim(&manager, domain, "active:web");
 
         let resolution = manager
             .resolve_service_by_domain(domain)
@@ -3144,7 +3736,7 @@ command = "sleep 30"
     }
 
     #[tokio::test]
-    async fn test_resolve_service_by_domain_ignores_stopped_port() {
+    async fn test_resolve_service_by_domain_uses_only_a_running_owner_port() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
@@ -3194,6 +3786,7 @@ command = "sleep 30"
             services.insert("stale:web".to_string(), stopped);
             services.insert("active:web".to_string(), running);
         }
+        install_test_claim(&manager, domain, "active:web");
 
         let resolution = manager
             .resolve_service_by_domain(domain)
@@ -3206,7 +3799,7 @@ command = "sleep 30"
     }
 
     #[tokio::test]
-    async fn test_resolve_service_by_domain_prefers_building() {
+    async fn test_resolve_service_by_domain_preserves_building_state() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
@@ -3250,6 +3843,7 @@ command = "sleep 30"
             services.insert("stale:web".to_string(), stopped);
             services.insert("builder:web".to_string(), building);
         }
+        install_test_claim(&manager, domain, "builder:web");
 
         let resolution = manager
             .resolve_service_by_domain(domain)
@@ -3288,6 +3882,7 @@ command = "sleep 30"
             let mut services = manager.services.lock().await;
             services.insert("stale:web".to_string(), stopped);
         }
+        install_test_claim(&manager, domain, "stale:web");
 
         let resolution = manager
             .resolve_service_by_domain(domain)

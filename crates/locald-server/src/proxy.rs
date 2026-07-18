@@ -18,6 +18,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::assets;
+use locald_core::DomainName;
 use locald_core::resolver::ServiceResolver;
 use locald_core::state::ServiceState;
 use locald_utils::cert::CertManager;
@@ -212,7 +213,7 @@ async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri
 }
 
 async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
-    let host = match req.headers().get("host") {
+    let raw_host = match req.headers().get("host") {
         Some(h) => h
             .to_str()
             .unwrap_or_default()
@@ -222,9 +223,20 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
             .to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing Host header").into_response(),
     };
+    let host = match raw_host.parse::<DomainName>() {
+        Ok(host) => host.to_string(),
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
 
-    // Dev UI routing: proxy dev domains to local Vite/Astro dev servers.
-    // This allows hot reload without rebuilding the Rust binary.
+    // Project services override platform fallbacks so locald can develop its
+    // own dashboard and docs through the same managed-domain workflow.
+    let resolution = state.resolver.resolve_service_by_domain(&host).await;
+    if let Some(resolution) = resolution {
+        return proxy_to_domain_resolution(&state, req, &host, resolution).await;
+    }
+
+    // Dev UI fallback: support standalone Vite/Astro development when no
+    // locald-managed project currently owns the dev domain.
     if dev_ui_enabled() {
         if host == "dev.locald.localhost" || host == "dev.locald.local" {
             let port = dev_ui_port("LOCALD_DASHBOARD_DEV_PORT", 5173);
@@ -237,21 +249,8 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
         }
     }
 
-    let resolution = state.resolver.resolve_service_by_domain(&host).await;
-
-    // Prefer a running service for docs.localhost too (useful for docs dev mode),
-    // and fall back to embedded docs when no service claims the domain.
     if host == "docs.localhost" || host == "docs.local" {
-        if let Some(resolution) = resolution {
-            return proxy_to_domain_resolution(&state, req, &host, resolution).await;
-        }
-
         return assets::handle_docs(req.uri()).into_response();
-    }
-
-    // Check if there is a running service for this domain first (e.g. locald-dashboard in dev mode)
-    if let Some(resolution) = resolution {
-        return proxy_to_domain_resolution(&state, req, &host, resolution).await;
     }
 
     // Fallback to embedded dashboard if no service claims the domain

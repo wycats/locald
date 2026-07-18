@@ -91,6 +91,27 @@ async fn test_docs_routing() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_project_service_overrides_platform_fallback() {
+    let resolver = Arc::new(MockResolver {
+        port: None,
+        status: ServiceState::Stopped,
+    });
+    let proxy = ProxyManager::new(resolver, Router::new(), None);
+    let app = proxy.make_app();
+
+    for host in ["locald.localhost", "docs.localhost", "dev.locald.localhost"] {
+        let req = Request::builder()
+            .uri("/")
+            .header("Host", host)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{host}");
+    }
+}
+
 #[derive(Debug)]
 struct MockResolver {
     port: Option<u16>,

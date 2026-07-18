@@ -75,12 +75,18 @@ pub mod state;
 #[doc(inline)]
 pub use state::{ServerState, ServiceState};
 pub mod catalog;
+pub mod domain;
 pub mod storage;
 #[doc(inline)]
 pub use catalog::{
     CatalogError, CatalogPaths, CatalogPresence, ProjectCatalog, ProjectDiscovery, ProjectEntry,
     ProjectInstanceOrigin, ProjectInstanceRecord, ProjectOrigin, ProjectRecord, RepositoryRecord,
     UnresolvedLegacyProject, WorktreeRecord,
+};
+#[doc(inline)]
+pub use domain::{
+    DomainClaim, DomainError, DomainIndex, DomainName, DomainTarget, PlatformDomain,
+    SharedDomainIndex,
 };
 pub mod registry;
 #[doc(inline)]

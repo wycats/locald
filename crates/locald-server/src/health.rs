@@ -1,3 +1,4 @@
+use locald_core::SharedDomainIndex;
 use locald_core::config::{
     DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_TIMEOUT_SECS, HealthCheckConfig,
     ProbeType, ServiceConfig,
@@ -13,6 +14,7 @@ pub(crate) struct HealthMonitor {
     services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
     event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
+    domain_index: SharedDomainIndex,
 }
 
 impl HealthMonitor {
@@ -20,11 +22,13 @@ impl HealthMonitor {
         services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
         event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
         proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
+        domain_index: SharedDomainIndex,
     ) -> Self {
         Self {
             services,
             event_sender,
             proxy_ports,
+            domain_index,
         }
     }
 
@@ -165,10 +169,10 @@ impl HealthMonitor {
                     (
                         true,
                         Some((
-                            Some(crate::manager::ProcessManager::get_service_domain(
-                                name,
-                                &service.config.project,
-                            )),
+                            self.domain_index
+                                .snapshot()
+                                .domain_for_service(name)
+                                .map(ToString::to_string),
                             Some(service.path.clone()),
                             proxy_ports,
                             snapshot,
@@ -248,10 +252,10 @@ impl HealthMonitor {
                     (
                         true,
                         Some((
-                            Some(crate::manager::ProcessManager::get_service_domain(
-                                name,
-                                &service.config.project,
-                            )),
+                            self.domain_index
+                                .snapshot()
+                                .domain_for_service(name)
+                                .map(ToString::to_string),
                             Some(service.path.clone()),
                             proxy_ports,
                             snapshot,
@@ -459,6 +463,7 @@ impl Clone for HealthMonitor {
             services: self.services.clone(),
             event_sender: self.event_sender.clone(),
             proxy_ports: self.proxy_ports.clone(),
+            domain_index: self.domain_index.clone(),
         }
     }
 }
