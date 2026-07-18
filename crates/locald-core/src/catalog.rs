@@ -689,14 +689,32 @@ impl ProjectCatalog {
         pinned: bool,
         last_seen: SystemTime,
     ) -> Result<ProjectInstanceId, CatalogError> {
-        if let Some(existing_id) = self.current_instance_at(&project_root)
-            && matches!(
-                self.instances
-                    .get(&existing_id)
-                    .map(|record| &record.origin),
+        let current_non_git = self.current_instance_at(&project_root).filter(|id| {
+            matches!(
+                self.instances.get(id).map(|record| record.origin),
                 Some(ProjectInstanceOrigin::NonGit)
             )
-        {
+        });
+        let aliased_non_git = self.legacy_paths.get(&project_root).copied().filter(|id| {
+            self.instances.get(id).is_some_and(|record| {
+                matches!(record.origin, ProjectInstanceOrigin::NonGit)
+                    && record.current_path.is_none()
+                    && record.last_known_path == project_root
+            })
+        });
+        let existing_id = current_non_git.or(aliased_non_git).or_else(|| {
+            self.instances
+                .iter()
+                .filter(|(_, record)| {
+                    matches!(record.origin, ProjectInstanceOrigin::NonGit)
+                        && record.current_path.is_none()
+                        && record.last_known_path == project_root
+                })
+                .max_by_key(|(id, record)| (record.last_seen, **id))
+                .map(|(id, _)| *id)
+        });
+        if let Some(existing_id) = existing_id {
+            self.retire_path_claims(&project_root, existing_id);
             let record = self
                 .instances
                 .get_mut(&existing_id)
@@ -706,6 +724,7 @@ impl ProjectCatalog {
             }
             record.pinned |= pinned;
             record.last_seen = last_seen;
+            record.current_path = Some(project_root.clone());
             record.presence = CatalogPresence::Active;
             self.legacy_paths.insert(project_root, existing_id);
             return Ok(existing_id);
@@ -938,13 +957,23 @@ impl ProjectCatalog {
     /// retained for identity discovery the next time the project is opened.
     pub fn prune_missing_projects(&mut self) -> Result<usize, CatalogError> {
         self.reconcile_missing()?;
-        let missing: Vec<_> = self
-            .instances
-            .iter()
-            .filter_map(|(id, record)| {
-                (record.presence == CatalogPresence::Missing && !record.pinned).then_some(*id)
-            })
-            .collect();
+        let mut missing = Vec::new();
+        for (id, record) in &self.instances {
+            if record.presence != CatalogPresence::Missing || record.pinned {
+                continue;
+            }
+            let removable = match record.origin {
+                ProjectInstanceOrigin::Git { .. } => {
+                    !git_locator_matches(&record.last_known_path, |identity| {
+                        identity.project_instance_id == *id
+                    })?
+                }
+                ProjectInstanceOrigin::NonGit => true,
+            };
+            if removable {
+                missing.push(*id);
+            }
+        }
         let unresolved: Vec<_> = self
             .unresolved_legacy
             .iter()
@@ -1009,9 +1038,13 @@ impl ProjectCatalog {
     /// Reconcile catalog presence with the filesystem without deleting records.
     pub fn reconcile_missing(&mut self) -> Result<usize, CatalogError> {
         let mut changed = 0;
+
+        // First release every current locator that no longer resolves to its
+        // recorded identity. A second pass can then reclaim restored locators
+        // without colliding with stale current-path claims.
         for (repository_id, record) in &mut self.repositories {
             if let Some(path) = record.current_git_dir.clone()
-                && !repository_locator_matches(&path, *repository_id)?
+                && !reconciliation_repository_locator_matches(&path, *repository_id)?
             {
                 record.current_git_dir = None;
                 record.last_known_git_dir = path;
@@ -1021,7 +1054,7 @@ impl ProjectCatalog {
         }
         for (worktree_id, record) in &mut self.worktrees {
             if let Some(path) = record.current_path.clone()
-                && !git_locator_matches(&path, |identity| {
+                && !reconciliation_git_locator_matches(&path, |identity| {
                     identity.repository_id == record.repository_id
                         && identity.worktree_id == *worktree_id
                 })?
@@ -1036,7 +1069,7 @@ impl ProjectCatalog {
             let matches = match record.origin {
                 ProjectInstanceOrigin::Git { .. } => {
                     record.current_path.as_deref().map_or(Ok(false), |path| {
-                        git_locator_matches(path, |identity| {
+                        reconciliation_git_locator_matches(path, |identity| {
                             identity.project_instance_id == *instance_id
                         })
                     })?
@@ -1055,6 +1088,95 @@ impl ProjectCatalog {
                 changed += 1;
             }
         }
+
+        let mut current_repository_paths: BTreeSet<_> = self
+            .repositories
+            .values()
+            .filter_map(|record| record.current_git_dir.clone())
+            .collect();
+        for (repository_id, record) in &mut self.repositories {
+            if record.presence == CatalogPresence::Missing
+                && !current_repository_paths.contains(&record.last_known_git_dir)
+                && reconciliation_repository_locator_matches(
+                    &record.last_known_git_dir,
+                    *repository_id,
+                )?
+            {
+                record.current_git_dir = Some(record.last_known_git_dir.clone());
+                record.presence = CatalogPresence::Active;
+                current_repository_paths.insert(record.last_known_git_dir.clone());
+                changed += 1;
+            }
+        }
+
+        let mut current_worktree_paths: BTreeSet<_> = self
+            .worktrees
+            .values()
+            .filter_map(|record| record.current_path.clone())
+            .collect();
+        for (worktree_id, record) in &mut self.worktrees {
+            if record.presence == CatalogPresence::Missing
+                && !current_worktree_paths.contains(&record.last_known_path)
+                && reconciliation_git_locator_matches(&record.last_known_path, |identity| {
+                    identity.repository_id == record.repository_id
+                        && identity.worktree_id == *worktree_id
+                })?
+            {
+                record.current_path = Some(record.last_known_path.clone());
+                record.presence = CatalogPresence::Active;
+                current_worktree_paths.insert(record.last_known_path.clone());
+                changed += 1;
+            }
+        }
+
+        let mut current_instance_paths: BTreeSet<_> = self
+            .instances
+            .values()
+            .filter_map(|record| record.current_path.clone())
+            .collect();
+        let mut missing_instances: Vec<_> = self
+            .instances
+            .iter()
+            .filter_map(|(id, record)| (record.presence == CatalogPresence::Missing).then_some(*id))
+            .collect();
+        missing_instances.sort_by(|left, right| {
+            let left_record = &self.instances[left];
+            let right_record = &self.instances[right];
+            let left_is_alias = self.legacy_paths.get(&left_record.last_known_path) == Some(left);
+            let right_is_alias =
+                self.legacy_paths.get(&right_record.last_known_path) == Some(right);
+            right_is_alias
+                .cmp(&left_is_alias)
+                .then_with(|| right_record.last_seen.cmp(&left_record.last_seen))
+                .then_with(|| right.cmp(left))
+        });
+        for instance_id in missing_instances {
+            let missing_record = &self.instances[&instance_id];
+            let path = missing_record.last_known_path.clone();
+            if current_instance_paths.contains(&path) {
+                continue;
+            }
+            let matches = match missing_record.origin {
+                ProjectInstanceOrigin::Git { .. } => {
+                    reconciliation_git_locator_matches(&path, |identity| {
+                        identity.project_instance_id == instance_id
+                    })?
+                }
+                ProjectInstanceOrigin::NonGit => try_exists(&path)?,
+            };
+            if matches {
+                let restored_record = self.instances.get_mut(&instance_id).ok_or_else(|| {
+                    CatalogError::Invariant("missing project instance".to_owned())
+                })?;
+                restored_record.current_path = Some(path.clone());
+                restored_record.presence = CatalogPresence::Active;
+                self.legacy_paths.insert(path.clone(), instance_id);
+                self.unresolved_legacy.remove(&path);
+                current_instance_paths.insert(path);
+                changed += 1;
+            }
+        }
+
         self.validate()?;
         Ok(changed)
     }
@@ -1374,6 +1496,18 @@ fn repository_locator_matches(path: &Path, expected: RepositoryId) -> Result<boo
     Ok(inspect_repository_id(path)?.is_some_and(|identity| identity == expected))
 }
 
+fn reconciliation_repository_locator_matches(
+    path: &Path,
+    expected: RepositoryId,
+) -> Result<bool, CatalogError> {
+    match repository_locator_matches(path, expected) {
+        Err(CatalogError::Io { .. } | CatalogError::Identity(IdentityError::MarkerIo { .. })) => {
+            Ok(false)
+        }
+        result => result,
+    }
+}
+
 fn git_locator_matches(
     path: &Path,
     matches: impl FnOnce(ProjectIdentity) -> bool,
@@ -1382,6 +1516,30 @@ fn git_locator_matches(
         return Ok(false);
     }
     Ok(inspect_git_project_identity(path)?.is_some_and(matches))
+}
+
+fn reconciliation_git_locator_matches(
+    path: &Path,
+    matches: impl FnOnce(ProjectIdentity) -> bool,
+) -> Result<bool, CatalogError> {
+    match git_locator_matches(path, matches) {
+        Err(CatalogError::Io { .. }) => Ok(false),
+        Err(CatalogError::Identity(error)) if unavailable_git_locator(&error) => Ok(false),
+        result => result,
+    }
+}
+
+const fn unavailable_git_locator(error: &IdentityError) -> bool {
+    matches!(
+        error,
+        IdentityError::CanonicalizeProjectRoot { .. }
+            | IdentityError::BrokenWorktree { .. }
+            | IdentityError::UnrepairedWorktree { .. }
+            | IdentityError::BareRepository { .. }
+            | IdentityError::CanonicalizeGitDirectory { .. }
+            | IdentityError::ProjectOutsideWorktree { .. }
+            | IdentityError::MarkerIo { .. }
+    )
 }
 
 fn validate_presence(
@@ -2117,6 +2275,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reappearing_non_git_project_reuses_its_identity_and_metadata() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("returning-plain-project");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let discovery = ProjectCatalog::discover(project.clone())
+            .await
+            .expect("discover non-Git project");
+        let instance_id = catalog
+            .register_project_and_save(discovery, Some("plain".to_owned()))
+            .await
+            .expect("register non-Git project");
+        let project_id = catalog.instances[&instance_id].project_id;
+        let record = catalog
+            .instances
+            .get_mut(&instance_id)
+            .expect("non-Git instance");
+        record.pinned = true;
+        record.domain_slug = Some("plain".to_owned());
+        record.domain_claims.insert("plain.localhost".to_owned());
+        catalog.save().await.expect("save non-Git metadata");
+
+        std::fs::remove_dir_all(&project).expect("remove non-Git project");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("persist missing non-Git project");
+        assert_eq!(
+            catalog.instances[&instance_id].presence,
+            CatalogPresence::Missing
+        );
+        std::fs::create_dir(&project).expect("restore non-Git project");
+        let discovery = ProjectCatalog::discover(project.clone())
+            .await
+            .expect("rediscover non-Git project");
+        let rediscovered_id = catalog
+            .register_project_and_save(discovery, Some("plain again".to_owned()))
+            .await
+            .expect("reconcile restored non-Git project");
+        let catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("reopen restored non-Git project");
+
+        assert_eq!(rediscovered_id, instance_id);
+        assert_eq!(catalog.instances.len(), 1);
+        assert_eq!(catalog.projects.len(), 1);
+        let record = &catalog.instances[&instance_id];
+        assert_eq!(record.project_id, project_id);
+        assert_eq!(record.presence, CatalogPresence::Active);
+        assert_eq!(
+            record.current_path,
+            Some(std::fs::canonicalize(&project).expect("canonical restored project"))
+        );
+        assert!(record.pinned);
+        assert_eq!(record.domain_slug.as_deref(), Some("plain"));
+        assert!(record.domain_claims.contains("plain.localhost"));
+    }
+
+    #[tokio::test]
     async fn malformed_existing_catalog_blocks_without_reimport_or_rewrite() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
@@ -2202,6 +2420,309 @@ mod tests {
             catalog.instances[&instance_id].last_known_path,
             canonical_original
         );
+    }
+
+    #[tokio::test]
+    async fn clean_reactivates_a_restored_git_project_before_pruning() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.git_project("restored-before-clean");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let discovery = ProjectCatalog::discover(project.clone())
+            .await
+            .expect("discover Git project");
+        let identity = match &discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.identity,
+            ProjectDiscovery::NonGit { .. } => panic!("expected Git discovery"),
+        };
+        catalog
+            .register_project_and_save(discovery, Some("restored".to_owned()))
+            .await
+            .expect("register Git project");
+        let record = catalog
+            .instances
+            .get_mut(&identity.project_instance_id)
+            .expect("Git instance");
+        record.domain_slug = Some("restored".to_owned());
+        record.domain_claims.insert("restored.localhost".to_owned());
+        catalog.save().await.expect("save Git project metadata");
+
+        let parked = fixture._temp.path().join("temporarily-parked");
+        std::fs::rename(&project, &parked).expect("temporarily move Git project");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("persist missing Git project");
+        assert_eq!(
+            catalog.repositories[&identity.repository_id].presence,
+            CatalogPresence::Missing
+        );
+        assert_eq!(
+            catalog.worktrees[&identity.worktree_id].presence,
+            CatalogPresence::Missing
+        );
+        assert_eq!(
+            catalog.instances[&identity.project_instance_id].presence,
+            CatalogPresence::Missing
+        );
+        std::fs::rename(&parked, &project).expect("restore Git project");
+
+        assert_eq!(
+            catalog
+                .prune_missing_projects()
+                .expect("clean restored Git project"),
+            0
+        );
+        catalog.save().await.expect("save restored Git project");
+        let catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("reopen restored Git project");
+        assert_eq!(
+            catalog.repositories[&identity.repository_id].presence,
+            CatalogPresence::Active
+        );
+        assert_eq!(
+            catalog.worktrees[&identity.worktree_id].presence,
+            CatalogPresence::Active
+        );
+        let record = &catalog.instances[&identity.project_instance_id];
+        assert_eq!(record.presence, CatalogPresence::Active);
+        assert_eq!(
+            record.current_path,
+            Some(std::fs::canonicalize(&project).expect("canonical restored project"))
+        );
+        assert_eq!(record.domain_slug.as_deref(), Some("restored"));
+        assert!(record.domain_claims.contains("restored.localhost"));
+        assert_eq!(
+            catalog.instance_for_path(&project),
+            Some(identity.project_instance_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_historical_git_identity_reclaims_its_compatibility_alias() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.git_project("historical-return");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let original_discovery = ProjectCatalog::discover(project.clone())
+            .await
+            .expect("discover original checkout");
+        let original_identity = match &original_discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.identity,
+            ProjectDiscovery::NonGit { .. } => panic!("expected Git discovery"),
+        };
+        catalog
+            .register_project_and_save(original_discovery, Some("original".to_owned()))
+            .await
+            .expect("register original checkout");
+        let original_record = catalog
+            .instances
+            .get_mut(&original_identity.project_instance_id)
+            .expect("original instance");
+        original_record.domain_slug = Some("historical".to_owned());
+        original_record
+            .domain_claims
+            .insert("historical.localhost".to_owned());
+        catalog.save().await.expect("save original metadata");
+
+        let parked = fixture._temp.path().join("parked-original");
+        std::fs::rename(&project, &parked).expect("park original checkout");
+        let replacement = fixture.git_project("historical-return");
+        let replacement_discovery = ProjectCatalog::discover(replacement.clone())
+            .await
+            .expect("discover replacement checkout");
+        let replacement_identity = match &replacement_discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.identity,
+            ProjectDiscovery::NonGit { .. } => panic!("expected Git discovery"),
+        };
+        catalog
+            .register_project_and_save(replacement_discovery, Some("replacement".to_owned()))
+            .await
+            .expect("register replacement checkout");
+        let canonical = std::fs::canonicalize(&replacement).expect("canonical replacement path");
+        assert_ne!(
+            original_identity.project_instance_id,
+            replacement_identity.project_instance_id
+        );
+        assert_eq!(
+            catalog.legacy_paths.get(&canonical),
+            Some(&replacement_identity.project_instance_id)
+        );
+
+        std::fs::remove_dir_all(&replacement).expect("remove replacement checkout");
+        std::fs::rename(&parked, &project).expect("restore original checkout");
+        catalog
+            .reconcile_missing()
+            .expect("reconcile restored original checkout");
+        catalog.save().await.expect("save restored catalog");
+        let catalog = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("reopen restored catalog");
+
+        assert_eq!(
+            catalog.legacy_paths.get(&canonical),
+            Some(&original_identity.project_instance_id)
+        );
+        assert_eq!(
+            catalog.instance_for_path(&project),
+            Some(original_identity.project_instance_id)
+        );
+        let original_record = &catalog.instances[&original_identity.project_instance_id];
+        assert_eq!(original_record.presence, CatalogPresence::Active);
+        assert_eq!(original_record.domain_slug.as_deref(), Some("historical"));
+        assert!(
+            original_record
+                .domain_claims
+                .contains("historical.localhost")
+        );
+        assert_eq!(
+            catalog.instances[&replacement_identity.project_instance_id].presence,
+            CatalogPresence::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_existing_git_locator_is_reconciled_as_missing() {
+        let fixture = Fixture::new();
+        let root = fixture.git_project("linked-root");
+        let linked = fixture._temp.path().join("linked-broken");
+        let linked_text = linked.to_str().expect("UTF-8 linked worktree path");
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked-broken", linked_text],
+        );
+        let mut catalog = ProjectCatalog::load_from_paths(fixture.paths().clone())
+            .await
+            .expect("initialize catalog");
+        let discovery = ProjectCatalog::discover(linked.clone())
+            .await
+            .expect("discover linked worktree");
+        let resolved = match &discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.clone(),
+            ProjectDiscovery::NonGit { .. } => panic!("expected Git discovery"),
+        };
+        catalog
+            .register_project_and_save(discovery, Some("linked".to_owned()))
+            .await
+            .expect("register linked worktree");
+        let unavailable_admin = fixture._temp.path().join("unavailable-worktree-admin");
+        std::fs::rename(&resolved.worktree_git_dir, &unavailable_admin)
+            .expect("make linked Git locator unreadable");
+
+        let mut reopened = ProjectCatalog::load_from_paths(fixture.paths())
+            .await
+            .expect("reconcile unreadable Git locator");
+
+        assert_eq!(
+            reopened.repositories[&resolved.identity.repository_id].presence,
+            CatalogPresence::Active
+        );
+        assert_eq!(
+            reopened.worktrees[&resolved.identity.worktree_id].presence,
+            CatalogPresence::Missing
+        );
+        assert!(
+            reopened.worktrees[&resolved.identity.worktree_id]
+                .current_path
+                .is_none()
+        );
+        assert_eq!(
+            reopened.worktrees[&resolved.identity.worktree_id].last_known_path,
+            resolved.worktree_root
+        );
+        assert_eq!(
+            reopened.instances[&resolved.identity.project_instance_id].presence,
+            CatalogPresence::Missing
+        );
+        assert!(
+            reopened.instances[&resolved.identity.project_instance_id]
+                .current_path
+                .is_none()
+        );
+        assert_eq!(
+            reopened.instances[&resolved.identity.project_instance_id].last_known_path,
+            resolved.project_root
+        );
+        let clean_error = reopened
+            .prune_missing_projects()
+            .expect_err("cleanup must retain an unreadable Git locator");
+        assert!(matches!(
+            clean_error,
+            CatalogError::Identity(IdentityError::BrokenWorktree { .. })
+        ));
+        assert!(clean_error.to_string().contains("git worktree repair"));
+        assert!(
+            reopened
+                .instances
+                .contains_key(&resolved.identity.project_instance_id)
+        );
+        let error = ProjectCatalog::discover(linked)
+            .await
+            .expect_err("active discovery still reports the broken worktree");
+        assert!(matches!(
+            error,
+            CatalogError::Identity(IdentityError::BrokenWorktree { .. })
+        ));
+        assert!(error.to_string().contains("git worktree repair"));
+    }
+
+    #[tokio::test]
+    async fn malformed_git_marker_still_blocks_catalog_reconciliation() {
+        let fixture = Fixture::new();
+        let project = fixture.git_project("malformed-reconciliation-marker");
+        let mut catalog = ProjectCatalog::load_from_paths(fixture.paths().clone())
+            .await
+            .expect("initialize catalog");
+        let discovery = ProjectCatalog::discover(project)
+            .await
+            .expect("discover Git project");
+        let resolved = match &discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.clone(),
+            ProjectDiscovery::NonGit { .. } => panic!("expected Git discovery"),
+        };
+        catalog
+            .register_project_and_save(discovery, Some("malformed".to_owned()))
+            .await
+            .expect("register Git project");
+        let marker = resolved.worktree_git_dir.join("locald/worktree-id");
+        let malformed = "v1 definitely-not-a-uuid\n";
+        std::fs::write(&marker, malformed).expect("corrupt worktree marker");
+
+        let error = ProjectCatalog::load_from_paths(fixture.paths())
+            .await
+            .expect_err("malformed marker must block reconciliation");
+
+        assert!(matches!(
+            error,
+            CatalogError::Identity(IdentityError::InvalidMarker { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("read malformed marker"),
+            malformed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_treats_locator_io_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let looped = fixture._temp.path().join("unavailable-repository-locator");
+        symlink(&looped, &looped).expect("create self-referential locator");
+        let expected = "4b032f75-5c3f-486a-9dc8-ae4501e12843"
+            .parse()
+            .expect("parse repository ID");
+
+        assert!(
+            !reconciliation_repository_locator_matches(&looped, expected)
+                .expect("reconciliation should classify locator I/O as missing")
+        );
+        assert!(repository_locator_matches(&looped, expected).is_err());
     }
 
     #[tokio::test]
