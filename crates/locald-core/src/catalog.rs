@@ -580,6 +580,9 @@ impl ProjectCatalog {
                 .collect::<Result<Vec<_>, DomainError>>()?;
             index = index.replacing_instance(instance_id, claims)?;
         }
+        for (instance_id, record) in &mut self.instances {
+            record.domain_claims = index.domains_for_instance(*instance_id);
+        }
         self.domain_index = index;
         Ok(())
     }
@@ -4223,7 +4226,7 @@ mod tests {
             .expect("catalog object")
             .remove("domain_index");
         stored["instances"][instance_id.to_string()]["domain_claims"] =
-            serde_json::json!(["legacy.localhost"]);
+            serde_json::json!(["LEGACY.LOCALHOST."]);
         tokio::fs::write(
             &paths.catalog,
             serde_json::to_vec_pretty(&stored).expect("serialize legacy catalog"),
@@ -4241,6 +4244,10 @@ mod tests {
                 project_instance_id: instance_id,
                 service_name: None,
             })
+        );
+        assert_eq!(
+            reopened.instances[&instance_id].domain_claims,
+            BTreeSet::from(["legacy.localhost".to_owned()])
         );
     }
 
