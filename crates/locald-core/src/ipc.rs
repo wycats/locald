@@ -269,6 +269,10 @@ pub enum IpcRequest {
     ///
     /// **Response:** `IpcResponse::Status(Vec<ServiceStatus>)`
     Status,
+    /// Synchronize the hosts file from the daemon-owned domain index.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    SyncHosts,
     /// Shut down the server.
     ///
     /// **Response:** `IpcResponse::Ok`

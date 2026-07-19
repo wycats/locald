@@ -823,7 +823,7 @@ impl ProcessManager {
                 let manager = manager.clone();
                 let syncer = syncer.clone();
                 async move {
-                    let domains = manager.domain_index.snapshot().service_domains();
+                    let domains = manager.domain_index.snapshot().hosts_domains();
                     syncer.sync(domains).await
                 }
             })
@@ -2385,6 +2385,19 @@ mod tests {
         }
     }
 
+    fn expected_hosts(service_domains: &[&str]) -> Vec<String> {
+        let mut domains = vec![
+            "dev.docs.local".to_owned(),
+            "dev.locald.local".to_owned(),
+            "docs.local".to_owned(),
+            "locald.local".to_owned(),
+        ];
+        domains.extend(service_domains.iter().map(|domain| (*domain).to_owned()));
+        domains.sort();
+        domains.dedup();
+        domains
+    }
+
     fn test_instance_id() -> ProjectInstanceId {
         "00000000-0000-4000-8000-000000000001"
             .parse()
@@ -2917,7 +2930,7 @@ API_URL = "https://api.example"
                 .lock()
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
-            &[Vec::<String>::new()]
+            &[expected_hosts(&[])]
         );
         assert!(
             manager
@@ -3278,8 +3291,8 @@ command = "sleep 30"
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
             &[
-                vec!["first.localhost".to_owned()],
-                vec!["second.localhost".to_owned()]
+                expected_hosts(&["first.localhost"]),
+                expected_hosts(&["second.localhost"]),
             ]
         );
 
@@ -3397,7 +3410,7 @@ BROKEN_URL = "${services.missing.url}"
                 .lock()
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
-            &[vec!["first.localhost".to_owned()]]
+            &[expected_hosts(&["first.localhost"])]
         );
 
         manager
@@ -3638,7 +3651,7 @@ domain = "reload.localhost"
                 .lock()
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
-            &[Vec::<String>::new()]
+            &[expected_hosts(&[])]
         );
     }
 
@@ -3694,7 +3707,7 @@ domain = "reload.localhost"
                 .lock()
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
-            &[Vec::<String>::new()]
+            &[expected_hosts(&[])]
         );
         assert!(registry.lock().await.get_project(&project_path).is_none());
         assert!(
@@ -4205,7 +4218,7 @@ command = "sleep 30"
                 .lock()
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
-            &[vec!["current.localhost".to_owned()]]
+            &[expected_hosts(&["current.localhost"])]
         );
     }
 

@@ -332,6 +332,27 @@ impl DomainIndex {
             .collect()
     }
 
+    /// Return the exact hostnames that require explicit hosts-file mappings.
+    ///
+    /// Project-service domains remain in the compatibility projection. Platform
+    /// `.local` aliases also require an entry because, unlike `.localhost`, they
+    /// do not resolve to loopback by definition.
+    #[must_use]
+    pub fn hosts_domains(&self) -> Vec<String> {
+        self.claims
+            .iter()
+            .filter(|(domain, target)| {
+                matches!(target, DomainTarget::Service { .. })
+                    || matches!(target, DomainTarget::Platform { .. })
+                        && domain
+                            .as_str()
+                            .rsplit_once('.')
+                            .is_some_and(|(_, suffix)| suffix == "local")
+            })
+            .map(|(domain, _)| domain.to_string())
+            .collect()
+    }
+
     /// Return every exact hostname owned by one project instance.
     #[must_use]
     pub fn domains_for_instance(&self, instance_id: ProjectInstanceId) -> BTreeSet<String> {
@@ -679,6 +700,40 @@ mod tests {
             })
         );
         assert!(index.validate().is_ok());
+        assert_eq!(
+            index.hosts_domains(),
+            [
+                "dev.docs.local",
+                "dev.locald.local",
+                "docs.local",
+                "locald.local",
+            ]
+        );
+    }
+
+    #[test]
+    fn hosts_projection_combines_service_claims_with_platform_aliases() {
+        let instance_id = instance(5);
+        let index = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    service_claim("app.localhost", instance_id, "app:web"),
+                    service_claim("docs.local", instance_id, "app:docs"),
+                ],
+            )
+            .expect("service claims");
+
+        assert_eq!(
+            index.hosts_domains(),
+            [
+                "app.localhost",
+                "dev.docs.local",
+                "dev.locald.local",
+                "docs.local",
+                "locald.local",
+            ]
+        );
     }
 
     #[test]

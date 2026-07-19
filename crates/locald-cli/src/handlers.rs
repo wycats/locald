@@ -1,9 +1,8 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
-use locald_core::{HostsFileSection, IpcRequest, IpcResponse, LocaldConfig};
+use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
-use std::collections::HashSet;
 use std::io::IsTerminal;
 
 #[cfg(feature = "experimental-cnb")]
@@ -1069,61 +1068,17 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         ));
                     }
                 }
-                AdminCommands::SyncHosts => {
-                    // Fetch services
-                    let IpcResponse::Status(services) = client::send_request(&IpcRequest::Status)?
-                    else {
-                        return Err(CliError::message("Failed to get status from daemon"));
-                    };
-
-                    let domains: HashSet<String> =
-                        services.into_iter().filter_map(|s| s.domain).collect();
-
-                    let mut domain_list: Vec<String> = domains.into_iter().collect();
-                    domain_list.sort();
-
-                    #[cfg(unix)]
-                    if !nix::unistd::geteuid().is_root() {
-                        // Check if we are already running under shim
-                        if std::env::var("LOCALD_SHIM_ACTIVE").is_ok() {
-                            return Err(CliError::message(
-                                "Failed to elevate privileges via shim (still not root).",
-                            ));
-                        }
-
-                        // Try to escalate via shim
-                        if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
-                            // Exec shim
-                            use std::os::unix::process::CommandExt;
-                            let err = std::process::Command::new(&shim_path)
-                                .arg("admin")
-                                .arg("sync-hosts")
-                                .args(&domain_list)
-                                .exec();
-                            eprintln!("Failed to exec shim: {err}");
-                        }
-
-                        return Err(CliError::message(
-                            "This command requires root privileges. Please run with sudo or ensure locald-shim is configured.",
-                        ));
+                AdminCommands::SyncHosts => match client::send_request(&IpcRequest::SyncHosts)? {
+                    IpcResponse::Ok => println!("Hosts file updated."),
+                    IpcResponse::Error(message) => {
+                        return Err(CliError::message(message));
                     }
-
-                    println!("Syncing {} domains to hosts file...", domain_list.len());
-
-                    let hosts = HostsFileSection::new();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-
-                    let content = rt
-                        .block_on(hosts.read())
-                        .context("Failed to read hosts file")?;
-                    let new_content = hosts.update_content(&content, &domain_list);
-                    rt.block_on(hosts.write(&new_content))
-                        .context("Failed to write hosts file")?;
-
-                    println!("Hosts file updated.");
-                }
+                    response => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                },
             }
         }
         Commands::Tray { command } => {

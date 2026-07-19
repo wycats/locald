@@ -28,8 +28,10 @@ pub enum DomainResolution {
 pub trait ServiceResolver: Send + Sync + std::fmt::Debug {
     /// Find the service associated with a given domain.
     ///
-    /// Returns `Some(DomainResolution)` if locald owns the domain, including
-    /// ownership-only claims, or `None` if the domain is unclaimed.
+    /// Returns `Some(DomainResolution)` for project-service ownership, including
+    /// ownership-only claims. Platform-owned domains return `None` so the proxy
+    /// can serve the corresponding platform surface; unclaimed domains also
+    /// return `None`.
     async fn resolve_service_by_domain(&self, domain: &str) -> Option<DomainResolution>;
 
     /// Update the port the HTTP proxy is bound to.

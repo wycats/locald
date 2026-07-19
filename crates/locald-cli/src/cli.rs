@@ -629,7 +629,7 @@ pub enum AdminCommands {
     Setup,
     /// Remove admin setup (helper, `LaunchAgent`, config). Auto-escalates to root.
     Teardown,
-    /// Sync hosts file with running services. Auto-escalates to root.
+    /// Sync the hosts file with daemon-owned domains.
     SyncHosts,
 }
 

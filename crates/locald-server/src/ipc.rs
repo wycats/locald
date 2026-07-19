@@ -247,6 +247,10 @@ async fn handle_connection(
             let status = manager.list().await;
             IpcResponse::Status(status)
         }
+        IpcRequest::SyncHosts => match manager.sync_hosts().await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
         IpcRequest::Shutdown => {
             let _ = shutdown_tx.send(ShutdownReason::Stop).await;
             IpcResponse::Ok
