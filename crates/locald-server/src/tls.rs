@@ -12,7 +12,8 @@ pub(crate) fn owned_server_name(
     requested_server_name: &str,
 ) -> Option<String> {
     let domain = requested_server_name.parse::<DomainName>().ok()?;
-    domain_index.snapshot().resolve(domain.as_str())?;
+    let snapshot = domain_index.snapshot();
+    snapshot.claims().get(&domain)?;
     Some(domain.to_string())
 }
 
