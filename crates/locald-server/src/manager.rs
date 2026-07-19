@@ -4805,27 +4805,42 @@ domain = "reload.localhost"
         let second_path = dir.path().join("second-project");
         std::fs::create_dir(&first_path).expect("create first project");
         std::fs::create_dir(&second_path).expect("create second project");
-        let project_config = |name: &str| {
+        let project_config = |name: &str, domain: &str, include_api: bool| {
             format!(
                 r#"
 [project]
 name = "{name}"
-domain = "shared.localhost"
+domain = "{domain}"
 
 [services.web]
 type = "worker"
 command = "sleep 30"
+{}
 "#,
+                if include_api {
+                    r#"
+[services.api]
+type = "worker"
+command = "sleep 30"
+"#
+                } else {
+                    ""
+                }
             )
         };
-        std::fs::write(first_path.join("locald.toml"), project_config("first"))
-            .expect("write first config");
-        std::fs::write(second_path.join("locald.toml"), project_config("second"))
-            .expect("write second config");
+        std::fs::write(
+            first_path.join("locald.toml"),
+            project_config("first", "first.localhost", false),
+        )
+        .expect("write first config");
+        std::fs::write(
+            second_path.join("locald.toml"),
+            project_config("second", "second.localhost", true),
+        )
+        .expect("write second config");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
-        let registry = Arc::new(Mutex::new(Registry::with_path(
-            dir.path().join("catalog.json"),
-        )));
+        let catalog_path = dir.path().join("catalog.json");
+        let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path.clone())));
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
@@ -4837,24 +4852,66 @@ command = "sleep 30"
             None,
         )
         .expect("create process manager");
-        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
 
         manager
             .apply_config(first_path.clone(), None, false)
             .await
             .expect("start first project");
+        manager
+            .apply_config(second_path.clone(), None, false)
+            .await
+            .expect("start second project");
         let first_controller = manager
             .get_service_controller("first:web")
             .await
             .expect("first controller");
+        let second_web_controller = manager
+            .get_service_controller("second:web")
+            .await
+            .expect("second web controller");
+        let second_api_controller = manager
+            .get_service_controller("second:api")
+            .await
+            .expect("second api controller");
+        let catalog_before = std::fs::read(&catalog_path).expect("read existing catalog");
+        let registry_before = registry.lock().await.clone();
+        let domain_index_before = manager.domain_index().snapshot();
+        let host_sync_calls_before = host_sync_calls
+            .lock()
+            .expect("recording host sync mutex poisoned")
+            .clone();
+
+        std::fs::write(
+            second_path.join("locald.toml"),
+            project_config("second", "first.localhost", true),
+        )
+        .expect("write conflicting second config");
         let error = manager
-            .apply_config(second_path, None, false)
+            .apply_config(second_path.clone(), None, false)
             .await
             .expect_err("conflicting project must fail");
 
         assert!(error.to_string().contains("first:web"));
         assert!(error.to_string().contains("second:web"));
-        assert!(manager.services.lock().await.get("second:web").is_none());
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read catalog after rejected reload"),
+            catalog_before
+        );
+        assert_eq!(*registry.lock().await, registry_before);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            domain_index_before.as_ref()
+        );
+        assert_eq!(
+            *host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned"),
+            host_sync_calls_before
+        );
         assert!(Arc::ptr_eq(
             &first_controller,
             &manager
@@ -4862,16 +4919,59 @@ command = "sleep 30"
                 .await
                 .expect("first controller remains")
         ));
-        assert_eq!(registry.lock().await.instances.len(), 1);
-        assert!(matches!(
-            manager
-                .resolve_service_by_domain("shared.localhost")
+        assert!(Arc::ptr_eq(
+            &second_web_controller,
+            &manager
+                .get_service_controller("second:web")
                 .await
-                .expect("first route remains"),
-            locald_core::resolver::DomainResolution::Service { ref name, .. }
-                if name == "first:web"
+                .expect("second web controller remains")
         ));
+        assert!(Arc::ptr_eq(
+            &second_api_controller,
+            &manager
+                .get_service_controller("second:api")
+                .await
+                .expect("second api controller remains")
+        ));
+        for (domain, service) in [
+            ("first.localhost", "first:web"),
+            ("second.localhost", "second:web"),
+            ("api.second.localhost", "second:api"),
+        ] {
+            assert!(matches!(
+                manager
+                    .resolve_service_by_domain(domain)
+                    .await
+                    .expect("published route remains"),
+                locald_core::resolver::DomainResolution::Service { ref name, .. }
+                    if name == service
+            ));
+            assert_eq!(
+                crate::tls::owned_server_name(&manager.domain_index(), domain),
+                Some(domain.to_owned())
+            );
+        }
+        assert!(
+            manager
+                .resolve_service_by_domain("api.first.localhost")
+                .await
+                .is_none()
+        );
+        assert!(
+            crate::tls::owned_server_name(&manager.domain_index(), "api.first.localhost").is_none()
+        );
 
+        manager
+            .stop_project(&second_path)
+            .await
+            .expect("stop second project");
+        for domain in ["second.localhost", "api.second.localhost"] {
+            assert_eq!(
+                crate::tls::owned_server_name(&manager.domain_index(), domain),
+                Some(domain.to_owned()),
+                "stopped project domains remain owned for the paused surface"
+            );
+        }
         manager
             .stop_project(&first_path)
             .await

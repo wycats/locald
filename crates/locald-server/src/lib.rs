@@ -108,7 +108,7 @@ pub mod shim_client;
 pub mod state;
 #[doc(hidden)]
 pub mod static_server;
-#[doc(hidden)]
+mod tls;
 #[doc(hidden)]
 pub mod toolbar;
 
@@ -534,7 +534,12 @@ async fn async_main(
     });
 
     // Initialize CertManager
-    let cert_manager = match locald_utils::cert::CertManager::new().await {
+    let certificate_domains = manager.domain_index();
+    let cert_manager = match locald_utils::cert::CertManager::new(move |server_name| {
+        tls::owned_server_name(&certificate_domains, server_name)
+    })
+    .await
+    {
         Ok(cm) => Some(std::sync::Arc::new(cm)),
         Err(e) => {
             if !config.server.is_sandbox() {

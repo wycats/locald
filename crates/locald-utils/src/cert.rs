@@ -12,7 +12,9 @@ use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use tracing::{debug, error, info};
+
+type ServerNameAuthorizer = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 /// Paths to the locald Root CA certificate and key files.
 #[derive(Debug, Clone)]
@@ -114,11 +116,13 @@ pub fn ensure_root_ca() -> Result<EnsureRootCaResult> {
 
 /// Manages TLS certificates for locald.
 ///
-/// Generates and caches certificates on the fly for requested domains, signed by the locald CA.
+/// Generates and caches locald-CA-signed certificates only for server names
+/// accepted by the required authorization policy.
 pub struct CertManager {
     issuer: CertifiedIssuer<'static, KeyPair>,
     ca_cert_der: rustls::pki_types::CertificateDer<'static>,
     cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    authorize_server_name: Arc<ServerNameAuthorizer>,
 }
 
 impl fmt::Debug for CertManager {
@@ -127,6 +131,7 @@ impl fmt::Debug for CertManager {
             .field("issuer", &"CertifiedIssuer(...)")
             .field("ca_cert_der", &"CertificateDer(...)")
             .field("cache", &self.cache)
+            .field("authorize_server_name", &"ServerNameAuthorizer(...)")
             .finish()
     }
 }
@@ -135,14 +140,26 @@ impl CertManager {
     /// Creates a new `CertManager`.
     ///
     /// Loads the root CA key and certificate from the locald certificates directory.
+    /// The authorizer returns the canonical owned server name, or `None` to
+    /// reject the TLS handshake. It is invoked before every cache lookup.
     ///
     /// # Errors
     ///
     /// Returns an error if the root CA files are missing or cannot be read/parsed.
-    pub async fn new() -> Result<Self> {
+    pub async fn new<F>(authorize_server_name: F) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
         let certs_dir = get_certs_dir()?;
+        Self::new_in_dir(&certs_dir, authorize_server_name).await
+    }
+
+    async fn new_in_dir<F>(certs_dir: &Path, authorize_server_name: F) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
         let ensure = tokio::task::spawn_blocking({
-            let certs_dir = certs_dir.clone();
+            let certs_dir = certs_dir.to_path_buf();
             move || ensure_root_ca_in_dir(&certs_dir)
         })
         .await
@@ -192,6 +209,7 @@ impl CertManager {
             issuer,
             ca_cert_der,
             cache: Mutex::new(HashMap::new()),
+            authorize_server_name: Arc::new(authorize_server_name),
         })
     }
 
@@ -218,17 +236,19 @@ impl CertManager {
 
         Ok(Arc::new(CertifiedKey::new(cert_chain, signing_key)))
     }
-}
 
-impl ResolvesServerCert for CertManager {
-    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?;
+    fn resolve_server_name(&self, requested_server_name: &str) -> Option<Arc<CertifiedKey>> {
+        let Some(server_name) = (self.authorize_server_name)(requested_server_name) else {
+            debug!("Rejecting certificate request for unowned SNI {requested_server_name}");
+            return None;
+        };
 
-        // Check cache first
+        // Authorization must happen before every cache lookup so removing a
+        // claim immediately prevents reuse of a previously generated leaf.
         {
             match self.cache.lock() {
                 Ok(cache) => {
-                    if let Some(cert) = cache.get(sni) {
+                    if let Some(cert) = cache.get(&server_name) {
                         return Some(cert.clone());
                     }
                 }
@@ -241,12 +261,12 @@ impl ResolvesServerCert for CertManager {
 
         // Generate new cert
         // Use block_in_place to avoid stalling the async reactor during heavy CPU ops
-        let cert_res = tokio::task::block_in_place(|| self.generate_cert(sni));
+        let cert_res = tokio::task::block_in_place(|| self.generate_cert(&server_name));
 
         match cert_res {
             Ok(cert) => match self.cache.lock() {
                 Ok(mut cache) => {
-                    cache.insert(sni.to_string(), cert.clone());
+                    cache.insert(server_name, cert.clone());
                     Some(cert)
                 }
                 Err(e) => {
@@ -255,10 +275,19 @@ impl ResolvesServerCert for CertManager {
                 }
             },
             Err(e) => {
-                error!("Failed to generate certificate for {}: {}", sni, e);
+                error!(
+                    "Failed to generate certificate for {}: {}",
+                    requested_server_name, e
+                );
                 None
             }
         }
+    }
+}
+
+impl ResolvesServerCert for CertManager {
+    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        self.resolve_server_name(client_hello.server_name()?)
     }
 }
 
@@ -372,14 +401,52 @@ pub fn locald_data_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    #[cfg(target_os = "linux")]
     use temp_env::with_vars;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+    #[cfg(target_os = "linux")]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir() -> PathBuf {
         let base = std::env::temp_dir();
         base.join(format!("locald-utils-cert-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn tls_handshake_results(manager: Arc<CertManager>, server_name: &str) -> (bool, bool) {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(manager.ca_cert_der.clone())
+            .expect("trust test root CA");
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(manager),
+        );
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .expect("valid test server name");
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let acceptor = TlsAcceptor::from(server_config);
+        let connector = TlsConnector::from(client_config);
+
+        let (server_result, client_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                acceptor.accept(server_io),
+                connector.connect(server_name, client_io)
+            )
+        })
+        .await
+        .expect("TLS handshake completes");
+
+        (server_result.is_ok(), client_result.is_ok())
     }
 
     #[test]
@@ -400,6 +467,65 @@ mod tests {
 
         let err = ensure_root_ca_in_dir(&dir).unwrap_err();
         assert!(err.to_string().contains("partially configured"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_handshake_requires_current_authorization_before_cache_reuse() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = unique_temp_dir();
+        let authorized = Arc::new(Mutex::new(BTreeSet::from(["owned.localhost".to_owned()])));
+        let policy = authorized.clone();
+        let manager = Arc::new(
+            CertManager::new_in_dir(&dir, move |requested| {
+                let canonical = requested
+                    .strip_suffix('.')
+                    .unwrap_or(requested)
+                    .to_ascii_lowercase();
+                let is_authorized = policy.lock().ok()?.contains(&canonical);
+                is_authorized.then_some(canonical)
+            })
+            .await
+            .expect("create certificate manager"),
+        );
+
+        assert!(manager.resolve_server_name("OWNED.LOCALHOST.").is_some());
+        assert_eq!(
+            manager
+                .cache
+                .lock()
+                .expect("certificate cache lock")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["owned.localhost".to_owned()]
+        );
+        assert_eq!(
+            tls_handshake_results(manager.clone(), "owned.localhost").await,
+            (true, true)
+        );
+
+        authorized.lock().expect("authorization set lock").clear();
+        assert!(manager.resolve_server_name("owned.localhost").is_none());
+        assert_eq!(
+            tls_handshake_results(manager.clone(), "owned.localhost").await,
+            (false, false)
+        );
+        assert_eq!(
+            tls_handshake_results(manager.clone(), "telemetry.vercel.com").await,
+            (false, false)
+        );
+        assert_eq!(
+            manager
+                .cache
+                .lock()
+                .expect("certificate cache lock")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["owned.localhost".to_owned()]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
