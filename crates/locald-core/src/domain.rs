@@ -367,11 +367,11 @@ impl DomainIndex {
             .iter()
             .filter(|(domain, target)| {
                 matches!(target, DomainTarget::Service { .. })
-                    || matches!(target, DomainTarget::Platform { .. })
+                    || (matches!(target, DomainTarget::Platform { .. })
                         && domain
                             .as_str()
                             .rsplit_once('.')
-                            .is_some_and(|(_, suffix)| suffix == "local")
+                            .is_some_and(|(_, suffix)| suffix == "local"))
             })
             .map(|(domain, _)| domain.clone())
             .collect()

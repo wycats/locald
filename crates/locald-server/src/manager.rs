@@ -70,6 +70,10 @@ struct InstanceLogBuffer {
     logs: LogBuffer,
 }
 
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("Service not found")]
+pub struct ServiceNotFoundError;
+
 #[async_trait::async_trait]
 pub trait HostSyncer: Send + Sync + 'static {
     async fn sync(&self, domains: Vec<String>) -> Result<()>;
@@ -1742,7 +1746,7 @@ impl ProcessManager {
         let Some((path, _transition_guard, _runtime_projection_guard)) =
             self.lock_service_runtime_transition(name).await
         else {
-            anyhow::bail!("Service not found");
+            return Err(ServiceNotFoundError.into());
         };
         self.stop_service_locked(name, &path).await?;
         self.watch_config(path.clone()).await;
@@ -2739,6 +2743,10 @@ impl ServiceResolver for ProcessManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use futures_util::{StreamExt, stream};
     use locald_core::config::{ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig};
     use locald_core::registry::Registry;
@@ -2749,6 +2757,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+    use tower::ServiceExt;
 
     #[derive(Debug)]
     struct TestController {
@@ -5163,6 +5172,67 @@ command = "sleep 30"
             health_source: HealthSource::None,
             warnings: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn service_restart_removed_during_transition_returns_not_found() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let canonical_path = ProcessManager::canonicalize_path(&project_path);
+
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+
+        manager.services.lock().await.insert(
+            "project:web".to_owned(),
+            test_service(
+                LocaldConfig::default(),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::None,
+                canonical_path.clone(),
+            ),
+        );
+
+        let (_, transition_lock) = manager.transition_lock_for_path(&canonical_path).await;
+        let transition_guard = transition_lock.lock().await;
+        let services_guard = manager.services.lock().await;
+
+        let app = crate::api::router(manager.clone());
+        let restart = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/services/project:web/restart")
+                    .body(Body::empty())
+                    .expect("build restart request"),
+            )
+            .await
+            .expect("restart response")
+        });
+        tokio::task::yield_now().await;
+
+        let services = manager.services.clone();
+        let remove = tokio::spawn(async move { services.lock().await.remove("project:web") });
+        tokio::task::yield_now().await;
+
+        drop(services_guard);
+        assert!(
+            remove
+                .await
+                .expect("service removal task completes")
+                .is_some()
+        );
+        drop(transition_guard);
+
+        let response = restart.await.expect("restart task completes");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
