@@ -219,18 +219,10 @@ async fn handle_connection(
             Ok(()) => IpcResponse::Ok,
             Err(e) => IpcResponse::Error(e.to_string()),
         },
-        IpcRequest::Restart { name } => {
-            if let Err(e) = manager.stop(&name).await {
-                IpcResponse::Error(e.to_string())
-            } else if let Some(path) = manager.get_service_path(&name).await {
-                match manager.start(path, None, false).await {
-                    Ok(()) => IpcResponse::Ok,
-                    Err(e) => IpcResponse::Error(format!("{e:#}")),
-                }
-            } else {
-                IpcResponse::Error("Service not found".to_string())
-            }
-        }
+        IpcRequest::Restart { name } => match manager.restart(&name).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(format!("{e:#}")),
+        },
         IpcRequest::Reset { name } => match manager.reset(&name).await {
             Ok(()) => IpcResponse::Ok,
             Err(e) => IpcResponse::Error(e.to_string()),
@@ -247,6 +239,11 @@ async fn handle_connection(
             let status = manager.list().await;
             IpcResponse::Status(status)
         }
+        IpcRequest::SyncHosts => match manager.sync_hosts().await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(e.to_string()),
+        },
+        IpcRequest::GetHostsDomains => IpcResponse::HostsDomains(manager.hosts_domain_names()),
         IpcRequest::Shutdown => {
             let _ = shutdown_tx.send(ShutdownReason::Stop).await;
             IpcResponse::Ok

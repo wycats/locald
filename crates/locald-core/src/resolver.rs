@@ -3,10 +3,17 @@ use async_trait::async_trait;
 use crate::state::ServiceState;
 
 #[derive(Debug, Clone)]
-pub struct DomainResolution {
-    pub name: String,
-    pub port: Option<u16>,
-    pub status: ServiceState,
+pub enum DomainResolution {
+    /// A claim with a concrete runtime service target.
+    Service {
+        name: String,
+        port: Option<u16>,
+        status: ServiceState,
+    },
+    /// A persisted project claim that cannot currently be mapped to loaded
+    /// service context. The domain remains owned and must not fall through to a
+    /// platform surface or an unknown-domain response.
+    OwnershipOnly,
 }
 
 /// Abstraction layer between the "World State" (Manager) and the "Gateway" (Proxy).
@@ -21,8 +28,10 @@ pub struct DomainResolution {
 pub trait ServiceResolver: Send + Sync + std::fmt::Debug {
     /// Find the service associated with a given domain.
     ///
-    /// Returns `Some(DomainResolution)` if a service claims the domain,
-    /// or `None` if no service matches.
+    /// Returns `Some(DomainResolution)` for project-service ownership, including
+    /// ownership-only claims. Platform-owned domains return `None` so the proxy
+    /// can serve the corresponding platform surface; unclaimed domains also
+    /// return `None`.
     async fn resolve_service_by_domain(&self, domain: &str) -> Option<DomainResolution>;
 
     /// Update the port the HTTP proxy is bound to.

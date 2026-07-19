@@ -5,9 +5,11 @@ use locald_core::config::{
     WorkerServiceConfig, merge_env_layers, overlay_env,
 };
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use tracing::info;
+
+const SERVICE_REFERENCE_PATTERN: &str = r"\$\{services\.([^.]+)\.([^}]+)\}";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayerConfig {
@@ -638,7 +640,7 @@ impl ConfigLoader {
         Fut: std::future::Future<Output = Result<String>>,
     {
         let mut resolved = HashMap::new();
-        let re = regex::Regex::new(r"\$\{services\.([^.]+)\.([^}]+)\}")?;
+        let re = regex::Regex::new(SERVICE_REFERENCE_PATTERN)?;
 
         for (k, v) in env {
             let mut new_val = v.clone();
@@ -672,6 +674,73 @@ impl ConfigLoader {
         }
 
         Ok(resolved)
+    }
+
+    /// Validate service references without consulting mutable runtime state.
+    ///
+    /// This is the declarative validation phase for `${services.name.field}`
+    /// interpolation. It runs before project identity and domain ownership are
+    /// published; runtime values are resolved later, after dependencies become
+    /// ready.
+    pub(crate) fn validate_env_references(
+        env: &HashMap<String, String>,
+        config: &LocaldConfig,
+        consumer_name: &str,
+    ) -> Result<()> {
+        let re = regex::Regex::new(SERVICE_REFERENCE_PATTERN)?;
+        let consumer = config.services.get(consumer_name).ok_or_else(|| {
+            anyhow::anyhow!("cannot validate environment for unknown service `{consumer_name}`")
+        })?;
+        let mut dependencies = HashSet::new();
+        let mut pending = consumer.depends_on().clone();
+        while let Some(dependency) = pending.pop() {
+            if dependencies.insert(dependency.clone()) {
+                let dependency_config = config.services.get(&dependency).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "service `{consumer_name}` depends on unknown service `{dependency}`"
+                    )
+                })?;
+                pending.extend(dependency_config.depends_on().iter().cloned());
+            }
+        }
+
+        for (env_name, value) in env {
+            for captures in re.captures_iter(value) {
+                let service_name = captures
+                    .get(1)
+                    .ok_or_else(|| anyhow::anyhow!("service reference is missing its service"))?
+                    .as_str();
+                let field = captures
+                    .get(2)
+                    .ok_or_else(|| anyhow::anyhow!("service reference is missing its field"))?
+                    .as_str();
+                let service = config.services.get(service_name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "environment variable `{env_name}` references unknown service `{service_name}`"
+                    )
+                })?;
+
+                match field {
+                    "host" => {}
+                    "port" | "url" => {
+                        anyhow::ensure!(
+                            !matches!(service, ServiceConfig::Typed(TypedServiceConfig::Worker(_))),
+                            "environment variable `{env_name}` references `{service_name}.{field}`, but worker services have no {field}"
+                        );
+                    }
+                    _ => anyhow::bail!(
+                        "environment variable `{env_name}` references unknown field `{field}` on service `{service_name}`"
+                    ),
+                }
+
+                anyhow::ensure!(
+                    dependencies.contains(service_name),
+                    "environment variable `{env_name}` references service `{service_name}`, but service `{consumer_name}` does not depend on it; add `{service_name}` to `{consumer_name}.depends_on`"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn resolve_startup_order(config: &LocaldConfig) -> Result<Vec<String>> {
@@ -739,6 +808,83 @@ impl ConfigLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_reference_validation_rejects_missing_services_and_fields() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.db]
+type = "postgres"
+
+[services.web]
+type = "worker"
+command = "run-web"
+depends_on = ["db"]
+"#,
+        )
+        .expect("parse test config");
+
+        let missing = HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "${services.missing.url}".to_owned(),
+        )]);
+        let error = ConfigLoader::validate_env_references(&missing, &config, "web")
+            .expect_err("missing service reference must fail");
+        assert!(error.to_string().contains("unknown service `missing`"));
+
+        let unknown_field = HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "${services.db.password}".to_owned(),
+        )]);
+        let error = ConfigLoader::validate_env_references(&unknown_field, &config, "web")
+            .expect_err("unknown service field must fail");
+        assert!(error.to_string().contains("unknown field `password`"));
+    }
+
+    #[test]
+    fn service_reference_validation_accepts_runtime_fields_and_rejects_worker_urls() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.db]
+type = "postgres"
+
+[services.jobs]
+type = "worker"
+command = "run-jobs"
+
+[services.web]
+type = "worker"
+command = "run-web"
+depends_on = ["db", "jobs"]
+"#,
+        )
+        .expect("parse test config");
+
+        let valid = HashMap::from([(
+            "DATABASE_URL".to_owned(),
+            "${services.db.url}@${services.db.host}:${services.db.port}".to_owned(),
+        )]);
+        ConfigLoader::validate_env_references(&valid, &config, "web")
+            .expect("supported runtime fields are valid");
+
+        let worker_url =
+            HashMap::from([("JOBS_URL".to_owned(), "${services.jobs.url}".to_owned())]);
+        let error = ConfigLoader::validate_env_references(&worker_url, &config, "web")
+            .expect_err("worker URL must fail before ownership publication");
+        assert!(error.to_string().contains("worker services have no url"));
+
+        let self_reference =
+            HashMap::from([("SELF_URL".to_owned(), "${services.web.host}".to_owned())]);
+        let error = ConfigLoader::validate_env_references(&self_reference, &config, "web")
+            .expect_err("self-reference must fail before ownership publication");
+        assert!(error.to_string().contains("service `web` does not depend"));
+    }
 
     #[tokio::test]
     async fn service_provenance_comes_from_project_config_path() {

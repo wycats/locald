@@ -10,6 +10,7 @@ use crate::identity::{
     ResolvedProjectIdentity, WorktreeId, derive_project_id, derive_project_instance_id,
     inspect_git_project_identity, inspect_repository_id, resolve_git_project_identity,
 };
+use crate::{DomainClaim, DomainError, DomainIndex, DomainName, DomainTarget};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,8 +22,9 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// The first identity-aware catalog follows the unversioned legacy registry.
-pub const CATALOG_VERSION: u32 = 2;
+/// The current identity and exact-domain catalog schema.
+pub const CATALOG_VERSION: u32 = 3;
+const PREVIOUS_CATALOG_VERSION: u32 = 2;
 
 /// Paths used to initialize a catalog and collect legacy locator evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +206,9 @@ pub enum CatalogError {
     #[error(transparent)]
     Identity(#[from] IdentityError),
 
+    #[error(transparent)]
+    Domain(#[from] DomainError),
+
     #[error("catalog {operation} task failed: {reason}")]
     TaskJoin {
         operation: &'static str,
@@ -238,6 +243,7 @@ pub struct ProjectCatalog {
     pub instances: BTreeMap<ProjectInstanceId, ProjectInstanceRecord>,
     pub legacy_paths: BTreeMap<PathBuf, ProjectInstanceId>,
     pub unresolved_legacy: BTreeMap<PathBuf, UnresolvedLegacyProject>,
+    pub domain_index: DomainIndex,
     #[serde(skip, default = "ProjectCatalog::path")]
     storage_path: PathBuf,
 }
@@ -249,7 +255,7 @@ impl Default for ProjectCatalog {
 }
 
 impl ProjectCatalog {
-    const fn empty_at(storage_path: PathBuf) -> Self {
+    fn empty_at(storage_path: PathBuf) -> Self {
         Self {
             version: CATALOG_VERSION,
             repositories: BTreeMap::new(),
@@ -258,13 +264,14 @@ impl ProjectCatalog {
             instances: BTreeMap::new(),
             legacy_paths: BTreeMap::new(),
             unresolved_legacy: BTreeMap::new(),
+            domain_index: DomainIndex::default(),
             storage_path,
         }
     }
 
     /// Create an empty catalog with an explicit persistence path.
     #[must_use]
-    pub const fn with_path(storage_path: PathBuf) -> Self {
+    pub fn with_path(storage_path: PathBuf) -> Self {
         Self::empty_at(storage_path)
     }
 
@@ -282,8 +289,9 @@ impl ProjectCatalog {
 
     /// Load the catalog, importing locator evidence if no catalog exists yet.
     ///
-    /// Existing v2 state is authoritative. Malformed or unsupported v2 state is
-    /// returned as an error and is never replaced from legacy inputs.
+    /// Existing catalog state is authoritative. Supported v2 state is migrated
+    /// atomically to v3; malformed or unsupported state is never replaced from
+    /// legacy inputs.
     pub async fn load() -> Result<Self, CatalogError> {
         Self::load_from_paths(CatalogPaths::for_data_dir(&data_dir())).await
     }
@@ -336,6 +344,18 @@ impl ProjectCatalog {
     }
 
     async fn load_existing(path: &Path) -> Result<Self, CatalogError> {
+        Self::load_existing_with_parent_sync(path, |path| async move { sync_parent(&path).await })
+            .await
+    }
+
+    async fn load_existing_with_parent_sync<Sync, SyncFuture>(
+        path: &Path,
+        parent_sync: Sync,
+    ) -> Result<Self, CatalogError>
+    where
+        Sync: FnOnce(PathBuf) -> SyncFuture,
+        SyncFuture: std::future::Future<Output = Result<(), CatalogError>>,
+    {
         let content = tokio::fs::read_to_string(path)
             .await
             .map_err(|source| CatalogError::Io {
@@ -362,12 +382,55 @@ impl ProjectCatalog {
                 path: path.to_path_buf(),
                 reason: "missing unsigned `version`".to_owned(),
             })?;
-        if version != u64::from(CATALOG_VERSION) {
-            return Err(CatalogError::UnsupportedVersion {
+        match version {
+            version if version == u64::from(CATALOG_VERSION) => {
+                Self::deserialize_current(value, path)
+            }
+            version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
+                let catalog = Self::migrate_v2(value, path)?;
+                match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
+                    Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => Ok(catalog),
+                    Err(error) => Err(error),
+                }
+            }
+            found => Err(CatalogError::UnsupportedVersion {
                 path: path.to_path_buf(),
-                found: version,
+                found,
                 expected: CATALOG_VERSION,
-            });
+            }),
+        }
+    }
+
+    fn deserialize_current(value: Value, path: &Path) -> Result<Self, CatalogError> {
+        let mut catalog: Self =
+            serde_json::from_value(value).map_err(|source| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: source.to_string(),
+            })?;
+        catalog.storage_path = path.to_path_buf();
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    fn migrate_v2(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        let had_domain_index = value.get("domain_index").is_some();
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "catalog must be an object".to_owned(),
+            })?;
+        object.insert("version".to_owned(), Value::from(CATALOG_VERSION));
+        if !had_domain_index {
+            object.insert(
+                "domain_index".to_owned(),
+                serde_json::to_value(DomainIndex::default()).map_err(|source| {
+                    CatalogError::InvalidData {
+                        path: path.to_path_buf(),
+                        reason: source.to_string(),
+                    }
+                })?,
+            );
         }
 
         let mut catalog: Self =
@@ -376,6 +439,9 @@ impl ProjectCatalog {
                 reason: source.to_string(),
             })?;
         catalog.storage_path = path.to_path_buf();
+        if !had_domain_index {
+            catalog.hydrate_legacy_domain_index()?;
+        }
         catalog.validate()?;
         Ok(catalog)
     }
@@ -460,6 +526,65 @@ impl ProjectCatalog {
             |path| async move { sync_parent(&path).await },
         )
         .await
+    }
+
+    /// Return the complete persistent exact-domain ownership index.
+    #[must_use]
+    pub const fn domain_index(&self) -> &DomainIndex {
+        &self.domain_index
+    }
+
+    /// Replace one instance's complete exact claim set in memory.
+    ///
+    /// Callers commit the resulting catalog candidate through [`Self::commit_candidate`]
+    /// so identity reconciliation and domain ownership publish together.
+    pub fn replace_domain_claims(
+        &mut self,
+        instance_id: ProjectInstanceId,
+        claims: impl IntoIterator<Item = DomainClaim>,
+    ) -> Result<(), CatalogError> {
+        if !self.instances.contains_key(&instance_id) {
+            return Err(CatalogError::Invariant(format!(
+                "domain claims reference missing project instance {instance_id}"
+            )));
+        }
+        let replacement = self.domain_index.replacing_instance(instance_id, claims)?;
+        let domains = replacement.domains_for_instance(instance_id);
+        let record = self.instances.get_mut(&instance_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "domain claims reference missing project instance {instance_id}"
+            ))
+        })?;
+        record.domain_claims = domains;
+        self.domain_index = replacement;
+        self.validate()?;
+        Ok(())
+    }
+
+    fn hydrate_legacy_domain_index(&mut self) -> Result<(), CatalogError> {
+        let instances = self
+            .instances
+            .iter()
+            .map(|(instance_id, record)| (*instance_id, record.domain_claims.clone()))
+            .collect::<Vec<_>>();
+        let mut index = DomainIndex::default();
+        for (instance_id, domains) in instances {
+            let claims = domains
+                .into_iter()
+                .map(|domain| {
+                    Ok(DomainClaim::legacy(
+                        domain.parse::<DomainName>()?,
+                        instance_id,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DomainError>>()?;
+            index = index.replacing_instance(instance_id, claims)?;
+        }
+        for (instance_id, record) in &mut self.instances {
+            record.domain_claims = index.domains_for_instance(*instance_id);
+        }
+        self.domain_index = index;
+        Ok(())
     }
 
     async fn commit_candidate_with_parent_sync<Sync, SyncFuture>(
@@ -948,15 +1073,15 @@ impl ProjectCatalog {
     }
 
     /// Explicitly forget a project catalog record while leaving resources alone.
-    pub fn unregister_project(&mut self, path: &Path) -> bool {
+    pub fn unregister_project(&mut self, path: &Path) -> Result<bool, CatalogError> {
         if self.unresolved_legacy.remove(path).is_some() {
-            return true;
+            return Ok(true);
         }
         let Some(instance_id) = self.instance_for_path(path) else {
-            return false;
+            return Ok(false);
         };
-        self.remove_instance(instance_id);
-        true
+        self.remove_instance(instance_id)?;
+        Ok(true)
     }
 
     /// Refresh filesystem presence and forget missing unpinned records.
@@ -996,7 +1121,7 @@ impl ProjectCatalog {
             })
             .collect();
         for instance_id in missing.iter().copied() {
-            self.remove_instance(instance_id);
+            self.remove_instance(instance_id)?;
         }
         for path in &unresolved {
             self.unresolved_legacy.remove(path);
@@ -1005,9 +1130,12 @@ impl ProjectCatalog {
         Ok(missing.len() + unresolved.len())
     }
 
-    fn remove_instance(&mut self, instance_id: ProjectInstanceId) {
+    fn remove_instance(&mut self, instance_id: ProjectInstanceId) -> Result<(), CatalogError> {
+        self.domain_index = self
+            .domain_index
+            .replacing_instance(instance_id, std::iter::empty())?;
         let Some(instance) = self.instances.remove(&instance_id) else {
-            return;
+            return Ok(());
         };
         self.legacy_paths.retain(|_, id| *id != instance_id);
 
@@ -1041,6 +1169,7 @@ impl ProjectCatalog {
             .collect();
         self.repositories
             .retain(|id, _| used_repositories.contains(id));
+        Ok(())
     }
 
     /// Reconcile catalog presence with the filesystem without deleting records.
@@ -1197,6 +1326,19 @@ impl ProjectCatalog {
                 self.version
             )));
         }
+        self.domain_index.validate()?;
+        for (domain, target) in self.domain_index.claims() {
+            if let DomainTarget::Service {
+                project_instance_id,
+                ..
+            } = target
+                && !self.instances.contains_key(project_instance_id)
+            {
+                return Err(CatalogError::Invariant(format!(
+                    "domain `{domain}` references missing project instance {project_instance_id}"
+                )));
+            }
+        }
         let mut current_repository_paths = BTreeMap::<&Path, RepositoryId>::new();
         for (id, record) in &self.repositories {
             if id != &record.id {
@@ -1333,6 +1475,12 @@ impl ProjectCatalog {
                 return Err(CatalogError::Invariant(format!(
                     "instances {previous} and {id} both claim current path `{}`",
                     path.display()
+                )));
+            }
+            let indexed_domains = self.domain_index.domains_for_instance(*id);
+            if record.domain_claims != indexed_domains {
+                return Err(CatalogError::Invariant(format!(
+                    "project instance {id} domain claims do not match the persistent domain index"
                 )));
             }
         }
@@ -2063,6 +2211,32 @@ mod tests {
         }
     }
 
+    fn catalog_fixture_bytes(
+        catalog: &ProjectCatalog,
+        version: u32,
+        include_domain_index: bool,
+    ) -> Vec<u8> {
+        let mut value = serde_json::to_value(catalog).expect("serialize catalog fixture");
+        value["version"] = Value::from(version);
+        if !include_domain_index {
+            value
+                .as_object_mut()
+                .expect("catalog fixture object")
+                .remove("domain_index");
+        }
+        let mut bytes = serde_json::to_vec_pretty(&value).expect("encode catalog fixture");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn catalog_fixture_version(bytes: &[u8]) -> u64 {
+        serde_json::from_slice::<Value>(bytes)
+            .expect("parse catalog fixture")
+            .get("version")
+            .and_then(Value::as_u64)
+            .expect("unsigned catalog fixture version")
+    }
+
     #[tokio::test]
     async fn empty_initialization_writes_a_deterministic_versioned_catalog() {
         let fixture = Fixture::new();
@@ -2083,7 +2257,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first_bytes, second_bytes);
-        assert!(first_bytes.starts_with(b"{\n  \"version\": 2,"));
+        assert!(first_bytes.starts_with(b"{\n  \"version\": 3,"));
     }
 
     #[tokio::test]
@@ -2474,7 +2648,15 @@ mod tests {
             .expect("non-Git instance");
         record.pinned = true;
         record.domain_slug = Some("plain".to_owned());
-        record.domain_claims.insert("plain.localhost".to_owned());
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::legacy(
+                    "plain.localhost".parse().expect("valid domain"),
+                    instance_id,
+                )],
+            )
+            .expect("record domain claims");
         catalog.save().await.expect("save non-Git metadata");
 
         std::fs::remove_dir_all(&project).expect("remove non-Git project");
@@ -2516,7 +2698,7 @@ mod tests {
     async fn malformed_existing_catalog_blocks_without_reimport_or_rewrite() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
-        let malformed = b"{\"version\":2,\"instances\":";
+        let malformed = b"{\"version\":3,\"instances\":";
         tokio::fs::write(&paths.catalog, malformed)
             .await
             .expect("write malformed catalog");
@@ -2624,7 +2806,15 @@ mod tests {
             .get_mut(&identity.project_instance_id)
             .expect("Git instance");
         record.domain_slug = Some("restored".to_owned());
-        record.domain_claims.insert("restored.localhost".to_owned());
+        catalog
+            .replace_domain_claims(
+                identity.project_instance_id,
+                [DomainClaim::legacy(
+                    "restored.localhost".parse().expect("valid domain"),
+                    identity.project_instance_id,
+                )],
+            )
+            .expect("record domain claims");
         catalog.save().await.expect("save Git project metadata");
 
         let parked = fixture._temp.path().join("temporarily-parked");
@@ -2702,9 +2892,15 @@ mod tests {
             .get_mut(&original_identity.project_instance_id)
             .expect("original instance");
         original_record.domain_slug = Some("historical".to_owned());
-        original_record
-            .domain_claims
-            .insert("historical.localhost".to_owned());
+        catalog
+            .replace_domain_claims(
+                original_identity.project_instance_id,
+                [DomainClaim::legacy(
+                    "historical.localhost".parse().expect("valid domain"),
+                    original_identity.project_instance_id,
+                )],
+            )
+            .expect("record domain claims");
         catalog.save().await.expect("save original metadata");
 
         let parked = fixture._temp.path().join("parked-original");
@@ -3728,6 +3924,420 @@ mod tests {
                 .expect("read runtime"),
             runtime
         );
+    }
+
+    #[tokio::test]
+    async fn v2_without_domain_index_migrates_identity_and_flat_claims_byte_stably() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.git_project("v2-flat-project");
+        let mut source = ProjectCatalog::with_path(paths.catalog.clone());
+        let discovery = ProjectCatalog::discover(project.clone())
+            .await
+            .expect("discover v2 Git project");
+        let instance_id = source
+            .register_project(discovery, Some("v2-flat".to_owned()))
+            .expect("register v2 Git project");
+        source.legacy_paths.insert(project, instance_id);
+        {
+            let record = source
+                .instances
+                .get_mut(&instance_id)
+                .expect("registered v2 instance");
+            record.pinned = true;
+            record.domain_slug = Some("v2-flat".to_owned());
+        }
+        source
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::legacy(
+                    "v2-flat.localhost".parse().expect("valid legacy domain"),
+                    instance_id,
+                )],
+            )
+            .expect("record v2 flat claim");
+        let v2_bytes = catalog_fixture_bytes(&source, PREVIOUS_CATALOG_VERSION, false);
+        tokio::fs::write(&paths.catalog, v2_bytes)
+            .await
+            .expect("write v2 catalog without domain index");
+
+        let migrated = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("migrate v2 flat catalog");
+
+        assert_eq!(migrated.repositories, source.repositories);
+        assert_eq!(migrated.worktrees, source.worktrees);
+        assert_eq!(migrated.projects, source.projects);
+        assert_eq!(migrated.instances, source.instances);
+        assert_eq!(migrated.legacy_paths, source.legacy_paths);
+        assert_eq!(migrated.unresolved_legacy, source.unresolved_legacy);
+        assert_eq!(
+            migrated.domain_index().resolve("v2-flat.localhost"),
+            Some(&DomainTarget::Service {
+                project_instance_id: instance_id,
+                service_name: None,
+            })
+        );
+
+        let first_v3_bytes = tokio::fs::read(&paths.catalog)
+            .await
+            .expect("read migrated v3 catalog");
+        assert_eq!(
+            catalog_fixture_version(&first_v3_bytes),
+            u64::from(CATALOG_VERSION)
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&first_v3_bytes)
+                .expect("parse migrated v3 catalog")
+                .get("domain_index")
+                .is_some()
+        );
+
+        let reopened = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("reopen migrated v3 catalog");
+        let second_v3_bytes = tokio::fs::read(&paths.catalog)
+            .await
+            .expect("read reopened v3 catalog");
+        assert_eq!(reopened, migrated);
+        assert_eq!(second_v3_bytes, first_v3_bytes);
+    }
+
+    #[tokio::test]
+    async fn v2_with_domain_index_preserves_exact_service_targets() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("v2-indexed-project");
+        let mut source = ProjectCatalog::with_path(paths.catalog.clone());
+        let discovery = ProjectCatalog::discover(project)
+            .await
+            .expect("discover v2 project");
+        let instance_id = source
+            .register_project(discovery, Some("v2-indexed".to_owned()))
+            .expect("register v2 project");
+        source
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "v2-indexed.localhost".parse().expect("valid exact domain"),
+                    instance_id,
+                    "v2-indexed:web".to_owned(),
+                )],
+            )
+            .expect("record v2 exact target");
+        let v2_bytes = catalog_fixture_bytes(&source, PREVIOUS_CATALOG_VERSION, true);
+        tokio::fs::write(&paths.catalog, v2_bytes)
+            .await
+            .expect("write v2 catalog with domain index");
+
+        let migrated = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("migrate indexed v2 catalog");
+
+        assert_eq!(migrated.instances, source.instances);
+        assert_eq!(
+            migrated.domain_index().resolve("v2-indexed.localhost"),
+            Some(&DomainTarget::Service {
+                project_instance_id: instance_id,
+                service_name: Some("v2-indexed:web".to_owned()),
+            })
+        );
+        let stored = tokio::fs::read(&paths.catalog)
+            .await
+            .expect("read indexed v3 catalog");
+        assert_eq!(catalog_fixture_version(&stored), u64::from(CATALOG_VERSION));
+    }
+
+    #[tokio::test]
+    async fn invalid_v2_migration_preserves_original_bytes() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("invalid-v2-project");
+        let mut source = ProjectCatalog::with_path(paths.catalog.clone());
+        let instance_id = source
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover invalid v2 project"),
+                Some("invalid-v2".to_owned()),
+            )
+            .expect("register invalid v2 project");
+        source
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "indexed.localhost".parse().expect("valid indexed domain"),
+                    instance_id,
+                    "invalid-v2:web".to_owned(),
+                )],
+            )
+            .expect("record indexed v2 claim");
+        let mut value: Value = serde_json::from_slice(&catalog_fixture_bytes(
+            &source,
+            PREVIOUS_CATALOG_VERSION,
+            true,
+        ))
+        .expect("parse invalid v2 fixture");
+        value["instances"][instance_id.to_string()]["domain_claims"] =
+            serde_json::json!(["different.localhost"]);
+        let mut original = serde_json::to_vec_pretty(&value).expect("encode invalid v2 fixture");
+        original.push(b'\n');
+        tokio::fs::write(&paths.catalog, &original)
+            .await
+            .expect("write invalid v2 catalog");
+
+        let error = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect_err("inconsistent v2 catalog must fail migration");
+
+        assert!(matches!(error, CatalogError::Invariant(_)));
+        assert_eq!(
+            tokio::fs::read(&paths.catalog)
+                .await
+                .expect("read rejected v2 catalog"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn native_v3_requires_domain_index_without_rewriting() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let catalog = ProjectCatalog::with_path(paths.catalog.clone());
+        let original = catalog_fixture_bytes(&catalog, CATALOG_VERSION, false);
+        tokio::fs::write(&paths.catalog, &original)
+            .await
+            .expect("write incomplete v3 catalog");
+
+        let error = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect_err("v3 domain index is required");
+
+        assert!(matches!(error, CatalogError::InvalidData { .. }));
+        assert_eq!(
+            tokio::fs::read(&paths.catalog)
+                .await
+                .expect("read rejected v3 catalog"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_migration_sync_failure_returns_published_v3() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let catalog = ProjectCatalog::with_path(paths.catalog.clone());
+        let v2_bytes = catalog_fixture_bytes(&catalog, PREVIOUS_CATALOG_VERSION, false);
+        tokio::fs::write(&paths.catalog, v2_bytes)
+            .await
+            .expect("write v2 migration fixture");
+
+        let migrated =
+            ProjectCatalog::load_existing_with_parent_sync(&paths.catalog, |path| async move {
+                Err(CatalogError::Io {
+                    operation: "perform injected migration parent sync",
+                    path,
+                    source: io::Error::other("injected migration parent sync failure"),
+                })
+            })
+            .await
+            .expect("post-rename migration sync failure must keep the published catalog active");
+
+        let published = tokio::fs::read(&paths.catalog)
+            .await
+            .expect("read published migration result");
+        assert_eq!(
+            catalog_fixture_version(&published),
+            u64::from(CATALOG_VERSION)
+        );
+        let reopened = ProjectCatalog::load_existing(&paths.catalog)
+            .await
+            .expect("published v3 migration remains readable");
+        assert_eq!(reopened, migrated);
+    }
+
+    #[tokio::test]
+    async fn exact_domain_targets_survive_catalog_reopen() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("domain-project");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let discovery = ProjectCatalog::discover(project)
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("domain-project".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "domain-project.localhost"
+                        .parse()
+                        .expect("valid exact domain"),
+                    instance_id,
+                    "domain-project:web".to_owned(),
+                )],
+            )
+            .expect("replace exact claims");
+        catalog.save().await.expect("save exact claims");
+
+        let reopened = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("reopen catalog");
+
+        assert_eq!(
+            reopened.domain_index().resolve("DOMAIN-PROJECT.LOCALHOST."),
+            Some(&DomainTarget::Service {
+                project_instance_id: instance_id,
+                service_name: Some("domain-project:web".to_owned()),
+            })
+        );
+        assert!(
+            reopened.instances[&instance_id]
+                .domain_claims
+                .contains("domain-project.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_flat_domain_claims_hydrate_as_owned_exact_names() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("legacy-domain-project");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let discovery = ProjectCatalog::discover(project)
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project_and_save(discovery, Some("legacy-domain".to_owned()))
+            .await
+            .expect("register project");
+        let mut stored: Value =
+            serde_json::from_slice(&tokio::fs::read(&paths.catalog).await.expect("read catalog"))
+                .expect("parse catalog");
+        stored["version"] = Value::from(PREVIOUS_CATALOG_VERSION);
+        stored
+            .as_object_mut()
+            .expect("catalog object")
+            .remove("domain_index");
+        stored["instances"][instance_id.to_string()]["domain_claims"] =
+            serde_json::json!(["LEGACY.LOCALHOST."]);
+        tokio::fs::write(
+            &paths.catalog,
+            serde_json::to_vec_pretty(&stored).expect("serialize legacy catalog"),
+        )
+        .await
+        .expect("write legacy catalog");
+
+        let reopened = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("hydrate legacy claims");
+
+        assert_eq!(
+            reopened.domain_index().resolve("legacy.localhost"),
+            Some(&DomainTarget::Service {
+                project_instance_id: instance_id,
+                service_name: None,
+            })
+        );
+        assert_eq!(
+            reopened.instances[&instance_id].domain_claims,
+            BTreeSet::from(["legacy.localhost".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_catalog_replacement_preserves_the_previous_claim_set() {
+        let fixture = Fixture::new();
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let first_path = fixture.project("first-domain-project");
+        let second_path = fixture.project("second-domain-project");
+        let first = catalog
+            .register_project(
+                ProjectCatalog::discover(first_path)
+                    .await
+                    .expect("discover first project"),
+                Some("first".to_owned()),
+            )
+            .expect("register first project");
+        let second = catalog
+            .register_project(
+                ProjectCatalog::discover(second_path)
+                    .await
+                    .expect("discover second project"),
+                Some("second".to_owned()),
+            )
+            .expect("register second project");
+        catalog
+            .replace_domain_claims(
+                first,
+                [DomainClaim::service(
+                    "shared.localhost".parse().expect("valid domain"),
+                    first,
+                    "first:web".to_owned(),
+                )],
+            )
+            .expect("record first claim");
+        let before = catalog.clone();
+
+        let error = catalog
+            .replace_domain_claims(
+                second,
+                [DomainClaim::service(
+                    "shared.localhost".parse().expect("valid domain"),
+                    second,
+                    "second:web".to_owned(),
+                )],
+            )
+            .expect_err("conflict must fail");
+
+        assert!(error.to_string().contains("first:web"));
+        assert!(error.to_string().contains("second:web"));
+        assert_eq!(catalog, before);
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_instance_releases_its_exact_domains() {
+        let fixture = Fixture::new();
+        let project = fixture.project("forgotten-domain-project");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project.clone())
+                    .await
+                    .expect("discover project"),
+                Some("forgotten".to_owned()),
+            )
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "forgotten.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "forgotten:web".to_owned(),
+                )],
+            )
+            .expect("record claim");
+
+        assert!(
+            catalog
+                .unregister_project(&project)
+                .expect("forget project")
+        );
+
+        assert!(
+            catalog
+                .domain_index()
+                .resolve("forgotten.localhost")
+                .is_none()
+        );
+        assert!(!catalog.instances.contains_key(&instance_id));
     }
 
     #[allow(clippy::disallowed_methods)]

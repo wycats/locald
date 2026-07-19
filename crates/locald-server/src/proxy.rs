@@ -18,7 +18,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::assets;
-use locald_core::resolver::ServiceResolver;
+use locald_core::DomainName;
+use locald_core::resolver::{DomainResolution, ServiceResolver};
 use locald_core::state::ServiceState;
 use locald_utils::cert::CertManager;
 
@@ -212,7 +213,7 @@ async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri
 }
 
 async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
-    let host = match req.headers().get("host") {
+    let raw_host = match req.headers().get("host") {
         Some(h) => h
             .to_str()
             .unwrap_or_default()
@@ -222,9 +223,20 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
             .to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing Host header").into_response(),
     };
+    let host = match raw_host.parse::<DomainName>() {
+        Ok(host) => host.to_string(),
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
 
-    // Dev UI routing: proxy dev domains to local Vite/Astro dev servers.
-    // This allows hot reload without rebuilding the Rust binary.
+    // Project services override platform fallbacks so locald can develop its
+    // own dashboard and docs through the same managed-domain workflow.
+    let resolution = state.resolver.resolve_service_by_domain(&host).await;
+    if let Some(resolution) = resolution {
+        return proxy_to_domain_resolution(&state, req, &host, resolution).await;
+    }
+
+    // Dev UI fallback: support standalone Vite/Astro development when no
+    // locald-managed project currently owns the dev domain.
     if dev_ui_enabled() {
         if host == "dev.locald.localhost" || host == "dev.locald.local" {
             let port = dev_ui_port("LOCALD_DASHBOARD_DEV_PORT", 5173);
@@ -237,21 +249,8 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
         }
     }
 
-    let resolution = state.resolver.resolve_service_by_domain(&host).await;
-
-    // Prefer a running service for docs.localhost too (useful for docs dev mode),
-    // and fall back to embedded docs when no service claims the domain.
     if host == "docs.localhost" || host == "docs.local" {
-        if let Some(resolution) = resolution {
-            return proxy_to_domain_resolution(&state, req, &host, resolution).await;
-        }
-
         return assets::handle_docs(req.uri()).into_response();
-    }
-
-    // Check if there is a running service for this domain first (e.g. locald-dashboard in dev mode)
-    if let Some(resolution) = resolution {
-        return proxy_to_domain_resolution(&state, req, &host, resolution).await;
     }
 
     // Fallback to embedded dashboard if no service claims the domain
@@ -266,12 +265,19 @@ async fn proxy_to_domain_resolution(
     state: &AppState,
     mut req: Request,
     host: &str,
-    resolution: locald_core::resolver::DomainResolution,
+    resolution: DomainResolution,
 ) -> Response {
-    let service_name = resolution.name;
-    let port = resolution.port;
+    let DomainResolution::Service {
+        name: service_name,
+        port,
+        status,
+    } = resolution
+    else {
+        return ownership_only_response(host);
+    };
+
     if port.is_none() {
-        if matches!(resolution.status, ServiceState::Building) {
+        if matches!(status, ServiceState::Building) {
             return loading_response(&service_name);
         }
 
@@ -591,6 +597,74 @@ fn disabled_response(service_name: &str, host: &str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [("content-type", "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+fn ownership_only_response(host: &str) -> Response {
+    let escaped_host = escape_html(host);
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local project is stopped</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0b0b0f;
+            color: #e4e4e7;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }}
+        .container {{
+            background: #111827;
+            padding: 2rem;
+            border-radius: 12px;
+            border: 1px solid #1f2937;
+            max-width: 560px;
+            width: 90%;
+        }}
+        h1 {{ margin: 0 0 0.75rem; font-size: 1.5rem; }}
+        p {{ margin: 0 0 1rem; line-height: 1.5; color: #d4d4d8; }}
+        .hint {{ font-size: 0.9rem; color: #a1a1aa; }}
+        .btn {{
+            display: inline-block;
+            background-color: #1f2937;
+            color: #e4e4e7;
+            padding: 0.6rem 1.1rem;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+        }}
+        code {{
+            background: #0f172a;
+            padding: 0.15rem 0.35rem;
+            border-radius: 6px;
+            color: #93c5fd;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>This local project is stopped</h1>
+        <p>locald has preserved this project domain, but its service mapping is not currently loaded.</p>
+        <p class="hint">Domain: <code>{escaped_host}</code></p>
+        <p>Run <code>locald up</code> from the project directory to load its services.</p>
+        <a class="btn" href="http://locald.localhost">Open dashboard</a>
+    </div>
+</body>
+</html>"#
+    );
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
     )
         .into_response()

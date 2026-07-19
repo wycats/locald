@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::domain::sanitize_dns_label;
+
 /// Git context for a project path.
 #[derive(Debug, Clone)]
 pub struct GitContext {
@@ -57,33 +59,7 @@ fn check_is_default(branch: &str, repo: &git2::Repository) -> bool {
 /// Lowercase, replace `[^a-z0-9-]` with `-`, collapse consecutive hyphens,
 /// trim leading/trailing hyphens, truncate to 63 characters.
 pub fn sanitize_branch_for_dns(branch: &str) -> String {
-    let mut result = String::with_capacity(branch.len());
-
-    for ch in branch.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' {
-            result.push(ch);
-        } else {
-            result.push('-');
-        }
-    }
-
-    // Collapse consecutive hyphens.
-    while result.contains("--") {
-        result = result.replace("--", "-");
-    }
-
-    let result = result.trim_matches('-').to_string();
-
-    // Guard against empty result (branch name was all special chars).
-    if result.is_empty() {
-        return "branch".to_string();
-    }
-
-    if result.len() > 63 {
-        result[..63].trim_end_matches('-').to_string()
-    } else {
-        result
-    }
+    sanitize_dns_label(branch, "branch")
 }
 
 /// Extract the last segment of a branch name (after the last `/`).

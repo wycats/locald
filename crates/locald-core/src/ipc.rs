@@ -269,6 +269,14 @@ pub enum IpcRequest {
     ///
     /// **Response:** `IpcResponse::Status(Vec<ServiceStatus>)`
     Status,
+    /// Synchronize the hosts file from the daemon-owned domain index.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    SyncHosts,
+    /// Read the authoritative hostnames that require hosts-file mappings.
+    ///
+    /// **Response:** `IpcResponse::HostsDomains`
+    GetHostsDomains,
     /// Shut down the server.
     ///
     /// **Response:** `IpcResponse::Ok`
@@ -401,6 +409,8 @@ pub enum IpcResponse {
     Ok,
     /// Response to Status request.
     Status(Vec<ServiceStatus>),
+    /// Authoritative exact hostnames that require hosts-file mappings.
+    HostsDomains(Vec<crate::DomainName>),
     /// Generic error response.
     Error(String),
     /// Response to AiContext request.
