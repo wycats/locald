@@ -477,6 +477,7 @@ impl ProjectAvailability {
     #[must_use]
     pub fn shutdown_deferred_at(&self, now: SystemTime) -> bool {
         !self.is_paused()
+            && !self.desired_up_at(now)
             && self
                 .shutdown_cooldown_until
                 .is_some_and(|deadline| deadline > now)
@@ -502,6 +503,7 @@ impl ProjectAvailability {
             self.demands[index]
                 .renew(now)
                 .map_err(|reason| AvailabilityError::Invariant { reason })?;
+            self.shutdown_cooldown_until = None;
             return Ok(EnsureDemandResult {
                 effect: EnsureDemandEffect::Renewed,
                 lease: self.demands[index].clone(),
@@ -520,6 +522,7 @@ impl ProjectAvailability {
             .map_err(|reason| AvailabilityError::Invariant { reason })?;
         self.demands.push(lease.clone());
         self.demands.sort_by(|left, right| left.key.cmp(&right.key));
+        self.shutdown_cooldown_until = None;
 
         Ok(EnsureDemandResult {
             effect: if crossed_pause_barrier {
@@ -540,25 +543,151 @@ impl ProjectAvailability {
             return Ok(RenewDemandResult::Missing);
         };
         if !self.demands[index].is_live_at(now) {
+            let availability_loss_at = self
+                .demands
+                .iter()
+                .filter(|demand| {
+                    self.demand_generation_is_effective(demand.generation)
+                        && !demand.is_live_at(now)
+                })
+                .filter_map(DemandLease::expires_at)
+                .max();
             self.demands.remove(index);
+            self.arm_shutdown_cooldown_if_idle(now, availability_loss_at)?;
             return Ok(RenewDemandResult::Expired);
         }
         self.demands[index]
             .renew(now)
             .map_err(|reason| AvailabilityError::Invariant { reason })?;
+        if self.demand_generation_is_effective(self.demands[index].generation) {
+            self.shutdown_cooldown_until = None;
+        }
         Ok(RenewDemandResult::Renewed(self.demands[index].clone()))
     }
 
-    fn release_demand(&mut self, key: &DemandKey) -> bool {
+    fn release_demand(
+        &mut self,
+        key: &DemandKey,
+        now: SystemTime,
+    ) -> Result<bool, AvailabilityError> {
+        let removed_effective = self.demands.iter().find(|demand| {
+            &demand.key == key && self.demand_generation_is_effective(demand.generation)
+        });
+        let availability_loss_at = removed_effective.and_then(|demand| {
+            if demand.is_live_at(now) {
+                Some(now)
+            } else {
+                self.demands
+                    .iter()
+                    .filter(|candidate| {
+                        self.demand_generation_is_effective(candidate.generation)
+                            && !candidate.is_live_at(now)
+                    })
+                    .filter_map(DemandLease::expires_at)
+                    .max()
+            }
+        });
         let previous_len = self.demands.len();
         self.demands.retain(|demand| &demand.key != key);
-        self.demands.len() != previous_len
+        let released = self.demands.len() != previous_len;
+        self.arm_shutdown_cooldown_if_idle(
+            now,
+            if released { availability_loss_at } else { None },
+        )?;
+        Ok(released)
     }
 
-    fn expire_demands(&mut self, now: SystemTime) -> usize {
+    fn expire_demands(&mut self, now: SystemTime) -> Result<usize, AvailabilityError> {
+        let availability_loss_at = self
+            .demands
+            .iter()
+            .filter(|demand| {
+                !demand.is_live_at(now) && self.demand_generation_is_effective(demand.generation)
+            })
+            .filter_map(DemandLease::expires_at)
+            .max();
         let previous_len = self.demands.len();
         self.demands.retain(|demand| demand.is_live_at(now));
-        previous_len - self.demands.len()
+        let expired = previous_len - self.demands.len();
+        self.arm_shutdown_cooldown_if_idle(now, availability_loss_at)?;
+        Ok(expired)
+    }
+
+    fn set_always_on(&mut self, enabled: bool, now: SystemTime) -> Result<bool, AvailabilityError> {
+        if enabled {
+            let activation_required = !self.always_on || self.is_paused();
+            let cooldown_cleared = self.shutdown_cooldown_until.take().is_some();
+            if activation_required {
+                self.activity_generation = self.activity_generation.checked_add(1).ok_or(
+                    AvailabilityError::GenerationExhausted {
+                        current: self.activity_generation,
+                    },
+                )?;
+            }
+            let changed = !self.always_on || activation_required || cooldown_cleared;
+            self.always_on = true;
+            return Ok(changed);
+        }
+
+        if !self.always_on {
+            return Ok(false);
+        }
+        self.always_on = false;
+        self.arm_shutdown_cooldown_if_idle(now, Some(now))?;
+        Ok(true)
+    }
+
+    fn pause_project(&mut self) -> bool {
+        let pause_through_generation = Some(self.activity_generation);
+        let changed = self.pause_through_generation != pause_through_generation
+            || self.shutdown_cooldown_until.is_some();
+        self.pause_through_generation = pause_through_generation;
+        self.shutdown_cooldown_until = None;
+        changed
+    }
+
+    fn set_trusted_launch_path(&mut self, path: Option<String>) -> bool {
+        if self.trusted_launch_path == path {
+            return false;
+        }
+        self.trusted_launch_path = path;
+        true
+    }
+
+    fn set_last_convergence_error(&mut self, error: Option<String>) -> bool {
+        if self.last_convergence_error == error {
+            return false;
+        }
+        self.last_convergence_error = error;
+        true
+    }
+
+    fn demand_generation_is_effective(&self, generation: u64) -> bool {
+        self.pause_through_generation
+            .is_none_or(|pause| generation > pause)
+    }
+
+    fn arm_shutdown_cooldown_if_idle(
+        &mut self,
+        now: SystemTime,
+        availability_loss_at: Option<SystemTime>,
+    ) -> Result<(), AvailabilityError> {
+        let Some(availability_loss_at) = availability_loss_at else {
+            return Ok(());
+        };
+        if self.shutdown_cooldown_until.is_some()
+            || self.always_on
+            || self.is_paused()
+            || self.effective_demands_at(now).next().is_some()
+        {
+            return Ok(());
+        }
+
+        self.shutdown_cooldown_until = Some(
+            deadline(availability_loss_at, SHUTDOWN_COOLDOWN)
+                .map_err(|reason| AvailabilityError::Invariant { reason })?,
+        );
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -718,11 +847,6 @@ impl<C: Clock> AvailabilityStore<C> {
         &self.path
     }
 
-    #[must_use]
-    pub const fn availability(&self) -> &ProjectAvailability {
-        &self.availability
-    }
-
     /// Explicitly acquire, renew, or resume one demand.
     pub async fn ensure_demand(
         &mut self,
@@ -747,8 +871,8 @@ impl<C: Clock> AvailabilityStore<C> {
 
     /// Release one owner while preserving every other demand.
     pub async fn release_demand(&mut self, key: &DemandKey) -> Result<bool, AvailabilityError> {
-        self.mutate(|candidate, _now| {
-            let released = candidate.release_demand(key);
+        self.mutate(|candidate, now| {
+            let released = candidate.release_demand(key, now)?;
             Ok((released, released))
         })
         .await
@@ -757,22 +881,127 @@ impl<C: Clock> AvailabilityStore<C> {
     /// Remove every demand whose absolute deadline has been reached.
     pub async fn expire_demands(&mut self) -> Result<usize, AvailabilityError> {
         self.mutate(|candidate, now| {
-            let expired = candidate.expire_demands(now);
+            let expired = candidate.expire_demands(now)?;
             Ok((expired, expired > 0))
         })
         .await
     }
 
-    /// Derive desired availability using one clock observation.
-    #[must_use]
-    pub fn desired_up(&self) -> bool {
-        self.availability.desired_up_at(self.clock.now())
+    /// Enable or disable durable Always On policy.
+    ///
+    /// Enabling a paused policy is explicit activity and advances beyond the
+    /// pause barrier. Disabling the policy arms the normal shutdown cooldown
+    /// when no live demand remains. Returns whether durable state changed.
+    pub async fn set_always_on(&mut self, enabled: bool) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, now| {
+            let changed = candidate.set_always_on(enabled, now)?;
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Pause the project through its current activity generation.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn pause_project(&mut self) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.pause_project();
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Replace the trusted launch `PATH` after an explicit trusted CLI ensure.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn replace_trusted_launch_path(
+        &mut self,
+        path: String,
+    ) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_trusted_launch_path(Some(path));
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Seed a trusted launch `PATH` only when no earlier trusted caller did so.
+    ///
+    /// Returns whether this call stored the seed.
+    pub async fn seed_trusted_launch_path_if_missing(
+        &mut self,
+        path: String,
+    ) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = if candidate.trusted_launch_path().is_none() {
+                candidate.set_trusted_launch_path(Some(path))
+            } else {
+                false
+            };
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Clear launch context that is no longer trusted or usable.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn clear_trusted_launch_path(&mut self) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_trusted_launch_path(None);
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Record the last convergence failure shown by status surfaces.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn record_convergence_error(
+        &mut self,
+        error: String,
+    ) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_last_convergence_error(Some(error));
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Clear the last convergence failure after a successful convergence.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn clear_convergence_error(&mut self) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_last_convergence_error(None);
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Load and return the latest authoritative availability snapshot.
+    pub async fn snapshot(&mut self) -> Result<ProjectAvailability, AvailabilityError> {
+        self.refresh().await?;
+        Ok(self.availability.clone())
+    }
+
+    /// Derive desired availability from the latest authoritative snapshot.
+    pub async fn desired_up(&mut self) -> Result<bool, AvailabilityError> {
+        self.refresh().await?;
+        Ok(self.availability.desired_up_at(self.clock.now()))
     }
 
     /// Whether convergence may keep this already-running instance alive.
-    #[must_use]
-    pub fn shutdown_deferred(&self) -> bool {
-        self.availability.shutdown_deferred_at(self.clock.now())
+    pub async fn shutdown_deferred(&mut self) -> Result<bool, AvailabilityError> {
+        self.refresh().await?;
+        Ok(self.availability.shutdown_deferred_at(self.clock.now()))
+    }
+
+    async fn refresh(&mut self) -> Result<(), AvailabilityError> {
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        let _guard = mutation_lock.lock_owned().await;
+        self.availability = load_availability(&self.path, self.project_instance_id).await?;
+        Ok(())
     }
 
     async fn mutate<Output, Transition>(
@@ -1243,7 +1472,7 @@ mod tests {
         assert_eq!(renewed.lease.generation(), 1);
         assert_eq!(renewed.lease.acquired_at(), acquired.lease.acquired_at());
         assert_eq!(renewed.lease.renewed_at(), clock.time());
-        assert_eq!(store.availability().activity_generation(), 1);
+        assert_eq!(store.availability.activity_generation(), 1);
     }
 
     #[tokio::test]
@@ -1263,9 +1492,9 @@ mod tests {
 
         assert_eq!(editor.effect, EnsureDemandEffect::Acquired);
         assert_eq!(editor.lease.generation(), 2);
-        assert_eq!(store.availability().activity_generation(), 2);
-        assert_eq!(store.availability().demands().len(), 2);
-        assert!(store.desired_up());
+        assert_eq!(store.availability.activity_generation(), 2);
+        assert_eq!(store.availability.demands().len(), 2);
+        assert!(store.desired_up().await.expect("derive desired state"));
     }
 
     #[tokio::test]
@@ -1279,10 +1508,8 @@ mod tests {
             .ensure_demand(manual.clone())
             .await
             .expect("acquire manual demand");
-        store.availability.pause_through_generation = Some(1);
-        let paused = store.availability.clone();
-        store.commit(paused).await.expect("persist pause barrier");
-        assert!(store.availability().is_paused());
+        assert!(store.pause_project().await.expect("pause project"));
+        assert!(store.availability.is_paused());
 
         clock.advance(Duration::from_secs(20));
         let renewed = store
@@ -1294,9 +1521,9 @@ mod tests {
             other => return assert!(matches!(other, RenewDemandResult::Renewed(_))),
         };
         assert_eq!(lease.generation(), 1);
-        assert_eq!(store.availability().activity_generation(), 1);
-        assert!(store.availability().is_paused());
-        assert!(!store.desired_up());
+        assert_eq!(store.availability.activity_generation(), 1);
+        assert!(store.availability.is_paused());
+        assert!(!store.desired_up().await.expect("derive paused state"));
 
         let resumed = store
             .ensure_demand(manual)
@@ -1304,8 +1531,8 @@ mod tests {
             .expect("explicitly resume demand");
         assert_eq!(resumed.effect, EnsureDemandEffect::Resumed);
         assert_eq!(resumed.lease.generation(), 2);
-        assert!(!store.availability().is_paused());
-        assert!(store.desired_up());
+        assert!(!store.availability.is_paused());
+        assert!(store.desired_up().await.expect("derive resumed state"));
     }
 
     #[tokio::test]
@@ -1320,9 +1547,7 @@ mod tests {
             .ensure_demand(editor.clone())
             .await
             .expect("acquire editor demand");
-        store.availability.pause_through_generation = Some(1);
-        let paused = store.availability.clone();
-        store.commit(paused).await.expect("persist pause barrier");
+        assert!(store.pause_project().await.expect("pause project"));
 
         let manual_resume = store
             .ensure_demand(manual.clone())
@@ -1338,19 +1563,19 @@ mod tests {
             .expect("passively renew suppressed editor");
         assert!(
             store
-                .availability()
+                .availability
                 .live_demands_at(clock.time())
                 .next()
                 .is_some()
         );
         assert!(
             store
-                .availability()
+                .availability
                 .effective_demands_at(clock.time())
                 .next()
                 .is_none()
         );
-        assert!(!store.desired_up());
+        assert!(!store.desired_up().await.expect("derive suppressed state"));
 
         let editor_resume = store
             .ensure_demand(editor)
@@ -1358,7 +1583,7 @@ mod tests {
             .expect("resume through editor activity");
         assert_eq!(editor_resume.effect, EnsureDemandEffect::Resumed);
         assert_eq!(editor_resume.lease.generation(), 3);
-        assert!(store.desired_up());
+        assert!(store.desired_up().await.expect("derive resumed state"));
     }
 
     #[tokio::test]
@@ -1389,8 +1614,12 @@ mod tests {
                 .expect("remove expired renewal"),
             RenewDemandResult::Expired
         );
-        assert!(store.availability().demands().is_empty());
-        assert_eq!(store.availability().activity_generation(), 1);
+        assert!(store.availability.demands().is_empty());
+        assert_eq!(store.availability.activity_generation(), 1);
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(clock.time() + SHUTDOWN_COOLDOWN)
+        );
     }
 
     #[tokio::test]
@@ -1412,7 +1641,8 @@ mod tests {
         clock.advance(VSCODE_DEMAND_TTL);
 
         assert_eq!(store.expire_demands().await.expect("expire demands"), 1);
-        assert_eq!(store.availability().demands().len(), 1);
+        assert_eq!(store.availability.demands().len(), 1);
+        assert_eq!(store.availability.shutdown_cooldown_until(), None);
         assert!(store.release_demand(&manual).await.expect("release manual"));
         assert!(
             !store
@@ -1420,8 +1650,18 @@ mod tests {
                 .await
                 .expect("release missing manual")
         );
-        assert!(store.availability().demands().is_empty());
-        assert!(!store.desired_up());
+        assert!(store.availability.demands().is_empty());
+        assert!(!store.desired_up().await.expect("derive idle state"));
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(clock.time() + SHUTDOWN_COOLDOWN)
+        );
+        assert!(
+            store
+                .shutdown_deferred()
+                .await
+                .expect("derive shutdown deferral")
+        );
     }
 
     #[tokio::test]
@@ -1442,8 +1682,8 @@ mod tests {
             store.expire_demands().await.expect("expire legacy demand"),
             1
         );
-        assert!(store.availability().demands().is_empty());
-        assert!(!store.desired_up());
+        assert!(store.availability.demands().is_empty());
+        assert!(!store.desired_up().await.expect("derive idle state"));
     }
 
     #[test]
@@ -1477,6 +1717,351 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_expiry_uses_the_lease_deadline_for_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(20), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let demand_expires_at = clock.time() + VSCODE_DEMAND_TTL;
+
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL + SHUTDOWN_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(
+            store.expire_demands().await.expect("expire editor demand"),
+            1
+        );
+
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(demand_expires_at + SHUTDOWN_COOLDOWN)
+        );
+        assert!(
+            !store
+                .shutdown_deferred()
+                .await
+                .expect("derive elapsed shutdown deferral")
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_an_expired_lease_uses_its_expiry_for_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(29), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let demand_expires_at = clock.time() + VSCODE_DEMAND_TTL;
+
+        store
+            .ensure_demand(editor.clone())
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL + Duration::from_secs(1));
+        assert!(
+            store
+                .release_demand(&editor)
+                .await
+                .expect("release expired editor demand")
+        );
+
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(demand_expires_at + SHUTDOWN_COOLDOWN)
+        );
+        assert!(
+            store
+                .shutdown_deferred()
+                .await
+                .expect("derive remaining shutdown deferral")
+        );
+    }
+
+    #[tokio::test]
+    async fn later_cleanup_preserves_an_already_armed_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(21), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let manual = DemandKey::manual_cli();
+
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL);
+        store
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire manual demand");
+        assert!(store.release_demand(&manual).await.expect("release manual"));
+        let armed_deadline = store
+            .availability
+            .shutdown_cooldown_until()
+            .expect("cooldown is armed");
+
+        assert_eq!(
+            store.expire_demands().await.expect("remove stale editor"),
+            1
+        );
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(armed_deadline)
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_transitions_are_generation_scoped_and_durable() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(22);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        assert!(store.set_always_on(true).await.expect("enable Always On"));
+        assert_eq!(store.availability.activity_generation(), 1);
+        assert!(store.availability.always_on());
+        assert!(store.desired_up().await.expect("derive pinned state"));
+
+        assert!(store.pause_project().await.expect("pause pinned project"));
+        assert!(store.availability.is_paused());
+        assert!(store.availability.always_on());
+        assert!(!store.desired_up().await.expect("derive paused state"));
+
+        assert!(
+            store
+                .set_always_on(true)
+                .await
+                .expect("renew pin to resume")
+        );
+        assert_eq!(store.availability.activity_generation(), 2);
+        assert!(!store.availability.is_paused());
+        assert!(store.desired_up().await.expect("derive resumed pin state"));
+
+        assert!(store.set_always_on(false).await.expect("disable Always On"));
+        assert!(!store.availability.always_on());
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(clock.time() + SHUTDOWN_COOLDOWN)
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert_eq!(
+            reopened.snapshot().await.expect("load policy snapshot"),
+            store.availability
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_context_and_convergence_error_transitions_are_durable() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(23);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        assert!(
+            store
+                .replace_trusted_launch_path("/opt/homebrew/bin:/usr/bin".to_owned())
+                .await
+                .expect("record trusted PATH")
+        );
+        assert!(
+            store
+                .record_convergence_error("web readiness timed out".to_owned())
+                .await
+                .expect("record convergence error")
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        let snapshot = reopened.snapshot().await.expect("load durable diagnostics");
+        assert_eq!(
+            snapshot.trusted_launch_path(),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        assert_eq!(
+            snapshot.last_convergence_error(),
+            Some("web readiness timed out")
+        );
+
+        assert!(
+            reopened
+                .clear_trusted_launch_path()
+                .await
+                .expect("clear trusted PATH")
+        );
+        assert!(
+            reopened
+                .clear_convergence_error()
+                .await
+                .expect("clear convergence error")
+        );
+        let cleared = reopened.snapshot().await.expect("load cleared diagnostics");
+        assert_eq!(cleared.trusted_launch_path(), None);
+        assert_eq!(cleared.last_convergence_error(), None);
+    }
+
+    #[tokio::test]
+    async fn orthogonal_mutations_from_stale_handles_are_preserved() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(24);
+        let mut policy = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut launch = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        let (policy_result, launch_result) = tokio::join!(
+            policy.set_always_on(true),
+            launch.replace_trusted_launch_path("/usr/local/bin:/usr/bin".to_owned())
+        );
+        assert!(policy_result.expect("persist Always On"));
+        assert!(launch_result.expect("persist trusted PATH"));
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        let snapshot = reopened
+            .snapshot()
+            .await
+            .expect("load combined policy state");
+        assert!(snapshot.always_on());
+        assert_eq!(
+            snapshot.trusted_launch_path(),
+            Some("/usr/local/bin:/usr/bin")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_launch_path_seeding_selects_one_trusted_value() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(25);
+        let mut editor = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut agent = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        let (editor_result, agent_result) = tokio::join!(
+            editor.seed_trusted_launch_path_if_missing("/editor/bin".to_owned()),
+            agent.seed_trusted_launch_path_if_missing("/agent/bin".to_owned())
+        );
+        assert_ne!(
+            editor_result.expect("seed editor PATH"),
+            agent_result.expect("seed agent PATH")
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert!(matches!(
+            reopened
+                .snapshot()
+                .await
+                .expect("load seeded PATH")
+                .trusted_launch_path(),
+            Some("/editor/bin" | "/agent/bin")
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_readers_refresh_before_availability_decisions() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(26);
+        let mut observer = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut writer = fake_store(&fixture, project_instance_id, clock).await;
+        let manual = DemandKey::manual_cli();
+
+        writer
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire demand through writer");
+        assert!(
+            observer
+                .desired_up()
+                .await
+                .expect("observe acquired demand")
+        );
+        assert_eq!(
+            observer
+                .snapshot()
+                .await
+                .expect("observe authoritative snapshot")
+                .demands()
+                .len(),
+            1
+        );
+
+        assert!(
+            writer
+                .release_demand(&manual)
+                .await
+                .expect("release demand")
+        );
+        assert!(
+            !observer
+                .desired_up()
+                .await
+                .expect("observe released demand")
+        );
+        assert!(
+            observer
+                .shutdown_deferred()
+                .await
+                .expect("observe armed cooldown")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_inputs_preserve_the_authoritative_snapshot() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(27);
+        let mut store = fake_store(&fixture, project_instance_id, clock).await;
+
+        store
+            .replace_trusted_launch_path("/usr/bin".to_owned())
+            .await
+            .expect("record initial trusted PATH");
+        let before = std::fs::read(store.path()).expect("read authoritative snapshot");
+
+        let path_error = store
+            .replace_trusted_launch_path("/bad\0path".to_owned())
+            .await
+            .expect_err("reject PATH containing NUL");
+        assert!(matches!(path_error, AvailabilityError::InvalidData { .. }));
+        assert_eq!(
+            std::fs::read(store.path()).expect("reread snapshot after invalid PATH"),
+            before
+        );
+
+        let convergence_error = store
+            .record_convergence_error("   ".to_owned())
+            .await
+            .expect_err("reject empty convergence error");
+        assert!(matches!(
+            convergence_error,
+            AvailabilityError::InvalidData { .. }
+        ));
+        assert_eq!(
+            std::fs::read(store.path()).expect("reread snapshot after invalid error"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_read_failure_never_reuses_cached_state() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(28);
+        let mut store = fake_store(&fixture, project_instance_id, clock).await;
+
+        store
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("persist live demand");
+        std::fs::write(store.path(), b"{").expect("corrupt authoritative snapshot");
+
+        let error = store
+            .desired_up()
+            .await
+            .expect_err("reject corrupt authoritative read");
+        assert!(matches!(error, AvailabilityError::InvalidData { .. }));
+    }
+
+    #[tokio::test]
     async fn persistence_round_trip_is_stable_and_instance_scoped() {
         let fixture = Fixture::new();
         let clock = FakeClock::new(START_SECONDS);
@@ -1505,8 +2090,8 @@ mod tests {
         );
 
         let reopened = fake_store(&fixture, first_id, clock).await;
-        assert_eq!(reopened.availability(), first.availability());
-        let unchanged = reopened.availability().clone();
+        assert_eq!(reopened.availability, first.availability);
+        let unchanged = reopened.availability.clone();
         let mut reopened = reopened;
         reopened
             .commit(unchanged)
@@ -1550,7 +2135,7 @@ mod tests {
             AvailabilityStore::load_with_clock(&relative_data_dir, project_instance_id, clock)
                 .await
                 .expect("reopen relative availability store");
-        assert_eq!(reopened.availability(), store.availability());
+        assert_eq!(reopened.availability, store.availability);
     }
 
     #[tokio::test]
@@ -1577,8 +2162,8 @@ mod tests {
         assert_eq!(generations, [1, 2]);
 
         let reopened = fake_store(&fixture, project_instance_id, clock.clone()).await;
-        assert_eq!(reopened.availability().activity_generation(), 2);
-        assert_eq!(reopened.availability().demands().len(), 2);
+        assert_eq!(reopened.availability.activity_generation(), 2);
+        assert_eq!(reopened.availability.demands().len(), 2);
 
         assert!(
             first
@@ -1587,8 +2172,8 @@ mod tests {
                 .expect("release from older handle")
         );
         let reopened = fake_store(&fixture, project_instance_id, clock).await;
-        assert_eq!(reopened.availability().demands().len(), 1);
-        assert_eq!(reopened.availability().demands()[0].key(), &editor);
+        assert_eq!(reopened.availability.demands().len(), 1);
+        assert_eq!(reopened.availability.demands()[0].key(), &editor);
     }
 
     #[cfg(unix)]
@@ -1620,8 +2205,8 @@ mod tests {
         editor_result.expect("acquire aliased demand");
 
         let reopened = fake_store(&fixture, project_instance_id, clock).await;
-        assert_eq!(reopened.availability().activity_generation(), 2);
-        assert_eq!(reopened.availability().demands().len(), 2);
+        assert_eq!(reopened.availability.activity_generation(), 2);
+        assert_eq!(reopened.availability.demands().len(), 2);
     }
 
     #[tokio::test]
@@ -1713,7 +2298,7 @@ mod tests {
         let fixture = Fixture::new();
         let clock = FakeClock::new(START_SECONDS);
         let mut store = fake_store(&fixture, instance_id(11), clock).await;
-        let before = store.availability().clone();
+        let before = store.availability.clone();
         let occupied_path = store.path().to_path_buf();
 
         let error = store
@@ -1726,7 +2311,7 @@ mod tests {
             .await
             .expect_err("fail before publishing availability");
         assert!(matches!(error, AvailabilityError::Io { .. }));
-        assert_eq!(store.availability(), &before);
+        assert_eq!(store.availability, before);
         assert!(temporary_files(store.path()).is_empty());
     }
 
@@ -1736,7 +2321,7 @@ mod tests {
         let clock = FakeClock::new(START_SECONDS);
         let project_instance_id = instance_id(12);
         let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
-        let mut candidate = store.availability().clone();
+        let mut candidate = store.availability.clone();
         candidate
             .ensure_demand(DemandKey::manual_cli(), clock.time())
             .expect("prepare availability candidate");
@@ -1755,11 +2340,11 @@ mod tests {
             error,
             AvailabilityError::PublishedNotDurable { .. }
         ));
-        assert_eq!(store.availability(), &candidate);
+        assert_eq!(store.availability, candidate);
         assert!(temporary_files(store.path()).is_empty());
 
         let reopened = fake_store(&fixture, project_instance_id, clock).await;
-        assert_eq!(reopened.availability(), &candidate);
+        assert_eq!(reopened.availability, candidate);
     }
 
     #[tokio::test]
@@ -1773,7 +2358,7 @@ mod tests {
             .commit(exhausted)
             .await
             .expect("persist exhausted generation");
-        let before = store.availability().clone();
+        let before = store.availability.clone();
 
         let error = store
             .ensure_demand(DemandKey::manual_cli())
@@ -1783,10 +2368,10 @@ mod tests {
             error,
             AvailabilityError::GenerationExhausted { current: u64::MAX }
         ));
-        assert_eq!(store.availability(), &before);
+        assert_eq!(store.availability, before);
         let persisted = AvailabilityStore::load(&fixture.data_dir, store.project_instance_id())
             .await
             .expect("reopen exhausted generation");
-        assert_eq!(persisted.availability(), &before);
+        assert_eq!(persisted.availability, before);
     }
 }
