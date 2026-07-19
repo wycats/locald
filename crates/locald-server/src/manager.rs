@@ -23,16 +23,17 @@ use locald_core::state::{
 };
 use locald_core::{
     CatalogError, DomainClaim, DomainName, DomainTarget, ProjectInstanceId, SharedDomainIndex,
-    sanitize_project_name_for_dns,
+    sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
@@ -61,6 +62,12 @@ impl LogBuffer {
     fn get_all(&self) -> Vec<LogEntry> {
         self.buffer.iter().cloned().collect()
     }
+}
+
+#[derive(Debug)]
+struct InstanceLogBuffer {
+    instance_id: ProjectInstanceId,
+    logs: LogBuffer,
 }
 
 #[async_trait::async_trait]
@@ -177,6 +184,9 @@ impl fmt::Debug for ServiceRuntime {
 
 #[derive(Debug)]
 pub(crate) struct Service {
+    pub instance_id: ProjectInstanceId,
+    pub controller_generation: u64,
+    pub projection_generation: u64,
     pub config: LocaldConfig,
     #[allow(clippy::struct_field_names)]
     pub service_config: ServiceConfig,
@@ -190,6 +200,30 @@ pub(crate) struct Service {
 }
 
 impl Service {}
+
+#[derive(Debug)]
+struct ConfigTransitionPlan {
+    removed_service_names: Vec<String>,
+    restart_service_names: Vec<String>,
+    reusable_service_envs: HashMap<String, HashMap<String, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ServiceProjectionToken {
+    instance_id: ProjectInstanceId,
+    controller_generation: u64,
+    projection_generation: u64,
+    has_controller: bool,
+}
+
+impl ServiceProjectionToken {
+    fn matches(self, service: &Service) -> bool {
+        self.instance_id == service.instance_id
+            && self.controller_generation == service.controller_generation
+            && self.projection_generation == service.projection_generation
+            && self.has_controller == matches!(service.runtime_state, ServiceRuntime::Controller(_))
+    }
+}
 
 /// Manages the lifecycle of services (processes, containers, databases).
 ///
@@ -212,7 +246,7 @@ pub struct ProcessManager {
     services: Arc<Mutex<HashMap<String, Service>>>,
     pub log_sender: broadcast::Sender<LogEntry>,
     pub event_sender: broadcast::Sender<Event>,
-    log_buffers: Arc<StdMutex<HashMap<String, LogBuffer>>>,
+    log_buffers: Arc<StdMutex<HashMap<String, InstanceLogBuffer>>>,
     state_manager: Arc<StateManager>,
     runtime: Arc<Runtime>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
@@ -225,6 +259,9 @@ pub struct ProcessManager {
     hosts_sync_guard: ConcurrencyGuard,
     host_syncer: Arc<dyn HostSyncer>,
     port_allocator: PortAllocator,
+    config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    runtime_projection_lock: Arc<Mutex<()>>,
+    next_controller_generation: Arc<AtomicU64>,
 }
 
 impl ProcessManager {
@@ -312,6 +349,9 @@ impl ProcessManager {
             hosts_sync_guard: ConcurrencyGuard::new(),
             host_syncer: Arc::new(DefaultHostSyncer),
             port_allocator: PortAllocator::new(),
+            config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
+            runtime_projection_lock: Arc::new(Mutex::new(())),
+            next_controller_generation: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -442,6 +482,7 @@ impl ProcessManager {
     fn build_domain_claims(
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
+        project_path: &Path,
     ) -> Result<Vec<DomainClaim>> {
         let base_domain = config.project.domain.clone().unwrap_or_else(|| {
             format!(
@@ -449,6 +490,12 @@ impl ProcessManager {
                 sanitize_project_name_for_dns(&config.project.name)
             )
         });
+        let base_domain = resolve_worktree_domain(
+            &base_domain,
+            &config.project.name,
+            config.worktrees.as_ref(),
+            project_path,
+        );
         let base_domain = base_domain.parse::<DomainName>().with_context(|| {
             format!(
                 "project `{}` has an invalid exact base domain `{base_domain}`",
@@ -463,9 +510,10 @@ impl ProcessManager {
             let domain = if service_name == "web" {
                 base_domain.clone()
             } else {
-                base_domain.with_prefix(&service_name).with_context(|| {
-                    format!("service `{service_name}` has an invalid exact domain label")
-                })?
+                let label = sanitize_service_name_for_dns(&service_name);
+                base_domain
+                    .with_prefix(&label)
+                    .with_context(|| format!("service `{service_name}` has an invalid domain"))?
             };
             claims.push(DomainClaim::service(
                 domain,
@@ -513,15 +561,132 @@ impl ProcessManager {
             .unwrap_or(full_name)
     }
 
-    fn domain_for_service(&self, name: &str) -> Option<String> {
+    pub(crate) fn advance_service_projection(service: &mut Service) -> u64 {
+        service.projection_generation = service.projection_generation.wrapping_add(1);
+        service.projection_generation
+    }
+
+    async fn prepublication_stop_plan(
+        &self,
+        path: &Path,
+        instance_id: ProjectInstanceId,
+        config: &LocaldConfig,
+        dot_env_vars: &HashMap<String, String>,
+        sorted_services: &[String],
+        desired_service_names: &HashSet<String>,
+    ) -> Result<ConfigTransitionPlan> {
+        let mut removed_service_names = {
+            let services = self.services.lock().await;
+            services
+                .iter()
+                .filter(|(name, service)| {
+                    service.path == path && !desired_service_names.contains(name.as_str())
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        removed_service_names.sort();
+
+        let mut changed_services = HashSet::new();
+        let mut restart_service_names = Vec::new();
+        let mut reusable_service_envs = HashMap::new();
+
+        for service_name in sorted_services {
+            let service_config = &config.services[service_name];
+            let dependency_will_change = service_config
+                .depends_on()
+                .iter()
+                .any(|dependency| changed_services.contains(dependency));
+            let (combined_env, _) =
+                Self::effective_service_env(config, dot_env_vars, service_config);
+            let manager = self.clone();
+            let expected_instance = instance_id;
+            let resolved_env =
+                ConfigLoader::resolve_env(&combined_env, config, move |name, field| {
+                    let manager = manager.clone();
+                    async move {
+                        manager
+                            .get_service_field(&name, &field, expected_instance)
+                            .await
+                    }
+                })
+                .await
+                .ok();
+            let full_name = format!("{}:{service_name}", config.project.name);
+            let service_snapshot = {
+                let services = self.services.lock().await;
+                services.get(&full_name).map(|service| {
+                    let controller = match &service.runtime_state {
+                        ServiceRuntime::Controller(controller) => Some(controller.clone()),
+                        ServiceRuntime::None => None,
+                    };
+                    (
+                        service.instance_id,
+                        service.path.clone(),
+                        service.service_config.clone(),
+                        service.resolved_env.clone(),
+                        controller,
+                    )
+                })
+            };
+
+            let (has_controller, is_up_to_date) = match service_snapshot {
+                Some((loaded_instance, loaded_path, _, _, Some(_)))
+                    if loaded_instance != instance_id =>
+                {
+                    anyhow::bail!(
+                        "service `{full_name}` is still loaded by project instance {loaded_instance} at {}; stop that project before starting instance {instance_id}",
+                        loaded_path.display()
+                    );
+                }
+                Some((_, _, current_config, current_env, Some(controller))) => {
+                    let is_running = controller.lock().await.read_state().await.status
+                        == locald_core::state::ServiceState::Running;
+                    let environment_matches = resolved_env
+                        .as_ref()
+                        .is_some_and(|resolved_env| current_env == *resolved_env);
+                    (
+                        true,
+                        !dependency_will_change
+                            && is_running
+                            && current_config == *service_config
+                            && environment_matches,
+                    )
+                }
+                Some((_, _, _, _, None)) | None => (false, false),
+            };
+
+            if !is_up_to_date {
+                changed_services.insert(service_name.clone());
+                if has_controller {
+                    restart_service_names.push(full_name);
+                }
+            } else if let Some(resolved_env) = resolved_env {
+                reusable_service_envs.insert(full_name, resolved_env);
+            }
+        }
+
+        // Dependents are later in startup order, so reverse it for shutdown.
+        restart_service_names.reverse();
+        Ok(ConfigTransitionPlan {
+            removed_service_names,
+            restart_service_names,
+            reusable_service_envs,
+        })
+    }
+
+    fn domain_for_service(&self, instance_id: ProjectInstanceId, name: &str) -> Option<String> {
         self.domain_index
             .snapshot()
-            .domain_for_service(name)
+            .domain_for_service(instance_id, name)
             .map(ToString::to_string)
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    async fn get_service_status(&self, name: &str) -> Option<ServiceStatus> {
+    async fn get_service_status(
+        &self,
+        name: &str,
+    ) -> Option<(ServiceStatus, ServiceProjectionToken)> {
         let proxy_ports = { *self.proxy_ports.lock().await };
         let (
             domain,
@@ -533,6 +698,7 @@ impl ProcessManager {
             workspace,
             constellation,
             warnings,
+            projection,
         ) = {
             let mut services = self.services.lock().await;
             let service = services.get_mut(name)?;
@@ -549,7 +715,7 @@ impl ProcessManager {
             };
 
             (
-                self.domain_for_service(name),
+                self.domain_for_service(service.instance_id, name),
                 Some(service.path.clone()),
                 service.health_status,
                 service.health_source,
@@ -558,10 +724,16 @@ impl ProcessManager {
                 service.config.project.workspace.clone(),
                 service.config.project.constellation.clone(),
                 service.warnings.clone(),
+                ServiceProjectionToken {
+                    instance_id: service.instance_id,
+                    controller_generation: service.controller_generation,
+                    projection_generation: service.projection_generation,
+                    has_controller: matches!(service.runtime_state, ServiceRuntime::Controller(_)),
+                },
             )
         };
 
-        Some(
+        Some((
             Self::build_service_status(
                 name.to_string(),
                 domain,
@@ -576,16 +748,48 @@ impl ProcessManager {
                 warnings,
             )
             .await,
-        )
+            projection,
+        ))
     }
 
     async fn broadcast_service_update(&self, name: &str) {
-        if let Some(status) = self.get_service_status(name).await {
-            let _ = self.event_sender.send(Event::ServiceUpdate(status));
+        if let Some((status, projection)) = self.get_service_status(name).await {
+            let services = self.services.lock().await;
+            if services
+                .get(name)
+                .is_some_and(|service| projection.matches(service))
+            {
+                let _ = self.event_sender.send(Event::ServiceUpdate(status));
+            }
         }
     }
 
-    fn broadcast_log(&self, entry: LogEntry) {
+    fn clear_foreign_log_buffer(&self, name: &str, instance_id: ProjectInstanceId) {
+        #[allow(clippy::expect_used)]
+        self.log_buffers
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .retain(|service_name, buffer| {
+                service_name != name || buffer.instance_id == instance_id
+            });
+    }
+
+    async fn broadcast_log(
+        &self,
+        instance_id: ProjectInstanceId,
+        controller_generation: u64,
+        entry: LogEntry,
+    ) {
+        let services = self.services.lock().await;
+        let is_current_controller = services.get(&entry.service).is_some_and(|service| {
+            service.instance_id == instance_id
+                && service.controller_generation == controller_generation
+                && matches!(service.runtime_state, ServiceRuntime::Controller(_))
+        });
+        if !is_current_controller {
+            return;
+        }
+
         info!("Broadcasting log for {}: {}", entry.service, entry.message);
         // Add to buffer
         {
@@ -593,8 +797,19 @@ impl ProcessManager {
             let mut buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
             let buffer = buffers
                 .entry(entry.service.clone())
-                .or_insert_with(|| LogBuffer::new(LOG_BUFFER_SIZE));
-            buffer.push(entry.clone());
+                .and_modify(|buffer| {
+                    if buffer.instance_id != instance_id {
+                        *buffer = InstanceLogBuffer {
+                            instance_id,
+                            logs: LogBuffer::new(LOG_BUFFER_SIZE),
+                        };
+                    }
+                })
+                .or_insert_with(|| InstanceLogBuffer {
+                    instance_id,
+                    logs: LogBuffer::new(LOG_BUFFER_SIZE),
+                });
+            buffer.logs.push(entry.clone());
         }
 
         // Broadcast (ignore error if no receivers)
@@ -608,7 +823,7 @@ impl ProcessManager {
         let buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
         let mut all_logs = Vec::new();
         for buffer in buffers.values() {
-            all_logs.extend(buffer.get_all());
+            all_logs.extend(buffer.logs.get_all());
         }
         all_logs.sort_by_key(|e| e.timestamp);
         all_logs
@@ -715,8 +930,13 @@ impl ProcessManager {
                 let state = c.lock().await.read_state().await;
                 if state.pid == Some(pid) {
                     info!("Service {} is ready (via notify)", name);
-                    service.health_status = HealthStatus::Healthy;
-                    service.health_source = HealthSource::Notify;
+                    if service.health_status != HealthStatus::Healthy
+                        || service.health_source != HealthSource::Notify
+                    {
+                        service.health_status = HealthStatus::Healthy;
+                        service.health_source = HealthSource::Notify;
+                        Self::advance_service_projection(service);
+                    }
                     break;
                 }
             }
@@ -743,7 +963,10 @@ impl ProcessManager {
                                 anyhow::bail!("Service {name} stopped unexpectedly during startup");
                             }
                             if state.health_status == HealthStatus::Healthy {
-                                service.health_status = HealthStatus::Healthy;
+                                if service.health_status != HealthStatus::Healthy {
+                                    service.health_status = HealthStatus::Healthy;
+                                    Self::advance_service_projection(service);
+                                }
                             }
                         }
                         ServiceRuntime::None => {
@@ -764,7 +987,12 @@ impl ProcessManager {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    async fn get_service_field(&self, name: &str, field: &str) -> Result<String> {
+    async fn get_service_field(
+        &self,
+        name: &str,
+        field: &str,
+        expected_instance: ProjectInstanceId,
+    ) -> Result<String> {
         // Re-acquire lock to get port, or just get it all at once?
         // The issue is holding the lock across await points or significant drops.
         // Let's get everything we need in one go.
@@ -773,6 +1001,11 @@ impl ProcessManager {
             let service = services
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("Service {name} not found"))?;
+            anyhow::ensure!(
+                service.instance_id == expected_instance,
+                "service `{name}` belongs to project instance {}, not requesting instance {expected_instance}",
+                service.instance_id
+            );
 
             let port_result = match &service.runtime_state {
                 ServiceRuntime::Controller(c) => Err(c.clone()),
@@ -945,8 +1178,18 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
     ) -> Result<()> {
-        let path = Self::canonicalize_path(&path);
+        let (path, transition_lock) = self.transition_lock_for_path(&path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        self.apply_config_locked(path, event_tx, verbose).await
+    }
 
+    async fn apply_config_locked(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+    ) -> Result<()> {
         // Setup log forwarding if verbose
         let _log_guard = if verbose {
             event_tx.as_ref().map(|tx| {
@@ -1014,31 +1257,44 @@ impl ProcessManager {
             .map(|service_name| format!("{}:{service_name}", config.project.name))
             .collect::<HashSet<_>>();
         let discovery = Registry::discover(path.clone()).await?;
-        let (commit_result, removed_service_names, published_domain_index) = {
+        let (
+            commit_result,
+            instance_id,
+            removed_service_names,
+            published_domain_index,
+            mut reusable_service_envs,
+        ) = {
             let mut registry = self.registry.lock().await;
             let mut candidate = registry.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
-            let claims = Self::build_domain_claims(instance_id, &config)?;
+            let claims = Self::build_domain_claims(instance_id, &config, &path)?;
             candidate.replace_domain_claims(instance_id, claims)?;
 
-            // Keep the previous claim set published until every service removed
-            // by this reload has stopped. A failed stop retains both ownership
-            // and the retryable service record.
-            let mut removed_service_names = {
-                let services = self.services.lock().await;
-                services
-                    .iter()
-                    .filter(|(name, service)| {
-                        service.path == path && !desired_service_names.contains(name.as_str())
-                    })
-                    .map(|(name, _)| name.clone())
-                    .collect::<Vec<_>>()
-            };
-            removed_service_names.sort();
+            // Keep the previous claim set published until every removed or
+            // restart-required service has stopped. A failed stop retains both
+            // ownership and the retryable service record.
+            let ConfigTransitionPlan {
+                removed_service_names,
+                restart_service_names,
+                reusable_service_envs,
+            } = self
+                .prepublication_stop_plan(
+                    &path,
+                    instance_id,
+                    &config,
+                    &dot_env_vars,
+                    &sorted_services,
+                    &desired_service_names,
+                )
+                .await?;
             for name in &removed_service_names {
                 info!("Service {name} removed from config, stopping before domain publication...");
-                self.stop(name).await?;
+                self.stop_service_locked(name, &path).await?;
+            }
+            for name in &restart_service_names {
+                info!("Service {name} changed, stopping before domain publication...");
+                self.stop_service_locked(name, &path).await?;
             }
 
             // `commit_candidate` advances the in-memory catalog at the atomic
@@ -1050,7 +1306,13 @@ impl ProcessManager {
                     Err(CatalogError::PublishedNotDurable { .. })
                 );
             let published_domain_index = catalog_published.then(|| registry.domain_index().clone());
-            (commit_result, removed_service_names, published_domain_index)
+            (
+                commit_result,
+                instance_id,
+                removed_service_names,
+                published_domain_index,
+                reusable_service_envs,
+            )
         };
 
         // The catalog rename is the ownership commit point. Synchronize hosts
@@ -1058,12 +1320,23 @@ impl ProcessManager {
         // PublishedNotDurable, then surface the durability result. Removed
         // service records leave runtime state at the same publication point.
         if let Some(published_domain_index) = published_domain_index {
-            self.domain_index.store(published_domain_index);
             {
                 let mut services = self.services.lock().await;
+                for (name, resolved_env) in &reusable_service_envs {
+                    if let Some(service) = services
+                        .get_mut(name)
+                        .filter(|service| service.instance_id == instance_id)
+                    {
+                        service.config = config.clone();
+                        service.path.clone_from(&path);
+                        service.resolved_env.clone_from(resolved_env);
+                        Self::advance_service_projection(service);
+                    }
+                }
                 for name in &removed_service_names {
                     services.remove(name);
                 }
+                self.domain_index.store(published_domain_index);
             }
             self.persist_state().await;
             self.sync_hosts_after_catalog_publish().await;
@@ -1087,6 +1360,37 @@ impl ProcessManager {
             );
             let name = format!("{}:{}", config.project.name, service_name);
 
+            // A domain-only reload updates the shared claim snapshot and the
+            // service's display configuration using the authoritative
+            // prepublication reuse decision.
+            if reusable_service_envs.remove(&name).is_some() {
+                let reused = self
+                    .services
+                    .lock()
+                    .await
+                    .get(&name)
+                    .is_some_and(|service| service.instance_id == instance_id);
+                if reused {
+                    info!("Service {name} is already running and up to date");
+                    if let Some(tx) = &event_tx {
+                        let _ = tx
+                            .send(BootEvent::StepStarted {
+                                id: name.clone(),
+                                description: format!("Service {name} up to date"),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(BootEvent::StepFinished {
+                                id: name.clone(),
+                                result: Ok(()),
+                            })
+                            .await;
+                    }
+                    self.broadcast_service_update(&name).await;
+                    continue;
+                }
+            }
+
             let (combined_env, injected_database) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config);
             if let Some(dependency) = injected_database {
@@ -1096,68 +1400,28 @@ impl ProcessManager {
             }
 
             let manager = self.clone();
+            let expected_instance = instance_id;
             let lookup = move |service_name: String, field: String| {
                 let manager = manager.clone();
-                async move { manager.get_service_field(&service_name, &field).await }
+                async move {
+                    manager
+                        .get_service_field(&service_name, &field, expected_instance)
+                        .await
+                }
             };
 
             let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
 
-            // A domain-only reload updates the shared claim snapshot and the
-            // service's display configuration without restarting its process.
-            let is_up_to_date = {
-                let mut services = self.services.lock().await;
-                if let Some(service) = services.get_mut(&name) {
-                    // Check if actually running
-                    let is_running = match &mut service.runtime_state {
-                        ServiceRuntime::Controller(c) => {
-                            c.lock().await.read_state().await.status
-                                == locald_core::state::ServiceState::Running
-                        }
-                        ServiceRuntime::None => false,
-                    };
-
-                    if is_running {
-                        if &service.service_config == service_config
-                            && service.resolved_env == resolved_env
-                        {
-                            service.config = config.clone();
-                            service.path.clone_from(&path);
-                            true
-                        } else {
-                            info!("Service {name} config changed, restarting...");
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+            let has_controller = {
+                let services = self.services.lock().await;
+                services.get(&name).is_some_and(|service| {
+                    matches!(&service.runtime_state, ServiceRuntime::Controller(_))
+                })
             };
-
-            if is_up_to_date {
-                info!("Service {name} is already running and up to date");
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(BootEvent::StepStarted {
-                            id: name.clone(),
-                            description: format!("Service {name} up to date"),
-                        })
-                        .await;
-                    let _ = tx
-                        .send(BootEvent::StepFinished {
-                            id: name.clone(),
-                            result: Ok(()),
-                        })
-                        .await;
-                }
-                self.broadcast_service_update(&name).await;
-                continue;
-            }
-
-            // Stop if running (restarting)
-            self.stop(&name).await?;
+            anyhow::ensure!(
+                !has_controller,
+                "service `{name}` changed after prepublication transition planning"
+            );
 
             let needs_port = !matches!(
                 service_config,
@@ -1230,6 +1494,9 @@ impl ProcessManager {
                     }
 
                     let controller = factory.create(name.clone(), service_config, &ctx);
+                    let controller_generation = self
+                        .next_controller_generation
+                        .fetch_add(1, AtomicOrdering::Relaxed);
 
                     // Hook up logs immediately so we catch build logs
                     let manager = self.clone();
@@ -1237,19 +1504,16 @@ impl ProcessManager {
                         let c = controller.lock().await;
                         c.logs().await
                     };
-                    tokio::spawn(async move {
-                        let mut logs = controller_logs;
-                        while let Some(entry) = logs.next().await {
-                            manager.broadcast_log(entry);
-                        }
-                    });
-
                     // Insert into map immediately so status is visible
                     {
                         let mut services = self.services.lock().await;
+                        self.clear_foreign_log_buffer(&name, instance_id);
                         services.insert(
                             name.clone(),
                             Service {
+                                instance_id,
+                                controller_generation,
+                                projection_generation: 1,
                                 config: config.clone(),
                                 service_config: service_config.clone(),
                                 resolved_env: resolved_env.clone(),
@@ -1262,6 +1526,14 @@ impl ProcessManager {
                             },
                         );
                     }
+                    tokio::spawn(async move {
+                        let mut logs = controller_logs;
+                        while let Some(entry) = logs.next().await {
+                            manager
+                                .broadcast_log(instance_id, controller_generation, entry)
+                                .await;
+                        }
+                    });
 
                     self.broadcast_service_update(&name).await;
 
@@ -1282,7 +1554,10 @@ impl ProcessManager {
                     // Update service with final state (port might have changed if dynamic?)
                     {
                         let mut services = self.services.lock().await;
-                        if let Some(service) = services.get_mut(&name) {
+                        if let Some(service) = services
+                            .get_mut(&name)
+                            .filter(|service| service.instance_id == instance_id)
+                        {
                             service.sticky_port = state.port;
                             service.health_status = state.health_status;
                         }
@@ -1292,6 +1567,8 @@ impl ProcessManager {
 
                     self.health_monitor.spawn_check(
                         name.clone(),
+                        instance_id,
+                        controller_generation,
                         service_config,
                         state.port,
                         state.pid,
@@ -1342,10 +1619,23 @@ impl ProcessManager {
     /// Returns an error if the service state cannot be persisted, though
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
+        let Some((path, _transition_guard, _runtime_projection_guard)) =
+            self.lock_service_runtime_transition(name).await
+        else {
+            return Ok(());
+        };
+        self.stop_service_locked(name, &path).await
+    }
+
+    async fn stop_service_locked(&self, name: &str, project_path: &Path) -> Result<()> {
         let runtime_state = {
-            let mut services = self.services.lock().await;
-            if let Some(service) = services.get_mut(name) {
-                std::mem::replace(&mut service.runtime_state, ServiceRuntime::None)
+            let services = self.services.lock().await;
+            if let Some(service) = services.get(name) {
+                anyhow::ensure!(
+                    service.path == project_path,
+                    "service `{name}` changed project during lifecycle transition"
+                );
+                service.runtime_state.clone()
             } else {
                 return Ok(());
             }
@@ -1356,12 +1646,23 @@ impl ProcessManager {
                 let stop_result = c.lock().await.stop().await;
                 if let Err(e) = stop_result {
                     warn!("Failed to stop service {name}: {e}");
-                    // Restore the controller — the service is still running
-                    let mut services = self.services.lock().await;
-                    if let Some(service) = services.get_mut(name) {
-                        service.runtime_state = ServiceRuntime::Controller(c);
-                    }
                     return Err(e).with_context(|| format!("failed to stop service `{name}`"));
+                }
+                let mut services = self.services.lock().await;
+                if let Some(service) = services.get_mut(name) {
+                    anyhow::ensure!(
+                        service.path == project_path,
+                        "service `{name}` changed project during lifecycle transition"
+                    );
+                    let same_controller = matches!(
+                        &service.runtime_state,
+                        ServiceRuntime::Controller(current) if Arc::ptr_eq(current, &c)
+                    );
+                    anyhow::ensure!(
+                        same_controller,
+                        "service `{name}` changed controller during lifecycle transition"
+                    );
+                    service.runtime_state = ServiceRuntime::None;
                 }
             }
             ServiceRuntime::None => {}
@@ -1373,6 +1674,7 @@ impl ProcessManager {
             if let Some(service) = services.get_mut(name) {
                 // Note: We do NOT clear sticky_port here, so we can reuse it on restart.
                 service.health_status = HealthStatus::Unknown;
+                Self::advance_service_projection(service);
             }
         }
 
@@ -1382,20 +1684,33 @@ impl ProcessManager {
     }
 
     pub async fn stop_all(&self) -> Result<()> {
-        let names: Vec<String> = {
+        let mut paths: Vec<PathBuf> = {
             let services = self.services.lock().await;
-            services.keys().cloned().collect()
+            services
+                .values()
+                .map(|service| Self::canonicalize_path(&service.path))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
         };
+        paths.sort();
 
-        for name in names {
-            if let Err(e) = self.stop(&name).await {
-                error!("Failed to stop service {}: {}", name, e);
+        for path in paths {
+            if let Err(e) = self.stop_project(&path).await {
+                error!("Failed to stop project at {}: {e}", path.display());
             }
         }
         Ok(())
     }
 
     pub async fn stop_project(&self, project_path: &Path) -> Result<()> {
+        let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        self.stop_project_locked(&project_path).await
+    }
+
+    async fn stop_project_locked(&self, project_path: &Path) -> Result<()> {
         let service_names: Vec<String> = {
             let services = self.services.lock().await;
             services
@@ -1406,24 +1721,47 @@ impl ProcessManager {
         };
 
         for name in service_names {
-            self.stop(&name).await?;
+            self.stop_service_locked(&name, project_path).await?;
         }
         Ok(())
     }
 
+    pub async fn restart(&self, name: &str) -> Result<()> {
+        let Some((path, _transition_guard, _runtime_projection_guard)) =
+            self.lock_service_runtime_transition(name).await
+        else {
+            anyhow::bail!("Service not found");
+        };
+        self.stop_service_locked(name, &path).await?;
+        self.watch_config(path.clone()).await;
+        self.apply_config_locked(path, None, false).await
+    }
+
+    async fn restart_project(&self, project_path: &Path) -> Result<()> {
+        let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        self.stop_project_locked(&project_path).await?;
+        self.watch_config(project_path.clone()).await;
+        self.apply_config_locked(project_path, None, false).await
+    }
+
     pub async fn restart_all(&self) -> Result<()> {
         // 1. Collect unique project paths
-        let paths: HashSet<PathBuf> = {
+        let mut paths: Vec<PathBuf> = {
             let services = self.services.lock().await;
-            services.values().map(|s| s.path.clone()).collect()
+            services
+                .values()
+                .map(|service| Self::canonicalize_path(&service.path))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
         };
+        paths.sort();
 
-        // 2. Stop all services
-        self.stop_all().await?;
-
-        // 3. Start each project
+        // Restart one project transition at a time.
         for path in paths {
-            if let Err(e) = self.start(path.clone(), None, false).await {
+            if let Err(e) = self.restart_project(&path).await {
                 error!("Failed to restart project at {:?}: {}", path, e);
             }
         }
@@ -1447,8 +1785,14 @@ impl ProcessManager {
     pub async fn reset(&self, name: &str) -> Result<()> {
         info!("Resetting service {}", name);
 
+        let Some((path, _transition_guard, _runtime_projection_guard)) =
+            self.lock_service_runtime_transition(name).await
+        else {
+            anyhow::bail!("Service {name} not found");
+        };
+
         // 1. Stop the service
-        self.stop(name).await?;
+        self.stop_service_locked(name, &path).await?;
 
         // Clear sticky port on reset
         {
@@ -1492,18 +1836,9 @@ impl ProcessManager {
             }
         }
 
-        // 3. Restart (by calling start with the project path)
-        // We need the project path.
-        let path = {
-            let services = self.services.lock().await;
-            services.get(name).map(|s| s.path.clone())
-        };
-
-        if let Some(path) = path {
-            self.start(path, None, false).await?;
-        } else {
-            anyhow::bail!("Service {name} not found");
-        }
+        // 3. Restart while retaining the same project transition boundary.
+        self.watch_config(path.clone()).await;
+        self.apply_config_locked(path, None, false).await?;
 
         Ok(())
     }
@@ -1533,7 +1868,7 @@ impl ProcessManager {
 
                 snapshots.push((
                     name.clone(),
-                    self.domain_for_service(name),
+                    self.domain_for_service(service.instance_id, name),
                     Some(service.path.clone()),
                     service.health_status,
                     service.health_source,
@@ -1581,6 +1916,7 @@ impl ProcessManager {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
         let mut controllers_to_stop = Vec::new();
 
         {
@@ -1616,13 +1952,13 @@ impl ProcessManager {
         &self,
         domain: &str,
     ) -> Option<locald_core::resolver::DomainResolution> {
-        let service_name = {
+        let (claimed_instance_id, service_name) = {
             let index = self.domain_index.snapshot();
             match index.resolve(domain) {
                 Some(DomainTarget::Service {
+                    project_instance_id,
                     service_name: Some(service_name),
-                    ..
-                }) => service_name.clone(),
+                }) => (*project_instance_id, service_name.clone()),
                 Some(DomainTarget::Service {
                     service_name: None, ..
                 }) => return Some(locald_core::resolver::DomainResolution::OwnershipOnly),
@@ -1633,6 +1969,7 @@ impl ProcessManager {
             let services = self.services.lock().await;
             services
                 .get(&service_name)
+                .filter(|service| service.instance_id == claimed_instance_id)
                 .map(|service| service.runtime_state.clone())
         };
         match runtime {
@@ -1761,10 +2098,12 @@ impl ProcessManager {
     }
 
     pub async fn remove_project(&self, project_path: &Path) -> Result<()> {
-        let canonical = Self::canonicalize_path(project_path);
+        let (canonical, transition_lock) = self.transition_lock_for_path(project_path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
 
         // Stop services.
-        self.stop_project(&canonical).await?;
+        self.stop_project_locked(&canonical).await?;
 
         // Keep both compatibility stores stable until each candidate is ready.
         // Catalog removal is the authoritative commit point; recoverable
@@ -1962,8 +2301,37 @@ impl ProcessManager {
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_clean(&self) -> Result<usize> {
-        let (count, removed_paths, commit_result) = {
+        loop {
+            // Snapshot before taking project locks so every operation observes
+            // the same transition -> registry lock order. Revalidate after all
+            // canonical project locks are held; a concurrent catalog change
+            // simply restarts the clean from a fresh snapshot.
+            let (baseline, mut project_paths) = {
+                let registry = self.registry.lock().await;
+                let paths = registry
+                    .instances
+                    .values()
+                    .map(|record| Self::canonicalize_path(&record.last_known_path))
+                    .collect::<Vec<_>>();
+                (registry.clone(), paths)
+            };
+            project_paths.sort();
+            project_paths.dedup();
+
+            let mut transition_guards = Vec::with_capacity(project_paths.len());
+            for path in &project_paths {
+                let (_, transition_lock) = self.transition_lock_for_path(path).await;
+                transition_guards.push(transition_lock.lock_owned().await);
+            }
+            let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+
             let mut registry = self.registry.lock().await;
+            if *registry != baseline {
+                drop(registry);
+                drop(transition_guards);
+                continue;
+            }
+
             let mut updated = registry.clone();
             let count = updated.prune_missing_projects()?;
             let removed_paths = registry
@@ -1974,19 +2342,16 @@ impl ProcessManager {
                 .collect::<HashSet<_>>();
 
             for path in &removed_paths {
-                self.stop_project(path).await?;
+                let canonical = Self::canonicalize_path(path);
+                self.stop_project_locked(&canonical).await?;
             }
 
-            let commit_result = if updated == *registry {
-                None
-            } else {
-                let commit_result = registry.commit_candidate(updated).await;
-                self.domain_index.store(registry.domain_index().clone());
-                Some(commit_result)
-            };
-            (count, removed_paths, commit_result)
-        };
-        if let Some(commit_result) = commit_result {
+            if updated == *registry {
+                return Ok(count);
+            }
+
+            let commit_result = registry.commit_candidate(updated).await;
+            self.domain_index.store(registry.domain_index().clone());
             let catalog_published = commit_result.is_ok()
                 || matches!(
                     &commit_result,
@@ -2000,8 +2365,8 @@ impl ProcessManager {
                 self.sync_hosts_after_catalog_publish().await;
             }
             commit_result?;
+            return Ok(count);
         }
-        Ok(count)
     }
 
     async fn refresh_attachments(&self) -> Result<()> {
@@ -2038,13 +2403,53 @@ impl ProcessManager {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
+    async fn transition_lock_for_path(&self, path: &Path) -> (PathBuf, Arc<Mutex<()>>) {
+        let canonical = Self::canonicalize_path(path);
+        let transition_lock = {
+            let mut locks = self.config_transition_locks.lock().await;
+            locks
+                .entry(canonical.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        (canonical, transition_lock)
+    }
+
+    async fn lock_service_runtime_transition(
+        &self,
+        name: &str,
+    ) -> Option<(PathBuf, OwnedMutexGuard<()>, OwnedMutexGuard<()>)> {
+        loop {
+            let path = self.get_service_path(name).await?;
+            let (canonical, transition_lock) = self.transition_lock_for_path(&path).await;
+            let transition_guard = transition_lock.lock_owned().await;
+            let runtime_projection_guard = self.runtime_projection_lock.clone().lock_owned().await;
+            match self.get_service_path(name).await {
+                Some(current_path) if Self::canonicalize_path(&current_path) == canonical => {
+                    return Some((canonical, transition_guard, runtime_projection_guard));
+                }
+                Some(_) => {
+                    drop(runtime_projection_guard);
+                    drop(transition_guard);
+                }
+                None => return None,
+            }
+        }
+    }
+
     pub async fn get_service_path(&self, name: &str) -> Option<PathBuf> {
         let services = self.services.lock().await;
         services.get(name).map(|s| s.path.clone())
     }
 
     pub async fn get_service_env(&self, name: &str) -> Result<HashMap<String, String>> {
-        let (config, service_config, path, port_result, sticky_port) = {
+        let Some((_path, _transition_guard, _runtime_projection_guard)) =
+            self.lock_service_runtime_transition(name).await
+        else {
+            anyhow::bail!("Service {name} not found");
+        };
+
+        let (instance_id, config, service_config, path, port_result, sticky_port) = {
             let services = self.services.lock().await;
             let service = services
                 .get(name)
@@ -2056,6 +2461,7 @@ impl ProcessManager {
             };
 
             (
+                service.instance_id,
                 service.config.clone(),
                 service.service_config.clone(),
                 service.path.clone(),
@@ -2111,7 +2517,11 @@ impl ProcessManager {
         let manager = self.clone();
         let lookup = move |service_name: String, field: String| {
             let manager = manager.clone();
-            async move { manager.get_service_field(&service_name, &field).await }
+            async move {
+                manager
+                    .get_service_field(&service_name, &field, instance_id)
+                    .await
+            }
         };
 
         let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
@@ -2152,7 +2562,7 @@ impl ProcessManager {
                 service.health_status,
                 service.health_source,
                 runtime_info,
-                self.domain_for_service(name),
+                self.domain_for_service(service.instance_id, name),
                 service.warnings.clone(),
             )
         };
@@ -2236,12 +2646,19 @@ impl ProcessManager {
         let services = {
             let services = self.services.lock().await;
             services
-                .values()
-                .map(|s| s.runtime_state.clone())
+                .iter()
+                .map(|(name, service)| {
+                    (
+                        name.clone(),
+                        service.instance_id,
+                        service.controller_generation,
+                        service.runtime_state.clone(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
-        for runtime in services {
+        for (name, instance_id, controller_generation, runtime) in services {
             if let ServiceRuntime::Controller(c) = runtime {
                 let metrics = {
                     let c = c.lock().await;
@@ -2249,11 +2666,45 @@ impl ProcessManager {
                 };
 
                 if let Ok(Some(m)) = metrics {
-                    let _ = self.event_sender.send(Event::Metrics(m));
+                    let services = self.services.lock().await;
+                    let is_current_controller = services.get(&name).is_some_and(|service| {
+                        service.instance_id == instance_id
+                            && service.controller_generation == controller_generation
+                            && matches!(service.runtime_state, ServiceRuntime::Controller(_))
+                    });
+                    if is_current_controller {
+                        let _ = self.event_sender.send(Event::Metrics(m));
+                    }
                 }
             }
         }
     }
+}
+
+/// Resolve the domain for a project, applying worktree branch qualification
+/// when the project is in a linked Git worktree with a domain template.
+fn resolve_worktree_domain(
+    base_domain: &str,
+    project_name: &str,
+    worktrees_config: Option<&locald_core::config::WorktreesConfig>,
+    project_path: &Path,
+) -> String {
+    let Some(git_context) = locald_core::worktree::detect(project_path) else {
+        return base_domain.to_owned();
+    };
+
+    if !git_context.is_worktree || git_context.is_default_branch {
+        return base_domain.to_owned();
+    }
+
+    let Some(template) = worktrees_config.and_then(|config| config.domain.as_ref()) else {
+        return base_domain.to_owned();
+    };
+    let Some(branch) = git_context.branch.as_ref() else {
+        return base_domain.to_owned();
+    };
+
+    locald_core::worktree::resolve_domain_template(template, project_name, branch, base_domain)
 }
 
 #[async_trait::async_trait]
@@ -2282,6 +2733,7 @@ mod tests {
     use locald_core::service::{RuntimeState, ServiceCommand};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::Ordering;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -2361,6 +2813,184 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockingFailStopController {
+        id: String,
+        state: RuntimeState,
+        stop_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        first_stop_entered: Arc<tokio::sync::Notify>,
+        release_first_stop: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingFailStopController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            let attempt = self.stop_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.first_stop_entered.notify_one();
+                self.release_first_stop.notified().await;
+            }
+            anyhow::bail!("injected stop failure")
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingMetricsController {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        state: RuntimeState,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingMetricsController {
+        fn id(&self) -> &str {
+            "blocking-metrics"
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some(locald_core::ipc::ServiceMetrics {
+                name: "app:web".to_owned(),
+                cpu_percent: 1.0,
+                memory_bytes: 1,
+                timestamp: 1,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingStatusController {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        state: RuntimeState,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingStatusController {
+        fn id(&self) -> &str {
+            "blocking-status"
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
     struct NoopHostSyncer;
 
     #[async_trait]
@@ -2404,6 +3034,12 @@ mod tests {
             .expect("valid project instance ID")
     }
 
+    fn alternate_test_instance_id() -> ProjectInstanceId {
+        "00000000-0000-4000-8000-000000000002"
+            .parse()
+            .expect("valid alternate project instance ID")
+    }
+
     fn config_with_services(project: ProjectConfig, service_names: &[&str]) -> LocaldConfig {
         LocaldConfig {
             project,
@@ -2421,30 +3057,75 @@ mod tests {
     }
 
     fn claim_domains(config: &LocaldConfig) -> HashMap<String, String> {
-        ProcessManager::build_domain_claims(test_instance_id(), config)
-            .expect("valid claims")
-            .into_iter()
-            .filter_map(|claim| match claim.target {
-                DomainTarget::Service {
-                    service_name: Some(service_name),
-                    ..
-                } => Some((service_name, claim.domain.to_string())),
-                DomainTarget::Platform { .. }
-                | DomainTarget::Service {
-                    service_name: None, ..
-                } => None,
-            })
-            .collect()
+        ProcessManager::build_domain_claims(
+            test_instance_id(),
+            config,
+            Path::new("/nonexistent/locald-domain-claims-test"),
+        )
+        .expect("valid claims")
+        .into_iter()
+        .filter_map(|claim| match claim.target {
+            DomainTarget::Service {
+                service_name: Some(service_name),
+                ..
+            } => Some((service_name, claim.domain.to_string())),
+            DomainTarget::Platform { .. }
+            | DomainTarget::Service {
+                service_name: None, ..
+            } => None,
+        })
+        .collect()
+    }
+
+    fn git(current_dir: &Path, arguments: &[&str]) {
+        let mut command = Command::new("git");
+        command.args(arguments).current_dir(current_dir);
+        for variable in [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_GRAFT_FILE",
+            "GIT_INDEX_FILE",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_PREFIX",
+            "GIT_SHALLOW_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            command.env_remove(variable);
+        }
+        let output = command.output().expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed:\nstdout: {}\nstderr: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn install_test_claim(manager: &ProcessManager, domain: &str, service_name: &str) {
+        install_test_claim_for_instance(manager, test_instance_id(), domain, service_name);
+    }
+
+    fn install_test_claim_for_instance(
+        manager: &ProcessManager,
+        instance_id: ProjectInstanceId,
+        domain: &str,
+        service_name: &str,
+    ) {
         let current = manager.domain_index.snapshot();
         let replacement = current
             .replacing_instance(
-                test_instance_id(),
+                instance_id,
                 [DomainClaim::service(
                     domain.parse().expect("valid test domain"),
-                    test_instance_id(),
+                    instance_id,
                     service_name.to_owned(),
                 )],
             )
@@ -2571,7 +3252,7 @@ API_URL = "https://api.example"
     }
 
     #[test]
-    fn explicit_project_and_service_domains_remain_strict() {
+    fn explicit_project_domains_remain_strict_and_service_labels_are_generated() {
         let invalid_project_domain = config_with_services(
             ProjectConfig {
                 name: "project".to_owned(),
@@ -2581,13 +3262,17 @@ API_URL = "https://api.example"
             &["web"],
         );
         assert!(
-            ProcessManager::build_domain_claims(test_instance_id(), &invalid_project_domain)
-                .expect_err("explicit project domains are not rewritten")
-                .to_string()
-                .contains("invalid exact base domain")
+            ProcessManager::build_domain_claims(
+                test_instance_id(),
+                &invalid_project_domain,
+                Path::new("/nonexistent/locald-domain-claims-test"),
+            )
+            .expect_err("explicit project domains are not rewritten")
+            .to_string()
+            .contains("invalid exact base domain")
         );
 
-        let invalid_service_domain = config_with_services(
+        let generated_service_domain = config_with_services(
             ProjectConfig {
                 name: "project".to_owned(),
                 domain: None,
@@ -2595,12 +3280,114 @@ API_URL = "https://api.example"
             },
             &["web", "api_v2"],
         );
-        assert!(
-            ProcessManager::build_domain_claims(test_instance_id(), &invalid_service_domain)
-                .expect_err("service labels are not rewritten")
-                .to_string()
-                .contains("invalid exact domain label")
+        assert_eq!(
+            claim_domains(&generated_service_domain).get("project:api_v2"),
+            Some(&"api-v2.project.localhost".to_owned())
         );
+    }
+
+    #[test]
+    fn colliding_generated_service_labels_are_rejected_atomically() {
+        let config = config_with_services(
+            ProjectConfig {
+                name: "project".to_owned(),
+                domain: None,
+                ..Default::default()
+            },
+            &["web", "my_api", "my-api"],
+        );
+        let claims = ProcessManager::build_domain_claims(
+            test_instance_id(),
+            &config,
+            Path::new("/nonexistent/locald-domain-claims-test"),
+        )
+        .expect("generated labels are individually valid");
+
+        let error = locald_core::DomainIndex::default()
+            .replacing_instance(test_instance_id(), claims)
+            .expect_err("colliding generated labels must fail as one claim set");
+
+        assert!(error.to_string().contains("my-api.project.localhost"));
+    }
+
+    #[test]
+    fn worktree_templates_qualify_claims_before_exact_domain_validation() {
+        let temp = tempdir().expect("create temporary directory");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir(&repository).expect("create repository directory");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = temp.path().join("feature-worktree");
+        let worktree_path = worktree.to_str().expect("UTF-8 worktree path");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/JIRA-123_foo",
+                worktree_path,
+            ],
+        );
+
+        let mut config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+domain = "app.localhost"
+
+[worktrees]
+domain = "{{branch.last}}.{{project.domain}}"
+
+[services.web]
+command = "web"
+
+[services.api]
+command = "api"
+"#,
+        )
+        .expect("parse worktree config");
+
+        let main_claims =
+            ProcessManager::build_domain_claims(test_instance_id(), &config, &repository)
+                .expect("primary checkout claims");
+        let main_domains = main_claims
+            .into_iter()
+            .map(|claim| claim.domain.to_string())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            main_domains,
+            HashSet::from(["app.localhost".to_owned(), "api.app.localhost".to_owned(),])
+        );
+
+        let worktree_claims =
+            ProcessManager::build_domain_claims(test_instance_id(), &config, &worktree)
+                .expect("linked worktree claims");
+        let worktree_domains = worktree_claims
+            .into_iter()
+            .map(|claim| claim.domain.to_string())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            worktree_domains,
+            HashSet::from([
+                "jira-123-foo.app.localhost".to_owned(),
+                "api.jira-123-foo.app.localhost".to_owned(),
+            ])
+        );
+
+        config.worktrees.as_mut().expect("worktree config").domain =
+            Some("bad_{{branch.last}}.{{project.domain}}".to_owned());
+        let error = ProcessManager::build_domain_claims(test_instance_id(), &config, &worktree)
+            .expect_err("invalid expanded templates remain strict");
+        assert!(error.to_string().contains("invalid exact base domain"));
     }
 
     #[test]
@@ -3051,6 +3838,9 @@ API_URL = "https://api.example"
 
         let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
         let service = |path: PathBuf| Service {
+            instance_id: test_instance_id(),
+            controller_generation: 1,
+            projection_generation: 1,
             config: LocaldConfig::default(),
             service_config: service_config.clone(),
             resolved_env: HashMap::new(),
@@ -3122,6 +3912,9 @@ API_URL = "https://api.example"
         manager.services.lock().await.insert(
             "project:web".to_owned(),
             Service {
+                instance_id: test_instance_id(),
+                controller_generation: 1,
+                projection_generation: 1,
                 config: LocaldConfig::default(),
                 service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
                 resolved_env: HashMap::new(),
@@ -3417,6 +4210,197 @@ BROKEN_URL = "${services.missing.url}"
             .stop_project(&project_path)
             .await
             .expect("stop initial project");
+    }
+
+    #[tokio::test]
+    async fn retained_service_restart_stop_failure_preserves_previous_domain_claims() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "reload"
+domain = "second.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 31"
+"#,
+        )
+        .expect("write replacement config");
+        let canonical_path = std::fs::canonicalize(&project_path).expect("canonical project path");
+        let previous_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+domain = "first.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+        )
+        .expect("parse previous config");
+        let previous_service_config = previous_config.services["web"].clone();
+        let catalog_path = dir.path().join("catalog.json");
+        let mut catalog = Registry::with_path(catalog_path.clone());
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover project");
+        let instance_id = catalog
+            .register_project(discovery, Some("reload".to_owned()))
+            .expect("register project");
+        catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "first.localhost".parse().expect("valid domain"),
+                    instance_id,
+                    "reload:web".to_owned(),
+                )],
+            )
+            .expect("record existing claims");
+        catalog.save().await.expect("persist existing catalog");
+        let catalog_before = std::fs::read(&catalog_path).expect("read existing catalog");
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry.clone(),
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let running_state = RuntimeState {
+            pid: Some(42),
+            port: None,
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        let stop_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first_stop = Arc::new(tokio::sync::Notify::new());
+        let failing_controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingFailStopController {
+                id: "reload:web".to_owned(),
+                state: running_state,
+                stop_attempts: stop_attempts.clone(),
+                first_stop_entered: first_stop_entered.clone(),
+                release_first_stop: release_first_stop.clone(),
+            }));
+        let mut retained_service = test_service(
+            previous_config.clone(),
+            previous_service_config.clone(),
+            ServiceRuntime::Controller(failing_controller.clone()),
+            canonical_path,
+        );
+        retained_service.instance_id = instance_id;
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("reload:web".to_owned(), retained_service);
+        }
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+
+        let stop_manager = manager.clone();
+        let stop_task = tokio::spawn(async move { stop_manager.stop("reload:web").await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            first_stop_entered.notified(),
+        )
+        .await
+        .expect("public stop reaches its controller");
+
+        let apply_manager = manager.clone();
+        let apply_task =
+            tokio::spawn(
+                async move { apply_manager.apply_config(project_path, None, false).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(
+            !apply_task.is_finished(),
+            "reload waits for the in-flight project transition"
+        );
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read catalog during blocked stop"),
+            catalog_before
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("first.localhost")
+                .is_some()
+        );
+        assert!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .is_empty()
+        );
+
+        release_first_stop.notify_one();
+        let stop_error = tokio::time::timeout(std::time::Duration::from_secs(2), stop_task)
+            .await
+            .expect("public stop does not deadlock")
+            .expect("public stop task joins")
+            .expect_err("injected public stop failure");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), apply_task)
+            .await
+            .expect("reload does not deadlock")
+            .expect("reload task joins")
+            .expect_err("restart stop failure must block domain publication");
+
+        assert!(format!("{stop_error:#}").contains("injected stop failure"));
+        assert!(format!("{error:#}").contains("injected stop failure"));
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read catalog after failed reload"),
+            catalog_before
+        );
+        for index in [
+            registry.lock().await.domain_index().clone(),
+            manager.domain_index().snapshot().as_ref().clone(),
+        ] {
+            assert!(index.resolve("first.localhost").is_some());
+            assert!(index.resolve("second.localhost").is_none());
+        }
+        assert!(
+            manager
+                .resolve_service_by_domain("first.localhost")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .resolve_service_by_domain("second.localhost")
+                .await
+                .is_none()
+        );
+        let services = manager.services.lock().await;
+        let service = &services["reload:web"];
+        let ServiceRuntime::Controller(restored_controller) = &service.runtime_state else {
+            panic!("failing controller must remain installed");
+        };
+        assert!(Arc::ptr_eq(restored_controller, &failing_controller));
+        assert_eq!(service.config, previous_config);
+        assert_eq!(service.service_config, previous_service_config);
+        drop(services);
+        assert!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4154,6 +5138,9 @@ command = "sleep 30"
         path: PathBuf,
     ) -> Service {
         Service {
+            instance_id: test_instance_id(),
+            controller_generation: 1,
+            projection_generation: 1,
             config,
             service_config,
             resolved_env: HashMap::new(),
@@ -4164,6 +5151,128 @@ command = "sleep 30"
             health_source: HealthSource::None,
             warnings: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn prepublication_plan_covers_dot_env_changes_and_dependents() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-project");
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let previous_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+domain = "first.localhost"
+
+[services.db]
+type = "worker"
+command = "old-db"
+
+[services.db.env]
+TOKEN = "stable"
+
+[services.web]
+type = "worker"
+command = "web"
+depends_on = ["db"]
+
+[services.web.env]
+TOKEN = "stable"
+
+[services.api]
+type = "worker"
+command = "api"
+"#,
+        )
+        .expect("parse previous config");
+        let next_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+domain = "second.localhost"
+
+[services.db]
+type = "worker"
+command = "new-db"
+
+[services.db.env]
+TOKEN = "stable"
+
+[services.web]
+type = "worker"
+command = "web"
+depends_on = ["db"]
+
+[services.web.env]
+TOKEN = "stable"
+
+[services.api]
+type = "worker"
+command = "api"
+"#,
+        )
+        .expect("parse next config");
+        let running_state = RuntimeState {
+            pid: Some(42),
+            port: None,
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        {
+            let mut services = manager.services.lock().await;
+            for (name, token) in [("db", "stable"), ("web", "stable"), ("api", "old")] {
+                let controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(
+                    TestController::new(format!("reload:{name}"), running_state.clone()),
+                ));
+                let mut service = test_service(
+                    previous_config.clone(),
+                    previous_config.services[name].clone(),
+                    ServiceRuntime::Controller(controller),
+                    project_path.clone(),
+                );
+                service
+                    .resolved_env
+                    .insert("TOKEN".to_owned(), token.to_owned());
+                services.insert(format!("reload:{name}"), service);
+            }
+        }
+        let desired_service_names = next_config
+            .services
+            .keys()
+            .map(|name| format!("reload:{name}"))
+            .collect::<HashSet<_>>();
+        let dot_env_vars = HashMap::from([("TOKEN".to_owned(), "new".to_owned())]);
+
+        let plan = manager
+            .prepublication_stop_plan(
+                &project_path,
+                test_instance_id(),
+                &next_config,
+                &dot_env_vars,
+                &["db".to_owned(), "web".to_owned(), "api".to_owned()],
+                &desired_service_names,
+            )
+            .await
+            .expect("build prepublication plan");
+
+        assert!(plan.removed_service_names.is_empty());
+        assert_eq!(
+            plan.restart_service_names,
+            ["reload:api", "reload:web", "reload:db"]
+        );
+        assert!(plan.reusable_service_envs.is_empty());
     }
 
     #[tokio::test]
@@ -4220,6 +5329,423 @@ command = "sleep 30"
                 .as_slice(),
             &[expected_hosts(&["current.localhost"])]
         );
+    }
+
+    #[tokio::test]
+    async fn same_name_instances_keep_runtime_routing_instance_scoped() {
+        let dir = tempdir().expect("create temporary directory");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let first_instance = test_instance_id();
+        let second_instance = alternate_test_instance_id();
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        let first_config = config_with_services(
+            ProjectConfig {
+                name: "app".to_owned(),
+                domain: Some("first.app.localhost".to_owned()),
+                ..Default::default()
+            },
+            &["web"],
+        );
+        let second_config = config_with_services(
+            ProjectConfig {
+                name: "app".to_owned(),
+                domain: Some("second.app.localhost".to_owned()),
+                ..Default::default()
+            },
+            &["web"],
+        );
+        let running_state = RuntimeState {
+            pid: Some(42),
+            port: Some(4242),
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        let first_controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(
+            TestController::new("app:web", running_state.clone()),
+        ));
+        let mut first_service = test_service(
+            first_config,
+            service_config.clone(),
+            ServiceRuntime::Controller(first_controller),
+            first_path.clone(),
+        );
+        first_service.instance_id = first_instance;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("app:web".to_owned(), first_service);
+
+        let desired_names = HashSet::from(["app:web".to_owned()]);
+        let error = manager
+            .prepublication_stop_plan(
+                &second_path,
+                second_instance,
+                &second_config,
+                &HashMap::new(),
+                &["web".to_owned()],
+                &desired_names,
+            )
+            .await
+            .expect_err("a live same-name instance cannot be reused or overwritten");
+        assert!(
+            error
+                .to_string()
+                .contains("still loaded by project instance")
+        );
+
+        manager
+            .broadcast_log(
+                first_instance,
+                1,
+                LogEntry {
+                    timestamp: 0,
+                    service: "app:web".to_owned(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "first-instance history".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(manager.get_recent_logs().len(), 1);
+        manager.services.lock().await.remove("app:web");
+
+        install_test_claim_for_instance(&manager, first_instance, "first.app.localhost", "app:web");
+        install_test_claim_for_instance(
+            &manager,
+            second_instance,
+            "second.app.localhost",
+            "app:web",
+        );
+        let second_controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new("app:web", running_state)));
+        let mut second_service = test_service(
+            second_config,
+            service_config,
+            ServiceRuntime::Controller(second_controller),
+            second_path,
+        );
+        second_service.instance_id = second_instance;
+        manager.clear_foreign_log_buffer("app:web", second_instance);
+        manager
+            .services
+            .lock()
+            .await
+            .insert("app:web".to_owned(), second_service);
+        assert!(manager.get_recent_logs().is_empty());
+
+        assert!(matches!(
+            manager
+                .resolve_service_by_domain("first.app.localhost")
+                .await,
+            Some(locald_core::resolver::DomainResolution::OwnershipOnly)
+        ));
+        assert!(matches!(
+            manager
+                .resolve_service_by_domain("second.app.localhost")
+                .await,
+            Some(locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: Some(4242),
+                status: ServiceState::Running,
+            }) if name == "app:web"
+        ));
+
+        let statuses = manager.list().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].domain.as_deref(), Some("second.app.localhost"));
+        let inspection = manager.inspect("app:web").await.expect("inspect service");
+        assert_eq!(inspection["domain"], "second.app.localhost");
+
+        manager
+            .broadcast_log(
+                first_instance,
+                1,
+                LogEntry {
+                    timestamp: 1,
+                    service: "app:web".to_owned(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "stale first-instance log".to_owned(),
+                },
+            )
+            .await;
+        assert!(manager.get_recent_logs().is_empty());
+        manager
+            .broadcast_log(
+                second_instance,
+                0,
+                LogEntry {
+                    timestamp: 2,
+                    service: "app:web".to_owned(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "stale second-instance controller log".to_owned(),
+                },
+            )
+            .await;
+        assert!(manager.get_recent_logs().is_empty());
+        manager
+            .broadcast_log(
+                second_instance,
+                1,
+                LogEntry {
+                    timestamp: 3,
+                    service: "app:web".to_owned(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "current second-instance log".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(manager.get_recent_logs().len(), 1);
+        manager
+            .services
+            .lock()
+            .await
+            .get_mut("app:web")
+            .expect("loaded service")
+            .runtime_state = ServiceRuntime::None;
+        manager
+            .broadcast_log(
+                second_instance,
+                1,
+                LogEntry {
+                    timestamp: 4,
+                    service: "app:web".to_owned(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "stopped controller log".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(manager.get_recent_logs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_env_rejects_a_foreign_instance_dependency() {
+        let dir = tempdir().expect("create temporary directory");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let first_instance = test_instance_id();
+        let second_instance = alternate_test_instance_id();
+        let mut config = config_with_services(
+            ProjectConfig {
+                name: "app".to_owned(),
+                ..Default::default()
+            },
+            &["web", "db"],
+        );
+        let ServiceConfig::Legacy(web_config) = config
+            .services
+            .get_mut("web")
+            .expect("web service configuration")
+        else {
+            panic!("web is a legacy exec service");
+        };
+        web_config
+            .common
+            .env
+            .insert("DEPENDENCY_URL".to_owned(), "${services.db.url}".to_owned());
+        let web_service_config = config.services["web"].clone();
+        let db_service_config = config.services["db"].clone();
+        let mut web_service = test_service(
+            config.clone(),
+            web_service_config,
+            ServiceRuntime::None,
+            dir.path().join("first"),
+        );
+        web_service.instance_id = first_instance;
+        let db_controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "app:db",
+                RuntimeState {
+                    pid: Some(42),
+                    port: Some(5432),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let mut db_service = test_service(
+            config,
+            db_service_config,
+            ServiceRuntime::Controller(db_controller),
+            dir.path().join("second"),
+        );
+        db_service.instance_id = second_instance;
+        manager.services.lock().await.extend([
+            ("app:web".to_owned(), web_service),
+            ("app:db".to_owned(), db_service),
+        ]);
+
+        let error = manager
+            .get_service_env("app:web")
+            .await
+            .expect_err("foreign dependency must not enter the command environment");
+        assert!(error.to_string().contains("belongs to project instance"));
+        assert!(error.to_string().contains(&first_instance.to_string()));
+        assert!(error.to_string().contains(&second_instance.to_string()));
+    }
+
+    #[tokio::test]
+    async fn stopped_controller_drops_inflight_metrics() {
+        let dir = tempdir().expect("create temporary directory");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingMetricsController {
+                entered: entered.clone(),
+                release: release.clone(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(4242),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            }));
+        manager.services.lock().await.insert(
+            "app:web".to_owned(),
+            test_service(
+                config_with_services(
+                    ProjectConfig {
+                        name: "app".to_owned(),
+                        ..Default::default()
+                    },
+                    &["web"],
+                ),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                dir.path().join("app"),
+            ),
+        );
+        let mut events = manager.event_sender.subscribe();
+
+        let metrics_task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager.collect_metrics().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("metrics collection starts");
+        manager
+            .services
+            .lock()
+            .await
+            .get_mut("app:web")
+            .expect("loaded service")
+            .runtime_state = ServiceRuntime::None;
+        release.notify_one();
+        metrics_task.await.expect("metrics task");
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn projection_change_suppresses_inflight_manager_status_event() {
+        let dir = tempdir().expect("create temporary directory");
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create process manager");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingStatusController {
+                entered: entered.clone(),
+                release: release.clone(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(4242),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            }));
+        manager.services.lock().await.insert(
+            "app:web".to_owned(),
+            test_service(
+                config_with_services(
+                    ProjectConfig {
+                        name: "app".to_owned(),
+                        ..Default::default()
+                    },
+                    &["web"],
+                ),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                dir.path().join("app"),
+            ),
+        );
+        let mut events = manager.event_sender.subscribe();
+
+        let status_task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager.broadcast_service_update("app:web").await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("status construction starts");
+        {
+            let mut services = manager.services.lock().await;
+            let service = services.get_mut("app:web").expect("loaded service");
+            service.warnings.push("new projection".to_owned());
+            ProcessManager::advance_service_projection(service);
+        }
+        release.notify_one();
+        status_task.await.expect("status task");
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

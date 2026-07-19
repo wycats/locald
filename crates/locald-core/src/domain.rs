@@ -17,6 +17,13 @@ pub fn sanitize_project_name_for_dns(project_name: &str) -> String {
     sanitize_dns_label(project_name, "project")
 }
 
+/// Convert a service display name into the DNS label used for its generated
+/// service subdomain. The original name remains the runtime service identity.
+#[must_use]
+pub fn sanitize_service_name_for_dns(service_name: &str) -> String {
+    sanitize_dns_label(service_name, "service")
+}
+
 pub(crate) fn sanitize_dns_label(value: &str, empty_fallback: &str) -> String {
     let mut result = String::with_capacity(value.len());
 
@@ -301,16 +308,23 @@ impl DomainIndex {
         &self.claims
     }
 
-    /// Return a service's exact domain. Milestone A assigns one claim per service.
+    /// Return an instance service's exact domain. Milestone A assigns one claim
+    /// per service within each project instance.
     #[must_use]
-    pub fn domain_for_service(&self, service_name: &str) -> Option<&DomainName> {
+    pub fn domain_for_service(
+        &self,
+        instance_id: ProjectInstanceId,
+        service_name: &str,
+    ) -> Option<&DomainName> {
         self.claims
             .iter()
             .find_map(|(domain, target)| match target {
                 DomainTarget::Service {
+                    project_instance_id,
                     service_name: Some(candidate),
-                    ..
-                } if candidate == service_name => Some(domain),
+                } if *project_instance_id == instance_id && candidate == service_name => {
+                    Some(domain)
+                }
                 DomainTarget::Platform { .. }
                 | DomainTarget::Service {
                     service_name: None, ..
@@ -449,7 +463,7 @@ impl DomainIndex {
         }
     }
 
-    /// Check platform fallbacks, exact owners, and legacy runtime-key safety.
+    /// Check platform fallbacks, exact owners, and per-instance service targets.
     pub fn validate(&self) -> Result<(), DomainError> {
         for (name, surface) in PLATFORM_DOMAINS {
             let domain = DomainName((*name).to_owned());
@@ -468,7 +482,7 @@ impl DomainIndex {
             }
         }
 
-        let mut runtime_services = BTreeMap::<&str, (&DomainName, ProjectInstanceId)>::new();
+        let mut runtime_services = BTreeMap::<(ProjectInstanceId, &str), &DomainName>::new();
         for (domain, target) in &self.claims {
             match target {
                 DomainTarget::Platform { surface } => {
@@ -483,13 +497,13 @@ impl DomainIndex {
                     project_instance_id,
                     service_name: Some(service_name),
                 } => {
-                    if let Some((existing_domain, existing_instance)) =
-                        runtime_services.insert(service_name, (domain, *project_instance_id))
+                    if let Some(existing_domain) =
+                        runtime_services.insert((*project_instance_id, service_name), domain)
                     {
                         return Err(DomainError::RuntimeServiceConflict {
                             service_name: service_name.clone(),
                             existing_domain: existing_domain.clone(),
-                            existing_instance,
+                            existing_instance: *project_instance_id,
                             requested_domain: domain.clone(),
                             requested_instance: *project_instance_id,
                         });
@@ -582,7 +596,7 @@ pub enum DomainError {
     },
 
     #[error(
-        "legacy runtime service `{service_name}` is already targeted by `{existing_domain}` in instance {existing_instance}; it cannot also be targeted by `{requested_domain}` in instance {requested_instance}"
+        "service `{service_name}` in instance {existing_instance} is already targeted by `{existing_domain}`; it cannot also be targeted by `{requested_domain}` in instance {requested_instance}"
     )]
     RuntimeServiceConflict {
         service_name: String,
@@ -646,6 +660,13 @@ mod tests {
             sanitize_project_name_for_dns(&format!("{}-suffix", "a".repeat(62))),
             "a".repeat(62)
         );
+    }
+
+    #[test]
+    fn service_names_receive_service_specific_dns_labels() {
+        assert_eq!(sanitize_service_name_for_dns("My_API v2!"), "my-api-v2");
+        assert_eq!(sanitize_service_name_for_dns(""), "service");
+        assert_eq!(sanitize_service_name_for_dns("---"), "service");
     }
 
     #[test]
@@ -849,17 +870,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_legacy_runtime_service_targets_are_rejected() {
+    fn same_runtime_service_name_is_allowed_in_distinct_instances() {
         let first_instance = instance(70);
         let second_instance = instance(80);
-        let current = DomainIndex::default()
+        let index = DomainIndex::default()
             .replacing_instance(
                 first_instance,
                 [service_claim("first.localhost", first_instance, "same:web")],
             )
-            .expect("first claim");
-
-        let error = current
+            .expect("first claim")
             .replacing_instance(
                 second_instance,
                 [service_claim(
@@ -868,7 +887,36 @@ mod tests {
                     "same:web",
                 )],
             )
-            .expect_err("legacy runtime key conflict must fail");
+            .expect("same display key belongs to a distinct instance");
+
+        assert!(matches!(
+            index.resolve("first.localhost"),
+            Some(DomainTarget::Service {
+                project_instance_id,
+                service_name: Some(service_name),
+            }) if *project_instance_id == first_instance && service_name == "same:web"
+        ));
+        assert!(matches!(
+            index.resolve("second.localhost"),
+            Some(DomainTarget::Service {
+                project_instance_id,
+                service_name: Some(service_name),
+            }) if *project_instance_id == second_instance && service_name == "same:web"
+        ));
+    }
+
+    #[test]
+    fn duplicate_runtime_service_target_within_one_instance_is_rejected() {
+        let instance_id = instance(90);
+        let error = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    service_claim("first.localhost", instance_id, "same:web"),
+                    service_claim("second.localhost", instance_id, "same:web"),
+                ],
+            )
+            .expect_err("one service cannot target two exact domains in milestone A");
 
         assert!(matches!(error, DomainError::RuntimeServiceConflict { .. }));
         assert!(error.to_string().contains("first.localhost"));

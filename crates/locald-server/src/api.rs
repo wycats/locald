@@ -223,17 +223,12 @@ async fn handle_service_restart(
     Path(name): Path<String>,
     State(pm): State<Arc<ProcessManager>>,
 ) -> impl IntoResponse {
-    if let Err(e) = pm.stop(&name).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    if pm.get_service_path(&name).await.is_none() {
+        return (StatusCode::NOT_FOUND, "Service not found").into_response();
     }
-
-    if let Some(path) = pm.get_service_path(&name).await {
-        match pm.start(path, None, false).await {
-            Ok(()) => StatusCode::OK.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    } else {
-        (StatusCode::NOT_FOUND, "Service not found").into_response()
+    match pm.restart(&name).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

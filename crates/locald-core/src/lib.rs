@@ -86,7 +86,7 @@ pub use catalog::{
 #[doc(inline)]
 pub use domain::{
     DomainClaim, DomainError, DomainIndex, DomainName, DomainTarget, PlatformDomain,
-    SharedDomainIndex, sanitize_project_name_for_dns,
+    SharedDomainIndex, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 pub mod registry;
 #[doc(inline)]

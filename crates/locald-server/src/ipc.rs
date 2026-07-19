@@ -219,18 +219,10 @@ async fn handle_connection(
             Ok(()) => IpcResponse::Ok,
             Err(e) => IpcResponse::Error(e.to_string()),
         },
-        IpcRequest::Restart { name } => {
-            if let Err(e) = manager.stop(&name).await {
-                IpcResponse::Error(e.to_string())
-            } else if let Some(path) = manager.get_service_path(&name).await {
-                match manager.start(path, None, false).await {
-                    Ok(()) => IpcResponse::Ok,
-                    Err(e) => IpcResponse::Error(format!("{e:#}")),
-                }
-            } else {
-                IpcResponse::Error("Service not found".to_string())
-            }
-        }
+        IpcRequest::Restart { name } => match manager.restart(&name).await {
+            Ok(()) => IpcResponse::Ok,
+            Err(e) => IpcResponse::Error(format!("{e:#}")),
+        },
         IpcRequest::Reset { name } => match manager.reset(&name).await {
             Ok(()) => IpcResponse::Ok,
             Err(e) => IpcResponse::Error(e.to_string()),
