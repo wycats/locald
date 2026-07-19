@@ -1,5 +1,7 @@
 //! Integration coverage for daemon-owned hosts-file synchronization.
 
+#![cfg(target_os = "linux")]
+
 use assert_cmd::Command;
 use locald_core::{IpcRequest, IpcResponse};
 use std::io::{Read, Write};

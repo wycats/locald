@@ -6,6 +6,8 @@ use locald_core::{
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
+#[cfg(target_os = "macos")]
+use crate::error::CliError;
 use crate::error::{CliResult, DaemonError};
 
 fn connect_to_daemon() -> Result<(UnixStream, String), DaemonError> {
@@ -32,6 +34,33 @@ fn connect_to_daemon() -> Result<(UnixStream, String), DaemonError> {
 pub fn send_request(request: &IpcRequest) -> CliResult<IpcResponse> {
     let (mut stream, _socket_display) = connect_to_daemon()?;
     send_request_on_stream(&mut stream, request)
+}
+
+#[cfg(target_os = "macos")]
+pub fn send_request_from_uid(request: &IpcRequest, expected_uid: u32) -> CliResult<IpcResponse> {
+    let (mut stream, socket_display) = connect_to_daemon()?;
+    send_request_on_verified_stream(&mut stream, request, expected_uid, &socket_display)
+}
+
+#[cfg(target_os = "macos")]
+fn send_request_on_verified_stream(
+    stream: &mut UnixStream,
+    request: &IpcRequest,
+    expected_uid: u32,
+    socket_display: &str,
+) -> CliResult<IpcResponse> {
+    let (peer_uid, _) = nix::unistd::getpeereid(&*stream).map_err(|error| {
+        CliError::message(format!(
+            "Failed to authenticate locald at {socket_display}: {error}"
+        ))
+    })?;
+    if peer_uid.as_raw() != expected_uid {
+        return Err(CliError::message(format!(
+            "Refusing privileged hosts synchronization: locald at {socket_display} belongs to uid {}, expected uid {expected_uid}.",
+            peer_uid.as_raw()
+        )));
+    }
+    send_request_on_stream(stream, request)
 }
 
 fn send_request_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliResult<IpcResponse> {
@@ -127,8 +156,12 @@ pub fn stream_boot_events(request: &IpcRequest) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::send_request_on_stream;
+    #[cfg(target_os = "macos")]
+    use super::send_request_on_verified_stream;
     use locald_core::IpcRequest;
     use std::io::Read;
+    #[cfg(target_os = "macos")]
+    use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::thread;
 
@@ -148,5 +181,55 @@ mod tests {
             err.to_string()
                 .contains("daemon closed the connection without a response")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn privileged_request_rejects_a_foreign_peer_uid() {
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let foreign_uid = if current_uid == u32::MAX {
+            current_uid - 1
+        } else {
+            current_uid + 1
+        };
+
+        let error = send_request_on_verified_stream(
+            &mut client,
+            &IpcRequest::GetHostsDomains,
+            foreign_uid,
+            "test socket",
+        )
+        .expect_err("foreign peer must be rejected before the request is sent");
+
+        assert!(error.to_string().contains("belongs to uid"));
+        assert!(error.to_string().contains("expected uid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn privileged_request_rejects_an_injected_domain() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let server_thread = thread::spawn(move || {
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+            let response = serde_json::to_vec(&serde_json::json!({
+                "HostsDomains": ["app.localhost\n127.0.0.1 injected.example"]
+            }))
+            .unwrap();
+            server.write_all(&response).unwrap();
+        });
+
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let error = send_request_on_verified_stream(
+            &mut client,
+            &IpcRequest::GetHostsDomains,
+            current_uid,
+            "test socket",
+        )
+        .expect_err("invalid domain response must fail deserialization");
+        server_thread.join().unwrap();
+
+        assert!(error.to_string().contains("invalid domain"));
     }
 }

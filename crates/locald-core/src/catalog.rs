@@ -388,8 +388,10 @@ impl ProjectCatalog {
             }
             version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
                 let catalog = Self::migrate_v2(value, path)?;
-                replace_catalog_with_parent_sync(&catalog, path, parent_sync).await?;
-                Ok(catalog)
+                match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
+                    Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => Ok(catalog),
+                    Err(error) => Err(error),
+                }
             }
             found => Err(CatalogError::UnsupportedVersion {
                 path: path.to_path_buf(),
@@ -4118,7 +4120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_migration_sync_failure_reports_published_v3() {
+    async fn v2_migration_sync_failure_returns_published_v3() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let catalog = ProjectCatalog::with_path(paths.catalog.clone());
@@ -4127,7 +4129,7 @@ mod tests {
             .await
             .expect("write v2 migration fixture");
 
-        let error =
+        let migrated =
             ProjectCatalog::load_existing_with_parent_sync(&paths.catalog, |path| async move {
                 Err(CatalogError::Io {
                     operation: "perform injected migration parent sync",
@@ -4136,9 +4138,8 @@ mod tests {
                 })
             })
             .await
-            .expect_err("post-rename migration sync failure must be reported");
+            .expect("post-rename migration sync failure must keep the published catalog active");
 
-        assert!(matches!(error, CatalogError::PublishedNotDurable { .. }));
         let published = tokio::fs::read(&paths.catalog)
             .await
             .expect("read published migration result");
@@ -4146,9 +4147,10 @@ mod tests {
             catalog_fixture_version(&published),
             u64::from(CATALOG_VERSION)
         );
-        ProjectCatalog::load_existing(&paths.catalog)
+        let reopened = ProjectCatalog::load_existing(&paths.catalog)
             .await
             .expect("published v3 migration remains readable");
+        assert_eq!(reopened, migrated);
     }
 
     #[tokio::test]

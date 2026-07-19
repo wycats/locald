@@ -243,6 +243,7 @@ async fn handle_connection(
             Ok(()) => IpcResponse::Ok,
             Err(e) => IpcResponse::Error(e.to_string()),
         },
+        IpcRequest::GetHostsDomains => IpcResponse::HostsDomains(manager.hosts_domain_names()),
         IpcRequest::Shutdown => {
             let _ = shutdown_tx.send(ShutdownReason::Stop).await;
             IpcResponse::Ok

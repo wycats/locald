@@ -1,6 +1,7 @@
 //! Exact domain ownership shared by routing, status, hosts, and TLS.
 
 use crate::identity::ProjectInstanceId;
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -55,7 +56,7 @@ pub(crate) fn sanitize_dns_label(value: &str, empty_fallback: &str) -> String {
 ///
 /// Names are ASCII lowercase and omit the optional trailing root dot. Wildcard
 /// claims are intentionally outside this milestone.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct DomainName(String);
 
@@ -353,6 +354,15 @@ impl DomainIndex {
     /// do not resolve to loopback by definition.
     #[must_use]
     pub fn hosts_domains(&self) -> Vec<String> {
+        self.hosts_domain_names()
+            .into_iter()
+            .map(|domain| domain.to_string())
+            .collect()
+    }
+
+    /// Return validated exact names that require explicit hosts-file mappings.
+    #[must_use]
+    pub fn hosts_domain_names(&self) -> Vec<DomainName> {
         self.claims
             .iter()
             .filter(|(domain, target)| {
@@ -363,7 +373,7 @@ impl DomainIndex {
                             .rsplit_once('.')
                             .is_some_and(|(_, suffix)| suffix == "local")
             })
-            .map(|(domain, _)| domain.to_string())
+            .map(|(domain, _)| domain.clone())
             .collect()
     }
 

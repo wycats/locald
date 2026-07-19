@@ -479,6 +479,18 @@ impl ProcessManager {
         self.domain_index.clone()
     }
 
+    /// Return the authoritative exact hostnames that require hosts-file mappings.
+    #[must_use]
+    pub fn hosts_domains(&self) -> Vec<String> {
+        self.domain_index.snapshot().hosts_domains()
+    }
+
+    /// Return validated exact names for a privileged hosts-file writer.
+    #[must_use]
+    pub fn hosts_domain_names(&self) -> Vec<DomainName> {
+        self.domain_index.snapshot().hosts_domain_names()
+    }
+
     fn build_domain_claims(
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
@@ -1056,7 +1068,7 @@ impl ProcessManager {
                 let manager = manager.clone();
                 let syncer = syncer.clone();
                 async move {
-                    let domains = manager.domain_index.snapshot().hosts_domains();
+                    let domains = manager.hosts_domains();
                     syncer.sync(domains).await
                 }
             })
@@ -5321,6 +5333,10 @@ command = "api"
             } if name == "app:web"
         ));
 
+        assert_eq!(
+            manager.hosts_domains(),
+            expected_hosts(&["current.localhost"])
+        );
         manager.sync_hosts().await.expect("synchronize hosts");
         assert_eq!(
             calls

@@ -1,6 +1,8 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
+#[cfg(target_os = "macos")]
+use locald_core::{DomainName, HostsFileSection};
 use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -1068,17 +1070,47 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         ));
                     }
                 }
-                AdminCommands::SyncHosts => match client::send_request(&IpcRequest::SyncHosts)? {
-                    IpcResponse::Ok => println!("Hosts file updated."),
-                    IpcResponse::Error(message) => {
-                        return Err(CliError::message(message));
+                AdminCommands::SyncHosts => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        require_root_for_hosts_sync(nix::unistd::geteuid().is_root())?;
+                        let sudo_uid = std::env::var("SUDO_UID").ok();
+                        let daemon_uid = invoking_user_uid(sudo_uid.as_deref())?;
+                        let response = client::send_request_from_uid(
+                            &IpcRequest::GetHostsDomains,
+                            daemon_uid,
+                        )?;
+                        match response {
+                            IpcResponse::HostsDomains(domains) => {
+                                sync_hosts_file(&HostsFileSection::new(), &domains)?;
+                                println!("Hosts file updated.");
+                            }
+                            IpcResponse::Error(message) => {
+                                return Err(CliError::message(message));
+                            }
+                            response => {
+                                return Err(CliError::message(format!(
+                                    "Unexpected response: {response:?}"
+                                )));
+                            }
+                        }
                     }
-                    response => {
-                        return Err(CliError::message(format!(
-                            "Unexpected response: {response:?}"
-                        )));
+
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        match client::send_request(&IpcRequest::SyncHosts)? {
+                            IpcResponse::Ok => println!("Hosts file updated."),
+                            IpcResponse::Error(message) => {
+                                return Err(CliError::message(message));
+                            }
+                            response => {
+                                return Err(CliError::message(format!(
+                                    "Unexpected response: {response:?}"
+                                )));
+                            }
+                        }
                     }
-                },
+                }
             }
         }
         Commands::Tray { command } => {
@@ -2086,6 +2118,51 @@ fn unescape_xml(value: &str) -> String {
     unescaped
 }
 
+#[cfg(target_os = "macos")]
+fn require_root_for_hosts_sync(is_root: bool) -> CliResult<()> {
+    if is_root {
+        Ok(())
+    } else {
+        Err(CliError::message(
+            "This command requires root privileges. Run `sudo locald admin sync-hosts`.",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn invoking_user_uid(sudo_uid: Option<&str>) -> CliResult<u32> {
+    let uid = sudo_uid
+        .ok_or_else(|| {
+            CliError::message(
+                "Could not identify the invoking user. Run `sudo locald admin sync-hosts` from your user session.",
+            )
+        })?
+        .parse::<u32>()
+        .map_err(|_| CliError::message("SUDO_UID is not a valid user ID."))?;
+    if uid == 0 {
+        return Err(CliError::message(
+            "Privileged hosts synchronization requires a non-root invoking user.",
+        ));
+    }
+    Ok(uid)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_hosts_file(hosts: &HostsFileSection, domains: &[DomainName]) -> CliResult<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let content = runtime
+        .block_on(hosts.read())
+        .context("Failed to read hosts file")?;
+    let domains = domains.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let updated = hosts.update_content(&content, &domains);
+    runtime
+        .block_on(hosts.write(&updated))
+        .context("Failed to write hosts file")?;
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -2141,6 +2218,44 @@ mod tests {
     #[test]
     fn launch_agent_daemon_path_is_absent_when_key_missing() {
         assert_eq!(parse_launch_agent_daemon_path("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn hosts_sync_requires_explicit_root() {
+        let error = require_root_for_hosts_sync(false).expect_err("non-root sync must fail");
+
+        assert!(error.to_string().contains("sudo locald admin sync-hosts"));
+        require_root_for_hosts_sync(true).expect("root sync may continue");
+    }
+
+    #[test]
+    fn hosts_sync_identifies_the_non_root_invoking_user() {
+        assert_eq!(invoking_user_uid(Some("501")).expect("valid uid"), 501);
+        assert!(invoking_user_uid(None).is_err());
+        assert!(invoking_user_uid(Some("root")).is_err());
+        assert!(invoking_user_uid(Some("0")).is_err());
+    }
+
+    #[test]
+    fn hosts_sync_writes_the_daemon_owned_domain_set() {
+        let directory = tempfile::tempdir().expect("create temporary hosts directory");
+        let path = directory.path().join("hosts");
+        std::fs::write(&path, "127.0.0.1 localhost\n").expect("write hosts fixture");
+        let hosts = HostsFileSection::with_path(path.clone());
+
+        sync_hosts_file(
+            &hosts,
+            &[
+                "app.localhost".parse().expect("valid project domain"),
+                "locald.local".parse().expect("valid platform domain"),
+            ],
+        )
+        .expect("synchronize hosts fixture");
+
+        let updated = std::fs::read_to_string(path).expect("read synchronized hosts fixture");
+        assert!(updated.contains("127.0.0.1 app.localhost"));
+        assert!(updated.contains("127.0.0.1 locald.local"));
+        assert_eq!(updated.matches("# BEGIN locald").count(), 1);
     }
 }
 
