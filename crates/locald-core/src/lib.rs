@@ -74,9 +74,18 @@ pub use hosts::HostsFileSection;
 pub mod state;
 #[doc(inline)]
 pub use state::{ServerState, ServiceState};
+pub mod availability;
 pub mod catalog;
 pub mod domain;
 pub mod storage;
+#[doc(inline)]
+pub use availability::{
+    AGENT_ACTIVE_TTL, AGENT_DEMAND_TTL, AGENT_REVIEW_GRACE, AVAILABILITY_VERSION,
+    AvailabilityError, AvailabilityStore, Clock, DemandKey, DemandKeyError, DemandKind,
+    DemandLease, EnsureDemandEffect, EnsureDemandResult, MANUAL_DEMAND_TTL, ProjectAvailability,
+    RenewDemandResult, SHUTDOWN_COOLDOWN, SystemClock, VSCODE_DEMAND_TTL, VSCODE_RENEWAL_INTERVAL,
+    availability_path,
+};
 #[doc(inline)]
 pub use catalog::{
     CatalogError, CatalogPaths, CatalogPresence, ProjectCatalog, ProjectDiscovery, ProjectEntry,
