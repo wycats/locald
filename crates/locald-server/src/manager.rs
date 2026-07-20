@@ -36,10 +36,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
+
+// This scope is entered only while holding a shared availability-transition
+// permit. It lets a transition admitted before shutdown finish its semantic
+// convergence while shutdown's exclusive permit waits to begin teardown.
+tokio::task_local! {
+    static AVAILABILITY_TRANSITION_ADMITTED: usize;
+}
 
 #[derive(Debug)]
 struct LogBuffer {
@@ -87,6 +94,10 @@ struct AvailabilityStartSuperseded {
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("locald is shutting down")]
 struct DaemonShuttingDown;
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("availability transitions cannot be nested")]
+struct ReentrantAvailabilityTransition;
 
 #[derive(Clone, Debug, thiserror::Error)]
 #[error(
@@ -314,7 +325,7 @@ pub struct ProcessManager {
     port_allocator: PortAllocator,
     config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     availability_coordinators: Arc<Mutex<HashMap<ProjectInstanceId, Arc<AvailabilityCoordinator>>>>,
-    availability_publication_lock: Arc<Mutex<()>>,
+    availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
     forgotten_reload_paths: Arc<Mutex<HashSet<PathBuf>>>,
     legacy_restore_evidence: Arc<Mutex<HashMap<ProjectInstanceId, Vec<PersistedServiceState>>>>,
@@ -336,12 +347,56 @@ impl ProcessManager {
         self.shutting_down.load(AtomicOrdering::Acquire)
     }
 
-    fn ensure_accepting_lifecycle_requests(&self) -> Result<()> {
+    fn availability_transition_key(&self) -> usize {
+        Arc::as_ptr(&self.availability_transition_gate) as usize
+    }
+
+    fn ensure_accepting_new_lifecycle_request(&self) -> Result<()> {
         if self.is_shutting_down() {
             Err(DaemonShuttingDown.into())
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_accepting_lifecycle_requests(&self) -> Result<()> {
+        let availability_transition_admitted = AVAILABILITY_TRANSITION_ADMITTED
+            .try_with(|admitted| *admitted == self.availability_transition_key())
+            .unwrap_or(false);
+        if self.is_shutting_down() && !availability_transition_admitted {
+            Err(DaemonShuttingDown.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Admit one availability transition and drain it before teardown.
+    ///
+    /// The transition may call lifecycle helpers on this manager after the
+    /// shutdown request is published. It must not call [`Self::shutdown`],
+    /// which waits for this method's own shared permit. Nested availability
+    /// transitions are rejected before they can request another read permit.
+    async fn run_admitted_availability_transition<Output, MakeTransition, Transition>(
+        &self,
+        make_transition: MakeTransition,
+    ) -> Result<Output>
+    where
+        MakeTransition: FnOnce() -> Transition,
+        Transition: std::future::Future<Output = Result<Output>>,
+    {
+        let reentrant = AVAILABILITY_TRANSITION_ADMITTED
+            .try_with(|admitted| *admitted == self.availability_transition_key())
+            .unwrap_or(false);
+        if reentrant {
+            return Err(ReentrantAvailabilityTransition.into());
+        }
+        let transition_guard = self.availability_transition_gate.read().await;
+        self.ensure_accepting_new_lifecycle_request()?;
+        let result = AVAILABILITY_TRANSITION_ADMITTED
+            .scope(self.availability_transition_key(), make_transition())
+            .await;
+        drop(transition_guard);
+        result
     }
 
     pub async fn get_service_controller(
@@ -443,7 +498,7 @@ impl ProcessManager {
             port_allocator: PortAllocator::new(),
             config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
             availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
-            availability_publication_lock: Arc::new(Mutex::new(())),
+            availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
             forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
             legacy_restore_evidence: Arc::new(Mutex::new(HashMap::new())),
@@ -2685,8 +2740,11 @@ impl ProcessManager {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.shutting_down.store(true, AtomicOrdering::Release);
+        // Drain transitions admitted before the shutdown request. Later
+        // readers observe `shutting_down` before entering the admitted scope.
+        let availability_shutdown_guard = self.availability_transition_gate.write().await;
+        drop(availability_shutdown_guard);
         let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
-        let _availability_publication_guard = self.availability_publication_lock.lock().await;
         // Availability convergence deliberately avoids the global runtime
         // projection lock so unrelated projects can stop independently. Drain
         // every coordinator that existed when shutdown began before taking the
@@ -2907,31 +2965,34 @@ impl ProcessManager {
             .required_availability_instance_for_path(project_path)
             .await?;
         let coordinator = self.availability_coordinator(instance_id).await;
-        let _runtime_guard = coordinator.runtime.lock().await;
-        self.ensure_accepting_lifecycle_requests()?;
-        anyhow::ensure!(
-            self.active_path_for_instance(instance_id).await.is_some(),
-            "project instance {instance_id} is no longer active"
-        );
-        self.watch_active_instance(instance_id).await;
-        let mut availability =
-            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
-        let (result, durability_error) =
-            Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
-        let convergence = self
-            .converge_availability_locked(
-                instance_id,
-                None,
-                None,
-                AvailabilityConvergenceOptions {
-                    verbose: false,
-                    apply_config_when_up: false,
-                    defer_config_reload_during_cooldown: false,
-                },
-            )
-            .await;
-        Self::surface_availability_durability(convergence, durability_error)?;
-        Ok(result.expect("successful availability publication returns its demand result"))
+        self.run_admitted_availability_transition(|| async {
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            anyhow::ensure!(
+                self.active_path_for_instance(instance_id).await.is_some(),
+                "project instance {instance_id} is no longer active"
+            );
+            self.watch_active_instance(instance_id).await;
+            let mut availability =
+                AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+            let (result, durability_error) =
+                Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
+            let convergence = self
+                .converge_availability_locked(
+                    instance_id,
+                    None,
+                    None,
+                    AvailabilityConvergenceOptions {
+                        verbose: false,
+                        apply_config_when_up: false,
+                        defer_config_reload_during_cooldown: false,
+                    },
+                )
+                .await;
+            Self::surface_availability_durability(convergence, durability_error)?;
+            Ok(result.expect("successful availability publication returns its demand result"))
+        })
+        .await
     }
 
     /// Enable or disable durable Always On policy and converge the runtime.
@@ -2940,31 +3001,34 @@ impl ProcessManager {
             .required_availability_instance_for_path(project_path)
             .await?;
         let coordinator = self.availability_coordinator(instance_id).await;
-        let _runtime_guard = coordinator.runtime.lock().await;
-        self.ensure_accepting_lifecycle_requests()?;
-        anyhow::ensure!(
-            self.active_path_for_instance(instance_id).await.is_some(),
-            "project instance {instance_id} is no longer active"
-        );
-        self.watch_active_instance(instance_id).await;
-        let mut availability =
-            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
-        let (changed, durability_error) =
-            Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
-        let convergence = self
-            .converge_availability_locked(
-                instance_id,
-                None,
-                None,
-                AvailabilityConvergenceOptions {
-                    verbose: false,
-                    apply_config_when_up: false,
-                    defer_config_reload_during_cooldown: false,
-                },
-            )
-            .await;
-        Self::surface_availability_durability(convergence, durability_error)?;
-        Ok(changed.expect("successful availability publication returns its change result"))
+        self.run_admitted_availability_transition(|| async {
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            anyhow::ensure!(
+                self.active_path_for_instance(instance_id).await.is_some(),
+                "project instance {instance_id} is no longer active"
+            );
+            self.watch_active_instance(instance_id).await;
+            let mut availability =
+                AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+            let (changed, durability_error) =
+                Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
+            let convergence = self
+                .converge_availability_locked(
+                    instance_id,
+                    None,
+                    None,
+                    AvailabilityConvergenceOptions {
+                        verbose: false,
+                        apply_config_when_up: false,
+                        defer_config_reload_during_cooldown: false,
+                    },
+                )
+                .await;
+            Self::surface_availability_durability(convergence, durability_error)?;
+            Ok(changed.expect("successful availability publication returns its change result"))
+        })
+        .await
     }
 
     /// Pause a project through its current activity generation and stop it.
@@ -2972,18 +3036,19 @@ impl ProcessManager {
         let (instance_id, _) = self
             .required_availability_instance_for_path(project_path)
             .await?;
-        let (changed, durability_error) = {
-            let _publication_guard = self.availability_publication_lock.lock().await;
+        self.run_admitted_availability_transition(|| async {
             self.ensure_accepting_lifecycle_requests()?;
             let mut availability =
                 AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
-            Self::capture_availability_publication(availability.pause_project().await)?
-        };
-        let convergence = self
-            .converge_managed_instance(instance_id, None, false, false)
-            .await;
-        Self::surface_availability_durability(convergence, durability_error)?;
-        Ok(changed.expect("successful availability publication returns its change result"))
+            let (changed, durability_error) =
+                Self::capture_availability_publication(availability.pause_project().await)?;
+            let convergence = self
+                .converge_managed_instance(instance_id, None, false, false)
+                .await;
+            Self::surface_availability_durability(convergence, durability_error)?;
+            Ok(changed.expect("successful availability publication returns its change result"))
+        })
+        .await
     }
 
     /// Re-evaluate one availability-managed project from authoritative state.
@@ -5804,10 +5869,6 @@ command = "sleep 30"
         let mut second_availability = AvailabilityStore::load(&availability_data_dir, second_id)
             .await
             .expect("load second availability");
-        second_availability
-            .set_always_on(true)
-            .await
-            .expect("enable second Always On");
         manager.services.lock().await.insert(
             "pause-now:web".to_owned(),
             availability_test_service(first_id, "pause-now", &first_path, false),
@@ -5824,7 +5885,7 @@ command = "sleep 30"
         let slow_start = tokio::spawn({
             let manager = manager.clone();
             let second_path = second_path.clone();
-            async move { manager.converge_project_availability(&second_path).await }
+            async move { manager.project_set_always_on(&second_path, true).await }
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), start_entered.notified())
             .await
@@ -5848,11 +5909,13 @@ command = "sleep 30"
             .pause_project()
             .await
             .expect("cancel slow startup");
-        tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
-            .await
-            .expect("slow startup observes pause")
-            .expect("join slow startup")
-            .expect("converge slow startup after pause");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
+                .await
+                .expect("slow startup observes pause")
+                .expect("join slow startup")
+                .expect("converge slow startup after pause")
+        );
     }
 
     #[tokio::test]
@@ -6956,6 +7019,212 @@ command = "ignored"
     }
 
     #[tokio::test]
+    async fn shutdown_drains_an_admitted_ensure_across_post_gate_checks() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("shutdown-admitted-ensure-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "shutdown-admitted-ensure").await;
+        write_availability_worker_config(
+            &project_path,
+            "shutdown-admitted-ensure",
+            "shutdown-admitted-ensure.localhost",
+            &["web"],
+        );
+        let start_entered = Arc::new(tokio::sync::Notify::new());
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: start_entered.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let ensure_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .project_ensure_availability(&project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), start_entered.notified())
+            .await
+            .expect("admitted ensure reaches its readiness wait");
+
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its lifecycle gate");
+        assert!(!shutdown_task.is_finished());
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load admitted ensure availability");
+        availability
+            .pause_project()
+            .await
+            .expect("supersede the admitted ensure after shutdown begins");
+
+        let (ensure_result, shutdown_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(ensure_task, shutdown_task)
+            })
+            .await
+            .expect("admitted ensure drains before shutdown teardown");
+        ensure_result
+            .expect("join admitted ensure")
+            .expect("admitted ensure crosses post-shutdown convergence checks");
+        shutdown_result
+            .expect("join shutdown")
+            .expect("finish shutdown after admitted ensure");
+
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("shutdown-admitted-ensure:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload admitted ensure availability")
+                .is_paused()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_transition_admission_is_manager_scoped_and_not_inherited() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("admission-scope-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "admission-scope").await;
+        let other_dir = tempdir().expect("create other temporary directory");
+        let other_path = other_dir.path().join("other-admission-scope-project");
+        let (other, _other_instance_id, _other_availability_data_dir) =
+            availability_manager(other_dir.path(), &other_path, "other-admission-scope").await;
+
+        let shutdown_task = manager
+            .run_admitted_availability_transition(|| async {
+                let shutdown_task = tokio::spawn({
+                    let manager = manager.clone();
+                    async move { manager.shutdown().await }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !manager.is_shutting_down() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("shutdown queues behind the admitted transition");
+                assert!(!shutdown_task.is_finished());
+
+                other.shutting_down.store(true, AtomicOrdering::Release);
+                manager
+                    .ensure_accepting_lifecycle_requests()
+                    .expect("the admitted manager continues");
+
+                let other_error = other
+                    .ensure_accepting_lifecycle_requests()
+                    .expect_err("admission does not authorize another manager");
+                assert!(other_error.downcast_ref::<DaemonShuttingDown>().is_some());
+
+                let nested_error = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    manager.project_set_always_on(&project_path, true),
+                )
+                .await
+                .expect("nested admission rejects without waiting for the shutdown writer")
+                .expect_err("a nested availability transition is rejected");
+                assert!(
+                    nested_error
+                        .downcast_ref::<ReentrantAvailabilityTransition>()
+                        .is_some()
+                );
+
+                let child_error = tokio::spawn({
+                    let manager = manager.clone();
+                    async move { manager.ensure_accepting_lifecycle_requests() }
+                })
+                .await
+                .expect("join unadmitted child")
+                .expect_err("spawned tasks do not inherit availability admission");
+                assert!(child_error.downcast_ref::<DaemonShuttingDown>().is_some());
+                Ok(shutdown_task)
+            })
+            .await
+            .expect("exercise scoped availability admission");
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_task)
+            .await
+            .expect("shutdown proceeds after the admitted scope exits")
+            .expect("join shutdown")
+            .expect("finish shutdown");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_admitted_transition_releases_shutdown() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("cancelled-admission-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "cancelled-admission").await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transition_task = tokio::spawn({
+            let manager = manager.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                manager
+                    .run_admitted_availability_transition(|| async {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("transition enters its admitted scope");
+
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its lifecycle gate");
+        assert!(!shutdown_task.is_finished());
+
+        transition_task.abort();
+        assert!(
+            transition_task
+                .await
+                .expect_err("join cancelled transition")
+                .is_cancelled()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_task)
+            .await
+            .expect("cancelled admission releases the shutdown writer")
+            .expect("join shutdown")
+            .expect("finish shutdown after cancellation");
+    }
+
+    #[tokio::test]
     async fn shutdown_gate_rejects_an_attachment_write_queued_before_teardown() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("shutdown-attachment-project");
@@ -7005,27 +7274,76 @@ command = "ignored"
         assert!(manager.attachments.lock().await.all_projects().is_empty());
     }
 
-    #[tokio::test]
-    async fn shutdown_gate_rejects_a_pause_queued_before_availability_publication() {
+    #[derive(Clone, Copy)]
+    enum QueuedAvailabilityTransition {
+        Pause,
+        Ensure,
+        AlwaysOn,
+    }
+
+    async fn assert_shutdown_rejects_queued_availability_transition(
+        transition: QueuedAvailabilityTransition,
+    ) {
         let dir = tempdir().expect("create temporary directory");
-        let project_path = dir.path().join("shutdown-pause-project");
+        let label = match transition {
+            QueuedAvailabilityTransition::Pause => "pause",
+            QueuedAvailabilityTransition::Ensure => "ensure",
+            QueuedAvailabilityTransition::AlwaysOn => "always-on",
+        };
+        let project_path = dir.path().join(format!("shutdown-{label}-project"));
+        let project_name = format!("shutdown-{label}");
         let (manager, instance_id, availability_data_dir) =
-            availability_manager(dir.path(), &project_path, "shutdown-pause").await;
+            availability_manager(dir.path(), &project_path, &project_name).await;
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
-            .expect("load shutdown-pause availability");
-        availability
-            .set_always_on(true)
+            .expect("load queued-transition availability");
+        match transition {
+            QueuedAvailabilityTransition::Pause => {
+                availability
+                    .set_always_on(true)
+                    .await
+                    .expect("establish running availability baseline");
+            }
+            QueuedAvailabilityTransition::Ensure | QueuedAvailabilityTransition::AlwaysOn => {
+                availability
+                    .pause_project()
+                    .await
+                    .expect("establish paused availability baseline");
+            }
+        }
+        let baseline = availability
+            .snapshot()
             .await
-            .expect("enable Always On before queued pause");
+            .expect("load queued-transition baseline");
 
-        let publication_guard = manager.availability_publication_lock.lock().await;
-        let pause_task = tokio::spawn({
+        let transition_guard = manager.availability_transition_gate.write().await;
+        let mut transition_task = tokio::spawn({
             let manager = manager.clone();
             let project_path = project_path.clone();
-            async move { manager.project_pause_availability(&project_path).await }
+            async move {
+                match transition {
+                    QueuedAvailabilityTransition::Pause => manager
+                        .project_pause_availability(&project_path)
+                        .await
+                        .map(|_| ()),
+                    QueuedAvailabilityTransition::Ensure => manager
+                        .project_ensure_availability(&project_path, DemandKey::manual_cli())
+                        .await
+                        .map(|_| ()),
+                    QueuedAvailabilityTransition::AlwaysOn => manager
+                        .project_set_always_on(&project_path, true)
+                        .await
+                        .map(|_| ()),
+                }
+            }
         });
-        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut transition_task,)
+                .await
+                .is_err(),
+            "availability transition waits for its admission gate"
+        );
+
         let shutdown_task = tokio::spawn({
             let manager = manager.clone();
             async move { manager.shutdown().await }
@@ -7037,23 +7355,49 @@ command = "ignored"
         })
         .await
         .expect("shutdown publishes its availability-publication gate");
-        drop(publication_guard);
+        drop(transition_guard);
 
-        let error = pause_task
+        let (transition_result, shutdown_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(transition_task, shutdown_task)
+            })
             .await
-            .expect("join queued pause")
-            .expect_err("queued pause is rejected after shutdown begins");
+            .expect("queued transition and shutdown finish without a lock inversion");
+        let error = transition_result
+            .expect("join queued availability transition")
+            .expect_err("queued transition is rejected after shutdown begins");
         assert!(error.downcast_ref::<DaemonShuttingDown>().is_some());
-        shutdown_task
-            .await
+        shutdown_result
             .expect("join shutdown")
             .expect("finish shutdown");
+
         let snapshot = availability
             .snapshot()
             .await
             .expect("reload availability after shutdown");
-        assert!(snapshot.always_on());
-        assert!(!snapshot.is_paused());
+        assert_eq!(snapshot, baseline);
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_a_pause_queued_before_availability_publication() {
+        assert_shutdown_rejects_queued_availability_transition(QueuedAvailabilityTransition::Pause)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_an_ensure_queued_before_availability_publication() {
+        assert_shutdown_rejects_queued_availability_transition(
+            QueuedAvailabilityTransition::Ensure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_always_on_queued_before_availability_publication() {
+        assert_shutdown_rejects_queued_availability_transition(
+            QueuedAvailabilityTransition::AlwaysOn,
+        )
+        .await;
     }
 
     #[tokio::test]
