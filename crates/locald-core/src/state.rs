@@ -94,12 +94,31 @@ impl std::fmt::Display for ServiceState {
     }
 }
 
+/// OS identity captured while locald still owns a running service process.
+///
+/// A PID alone is never sufficient authorization to signal a process after a
+/// daemon restart because the operating system can reuse it. These fields let
+/// startup reconciliation prove that the live process is the one locald
+/// recorded before sending either a graceful or forceful signal.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PersistedProcessIdentity {
+    pub start_time: u64,
+    pub process_group_id: i32,
+    /// Executable observed at spawn time for diagnostics. A normal `exec`
+    /// changes this path without changing process identity, so cleanup never
+    /// treats it as authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<PathBuf>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PersistedServiceState {
     pub name: String,
     pub config: LocaldConfig,
     pub path: PathBuf,
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_identity: Option<PersistedProcessIdentity>,
     pub container_id: Option<String>,
     pub port: Option<u16>,
     pub status: ServiceState,
@@ -112,4 +131,53 @@ pub struct PersistedServiceState {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ServerState {
     pub services: Vec<PersistedServiceState>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service_state(process_identity: Option<PersistedProcessIdentity>) -> PersistedServiceState {
+        PersistedServiceState {
+            name: "example:web".to_owned(),
+            config: LocaldConfig::default(),
+            path: PathBuf::from("/tmp/example"),
+            pid: Some(42),
+            process_identity,
+            container_id: None,
+            port: Some(3000),
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+            health_source: HealthSource::Tcp,
+        }
+    }
+
+    #[test]
+    fn legacy_service_state_without_process_identity_remains_readable() {
+        let mut value = serde_json::to_value(service_state(None)).expect("serialize service state");
+        value
+            .as_object_mut()
+            .expect("service state is an object")
+            .remove("process_identity");
+
+        let decoded: PersistedServiceState =
+            serde_json::from_value(value).expect("deserialize legacy service state");
+        assert!(decoded.process_identity.is_none());
+        assert_eq!(decoded.pid, Some(42));
+    }
+
+    #[test]
+    fn process_identity_round_trip_preserves_cleanup_authority() {
+        let identity = PersistedProcessIdentity {
+            start_time: 1234,
+            process_group_id: 42,
+            executable: Some(PathBuf::from("/bin/example")),
+        };
+        let encoded = serde_json::to_vec(&service_state(Some(identity.clone())))
+            .expect("serialize fingerprinted service state");
+        let decoded: PersistedServiceState =
+            serde_json::from_slice(&encoded).expect("deserialize fingerprinted service state");
+
+        assert_eq!(decoded.process_identity, Some(identity));
+    }
 }

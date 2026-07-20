@@ -3,18 +3,23 @@ use locald_builder::{
     BuilderImage, BundleSource, ContainerImage, Lifecycle, LocalLayoutBundleSource, ShimRuntime,
 };
 use locald_core::ipc::{LogEntry, LogStream};
+use locald_core::state::PersistedProcessIdentity;
 use locald_oci::{oci_layout, runtime_spec};
-use nix::sys::signal::Signal;
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::{Pid, getpgid, getpgrp};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo::{Pid as SysinfoPid, ProcessesToUpdate, System};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 type ProcessHandle = (
     Box<dyn Child + Send>,
     Box<dyn MasterPty + Send>,
+    Box<dyn std::io::Write + Send>,
     String,
     mpsc::Receiver<LogEntry>,
     broadcast::Sender<Vec<u8>>,
@@ -25,6 +30,12 @@ pub struct ProcessRuntime {
     notify_socket_path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct VerifiedStaleProcess {
+    pid: i32,
+    identity: PersistedProcessIdentity,
+}
+
 impl ProcessRuntime {
     #[must_use]
     pub fn new(notify_socket_path: PathBuf) -> Self {
@@ -33,6 +44,263 @@ impl ProcessRuntime {
 
     pub fn kill_pid(&self, pid: i32, signal: Signal) -> Result<()> {
         locald_utils::process::kill_pid(pid, signal)
+    }
+
+    fn validated_stale_pid(pid: u32) -> Result<i32> {
+        anyhow::ensure!(pid > 1, "refusing to operate on reserved process ID {pid}");
+        anyhow::ensure!(
+            pid != std::process::id(),
+            "refusing to operate on the current locald process ({pid})"
+        );
+        let pid = i32::try_from(pid).context("recorded process ID exceeds the platform range")?;
+        anyhow::ensure!(
+            pid != getpgrp().as_raw(),
+            "refusing to operate on the current locald process group ({pid})"
+        );
+        Ok(pid)
+    }
+
+    fn observed_process_identity(pid: i32) -> Result<Option<PersistedProcessIdentity>> {
+        let sysinfo_pid = SysinfoPid::from_u32(
+            u32::try_from(pid).context("validated process ID became negative")?,
+        );
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&[sysinfo_pid]), true);
+        let Some(process) = system.process(sysinfo_pid) else {
+            return Ok(None);
+        };
+        let process_group_id = match getpgid(Some(Pid::from_raw(pid))) {
+            Ok(process_group_id) => process_group_id.as_raw(),
+            Err(Errno::ESRCH) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to inspect process group for PID {pid}: {error}"
+                ));
+            }
+        };
+        Ok(Some(PersistedProcessIdentity {
+            start_time: process.start_time(),
+            process_group_id,
+            executable: process.exe().map(Path::to_path_buf),
+        }))
+    }
+
+    /// Capture an ownership fingerprint while locald still owns the process.
+    pub fn capture_process_identity(&self, pid: u32) -> Result<Option<PersistedProcessIdentity>> {
+        let pid = Self::validated_stale_pid(pid)?;
+        Self::observed_process_identity(pid)
+    }
+
+    /// Signal a process or process group that a live controller identified at
+    /// spawn time. Unlike restart reconciliation, the controller has retained
+    /// continuous ownership even after its leader exits, so a recorded group
+    /// whose ID equals the spawn PID remains an authorized target.
+    pub fn signal_owned_process(
+        &self,
+        pid: u32,
+        expected: &PersistedProcessIdentity,
+        signal: Signal,
+    ) -> Result<()> {
+        let pid = Self::validated_stale_pid(pid)?;
+        let observed = Self::observed_process_identity(pid)?;
+        if let Some(observed) = &observed {
+            anyhow::ensure!(
+                observed.start_time == expected.start_time,
+                "owned PID {pid} was reused before {signal:?}: expected start time {}, observed {}",
+                expected.start_time,
+                observed.start_time
+            );
+            anyhow::ensure!(
+                observed.process_group_id == expected.process_group_id,
+                "owned PID {pid} changed process group before {signal:?}: expected {}, observed {}",
+                expected.process_group_id,
+                observed.process_group_id
+            );
+        }
+
+        let target = if expected.process_group_id == pid
+            && expected.process_group_id > 1
+            && expected.process_group_id != getpgrp().as_raw()
+        {
+            Pid::from_raw(-expected.process_group_id)
+        } else {
+            anyhow::ensure!(
+                observed.is_some(),
+                "owned PID {pid} exited without a distinct authorized process group"
+            );
+            Pid::from_raw(pid)
+        };
+
+        match kill(target, signal) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to signal owned process {pid} (target {}) with {signal:?}: {error}",
+                target.as_raw()
+            )),
+        }
+    }
+
+    /// Return whether a live controller's captured process or authorized group
+    /// still exists. Identity mismatches fail closed.
+    pub fn owned_process_or_group_exists(
+        &self,
+        pid: u32,
+        expected: &PersistedProcessIdentity,
+    ) -> Result<bool> {
+        let pid = Self::validated_stale_pid(pid)?;
+        self.verified_stale_process_exists(&VerifiedStaleProcess {
+            pid,
+            identity: expected.clone(),
+        })
+    }
+
+    /// Verify that a persisted PID still names the process locald recorded.
+    /// A missing process is safe to forget; any mismatch fails closed.
+    pub fn verify_stale_process(
+        &self,
+        pid: u32,
+        expected: &PersistedProcessIdentity,
+    ) -> Result<Option<VerifiedStaleProcess>> {
+        let pid = Self::validated_stale_pid(pid)?;
+        let Some(observed) = Self::observed_process_identity(pid)? else {
+            if expected.process_group_id == pid
+                && expected.process_group_id > 1
+                && expected.process_group_id != getpgrp().as_raw()
+            {
+                match kill(Pid::from_raw(-expected.process_group_id), None) {
+                    Ok(()) | Err(Errno::EPERM) => {
+                        anyhow::bail!(
+                            "recorded leader PID {pid} is gone but its verified process group {} remains live; ownership cannot be revalidated",
+                            expected.process_group_id
+                        );
+                    }
+                    Err(Errno::ESRCH) => {}
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to inspect recorded process group {} after leader PID {pid} exited: {error}",
+                            expected.process_group_id
+                        ));
+                    }
+                }
+            }
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            observed.start_time == expected.start_time,
+            "recorded PID {pid} was reused: expected start time {}, observed {}",
+            expected.start_time,
+            observed.start_time
+        );
+        anyhow::ensure!(
+            observed.process_group_id == expected.process_group_id,
+            "recorded PID {pid} changed process group: expected {}, observed {}",
+            expected.process_group_id,
+            observed.process_group_id
+        );
+        Ok(Some(VerifiedStaleProcess {
+            pid,
+            identity: expected.clone(),
+        }))
+    }
+
+    fn can_signal_verified_group(process: &VerifiedStaleProcess) -> bool {
+        process.identity.process_group_id > 1
+            && process.identity.process_group_id == process.pid
+            && process.identity.process_group_id != getpgrp().as_raw()
+    }
+
+    /// Signal a process whose persisted ownership fingerprint was verified in
+    /// this reconciliation pass. Group signaling is used only for a distinct,
+    /// recorded process group; otherwise locald signals the verified PID.
+    pub fn signal_verified_stale_process(
+        &self,
+        process: &VerifiedStaleProcess,
+        signal: Signal,
+    ) -> Result<()> {
+        let pid = u32::try_from(process.pid).context("verified process ID became negative")?;
+        let Some(current) = self.verify_stale_process(pid, &process.identity)? else {
+            anyhow::bail!(
+                "verified stale process {} exited before {signal:?}; refusing to signal its former process group",
+                process.pid
+            );
+        };
+        let target = if Self::can_signal_verified_group(&current) {
+            Pid::from_raw(-current.identity.process_group_id)
+        } else {
+            Pid::from_raw(current.pid)
+        };
+        match kill(target, signal) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to signal verified stale process {} (target {}): {error}",
+                current.pid,
+                target.as_raw()
+            )),
+        }
+    }
+
+    /// Return whether a previously verified process or its owned group remains
+    /// live. If the PID is reused while cleanup is in flight, fail closed.
+    pub fn verified_stale_process_exists(&self, process: &VerifiedStaleProcess) -> Result<bool> {
+        if let Some(observed) = Self::observed_process_identity(process.pid)? {
+            anyhow::ensure!(
+                observed.start_time == process.identity.start_time
+                    && observed.process_group_id == process.identity.process_group_id,
+                "recorded PID {} changed identity while stale cleanup was in flight",
+                process.pid
+            );
+        }
+
+        let group_exists = if Self::can_signal_verified_group(process) {
+            match kill(Pid::from_raw(-process.identity.process_group_id), None) {
+                Ok(()) | Err(Errno::EPERM) => true,
+                Err(Errno::ESRCH) => false,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to inspect verified stale process group {}: {error}",
+                        process.identity.process_group_id
+                    ));
+                }
+            }
+        } else {
+            false
+        };
+        let process_exists = match kill(Pid::from_raw(process.pid), None) {
+            Ok(()) | Err(Errno::EPERM) => true,
+            Err(Errno::ESRCH) => false,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to inspect verified stale process {}: {error}",
+                    process.pid
+                ));
+            }
+        };
+
+        Ok(group_exists || process_exists)
+    }
+
+    /// Check a legacy bare PID without treating it as authorization to signal.
+    pub fn unverified_stale_process_exists(&self, pid: u32) -> Result<bool> {
+        let pid = Self::validated_stale_pid(pid)?;
+        let process_exists = match kill(Pid::from_raw(pid), None) {
+            Ok(()) | Err(Errno::EPERM) => true,
+            Err(Errno::ESRCH) => false,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to inspect unverified stale process {pid}: {error}"
+                ));
+            }
+        };
+        let group_exists = match kill(Pid::from_raw(-pid), None) {
+            Ok(()) | Err(Errno::EPERM) => true,
+            Err(Errno::ESRCH) => false,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to inspect unverified stale process group {pid}: {error}"
+                ));
+            }
+        };
+        Ok(process_exists || group_exists)
     }
 
     pub fn stop_shim_container(&self, id: &str) -> Result<()> {
@@ -58,58 +326,60 @@ impl ProcessRuntime {
     fn spawn_log_streamer(
         reader: Box<dyn std::io::Read + Send>,
         service_name: String,
-    ) -> (mpsc::Receiver<LogEntry>, broadcast::Sender<Vec<u8>>) {
+    ) -> Result<(mpsc::Receiver<LogEntry>, broadcast::Sender<Vec<u8>>)> {
         let (tx, rx) = mpsc::channel(100);
         let (pty_tx, _) = broadcast::channel(100);
         let pty_tx_clone = pty_tx.clone();
 
-        std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut buffer = Vec::new();
-            let mut buf = [0u8; 4096];
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut reader = reader;
+                let mut buffer = Vec::new();
+                let mut buf = [0u8; 4096];
 
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = buf[0..n].to_vec();
-                        let _ = pty_tx_clone.send(data.clone());
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let data = buf[0..n].to_vec();
+                            let _ = pty_tx_clone.send(data.clone());
 
-                        buffer.extend_from_slice(&data);
-                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                            let line_bytes: Vec<u8> = buffer.drain(0..=pos).collect();
-                            let line_len = line_bytes.len();
-                            let line_content = if line_len > 0 && line_bytes[line_len - 1] == b'\n'
-                            {
-                                &line_bytes[..line_len - 1]
-                            } else {
-                                &line_bytes[..]
-                            };
+                            buffer.extend_from_slice(&data);
+                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                                let line_bytes: Vec<u8> = buffer.drain(0..=pos).collect();
+                                let line_len = line_bytes.len();
+                                let line_content =
+                                    if line_len > 0 && line_bytes[line_len - 1] == b'\n' {
+                                        &line_bytes[..line_len - 1]
+                                    } else {
+                                        &line_bytes[..]
+                                    };
 
-                            let line = String::from_utf8_lossy(line_content).to_string();
+                                let line = String::from_utf8_lossy(line_content).to_string();
 
-                            let timestamp = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let timestamp = i64::try_from(timestamp).unwrap_or(i64::MAX);
+                                let timestamp = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let timestamp = i64::try_from(timestamp).unwrap_or(i64::MAX);
 
-                            let entry = LogEntry {
-                                timestamp,
-                                service: service_name.clone(),
-                                stream: LogStream::Stdout,
-                                message: line,
-                            };
-                            if tx.blocking_send(entry).is_err() {
-                                return;
+                                let entry = LogEntry {
+                                    timestamp,
+                                    service: service_name.clone(),
+                                    stream: LogStream::Stdout,
+                                    message: line,
+                                };
+                                if tx.blocking_send(entry).is_err() {
+                                    return;
+                                }
                             }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-        });
-        (rx, pty_tx)
+            })
+            .context("Failed to start PTY log reader")?;
+        Ok((rx, pty_tx))
     }
 
     fn spawn_bundle_process(name: String, bundle_dir: &Path) -> Result<ProcessHandle> {
@@ -128,20 +398,26 @@ impl ProcessRuntime {
         cmd.arg("--id");
         cmd.arg(&container_id);
 
+        // Finish every fallible PTY setup step before spawning. Once the OS
+        // child exists, the returned handle can move directly into controller
+        // ownership without another error path that could strand it.
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .context("Failed to clone PTY reader")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("Failed to take PTY writer")?;
+        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name)?;
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn process")?;
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("Failed to clone PTY reader")?;
-
-        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name);
         let master = pair.master;
 
-        Ok((child, master, container_id, rx, pty_tx))
+        Ok((child, master, writer, container_id, rx, pty_tx))
     }
 
     pub fn start_host_process(
@@ -174,23 +450,28 @@ impl ProcessRuntime {
             self.notify_socket_path.display().to_string(),
         );
 
+        // Prepare all fallible PTY I/O before the process exists. The caller
+        // can therefore adopt every successfully spawned child atomically.
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .context("Failed to clone PTY reader")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("Failed to take PTY writer")?;
+        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name)?;
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn process")?;
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("Failed to clone PTY reader")?;
-
-        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name);
         let master = pair.master;
 
         // Generate a pseudo-container ID for tracking
         let container_id = format!("host-{}", uuid::Uuid::new_v4());
 
-        Ok((child, master, container_id, rx, pty_tx))
+        Ok((child, master, writer, container_id, rx, pty_tx))
     }
 
     #[allow(clippy::too_many_arguments)]

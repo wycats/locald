@@ -8,7 +8,7 @@ use locald_core::ipc::{LogEntry, LogStream, ServiceMetrics};
 use locald_core::service::{
     RuntimeState, ServiceCommand, ServiceContext, ServiceController, ServiceFactory,
 };
-use locald_core::state::{HealthStatus, ServiceState};
+use locald_core::state::{HealthStatus, PersistedProcessIdentity, ServiceState};
 use nix::sys::signal::Signal;
 use portable_pty::{Child, MasterPty, PtySize};
 use std::fmt;
@@ -29,6 +29,8 @@ pub struct ExecController {
     pty_master: Option<StdMutex<Box<dyn MasterPty + Send>>>,
     pty_writer: Option<StdMutex<Box<dyn std::io::Write + Send>>>,
     container_id: Option<String>,
+    owned_process_id: Option<u32>,
+    process_identity: Option<PersistedProcessIdentity>,
     cgroup_path: Option<String>,
     port: Option<u16>,
     log_tx: broadcast::Sender<LogEntry>,
@@ -70,6 +72,8 @@ impl ExecController {
             pty_master: None,
             pty_writer: None,
             container_id: None,
+            owned_process_id: None,
+            process_identity: None,
             cgroup_path: None,
             port,
             log_tx,
@@ -82,6 +86,28 @@ impl ExecController {
 
     fn resolve_env(&self) -> std::collections::HashMap<String, String> {
         self.env.clone()
+    }
+
+    async fn wait_for_owned_cleanup(
+        &self,
+        child: &mut Option<Box<dyn Child + Send>>,
+        pid: u32,
+        identity: &PersistedProcessIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(child) = child.as_mut() {
+                let _ = child.try_wait();
+            }
+            if !self.runtime.owned_process_or_group_exists(pid, identity)? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -174,7 +200,7 @@ impl ServiceController for ExecController {
     }
 
     async fn start(&mut self) -> Result<()> {
-        let (child, master, container_id, mut log_rx, pty_tx) =
+        let (child, master, writer, container_id, mut log_rx, pty_tx) =
             if let Some(bundle_dir) = &self.bundle_dir {
                 self.runtime
                     .start_container_process(self.id.clone(), bundle_dir)?
@@ -209,12 +235,28 @@ impl ServiceController for ExecController {
                 )?
             };
 
-        let writer = master.take_writer()?;
+        // Capture the ownership fingerprint before the child is ever polled or
+        // reaped. Even if it exited immediately, the OS cannot reuse its PID
+        // while this child handle still owns the unreaped process record.
+        let owned_process_id = child.process_id();
+        let process_identity =
+            owned_process_id.and_then(|pid| match self.runtime.capture_process_identity(pid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    warn!(
+                        "Failed to capture process identity for service {} PID {pid}: {error:#}",
+                        self.id
+                    );
+                    None
+                }
+            });
 
         self.child = Some(StdMutex::new(child));
         self.pty_master = Some(StdMutex::new(master));
         self.pty_writer = Some(StdMutex::new(writer));
         self.container_id = Some(container_id);
+        self.owned_process_id = owned_process_id;
+        self.process_identity = process_identity;
         self.pty_tx = Some(pty_tx);
 
         // Spawn log forwarder
@@ -232,23 +274,89 @@ impl ServiceController for ExecController {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        if let Some(child_mutex) = self.child.take() {
-            if let Ok(mut child) = child_mutex.into_inner() {
-                let signal = self.config.common().stop_signal.as_deref().map_or(
-                    Signal::SIGTERM,
-                    |s| match s.to_uppercase().as_str() {
-                        "SIGINT" | "INT" => Signal::SIGINT,
-                        "SIGQUIT" | "QUIT" => Signal::SIGQUIT,
-                        "SIGKILL" | "KILL" => Signal::SIGKILL,
-                        _ => Signal::SIGTERM,
-                    },
-                );
+        let signal =
+            self.config
+                .common()
+                .stop_signal
+                .as_deref()
+                .map_or(Signal::SIGTERM, |s| match s.to_uppercase().as_str() {
+                    "SIGINT" | "INT" => Signal::SIGINT,
+                    "SIGQUIT" | "QUIT" => Signal::SIGQUIT,
+                    "SIGKILL" | "KILL" => Signal::SIGKILL,
+                    _ => Signal::SIGTERM,
+                });
+        let mut child = self.child.take().map(|child_mutex| {
+            child_mutex
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
 
-                crate::runtime::process::ProcessRuntime::terminate_process(
-                    &mut child, &self.id, signal,
-                )
-                .await;
+        let cleanup_result: Result<()> = async {
+            match (self.owned_process_id, self.process_identity.clone()) {
+                (Some(pid), Some(identity)) => {
+                    self.runtime.signal_owned_process(pid, &identity, signal)?;
+                    let exited = self
+                        .wait_for_owned_cleanup(
+                            &mut child,
+                            pid,
+                            &identity,
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await?;
+                    if !exited {
+                        warn!(
+                            "Service {} did not fully exit after {signal:?}; sending SIGKILL",
+                            self.id
+                        );
+                        self.runtime
+                            .signal_owned_process(pid, &identity, Signal::SIGKILL)?;
+                        anyhow::ensure!(
+                            self.wait_for_owned_cleanup(
+                                &mut child,
+                                pid,
+                                &identity,
+                                std::time::Duration::from_secs(2),
+                            )
+                            .await?,
+                            "owned process or process group for service {} remained live after SIGKILL",
+                            self.id
+                        );
+                    }
+                }
+                (Some(pid), None) => {
+                    if let Some(child) = child.as_mut() {
+                        crate::runtime::process::ProcessRuntime::terminate_process(
+                            child, &self.id, signal,
+                        )
+                        .await;
+                    }
+                    anyhow::ensure!(
+                        !self.runtime.unverified_stale_process_exists(pid)?,
+                        "service {} still has a live process or process group, but locald could not capture an ownership identity; stop it manually",
+                        self.id
+                    );
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!(
+                        "service {} retained a process identity without its owned process ID",
+                        self.id
+                    );
+                }
+                (None, None) => {
+                    if let Some(child) = child.as_mut() {
+                        crate::runtime::process::ProcessRuntime::terminate_process(
+                            child, &self.id, signal,
+                        )
+                        .await;
+                    }
+                }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = cleanup_result {
+            self.child = child.map(StdMutex::new);
+            return Err(error);
         }
 
         // Phase 99: after graceful termination, ensure no leaked subprocesses remain by
@@ -299,6 +407,8 @@ impl ServiceController for ExecController {
         self.pty_master = None;
         self.pty_writer = None;
         self.container_id = None;
+        self.owned_process_id = None;
+        self.process_identity = None;
 
         Ok(())
     }
@@ -328,7 +438,8 @@ impl ServiceController for ExecController {
         let (is_running, pid) = self.child.as_ref().map_or((false, None), |child_mutex| {
             child_mutex.lock().map_or((false, None), |mut child| {
                 let running = matches!(child.try_wait(), Ok(None));
-                (running, child.process_id())
+                let pid = running.then(|| child.process_id()).flatten();
+                (running, pid)
             })
         });
 
@@ -346,6 +457,14 @@ impl ServiceController for ExecController {
                 HealthStatus::Unknown
             }, // Simplified
         }
+    }
+
+    fn owned_process_id(&self) -> Option<u32> {
+        self.owned_process_id
+    }
+
+    fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+        self.process_identity.clone()
     }
 
     async fn logs(&self) -> BoxStream<'static, LogEntry> {
@@ -457,5 +576,103 @@ impl ServiceFactory for ExecFactory {
             ctx.port,
             ctx.env.clone(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locald_core::config::WorkerServiceConfig;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn exited_child_never_reports_a_reusable_pid_or_loses_its_spawn_identity() {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let mut controller = ExecController::new(
+            "identity:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "sleep 0.1".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        controller.start().await.expect("start short-lived child");
+        let spawn_pid = controller
+            .owned_process_id()
+            .expect("capture cleanup PID before the child can be reaped");
+        let spawn_identity = controller
+            .process_identity()
+            .expect("capture identity before the child can be reaped");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let stopped = loop {
+            let state = controller.read_state().await;
+            if state.status == ServiceState::Stopped {
+                break state;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "short-lived child did not exit before the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(stopped.status, ServiceState::Stopped);
+        assert_eq!(stopped.pid, None);
+        assert_eq!(controller.owned_process_id(), Some(spawn_pid));
+        assert_eq!(controller.process_identity(), Some(spawn_identity));
+
+        controller.stop().await.expect("release stopped child");
+        assert_eq!(controller.owned_process_id(), None);
+        assert_eq!(controller.process_identity(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_retains_the_child_handle_and_ownership_for_retry() {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let mut controller = ExecController::new(
+            "retry-cleanup:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "sleep 30".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        controller.start().await.expect("start owned child");
+        let spawn_pid = controller
+            .owned_process_id()
+            .expect("capture owned process ID");
+        let spawn_identity = controller
+            .process_identity()
+            .expect("capture owned process identity");
+        controller
+            .process_identity
+            .as_mut()
+            .expect("retain owned identity")
+            .start_time = spawn_identity.start_time.saturating_add(1);
+
+        let error = controller
+            .stop()
+            .await
+            .expect_err("mismatched ownership fails closed");
+        assert!(format!("{error:#}").contains("was reused"));
+        assert!(controller.child.is_some());
+        assert_eq!(controller.owned_process_id(), Some(spawn_pid));
+        assert!(controller.process_identity().is_some());
+
+        controller.process_identity = Some(spawn_identity);
+        controller
+            .stop()
+            .await
+            .expect("retry reaps the retained child");
+        assert!(controller.child.is_none());
+        assert_eq!(controller.owned_process_id(), None);
+        assert_eq!(controller.process_identity(), None);
     }
 }

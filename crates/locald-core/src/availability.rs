@@ -483,6 +483,19 @@ impl ProjectAvailability {
                 .is_some_and(|deadline| deadline > now)
     }
 
+    fn convergence_decision_at(&self, now: SystemTime) -> ConvergenceDecision {
+        if self.desired_up_at(now) {
+            return ConvergenceDecision::EnsureUp;
+        }
+        if !self.is_paused()
+            && let Some(deadline) = self.shutdown_cooldown_until
+            && deadline > now
+        {
+            return ConvergenceDecision::PreserveRuntimeUntil { deadline };
+        }
+        ConvergenceDecision::EnsureDown
+    }
+
     fn ensure_demand(
         &mut self,
         key: DemandKey,
@@ -752,6 +765,24 @@ pub enum RenewDemandResult {
     Expired,
 }
 
+/// The authoritative runtime action derived from one availability snapshot.
+///
+/// A cooldown preserves the runtime disposition that already exists: it keeps
+/// a running project alive until the deadline, but never authorizes starting
+/// or restoring a stopped project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceDecision {
+    /// Demand or Always On policy requires the project to be running.
+    EnsureUp,
+    /// Keep the current runtime disposition until the cooldown deadline.
+    PreserveRuntimeUntil {
+        /// The absolute wall-clock deadline for the next convergence pass.
+        deadline: SystemTime,
+    },
+    /// The project should be stopped, including while explicitly paused.
+    EnsureDown,
+}
+
 /// A load, transition, or persistence failure in authoritative availability state.
 #[derive(Debug, Error)]
 pub enum AvailabilityError {
@@ -883,6 +914,21 @@ impl<C: Clock> AvailabilityStore<C> {
         self.mutate(|candidate, now| {
             let expired = candidate.expire_demands(now)?;
             Ok((expired, expired > 0))
+        })
+        .await
+    }
+
+    /// Expire due demands and derive one authoritative convergence decision.
+    ///
+    /// Expiry, cooldown arming, and decision derivation share one clock reading
+    /// and one serialized mutation. Daemon convergence should use this method
+    /// instead of composing the observational [`Self::desired_up`] and
+    /// [`Self::shutdown_deferred`] queries.
+    pub async fn sweep_and_decide(&mut self) -> Result<ConvergenceDecision, AvailabilityError> {
+        self.mutate(|candidate, now| {
+            let expired = candidate.expire_demands(now)?;
+            let decision = candidate.convergence_decision_at(now);
+            Ok((decision, expired > 0))
         })
         .await
     }
@@ -1743,6 +1789,136 @@ mod tests {
                 .shutdown_deferred()
                 .await
                 .expect("derive elapsed shutdown deferral")
+        );
+    }
+
+    #[tokio::test]
+    async fn convergence_sweep_arms_cooldown_at_the_exact_lease_boundary() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(30);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let demand_expires_at = clock.time() + VSCODE_DEMAND_TTL;
+
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL);
+
+        assert_eq!(
+            store.sweep_and_decide().await.expect("sweep exact expiry"),
+            ConvergenceDecision::PreserveRuntimeUntil {
+                deadline: demand_expires_at + SHUTDOWN_COOLDOWN,
+            }
+        );
+        let snapshot = store.snapshot().await.expect("reload swept availability");
+        assert!(snapshot.demands().is_empty());
+        assert_eq!(
+            snapshot.shutdown_cooldown_until(),
+            Some(demand_expires_at + SHUTDOWN_COOLDOWN)
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert_eq!(
+            reopened
+                .sweep_and_decide()
+                .await
+                .expect("repeat authoritative decision"),
+            ConvergenceDecision::PreserveRuntimeUntil {
+                deadline: demand_expires_at + SHUTDOWN_COOLDOWN,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn late_convergence_sweep_does_not_create_a_fresh_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(31), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let demand_expires_at = clock.time() + VSCODE_DEMAND_TTL;
+
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL + SHUTDOWN_COOLDOWN + Duration::from_secs(1));
+
+        assert_eq!(
+            store
+                .sweep_and_decide()
+                .await
+                .expect("sweep after cooldown"),
+            ConvergenceDecision::EnsureDown
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .await
+                .expect("reload late sweep")
+                .shutdown_cooldown_until(),
+            Some(demand_expires_at + SHUTDOWN_COOLDOWN)
+        );
+    }
+
+    #[tokio::test]
+    async fn always_on_and_pause_produce_authoritative_convergence_decisions() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(32), clock).await;
+
+        store.set_always_on(true).await.expect("enable Always On");
+        assert_eq!(
+            store
+                .sweep_and_decide()
+                .await
+                .expect("derive Always On decision"),
+            ConvergenceDecision::EnsureUp
+        );
+
+        store.pause_project().await.expect("pause project");
+        assert_eq!(
+            store
+                .sweep_and_decide()
+                .await
+                .expect("derive paused decision"),
+            ConvergenceDecision::EnsureDown
+        );
+
+        store
+            .set_always_on(true)
+            .await
+            .expect("renew Always On to resume");
+        assert_eq!(
+            store
+                .sweep_and_decide()
+                .await
+                .expect("derive resumed decision"),
+            ConvergenceDecision::EnsureUp
+        );
+    }
+
+    #[tokio::test]
+    async fn convergence_sweep_reloads_newer_authoritative_demand() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(33);
+        let mut observer = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut writer = fake_store(&fixture, project_instance_id, clock).await;
+
+        writer
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("acquire demand through newer writer");
+
+        assert_eq!(
+            observer
+                .sweep_and_decide()
+                .await
+                .expect("derive from reloaded authority"),
+            ConvergenceDecision::EnsureUp
         );
     }
 

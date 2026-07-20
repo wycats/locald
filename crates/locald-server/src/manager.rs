@@ -19,18 +19,21 @@ use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
 use locald_core::service::{ServiceContext, ServiceController, ServiceFactory};
 use locald_core::state::{
-    HealthSource, HealthStatus, PersistedServiceState, ServerState, ServiceState,
+    HealthSource, HealthStatus, PersistedProcessIdentity, PersistedServiceState, ServerState,
+    ServiceState,
 };
 use locald_core::{
-    CatalogError, DomainClaim, DomainName, DomainTarget, ProjectInstanceId, SharedDomainIndex,
-    sanitize_project_name_for_dns, sanitize_service_name_for_dns,
+    AvailabilityError, AvailabilityStore, CatalogError, CatalogPresence, ConvergenceDecision,
+    DemandKey, DomainClaim, DomainName, DomainTarget, EnsureDemandResult, ProjectInstanceId,
+    SharedDomainIndex, availability_path, sanitize_project_name_for_dns,
+    sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
@@ -73,6 +76,26 @@ struct InstanceLogBuffer {
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("Service not found")]
 pub struct ServiceNotFoundError;
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("project instance {instance_id} startup was superseded by {decision:?}")]
+struct AvailabilityStartSuperseded {
+    instance_id: ProjectInstanceId,
+    decision: ConvergenceDecision,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("locald is shutting down")]
+struct DaemonShuttingDown;
+
+#[derive(Clone, Debug, thiserror::Error)]
+#[error(
+    "service `{name}` belongs to project instance {instance_id}, whose legacy runtime restore is pending; wait for restoration and retry"
+)]
+struct ServiceRestorePending {
+    name: String,
+    instance_id: ProjectInstanceId,
+}
 
 #[async_trait::async_trait]
 pub trait HostSyncer: Send + Sync + 'static {
@@ -220,6 +243,31 @@ struct ServiceProjectionToken {
     has_controller: bool,
 }
 
+#[derive(Debug)]
+struct AvailabilityCoordinator {
+    runtime: Mutex<()>,
+}
+
+impl AvailabilityCoordinator {
+    fn new() -> Self {
+        Self {
+            runtime: Mutex::new(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AvailabilityConvergenceOptions {
+    verbose: bool,
+    apply_config_when_up: bool,
+    defer_config_reload_during_cooldown: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeRestorePlan {
+    legacy_instances: HashSet<ProjectInstanceId>,
+}
+
 impl ServiceProjectionToken {
     fn matches(self, service: &Service) -> bool {
         self.instance_id == service.instance_id
@@ -258,14 +306,23 @@ pub struct ProcessManager {
     registry: Arc<Mutex<Registry>>,
     domain_index: SharedDomainIndex,
     attachments: Arc<Mutex<AttachmentStore>>,
+    attachment_transition_lock: Arc<Mutex<()>>,
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
     hosts_sync_guard: ConcurrencyGuard,
     host_syncer: Arc<dyn HostSyncer>,
     port_allocator: PortAllocator,
     config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    availability_coordinators: Arc<Mutex<HashMap<ProjectInstanceId, Arc<AvailabilityCoordinator>>>>,
+    availability_publication_lock: Arc<Mutex<()>>,
+    pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
+    forgotten_reload_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    legacy_restore_evidence: Arc<Mutex<HashMap<ProjectInstanceId, Vec<PersistedServiceState>>>>,
+    availability_data_dir: PathBuf,
     runtime_projection_lock: Arc<Mutex<()>>,
+    state_persistence_lock: Arc<Mutex<()>>,
     next_controller_generation: Arc<AtomicU64>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl ProcessManager {
@@ -273,6 +330,18 @@ impl ProcessManager {
         ProjectDirs::from("com", "locald", "locald")
             .map(|d| d.data_dir().join("postgres").join(name))
             .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(name))
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(AtomicOrdering::Acquire)
+    }
+
+    fn ensure_accepting_lifecycle_requests(&self) -> Result<()> {
+        if self.is_shutting_down() {
+            Err(DaemonShuttingDown.into())
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn get_service_controller(
@@ -301,6 +370,24 @@ impl ProcessManager {
         registry: Arc<Mutex<Registry>>,
         attachments: Arc<Mutex<AttachmentStore>>,
         external_log_sender: Option<broadcast::Sender<LogEntry>>,
+    ) -> Result<Self> {
+        Self::new_with_availability_data_dir(
+            notify_socket_path,
+            state_manager,
+            registry,
+            attachments,
+            external_log_sender,
+            locald_core::storage::data_dir(),
+        )
+    }
+
+    fn new_with_availability_data_dir(
+        notify_socket_path: PathBuf,
+        state_manager: Arc<StateManager>,
+        registry: Arc<Mutex<Registry>>,
+        attachments: Arc<Mutex<AttachmentStore>>,
+        external_log_sender: Option<broadcast::Sender<LogEntry>>,
+        availability_data_dir: PathBuf,
     ) -> Result<Self> {
         let (tx, _) = if let Some(tx) = external_log_sender {
             (tx, broadcast::channel(1).1) // Dummy receiver
@@ -348,14 +435,23 @@ impl ProcessManager {
             registry,
             domain_index,
             attachments,
+            attachment_transition_lock: Arc::new(Mutex::new(())),
             health_monitor,
             factories,
             hosts_sync_guard: ConcurrencyGuard::new(),
             host_syncer: Arc::new(DefaultHostSyncer),
             port_allocator: PortAllocator::new(),
             config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
+            availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
+            availability_publication_lock: Arc::new(Mutex::new(())),
+            pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
+            forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
+            legacy_restore_evidence: Arc::new(Mutex::new(HashMap::new())),
+            availability_data_dir,
             runtime_projection_lock: Arc::new(Mutex::new(())),
+            state_persistence_lock: Arc::new(Mutex::new(())),
             next_controller_generation: Arc::new(AtomicU64::new(1)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -584,7 +680,6 @@ impl ProcessManager {
 
     async fn prepublication_stop_plan(
         &self,
-        path: &Path,
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
         dot_env_vars: &HashMap<String, String>,
@@ -596,7 +691,8 @@ impl ProcessManager {
             services
                 .iter()
                 .filter(|(name, service)| {
-                    service.path == path && !desired_service_names.contains(name.as_str())
+                    service.instance_id == instance_id
+                        && !desired_service_names.contains(name.as_str())
                 })
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>()
@@ -845,13 +941,15 @@ impl ProcessManager {
         all_logs
     }
 
-    async fn persist_state(&self) {
+    async fn persist_state_checked(&self) -> Result<()> {
+        let _persistence_guard = self.state_persistence_lock.lock().await;
         let mut services_data = Vec::new();
         {
             let services = self.services.lock().await;
             for (name, service) in services.iter() {
                 services_data.push((
                     name.clone(),
+                    service.instance_id,
                     service.config.clone(),
                     service.path.clone(),
                     service.health_status,
@@ -862,81 +960,395 @@ impl ProcessManager {
         }
 
         let mut service_states = Vec::new();
-        for (name, config, path, health_status, health_source, runtime) in services_data {
-            let (pid, port, status, container_id) = match runtime {
+        for (name, instance_id, config, path, health_status, health_source, runtime) in
+            services_data
+        {
+            let (pid, process_identity, port, status, container_id) = match runtime {
                 ServiceRuntime::Controller(c) => {
                     let guard = c.lock().await;
                     let state = guard.read_state().await;
                     let container_id = guard.get_metadata("container_id");
-                    (state.pid, state.port, state.status, container_id)
+                    let pid = guard.owned_process_id().or_else(|| {
+                        (state.status == ServiceState::Running)
+                            .then_some(state.pid)
+                            .flatten()
+                    });
+                    let process_identity = pid.and_then(|_| guard.process_identity());
+                    (
+                        pid,
+                        process_identity,
+                        state.port,
+                        state.status,
+                        container_id,
+                    )
                 }
-                ServiceRuntime::None => {
-                    (None, None, locald_core::state::ServiceState::Stopped, None)
-                }
+                ServiceRuntime::None => (
+                    None,
+                    None,
+                    None,
+                    locald_core::state::ServiceState::Stopped,
+                    None,
+                ),
             };
 
-            service_states.push(PersistedServiceState {
-                name,
-                config,
-                path,
-                pid,
-                container_id,
-                port,
-                status,
-                health_status,
-                health_source,
-            });
+            service_states.push((
+                instance_id,
+                PersistedServiceState {
+                    name,
+                    config,
+                    path,
+                    pid,
+                    process_identity,
+                    container_id,
+                    port,
+                    status,
+                    health_status,
+                    health_source,
+                },
+            ));
+        }
+
+        // While the compatibility restore bridge is active, every global
+        // snapshot retains not-yet-restored legacy Running evidence. This
+        // prevents a successful or partial start of one project from erasing
+        // the retry intent for another before a.2.3 migrates it.
+        let legacy_evidence = self.legacy_restore_evidence.lock().await.clone();
+        for (instance_id, evidence) in legacy_evidence {
+            for pending in evidence {
+                match service_states
+                    .iter_mut()
+                    .find(|(current_instance, current)| {
+                        *current_instance == instance_id && current.name == pending.name
+                    }) {
+                    Some((_, current))
+                        if current.pid.is_some()
+                            || current.container_id.is_some()
+                            || current.status == ServiceState::Running => {}
+                    Some((_, current)) => *current = pending,
+                    None => service_states.push((instance_id, pending)),
+                }
+            }
         }
 
         let state = ServerState {
-            services: service_states,
+            services: service_states
+                .into_iter()
+                .map(|(_, service)| service)
+                .collect(),
         };
 
-        if let Err(e) = self.state_manager.save(&state).await {
-            error!("Failed to persist state: {e}");
+        self.state_manager.save(&state).await
+    }
+
+    async fn persist_state(&self) {
+        if let Err(error) = self.persist_state_checked().await {
+            error!("Failed to persist state: {error}");
         }
     }
 
-    pub async fn restore(&self) -> Result<()> {
-        let Ok(state) = self.state_manager.load().await else {
-            return Ok(()); // No state to restore
-        };
+    /// Reconcile process evidence left by the previous daemon before lifecycle
+    /// IPC can launch anything new. Cleanup is bounded across all recorded
+    /// processes, and handles are cleared only after the OS confirms that both
+    /// the recorded process and process group are gone.
+    pub(crate) async fn reconcile_stale_runtime_state(&self) -> Result<RuntimeRestorePlan> {
+        let _persistence_guard = self.state_persistence_lock.lock().await;
+        let mut state = self.state_manager.load().await?;
+        info!(
+            "Reconciling stale runtime state: found {} services",
+            state.services.len()
+        );
 
-        info!("Restoring state: found {} services", state.services.len());
+        let mut recorded_processes = HashMap::<u32, Option<PersistedProcessIdentity>>::new();
+        for service in &state.services {
+            let Some(pid) = service.pid else {
+                continue;
+            };
+            recorded_processes
+                .entry(pid)
+                .and_modify(|identity| {
+                    if *identity != service.process_identity {
+                        *identity = None;
+                    }
+                })
+                .or_insert_with(|| service.process_identity.clone());
+        }
+        let mut pending = HashMap::new();
+        let mut confirmed_gone = HashSet::new();
+        let mut failures = HashMap::<u32, String>::new();
 
-        // Cleanup old processes and containers
-        for service_state in &state.services {
-            if let Some(pid) = service_state.pid {
-                if let Err(e) = self.runtime.process.kill_pid(pid as i32, Signal::SIGTERM) {
-                    warn!("Cleanup warning (kill_pid): {:#}", e);
+        for (pid, identity) in recorded_processes {
+            let Some(identity) = identity else {
+                match self.runtime.process.unverified_stale_process_exists(pid) {
+                    Ok(false) => {
+                        confirmed_gone.insert(pid);
+                    }
+                    Ok(true) => {
+                        failures.insert(
+                            pid,
+                            "live process has no verified ownership identity; stop it manually"
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        failures
+                            .insert(pid, format!("unverified liveness check failed: {error:#}"));
+                    }
+                }
+                continue;
+            };
+
+            match self.runtime.process.verify_stale_process(pid, &identity) {
+                Ok(None) => {
+                    confirmed_gone.insert(pid);
+                }
+                Ok(Some(process)) => {
+                    match self
+                        .runtime
+                        .process
+                        .signal_verified_stale_process(&process, Signal::SIGTERM)
+                    {
+                        Ok(()) => {
+                            pending.insert(pid, process);
+                        }
+                        Err(error) => {
+                            failures.insert(pid, format!("verified SIGTERM failed: {error:#}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures.insert(pid, format!("ownership verification failed: {error:#}"));
                 }
             }
-            if let Some(container_id) = &service_state.container_id {
-                if let Err(e) = self.runtime.process.stop_shim_container(container_id) {
-                    warn!("Cleanup warning (stop_shim_container): {:#}", e);
+        }
+
+        let term_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pending.is_empty() && tokio::time::Instant::now() < term_deadline {
+            let candidates = pending
+                .iter()
+                .map(|(pid, process)| (*pid, process.clone()))
+                .collect::<Vec<_>>();
+            for (pid, process) in candidates {
+                match self.runtime.process.verified_stale_process_exists(&process) {
+                    Ok(false) => {
+                        pending.remove(&pid);
+                        confirmed_gone.insert(pid);
+                    }
+                    Ok(true) => {}
+                    Err(error) => {
+                        pending.remove(&pid);
+                        failures.insert(pid, format!("liveness check failed: {error:#}"));
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        let mut kill_failures = Vec::new();
+        for (pid, process) in &pending {
+            if let Err(error) = self
+                .runtime
+                .process
+                .signal_verified_stale_process(process, Signal::SIGKILL)
+            {
+                kill_failures.push((*pid, error));
+            }
+        }
+        for (pid, error) in kill_failures {
+            pending.remove(&pid);
+            failures.insert(pid, format!("SIGKILL failed: {error:#}"));
+        }
+
+        let kill_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !pending.is_empty() && tokio::time::Instant::now() < kill_deadline {
+            let candidates = pending
+                .iter()
+                .map(|(pid, process)| (*pid, process.clone()))
+                .collect::<Vec<_>>();
+            for (pid, process) in candidates {
+                match self.runtime.process.verified_stale_process_exists(&process) {
+                    Ok(false) => {
+                        pending.remove(&pid);
+                        confirmed_gone.insert(pid);
+                    }
+                    Ok(true) => {}
+                    Err(error) => {
+                        pending.remove(&pid);
+                        failures.insert(pid, format!("liveness check failed: {error:#}"));
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        for pid in pending.into_keys() {
+            failures.insert(
+                pid,
+                "process or process group remained live after SIGKILL".to_owned(),
+            );
+        }
+        let mut unresolved_containers = Vec::new();
+        for service in &mut state.services {
+            match service.pid {
+                Some(pid) if confirmed_gone.contains(&pid) => {
+                    service.pid = None;
+                    service.process_identity = None;
+                    // The shim owns its container as a foreground child, so a
+                    // confirmed-dead shim/process group also confirms cleanup.
+                    service.container_id = None;
+                }
+                Some(_) => {}
+                None if service.container_id.is_some() => {
+                    service.process_identity = None;
+                    unresolved_containers.push(service.name.clone());
+                }
+                None => {
+                    service.process_identity = None;
                 }
             }
         }
 
-        // Restart projects
-        let mut paths = HashSet::new();
-        for service_state in state.services {
-            // Only restore if it was running or we want to be aggressive?
-            // For now, let's restore everything that was in the state file as "running"
-            // But wait, the state file has a "status" field.
-            if service_state.status == ServiceState::Running {
-                paths.insert(service_state.path);
-            }
+        // Persist partial progress before returning an error. A later daemon
+        // attempt retries only the handles that could not be confirmed gone.
+        self.state_manager.save(&state).await?;
+
+        if !failures.is_empty() || !unresolved_containers.is_empty() {
+            let mut details = failures
+                .into_iter()
+                .map(|(pid, failure)| format!("PID {pid}: {failure}"))
+                .collect::<Vec<_>>();
+            details.extend(unresolved_containers.into_iter().map(|service| {
+                format!("service `{service}` has container evidence without a confirmable PID")
+            }));
+            details.sort();
+            anyhow::bail!(
+                "stale locald runtime cleanup is incomplete; stop the recorded processes manually and restart locald. Preserved evidence: {}",
+                details.join("; ")
+            );
         }
 
-        for path in paths {
-            info!("Restoring project at {path:?}");
-            if let Err(e) = self.start(path.clone(), None, false).await {
-                error!("Failed to restore project at {path:?}: {e}");
+        // Availability migration lands in the next productization task. Until
+        // then, preserve the old restart promise only for identities that are
+        // still active in the catalog. A path/status record alone can never
+        // recreate a forgotten project.
+        let registry = self.registry.lock().await;
+        let mut legacy_evidence = HashMap::<ProjectInstanceId, Vec<PersistedServiceState>>::new();
+        for service in state
+            .services
+            .iter()
+            .filter(|service| service.status == ServiceState::Running)
+        {
+            if let Some(instance_id) =
+                Self::active_catalog_instance_for_path(&registry, &service.path)
+            {
+                legacy_evidence
+                    .entry(instance_id)
+                    .or_default()
+                    .push(service.clone());
             }
         }
+        let legacy_instances = legacy_evidence.keys().copied().collect();
+        drop(registry);
+        *self.legacy_restore_evidence.lock().await = legacy_evidence;
+        Ok(RuntimeRestorePlan { legacy_instances })
+    }
 
-        Ok(())
+    fn active_catalog_instance_for_path(
+        registry: &Registry,
+        path: &Path,
+    ) -> Option<ProjectInstanceId> {
+        let path = Self::canonicalize_path(path);
+        let mut candidates = registry
+            .instances
+            .iter()
+            .filter_map(|(instance_id, record)| {
+                (record.current_path.as_deref() == Some(path.as_path())
+                    || record.last_known_path == path)
+                    .then_some(*instance_id)
+            })
+            .collect::<HashSet<_>>();
+        if let Some(instance_id) = registry.legacy_paths.get(&path).copied() {
+            candidates.insert(instance_id);
+        }
+        let instance_id = (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()?;
+        registry.instances.get(&instance_id).and_then(|record| {
+            (record.presence == CatalogPresence::Active && record.current_path.is_some())
+                .then_some(instance_id)
+        })
+    }
+
+    /// Restore daemon-owned availability first, then the catalog-gated legacy
+    /// restart promise that remains until availability migration is complete.
+    /// The whole phase runs after IPC is online.
+    pub(crate) async fn restore_policy_owned_projects(&self, plan: RuntimeRestorePlan) {
+        if self.is_shutting_down() {
+            return;
+        }
+        self.converge_all_project_availability().await;
+
+        for instance_id in plan.legacy_instances {
+            if self.is_shutting_down() {
+                break;
+            }
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            if self.is_shutting_down() {
+                break;
+            }
+            if !self
+                .legacy_restore_evidence
+                .lock()
+                .await
+                .contains_key(&instance_id)
+            {
+                continue;
+            }
+            match self.availability_is_managed(instance_id).await {
+                Ok(true) => {
+                    self.legacy_restore_evidence
+                        .lock()
+                        .await
+                        .remove(&instance_id);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        "Failed to inspect legacy restoration policy for {instance_id}: {error:#}"
+                    );
+                    continue;
+                }
+            }
+            let Some(path) = self.active_path_for_instance(instance_id).await else {
+                continue;
+            };
+            info!("Restoring catalogued legacy project instance {instance_id} at {path:?}");
+            if self.forgotten_reload_paths.lock().await.contains(&path) {
+                continue;
+            }
+            if let Err(error) = self
+                .apply_config_for_instance(path.clone(), None, false, Some(instance_id), true)
+                .await
+            {
+                warn!("Failed to restore legacy project instance {instance_id}: {error:#}");
+                continue;
+            }
+            self.watch_active_instance(instance_id).await;
+            self.legacy_restore_evidence
+                .lock()
+                .await
+                .remove(&instance_id);
+        }
+
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        if !self.is_shutting_down() {
+            self.persist_state().await;
+        }
     }
 
     pub async fn handle_notify(&self, pid: u32) {
@@ -959,11 +1371,13 @@ impl ProcessManager {
         }
     }
 
-    async fn wait_for_health(&self, name: &str) -> Result<()> {
+    async fn wait_for_health(&self, name: &str, instance_id: ProjectInstanceId) -> Result<()> {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(30); // TODO: Make configurable
 
         loop {
+            self.availability_allows_inflight_transition(instance_id)
+                .await?;
             if start.elapsed() > timeout {
                 anyhow::bail!("Service {name} timed out waiting for health check");
             }
@@ -1103,11 +1517,54 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
     ) -> Result<()> {
+        self.ensure_accepting_lifecycle_requests()?;
+        let path = Self::canonicalize_path(&path);
+        if let Some((instance_id, _)) = self.availability_instance_for_path(&path).await {
+            return self
+                .start_catalogued_instance(instance_id, path, event_tx, verbose)
+                .await;
+        }
+
+        self.start_runtime(path, event_tx, verbose).await
+    }
+
+    async fn start_runtime(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+    ) -> Result<()> {
+        let (path, transition_lock) = self.transition_lock_for_path(&path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.forgotten_reload_paths.lock().await.remove(&path);
+        // Install the watcher while the same transition still owns tombstone
+        // reactivation. Events during a slow build/readiness wait are queued;
+        // their reload will take this lock after the initial apply finishes.
         self.watch_config(path.clone()).await;
-        self.apply_config(path, event_tx, verbose).await
+        self.apply_config_locked(path, event_tx, verbose, None)
+            .await
+    }
+
+    async fn reload_config(&self, path: PathBuf) -> Result<()> {
+        let path = Self::canonicalize_path(&path);
+        if self.forgotten_reload_paths.lock().await.contains(&path) {
+            return Ok(());
+        }
+        if let Some((instance_id, _)) = self.availability_instance_for_path(&path).await {
+            return self.reload_catalogued_instance(instance_id, path).await;
+        }
+
+        self.apply_config_for_instance(path, None, false, None, true)
+            .await
     }
 
     async fn watch_config(&self, path: PathBuf) {
+        let path = Self::canonicalize_path(&path);
+        if self.forgotten_reload_paths.lock().await.contains(&path) {
+            return;
+        }
         {
             let watchers = self.watchers.lock().await;
             if watchers.contains_key(&path) {
@@ -1140,7 +1597,7 @@ impl ProcessManager {
                         () = timeout => {
                             // Timeout expired, trigger reload
                             info!("Reloading config for {:?}", path_clone);
-                            if let Err(e) = manager.apply_config(path_clone.clone(), None, false).await {
+                            if let Err(e) = manager.reload_config(path_clone.clone()).await {
                                 error!("Failed to reload config: {e}");
                             }
                             break; // Break inner loop, go back to waiting for first event
@@ -1180,6 +1637,9 @@ impl ProcessManager {
                 if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
                     error!("Failed to watch config: {e}");
                 } else {
+                    if self.forgotten_reload_paths.lock().await.contains(&path) {
+                        return;
+                    }
                     let mut watchers = self.watchers.lock().await;
                     watchers.insert(path, watcher);
                 }
@@ -1188,16 +1648,55 @@ impl ProcessManager {
         }
     }
 
+    async fn retire_config_reload_paths(
+        &self,
+        paths: HashSet<PathBuf>,
+        instance_ids: HashSet<ProjectInstanceId>,
+    ) {
+        let paths = paths
+            .into_iter()
+            .map(|path| Self::canonicalize_path(&path))
+            .collect::<HashSet<_>>();
+        self.forgotten_reload_paths
+            .lock()
+            .await
+            .extend(paths.iter().cloned());
+        self.pending_config_reloads
+            .lock()
+            .await
+            .retain(|instance_id| !instance_ids.contains(instance_id));
+        self.watchers
+            .lock()
+            .await
+            .retain(|path, _| !paths.contains(path));
+    }
+
     pub async fn apply_config(
         &self,
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
     ) -> Result<()> {
+        self.apply_config_for_instance(path, event_tx, verbose, None, false)
+            .await
+    }
+
+    async fn apply_config_for_instance(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        expected_instance: Option<ProjectInstanceId>,
+        reject_forgotten: bool,
+    ) -> Result<()> {
         let (path, transition_lock) = self.transition_lock_for_path(&path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
-        self.apply_config_locked(path, event_tx, verbose).await
+        if reject_forgotten && self.forgotten_reload_paths.lock().await.contains(&path) {
+            return Ok(());
+        }
+        self.apply_config_locked(path, event_tx, verbose, expected_instance)
+            .await
     }
 
     async fn apply_config_locked(
@@ -1205,7 +1704,9 @@ impl ProcessManager {
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
+        expected_instance: Option<ProjectInstanceId>,
     ) -> Result<()> {
+        self.ensure_accepting_lifecycle_requests()?;
         // Setup log forwarding if verbose
         let _log_guard = if verbose {
             event_tx.as_ref().map(|tx| {
@@ -1284,6 +1785,16 @@ impl ProcessManager {
             let mut candidate = registry.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            if let Some(expected_instance) = expected_instance {
+                anyhow::ensure!(
+                    registry.instances.contains_key(&expected_instance),
+                    "project instance {expected_instance} is no longer catalogued"
+                );
+                anyhow::ensure!(
+                    instance_id == expected_instance,
+                    "project identity changed while applying config: expected {expected_instance}, discovered {instance_id}"
+                );
+            }
             let claims = Self::build_domain_claims(instance_id, &config, &path)?;
             candidate.replace_domain_claims(instance_id, claims)?;
 
@@ -1296,7 +1807,6 @@ impl ProcessManager {
                 reusable_service_envs,
             } = self
                 .prepublication_stop_plan(
-                    &path,
                     instance_id,
                     &config,
                     &dot_env_vars,
@@ -1304,13 +1814,16 @@ impl ProcessManager {
                     &desired_service_names,
                 )
                 .await?;
+            if expected_instance.is_some() {
+                self.availability_authorizes_start(instance_id).await?;
+            }
             for name in &removed_service_names {
                 info!("Service {name} removed from config, stopping before domain publication...");
-                self.stop_service_locked(name, &path).await?;
+                self.stop_service_instance_locked(name, instance_id).await?;
             }
             for name in &restart_service_names {
                 info!("Service {name} changed, stopping before domain publication...");
-                self.stop_service_locked(name, &path).await?;
+                self.stop_service_instance_locked(name, instance_id).await?;
             }
 
             // `commit_candidate` advances the in-memory catalog at the atomic
@@ -1369,6 +1882,8 @@ impl ProcessManager {
         }
 
         for service_name in sorted_services {
+            self.availability_allows_inflight_transition(instance_id)
+                .await?;
             let service_config = &config.services[&service_name];
             info!(
                 "Service {}:{} config: {:?}",
@@ -1560,6 +2075,9 @@ impl ProcessManager {
                     }
                     self.broadcast_service_update(&name).await;
 
+                    self.availability_allows_inflight_transition(instance_id)
+                        .await?;
+
                     {
                         let mut c = controller.lock().await;
                         c.start().await.context("Failed to start service")?;
@@ -1577,6 +2095,30 @@ impl ProcessManager {
                             service.sticky_port = state.port;
                             service.health_status = state.health_status;
                         }
+                    }
+
+                    // A successful spawn is a crash-recovery boundary. Publish
+                    // its controller-owned process identity before readiness
+                    // can block or a later service can start. If publication
+                    // fails, synchronously stop this controller so locald never
+                    // leaves behind a child that the next daemon cannot own.
+                    if let Err(persistence_error) = self.persist_state_checked().await {
+                        let rollback_result = self
+                            .stop_service_instance_runtime_locked(&name, instance_id)
+                            .await;
+                        self.persist_state().await;
+                        self.broadcast_service_update(&name).await;
+
+                        if let Err(rollback_error) = rollback_result {
+                            anyhow::bail!(
+                                "failed to persist ownership for started service `{name}`: {persistence_error:#}; rollback stop also failed: {rollback_error:#}"
+                            );
+                        }
+                        return Err(persistence_error).with_context(|| {
+                            format!(
+                                "failed to persist ownership for started service `{name}`; the service was stopped"
+                            )
+                        });
                     }
 
                     self.broadcast_service_update(&name).await;
@@ -1603,7 +2145,7 @@ impl ProcessManager {
 
             // Wait for health before starting next service (which might depend on this one)
             info!("Waiting for service {} to be ready...", name);
-            if let Err(e) = self.wait_for_health(&name).await {
+            if let Err(e) = self.wait_for_health(&name, instance_id).await {
                 error!("Dependency failed: {}", e);
                 return Err(e);
             }
@@ -1618,6 +2160,10 @@ impl ProcessManager {
             }
         }
 
+        self.legacy_restore_evidence
+            .lock()
+            .await
+            .remove(&instance_id);
         self.persist_state().await;
         Ok(())
     }
@@ -1635,21 +2181,86 @@ impl ProcessManager {
     /// Returns an error if the service state cannot be persisted, though
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
-        let Some((path, _transition_guard, _runtime_projection_guard)) =
-            self.lock_service_runtime_transition(name).await
-        else {
-            return Ok(());
-        };
-        self.stop_service_locked(name, &path).await
+        loop {
+            if let Some((path, _transition_guard, _runtime_projection_guard)) =
+                self.lock_service_runtime_transition(name).await
+            {
+                self.ensure_accepting_lifecycle_requests()?;
+                return self.stop_service_locked(name, &path).await;
+            }
+
+            let pending_instance = {
+                let evidence = self.legacy_restore_evidence.lock().await;
+                evidence.iter().find_map(|(instance_id, services)| {
+                    services
+                        .iter()
+                        .any(|service| service.name == name)
+                        .then_some(*instance_id)
+                })
+            };
+            let Some(instance_id) = pending_instance else {
+                return Ok(());
+            };
+
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _availability_guard = coordinator.runtime.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            let still_pending = self
+                .legacy_restore_evidence
+                .lock()
+                .await
+                .get(&instance_id)
+                .is_some_and(|services| services.iter().any(|service| service.name == name));
+            if still_pending {
+                return Err(ServiceRestorePending {
+                    name: name.to_owned(),
+                    instance_id,
+                }
+                .into());
+            }
+        }
     }
 
     async fn stop_service_locked(&self, name: &str, project_path: &Path) -> Result<()> {
-        let runtime_state = {
+        let instance_id = {
             let services = self.services.lock().await;
             if let Some(service) = services.get(name) {
                 anyhow::ensure!(
                     service.path == project_path,
                     "service `{name}` changed project during lifecycle transition"
+                );
+                service.instance_id
+            } else {
+                return Ok(());
+            }
+        };
+
+        self.stop_service_instance_locked(name, instance_id).await
+    }
+
+    async fn stop_service_instance_locked(
+        &self,
+        name: &str,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        self.stop_service_instance_runtime_locked(name, instance_id)
+            .await?;
+        self.persist_state().await;
+        self.broadcast_service_update(name).await;
+        Ok(())
+    }
+
+    async fn stop_service_instance_runtime_locked(
+        &self,
+        name: &str,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        let runtime_state = {
+            let services = self.services.lock().await;
+            if let Some(service) = services.get(name) {
+                anyhow::ensure!(
+                    service.instance_id == instance_id,
+                    "service `{name}` changed project instance during lifecycle transition"
                 );
                 service.runtime_state.clone()
             } else {
@@ -1667,8 +2278,8 @@ impl ProcessManager {
                 let mut services = self.services.lock().await;
                 if let Some(service) = services.get_mut(name) {
                     anyhow::ensure!(
-                        service.path == project_path,
-                        "service `{name}` changed project during lifecycle transition"
+                        service.instance_id == instance_id,
+                        "service `{name}` changed project instance during lifecycle transition"
                     );
                     let same_controller = matches!(
                         &service.runtime_state,
@@ -1687,28 +2298,52 @@ impl ProcessManager {
         // Clear health and broadcast after stop
         {
             let mut services = self.services.lock().await;
-            if let Some(service) = services.get_mut(name) {
+            if let Some(service) = services
+                .get_mut(name)
+                .filter(|service| service.instance_id == instance_id)
+            {
                 // Note: We do NOT clear sticky_port here, so we can reuse it on restart.
                 service.health_status = HealthStatus::Unknown;
                 Self::advance_service_projection(service);
             }
         }
-
-        self.persist_state().await;
-        self.broadcast_service_update(name).await;
         Ok(())
     }
 
     pub async fn stop_all(&self) -> Result<()> {
-        let mut paths: Vec<PathBuf> = {
+        self.ensure_accepting_lifecycle_requests()?;
+        let (pending_instances, pending_paths) = {
+            let evidence = self.legacy_restore_evidence.lock().await;
+            (
+                evidence.keys().copied().collect::<Vec<_>>(),
+                evidence
+                    .values()
+                    .flatten()
+                    .map(|service| Self::canonicalize_path(&service.path))
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        for instance_id in pending_instances {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _availability_guard = coordinator.runtime.lock().await;
+            let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            self.legacy_restore_evidence
+                .lock()
+                .await
+                .remove(&instance_id);
+            self.persist_state().await;
+        }
+
+        let mut paths = {
             let services = self.services.lock().await;
             services
                 .values()
                 .map(|service| Self::canonicalize_path(&service.path))
                 .collect::<HashSet<_>>()
-                .into_iter()
-                .collect()
         };
+        paths.extend(pending_paths);
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
         paths.sort();
 
         for path in paths {
@@ -1720,10 +2355,45 @@ impl ProcessManager {
     }
 
     pub async fn stop_project(&self, project_path: &Path) -> Result<()> {
+        self.stop_project_unless_shutting_down(project_path).await
+    }
+
+    async fn stop_project_unless_shutting_down(&self, project_path: &Path) -> Result<()> {
+        let instance_id = self
+            .availability_instance_for_path(project_path)
+            .await
+            .map(|(instance_id, _)| instance_id);
+        let coordinator = match instance_id {
+            Some(instance_id) => Some(self.availability_coordinator(instance_id).await),
+            None => None,
+        };
+        let _availability_guard = match coordinator.as_ref() {
+            Some(coordinator) => Some(coordinator.runtime.lock().await),
+            None => None,
+        };
         let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
-        self.stop_project_locked(&project_path).await
+        if self.is_shutting_down() {
+            return Ok(());
+        }
+        self.retire_legacy_restore_for_path(&project_path).await;
+        self.stop_project_locked(&project_path).await?;
+        self.persist_state().await;
+        Ok(())
+    }
+
+    async fn retire_legacy_restore_for_path(&self, project_path: &Path) {
+        let instance_id = {
+            let registry = self.registry.lock().await;
+            Self::active_catalog_instance_for_path(&registry, project_path)
+        };
+        if let Some(instance_id) = instance_id {
+            self.legacy_restore_evidence
+                .lock()
+                .await
+                .remove(&instance_id);
+        }
     }
 
     async fn stop_project_locked(&self, project_path: &Path) -> Result<()> {
@@ -1742,24 +2412,61 @@ impl ProcessManager {
         Ok(())
     }
 
+    async fn stop_project_instance_locked(&self, instance_id: ProjectInstanceId) -> Result<()> {
+        let service_names: Vec<String> = {
+            let services = self.services.lock().await;
+            services
+                .iter()
+                .filter(|(_, service)| service.instance_id == instance_id)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        if service_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut stopped_service_names: Vec<String> = Vec::new();
+        for name in service_names {
+            if let Err(error) = self
+                .stop_service_instance_runtime_locked(&name, instance_id)
+                .await
+            {
+                self.persist_state().await;
+                for stopped_name in stopped_service_names {
+                    self.broadcast_service_update(&stopped_name).await;
+                }
+                return Err(error);
+            }
+            stopped_service_names.push(name);
+        }
+        self.persist_state().await;
+        for name in stopped_service_names {
+            self.broadcast_service_update(&name).await;
+        }
+        Ok(())
+    }
+
     pub async fn restart(&self, name: &str) -> Result<()> {
         let Some((path, _transition_guard, _runtime_projection_guard)) =
             self.lock_service_runtime_transition(name).await
         else {
             return Err(ServiceNotFoundError.into());
         };
+        self.ensure_accepting_lifecycle_requests()?;
         self.stop_service_locked(name, &path).await?;
         self.watch_config(path.clone()).await;
-        self.apply_config_locked(path, None, false).await
+        self.apply_config_locked(path, None, false, None).await
     }
 
     async fn restart_project(&self, project_path: &Path) -> Result<()> {
         let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         self.stop_project_locked(&project_path).await?;
         self.watch_config(project_path.clone()).await;
-        self.apply_config_locked(project_path, None, false).await
+        self.apply_config_locked(project_path, None, false, None)
+            .await
     }
 
     pub async fn restart_all(&self) -> Result<()> {
@@ -1806,6 +2513,7 @@ impl ProcessManager {
         else {
             anyhow::bail!("Service {name} not found");
         };
+        self.ensure_accepting_lifecycle_requests()?;
 
         // 1. Stop the service
         self.stop_service_locked(name, &path).await?;
@@ -1854,7 +2562,7 @@ impl ProcessManager {
 
         // 3. Restart while retaining the same project transition boundary.
         self.watch_config(path.clone()).await;
-        self.apply_config_locked(path, None, false).await?;
+        self.apply_config_locked(path, None, false, None).await?;
 
         Ok(())
     }
@@ -1932,6 +2640,26 @@ impl ProcessManager {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutting_down.store(true, AtomicOrdering::Release);
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        let _availability_publication_guard = self.availability_publication_lock.lock().await;
+        // Availability convergence deliberately avoids the global runtime
+        // projection lock so unrelated projects can stop independently. Drain
+        // every coordinator that existed when shutdown began before taking the
+        // global teardown lock. A coordinator created after this snapshot sees
+        // `shutting_down` at the convergence boundary before any runtime action.
+        let mut coordinators = {
+            let coordinators = self.availability_coordinators.lock().await;
+            coordinators
+                .iter()
+                .map(|(instance_id, coordinator)| (*instance_id, coordinator.clone()))
+                .collect::<Vec<_>>()
+        };
+        coordinators.sort_by_key(|(instance_id, _)| *instance_id);
+        let mut availability_guards = Vec::with_capacity(coordinators.len());
+        for (_, coordinator) in &coordinators {
+            availability_guards.push(coordinator.runtime.lock().await);
+        }
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
         let mut controllers_to_stop = Vec::new();
 
@@ -1960,6 +2688,7 @@ impl ProcessManager {
             });
         }
         futures_util::future::join_all(futures).await;
+        drop(availability_guards);
 
         Ok(())
     }
@@ -2024,6 +2753,8 @@ impl ProcessManager {
             !matches!(&source, AttachmentSource::Runtime),
             "Runtime attachment evidence is accepted only from persisted legacy state"
         );
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         // Canonicalize to prevent duplicate attachments from different relative paths.
         let canonical =
             std::fs::canonicalize(&project_path).unwrap_or_else(|_| project_path.clone());
@@ -2071,6 +2802,8 @@ impl ProcessManager {
             !matches!(&source, Some(AttachmentSource::Runtime)),
             "Runtime attachment evidence is retained for the availability migration"
         );
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         let canonical = Self::canonicalize_path(&project_path);
         let should_stop = {
             let mut attachments = self.attachments.lock().await;
@@ -2096,6 +2829,8 @@ impl ProcessManager {
     }
 
     pub async fn project_force_start(&self, project_path: PathBuf) -> Result<()> {
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         {
             let mut attachments = self.attachments.lock().await;
             attachments.clear_stopped(&project_path);
@@ -2105,6 +2840,8 @@ impl ProcessManager {
     }
 
     pub async fn project_force_stop(&self, project_path: PathBuf) -> Result<()> {
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         {
             let mut attachments = self.attachments.lock().await;
             attachments.mark_stopped(&project_path);
@@ -2113,13 +2850,153 @@ impl ProcessManager {
         self.stop_project(&project_path).await
     }
 
+    /// Acquire or renew semantic availability and converge the project runtime.
+    ///
+    /// This is the daemon-owned primitive used by compatibility and future
+    /// lifecycle IPC. Public readiness semantics are layered on it separately.
+    pub async fn project_ensure_availability(
+        &self,
+        project_path: &Path,
+        demand: DemandKey,
+    ) -> Result<EnsureDemandResult> {
+        let (instance_id, _) = self
+            .required_availability_instance_for_path(project_path)
+            .await?;
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _runtime_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        anyhow::ensure!(
+            self.active_path_for_instance(instance_id).await.is_some(),
+            "project instance {instance_id} is no longer active"
+        );
+        self.watch_active_instance(instance_id).await;
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let (result, durability_error) =
+            Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
+        let convergence = self
+            .converge_availability_locked(
+                instance_id,
+                None,
+                None,
+                AvailabilityConvergenceOptions {
+                    verbose: false,
+                    apply_config_when_up: false,
+                    defer_config_reload_during_cooldown: false,
+                },
+            )
+            .await;
+        Self::surface_availability_durability(convergence, durability_error)?;
+        Ok(result.expect("successful availability publication returns its demand result"))
+    }
+
+    /// Enable or disable durable Always On policy and converge the runtime.
+    pub async fn project_set_always_on(&self, project_path: &Path, enabled: bool) -> Result<bool> {
+        let (instance_id, _) = self
+            .required_availability_instance_for_path(project_path)
+            .await?;
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _runtime_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        anyhow::ensure!(
+            self.active_path_for_instance(instance_id).await.is_some(),
+            "project instance {instance_id} is no longer active"
+        );
+        self.watch_active_instance(instance_id).await;
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let (changed, durability_error) =
+            Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
+        let convergence = self
+            .converge_availability_locked(
+                instance_id,
+                None,
+                None,
+                AvailabilityConvergenceOptions {
+                    verbose: false,
+                    apply_config_when_up: false,
+                    defer_config_reload_during_cooldown: false,
+                },
+            )
+            .await;
+        Self::surface_availability_durability(convergence, durability_error)?;
+        Ok(changed.expect("successful availability publication returns its change result"))
+    }
+
+    /// Pause a project through its current activity generation and stop it.
+    pub async fn project_pause_availability(&self, project_path: &Path) -> Result<bool> {
+        let (instance_id, _) = self
+            .required_availability_instance_for_path(project_path)
+            .await?;
+        let (changed, durability_error) = {
+            let _publication_guard = self.availability_publication_lock.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            let mut availability =
+                AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+            Self::capture_availability_publication(availability.pause_project().await)?
+        };
+        let convergence = self
+            .converge_managed_instance(instance_id, None, false, false)
+            .await;
+        Self::surface_availability_durability(convergence, durability_error)?;
+        Ok(changed.expect("successful availability publication returns its change result"))
+    }
+
+    /// Re-evaluate one availability-managed project from authoritative state.
+    ///
+    /// Returns `None` while the project still uses the legacy lifecycle model.
+    pub async fn converge_project_availability(
+        &self,
+        project_path: &Path,
+    ) -> Result<Option<ConvergenceDecision>> {
+        let Some((instance_id, _)) = self.availability_instance_for_path(project_path).await else {
+            return Ok(None);
+        };
+        if !self.availability_is_managed(instance_id).await? {
+            return Ok(None);
+        }
+        self.converge_managed_instance(instance_id, None, false, false)
+            .await
+            .map(Some)
+    }
+
     pub async fn remove_project(&self, project_path: &Path) -> Result<()> {
+        let instance_id = self
+            .availability_instance_for_path(project_path)
+            .await
+            .map(|(instance_id, _)| instance_id);
+        let coordinator = match instance_id {
+            Some(instance_id) => Some(self.availability_coordinator(instance_id).await),
+            None => None,
+        };
+        let _availability_guard = match coordinator.as_ref() {
+            Some(coordinator) => Some(coordinator.runtime.lock().await),
+            None => None,
+        };
         let (canonical, transition_lock) = self.transition_lock_for_path(project_path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let mut retired_paths = HashSet::from([canonical.clone()]);
+        let retired_instance_ids = instance_id.into_iter().collect::<HashSet<_>>();
+        if let Some(instance_id) = instance_id {
+            retired_paths.extend(
+                self.services
+                    .lock()
+                    .await
+                    .values()
+                    .filter(|service| service.instance_id == instance_id)
+                    .map(|service| service.path.clone()),
+            );
+        }
 
-        // Stop services.
-        self.stop_project_locked(&canonical).await?;
+        // Stop services by stable identity when one is available so a moved
+        // runtime cannot outlive removal at its current catalog locator.
+        if let Some(instance_id) = instance_id {
+            self.stop_project_instance_locked(instance_id).await?;
+        } else {
+            self.stop_project_locked(&canonical).await?;
+        }
 
         // Keep both compatibility stores stable until each candidate is ready.
         // Catalog removal is the authoritative commit point; recoverable
@@ -2131,7 +3008,31 @@ impl ProcessManager {
         let mut attachment_candidate = original_attachments.clone();
         attachment_candidate.forget_project(&canonical);
         let mut catalog_candidate = registry.clone();
+        if let Some(instance_id) = instance_id
+            && let Some(record) = registry.instances.get(&instance_id)
+        {
+            retired_paths.insert(record.last_known_path.clone());
+            retired_paths.extend(record.current_path.iter().cloned());
+            retired_paths.extend(
+                registry
+                    .legacy_paths
+                    .iter()
+                    .filter(|(_, candidate)| **candidate == instance_id)
+                    .map(|(path, _)| path.clone()),
+            );
+        }
         catalog_candidate.unregister_project(&canonical)?;
+        let surviving_paths = catalog_candidate
+            .instances
+            .values()
+            .flat_map(|record| {
+                std::iter::once(record.last_known_path.clone())
+                    .chain(record.current_path.iter().cloned())
+            })
+            .chain(catalog_candidate.legacy_paths.keys().cloned())
+            .map(|path| Self::canonicalize_path(&path))
+            .collect::<HashSet<_>>();
+        retired_paths.retain(|path| !surviving_paths.contains(&Self::canonicalize_path(path)));
 
         attachment_candidate.save().await?;
         let commit_result = registry.commit_candidate(catalog_candidate).await;
@@ -2158,10 +3059,20 @@ impl ProcessManager {
         drop(attachments);
         drop(registry);
 
-        self.services
-            .lock()
-            .await
-            .retain(|_, service| service.path != canonical);
+        self.retire_config_reload_paths(retired_paths, retired_instance_ids)
+            .await;
+        self.services.lock().await.retain(|_, service| {
+            instance_id.map_or(service.path != canonical, |instance_id| {
+                service.instance_id != instance_id
+            })
+        });
+        if let Some(instance_id) = instance_id {
+            self.legacy_restore_evidence
+                .lock()
+                .await
+                .remove(&instance_id);
+        }
+        self.persist_state().await;
         self.sync_hosts_after_catalog_publish().await;
 
         if let Some(error) = durability_error {
@@ -2172,7 +3083,6 @@ impl ProcessManager {
     }
 
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
-        self.refresh_attachments().await?;
         let canonical = Self::canonicalize_path(project_path);
 
         let project_name = {
@@ -2220,8 +3130,6 @@ impl ProcessManager {
         &self,
         filter: Option<ProjectFilter>,
     ) -> Result<Vec<ProjectListEntry>> {
-        self.refresh_attachments().await?;
-
         let registry_projects = {
             let registry = self.registry.lock().await;
             registry.project_entries_by_path()
@@ -2293,6 +3201,8 @@ impl ProcessManager {
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_pin(&self, path: &std::path::Path) -> Result<()> {
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         let mut registry = self.registry.lock().await;
         let mut updated = registry.clone();
         if updated.pin_project(path) {
@@ -2305,6 +3215,8 @@ impl ProcessManager {
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_unpin(&self, path: &std::path::Path) -> Result<()> {
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
         let mut registry = self.registry.lock().await;
         let mut updated = registry.clone();
         if updated.unpin_project(path) {
@@ -2340,6 +3252,7 @@ impl ProcessManager {
                 transition_guards.push(transition_lock.lock_owned().await);
             }
             let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
 
             let mut registry = self.registry.lock().await;
             if *registry != baseline {
@@ -2350,16 +3263,50 @@ impl ProcessManager {
 
             let mut updated = registry.clone();
             let count = updated.prune_missing_projects()?;
-            let removed_paths = registry
+            let removed_instance_ids = registry
+                .instances
+                .keys()
+                .filter(|instance_id| !updated.instances.contains_key(instance_id))
+                .copied()
+                .collect::<HashSet<_>>();
+            let mut removed_paths = registry
                 .instances
                 .iter()
-                .filter(|(instance_id, _)| !updated.instances.contains_key(instance_id))
-                .map(|(_, record)| record.last_known_path.clone())
+                .filter(|(instance_id, _)| removed_instance_ids.contains(instance_id))
+                .flat_map(|(_, record)| {
+                    std::iter::once(record.last_known_path.clone())
+                        .chain(record.current_path.iter().cloned())
+                })
                 .collect::<HashSet<_>>();
+            removed_paths.extend(
+                registry
+                    .legacy_paths
+                    .iter()
+                    .filter(|(_, instance_id)| removed_instance_ids.contains(instance_id))
+                    .map(|(path, _)| path.clone()),
+            );
+            removed_paths.extend(
+                self.services
+                    .lock()
+                    .await
+                    .values()
+                    .filter(|service| removed_instance_ids.contains(&service.instance_id))
+                    .map(|service| service.path.clone()),
+            );
+            let surviving_paths = updated
+                .instances
+                .values()
+                .flat_map(|record| {
+                    std::iter::once(record.last_known_path.clone())
+                        .chain(record.current_path.iter().cloned())
+                })
+                .chain(updated.legacy_paths.keys().cloned())
+                .map(|path| Self::canonicalize_path(&path))
+                .collect::<HashSet<_>>();
+            removed_paths.retain(|path| !surviving_paths.contains(&Self::canonicalize_path(path)));
 
-            for path in &removed_paths {
-                let canonical = Self::canonicalize_path(path);
-                self.stop_project_locked(&canonical).await?;
+            for instance_id in &removed_instance_ids {
+                self.stop_project_instance_locked(*instance_id).await?;
             }
 
             if updated == *registry {
@@ -2374,10 +3321,20 @@ impl ProcessManager {
                     Err(CatalogError::PublishedNotDurable { .. })
                 );
             if catalog_published {
+                self.retire_config_reload_paths(
+                    removed_paths.clone(),
+                    removed_instance_ids.clone(),
+                )
+                .await;
                 self.services
                     .lock()
                     .await
-                    .retain(|_, service| !removed_paths.contains(&service.path));
+                    .retain(|_, service| !removed_instance_ids.contains(&service.instance_id));
+                self.legacy_restore_evidence
+                    .lock()
+                    .await
+                    .retain(|instance_id, _| !removed_instance_ids.contains(instance_id));
+                self.persist_state().await;
                 self.sync_hosts_after_catalog_publish().await;
             }
             commit_result?;
@@ -2385,16 +3342,11 @@ impl ProcessManager {
         }
     }
 
-    async fn refresh_attachments(&self) -> Result<()> {
-        let mut attachments = self.attachments.lock().await;
-        let removed = attachments.reap_stale_attachments();
-        if !removed.is_empty() {
-            attachments.save().await?;
-        }
-        Ok(())
-    }
-
     pub async fn reap_and_stop_orphans(&self) {
+        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        if self.is_shutting_down() {
+            return;
+        }
         let orphaned = {
             let mut attachments = self.attachments.lock().await;
             let orphaned = attachments.reap_stale_attachments();
@@ -2409,8 +3361,677 @@ impl ProcessManager {
                 "Stale attachments reaped for {}, stopping services",
                 path.display()
             );
-            if let Err(e) = self.stop_project(&path).await {
+            if let Err(e) = self.stop_project_unless_shutting_down(&path).await {
                 warn!("Failed to stop orphaned project: {e}");
+            }
+        }
+    }
+
+    /// Re-evaluate every project that has entered the availability lifecycle.
+    pub async fn converge_all_project_availability(&self) {
+        if self.is_shutting_down() {
+            return;
+        }
+        let instance_ids = {
+            let registry = self.registry.lock().await;
+            registry.instances.keys().copied().collect::<Vec<_>>()
+        };
+
+        for instance_id in instance_ids {
+            if self.is_shutting_down() {
+                break;
+            }
+            match self.availability_is_managed(instance_id).await {
+                Ok(true) => {
+                    if let Err(error) = self
+                        .converge_managed_instance(instance_id, None, false, false)
+                        .await
+                    {
+                        warn!("Failed to converge availability for {instance_id}: {error:#}");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!("Failed to inspect availability for {instance_id}: {error:#}");
+                }
+            }
+        }
+    }
+
+    async fn availability_instance_for_path(
+        &self,
+        path: &Path,
+    ) -> Option<(ProjectInstanceId, PathBuf)> {
+        let canonical = Self::canonicalize_path(path);
+        if let Ok(discovery) = Registry::discover(canonical.clone()).await {
+            let registry = self.registry.lock().await;
+            let mut candidate = registry.clone();
+            let instance_id = candidate.register_project(discovery, None).ok()?;
+            return registry
+                .instances
+                .contains_key(&instance_id)
+                .then_some((instance_id, canonical));
+        }
+
+        let registry = self.registry.lock().await;
+        registry.instances.iter().find_map(|(instance_id, record)| {
+            (record.presence == CatalogPresence::Active
+                && record.current_path.as_deref() == Some(canonical.as_path()))
+            .then_some((*instance_id, canonical.clone()))
+        })
+    }
+
+    async fn required_availability_instance_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<(ProjectInstanceId, PathBuf)> {
+        self.availability_instance_for_path(path)
+            .await
+            .with_context(|| {
+                format!(
+                    "project `{}` is not registered in the identity catalog",
+                    path.display()
+                )
+            })
+    }
+
+    async fn availability_is_managed(&self, instance_id: ProjectInstanceId) -> Result<bool> {
+        let path = availability_path(&self.availability_data_dir, instance_id);
+        tokio::fs::try_exists(&path)
+            .await
+            .with_context(|| format!("failed to inspect availability state `{}`", path.display()))
+    }
+
+    async fn sweep_availability(
+        availability: &mut AvailabilityStore,
+    ) -> Result<(ConvergenceDecision, Option<anyhow::Error>)> {
+        match availability.sweep_and_decide().await {
+            Ok(decision) => Ok((decision, None)),
+            Err(error @ AvailabilityError::PublishedNotDurable { .. }) => {
+                let decision = availability.sweep_and_decide().await.with_context(|| {
+                    format!(
+                        "availability was published with incomplete durability ({error}); failed to read the published decision"
+                    )
+                })?;
+                Ok((decision, Some(error.into())))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn capture_availability_publication<Output>(
+        result: std::result::Result<Output, AvailabilityError>,
+    ) -> Result<(Option<Output>, Option<anyhow::Error>)> {
+        match result {
+            Ok(output) => Ok((Some(output), None)),
+            Err(error @ AvailabilityError::PublishedNotDurable { .. }) => {
+                Ok((None, Some(error.into())))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn merge_availability_durability(
+        current: &mut Option<anyhow::Error>,
+        next: Option<anyhow::Error>,
+    ) {
+        let Some(next) = next else {
+            return;
+        };
+        *current = Some(match current.take() {
+            Some(previous) => previous.context(format!(
+                "an additional availability publication had incomplete durability: {next:#}"
+            )),
+            None => next,
+        });
+    }
+
+    fn surface_availability_durability<Output>(
+        result: Result<Output>,
+        durability_error: Option<anyhow::Error>,
+    ) -> Result<Output> {
+        match (result, durability_error) {
+            (Ok(_), Some(error)) => Err(error),
+            (Err(action_error), Some(error)) => Err(action_error.context(format!(
+                "availability state was published with incomplete durability: {error:#}"
+            ))),
+            (result, None) => result,
+        }
+    }
+
+    async fn availability_authorizes_start(&self, instance_id: ProjectInstanceId) -> Result<()> {
+        self.ensure_accepting_lifecycle_requests()?;
+        if !self.availability_is_managed(instance_id).await? {
+            return Ok(());
+        }
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let decision = availability.sweep_and_decide().await?;
+        if matches!(decision, ConvergenceDecision::EnsureUp) {
+            Ok(())
+        } else {
+            Err(AvailabilityStartSuperseded {
+                instance_id,
+                decision,
+            }
+            .into())
+        }
+    }
+
+    async fn availability_allows_inflight_transition(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        self.ensure_accepting_lifecycle_requests()?;
+        if !self.availability_is_managed(instance_id).await? {
+            return Ok(());
+        }
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let snapshot = availability.snapshot().await?;
+        if snapshot.is_paused() {
+            Err(AvailabilityStartSuperseded {
+                instance_id,
+                decision: ConvergenceDecision::EnsureDown,
+            }
+            .into())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn availability_coordinator(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Arc<AvailabilityCoordinator> {
+        let mut coordinators = self.availability_coordinators.lock().await;
+        coordinators
+            .entry(instance_id)
+            .or_insert_with(|| Arc::new(AvailabilityCoordinator::new()))
+            .clone()
+    }
+
+    async fn active_path_for_instance(&self, instance_id: ProjectInstanceId) -> Option<PathBuf> {
+        let registry = self.registry.lock().await;
+        registry.instances.get(&instance_id).and_then(|record| {
+            (record.presence == CatalogPresence::Active)
+                .then(|| record.current_path.clone())
+                .flatten()
+        })
+    }
+
+    async fn watch_active_instance(&self, instance_id: ProjectInstanceId) {
+        if self.is_shutting_down() {
+            return;
+        }
+        if let Some(path) = self.active_path_for_instance(instance_id).await {
+            let (path, transition_lock) = self.transition_lock_for_path(&path).await;
+            let _transition_guard = transition_lock.lock().await;
+            if !self.is_shutting_down() && self.path_matches_instance(&path, instance_id).await {
+                self.forgotten_reload_paths.lock().await.remove(&path);
+                self.watch_config(path).await;
+            }
+        }
+    }
+
+    async fn path_matches_instance(&self, path: &Path, instance_id: ProjectInstanceId) -> bool {
+        let canonical = Self::canonicalize_path(path);
+        let Ok(discovery) = Registry::discover(canonical).await else {
+            return false;
+        };
+        let registry = self.registry.lock().await;
+        if !registry.instances.contains_key(&instance_id) {
+            return false;
+        }
+        let mut candidate = registry.clone();
+        candidate.register_project(discovery, None).ok() == Some(instance_id)
+    }
+
+    async fn project_runtime_exists(&self, instance_id: ProjectInstanceId) -> bool {
+        let services = self.services.lock().await;
+        services.values().any(|service| {
+            service.instance_id == instance_id
+                && (matches!(&service.runtime_state, ServiceRuntime::Controller(_))
+                    || service.health_status != HealthStatus::Unknown)
+        })
+    }
+
+    async fn project_runtime_is_ready(&self, instance_id: ProjectInstanceId) -> bool {
+        let runtimes = {
+            let services = self.services.lock().await;
+            services
+                .values()
+                .filter(|service| service.instance_id == instance_id)
+                .map(|service| (service.runtime_state.clone(), service.health_status))
+                .collect::<Vec<_>>()
+        };
+        if runtimes.is_empty() {
+            return false;
+        }
+
+        for (runtime, health_status) in runtimes {
+            if health_status != HealthStatus::Healthy {
+                return false;
+            }
+            match runtime {
+                ServiceRuntime::None => return false,
+                ServiceRuntime::Controller(controller) => {
+                    if controller.lock().await.read_state().await.status != ServiceState::Running {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    async fn stop_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
+        let mut paths = {
+            let services = self.services.lock().await;
+            services
+                .values()
+                .filter(|service| service.instance_id == instance_id)
+                .map(|service| Self::canonicalize_path(&service.path))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        if let Some(record) = self.registry.lock().await.instances.get(&instance_id) {
+            paths.push(Self::canonicalize_path(&record.last_known_path));
+            paths.extend(
+                record
+                    .current_path
+                    .iter()
+                    .map(|path| Self::canonicalize_path(path)),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+
+        let mut transition_guards = Vec::with_capacity(paths.len());
+        for path in paths {
+            let (_, transition_lock) = self.transition_lock_for_path(&path).await;
+            transition_guards.push(transition_lock.lock_owned().await);
+        }
+        let result = self.stop_project_instance_locked(instance_id).await;
+        drop(transition_guards);
+        result
+    }
+
+    async fn start_catalogued_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+        requested_path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+    ) -> Result<()> {
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _runtime_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let requested_path = if self
+            .path_matches_instance(&requested_path, instance_id)
+            .await
+        {
+            Some(Self::canonicalize_path(&requested_path))
+        } else {
+            None
+        };
+
+        if self.availability_is_managed(instance_id).await? {
+            if let Some(path) = requested_path
+                .clone()
+                .or(self.active_path_for_instance(instance_id).await)
+            {
+                self.watch_config(path).await;
+            }
+            self.converge_availability_locked(
+                instance_id,
+                requested_path,
+                event_tx,
+                AvailabilityConvergenceOptions {
+                    verbose,
+                    apply_config_when_up: true,
+                    defer_config_reload_during_cooldown: false,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let path = requested_path
+            .or(self.active_path_for_instance(instance_id).await)
+            .context("catalogued project instance has no active path")?;
+        let action = self.start_runtime(path, event_tx, verbose).await;
+
+        if self.availability_is_managed(instance_id).await? {
+            self.converge_availability_locked(
+                instance_id,
+                None,
+                None,
+                AvailabilityConvergenceOptions {
+                    verbose: false,
+                    apply_config_when_up: false,
+                    defer_config_reload_during_cooldown: false,
+                },
+            )
+            .await?;
+            Ok(())
+        } else {
+            action
+        }
+    }
+
+    async fn reload_catalogued_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+        requested_path: PathBuf,
+    ) -> Result<()> {
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _runtime_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let requested_path = if self
+            .path_matches_instance(&requested_path, instance_id)
+            .await
+        {
+            Some(Self::canonicalize_path(&requested_path))
+        } else {
+            None
+        };
+
+        if self.availability_is_managed(instance_id).await? {
+            self.converge_availability_locked(
+                instance_id,
+                requested_path,
+                None,
+                AvailabilityConvergenceOptions {
+                    verbose: false,
+                    apply_config_when_up: true,
+                    defer_config_reload_during_cooldown: true,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let path = requested_path
+            .or(self.active_path_for_instance(instance_id).await)
+            .context("catalogued project instance has no active path")?;
+        let action = self
+            .apply_config_for_instance(path, None, false, None, true)
+            .await;
+
+        if self.availability_is_managed(instance_id).await? {
+            self.converge_availability_locked(
+                instance_id,
+                None,
+                None,
+                AvailabilityConvergenceOptions {
+                    verbose: false,
+                    apply_config_when_up: true,
+                    defer_config_reload_during_cooldown: true,
+                },
+            )
+            .await?;
+            Ok(())
+        } else {
+            action
+        }
+    }
+
+    async fn converge_managed_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        apply_config_when_up: bool,
+    ) -> Result<ConvergenceDecision> {
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _runtime_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.watch_active_instance(instance_id).await;
+        let decision = self
+            .converge_availability_locked(
+                instance_id,
+                None,
+                event_tx,
+                AvailabilityConvergenceOptions {
+                    verbose,
+                    apply_config_when_up,
+                    defer_config_reload_during_cooldown: false,
+                },
+            )
+            .await?;
+        Ok(decision)
+    }
+
+    async fn converge_availability_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+        mut requested_path: Option<PathBuf>,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        options: AvailabilityConvergenceOptions,
+    ) -> Result<ConvergenceDecision> {
+        let mut durability_error = None;
+        loop {
+            self.ensure_accepting_lifecycle_requests()?;
+            let mut availability =
+                match AvailabilityStore::load(&self.availability_data_dir, instance_id).await {
+                    Ok(availability) => availability,
+                    Err(error) => {
+                        return Self::surface_availability_durability(
+                            Err(error.into()),
+                            durability_error,
+                        );
+                    }
+                };
+            let (decision, sweep_durability_error) =
+                match Self::sweep_availability(&mut availability).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Self::surface_availability_durability(Err(error), durability_error);
+                    }
+                };
+            Self::merge_availability_durability(&mut durability_error, sweep_durability_error);
+            let snapshot = match availability.snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Self::surface_availability_durability(
+                        Err(error.into()),
+                        durability_error,
+                    );
+                }
+            };
+            let project_path = requested_path
+                .take()
+                .or(self.active_path_for_instance(instance_id).await);
+
+            let Some(project_path) = project_path else {
+                let action = self.stop_project_instance(instance_id).await;
+                if matches!(decision, ConvergenceDecision::EnsureUp) && action.is_ok() {
+                    let message =
+                        format!("project instance {instance_id} is missing from the filesystem");
+                    let result = match availability
+                        .record_convergence_error(message.clone())
+                        .await
+                    {
+                        Ok(_) => Err(anyhow::anyhow!(message)),
+                        Err(error @ AvailabilityError::PublishedNotDurable { .. }) => {
+                            Err(anyhow::anyhow!(message).context(format!(
+                                "the missing-project convergence error was published with incomplete durability: {error}"
+                            )))
+                        }
+                        Err(error) => Err(anyhow::anyhow!(message).context(format!(
+                            "failed to record the missing-project convergence error: {error}"
+                        ))),
+                    };
+                    return Self::surface_availability_durability(result, durability_error);
+                }
+                let result = self
+                    .finish_availability_action(
+                        &mut availability,
+                        decision,
+                        action,
+                        matches!(decision, ConvergenceDecision::EnsureDown),
+                    )
+                    .await;
+                return Self::surface_availability_durability(result, durability_error);
+            };
+
+            let (action, clear_on_success, applied_config) = match decision {
+                ConvergenceDecision::EnsureUp => {
+                    let has_pending_reload = self
+                        .pending_config_reloads
+                        .lock()
+                        .await
+                        .contains(&instance_id);
+                    let should_apply = options.apply_config_when_up
+                        || has_pending_reload
+                        || snapshot.last_convergence_error().is_some()
+                        || !self.project_runtime_is_ready(instance_id).await;
+                    if should_apply {
+                        (
+                            self.apply_config_for_instance(
+                                project_path,
+                                event_tx.clone(),
+                                options.verbose,
+                                Some(instance_id),
+                                false,
+                            )
+                            .await,
+                            true,
+                            true,
+                        )
+                    } else {
+                        (Ok(()), true, false)
+                    }
+                }
+                ConvergenceDecision::PreserveRuntimeUntil { .. } => {
+                    if options.defer_config_reload_during_cooldown {
+                        self.pending_config_reloads.lock().await.insert(instance_id);
+                    }
+                    (Ok(()), false, false)
+                }
+                ConvergenceDecision::EnsureDown => {
+                    if self.project_runtime_exists(instance_id).await {
+                        (self.stop_project_instance(instance_id).await, true, false)
+                    } else {
+                        (Ok(()), true, false)
+                    }
+                }
+            };
+
+            if action.is_ok() && applied_config {
+                self.pending_config_reloads
+                    .lock()
+                    .await
+                    .remove(&instance_id);
+            }
+
+            let (latest_decision, latest_durability_error) =
+                match Self::sweep_availability(&mut availability).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Self::surface_availability_durability(Err(error), durability_error);
+                    }
+                };
+            Self::merge_availability_durability(&mut durability_error, latest_durability_error);
+            if action
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<DaemonShuttingDown>().is_some())
+            {
+                let Err(error) = action else {
+                    unreachable!("checked error action")
+                };
+                return Self::surface_availability_durability(Err(error), durability_error);
+            }
+            if latest_decision != decision {
+                match &action {
+                    Ok(()) if clear_on_success => {
+                        let (_, clear_durability_error) =
+                            match Self::capture_availability_publication(
+                                availability.clear_convergence_error().await,
+                            ) {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    return Self::surface_availability_durability(
+                                        Err(error),
+                                        durability_error,
+                                    );
+                                }
+                            };
+                        Self::merge_availability_durability(
+                            &mut durability_error,
+                            clear_durability_error,
+                        );
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<AvailabilityStartSuperseded>()
+                            .is_none() =>
+                    {
+                        let (_, record_durability_error) =
+                            match Self::capture_availability_publication(
+                                availability
+                                    .record_convergence_error(format!("{error:#}"))
+                                    .await,
+                            ) {
+                                Ok(result) => result,
+                                Err(record_error) => {
+                                    return Self::surface_availability_durability(
+                                        Err(record_error.context(format!(
+                                            "failed to record availability convergence error after: {error:#}"
+                                        ))),
+                                        durability_error,
+                                    );
+                                }
+                            };
+                        Self::merge_availability_durability(
+                            &mut durability_error,
+                            record_durability_error,
+                        );
+                    }
+                    Ok(()) | Err(_) => {}
+                }
+                continue;
+            }
+
+            if action.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<AvailabilityStartSuperseded>()
+                    .is_some()
+            }) {
+                continue;
+            }
+
+            let result = self
+                .finish_availability_action(&mut availability, decision, action, clear_on_success)
+                .await;
+            return Self::surface_availability_durability(result, durability_error);
+        }
+    }
+
+    async fn finish_availability_action(
+        &self,
+        availability: &mut AvailabilityStore,
+        decision: ConvergenceDecision,
+        action: Result<()>,
+        clear_on_success: bool,
+    ) -> Result<ConvergenceDecision> {
+        match action {
+            Ok(()) => {
+                if clear_on_success {
+                    availability.clear_convergence_error().await?;
+                }
+                Ok(decision)
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if let Err(record_error) = availability.record_convergence_error(message).await {
+                    return Err(error.context(format!(
+                        "failed to record availability convergence error: {record_error}"
+                    )));
+                }
+                Err(error)
             }
         }
     }
@@ -2742,6 +4363,7 @@ impl ServiceResolver for ProcessManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::exec::ExecController;
     use async_trait::async_trait;
     use axum::{
         body::Body,
@@ -2752,9 +4374,10 @@ mod tests {
     use locald_core::registry::Registry;
     use locald_core::service::{RuntimeState, ServiceCommand};
     use std::collections::HashMap;
+    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::tempdir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
@@ -2764,6 +4387,7 @@ mod tests {
         id: String,
         state: RuntimeState,
         fail_stop: bool,
+        process_identity: Option<PersistedProcessIdentity>,
     }
 
     impl TestController {
@@ -2772,6 +4396,7 @@ mod tests {
                 id: id.into(),
                 state,
                 fail_stop: false,
+                process_identity: None,
             }
         }
 
@@ -2780,6 +4405,7 @@ mod tests {
                 id: id.into(),
                 state,
                 fail_stop: true,
+                process_identity: None,
             }
         }
     }
@@ -2809,6 +4435,10 @@ mod tests {
             self.state
         }
 
+        fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+            self.process_identity.clone()
+        }
+
         async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
             stream::empty().boxed()
         }
@@ -2831,6 +4461,224 @@ mod tests {
 
         async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
             Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedController {
+        id: String,
+        state: RuntimeState,
+        process_identity: Option<PersistedProcessIdentity>,
+        start_entered: Option<Arc<tokio::sync::Notify>>,
+        fail_prepare: bool,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ServiceController for ScriptedController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            if self.fail_prepare {
+                anyhow::bail!("injected prepare failure");
+            }
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            if let Some(entered) = &self.start_entered {
+                entered.notify_one();
+                self.state.status = ServiceState::Running;
+                return Ok(());
+            }
+            self.state.status = ServiceState::Running;
+            self.state.health_status = HealthStatus::Healthy;
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.stop_count.fetch_add(1, Ordering::SeqCst);
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        fn owned_process_id(&self) -> Option<u32> {
+            self.process_identity.as_ref().and(self.state.pid)
+        }
+
+        fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+            self.process_identity.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnreadyStartFactory {
+        entered: Arc<tokio::sync::Notify>,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    impl ServiceFactory for UnreadyStartFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: Some(41),
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: Some(PersistedProcessIdentity {
+                    start_time: 1_234,
+                    process_group_id: 41,
+                    executable: Some(PathBuf::from("/test/unready-worker")),
+                }),
+                start_entered: Some(self.entered.clone()),
+                fail_prepare: false,
+                stop_count: self.stop_count.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryPrepareFactory {
+        failure_consumed: Arc<AtomicBool>,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    impl ServiceFactory for RetryPrepareFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            let fail_prepare =
+                name.ends_with(":second") && !self.failure_consumed.swap(true, Ordering::SeqCst);
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: None,
+                start_entered: None,
+                fail_prepare,
+                stop_count: self.stop_count.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryPrepareWithoutPidFactory {
+        failure_consumed: Arc<AtomicBool>,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct CountingStartFactory {
+        creates: Arc<AtomicUsize>,
+    }
+
+    impl ServiceFactory for CountingStartFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: None,
+                start_entered: None,
+                fail_prepare: false,
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    impl ServiceFactory for RetryPrepareWithoutPidFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            let fail_prepare =
+                name.ends_with(":second") && !self.failure_consumed.swap(true, Ordering::SeqCst);
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: None,
+                start_entered: None,
+                fail_prepare,
+                stop_count: self.stop_count.clone(),
+            }))
         }
     }
 
@@ -3059,6 +4907,2908 @@ mod tests {
         "00000000-0000-4000-8000-000000000002"
             .parse()
             .expect("valid alternate project instance ID")
+    }
+
+    async fn availability_manager(
+        root: &Path,
+        project_path: &Path,
+        project_name: &str,
+    ) -> (ProcessManager, ProjectInstanceId, PathBuf) {
+        std::fs::create_dir_all(project_path).expect("create availability project");
+        let canonical = std::fs::canonicalize(project_path).expect("canonical availability path");
+        let mut catalog = Registry::with_path(root.join("catalog.json"));
+        let discovery = Registry::discover(canonical.clone())
+            .await
+            .expect("discover availability project");
+        let instance_id = catalog
+            .register_project(discovery, Some(project_name.to_owned()))
+            .expect("register availability project");
+        catalog.save().await.expect("save availability catalog");
+
+        let availability_data_dir = root.join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            root.join("notify.sock"),
+            Arc::new(StateManager::with_path(root.join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                root.join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create availability process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        (manager, instance_id, availability_data_dir)
+    }
+
+    fn availability_test_service(
+        instance_id: ProjectInstanceId,
+        project_name: &str,
+        project_path: &Path,
+        fail_stop: bool,
+    ) -> Service {
+        let service_name = format!("{project_name}:web");
+        let state = RuntimeState {
+            pid: Some(42),
+            port: Some(3000),
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        let controller: Arc<Mutex<dyn ServiceController>> = if fail_stop {
+            Arc::new(Mutex::new(TestController::failing_stop(
+                service_name,
+                state,
+            )))
+        } else {
+            Arc::new(Mutex::new(TestController::new(service_name, state)))
+        };
+        let mut service = test_service(
+            test_config_with_domain(project_name, &format!("{project_name}.localhost")),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(controller),
+            std::fs::canonicalize(project_path).expect("canonical availability service path"),
+        );
+        service.instance_id = instance_id;
+        service
+    }
+
+    fn write_availability_worker_config(
+        project_path: &Path,
+        project_name: &str,
+        domain: &str,
+        service_names: &[&str],
+    ) {
+        let mut config = format!("[project]\nname = \"{project_name}\"\ndomain = \"{domain}\"\n");
+        for service_name in service_names {
+            config.push_str(&format!(
+                "\n[services.{service_name}]\ntype = \"worker\"\ncommand = \"unused-by-test-factory\"\n"
+            ));
+        }
+        std::fs::write(project_path.join("locald.toml"), config)
+            .expect("write availability worker config");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_cooldown_preserves_stopped_runtime() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("cooldown-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "cooldown").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load project availability");
+        let manual = DemandKey::manual_cli();
+        availability
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire manual demand");
+        availability
+            .release_demand(&manual)
+            .await
+            .expect("release manual demand");
+
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("converge cooldown project"),
+            Some(ConvergenceDecision::PreserveRuntimeUntil {
+                deadline: availability
+                    .snapshot()
+                    .await
+                    .expect("reload cooldown")
+                    .shutdown_cooldown_until()
+                    .expect("cooldown deadline"),
+            })
+        );
+        assert!(manager.services.lock().await.is_empty());
+        assert!(
+            manager
+                .watchers
+                .lock()
+                .await
+                .contains_key(&ProcessManager::canonicalize_path(&project_path))
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_pause_stops_and_preserves_always_on() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("paused-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "paused").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load project availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable Always On");
+        manager.services.lock().await.insert(
+            "paused:web".to_owned(),
+            availability_test_service(instance_id, "paused", &project_path, false),
+        );
+
+        assert!(
+            manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("pause project")
+        );
+        assert!(manager.get_service_controller("paused:web").await.is_none());
+        let snapshot = availability.snapshot().await.expect("reload paused policy");
+        assert!(snapshot.always_on());
+        assert!(snapshot.is_paused());
+        assert_eq!(snapshot.last_convergence_error(), None);
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_failure_preserves_intent_until_retry() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("retry-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retry").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load project availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable Always On");
+        let canonical = std::fs::canonicalize(&project_path).expect("canonical retry path");
+        manager.services.lock().await.insert(
+            "retry:web".to_owned(),
+            availability_test_service(instance_id, "retry", &project_path, true),
+        );
+
+        let error = manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect_err("injected stop failure must surface");
+        assert!(format!("{error:#}").contains("injected stop failure"));
+        let failed = availability
+            .snapshot()
+            .await
+            .expect("reload failed convergence");
+        assert!(failed.is_paused());
+        assert!(failed.always_on());
+        assert!(
+            failed
+                .last_convergence_error()
+                .is_some_and(|message| message.contains("injected stop failure"))
+        );
+
+        let replacement = Arc::new(Mutex::new(TestController::new(
+            "retry:web",
+            RuntimeState {
+                pid: Some(43),
+                port: Some(3000),
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+        )));
+        manager
+            .services
+            .lock()
+            .await
+            .get_mut("retry:web")
+            .expect("retry service remains registered")
+            .runtime_state = ServiceRuntime::Controller(replacement);
+
+        assert_eq!(
+            manager
+                .converge_project_availability(&canonical)
+                .await
+                .expect("retry convergence"),
+            Some(ConvergenceDecision::EnsureDown)
+        );
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload successful retry")
+                .last_convergence_error(),
+            None
+        );
+        assert!(manager.get_service_controller("retry:web").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_renewed_always_on_crosses_pause() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("resume-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "resume").await;
+        write_availability_worker_config(&project_path, "resume", "resume.localhost", &["web"]);
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load project availability");
+        assert!(
+            manager
+                .project_set_always_on(&project_path, true)
+                .await
+                .expect("enable Always On")
+        );
+        let first_controller = manager
+            .get_service_controller("resume:web")
+            .await
+            .expect("initial Always On runtime");
+        assert!(
+            manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("pause project")
+        );
+        assert!(manager.get_service_controller("resume:web").await.is_none());
+        let generation = availability
+            .snapshot()
+            .await
+            .expect("load paused generation")
+            .activity_generation();
+
+        assert!(
+            manager
+                .project_set_always_on(&project_path, true)
+                .await
+                .expect("renew Always On")
+        );
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("reload resumed policy");
+        assert_eq!(snapshot.activity_generation(), generation + 1);
+        assert!(!snapshot.is_paused());
+        assert!(snapshot.always_on());
+        let resumed_controller = manager
+            .get_service_controller("resume:web")
+            .await
+            .expect("resumed Always On runtime");
+        assert!(!Arc::ptr_eq(&first_controller, &resumed_controller));
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed runtime");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_managed_start_cannot_bypass_pause() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("start-paused-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "start-paused").await;
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "start-paused"
+domain = "start-paused.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+        )
+        .expect("write paused project config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load project availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("acquire manual demand");
+        availability.pause_project().await.expect("pause project");
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("paused start converges down");
+
+        assert!(manager.services.lock().await.is_empty());
+        assert!(
+            manager
+                .watchers
+                .lock()
+                .await
+                .contains_key(&ProcessManager::canonicalize_path(&project_path))
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("start-paused.localhost")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_first_pause_cancels_in_flight_legacy_start() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("pause-race-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "pause-race").await;
+        write_availability_worker_config(
+            &project_path,
+            "pause-race",
+            "pause-race.localhost",
+            &["web"],
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: entered.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let start_manager = manager.clone();
+        let start_path = project_path.clone();
+        let start = tokio::spawn(async move { start_manager.start(start_path, None, false).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("startup reaches blocking controller");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.project_pause_availability(&project_path),
+        )
+        .await
+        .expect("pause cancels startup promptly")
+        .expect("pause convergence succeeds");
+        tokio::time::timeout(std::time::Duration::from_secs(1), start)
+            .await
+            .expect("cancelled start returns promptly")
+            .expect("start task joins")
+            .expect("superseded start converges to pause");
+
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("pause-race:web")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn started_service_ownership_is_durable_while_readiness_is_blocked() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("durable-start-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "durable-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "durable-start",
+            "durable-start.localhost",
+            &["web"],
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: entered.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("service starts and enters its readiness wait");
+
+        let expected_identity = PersistedProcessIdentity {
+            start_time: 1_234,
+            process_group_id: 41,
+            executable: Some(PathBuf::from("/test/unready-worker")),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let persisted = manager
+                    .state_manager
+                    .load()
+                    .await
+                    .expect("load runtime state during readiness");
+                if persisted.services.iter().any(|service| {
+                    service.name == "durable-start:web"
+                        && service.status == ServiceState::Running
+                        && service.pid == Some(41)
+                        && service.process_identity.as_ref() == Some(&expected_identity)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spawn ownership becomes durable before readiness completes");
+        assert!(
+            !start.is_finished(),
+            "startup remains blocked on readiness after ownership publication"
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause cancels the blocked startup");
+        start
+            .await
+            .expect("join cancelled startup")
+            .expect("blocked startup converges to pause");
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_spawn_ownership_publication_stops_the_started_service() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("failed-publication-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "failed-publication").await;
+        write_availability_worker_config(
+            &project_path,
+            "failed-publication",
+            "failed-publication.localhost",
+            &["web"],
+        );
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        std::fs::create_dir(dir.path().join("state.json"))
+            .expect("make the runtime-state destination unwritable as a file");
+
+        let error = manager
+            .start(project_path, None, false)
+            .await
+            .expect_err("ownership publication failure must fail startup");
+        assert!(format!("{error:#}").contains("failed to persist ownership"));
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("failed-publication:web")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_pause_is_not_blocked_by_unrelated_startup() {
+        let dir = tempdir().expect("create temporary directory");
+        let first_path = dir.path().join("pause-now-project");
+        let second_path = dir.path().join("slow-start-project");
+        let (mut manager, first_id, availability_data_dir) =
+            availability_manager(dir.path(), &first_path, "pause-now").await;
+        std::fs::create_dir_all(&second_path).expect("create slow-start project");
+        write_availability_worker_config(
+            &second_path,
+            "slow-start",
+            "slow-start.localhost",
+            &["web"],
+        );
+        let second_discovery = Registry::discover(
+            std::fs::canonicalize(&second_path).expect("canonical slow-start path"),
+        )
+        .await
+        .expect("discover slow-start project");
+        let second_id = manager
+            .registry
+            .lock()
+            .await
+            .register_project(second_discovery, Some("slow-start".to_owned()))
+            .expect("register slow-start project");
+
+        let mut first_availability = AvailabilityStore::load(&availability_data_dir, first_id)
+            .await
+            .expect("load first availability");
+        first_availability
+            .set_always_on(true)
+            .await
+            .expect("enable first Always On");
+        let mut second_availability = AvailabilityStore::load(&availability_data_dir, second_id)
+            .await
+            .expect("load second availability");
+        second_availability
+            .set_always_on(true)
+            .await
+            .expect("enable second Always On");
+        manager.services.lock().await.insert(
+            "pause-now:web".to_owned(),
+            availability_test_service(first_id, "pause-now", &first_path, false),
+        );
+
+        let start_entered = Arc::new(tokio::sync::Notify::new());
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: start_entered.clone(),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let slow_start = tokio::spawn({
+            let manager = manager.clone();
+            let second_path = second_path.clone();
+            async move { manager.converge_project_availability(&second_path).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), start_entered.notified())
+            .await
+            .expect("unrelated startup reaches readiness wait");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.project_pause_availability(&first_path),
+        )
+        .await
+        .expect("pause is independent of unrelated readiness")
+        .expect("pause first project");
+        assert!(
+            manager
+                .get_service_controller("pause-now:web")
+                .await
+                .is_none()
+        );
+
+        second_availability
+            .pause_project()
+            .await
+            .expect("cancel slow startup");
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
+            .await
+            .expect("slow startup observes pause")
+            .expect("join slow startup")
+            .expect("converge slow startup after pause");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_project_stop_batches_before_global_persistence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("batched-stop-project");
+        let other_path = dir.path().join("unrelated-project");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "batched-stop").await;
+        std::fs::create_dir_all(&other_path).expect("create unrelated project");
+
+        let mut web = availability_test_service(instance_id, "batched-stop", &project_path, false);
+        let mut api = availability_test_service(instance_id, "batched-stop", &project_path, false);
+        api.service_config = ServiceConfig::Legacy(ExecServiceConfig {
+            command: Some("api".to_owned()),
+            ..Default::default()
+        });
+        let unrelated = availability_test_service(
+            alternate_test_instance_id(),
+            "unrelated",
+            &other_path,
+            false,
+        );
+        web.projection_generation = 1;
+        api.projection_generation = 1;
+        let unrelated_controller = match &unrelated.runtime_state {
+            ServiceRuntime::Controller(controller) => controller.clone(),
+            ServiceRuntime::None => unreachable!("test service has a controller"),
+        };
+        {
+            let mut services = manager.services.lock().await;
+            services.insert("batched-stop:web".to_owned(), web);
+            services.insert("batched-stop:api".to_owned(), api);
+            services.insert("unrelated:web".to_owned(), unrelated);
+        }
+
+        let unrelated_guard = unrelated_controller.lock().await;
+        let pause_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let both_stopped = {
+                    let services = manager.services.lock().await;
+                    ["batched-stop:web", "batched-stop:api"]
+                        .into_iter()
+                        .all(|name| {
+                            services.get(name).is_some_and(|service| {
+                                matches!(service.runtime_state, ServiceRuntime::None)
+                            })
+                        })
+                };
+                if both_stopped {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all selected controllers stop before persistence can read unrelated state");
+        assert!(!pause_task.is_finished());
+
+        drop(unrelated_guard);
+        pause_task
+            .await
+            .expect("join batched pause")
+            .expect("finish batched pause");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_move_stops_stale_path_by_instance() {
+        let dir = tempdir().expect("create temporary directory");
+        let old_path = dir.path().join("old-location");
+        let new_path = dir.path().join("new-location");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &old_path, "moved").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load moved availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable moved Always On");
+        manager.services.lock().await.insert(
+            "moved:web".to_owned(),
+            availability_test_service(instance_id, "moved", &old_path, false),
+        );
+
+        std::fs::rename(&old_path, &new_path).expect("move project directory");
+        let canonical_new = std::fs::canonicalize(&new_path).expect("canonical moved path");
+        {
+            let mut registry = manager.registry.lock().await;
+            let record = registry
+                .instances
+                .get_mut(&instance_id)
+                .expect("moved instance record");
+            record.current_path = Some(canonical_new.clone());
+            record.last_known_path = canonical_new.clone();
+            record.presence = CatalogPresence::Active;
+            registry
+                .legacy_paths
+                .retain(|_, candidate| *candidate != instance_id);
+            registry.legacy_paths.insert(canonical_new, instance_id);
+        }
+
+        manager
+            .project_pause_availability(&new_path)
+            .await
+            .expect("pause moved project");
+        assert!(manager.get_service_controller("moved:web").await.is_none());
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload moved availability")
+                .is_paused()
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_instance_config_reload_restarts_stale_path_runtime_by_identity() {
+        let dir = tempdir().expect("create temporary directory");
+        let old_path = dir.path().join("reload-old-location");
+        let new_path = dir.path().join("reload-new-location");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &old_path, "move-reload").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager.services.lock().await.insert(
+            "move-reload:web".to_owned(),
+            availability_test_service(instance_id, "move-reload", &old_path, false),
+        );
+
+        std::fs::rename(&old_path, &new_path).expect("move reload project directory");
+        write_availability_worker_config(
+            &new_path,
+            "move-reload",
+            "move-reload.localhost",
+            &["web"],
+        );
+        let canonical_new = std::fs::canonicalize(&new_path).expect("canonical moved reload path");
+        {
+            let mut registry = manager.registry.lock().await;
+            let record = registry
+                .instances
+                .get_mut(&instance_id)
+                .expect("moved reload instance record");
+            record.current_path = Some(canonical_new.clone());
+            record.last_known_path = canonical_new.clone();
+            record.presence = CatalogPresence::Active;
+            registry
+                .legacy_paths
+                .insert(canonical_new.clone(), instance_id);
+        }
+
+        manager
+            .apply_config_for_instance(canonical_new.clone(), None, false, Some(instance_id), false)
+            .await
+            .expect("reload moved project with a restart-required change");
+
+        let services = manager.services.lock().await;
+        let service = services
+            .get("move-reload:web")
+            .expect("restarted moved service");
+        assert_eq!(service.instance_id, instance_id);
+        assert_eq!(service.path, canonical_new);
+        assert!(matches!(
+            service.runtime_state,
+            ServiceRuntime::Controller(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_remove_moved_instance_stops_stale_path_runtime() {
+        let dir = tempdir().expect("create temporary directory");
+        let old_path = dir.path().join("remove-old-location");
+        let new_path = dir.path().join("remove-new-location");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &old_path, "remove-moved").await;
+        manager.services.lock().await.insert(
+            "remove-moved:web".to_owned(),
+            availability_test_service(instance_id, "remove-moved", &old_path, false),
+        );
+        manager.watch_config(old_path.clone()).await;
+        let canonical_old = ProcessManager::canonicalize_path(&old_path);
+        assert!(manager.watchers.lock().await.contains_key(&canonical_old));
+
+        std::fs::rename(&old_path, &new_path).expect("move removable project directory");
+        let canonical_new =
+            std::fs::canonicalize(&new_path).expect("canonical removable moved path");
+        {
+            let mut registry = manager.registry.lock().await;
+            let record = registry
+                .instances
+                .get_mut(&instance_id)
+                .expect("removable moved instance record");
+            record.current_path = Some(canonical_new.clone());
+            record.last_known_path = canonical_new.clone();
+            registry.legacy_paths.insert(canonical_new, instance_id);
+        }
+
+        manager
+            .remove_project(&new_path)
+            .await
+            .expect("remove moved project");
+
+        assert!(
+            manager
+                .get_service_controller("remove-moved:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&instance_id)
+        );
+        assert!(!manager.watchers.lock().await.contains_key(&canonical_old));
+        assert!(
+            manager
+                .forgotten_reload_paths
+                .lock()
+                .await
+                .contains(&canonical_old)
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_remove_moved_instance_preserves_reused_path_watcher() {
+        let dir = tempdir().expect("create temporary directory");
+        let reused_path = dir.path().join("shared-location");
+        let moved_path = dir.path().join("moved-location");
+        let (mut manager, moved_id, _availability_data_dir) =
+            availability_manager(dir.path(), &reused_path, "moved-owner").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager.services.lock().await.insert(
+            "moved-owner:web".to_owned(),
+            availability_test_service(moved_id, "moved-owner", &reused_path, false),
+        );
+
+        std::fs::rename(&reused_path, &moved_path).expect("move first project");
+        let canonical_moved = std::fs::canonicalize(&moved_path).expect("canonical moved path");
+        std::fs::create_dir_all(&reused_path).expect("recreate reused path");
+        write_availability_worker_config(
+            &reused_path,
+            "replacement",
+            "replacement.localhost",
+            &["web"],
+        );
+        let replacement_discovery = Registry::discover(
+            std::fs::canonicalize(&reused_path).expect("canonical replacement path"),
+        )
+        .await
+        .expect("discover replacement project");
+        let replacement_id = {
+            let mut registry = manager.registry.lock().await;
+            let moved = registry
+                .instances
+                .get_mut(&moved_id)
+                .expect("moved owner record");
+            moved.current_path = Some(canonical_moved.clone());
+            moved.last_known_path = canonical_moved.clone();
+            moved.presence = CatalogPresence::Active;
+            registry
+                .legacy_paths
+                .retain(|_, candidate| *candidate != moved_id);
+            registry
+                .legacy_paths
+                .insert(canonical_moved.clone(), moved_id);
+            registry
+                .register_project(replacement_discovery, Some("replacement".to_owned()))
+                .expect("register replacement project")
+        };
+        assert_ne!(replacement_id, moved_id);
+        manager.watch_config(reused_path.clone()).await;
+        let canonical_reused = ProcessManager::canonicalize_path(&reused_path);
+        assert!(
+            manager
+                .watchers
+                .lock()
+                .await
+                .contains_key(&canonical_reused)
+        );
+
+        manager
+            .remove_project(&moved_path)
+            .await
+            .expect("remove moved owner");
+        assert!(
+            manager
+                .watchers
+                .lock()
+                .await
+                .contains_key(&canonical_reused)
+        );
+        assert!(
+            !manager
+                .forgotten_reload_paths
+                .lock()
+                .await
+                .contains(&canonical_reused)
+        );
+
+        manager
+            .reload_config(reused_path.clone())
+            .await
+            .expect("reload replacement project");
+        assert!(
+            manager
+                .get_service_controller("replacement:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&replacement_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_stale_start_cannot_reregister_removed_instance() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("stale-start-project");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "stale-start").await;
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove project before stale start");
+        let error = manager
+            .start_catalogued_instance(instance_id, project_path, None, false)
+            .await
+            .expect_err("captured start cannot restore removed identity");
+
+        assert!(format!("{error:#}").contains("no active path"));
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&instance_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_removed_watcher_cannot_resurrect_project() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("forgotten-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "forgotten").await;
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "forgotten"
+domain = "forgotten.localhost"
+
+[services.web]
+type = "worker"
+command = "ignored"
+"#,
+        )
+        .expect("write forgotten project config");
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load forgotten availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable forgotten Always On");
+        manager
+            .converge_project_availability(&project_path)
+            .await
+            .expect("start forgotten project");
+        let canonical = ProcessManager::canonicalize_path(&project_path);
+        assert!(manager.watchers.lock().await.contains_key(&canonical));
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove forgotten project");
+        assert!(!manager.watchers.lock().await.contains_key(&canonical));
+
+        manager
+            .reload_config(project_path.clone())
+            .await
+            .expect("ignore queued reload after removal");
+        assert!(manager.services.lock().await.is_empty());
+        assert!(manager.registry.lock().await.instances.is_empty());
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("forgotten.localhost")
+                .is_none()
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("explicit start re-registers forgotten path");
+        let (replacement_id, _) = manager
+            .availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve replacement instance");
+        assert_ne!(replacement_id, instance_id);
+        assert!(manager.watchers.lock().await.contains_key(&canonical));
+        assert!(
+            manager
+                .get_service_controller("forgotten:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_missing_instance_cannot_stop_reused_path() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reused-location");
+        let (manager, missing_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "missing").await;
+        let replacement_id = alternate_test_instance_id();
+        let mut availability = AvailabilityStore::load(&availability_data_dir, missing_id)
+            .await
+            .expect("load missing availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed missing demand");
+        availability
+            .pause_project()
+            .await
+            .expect("pause missing instance");
+
+        {
+            let mut registry = manager.registry.lock().await;
+            let original = registry
+                .instances
+                .get(&missing_id)
+                .expect("missing instance record")
+                .clone();
+            let missing = registry
+                .instances
+                .get_mut(&missing_id)
+                .expect("mutable missing instance record");
+            missing.current_path = None;
+            missing.presence = CatalogPresence::Missing;
+
+            let mut replacement = original;
+            replacement.id = replacement_id;
+            replacement.current_path = Some(replacement.last_known_path.clone());
+            replacement.presence = CatalogPresence::Active;
+            registry.instances.insert(replacement_id, replacement);
+            registry
+                .legacy_paths
+                .insert(project_path.clone(), replacement_id);
+        }
+        manager.services.lock().await.insert(
+            "replacement:web".to_owned(),
+            availability_test_service(replacement_id, "replacement", &project_path, false),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "replacement",
+            "replacement.localhost",
+            &["web"],
+        );
+
+        let error = manager
+            .apply_config_for_instance(project_path.clone(), None, false, Some(missing_id), false)
+            .await
+            .expect_err("stale convergence cannot apply config to replacement identity");
+        assert!(format!("{error:#}").contains("project identity changed"));
+
+        manager.converge_all_project_availability().await;
+
+        assert!(
+            manager
+                .get_service_controller("replacement:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_reload_defers_until_cooldown_resume() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("cooldown-reload-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "cooldown-reload").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "cooldown-reload",
+            "first.localhost",
+            &["web"],
+        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("start cooldown reload project");
+        let controller = manager
+            .get_service_controller("cooldown-reload:web")
+            .await
+            .expect("initial cooldown runtime");
+        manager
+            .project_set_always_on(&project_path, false)
+            .await
+            .expect("enter cooldown");
+
+        write_availability_worker_config(
+            &project_path,
+            "cooldown-reload",
+            "second.localhost",
+            &["web"],
+        );
+        manager
+            .reload_config(project_path.clone())
+            .await
+            .expect("record running cooldown reload");
+
+        assert!(Arc::ptr_eq(
+            &controller,
+            &manager
+                .get_service_controller("cooldown-reload:web")
+                .await
+                .expect("cooldown keeps the original runtime")
+        ));
+        assert!(
+            manager
+                .resolve_service_by_domain("first.localhost")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("resume and apply pending reload");
+
+        let reloaded = manager
+            .get_service_controller("cooldown-reload:web")
+            .await
+            .expect("reloaded cooldown runtime");
+        assert!(Arc::ptr_eq(&controller, &reloaded));
+        assert!(
+            manager
+                .resolve_service_by_domain("first.localhost")
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .resolve_service_by_domain("second.localhost")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up cooldown runtime");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_reload_rechecks_authority_before_stopping_runtime() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reload-authority-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "reload-authority").await;
+        write_availability_worker_config(
+            &project_path,
+            "reload-authority",
+            "reload-authority.localhost",
+            &["web"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load reload authority state");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable reload authority Always On");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingStatusController {
+                entered: entered.clone(),
+                release: release.clone(),
+                state: RuntimeState {
+                    pid: Some(77),
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            }));
+        let mut service =
+            availability_test_service(instance_id, "reload-authority", &project_path, false);
+        service.runtime_state = ServiceRuntime::Controller(controller.clone());
+        manager
+            .services
+            .lock()
+            .await
+            .insert("reload-authority:web".to_owned(), service);
+
+        let reload_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.reload_config(project_path).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("reload observes existing runtime");
+        availability
+            .set_always_on(false)
+            .await
+            .expect("disable Always On before destructive reload boundary");
+        release.notify_one();
+        reload_task
+            .await
+            .expect("join reload task")
+            .expect("defer reload during cooldown");
+
+        let retained = manager
+            .get_service_controller("reload-authority:web")
+            .await
+            .expect("retain original controller");
+        assert!(Arc::ptr_eq(&retained, &controller));
+        assert!(
+            manager
+                .pending_config_reloads
+                .lock()
+                .await
+                .contains(&instance_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_cooldown_reload_never_starts_stopped_runtime() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("stopped-cooldown-reload-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "stopped-cooldown-reload").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "stopped-cooldown-reload",
+            "stopped-new.localhost",
+            &["web"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load stopped cooldown availability");
+        let manual = DemandKey::manual_cli();
+        availability
+            .ensure_demand(manual.clone())
+            .await
+            .expect("seed stopped cooldown demand");
+        availability
+            .release_demand(&manual)
+            .await
+            .expect("enter stopped cooldown");
+        let stopped_controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "stopped-cooldown-reload:web",
+                RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Stopped,
+                    health_status: HealthStatus::Unknown,
+                },
+            )));
+        let mut service = test_service(
+            test_config_with_domain("stopped-cooldown-reload", "stopped-old.localhost"),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(stopped_controller.clone()),
+            std::fs::canonicalize(&project_path).expect("canonical stopped cooldown path"),
+        );
+        service.instance_id = instance_id;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("stopped-cooldown-reload:web".to_owned(), service);
+
+        manager
+            .reload_config(project_path.clone())
+            .await
+            .expect("defer stopped cooldown reload");
+
+        let retained = manager
+            .get_service_controller("stopped-cooldown-reload:web")
+            .await
+            .expect("retain stopped controller projection");
+        assert!(Arc::ptr_eq(&stopped_controller, &retained));
+        assert!(
+            manager
+                .resolve_service_by_domain("stopped-new.localhost")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_retries_partial_start_before_clearing_error() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("partial-retry-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "partial-retry").await;
+        let failure_consumed = Arc::new(AtomicBool::new(false));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: failure_consumed.clone(),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "partial-retry",
+            "partial-retry.localhost",
+            &["first", "second"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load partial retry availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable retry Always On");
+
+        let error = manager
+            .converge_project_availability(&project_path)
+            .await
+            .expect_err("first partial start fails");
+        assert!(format!("{error:#}").contains("injected prepare failure"));
+        assert!(failure_consumed.load(Ordering::SeqCst));
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload partial failure")
+                .last_convergence_error()
+                .is_some()
+        );
+
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("retry partial start"),
+            Some(ConvergenceDecision::EnsureUp)
+        );
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload successful retry")
+                .last_convergence_error(),
+            None
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up retry runtimes");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_restore_retires_paused_runtime_snapshot() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("restore-paused-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "restore-paused").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load restore availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed restore demand");
+        availability
+            .pause_project()
+            .await
+            .expect("pause restore project");
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "restore-paused:web".to_owned(),
+                    config: test_config_with_domain("restore-paused", "restore-paused.localhost"),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist stale runtime snapshot");
+
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile paused runtime evidence");
+        manager.restore_policy_owned_projects(restore_plan).await;
+
+        let restored_evidence = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload retired runtime snapshot");
+        assert!(restored_evidence.services.is_empty());
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_a_start_already_queued_on_runtime_projection() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("shutdown-gate-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "shutdown-gate").await;
+        write_availability_worker_config(
+            &project_path,
+            "shutdown-gate",
+            "shutdown-gate.localhost",
+            &["web"],
+        );
+        let creates = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CountingStartFactory {
+                creates: creates.clone(),
+            }),
+        );
+
+        let runtime_guard = manager.runtime_projection_lock.lock().await;
+        let (_, transition_lock) = manager.transition_lock_for_path(&project_path).await;
+        let start_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if transition_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("start queues behind the runtime projection");
+
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its start gate");
+        drop(runtime_guard);
+
+        let error = start_task
+            .await
+            .expect("join queued start")
+            .expect_err("queued start is rejected after shutdown begins");
+        assert!(error.downcast_ref::<DaemonShuttingDown>().is_some());
+        shutdown_task
+            .await
+            .expect("join shutdown")
+            .expect("finish shutdown");
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_a_stop_already_queued_on_runtime_projection() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("shutdown-stop-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "shutdown-stop").await;
+        write_availability_worker_config(
+            &project_path,
+            "shutdown-stop",
+            "shutdown-stop.localhost",
+            &["web"],
+        );
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start shutdown-stop project");
+        let persisted_before = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load running state before shutdown");
+        assert_eq!(persisted_before.services.len(), 1);
+        assert_eq!(persisted_before.services[0].status, ServiceState::Running);
+
+        let runtime_guard = manager.runtime_projection_lock.lock().await;
+        let (_, transition_lock) = manager.transition_lock_for_path(&project_path).await;
+        let stop_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.stop("shutdown-stop:web").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if transition_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop queues behind the runtime projection");
+
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its lifecycle gate");
+        drop(runtime_guard);
+
+        let error = stop_task
+            .await
+            .expect("join queued stop")
+            .expect_err("queued stop is rejected after shutdown begins");
+        assert!(error.downcast_ref::<DaemonShuttingDown>().is_some());
+        shutdown_task
+            .await
+            .expect("join shutdown")
+            .expect("finish shutdown");
+
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        let persisted_after = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload state after shutdown");
+        assert_eq!(persisted_after.services.len(), 1);
+        assert_eq!(persisted_after.services[0].status, ServiceState::Running);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_inflight_availability_stop_before_teardown() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("shutdown-convergence-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "shutdown-convergence").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load shutdown-convergence availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable Always On before pause");
+
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let first_stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first_stop = Arc::new(tokio::sync::Notify::new());
+        let mut service =
+            availability_test_service(instance_id, "shutdown-convergence", &project_path, false);
+        service.runtime_state =
+            ServiceRuntime::Controller(Arc::new(Mutex::new(BlockingFailStopController {
+                id: "shutdown-convergence:web".to_owned(),
+                state: RuntimeState {
+                    pid: Some(44),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+                stop_attempts: stop_attempts.clone(),
+                first_stop_entered: first_stop_entered.clone(),
+                release_first_stop: release_first_stop.clone(),
+            })));
+        manager
+            .services
+            .lock()
+            .await
+            .insert("shutdown-convergence:web".to_owned(), service);
+        manager.persist_state().await;
+
+        let pause_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first_stop_entered.notified(),
+        )
+        .await
+        .expect("availability stop enters its controller");
+
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its lifecycle gate");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!shutdown_task.is_finished());
+        assert!(
+            manager
+                .get_service_controller("shutdown-convergence:web")
+                .await
+                .is_some()
+        );
+
+        release_first_stop.notify_one();
+        let pause_error = pause_task
+            .await
+            .expect("join availability pause")
+            .expect_err("injected availability stop failure surfaces");
+        assert!(format!("{pause_error:#}").contains("injected stop failure"));
+        shutdown_task
+            .await
+            .expect("join shutdown")
+            .expect("finish shutdown after convergence drains");
+
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload convergence state after shutdown");
+        assert_eq!(persisted.services.len(), 1);
+        assert_eq!(persisted.services[0].status, ServiceState::Running);
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_an_attachment_write_queued_before_teardown() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("shutdown-attachment-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "shutdown-attachment").await;
+        let transition_guard = manager.attachment_transition_lock.lock().await;
+        let attach_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .project_attach(
+                        project_path,
+                        AttachmentSource::Editor {
+                            name: "vscode".to_owned(),
+                            id: "shutdown-window".to_owned(),
+                            pid: Some(std::process::id()),
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its attachment gate");
+        drop(transition_guard);
+
+        let error = attach_task
+            .await
+            .expect("join queued attachment")
+            .expect_err("queued attachment is rejected after shutdown begins");
+        assert!(error.downcast_ref::<DaemonShuttingDown>().is_some());
+        shutdown_task
+            .await
+            .expect("join shutdown")
+            .expect("finish shutdown");
+        assert!(manager.attachments.lock().await.all_projects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_rejects_a_pause_queued_before_availability_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("shutdown-pause-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "shutdown-pause").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load shutdown-pause availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable Always On before queued pause");
+
+        let publication_guard = manager.availability_publication_lock.lock().await;
+        let pause_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        tokio::task::yield_now().await;
+        let shutdown_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.is_shutting_down() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes its availability-publication gate");
+        drop(publication_guard);
+
+        let error = pause_task
+            .await
+            .expect("join queued pause")
+            .expect_err("queued pause is rejected after shutdown begins");
+        assert!(error.downcast_ref::<DaemonShuttingDown>().is_some());
+        shutdown_task
+            .await
+            .expect("join shutdown")
+            .expect("finish shutdown");
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("reload availability after shutdown");
+        assert!(snapshot.always_on());
+        assert!(!snapshot.is_paused());
+    }
+
+    #[tokio::test]
+    async fn runtime_persistence_ignores_status_pids_without_a_cleanup_handle() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("process-identity-project");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "process-identity").await;
+        let identity = PersistedProcessIdentity {
+            start_time: 1234,
+            process_group_id: 42,
+            executable: Some(PathBuf::from("/bin/controller-owned")),
+        };
+        let controller = Arc::new(Mutex::new(TestController {
+            id: "process-identity:web".to_owned(),
+            state: RuntimeState {
+                pid: Some(42),
+                port: Some(3000),
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+            fail_stop: false,
+            process_identity: Some(identity.clone()),
+        }));
+        let runtime_controller: Arc<Mutex<dyn ServiceController>> = controller.clone();
+        let mut service =
+            availability_test_service(instance_id, "process-identity", &project_path, false);
+        service.runtime_state = ServiceRuntime::Controller(runtime_controller);
+        manager
+            .services
+            .lock()
+            .await
+            .insert("process-identity:web".to_owned(), service);
+
+        manager.persist_state().await;
+        let running = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load running controller identity");
+        assert_eq!(running.services[0].pid, Some(42));
+        assert_eq!(running.services[0].process_identity, Some(identity));
+
+        controller.lock().await.state.status = ServiceState::Stopped;
+        manager.persist_state().await;
+        let stopped = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load stopped controller identity");
+        assert_eq!(stopped.services[0].pid, None);
+        assert_eq!(stopped.services[0].process_identity, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_persistence_retains_a_stopped_leaders_live_group_ownership() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("leaderless-group-project");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "leaderless-group").await;
+        let runtime = crate::runtime::process::ProcessRuntime::new(dir.path().join("notify.sock"));
+        let service_config = ServiceConfig::Legacy(ExecServiceConfig {
+            command: Some("trap '' HUP; set +m; sleep 30 & exec sleep 0.2".to_owned()),
+            ..Default::default()
+        });
+        let controller = Arc::new(Mutex::new(ExecController::new(
+            "leaderless-group:web".to_owned(),
+            runtime.clone(),
+            service_config.clone(),
+            project_path.clone(),
+            None,
+            HashMap::new(),
+        )));
+        controller
+            .lock()
+            .await
+            .start()
+            .await
+            .expect("start process-group leader");
+        let (spawn_pid, spawn_identity) = {
+            let controller = controller.lock().await;
+            (
+                controller
+                    .owned_process_id()
+                    .expect("capture process-group leader PID"),
+                controller
+                    .process_identity()
+                    .expect("capture process-group identity"),
+            )
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if controller.lock().await.read_state().await.status == ServiceState::Stopped {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process-group leader did not exit before the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            runtime
+                .owned_process_or_group_exists(spawn_pid, &spawn_identity)
+                .expect("inspect leaderless process group"),
+            "the leader exits while its descendant group remains live (PID {spawn_pid}, PGID {})",
+            spawn_identity.process_group_id
+        );
+
+        let runtime_controller: Arc<Mutex<dyn ServiceController>> = controller;
+        let mut service =
+            availability_test_service(instance_id, "leaderless-group", &project_path, false);
+        service.service_config = service_config;
+        service.runtime_state = ServiceRuntime::Controller(runtime_controller);
+        manager
+            .services
+            .lock()
+            .await
+            .insert("leaderless-group:web".to_owned(), service);
+
+        manager
+            .persist_state_checked()
+            .await
+            .expect("persist stopped leader ownership");
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload stopped leader ownership");
+        let persisted = persisted
+            .services
+            .iter()
+            .find(|service| service.name == "leaderless-group:web")
+            .expect("persist leaderless service");
+        assert_eq!(persisted.status, ServiceState::Stopped);
+        assert_eq!(persisted.pid, Some(spawn_pid));
+        assert_eq!(persisted.process_identity.as_ref(), Some(&spawn_identity));
+
+        manager
+            .stop("leaderless-group:web")
+            .await
+            .expect("stop and confirm the leaderless process group");
+        let stopped = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload state after confirmed cleanup");
+        let stopped = stopped
+            .services
+            .iter()
+            .find(|service| service.name == "leaderless-group:web")
+            .expect("retain stopped service record");
+        assert_eq!(stopped.pid, None);
+        assert_eq!(stopped.process_identity, None);
+    }
+
+    #[test]
+    fn stale_runtime_cleanup_rejects_reserved_and_current_group_identifiers() {
+        let runtime = crate::runtime::process::ProcessRuntime::new(PathBuf::from("notify.sock"));
+        for operation in [
+            runtime.capture_process_identity(1).map(|_| ()),
+            runtime.unverified_stale_process_exists(1).map(|_| ()),
+        ] {
+            assert!(
+                format!("{}", operation.expect_err("PID 1 must be rejected"))
+                    .contains("reserved process ID 1")
+            );
+        }
+
+        let process_group = u32::try_from(nix::unistd::getpgrp().as_raw())
+            .expect("current process-group ID is positive");
+        if process_group != std::process::id() {
+            for operation in [
+                runtime.capture_process_identity(process_group).map(|_| ()),
+                runtime
+                    .unverified_stale_process_exists(process_group)
+                    .map(|_| ()),
+            ] {
+                assert!(
+                    format!(
+                        "{}",
+                        operation.expect_err("the current process group must be rejected")
+                    )
+                    .contains("current locald process group")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_runtime_cleanup_rejects_a_mismatched_process_identity() {
+        let runtime = crate::runtime::process::ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn identity test process");
+        let pid = child.id();
+        let mut identity = runtime
+            .capture_process_identity(pid)
+            .expect("inspect identity test process")
+            .expect("identity test process is live");
+        identity.start_time = identity.start_time.saturating_add(1);
+
+        let error = runtime
+            .verify_stale_process(pid, &identity)
+            .expect_err("mismatched process identity must fail closed");
+        assert!(format!("{error:#}").contains("was reused"));
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect identity test process")
+                .is_none()
+        );
+        child.kill().expect("terminate identity test process");
+        child.wait().expect("reap identity test process");
+    }
+
+    #[test]
+    fn stale_runtime_identity_survives_exec_with_the_same_process_birth() {
+        let runtime = crate::runtime::process::ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.5; exec sleep 2")
+            .spawn()
+            .expect("spawn exec identity test process");
+        let pid = child.id();
+        let identity = runtime
+            .capture_process_identity(pid)
+            .expect("inspect shell identity")
+            .expect("shell process is live");
+        let initial_executable = identity
+            .executable
+            .clone()
+            .expect("shell executable is observable");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let observed_after_exec = loop {
+            let observed = runtime
+                .capture_process_identity(pid)
+                .expect("inspect process across exec")
+                .expect("exec process remains live");
+            if observed.executable.as_ref() != Some(&initial_executable) {
+                break observed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test process did not exec before the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        assert_eq!(observed_after_exec.start_time, identity.start_time);
+        assert_eq!(
+            observed_after_exec.process_group_id,
+            identity.process_group_id
+        );
+        assert!(
+            runtime
+                .verify_stale_process(pid, &identity)
+                .expect("verify process after exec")
+                .is_some()
+        );
+
+        child.kill().expect("terminate exec identity test process");
+        child.wait().expect("reap exec identity test process");
+    }
+
+    #[test]
+    fn stale_runtime_cleanup_preserves_a_verified_group_after_its_leader_exits() {
+        let runtime = crate::runtime::process::ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut leader = Command::new("sh");
+        leader
+            .arg("-c")
+            .arg("sleep 30 & exec sleep 0.2")
+            .process_group(0);
+        let mut leader = leader.spawn().expect("spawn stale process-group leader");
+        let pid = leader.id();
+        let identity = runtime
+            .capture_process_identity(pid)
+            .expect("inspect stale process-group leader")
+            .expect("stale process-group leader is live");
+        assert_eq!(
+            identity.process_group_id,
+            i32::try_from(pid).expect("test process ID fits i32")
+        );
+        leader.wait().expect("reap stale process-group leader");
+
+        let error = runtime
+            .verify_stale_process(pid, &identity)
+            .expect_err("live orphaned group must preserve cleanup evidence");
+        assert!(format!("{error:#}").contains("verified process group"));
+
+        let group = i32::try_from(pid).expect("test process-group ID fits i32");
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => panic!("terminate stale test process group: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_reconciliation_restores_catalogued_legacy_project() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-restore-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-restore").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "legacy-restore",
+            "legacy-restore.localhost",
+            &["web"],
+        );
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "legacy-restore:web".to_owned(),
+                    config: test_config_with_domain("legacy-restore", "legacy-restore.localhost"),
+                    path: project_path,
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist legacy Running evidence");
+
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile legacy runtime evidence");
+        manager.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(
+            manager
+                .get_service_controller("legacy-restore:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_daemon_restores_an_availability_managed_always_on_project() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("always-on-restore-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "always-on-restore").await;
+        write_availability_worker_config(
+            &project_path,
+            "always-on-restore",
+            "always-on-restore.localhost",
+            &["web"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load Always On restore policy");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("persist Always On restore policy");
+        manager
+            .state_manager
+            .save(&ServerState::default())
+            .await
+            .expect("persist empty runtime snapshot");
+        drop(manager);
+
+        let catalog =
+            Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(dir.path()))
+                .await
+                .expect("reload Always On catalog");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create fresh Always On manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        fresh.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let restore_plan = fresh
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile empty runtime snapshot");
+        fresh.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(
+            fresh
+                .get_service_controller("always-on-restore:web")
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            fresh
+                .services
+                .lock()
+                .await
+                .get("always-on-restore:web")
+                .expect("restored Always On service")
+                .instance_id,
+            instance_id
+        );
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("reload Always On policy after restore");
+        assert!(snapshot.always_on());
+        assert!(!snapshot.is_paused());
+        assert_eq!(snapshot.last_convergence_error(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_restore_evidence_survives_for_fresh_retry() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-retry-project");
+        let (mut manager, _instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-retry").await;
+        write_availability_worker_config(
+            &project_path,
+            "legacy-retry",
+            "legacy-retry.localhost",
+            &["first", "second"],
+        );
+        let failure_consumed = Arc::new(AtomicBool::new(false));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareWithoutPidFactory {
+                failure_consumed: failure_consumed.clone(),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "legacy-retry:intent".to_owned(),
+                    config: test_config_with_domain("legacy-retry", "legacy-retry.localhost"),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist retryable legacy intent");
+
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile retryable legacy intent");
+        manager.restore_policy_owned_projects(restore_plan).await;
+        assert!(failure_consumed.load(Ordering::SeqCst));
+        let failed_snapshot = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload failed legacy restore snapshot");
+        assert!(failed_snapshot.services.iter().any(|service| {
+            service.name == "legacy-retry:intent" && service.status == ServiceState::Running
+        }));
+
+        let catalog =
+            Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(dir.path()))
+                .await
+                .expect("reload retry catalog");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create fresh retry manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        fresh.factories.insert(
+            0,
+            Arc::new(RetryPrepareWithoutPidFactory {
+                failure_consumed,
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let retry_plan = fresh
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile preserved retry intent");
+        fresh.restore_policy_owned_projects(retry_plan).await;
+
+        assert!(
+            fresh
+                .get_service_controller("legacy-retry:first")
+                .await
+                .is_some()
+        );
+        assert!(
+            fresh
+                .get_service_controller("legacy-retry:second")
+                .await
+                .is_some()
+        );
+        assert!(
+            !fresh
+                .state_manager
+                .load()
+                .await
+                .expect("reload successful retry snapshot")
+                .services
+                .iter()
+                .any(|service| service.name == "legacy-retry:intent")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_stop_reports_legacy_restore_that_has_not_materialized() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-service-stop").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "legacy-service-stop",
+            "legacy-service-stop.localhost",
+            &["web"],
+        );
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "legacy-service-stop:web".to_owned(),
+                    config: test_config_with_domain(
+                        "legacy-service-stop",
+                        "legacy-service-stop.localhost",
+                    ),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist pending service restore");
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile pending service restore");
+
+        let error = manager
+            .stop("legacy-service-stop:web")
+            .await
+            .expect_err("pending service stop must be explicit");
+        let pending = error
+            .downcast_ref::<ServiceRestorePending>()
+            .expect("pending restore error type");
+        assert_eq!(pending.name, "legacy-service-stop:web");
+        assert_eq!(pending.instance_id, instance_id);
+        assert!(manager.services.lock().await.is_empty());
+
+        manager.restore_policy_owned_projects(restore_plan).await;
+        assert!(
+            manager
+                .get_service_controller("legacy-service-stop:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_stop_retires_pending_restore_evidence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-stop-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-stop").await;
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "legacy-stop:web".to_owned(),
+                    config: test_config_with_domain("legacy-stop", "legacy-stop.localhost"),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist legacy stop intent");
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile legacy stop evidence");
+
+        manager
+            .stop_project(&project_path)
+            .await
+            .expect("explicitly stop legacy project");
+        manager.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(
+            manager
+                .state_manager
+                .load()
+                .await
+                .expect("reload stopped legacy state")
+                .services
+                .is_empty()
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_reconciliation_does_not_retarget_ambiguous_reused_path() {
+        let dir = tempdir().expect("create temporary directory");
+        let old_path = dir.path().join("legacy-old-path");
+        let moved_path = dir.path().join("legacy-moved-path");
+        let (mut manager, moved_id, _availability_data_dir) =
+            availability_manager(dir.path(), &old_path, "legacy-moved").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        std::fs::rename(&old_path, &moved_path).expect("move legacy project");
+        let canonical_moved =
+            std::fs::canonicalize(&moved_path).expect("canonical moved legacy path");
+        std::fs::create_dir_all(&old_path).expect("recreate legacy path");
+        write_availability_worker_config(
+            &old_path,
+            "legacy-replacement",
+            "legacy-replacement.localhost",
+            &["web"],
+        );
+        let canonical_old = std::fs::canonicalize(&old_path).expect("canonical reused legacy path");
+        let replacement_discovery = Registry::discover(canonical_old.clone())
+            .await
+            .expect("discover legacy replacement");
+        let replacement_id = {
+            let mut registry = manager.registry.lock().await;
+            let moved = registry
+                .instances
+                .get_mut(&moved_id)
+                .expect("moved legacy instance");
+            moved.current_path = Some(canonical_moved.clone());
+            // Retain the old locator as historical evidence so the path-only
+            // runtime record is explicitly ambiguous.
+            moved.last_known_path = canonical_old.clone();
+            moved.presence = CatalogPresence::Active;
+            registry.legacy_paths.insert(canonical_moved, moved_id);
+            let replacement_id = registry
+                .register_project(replacement_discovery, Some("legacy-replacement".to_owned()))
+                .expect("register legacy replacement");
+            let moved = registry
+                .instances
+                .get_mut(&moved_id)
+                .expect("missing legacy instance");
+            moved.current_path = None;
+            moved.last_known_path = canonical_old.clone();
+            moved.presence = CatalogPresence::Missing;
+            replacement_id
+        };
+        assert_ne!(replacement_id, moved_id);
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "legacy-moved:web".to_owned(),
+                    config: test_config_with_domain("legacy-moved", "legacy-moved.localhost"),
+                    path: canonical_old,
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist ambiguous legacy Running evidence");
+
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile ambiguous legacy runtime evidence");
+        manager.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(manager.services.lock().await.is_empty());
+        assert!(
+            manager
+                .get_service_controller("legacy-replacement:web")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_reconciliation_does_not_register_unseen_replacement_worktree() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("legacy-repository");
+        std::fs::create_dir(&repository).expect("create legacy repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
+        std::fs::write(
+            repository.join("locald.toml"),
+            r#"[project]
+name = "legacy-recreated"
+domain = "legacy-recreated.localhost"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write legacy config");
+        git(&repository, &["add", "README.md", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = dir.path().join("legacy-worktree");
+        let worktree_arg = worktree.to_str().expect("UTF-8 legacy worktree path");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "first", worktree_arg],
+        );
+        let canonical_worktree =
+            std::fs::canonicalize(&worktree).expect("canonical first legacy worktree");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let stale_instance = catalog
+            .register_project(
+                Registry::discover(canonical_worktree.clone())
+                    .await
+                    .expect("discover first legacy worktree"),
+                Some("legacy-recreated".to_owned()),
+            )
+            .expect("register first legacy worktree");
+        catalog.save().await.expect("persist stale legacy catalog");
+
+        git(&repository, &["worktree", "remove", worktree_arg]);
+        git(&repository, &["worktree", "prune"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "second", worktree_arg],
+        );
+        let replacement_discovery = Registry::discover(
+            std::fs::canonicalize(&worktree).expect("canonical replacement worktree"),
+        )
+        .await
+        .expect("discover unseen replacement identity");
+        let mut expected_catalog = catalog.clone();
+        let replacement_instance = expected_catalog
+            .register_project(replacement_discovery, Some("legacy-recreated".to_owned()))
+            .expect("derive replacement identity");
+        assert_ne!(replacement_instance, stale_instance);
+
+        let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
+        state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "legacy-recreated:web".to_owned(),
+                    config: test_config_with_domain(
+                        "legacy-recreated",
+                        "legacy-recreated.localhost",
+                    ),
+                    path: canonical_worktree,
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist unregistered replacement evidence");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            state_manager,
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            dir.path().join("availability-data"),
+        )
+        .expect("create stale-catalog process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile stale worktree evidence");
+        manager.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(manager.services.lock().await.is_empty());
+        let registry = manager.registry.lock().await;
+        assert!(registry.instances.contains_key(&stale_instance));
+        assert!(!registry.instances.contains_key(&replacement_instance));
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_reconciliation_preserves_unconfirmed_process_evidence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unconfirmed-cleanup-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "unconfirmed-cleanup").await;
+        let current_pid = std::process::id();
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "unconfirmed-cleanup:web".to_owned(),
+                    config: test_config_with_domain(
+                        "unconfirmed-cleanup",
+                        "unconfirmed-cleanup.localhost",
+                    ),
+                    path: project_path,
+                    pid: Some(current_pid),
+                    process_identity: None,
+                    container_id: Some("host-unconfirmed".to_owned()),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist unconfirmed process evidence");
+
+        let error = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect_err("the current daemon process cannot be treated as stale");
+        assert!(format!("{error:#}").contains("current locald process"));
+
+        let preserved = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload preserved process evidence");
+        assert_eq!(preserved.services.len(), 1);
+        assert_eq!(preserved.services[0].pid, Some(current_pid));
+        assert_eq!(
+            preserved.services[0].container_id.as_deref(),
+            Some("host-unconfirmed")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_reconciliation_never_signals_a_live_unverified_pid() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unverified-live-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "unverified-live").await;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unverified test process");
+        let stale_pid = child.id();
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "unverified-live:web".to_owned(),
+                    config: test_config_with_domain("unverified-live", "unverified-live.localhost"),
+                    path: project_path,
+                    pid: Some(stale_pid),
+                    process_identity: None,
+                    container_id: Some("host-unverified-live".to_owned()),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist unverified live process evidence");
+
+        let error = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect_err("live unverified process requires manual recovery");
+        assert!(format!("{error:#}").contains("no verified ownership identity"));
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect unverified test process")
+                .is_none()
+        );
+        child.kill().expect("terminate unverified test process");
+        child.wait().expect("reap unverified test process");
+
+        let preserved = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload unverified process evidence");
+        assert_eq!(preserved.services[0].pid, Some(stale_pid));
+        assert!(preserved.services[0].process_identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_reconciliation_clears_confirmed_process_evidence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("confirmed-cleanup-project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "confirmed-cleanup").await;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stale test process");
+        let stale_pid = child.id();
+        let process_identity = manager
+            .runtime
+            .process
+            .capture_process_identity(stale_pid)
+            .expect("inspect stale test process")
+            .expect("stale test process is live");
+        let waiter = std::thread::spawn(move || child.wait().expect("reap stale test process"));
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "confirmed-cleanup:web".to_owned(),
+                    config: test_config_with_domain(
+                        "confirmed-cleanup",
+                        "confirmed-cleanup.localhost",
+                    ),
+                    path: project_path,
+                    pid: Some(stale_pid),
+                    process_identity: Some(process_identity),
+                    container_id: Some("host-confirmed".to_owned()),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist confirmed process evidence");
+
+        let _restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile confirmed stale process");
+        waiter.join().expect("join stale process reaper");
+
+        let reconciled = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload reconciled process evidence");
+        assert_eq!(reconciled.services.len(), 1);
+        assert_eq!(reconciled.services[0].pid, None);
+        assert_eq!(reconciled.services[0].container_id, None);
+    }
+
+    #[tokio::test]
+    async fn removed_project_is_not_restored_from_stale_running_evidence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("removed-restore-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "removed-restore").await;
+        let domain: DomainName = "removed-restore.localhost"
+            .parse()
+            .expect("valid removed project domain");
+        {
+            let mut registry = manager.registry.lock().await;
+            let mut candidate = registry.clone();
+            candidate
+                .replace_domain_claims(
+                    instance_id,
+                    [DomainClaim::service(
+                        domain.clone(),
+                        instance_id,
+                        "removed-restore:web".to_owned(),
+                    )],
+                )
+                .expect("claim removed project domain");
+            registry
+                .commit_candidate(candidate)
+                .await
+                .expect("persist removed project domain");
+            manager.domain_index.store(registry.domain_index().clone());
+        }
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load removed project availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable removed project Always On");
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "removed-restore:web".to_owned(),
+                    config: test_config_with_domain("removed-restore", "removed-restore.localhost"),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist stale Running evidence");
+
+        let _restore_plan = manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile handle-free stale evidence");
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove project after reconciliation");
+
+        let catalog =
+            Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(dir.path()))
+                .await
+                .expect("reload catalog after removal");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create fresh process manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        let restore_plan = fresh
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile fresh manager state");
+        fresh.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(fresh.registry.lock().await.instances.is_empty());
+        assert!(fresh.services.lock().await.is_empty());
+        assert!(
+            fresh
+                .domain_index()
+                .snapshot()
+                .resolve(domain.as_str())
+                .is_none()
+        );
+        assert!(
+            fresh
+                .state_manager
+                .load()
+                .await
+                .expect("reload fresh runtime state")
+                .services
+                .is_empty()
+        );
     }
 
     fn config_with_services(project: ProjectConfig, service_names: &[&str]) -> LocaldConfig {
@@ -3750,6 +8500,229 @@ command = "api"
     }
 
     #[tokio::test]
+    async fn registry_clean_preserves_watcher_for_reused_worktree_path() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
+        std::fs::write(
+            repository.join("locald.toml"),
+            "[project]\nname = \"reused\"\ndomain = \"reused.localhost\"\n",
+        )
+        .expect("write config fixture");
+        git(&repository, &["add", "README.md", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let reused_path = dir.path().join("reused-worktree");
+        let reused_arg = reused_path.to_str().expect("UTF-8 worktree path");
+        git(&repository, &["worktree", "add", "-b", "first", reused_arg]);
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let first_id = catalog
+            .register_project(
+                Registry::discover(
+                    std::fs::canonicalize(&reused_path).expect("canonical first worktree"),
+                )
+                .await
+                .expect("discover first worktree"),
+                Some("first".to_owned()),
+            )
+            .expect("register first worktree");
+        git(&repository, &["worktree", "remove", reused_arg]);
+        git(&repository, &["worktree", "prune"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "second", reused_arg],
+        );
+        let second_id = catalog
+            .register_project(
+                Registry::discover(
+                    std::fs::canonicalize(&reused_path).expect("canonical second worktree"),
+                )
+                .await
+                .expect("discover second worktree"),
+                Some("second".to_owned()),
+            )
+            .expect("register second worktree");
+        assert_ne!(first_id, second_id);
+        catalog.save().await.expect("persist reused catalog");
+
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.watch_config(reused_path.clone()).await;
+        let canonical_reused = ProcessManager::canonicalize_path(&reused_path);
+
+        assert_eq!(
+            manager.registry_clean().await.expect("clean old worktree"),
+            1
+        );
+        assert!(
+            manager
+                .watchers
+                .lock()
+                .await
+                .contains_key(&canonical_reused)
+        );
+        assert!(
+            !manager
+                .forgotten_reload_paths
+                .lock()
+                .await
+                .contains(&canonical_reused)
+        );
+        let registry = manager.registry.lock().await;
+        assert!(!registry.instances.contains_key(&first_id));
+        assert!(registry.instances.contains_key(&second_id));
+    }
+
+    #[tokio::test]
+    async fn registry_clean_then_explicit_start_reactivates_replacement_watcher() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("clean-start-repository");
+        std::fs::create_dir(&repository).expect("create clean/start repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
+        std::fs::write(
+            repository.join("locald.toml"),
+            r#"[project]
+name = "clean-start"
+domain = "clean-start.localhost"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write clean/start config");
+        git(&repository, &["add", "README.md", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let reused_path = dir.path().join("clean-start-worktree");
+        let reused_arg = reused_path.to_str().expect("UTF-8 reused path");
+        git(&repository, &["worktree", "add", "-b", "first", reused_arg]);
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let removed_id = catalog
+            .register_project(
+                Registry::discover(
+                    std::fs::canonicalize(&reused_path).expect("canonical first clean worktree"),
+                )
+                .await
+                .expect("discover first clean worktree"),
+                Some("clean-start".to_owned()),
+            )
+            .expect("register first clean worktree");
+        catalog.save().await.expect("persist clean/start catalog");
+        git(&repository, &["worktree", "remove", reused_arg]);
+        git(&repository, &["worktree", "prune"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "second", reused_arg],
+        );
+
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create clean/start process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let canonical_reused = ProcessManager::canonicalize_path(&reused_path);
+        let (_, transition_lock) = manager.transition_lock_for_path(&reused_path).await;
+        let runtime_guard = manager.runtime_projection_lock.lock().await;
+        let clean_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.registry_clean().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if transition_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clean acquires the project transition before start");
+
+        let start_task = tokio::spawn({
+            let manager = manager.clone();
+            let reused_path = reused_path.clone();
+            async move { manager.start(reused_path, None, false).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!start_task.is_finished());
+        drop(runtime_guard);
+
+        assert_eq!(
+            clean_task
+                .await
+                .expect("join clean task")
+                .expect("clean stale worktree"),
+            1
+        );
+        start_task
+            .await
+            .expect("join explicit start")
+            .expect("start replacement worktree");
+
+        let (replacement_id, _) = manager
+            .availability_instance_for_path(&reused_path)
+            .await
+            .expect("resolve registered replacement");
+        assert_ne!(replacement_id, removed_id);
+        assert!(
+            manager
+                .watchers
+                .lock()
+                .await
+                .contains_key(&canonical_reused)
+        );
+        assert!(
+            !manager
+                .forgotten_reload_paths
+                .lock()
+                .await
+                .contains(&canonical_reused)
+        );
+        assert!(
+            manager
+                .get_service_controller("clean-start:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn registry_clean_preserves_claim_and_controller_when_stop_fails() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("busy-missing-project");
@@ -3796,15 +8769,18 @@ command = "api"
                 health_status: HealthStatus::Healthy,
             },
         )));
-        manager.services.lock().await.insert(
-            "busy-missing:web".to_owned(),
-            test_service(
-                test_config_with_domain("busy-missing", "busy-missing.localhost"),
-                ServiceConfig::Legacy(ExecServiceConfig::default()),
-                ServiceRuntime::Controller(controller),
-                canonical_path,
-            ),
+        let mut service = test_service(
+            test_config_with_domain("busy-missing", "busy-missing.localhost"),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(controller),
+            canonical_path,
         );
+        service.instance_id = instance_id;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("busy-missing:web".to_owned(), service);
         let calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: calls.clone(),
@@ -4497,24 +9473,22 @@ domain = "reload.localhost"
         let previous_config = test_config_with_domain("reload", "reload.localhost");
         {
             let mut services = manager.services.lock().await;
-            services.insert(
-                "reload:a".to_owned(),
-                test_service(
-                    previous_config.clone(),
-                    service_config.clone(),
-                    ServiceRuntime::Controller(successful_controller),
-                    canonical_path.clone(),
-                ),
+            let mut service_a = test_service(
+                previous_config.clone(),
+                service_config.clone(),
+                ServiceRuntime::Controller(successful_controller),
+                canonical_path.clone(),
             );
-            services.insert(
-                "reload:z".to_owned(),
-                test_service(
-                    previous_config,
-                    service_config,
-                    ServiceRuntime::Controller(failing_controller.clone()),
-                    canonical_path,
-                ),
+            service_a.instance_id = instance_id;
+            services.insert("reload:a".to_owned(), service_a);
+            let mut service_z = test_service(
+                previous_config,
+                service_config,
+                ServiceRuntime::Controller(failing_controller.clone()),
+                canonical_path,
             );
+            service_z.instance_id = instance_id;
+            services.insert("reload:z".to_owned(), service_z);
         }
         let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
@@ -4608,23 +9582,26 @@ domain = "reload.localhost"
             None,
         )
         .expect("create process manager");
-        manager.services.lock().await.insert(
-            "reload:web".to_owned(),
-            test_service(
-                test_config_with_domain("reload", "reload.localhost"),
-                ServiceConfig::Legacy(ExecServiceConfig::default()),
-                ServiceRuntime::Controller(Arc::new(Mutex::new(TestController::new(
-                    "reload:web",
-                    RuntimeState {
-                        pid: Some(42),
-                        port: Some(3000),
-                        status: ServiceState::Running,
-                        health_status: HealthStatus::Healthy,
-                    },
-                )))),
-                canonical_path,
-            ),
+        let mut service = test_service(
+            test_config_with_domain("reload", "reload.localhost"),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(Arc::new(Mutex::new(TestController::new(
+                "reload:web",
+                RuntimeState {
+                    pid: Some(42),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )))),
+            canonical_path,
         );
+        service.instance_id = instance_id;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("reload:web".to_owned(), service);
         let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: host_sync_calls.clone(),
@@ -4771,15 +9748,18 @@ domain = "reload.localhost"
                 health_status: HealthStatus::Healthy,
             },
         )));
-        manager.services.lock().await.insert(
-            "busy:web".to_owned(),
-            test_service(
-                test_config_with_domain("busy", "busy.localhost"),
-                ServiceConfig::Legacy(ExecServiceConfig::default()),
-                ServiceRuntime::Controller(controller),
-                canonical_path,
-            ),
+        let mut service = test_service(
+            test_config_with_domain("busy", "busy.localhost"),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(controller),
+            canonical_path,
         );
+        service.instance_id = instance_id;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("busy:web".to_owned(), service);
 
         let error = manager
             .remove_project(&project_path)
@@ -5439,7 +10419,6 @@ command = "api"
 
         let plan = manager
             .prepublication_stop_plan(
-                &project_path,
                 test_instance_id(),
                 &next_config,
                 &dot_env_vars,
@@ -5579,7 +10558,6 @@ command = "api"
         let desired_names = HashSet::from(["app:web".to_owned()]);
         let error = manager
             .prepublication_stop_plan(
-                &second_path,
                 second_instance,
                 &second_config,
                 &HashMap::new(),

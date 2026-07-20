@@ -492,20 +492,27 @@ async fn async_main(
         let _ = notify_path; // suppress unused warning
     }
 
-    // Restore state
-    let manager_restore = manager.clone();
-    tokio::spawn(async move {
-        if let Err(e) = manager_restore.restore().await {
-            warn!("Failed to restore state: {e}");
-        }
-    });
+    // Reconcile stale runtime evidence before accepting lifecycle requests that
+    // could launch new processes. Availability-policy convergence happens in
+    // the background once IPC is online.
+    let restore_plan = manager
+        .reconcile_stale_runtime_state()
+        .await
+        .context("Failed to reconcile daemon runtime state")?;
 
     // Spawn attachment reaper — cleans up stale editor/CLI attachments
     let manager_reaper = manager.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if manager_reaper.is_shutting_down() {
+                break;
+            }
             manager_reaper.reap_and_stop_orphans().await;
+            if manager_reaper.is_shutting_down() {
+                break;
+            }
+            manager_reaper.converge_all_project_availability().await;
         }
     });
 
@@ -524,6 +531,13 @@ async fn async_main(
             version_clone,
         )
         .await
+    });
+
+    let restore_manager = manager.clone();
+    tokio::spawn(async move {
+        restore_manager
+            .restore_policy_owned_projects(restore_plan)
+            .await;
     });
 
     // Spawn upgrade watcher

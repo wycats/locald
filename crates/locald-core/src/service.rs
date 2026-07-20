@@ -6,7 +6,7 @@
 //! (downloads, builds) and `start` is fast and idempotent.
 use crate::config::ServiceConfig;
 use crate::ipc::{LogEntry, ServiceMetrics};
-use crate::state::{HealthStatus, ServiceState};
+use crate::state::{HealthStatus, PersistedProcessIdentity, ServiceState};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -59,6 +59,21 @@ pub trait ServiceController: Send + Sync + std::fmt::Debug {
     /// This returns the dynamic parts of the status (PID, port, lifecycle state).
     /// The manager combines this with static config to form the full status view.
     async fn read_state(&self) -> RuntimeState;
+
+    /// Return the immutable process ID captured when this controller spawned
+    /// its current child. Unlike `RuntimeState::pid`, this cleanup handle stays
+    /// present after the leader exits and is cleared only after `stop()` has
+    /// confirmed that the owned process or process group is gone.
+    fn owned_process_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// Return the immutable OS identity captured while this controller owned
+    /// its current child. It has the same lifetime as `owned_process_id`;
+    /// controllers without an OS process return `None`.
+    fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+        None
+    }
 
     /// Get a stream of logs from the service.
     async fn logs(&self) -> BoxStream<'static, LogEntry>;

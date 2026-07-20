@@ -81,8 +81,8 @@ pub mod storage;
 #[doc(inline)]
 pub use availability::{
     AGENT_ACTIVE_TTL, AGENT_DEMAND_TTL, AGENT_REVIEW_GRACE, AVAILABILITY_VERSION,
-    AvailabilityError, AvailabilityStore, Clock, DemandKey, DemandKeyError, DemandKind,
-    DemandLease, EnsureDemandEffect, EnsureDemandResult, LEGACY_PROCESS_DEMAND_TTL,
+    AvailabilityError, AvailabilityStore, Clock, ConvergenceDecision, DemandKey, DemandKeyError,
+    DemandKind, DemandLease, EnsureDemandEffect, EnsureDemandResult, LEGACY_PROCESS_DEMAND_TTL,
     MANUAL_DEMAND_TTL, ProjectAvailability, RenewDemandResult, SHUTDOWN_COOLDOWN, SystemClock,
     VSCODE_DEMAND_TTL, VSCODE_RENEWAL_INTERVAL, availability_path,
 };
