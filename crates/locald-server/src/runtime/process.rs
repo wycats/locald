@@ -3,11 +3,11 @@ use locald_builder::{
     BuilderImage, BundleSource, ContainerImage, Lifecycle, LocalLayoutBundleSource, ShimRuntime,
 };
 use locald_core::ipc::{LogEntry, LogStream};
-use locald_core::state::PersistedProcessIdentity;
+use locald_core::state::{PersistedProcessBirth, PersistedProcessIdentity};
 use locald_oci::{oci_layout, runtime_spec};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::{Pid, getpgid, getpgrp};
+use nix::unistd::{Pid, getpgrp};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::fmt;
@@ -74,47 +74,202 @@ impl ProcessRuntime {
         Ok(pid)
     }
 
-    fn observed_process_identity(&self, pid: i32) -> Result<Option<PersistedProcessIdentity>> {
-        let sysinfo_pid = SysinfoPid::from_u32(
-            u32::try_from(pid).context("validated process ID became negative")?,
+    fn observed_executable(&self, pid: i32) -> Option<PathBuf> {
+        let sysinfo_pid =
+            SysinfoPid::from_u32(u32::try_from(pid).expect("validated process ID is positive"));
+        let mut system = self
+            .process_system
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sysinfo_pid]),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
         );
-        let observed = {
-            let mut system = self
-                .process_system
-                .lock()
-                .map_err(|_| anyhow::anyhow!("process observation state is poisoned"))?;
-            system.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&[sysinfo_pid]),
-                true,
-                ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
-            );
-            system
-                .process(sysinfo_pid)
-                .map(|process| (process.start_time(), process.exe().map(Path::to_path_buf)))
+        system
+            .process(sysinfo_pid)
+            .and_then(|process| process.exe().map(Path::to_path_buf))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(
+        unsafe_code,
+        reason = "proc_pidinfo is the macOS kernel API for an atomic birth and process-group snapshot"
+    )]
+    fn observed_process_authority(pid: i32) -> Result<Option<PersistedProcessIdentity>> {
+        let expected_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .context("proc_bsdinfo exceeds the platform buffer-size range")?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: `info` points to a correctly sized writable proc_bsdinfo
+        // buffer. It is initialized only when proc_pidinfo reports a full read.
+        let bytes_read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                expected_size,
+            )
         };
-        let Some((start_time, executable)) = observed else {
-            return Ok(None);
-        };
-        let process_group_id = match getpgid(Some(Pid::from_raw(pid))) {
-            Ok(process_group_id) => process_group_id.as_raw(),
-            Err(Errno::ESRCH) => return Ok(None),
+        if bytes_read != expected_size {
+            let inspection_error = std::io::Error::last_os_error();
+            if bytes_read <= 0 && inspection_error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return match kill(Pid::from_raw(pid), None) {
+                Err(Errno::ESRCH) => Ok(None),
+                Ok(()) | Err(Errno::EPERM) => Err(anyhow::anyhow!(
+                    "failed to read a complete process identity for PID {pid}: read {bytes_read} of {expected_size} bytes ({inspection_error})"
+                )),
+                Err(error) => Err(anyhow::anyhow!(
+                    "failed to confirm PID {pid} after proc_pidinfo read {bytes_read} of {expected_size} bytes ({inspection_error}): {error}"
+                )),
+            };
+        }
+        // SAFETY: the exact-size check above proves proc_pidinfo initialized the
+        // entire proc_bsdinfo value.
+        let info = unsafe { info.assume_init() };
+        let expected_pid = u32::try_from(pid).context("validated process ID became negative")?;
+        anyhow::ensure!(
+            info.pbi_pid == expected_pid,
+            "process identity snapshot for PID {pid} reported PID {}",
+            info.pbi_pid
+        );
+        let process_group_id =
+            i32::try_from(info.pbi_pgid).context("process group ID exceeds the platform range")?;
+        anyhow::ensure!(
+            process_group_id > 0,
+            "process identity snapshot for PID {pid} reported invalid process group {process_group_id}"
+        );
+
+        Ok(Some(PersistedProcessIdentity {
+            birth: Some(PersistedProcessBirth::Macos {
+                start_seconds: info.pbi_start_tvsec,
+                start_microseconds: info.pbi_start_tvusec,
+            }),
+            process_group_id,
+            executable: None,
+        }))
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn parse_linux_proc_stat(stat: &str) -> Result<(i32, i32, u64)> {
+        let command_start = stat
+            .find('(')
+            .context("Linux process stat is missing its command start")?;
+        let fields_start = stat
+            .rfind(") ")
+            .map(|index| index + 2)
+            .context("Linux process stat is missing its command terminator")?;
+        anyhow::ensure!(
+            command_start < fields_start,
+            "Linux process stat has malformed command boundaries"
+        );
+        let observed_pid = stat[..command_start]
+            .trim()
+            .parse::<i32>()
+            .context("Linux process stat contains an invalid PID")?;
+        let fields = stat[fields_start..]
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        let process_group_id = fields
+            .get(2)
+            .context("Linux process stat is missing its process group")?
+            .parse::<i32>()
+            .context("Linux process stat contains an invalid process group")?;
+        let start_ticks = fields
+            .get(19)
+            .context("Linux process stat is missing its start ticks")?
+            .parse::<u64>()
+            .context("Linux process stat contains invalid start ticks")?;
+        anyhow::ensure!(
+            process_group_id > 0,
+            "Linux process stat reported invalid process group {process_group_id}"
+        );
+        Ok((observed_pid, process_group_id, start_ticks))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn observed_process_authority(pid: i32) -> Result<Option<PersistedProcessIdentity>> {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None);
+            }
             Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "failed to inspect process group for PID {pid}: {error}"
-                ));
+                return Err(error)
+                    .with_context(|| format!("failed to read identity for PID {pid}"));
             }
         };
+        let (observed_pid, process_group_id, start_ticks) = Self::parse_linux_proc_stat(&stat)?;
+        anyhow::ensure!(
+            observed_pid == pid,
+            "process identity snapshot for PID {pid} reported PID {observed_pid}"
+        );
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .context("failed to read the Linux kernel boot identity")?;
+        let boot_id = boot_id.trim();
+        anyhow::ensure!(!boot_id.is_empty(), "Linux kernel boot identity is empty");
+
         Ok(Some(PersistedProcessIdentity {
-            start_time,
+            birth: Some(PersistedProcessBirth::Linux {
+                boot_id: boot_id.to_owned(),
+                start_ticks,
+            }),
             process_group_id,
-            executable,
+            executable: None,
         }))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn observed_process_authority(pid: i32) -> Result<Option<PersistedProcessIdentity>> {
+        anyhow::bail!(
+            "durable process birth identity for PID {pid} is unsupported on {}",
+            std::env::consts::OS
+        )
+    }
+
+    fn ensure_same_process_identity(
+        pid: i32,
+        observed: &PersistedProcessIdentity,
+        expected: &PersistedProcessIdentity,
+    ) -> Result<()> {
+        let expected_birth = expected.birth.as_ref().with_context(|| {
+            format!(
+                "recorded PID {pid} has no high-resolution process birth identity; stop it manually"
+            )
+        })?;
+        let observed_birth = observed.birth.as_ref().with_context(|| {
+            format!("platform process observation for PID {pid} has no birth identity")
+        })?;
+        anyhow::ensure!(
+            observed_birth == expected_birth,
+            "recorded PID {pid} was reused: expected birth {expected_birth:?}, observed {observed_birth:?}"
+        );
+        anyhow::ensure!(
+            observed.process_group_id == expected.process_group_id,
+            "recorded PID {pid} changed process group: expected {}, observed {}",
+            expected.process_group_id,
+            observed.process_group_id
+        );
+        Ok(())
     }
 
     /// Capture an ownership fingerprint while locald still owns the process.
     pub fn capture_process_identity(&self, pid: u32) -> Result<Option<PersistedProcessIdentity>> {
         let pid = Self::validated_stale_pid(pid)?;
-        self.observed_process_identity(pid)
+        // Executable metadata is diagnostic only. Observe it before the
+        // platform-native authority snapshot so it cannot widen the window
+        // between the final ownership check and a caller's next action.
+        let executable = self.observed_executable(pid);
+        let Some(mut identity) = Self::observed_process_authority(pid)? else {
+            return Ok(None);
+        };
+        identity.executable = executable;
+        Ok(Some(identity))
     }
 
     /// Signal a process or process group that a live controller identified at
@@ -168,7 +323,7 @@ impl ProcessRuntime {
         expected: &PersistedProcessIdentity,
     ) -> Result<Option<VerifiedStaleProcess>> {
         let pid = Self::validated_stale_pid(pid)?;
-        let Some(observed) = self.observed_process_identity(pid)? else {
+        let Some(observed) = Self::observed_process_authority(pid)? else {
             if expected.process_group_id == pid
                 && expected.process_group_id > 1
                 && expected.process_group_id != getpgrp().as_raw()
@@ -191,18 +346,7 @@ impl ProcessRuntime {
             }
             return Ok(None);
         };
-        anyhow::ensure!(
-            observed.start_time == expected.start_time,
-            "recorded PID {pid} was reused: expected start time {}, observed {}",
-            expected.start_time,
-            observed.start_time
-        );
-        anyhow::ensure!(
-            observed.process_group_id == expected.process_group_id,
-            "recorded PID {pid} changed process group: expected {}, observed {}",
-            expected.process_group_id,
-            observed.process_group_id
-        );
+        Self::ensure_same_process_identity(pid, &observed, expected)?;
         Ok(Some(VerifiedStaleProcess {
             pid,
             identity: expected.clone(),
@@ -225,10 +369,7 @@ impl ProcessRuntime {
     ) -> Result<()> {
         let pid = u32::try_from(process.pid).context("verified process ID became negative")?;
         let Some(current) = self.verify_stale_process(pid, &process.identity)? else {
-            anyhow::bail!(
-                "verified stale process {} exited before {signal:?}; refusing to signal its former process group",
-                process.pid
-            );
+            return Ok(());
         };
         let target = if Self::can_signal_verified_group(&current) {
             Pid::from_raw(-current.identity.process_group_id)
@@ -248,13 +389,9 @@ impl ProcessRuntime {
     /// Return whether a previously verified process or its owned group remains
     /// live. If the PID is reused while cleanup is in flight, fail closed.
     pub fn verified_stale_process_exists(&self, process: &VerifiedStaleProcess) -> Result<bool> {
-        if let Some(observed) = self.observed_process_identity(process.pid)? {
-            anyhow::ensure!(
-                observed.start_time == process.identity.start_time
-                    && observed.process_group_id == process.identity.process_group_id,
-                "recorded PID {} changed identity while stale cleanup was in flight",
-                process.pid
-            );
+        if let Some(observed) = Self::observed_process_authority(process.pid)? {
+            Self::ensure_same_process_identity(process.pid, &observed, &process.identity)
+                .context("recorded process changed identity while stale cleanup was in flight")?;
         }
 
         let group_exists = if Self::can_signal_verified_group(process) {
@@ -282,7 +419,16 @@ impl ProcessRuntime {
             }
         };
 
-        Ok(group_exists || process_exists)
+        let exists = group_exists || process_exists;
+        if exists {
+            anyhow::ensure!(
+                process.identity.birth.is_some(),
+                "recorded PID {} has no high-resolution process birth identity; stop it manually",
+                process.pid
+            );
+        }
+
+        Ok(exists)
     }
 
     /// Check a legacy bare PID without treating it as authorization to signal.
@@ -826,7 +972,39 @@ impl ProcessRuntime {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
-    use std::process::Command;
+    use std::process::{Child as StdChild, Command};
+
+    struct ChildCleanup(Option<StdChild>);
+
+    impl ChildCleanup {
+        fn new(child: StdChild) -> Self {
+            Self(Some(child))
+        }
+
+        fn id(&self) -> u32 {
+            self.0.as_ref().expect("test child is present").id()
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.0.as_mut().expect("test child is present").try_wait()
+        }
+
+        fn terminate_and_reap(&mut self) {
+            let child = self.0.as_mut().expect("test child is present");
+            child.kill().expect("terminate test child");
+            child.wait().expect("reap test child");
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ChildCleanup {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     struct ProcessGroupCleanup {
         group: i32,
@@ -864,6 +1042,73 @@ mod tests {
         let cloned = runtime.clone();
 
         assert!(Arc::ptr_eq(&runtime.process_system, &cloned.process_system));
+    }
+
+    #[test]
+    fn live_process_without_birth_authority_cannot_be_signaled() {
+        let runtime = ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut child = ChildCleanup::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn legacy-identity test process"),
+        );
+        let pid = child.id();
+        let mut identity = runtime
+            .capture_process_identity(pid)
+            .expect("capture process identity")
+            .expect("test process is live");
+        assert!(identity.birth.is_some());
+        identity.birth = None;
+
+        let error = runtime
+            .signal_owned_process(pid, &identity, Signal::SIGTERM)
+            .expect_err("legacy identity must not authorize a live process");
+        assert!(format!("{error:#}").contains("no high-resolution process birth identity"));
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect legacy-identity test process")
+                .is_none()
+        );
+
+        child.terminate_and_reap();
+    }
+
+    #[test]
+    fn verified_signal_accepts_a_process_that_vanished_before_the_signal() {
+        let runtime = ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut child = ChildCleanup::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn stale-signal race process"),
+        );
+        let pid = child.id();
+        let identity = runtime
+            .capture_process_identity(pid)
+            .expect("capture stale-signal race identity")
+            .expect("stale-signal race process is live");
+        let verified = runtime
+            .verify_stale_process(pid, &identity)
+            .expect("verify stale-signal race process")
+            .expect("stale-signal race process remains live");
+
+        child.terminate_and_reap();
+
+        runtime
+            .signal_verified_stale_process(&verified, Signal::SIGTERM)
+            .expect("a fully vanished verified process requires no signal");
+    }
+
+    #[test]
+    fn linux_proc_stat_parser_handles_spaces_and_parentheses_in_the_command() {
+        let stat = "4242 (worker name ) tricky) S 1 4242 1 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 123456 0";
+
+        let parsed =
+            ProcessRuntime::parse_linux_proc_stat(stat).expect("parse Linux process stat fixture");
+
+        assert_eq!(parsed, (4242, 4242, 123_456));
     }
 
     #[test]

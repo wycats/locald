@@ -4417,6 +4417,7 @@ mod tests {
     use locald_core::config::{ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig};
     use locald_core::registry::Registry;
     use locald_core::service::{RuntimeState, ServiceCommand};
+    use locald_core::state::PersistedProcessBirth;
     use std::collections::HashMap;
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
@@ -4456,6 +4457,40 @@ mod tests {
                     Signal::SIGKILL,
                 );
             }
+        }
+    }
+
+    fn test_process_identity(
+        start_ticks: u64,
+        process_group_id: i32,
+        executable: impl Into<PathBuf>,
+    ) -> PersistedProcessIdentity {
+        PersistedProcessIdentity {
+            birth: Some(PersistedProcessBirth::Linux {
+                boot_id: "test-boot".to_owned(),
+                start_ticks,
+            }),
+            process_group_id,
+            executable: Some(executable.into()),
+        }
+    }
+
+    fn different_process_birth(birth: &PersistedProcessBirth) -> PersistedProcessBirth {
+        match birth {
+            PersistedProcessBirth::Macos {
+                start_seconds,
+                start_microseconds,
+            } => PersistedProcessBirth::Macos {
+                start_seconds: *start_seconds,
+                start_microseconds: start_microseconds.saturating_add(1),
+            },
+            PersistedProcessBirth::Linux {
+                boot_id,
+                start_ticks,
+            } => PersistedProcessBirth::Linux {
+                boot_id: boot_id.clone(),
+                start_ticks: start_ticks.saturating_add(1),
+            },
         }
     }
 
@@ -4700,11 +4735,7 @@ mod tests {
                     status: ServiceState::Building,
                     health_status: HealthStatus::Unknown,
                 },
-                process_identity: Some(PersistedProcessIdentity {
-                    start_time: 1_234,
-                    process_group_id: 41,
-                    executable: Some(PathBuf::from("/test/unready-worker")),
-                }),
+                process_identity: Some(test_process_identity(1_234, 41, "/test/unready-worker")),
                 start_entered: Some(self.entered.clone()),
                 fail_prepare: false,
                 stop_count: self.stop_count.clone(),
@@ -4900,11 +4931,12 @@ mod tests {
                 },
                 fail_start,
                 owned_process_id: Some(pid),
-                process_identity: (!fail_start).then_some(PersistedProcessIdentity {
-                    start_time: 1_234
-                        + u64::try_from(creation).expect("test creation count fits in u64"),
-                    process_group_id: i32::try_from(pid).expect("test PID fits in i32"),
-                    executable: Some(PathBuf::from("/test/retry-controller")),
+                process_identity: (!fail_start).then(|| {
+                    test_process_identity(
+                        1_234 + u64::try_from(creation).expect("test creation count fits in u64"),
+                        i32::try_from(pid).expect("test PID fits in i32"),
+                        "/test/retry-controller",
+                    )
                 }),
                 start_count: self.start_count.clone(),
                 stop_count: self.stop_count.clone(),
@@ -4934,11 +4966,11 @@ mod tests {
                     status: ServiceState::Building,
                     health_status: HealthStatus::Unknown,
                 },
-                process_identity: Some(PersistedProcessIdentity {
-                    start_time: 1_234,
-                    process_group_id: 42,
-                    executable: Some(PathBuf::from("/test/retry-prepare-worker")),
-                }),
+                process_identity: Some(test_process_identity(
+                    1_234,
+                    42,
+                    "/test/retry-prepare-worker",
+                )),
                 start_entered: None,
                 fail_prepare,
                 stop_count: self.stop_count.clone(),
@@ -5662,11 +5694,7 @@ command = "sleep 30"
             .await
             .expect("service starts and enters its readiness wait");
 
-        let expected_identity = PersistedProcessIdentity {
-            start_time: 1_234,
-            process_group_id: 41,
-            executable: Some(PathBuf::from("/test/unready-worker")),
-        };
+        let expected_identity = test_process_identity(1_234, 41, "/test/unready-worker");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let persisted = manager
@@ -7267,11 +7295,7 @@ command = "ignored"
         let project_path = dir.path().join("process-identity-project");
         let (manager, instance_id, _availability_data_dir) =
             availability_manager(dir.path(), &project_path, "process-identity").await;
-        let identity = PersistedProcessIdentity {
-            start_time: 1234,
-            process_group_id: 42,
-            executable: Some(PathBuf::from("/bin/controller-owned")),
-        };
+        let identity = test_process_identity(1_234, 42, "/bin/controller-owned");
         let controller = Arc::new(Mutex::new(TestController {
             id: "process-identity:web".to_owned(),
             state: RuntimeState {
@@ -7503,7 +7527,12 @@ command = "ignored"
             .capture_process_identity(pid)
             .expect("inspect identity test process")
             .expect("identity test process is live");
-        identity.start_time = identity.start_time.saturating_add(1);
+        identity.birth = Some(different_process_birth(
+            identity
+                .birth
+                .as_ref()
+                .expect("captured identity has process birth authority"),
+        ));
 
         let error = runtime
             .verify_stale_process(pid, &identity)
@@ -7552,7 +7581,7 @@ command = "ignored"
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         };
-        assert_eq!(observed_after_exec.start_time, identity.start_time);
+        assert_eq!(observed_after_exec.birth, identity.birth);
         assert_eq!(
             observed_after_exec.process_group_id,
             identity.process_group_id

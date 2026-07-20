@@ -664,9 +664,29 @@ impl ServiceFactory for ExecFactory {
 mod tests {
     use super::*;
     use locald_core::config::WorkerServiceConfig;
+    use locald_core::state::PersistedProcessBirth;
     use portable_pty::{ChildKiller, ExitStatus};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::tempdir;
+
+    fn different_process_birth(birth: &PersistedProcessBirth) -> PersistedProcessBirth {
+        match birth {
+            PersistedProcessBirth::Macos {
+                start_seconds,
+                start_microseconds,
+            } => PersistedProcessBirth::Macos {
+                start_seconds: *start_seconds,
+                start_microseconds: start_microseconds.saturating_add(1),
+            },
+            PersistedProcessBirth::Linux {
+                boot_id,
+                start_ticks,
+            } => PersistedProcessBirth::Linux {
+                boot_id: boot_id.clone(),
+                start_ticks: start_ticks.saturating_add(1),
+            },
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum PidlessChildBehavior {
@@ -1102,11 +1122,17 @@ mod tests {
         let spawn_identity = controller
             .process_identity()
             .expect("capture owned process identity");
+        let mismatched_birth = different_process_birth(
+            spawn_identity
+                .birth
+                .as_ref()
+                .expect("spawned process has birth authority"),
+        );
         controller
             .process_identity
             .as_mut()
             .expect("retain owned identity")
-            .start_time = spawn_identity.start_time.saturating_add(1);
+            .birth = Some(mismatched_birth);
 
         let error = controller
             .stop()

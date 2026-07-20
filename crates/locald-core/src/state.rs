@@ -94,6 +94,25 @@ impl std::fmt::Display for ServiceState {
     }
 }
 
+/// Platform-native process birth identity captured while locald still owns a
+/// running service process.
+///
+/// Each variant uses the highest-resolution stable value exposed by the host
+/// platform. The value is paired with the recorded PID and process group before
+/// locald authorizes a signal after a daemon restart.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "platform", rename_all = "snake_case")]
+pub enum PersistedProcessBirth {
+    /// Darwin process creation time from `proc_bsdinfo`.
+    #[serde(rename = "macos")]
+    Macos {
+        start_seconds: u64,
+        start_microseconds: u64,
+    },
+    /// Linux boot identity plus `/proc/<pid>/stat` start ticks.
+    Linux { boot_id: String, start_ticks: u64 },
+}
+
 /// OS identity captured while locald still owns a running service process.
 ///
 /// A PID alone is never sufficient authorization to signal a process after a
@@ -102,7 +121,10 @@ impl std::fmt::Display for ServiceState {
 /// recorded before sending either a graceful or forceful signal.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PersistedProcessIdentity {
-    pub start_time: u64,
+    /// High-resolution birth authority. `None` exists only so state written by
+    /// an older locald remains decodable; it never authorizes a live process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birth: Option<PersistedProcessBirth>,
     pub process_group_id: i32,
     /// Executable observed at spawn time for diagnostics. A normal `exec`
     /// changes this path without changing process identity, so cleanup never
@@ -168,16 +190,57 @@ mod tests {
 
     #[test]
     fn process_identity_round_trip_preserves_cleanup_authority() {
-        let identity = PersistedProcessIdentity {
-            start_time: 1234,
-            process_group_id: 42,
-            executable: Some(PathBuf::from("/bin/example")),
-        };
-        let encoded = serde_json::to_vec(&service_state(Some(identity.clone())))
-            .expect("serialize fingerprinted service state");
-        let decoded: PersistedServiceState =
-            serde_json::from_slice(&encoded).expect("deserialize fingerprinted service state");
+        for birth in [
+            PersistedProcessBirth::Macos {
+                start_seconds: 1_234,
+                start_microseconds: 567_890,
+            },
+            PersistedProcessBirth::Linux {
+                boot_id: "test-boot".to_owned(),
+                start_ticks: 98_765,
+            },
+        ] {
+            let identity = PersistedProcessIdentity {
+                birth: Some(birth),
+                process_group_id: 42,
+                executable: Some(PathBuf::from("/bin/example")),
+            };
+            let encoded = serde_json::to_vec(&service_state(Some(identity.clone())))
+                .expect("serialize fingerprinted service state");
+            let decoded: PersistedServiceState =
+                serde_json::from_slice(&encoded).expect("deserialize fingerprinted service state");
 
-        assert_eq!(decoded.process_identity, Some(identity));
+            assert_eq!(decoded.process_identity, Some(identity));
+        }
+    }
+
+    #[test]
+    fn legacy_seconds_only_process_identity_decodes_without_cleanup_authority() {
+        let value = serde_json::json!({
+            "name": "example:web",
+            "config": LocaldConfig::default(),
+            "path": "/tmp/example",
+            "pid": 42,
+            "process_identity": {
+                "start_time": 1234,
+                "process_group_id": 42,
+                "executable": "/bin/example"
+            },
+            "container_id": null,
+            "port": 3000,
+            "status": "running",
+            "health_status": "Healthy",
+            "health_source": "Tcp"
+        });
+
+        let decoded: PersistedServiceState =
+            serde_json::from_value(value).expect("deserialize legacy process identity");
+        let identity = decoded
+            .process_identity
+            .expect("preserve legacy process identity diagnostics");
+
+        assert!(identity.birth.is_none());
+        assert_eq!(identity.process_group_id, 42);
+        assert_eq!(identity.executable, Some(PathBuf::from("/bin/example")));
     }
 }
