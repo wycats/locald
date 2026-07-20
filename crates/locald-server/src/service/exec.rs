@@ -97,6 +97,10 @@ impl ExecController {
         self.env.clone()
     }
 
+    fn escalation_signal_after_timeout(initial_signal: Signal) -> Option<Signal> {
+        (initial_signal != Signal::SIGKILL).then_some(Signal::SIGKILL)
+    }
+
     async fn wait_for_owned_cleanup(
         &self,
         child: &mut Option<Box<dyn Child + Send>>,
@@ -385,12 +389,20 @@ impl ServiceController for ExecController {
                         )
                         .await?;
                     if !exited {
+                        let Some(escalation_signal) =
+                            Self::escalation_signal_after_timeout(signal)
+                        else {
+                            anyhow::bail!(
+                                "owned process or process group for service {} remained live after SIGKILL",
+                                self.id
+                            );
+                        };
                         warn!(
-                            "Service {} did not fully exit after {signal:?}; sending SIGKILL",
-                            self.id
+                            "Service {} did not fully exit after {signal:?}; sending {escalation_signal:?}",
+                            self.id,
                         );
                         self.runtime
-                            .signal_owned_process(pid, &identity, Signal::SIGKILL)?;
+                            .signal_owned_process(pid, &identity, escalation_signal)?;
                         anyhow::ensure!(
                             self.wait_for_owned_cleanup(
                                 &mut child,
@@ -684,6 +696,18 @@ mod tests {
     use portable_pty::{ChildKiller, ExitStatus};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::tempdir;
+
+    #[test]
+    fn sigkill_is_a_terminal_stop_signal() {
+        assert_eq!(
+            ExecController::escalation_signal_after_timeout(Signal::SIGKILL),
+            None
+        );
+        assert_eq!(
+            ExecController::escalation_signal_after_timeout(Signal::SIGTERM),
+            Some(Signal::SIGKILL)
+        );
+    }
 
     fn different_process_birth(birth: &PersistedProcessBirth) -> PersistedProcessBirth {
         match birth {
