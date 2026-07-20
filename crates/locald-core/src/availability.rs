@@ -1,0 +1,2377 @@
+//! Durable desired-availability state for one project instance.
+//!
+//! Availability is daemon-owned intent. It is keyed by stable
+//! [`ProjectInstanceId`] rather than a path and is persisted separately from
+//! both project configuration and process snapshots.
+
+use crate::ProjectInstanceId;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
+use std::time::{Duration, SystemTime};
+use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
+use uuid::Uuid;
+
+/// The current on-disk availability schema.
+pub const AVAILABILITY_VERSION: u32 = 1;
+
+/// How long an explicit CLI demand remains live without renewal.
+pub const MANUAL_DEMAND_TTL: Duration = Duration::from_hours(4);
+
+/// The expected cadence for VS Code demand renewal.
+pub const VSCODE_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a VS Code demand remains live without renewal.
+pub const VSCODE_DEMAND_TTL: Duration = Duration::from_mins(2);
+
+/// The active portion of an agent-conversation demand.
+pub const AGENT_ACTIVE_TTL: Duration = Duration::from_mins(15);
+
+/// The review grace retained after an agent's active lease.
+pub const AGENT_REVIEW_GRACE: Duration = Duration::from_mins(30);
+
+/// How long an agent-conversation demand remains live without renewal.
+pub const AGENT_DEMAND_TTL: Duration = Duration::from_mins(45);
+
+/// How long a process-bound compatibility demand survives without revalidation.
+pub const LEGACY_PROCESS_DEMAND_TTL: Duration = Duration::from_mins(2);
+
+/// The default delay before stopping after the final live demand disappears.
+pub const SHUTDOWN_COOLDOWN: Duration = Duration::from_mins(2);
+
+const AVAILABILITY_FILE_NAME: &str = "availability.json";
+const OWNER_DIGEST_DOMAIN: &[u8] = b"locald-demand-owner-v1\0";
+
+type MutationLock = AsyncMutex<()>;
+
+static AVAILABILITY_MUTATION_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Weak<MutationLock>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn availability_mutation_lock(path: &Path) -> Arc<MutationLock> {
+    let mut locks = AVAILABILITY_MUTATION_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(MutationLock::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+async fn normalized_data_directory(data_dir: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(data_dir)?;
+    let mut existing_ancestor = absolute.as_path();
+
+    loop {
+        match tokio::fs::canonicalize(existing_ancestor).await {
+            Ok(canonical_ancestor) => {
+                let suffix = absolute.strip_prefix(existing_ancestor).map_err(|error| {
+                    io::Error::other(format!(
+                        "failed to derive availability path suffix: {error}"
+                    ))
+                })?;
+                return Ok(lexically_normalize(&canonical_ancestor.join(suffix)));
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = existing_ancestor.parent() else {
+                    return Err(source);
+                };
+                existing_ancestor = parent;
+            }
+            Err(source) => return Err(source),
+        }
+    }
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    normalized
+}
+
+/// A source of wall-clock time for restart-stable lease deadlines.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> SystemTime;
+}
+
+/// The production availability clock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    #[allow(clippy::disallowed_methods)]
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// The semantic category of a renewable availability demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemandKind {
+    ManualCli,
+    VsCodeWindow,
+    AgentConversation,
+    LegacyProcessAttachment,
+    StoppedPageResume,
+}
+
+impl DemandKind {
+    /// A privacy-safe label suitable for normal status projections.
+    #[must_use]
+    pub const fn safe_label(self) -> &'static str {
+        match self {
+            Self::ManualCli => "Manual CLI",
+            Self::VsCodeWindow => "VS Code window",
+            Self::AgentConversation => "Agent conversation",
+            Self::LegacyProcessAttachment => "Legacy process attachment",
+            Self::StoppedPageResume => "Stopped-page resume",
+        }
+    }
+
+    const fn lease_duration(self) -> Duration {
+        match self {
+            Self::ManualCli | Self::StoppedPageResume => MANUAL_DEMAND_TTL,
+            Self::VsCodeWindow => VSCODE_DEMAND_TTL,
+            Self::AgentConversation => AGENT_DEMAND_TTL,
+            Self::LegacyProcessAttachment => LEGACY_PROCESS_DEMAND_TTL,
+        }
+    }
+
+    const fn requires_owner(self) -> bool {
+        matches!(
+            self,
+            Self::VsCodeWindow | Self::AgentConversation | Self::LegacyProcessAttachment
+        )
+    }
+
+    const fn persistence_tag(self) -> &'static [u8] {
+        match self {
+            Self::ManualCli => b"manual_cli",
+            Self::VsCodeWindow => b"vs_code_window",
+            Self::AgentConversation => b"agent_conversation",
+            Self::LegacyProcessAttachment => b"legacy_process_attachment",
+            Self::StoppedPageResume => b"stopped_page_resume",
+        }
+    }
+}
+
+/// A validation failure while constructing a demand key from private host data.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DemandKeyError {
+    #[error("{kind:?} demand identity must not be empty")]
+    EmptyPrivateIdentity { kind: DemandKind },
+}
+
+/// A stable, privacy-preserving demand-owner digest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+struct OpaqueDemandOwner(String);
+
+impl OpaqueDemandOwner {
+    fn digest(kind: DemandKind, private_identity: &str) -> Result<Self, DemandKeyError> {
+        if private_identity.trim().is_empty() {
+            return Err(DemandKeyError::EmptyPrivateIdentity { kind });
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(OWNER_DIGEST_DOMAIN);
+        hasher.update(kind.persistence_tag());
+        hasher.update([0]);
+        hasher.update(private_identity.as_bytes());
+        Ok(Self(format!("{:x}", hasher.finalize())))
+    }
+
+    fn is_valid(&self) -> bool {
+        self.0.len() == 64
+            && self
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// The stable key for one independent availability demand.
+///
+/// Private editor, conversation, and compatibility identities are hashed
+/// before they enter durable state. Normal status surfaces expose only
+/// [`DemandKind`] and [`DemandKind::safe_label`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandKey {
+    kind: DemandKind,
+    owner: Option<OpaqueDemandOwner>,
+}
+
+impl DemandKey {
+    /// The singleton manual CLI demand used by `locald up`.
+    #[must_use]
+    pub const fn manual_cli() -> Self {
+        Self {
+            kind: DemandKind::ManualCli,
+            owner: None,
+        }
+    }
+
+    /// A demand owned by one trusted VS Code window identity.
+    pub fn vs_code_window(private_identity: &str) -> Result<Self, DemandKeyError> {
+        Self::owned(DemandKind::VsCodeWindow, private_identity)
+    }
+
+    /// A demand owned by one private agent-conversation identity.
+    pub fn agent_conversation(private_identity: &str) -> Result<Self, DemandKeyError> {
+        Self::owned(DemandKind::AgentConversation, private_identity)
+    }
+
+    /// A process-bound compatibility demand imported from legacy state.
+    pub fn legacy_process_attachment(private_identity: &str) -> Result<Self, DemandKeyError> {
+        Self::owned(DemandKind::LegacyProcessAttachment, private_identity)
+    }
+
+    /// The singleton demand created by an explicit stopped-page Resume action.
+    #[must_use]
+    pub const fn stopped_page_resume() -> Self {
+        Self {
+            kind: DemandKind::StoppedPageResume,
+            owner: None,
+        }
+    }
+
+    /// Return the privacy-safe demand category.
+    #[must_use]
+    pub const fn kind(&self) -> DemandKind {
+        self.kind
+    }
+
+    /// Return the privacy-safe label for normal status projections.
+    #[must_use]
+    pub const fn safe_label(&self) -> &'static str {
+        self.kind.safe_label()
+    }
+
+    fn owned(kind: DemandKind, private_identity: &str) -> Result<Self, DemandKeyError> {
+        Ok(Self {
+            kind,
+            owner: Some(OpaqueDemandOwner::digest(kind, private_identity)?),
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.kind.requires_owner() != self.owner.is_some() {
+            return Err(format!(
+                "{:?} demand has an invalid owner representation",
+                self.kind
+            ));
+        }
+        if self.owner.as_ref().is_some_and(|owner| !owner.is_valid()) {
+            return Err(format!(
+                "{:?} demand owner is not a canonical SHA-256 digest",
+                self.kind
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One independently renewable reason for keeping a project instance up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandLease {
+    key: DemandKey,
+    generation: u64,
+    acquired_at: SystemTime,
+    renewed_at: SystemTime,
+    expires_at: Option<SystemTime>,
+}
+
+impl DemandLease {
+    #[must_use]
+    pub const fn key(&self) -> &DemandKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> DemandKind {
+        self.key.kind()
+    }
+
+    #[must_use]
+    pub const fn safe_label(&self) -> &'static str {
+        self.key.safe_label()
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn acquired_at(&self) -> SystemTime {
+        self.acquired_at
+    }
+
+    #[must_use]
+    pub const fn renewed_at(&self) -> SystemTime {
+        self.renewed_at
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<SystemTime> {
+        self.expires_at
+    }
+
+    /// Whether this demand is live at the supplied wall-clock time.
+    #[must_use]
+    pub fn is_live_at(&self, now: SystemTime) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
+
+    fn new(key: DemandKey, generation: u64, now: SystemTime) -> Result<Self, String> {
+        let expires_at = Some(deadline(now, key.kind().lease_duration())?);
+        Ok(Self {
+            key,
+            generation,
+            acquired_at: now,
+            renewed_at: now,
+            expires_at,
+        })
+    }
+
+    fn renew(&mut self, now: SystemTime) -> Result<(), String> {
+        let effective_now = now.max(self.renewed_at);
+        self.renewed_at = effective_now;
+        self.expires_at = Some(deadline(effective_now, self.kind().lease_duration())?);
+        Ok(())
+    }
+
+    fn validate(&self, activity_generation: u64) -> Result<(), String> {
+        self.key.validate()?;
+        if self.generation == 0 || self.generation > activity_generation {
+            return Err(format!(
+                "{:?} demand generation {} is outside 1..={activity_generation}",
+                self.kind(),
+                self.generation
+            ));
+        }
+        if self.renewed_at < self.acquired_at {
+            return Err(format!(
+                "{:?} demand renewal predates acquisition",
+                self.kind()
+            ));
+        }
+        let expected_expiry = Some(deadline(self.renewed_at, self.kind().lease_duration())?);
+        if self.expires_at != expected_expiry {
+            return Err(format!(
+                "{:?} demand expiry does not match its canonical lease duration",
+                self.kind()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Durable desired-availability inputs for one project instance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAvailability {
+    activity_generation: u64,
+    always_on: bool,
+    pause_through_generation: Option<u64>,
+    demands: Vec<DemandLease>,
+    shutdown_cooldown_until: Option<SystemTime>,
+    trusted_launch_path: Option<String>,
+    last_convergence_error: Option<String>,
+}
+
+impl ProjectAvailability {
+    #[must_use]
+    pub const fn activity_generation(&self) -> u64 {
+        self.activity_generation
+    }
+
+    #[must_use]
+    pub const fn always_on(&self) -> bool {
+        self.always_on
+    }
+
+    #[must_use]
+    pub const fn pause_through_generation(&self) -> Option<u64> {
+        self.pause_through_generation
+    }
+
+    #[must_use]
+    pub fn demands(&self) -> &[DemandLease] {
+        &self.demands
+    }
+
+    #[must_use]
+    pub const fn shutdown_cooldown_until(&self) -> Option<SystemTime> {
+        self.shutdown_cooldown_until
+    }
+
+    #[must_use]
+    pub fn trusted_launch_path(&self) -> Option<&str> {
+        self.trusted_launch_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn last_convergence_error(&self) -> Option<&str> {
+        self.last_convergence_error.as_deref()
+    }
+
+    /// Whether the current activity generation is covered by a manual pause.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.pause_through_generation
+            .is_some_and(|generation| generation >= self.activity_generation)
+    }
+
+    /// Iterate over the demands that remain live at `now`.
+    pub fn live_demands_at(&self, now: SystemTime) -> impl Iterator<Item = &DemandLease> {
+        self.demands
+            .iter()
+            .filter(move |demand| demand.is_live_at(now))
+    }
+
+    /// Iterate over live demands that are newer than the last pause barrier.
+    ///
+    /// A passive renewal may extend a suppressed lease, but only explicit
+    /// semantic activity can move that owner into a later generation.
+    pub fn effective_demands_at(&self, now: SystemTime) -> impl Iterator<Item = &DemandLease> {
+        let pause_through_generation = self.pause_through_generation;
+        self.live_demands_at(now).filter(move |demand| {
+            pause_through_generation.is_none_or(|pause| demand.generation() > pause)
+        })
+    }
+
+    /// Derive desired availability without inspecting runtime process state.
+    #[must_use]
+    pub fn desired_up_at(&self, now: SystemTime) -> bool {
+        !self.is_paused() && (self.always_on || self.effective_demands_at(now).next().is_some())
+    }
+
+    /// Whether an already-running instance may remain alive until cooldown ends.
+    ///
+    /// This is a convergence deferral, not desired availability. In
+    /// particular, a cooldown never authorizes starting or restoring a stopped
+    /// instance after daemon restart.
+    #[must_use]
+    pub fn shutdown_deferred_at(&self, now: SystemTime) -> bool {
+        !self.is_paused()
+            && !self.desired_up_at(now)
+            && self
+                .shutdown_cooldown_until
+                .is_some_and(|deadline| deadline > now)
+    }
+
+    fn ensure_demand(
+        &mut self,
+        key: DemandKey,
+        now: SystemTime,
+    ) -> Result<EnsureDemandResult, AvailabilityError> {
+        let existing = self.demands.iter().position(|demand| demand.key == key);
+        let existing_is_live = existing.is_some_and(|index| self.demands[index].is_live_at(now));
+        let existing_is_effective = existing_is_live
+            && existing.is_some_and(|index| {
+                self.pause_through_generation
+                    .is_none_or(|pause| self.demands[index].generation > pause)
+            });
+
+        if existing_is_effective {
+            let index = existing.ok_or_else(|| AvailabilityError::Invariant {
+                reason: "live demand index disappeared during renewal".to_owned(),
+            })?;
+            self.demands[index]
+                .renew(now)
+                .map_err(|reason| AvailabilityError::Invariant { reason })?;
+            self.shutdown_cooldown_until = None;
+            return Ok(EnsureDemandResult {
+                effect: EnsureDemandEffect::Renewed,
+                lease: self.demands[index].clone(),
+            });
+        }
+
+        let crossed_pause_barrier = self.is_paused() || existing_is_live;
+        let generation = self.activity_generation.checked_add(1).ok_or(
+            AvailabilityError::GenerationExhausted {
+                current: self.activity_generation,
+            },
+        )?;
+        self.activity_generation = generation;
+        self.demands.retain(|demand| demand.key != key);
+        let lease = DemandLease::new(key, generation, now)
+            .map_err(|reason| AvailabilityError::Invariant { reason })?;
+        self.demands.push(lease.clone());
+        self.demands.sort_by(|left, right| left.key.cmp(&right.key));
+        self.shutdown_cooldown_until = None;
+
+        Ok(EnsureDemandResult {
+            effect: if crossed_pause_barrier {
+                EnsureDemandEffect::Resumed
+            } else {
+                EnsureDemandEffect::Acquired
+            },
+            lease,
+        })
+    }
+
+    fn renew_demand(
+        &mut self,
+        key: &DemandKey,
+        now: SystemTime,
+    ) -> Result<RenewDemandResult, AvailabilityError> {
+        let Some(index) = self.demands.iter().position(|demand| &demand.key == key) else {
+            return Ok(RenewDemandResult::Missing);
+        };
+        if !self.demands[index].is_live_at(now) {
+            let availability_loss_at = self
+                .demands
+                .iter()
+                .filter(|demand| {
+                    self.demand_generation_is_effective(demand.generation)
+                        && !demand.is_live_at(now)
+                })
+                .filter_map(DemandLease::expires_at)
+                .max();
+            self.demands.remove(index);
+            self.arm_shutdown_cooldown_if_idle(now, availability_loss_at)?;
+            return Ok(RenewDemandResult::Expired);
+        }
+        self.demands[index]
+            .renew(now)
+            .map_err(|reason| AvailabilityError::Invariant { reason })?;
+        if self.demand_generation_is_effective(self.demands[index].generation) {
+            self.shutdown_cooldown_until = None;
+        }
+        Ok(RenewDemandResult::Renewed(self.demands[index].clone()))
+    }
+
+    fn release_demand(
+        &mut self,
+        key: &DemandKey,
+        now: SystemTime,
+    ) -> Result<bool, AvailabilityError> {
+        let removed_effective = self.demands.iter().find(|demand| {
+            &demand.key == key && self.demand_generation_is_effective(demand.generation)
+        });
+        let availability_loss_at = removed_effective.and_then(|demand| {
+            if demand.is_live_at(now) {
+                Some(now)
+            } else {
+                self.demands
+                    .iter()
+                    .filter(|candidate| {
+                        self.demand_generation_is_effective(candidate.generation)
+                            && !candidate.is_live_at(now)
+                    })
+                    .filter_map(DemandLease::expires_at)
+                    .max()
+            }
+        });
+        let previous_len = self.demands.len();
+        self.demands.retain(|demand| &demand.key != key);
+        let released = self.demands.len() != previous_len;
+        self.arm_shutdown_cooldown_if_idle(
+            now,
+            if released { availability_loss_at } else { None },
+        )?;
+        Ok(released)
+    }
+
+    fn expire_demands(&mut self, now: SystemTime) -> Result<usize, AvailabilityError> {
+        let availability_loss_at = self
+            .demands
+            .iter()
+            .filter(|demand| {
+                !demand.is_live_at(now) && self.demand_generation_is_effective(demand.generation)
+            })
+            .filter_map(DemandLease::expires_at)
+            .max();
+        let previous_len = self.demands.len();
+        self.demands.retain(|demand| demand.is_live_at(now));
+        let expired = previous_len - self.demands.len();
+        self.arm_shutdown_cooldown_if_idle(now, availability_loss_at)?;
+        Ok(expired)
+    }
+
+    fn set_always_on(&mut self, enabled: bool, now: SystemTime) -> Result<bool, AvailabilityError> {
+        if enabled {
+            let activation_required = !self.always_on || self.is_paused();
+            let cooldown_cleared = self.shutdown_cooldown_until.take().is_some();
+            if activation_required {
+                self.activity_generation = self.activity_generation.checked_add(1).ok_or(
+                    AvailabilityError::GenerationExhausted {
+                        current: self.activity_generation,
+                    },
+                )?;
+            }
+            let changed = !self.always_on || activation_required || cooldown_cleared;
+            self.always_on = true;
+            return Ok(changed);
+        }
+
+        if !self.always_on {
+            return Ok(false);
+        }
+        self.always_on = false;
+        self.arm_shutdown_cooldown_if_idle(now, Some(now))?;
+        Ok(true)
+    }
+
+    fn pause_project(&mut self) -> bool {
+        let pause_through_generation = Some(self.activity_generation);
+        let changed = self.pause_through_generation != pause_through_generation
+            || self.shutdown_cooldown_until.is_some();
+        self.pause_through_generation = pause_through_generation;
+        self.shutdown_cooldown_until = None;
+        changed
+    }
+
+    fn set_trusted_launch_path(&mut self, path: Option<String>) -> bool {
+        if self.trusted_launch_path == path {
+            return false;
+        }
+        self.trusted_launch_path = path;
+        true
+    }
+
+    fn set_last_convergence_error(&mut self, error: Option<String>) -> bool {
+        if self.last_convergence_error == error {
+            return false;
+        }
+        self.last_convergence_error = error;
+        true
+    }
+
+    fn demand_generation_is_effective(&self, generation: u64) -> bool {
+        self.pause_through_generation
+            .is_none_or(|pause| generation > pause)
+    }
+
+    fn arm_shutdown_cooldown_if_idle(
+        &mut self,
+        now: SystemTime,
+        availability_loss_at: Option<SystemTime>,
+    ) -> Result<(), AvailabilityError> {
+        let Some(availability_loss_at) = availability_loss_at else {
+            return Ok(());
+        };
+        if self.shutdown_cooldown_until.is_some()
+            || self.always_on
+            || self.is_paused()
+            || self.effective_demands_at(now).next().is_some()
+        {
+            return Ok(());
+        }
+
+        self.shutdown_cooldown_until = Some(
+            deadline(availability_loss_at, SHUTDOWN_COOLDOWN)
+                .map_err(|reason| AvailabilityError::Invariant { reason })?,
+        );
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .pause_through_generation
+            .is_some_and(|pause| pause > self.activity_generation)
+        {
+            return Err(format!(
+                "pause generation exceeds activity generation {}",
+                self.activity_generation
+            ));
+        }
+        if self
+            .trusted_launch_path
+            .as_ref()
+            .is_some_and(|path| path.contains('\0'))
+        {
+            return Err("trusted launch PATH contains a NUL byte".to_owned());
+        }
+        if self
+            .last_convergence_error
+            .as_ref()
+            .is_some_and(|error| error.trim().is_empty())
+        {
+            return Err("last convergence error must not be empty".to_owned());
+        }
+
+        let mut keys = BTreeSet::new();
+        for demand in &self.demands {
+            demand.validate(self.activity_generation)?;
+            if !keys.insert(&demand.key) {
+                return Err(format!("duplicate {:?} demand", demand.kind()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The effect of an explicit semantic ensure operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureDemandEffect {
+    /// A new owner or a renewed owner after expiry started a generation.
+    Acquired,
+    /// A still-live owner renewed its lease in the current generation.
+    Renewed,
+    /// Explicit activity advanced beyond the current pause barrier.
+    Resumed,
+}
+
+/// The result of explicitly ensuring one demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsureDemandResult {
+    pub effect: EnsureDemandEffect,
+    pub lease: DemandLease,
+}
+
+/// The result of passively renewing an existing demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewDemandResult {
+    Renewed(DemandLease),
+    Missing,
+    Expired,
+}
+
+/// A load, transition, or persistence failure in authoritative availability state.
+#[derive(Debug, Error)]
+pub enum AvailabilityError {
+    #[error("failed to {operation} `{path}`: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("availability `{path}` uses unsupported schema version {found}; expected {expected}")]
+    UnsupportedVersion {
+        path: PathBuf,
+        found: u64,
+        expected: u32,
+    },
+
+    #[error("invalid availability state `{path}`: {reason}")]
+    InvalidData { path: PathBuf, reason: String },
+
+    #[error("activity generation {current} cannot be advanced")]
+    GenerationExhausted { current: u64 },
+
+    #[error("availability invariant failed: {reason}")]
+    Invariant { reason: String },
+
+    #[error("availability `{path}` was published and its parent-directory sync failed: {reason}")]
+    PublishedNotDurable { path: PathBuf, reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvailabilityFile {
+    version: u32,
+    project_instance_id: ProjectInstanceId,
+    availability: ProjectAvailability,
+}
+
+/// The authoritative availability record for one stable project instance.
+#[derive(Debug)]
+pub struct AvailabilityStore<C = SystemClock> {
+    project_instance_id: ProjectInstanceId,
+    path: PathBuf,
+    availability: ProjectAvailability,
+    mutation_lock: Arc<MutationLock>,
+    clock: C,
+}
+
+impl AvailabilityStore<SystemClock> {
+    /// Load one project instance from the standard layout beneath `data_dir`.
+    pub async fn load(
+        data_dir: &Path,
+        project_instance_id: ProjectInstanceId,
+    ) -> Result<Self, AvailabilityError> {
+        Self::load_with_clock(data_dir, project_instance_id, SystemClock).await
+    }
+}
+
+impl<C: Clock> AvailabilityStore<C> {
+    /// Load one project instance with an injected clock.
+    pub async fn load_with_clock(
+        data_dir: &Path,
+        project_instance_id: ProjectInstanceId,
+        clock: C,
+    ) -> Result<Self, AvailabilityError> {
+        let data_dir = normalized_data_directory(data_dir)
+            .await
+            .map_err(|source| AvailabilityError::Io {
+                operation: "resolve availability data directory",
+                path: data_dir.to_path_buf(),
+                source,
+            })?;
+        let path = availability_path(&data_dir, project_instance_id);
+        let availability = load_availability(&path, project_instance_id).await?;
+        let mutation_lock = availability_mutation_lock(&path);
+        Ok(Self {
+            project_instance_id,
+            path,
+            availability,
+            mutation_lock,
+            clock,
+        })
+    }
+
+    #[must_use]
+    pub const fn project_instance_id(&self) -> ProjectInstanceId {
+        self.project_instance_id
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Explicitly acquire, renew, or resume one demand.
+    pub async fn ensure_demand(
+        &mut self,
+        key: DemandKey,
+    ) -> Result<EnsureDemandResult, AvailabilityError> {
+        self.mutate(|candidate, now| Ok((candidate.ensure_demand(key, now)?, true)))
+            .await
+    }
+
+    /// Passively renew a live demand without advancing or resuming a generation.
+    pub async fn renew_demand(
+        &mut self,
+        key: &DemandKey,
+    ) -> Result<RenewDemandResult, AvailabilityError> {
+        self.mutate(|candidate, now| {
+            let result = candidate.renew_demand(key, now)?;
+            let changed = !matches!(result, RenewDemandResult::Missing);
+            Ok((result, changed))
+        })
+        .await
+    }
+
+    /// Release one owner while preserving every other demand.
+    pub async fn release_demand(&mut self, key: &DemandKey) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, now| {
+            let released = candidate.release_demand(key, now)?;
+            Ok((released, released))
+        })
+        .await
+    }
+
+    /// Remove every demand whose absolute deadline has been reached.
+    pub async fn expire_demands(&mut self) -> Result<usize, AvailabilityError> {
+        self.mutate(|candidate, now| {
+            let expired = candidate.expire_demands(now)?;
+            Ok((expired, expired > 0))
+        })
+        .await
+    }
+
+    /// Enable or disable durable Always On policy.
+    ///
+    /// Enabling a paused policy is explicit activity and advances beyond the
+    /// pause barrier. Disabling the policy arms the normal shutdown cooldown
+    /// when no live demand remains. Returns whether durable state changed.
+    pub async fn set_always_on(&mut self, enabled: bool) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, now| {
+            let changed = candidate.set_always_on(enabled, now)?;
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Pause the project through its current activity generation.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn pause_project(&mut self) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.pause_project();
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Replace the trusted launch `PATH` after an explicit trusted CLI ensure.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn replace_trusted_launch_path(
+        &mut self,
+        path: String,
+    ) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_trusted_launch_path(Some(path));
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Seed a trusted launch `PATH` only when no earlier trusted caller did so.
+    ///
+    /// Returns whether this call stored the seed.
+    pub async fn seed_trusted_launch_path_if_missing(
+        &mut self,
+        path: String,
+    ) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = if candidate.trusted_launch_path().is_none() {
+                candidate.set_trusted_launch_path(Some(path))
+            } else {
+                false
+            };
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Clear launch context that is no longer trusted or usable.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn clear_trusted_launch_path(&mut self) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_trusted_launch_path(None);
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Record the last convergence failure shown by status surfaces.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn record_convergence_error(
+        &mut self,
+        error: String,
+    ) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_last_convergence_error(Some(error));
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Clear the last convergence failure after a successful convergence.
+    ///
+    /// Returns whether durable state changed.
+    pub async fn clear_convergence_error(&mut self) -> Result<bool, AvailabilityError> {
+        self.mutate(|candidate, _now| {
+            let changed = candidate.set_last_convergence_error(None);
+            Ok((changed, changed))
+        })
+        .await
+    }
+
+    /// Load and return the latest authoritative availability snapshot.
+    pub async fn snapshot(&mut self) -> Result<ProjectAvailability, AvailabilityError> {
+        self.refresh().await?;
+        Ok(self.availability.clone())
+    }
+
+    /// Derive desired availability from the latest authoritative snapshot.
+    pub async fn desired_up(&mut self) -> Result<bool, AvailabilityError> {
+        self.refresh().await?;
+        Ok(self.availability.desired_up_at(self.clock.now()))
+    }
+
+    /// Whether convergence may keep this already-running instance alive.
+    pub async fn shutdown_deferred(&mut self) -> Result<bool, AvailabilityError> {
+        self.refresh().await?;
+        Ok(self.availability.shutdown_deferred_at(self.clock.now()))
+    }
+
+    async fn refresh(&mut self) -> Result<(), AvailabilityError> {
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        let _guard = mutation_lock.lock_owned().await;
+        self.availability = load_availability(&self.path, self.project_instance_id).await?;
+        Ok(())
+    }
+
+    async fn mutate<Output, Transition>(
+        &mut self,
+        transition: Transition,
+    ) -> Result<Output, AvailabilityError>
+    where
+        Transition: FnOnce(
+            &mut ProjectAvailability,
+            SystemTime,
+        ) -> Result<(Output, bool), AvailabilityError>,
+    {
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        let _guard = mutation_lock.lock_owned().await;
+
+        let current = load_availability(&self.path, self.project_instance_id).await?;
+        self.availability = current.clone();
+        let mut candidate = current;
+        let (result, changed) = transition(&mut candidate, self.clock.now())?;
+        if changed {
+            self.commit(candidate).await?;
+        }
+        Ok(result)
+    }
+
+    async fn commit(&mut self, candidate: ProjectAvailability) -> Result<(), AvailabilityError> {
+        self.commit_with_parent_sync(candidate, |path| async move { sync_parent(&path).await })
+            .await
+    }
+
+    async fn commit_with_parent_sync<Sync, SyncFuture>(
+        &mut self,
+        candidate: ProjectAvailability,
+        parent_sync: Sync,
+    ) -> Result<(), AvailabilityError>
+    where
+        Sync: FnOnce(PathBuf) -> SyncFuture,
+        SyncFuture: Future<Output = Result<(), AvailabilityError>>,
+    {
+        candidate
+            .validate()
+            .map_err(|reason| AvailabilityError::InvalidData {
+                path: self.path.clone(),
+                reason,
+            })?;
+        let result = replace_availability_with_parent_sync(
+            &candidate,
+            self.project_instance_id,
+            &self.path,
+            parent_sync,
+        )
+        .await;
+        if result.is_ok() || matches!(&result, Err(AvailabilityError::PublishedNotDurable { .. })) {
+            self.availability = candidate;
+        }
+        result
+    }
+}
+
+/// Return the standard per-instance availability path beneath `data_dir`.
+#[must_use]
+pub fn availability_path(data_dir: &Path, project_instance_id: ProjectInstanceId) -> PathBuf {
+    data_dir
+        .join("instances")
+        .join(project_instance_id.to_string())
+        .join(AVAILABILITY_FILE_NAME)
+}
+
+async fn load_availability(
+    path: &Path,
+    project_instance_id: ProjectInstanceId,
+) -> Result<ProjectAvailability, AvailabilityError> {
+    let content = match tokio::fs::read(path).await {
+        Ok(content) => content,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(ProjectAvailability::default());
+        }
+        Err(source) => {
+            return Err(AvailabilityError::Io {
+                operation: "read availability state",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&content).map_err(|source| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        })?;
+    let found = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "missing unsigned integer schema version".to_owned(),
+        })?;
+    if found != u64::from(AVAILABILITY_VERSION) {
+        return Err(AvailabilityError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            found,
+            expected: AVAILABILITY_VERSION,
+        });
+    }
+
+    let file: AvailabilityFile =
+        serde_json::from_value(value).map_err(|source| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        })?;
+    if file.project_instance_id != project_instance_id {
+        return Err(AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: format!(
+                "embedded project instance {} does not match path owner {project_instance_id}",
+                file.project_instance_id
+            ),
+        });
+    }
+    file.availability
+        .validate()
+        .map_err(|reason| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason,
+        })?;
+    Ok(file.availability)
+}
+
+async fn replace_availability_with_parent_sync<Sync, SyncFuture>(
+    availability: &ProjectAvailability,
+    project_instance_id: ProjectInstanceId,
+    path: &Path,
+    parent_sync: Sync,
+) -> Result<(), AvailabilityError>
+where
+    Sync: FnOnce(PathBuf) -> SyncFuture,
+    SyncFuture: Future<Output = Result<(), AvailabilityError>>,
+{
+    let temporary = write_temporary_availability(availability, project_instance_id, path).await?;
+    if let Err(source) = tokio::fs::rename(&temporary, path).await {
+        let cleanup = tokio::fs::remove_file(&temporary).await;
+        let reason = cleanup.err().map_or_else(
+            || source.to_string(),
+            |cleanup_error| format!("{source}; temporary cleanup also failed: {cleanup_error}"),
+        );
+        return Err(AvailabilityError::Io {
+            operation: "replace availability state",
+            path: path.to_path_buf(),
+            source: io::Error::new(source.kind(), reason),
+        });
+    }
+    parent_sync(path.to_path_buf())
+        .await
+        .map_err(|error| AvailabilityError::PublishedNotDurable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })
+}
+
+async fn write_temporary_availability(
+    availability: &ProjectAvailability,
+    project_instance_id: ProjectInstanceId,
+    path: &Path,
+) -> Result<PathBuf, AvailabilityError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "availability path has no parent directory".to_owned(),
+        })?;
+    let first_publish = match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => false,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => true,
+        Err(source) => {
+            return Err(AvailabilityError::Io {
+                operation: "inspect availability state before publication",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|source| AvailabilityError::Io {
+            operation: "create availability directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    if first_publish {
+        sync_new_availability_hierarchy(path).await?;
+    }
+
+    let temporary = parent.join(format!(".{AVAILABILITY_FILE_NAME}.{}.tmp", Uuid::new_v4()));
+    let file = AvailabilityFile {
+        version: AVAILABILITY_VERSION,
+        project_instance_id,
+        availability: availability.clone(),
+    };
+    let mut content =
+        serde_json::to_vec_pretty(&file).map_err(|source| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        })?;
+    content.push(b'\n');
+
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await
+        .map_err(|source| AvailabilityError::Io {
+            operation: "create temporary availability state",
+            path: temporary.clone(),
+            source,
+        })?;
+    let write_result = async {
+        output.write_all(&content).await?;
+        output.sync_all().await
+    }
+    .await;
+    if let Err(source) = write_result {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(AvailabilityError::Io {
+            operation: "write and sync temporary availability state",
+            path: temporary,
+            source,
+        });
+    }
+    Ok(temporary)
+}
+
+async fn sync_parent(path: &Path) -> Result<(), AvailabilityError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "availability path has no parent directory".to_owned(),
+        })?;
+    sync_directory(parent).await
+}
+
+async fn sync_new_availability_hierarchy(path: &Path) -> Result<(), AvailabilityError> {
+    let project_state_directory = path
+        .parent()
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "availability path has no instance directory".to_owned(),
+        })?;
+    let instances_root =
+        project_state_directory
+            .parent()
+            .ok_or_else(|| AvailabilityError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "availability path has no instances directory".to_owned(),
+            })?;
+    let data_directory = instances_root
+        .parent()
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "availability path has no data directory".to_owned(),
+        })?;
+    let data_parent = data_directory
+        .parent()
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "availability data directory has no parent".to_owned(),
+        })?;
+
+    // A successful first publication must make every newly introduced
+    // directory entry durable, not only the final availability.json entry.
+    // Syncing all three parents also repairs a hierarchy left by an earlier
+    // failed first-publication attempt.
+    sync_directory(instances_root).await?;
+    sync_directory(data_directory).await?;
+    sync_directory(data_parent).await
+}
+
+async fn sync_directory(path: &Path) -> Result<(), AvailabilityError> {
+    let directory = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| AvailabilityError::Io {
+            operation: "open availability directory for sync",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    directory
+        .sync_all()
+        .await
+        .map_err(|source| AvailabilityError::Io {
+            operation: "sync availability directory",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn deadline(now: SystemTime, duration: Duration) -> Result<SystemTime, String> {
+    now.checked_add(duration)
+        .ok_or_else(|| "demand expiry exceeds SystemTime range".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::UNIX_EPOCH;
+    use tempfile::TempDir;
+
+    const START_SECONDS: u64 = 1_000_000;
+
+    #[derive(Debug, Clone)]
+    struct FakeClock {
+        seconds: Arc<AtomicU64>,
+    }
+
+    impl FakeClock {
+        fn new(seconds: u64) -> Self {
+            Self {
+                seconds: Arc::new(AtomicU64::new(seconds)),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.seconds.fetch_add(duration.as_secs(), Ordering::SeqCst);
+        }
+
+        fn time(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(self.seconds.load(Ordering::SeqCst))
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> SystemTime {
+            self.time()
+        }
+    }
+
+    struct Fixture {
+        _temp: TempDir,
+        data_dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("create availability fixture");
+            let data_dir = temp.path().join("data");
+            Self {
+                _temp: temp,
+                data_dir,
+            }
+        }
+    }
+
+    fn instance_id(value: u128) -> ProjectInstanceId {
+        ProjectInstanceId::from_str(&Uuid::from_u128(value).to_string())
+            .expect("parse fixture project instance id")
+    }
+
+    async fn fake_store(
+        fixture: &Fixture,
+        project_instance_id: ProjectInstanceId,
+        clock: FakeClock,
+    ) -> AvailabilityStore<FakeClock> {
+        AvailabilityStore::load_with_clock(&fixture.data_dir, project_instance_id, clock)
+            .await
+            .expect("load availability store")
+    }
+
+    fn temporary_files(path: &Path) -> Vec<PathBuf> {
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+        std::fs::read_dir(parent)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                Path::new(name)
+                                    .extension()
+                                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn demand_keys_digest_private_identity_and_expose_safe_labels() {
+        let private_identity = "private-conversation-123";
+        let key = DemandKey::agent_conversation(private_identity)
+            .expect("construct agent conversation demand");
+        let serialized = serde_json::to_string(&key).expect("serialize demand key");
+
+        assert_eq!(key.kind(), DemandKind::AgentConversation);
+        assert_eq!(key.safe_label(), "Agent conversation");
+        assert!(!serialized.contains(private_identity));
+        assert_ne!(
+            key,
+            DemandKey::agent_conversation("private-conversation-456")
+                .expect("construct second agent conversation demand")
+        );
+        assert_eq!(
+            DemandKey::vs_code_window(" ").expect_err("reject empty private identity"),
+            DemandKeyError::EmptyPrivateIdentity {
+                kind: DemandKind::VsCodeWindow
+            }
+        );
+        assert_eq!(AGENT_DEMAND_TTL, AGENT_ACTIVE_TTL + AGENT_REVIEW_GRACE);
+    }
+
+    #[test]
+    fn legacy_process_lease_has_a_bounded_canonical_deadline() {
+        let now = UNIX_EPOCH + Duration::from_secs(START_SECONDS);
+        let lease = DemandLease::new(
+            DemandKey::legacy_process_attachment("process-42")
+                .expect("construct legacy process demand"),
+            1,
+            now,
+        )
+        .expect("construct legacy process lease");
+
+        assert_eq!(lease.expires_at(), Some(now + LEGACY_PROCESS_DEMAND_TTL));
+        assert!(lease.validate(1).is_ok());
+    }
+
+    #[test]
+    fn lease_validation_enforces_canonical_deadline() {
+        let now = UNIX_EPOCH + Duration::from_secs(START_SECONDS);
+        let mut lease =
+            DemandLease::new(DemandKey::manual_cli(), 1, now).expect("construct manual lease");
+        lease.expires_at = Some(now + Duration::from_secs(1));
+
+        assert!(lease.validate(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_ensure_acquires_then_renews_a_live_owner() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(1), clock.clone()).await;
+        let key = DemandKey::manual_cli();
+
+        let acquired = store
+            .ensure_demand(key.clone())
+            .await
+            .expect("acquire manual demand");
+        assert_eq!(acquired.effect, EnsureDemandEffect::Acquired);
+        assert_eq!(acquired.lease.generation(), 1);
+        assert_eq!(
+            acquired.lease.expires_at(),
+            Some(clock.time() + MANUAL_DEMAND_TTL)
+        );
+
+        clock.advance(Duration::from_secs(10));
+        let renewed = store
+            .ensure_demand(key)
+            .await
+            .expect("renew live manual demand");
+        assert_eq!(renewed.effect, EnsureDemandEffect::Renewed);
+        assert_eq!(renewed.lease.generation(), 1);
+        assert_eq!(renewed.lease.acquired_at(), acquired.lease.acquired_at());
+        assert_eq!(renewed.lease.renewed_at(), clock.time());
+        assert_eq!(store.availability.activity_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_owner_advances_generation_and_demands_coexist() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(2), clock).await;
+
+        store
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("acquire manual demand");
+        let editor = store
+            .ensure_demand(DemandKey::vs_code_window("window-1").expect("construct editor demand"))
+            .await
+            .expect("acquire editor demand");
+
+        assert_eq!(editor.effect, EnsureDemandEffect::Acquired);
+        assert_eq!(editor.lease.generation(), 2);
+        assert_eq!(store.availability.activity_generation(), 2);
+        assert_eq!(store.availability.demands().len(), 2);
+        assert!(store.desired_up().await.expect("derive desired state"));
+    }
+
+    #[tokio::test]
+    async fn passive_renewal_cannot_cross_a_pause_barrier() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(3), clock.clone()).await;
+        let manual = DemandKey::manual_cli();
+
+        store
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire manual demand");
+        assert!(store.pause_project().await.expect("pause project"));
+        assert!(store.availability.is_paused());
+
+        clock.advance(Duration::from_secs(20));
+        let renewed = store
+            .renew_demand(&manual)
+            .await
+            .expect("passively renew demand");
+        let lease = match renewed {
+            RenewDemandResult::Renewed(lease) => lease,
+            other => return assert!(matches!(other, RenewDemandResult::Renewed(_))),
+        };
+        assert_eq!(lease.generation(), 1);
+        assert_eq!(store.availability.activity_generation(), 1);
+        assert!(store.availability.is_paused());
+        assert!(!store.desired_up().await.expect("derive paused state"));
+
+        let resumed = store
+            .ensure_demand(manual)
+            .await
+            .expect("explicitly resume demand");
+        assert_eq!(resumed.effect, EnsureDemandEffect::Resumed);
+        assert_eq!(resumed.lease.generation(), 2);
+        assert!(!store.availability.is_paused());
+        assert!(store.desired_up().await.expect("derive resumed state"));
+    }
+
+    #[tokio::test]
+    async fn paused_owner_stays_suppressed_until_its_own_semantic_activity() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(15), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let manual = DemandKey::manual_cli();
+
+        store
+            .ensure_demand(editor.clone())
+            .await
+            .expect("acquire editor demand");
+        assert!(store.pause_project().await.expect("pause project"));
+
+        let manual_resume = store
+            .ensure_demand(manual.clone())
+            .await
+            .expect("resume through manual activity");
+        assert_eq!(manual_resume.effect, EnsureDemandEffect::Resumed);
+        assert_eq!(manual_resume.lease.generation(), 2);
+        assert!(store.release_demand(&manual).await.expect("release manual"));
+
+        store
+            .renew_demand(&editor)
+            .await
+            .expect("passively renew suppressed editor");
+        assert!(
+            store
+                .availability
+                .live_demands_at(clock.time())
+                .next()
+                .is_some()
+        );
+        assert!(
+            store
+                .availability
+                .effective_demands_at(clock.time())
+                .next()
+                .is_none()
+        );
+        assert!(!store.desired_up().await.expect("derive suppressed state"));
+
+        let editor_resume = store
+            .ensure_demand(editor)
+            .await
+            .expect("resume through editor activity");
+        assert_eq!(editor_resume.effect, EnsureDemandEffect::Resumed);
+        assert_eq!(editor_resume.lease.generation(), 3);
+        assert!(store.desired_up().await.expect("derive resumed state"));
+    }
+
+    #[tokio::test]
+    async fn renewal_reports_missing_and_removes_expired_demand() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(4), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+
+        assert_eq!(
+            store
+                .renew_demand(&editor)
+                .await
+                .expect("inspect missing renewal"),
+            RenewDemandResult::Missing
+        );
+        assert!(!store.path().exists());
+
+        store
+            .ensure_demand(editor.clone())
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL);
+        assert_eq!(
+            store
+                .renew_demand(&editor)
+                .await
+                .expect("remove expired renewal"),
+            RenewDemandResult::Expired
+        );
+        assert!(store.availability.demands().is_empty());
+        assert_eq!(store.availability.activity_generation(), 1);
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(clock.time() + SHUTDOWN_COOLDOWN)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_and_expiry_preserve_independent_owners() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(5), clock.clone()).await;
+        let manual = DemandKey::manual_cli();
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+
+        store
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire manual demand");
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL);
+
+        assert_eq!(store.expire_demands().await.expect("expire demands"), 1);
+        assert_eq!(store.availability.demands().len(), 1);
+        assert_eq!(store.availability.shutdown_cooldown_until(), None);
+        assert!(store.release_demand(&manual).await.expect("release manual"));
+        assert!(
+            !store
+                .release_demand(&manual)
+                .await
+                .expect("release missing manual")
+        );
+        assert!(store.availability.demands().is_empty());
+        assert!(!store.desired_up().await.expect("derive idle state"));
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(clock.time() + SHUTDOWN_COOLDOWN)
+        );
+        assert!(
+            store
+                .shutdown_deferred()
+                .await
+                .expect("derive shutdown deferral")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_process_demand_expires() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(16), clock.clone()).await;
+        let legacy = DemandKey::legacy_process_attachment("process-42")
+            .expect("construct legacy process demand");
+
+        store
+            .ensure_demand(legacy)
+            .await
+            .expect("acquire legacy process demand");
+        clock.advance(LEGACY_PROCESS_DEMAND_TTL);
+
+        assert_eq!(
+            store.expire_demands().await.expect("expire legacy demand"),
+            1
+        );
+        assert!(store.availability.demands().is_empty());
+        assert!(!store.desired_up().await.expect("derive idle state"));
+    }
+
+    #[test]
+    fn desired_state_combines_always_on_pause_and_live_demands() {
+        let now = UNIX_EPOCH + Duration::from_secs(START_SECONDS);
+        let mut availability = ProjectAvailability::default();
+
+        assert!(!availability.desired_up_at(now));
+        availability.always_on = true;
+        assert!(availability.desired_up_at(now));
+        availability.pause_through_generation = Some(0);
+        assert!(!availability.desired_up_at(now));
+        availability.activity_generation = 1;
+        assert!(availability.desired_up_at(now));
+    }
+
+    #[test]
+    fn cooldown_defers_shutdown_without_authorizing_start_or_restore() {
+        let now = UNIX_EPOCH + Duration::from_secs(START_SECONDS);
+        let mut availability = ProjectAvailability {
+            shutdown_cooldown_until: Some(now + SHUTDOWN_COOLDOWN),
+            ..ProjectAvailability::default()
+        };
+
+        assert!(!availability.desired_up_at(now));
+        assert!(availability.shutdown_deferred_at(now));
+        assert!(!availability.shutdown_deferred_at(now + SHUTDOWN_COOLDOWN));
+
+        availability.pause_through_generation = Some(0);
+        assert!(!availability.shutdown_deferred_at(now));
+    }
+
+    #[tokio::test]
+    async fn delayed_expiry_uses_the_lease_deadline_for_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(20), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let demand_expires_at = clock.time() + VSCODE_DEMAND_TTL;
+
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL + SHUTDOWN_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(
+            store.expire_demands().await.expect("expire editor demand"),
+            1
+        );
+
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(demand_expires_at + SHUTDOWN_COOLDOWN)
+        );
+        assert!(
+            !store
+                .shutdown_deferred()
+                .await
+                .expect("derive elapsed shutdown deferral")
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_an_expired_lease_uses_its_expiry_for_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(29), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let demand_expires_at = clock.time() + VSCODE_DEMAND_TTL;
+
+        store
+            .ensure_demand(editor.clone())
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL + Duration::from_secs(1));
+        assert!(
+            store
+                .release_demand(&editor)
+                .await
+                .expect("release expired editor demand")
+        );
+
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(demand_expires_at + SHUTDOWN_COOLDOWN)
+        );
+        assert!(
+            store
+                .shutdown_deferred()
+                .await
+                .expect("derive remaining shutdown deferral")
+        );
+    }
+
+    #[tokio::test]
+    async fn later_cleanup_preserves_an_already_armed_cooldown() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(21), clock.clone()).await;
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let manual = DemandKey::manual_cli();
+
+        store
+            .ensure_demand(editor)
+            .await
+            .expect("acquire editor demand");
+        clock.advance(VSCODE_DEMAND_TTL);
+        store
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire manual demand");
+        assert!(store.release_demand(&manual).await.expect("release manual"));
+        let armed_deadline = store
+            .availability
+            .shutdown_cooldown_until()
+            .expect("cooldown is armed");
+
+        assert_eq!(
+            store.expire_demands().await.expect("remove stale editor"),
+            1
+        );
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(armed_deadline)
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_transitions_are_generation_scoped_and_durable() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(22);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        assert!(store.set_always_on(true).await.expect("enable Always On"));
+        assert_eq!(store.availability.activity_generation(), 1);
+        assert!(store.availability.always_on());
+        assert!(store.desired_up().await.expect("derive pinned state"));
+
+        assert!(store.pause_project().await.expect("pause pinned project"));
+        assert!(store.availability.is_paused());
+        assert!(store.availability.always_on());
+        assert!(!store.desired_up().await.expect("derive paused state"));
+
+        assert!(
+            store
+                .set_always_on(true)
+                .await
+                .expect("renew pin to resume")
+        );
+        assert_eq!(store.availability.activity_generation(), 2);
+        assert!(!store.availability.is_paused());
+        assert!(store.desired_up().await.expect("derive resumed pin state"));
+
+        assert!(store.set_always_on(false).await.expect("disable Always On"));
+        assert!(!store.availability.always_on());
+        assert_eq!(
+            store.availability.shutdown_cooldown_until(),
+            Some(clock.time() + SHUTDOWN_COOLDOWN)
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert_eq!(
+            reopened.snapshot().await.expect("load policy snapshot"),
+            store.availability
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_context_and_convergence_error_transitions_are_durable() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(23);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        assert!(
+            store
+                .replace_trusted_launch_path("/opt/homebrew/bin:/usr/bin".to_owned())
+                .await
+                .expect("record trusted PATH")
+        );
+        assert!(
+            store
+                .record_convergence_error("web readiness timed out".to_owned())
+                .await
+                .expect("record convergence error")
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        let snapshot = reopened.snapshot().await.expect("load durable diagnostics");
+        assert_eq!(
+            snapshot.trusted_launch_path(),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        assert_eq!(
+            snapshot.last_convergence_error(),
+            Some("web readiness timed out")
+        );
+
+        assert!(
+            reopened
+                .clear_trusted_launch_path()
+                .await
+                .expect("clear trusted PATH")
+        );
+        assert!(
+            reopened
+                .clear_convergence_error()
+                .await
+                .expect("clear convergence error")
+        );
+        let cleared = reopened.snapshot().await.expect("load cleared diagnostics");
+        assert_eq!(cleared.trusted_launch_path(), None);
+        assert_eq!(cleared.last_convergence_error(), None);
+    }
+
+    #[tokio::test]
+    async fn orthogonal_mutations_from_stale_handles_are_preserved() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(24);
+        let mut policy = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut launch = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        let (policy_result, launch_result) = tokio::join!(
+            policy.set_always_on(true),
+            launch.replace_trusted_launch_path("/usr/local/bin:/usr/bin".to_owned())
+        );
+        assert!(policy_result.expect("persist Always On"));
+        assert!(launch_result.expect("persist trusted PATH"));
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        let snapshot = reopened
+            .snapshot()
+            .await
+            .expect("load combined policy state");
+        assert!(snapshot.always_on());
+        assert_eq!(
+            snapshot.trusted_launch_path(),
+            Some("/usr/local/bin:/usr/bin")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_launch_path_seeding_selects_one_trusted_value() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(25);
+        let mut editor = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut agent = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        let (editor_result, agent_result) = tokio::join!(
+            editor.seed_trusted_launch_path_if_missing("/editor/bin".to_owned()),
+            agent.seed_trusted_launch_path_if_missing("/agent/bin".to_owned())
+        );
+        assert_ne!(
+            editor_result.expect("seed editor PATH"),
+            agent_result.expect("seed agent PATH")
+        );
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert!(matches!(
+            reopened
+                .snapshot()
+                .await
+                .expect("load seeded PATH")
+                .trusted_launch_path(),
+            Some("/editor/bin" | "/agent/bin")
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_readers_refresh_before_availability_decisions() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(26);
+        let mut observer = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut writer = fake_store(&fixture, project_instance_id, clock).await;
+        let manual = DemandKey::manual_cli();
+
+        writer
+            .ensure_demand(manual.clone())
+            .await
+            .expect("acquire demand through writer");
+        assert!(
+            observer
+                .desired_up()
+                .await
+                .expect("observe acquired demand")
+        );
+        assert_eq!(
+            observer
+                .snapshot()
+                .await
+                .expect("observe authoritative snapshot")
+                .demands()
+                .len(),
+            1
+        );
+
+        assert!(
+            writer
+                .release_demand(&manual)
+                .await
+                .expect("release demand")
+        );
+        assert!(
+            !observer
+                .desired_up()
+                .await
+                .expect("observe released demand")
+        );
+        assert!(
+            observer
+                .shutdown_deferred()
+                .await
+                .expect("observe armed cooldown")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_inputs_preserve_the_authoritative_snapshot() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(27);
+        let mut store = fake_store(&fixture, project_instance_id, clock).await;
+
+        store
+            .replace_trusted_launch_path("/usr/bin".to_owned())
+            .await
+            .expect("record initial trusted PATH");
+        let before = std::fs::read(store.path()).expect("read authoritative snapshot");
+
+        let path_error = store
+            .replace_trusted_launch_path("/bad\0path".to_owned())
+            .await
+            .expect_err("reject PATH containing NUL");
+        assert!(matches!(path_error, AvailabilityError::InvalidData { .. }));
+        assert_eq!(
+            std::fs::read(store.path()).expect("reread snapshot after invalid PATH"),
+            before
+        );
+
+        let convergence_error = store
+            .record_convergence_error("   ".to_owned())
+            .await
+            .expect_err("reject empty convergence error");
+        assert!(matches!(
+            convergence_error,
+            AvailabilityError::InvalidData { .. }
+        ));
+        assert_eq!(
+            std::fs::read(store.path()).expect("reread snapshot after invalid error"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_read_failure_never_reuses_cached_state() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(28);
+        let mut store = fake_store(&fixture, project_instance_id, clock).await;
+
+        store
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("persist live demand");
+        std::fs::write(store.path(), b"{").expect("corrupt authoritative snapshot");
+
+        let error = store
+            .desired_up()
+            .await
+            .expect_err("reject corrupt authoritative read");
+        assert!(matches!(error, AvailabilityError::InvalidData { .. }));
+    }
+
+    #[tokio::test]
+    async fn persistence_round_trip_is_stable_and_instance_scoped() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let first_id = instance_id(6);
+        let second_id = instance_id(7);
+        let mut first = fake_store(&fixture, first_id, clock.clone()).await;
+        let mut second = fake_store(&fixture, second_id, clock.clone()).await;
+
+        first
+            .ensure_demand(
+                DemandKey::agent_conversation("conversation-1")
+                    .expect("construct conversation demand"),
+            )
+            .await
+            .expect("acquire conversation demand");
+        let first_bytes = std::fs::read(first.path()).expect("read first availability state");
+        assert_eq!(first_bytes.last(), Some(&b'\n'));
+
+        second
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("acquire second instance demand");
+        assert_eq!(
+            std::fs::read(first.path()).expect("reread first availability state"),
+            first_bytes
+        );
+
+        let reopened = fake_store(&fixture, first_id, clock).await;
+        assert_eq!(reopened.availability, first.availability);
+        let unchanged = reopened.availability.clone();
+        let mut reopened = reopened;
+        reopened
+            .commit(unchanged)
+            .await
+            .expect("republish unchanged availability");
+        assert_eq!(
+            std::fs::read(reopened.path()).expect("read republished availability state"),
+            first_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_data_directory_publishes_through_an_absolute_store_path() {
+        let relative_fixture = tempfile::Builder::new()
+            .prefix(".locald-availability-relative-")
+            .tempdir_in(".")
+            .expect("create relative availability fixture");
+        let relative_data_dir = PathBuf::from(
+            relative_fixture
+                .path()
+                .file_name()
+                .expect("relative fixture name"),
+        );
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(17);
+        let mut store = AvailabilityStore::load_with_clock(
+            &relative_data_dir,
+            project_instance_id,
+            clock.clone(),
+        )
+        .await
+        .expect("load relative availability store");
+
+        assert!(store.path().is_absolute());
+        store
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("publish relative availability state");
+
+        let reopened =
+            AvailabilityStore::load_with_clock(&relative_data_dir, project_instance_id, clock)
+                .await
+                .expect("reopen relative availability store");
+        assert_eq!(reopened.availability, store.availability);
+    }
+
+    #[tokio::test]
+    async fn concurrent_stale_handles_preserve_independent_demands() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(18);
+        let mut first = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut second = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let manual = DemandKey::manual_cli();
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+
+        let (manual_result, editor_result) = tokio::join!(
+            first.ensure_demand(manual.clone()),
+            second.ensure_demand(editor.clone())
+        );
+        let manual_result = manual_result.expect("acquire manual demand");
+        let editor_result = editor_result.expect("acquire editor demand");
+        let mut generations = [
+            manual_result.lease.generation(),
+            editor_result.lease.generation(),
+        ];
+        generations.sort_unstable();
+        assert_eq!(generations, [1, 2]);
+
+        let reopened = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        assert_eq!(reopened.availability.activity_generation(), 2);
+        assert_eq!(reopened.availability.demands().len(), 2);
+
+        assert!(
+            first
+                .release_demand(&manual)
+                .await
+                .expect("release from older handle")
+        );
+        let reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert_eq!(reopened.availability.demands().len(), 1);
+        assert_eq!(reopened.availability.demands()[0].key(), &editor);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_data_directory_shares_the_authoritative_mutation_lock() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.data_dir).expect("create canonical data directory");
+        let alias = fixture
+            .data_dir
+            .parent()
+            .expect("data directory parent")
+            .join("data-alias");
+        std::os::unix::fs::symlink(&fixture.data_dir, &alias).expect("create data directory alias");
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(19);
+        let mut canonical = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut aliased =
+            AvailabilityStore::load_with_clock(&alias, project_instance_id, clock.clone())
+                .await
+                .expect("load aliased availability store");
+        assert_eq!(canonical.path(), aliased.path());
+
+        let editor = DemandKey::vs_code_window("window-1").expect("construct editor demand");
+        let (manual_result, editor_result) = tokio::join!(
+            canonical.ensure_demand(DemandKey::manual_cli()),
+            aliased.ensure_demand(editor)
+        );
+        manual_result.expect("acquire canonical demand");
+        editor_result.expect("acquire aliased demand");
+
+        let reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert_eq!(reopened.availability.activity_generation(), 2);
+        assert_eq!(reopened.availability.demands().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unsupported_state_remain_untouched() {
+        let fixture = Fixture::new();
+        let project_instance_id = instance_id(8);
+        let path = availability_path(&fixture.data_dir, project_instance_id);
+        std::fs::create_dir_all(path.parent().expect("availability parent"))
+            .expect("create availability parent");
+
+        for content in [b"{".as_slice(), br#"{"version":2}"#.as_slice()] {
+            std::fs::write(&path, content).expect("write invalid availability state");
+            let error = AvailabilityStore::load(&fixture.data_dir, project_instance_id)
+                .await
+                .expect_err("reject invalid availability state");
+            assert!(matches!(
+                error,
+                AvailabilityError::InvalidData { .. }
+                    | AvailabilityError::UnsupportedVersion { .. }
+            ));
+            assert_eq!(
+                std::fs::read(&path).expect("read preserved invalid state"),
+                content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_current_version_field_remains_untouched() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(14);
+        let mut store = fake_store(&fixture, project_instance_id, clock).await;
+        store
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("persist valid availability state");
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(store.path()).expect("read valid availability state"),
+        )
+        .expect("parse valid availability state");
+        value
+            .as_object_mut()
+            .expect("availability envelope is an object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        let mut content = serde_json::to_vec_pretty(&value).expect("serialize unknown field state");
+        content.push(b'\n');
+        std::fs::write(store.path(), &content).expect("write unknown field state");
+
+        let error = AvailabilityStore::load(&fixture.data_dir, project_instance_id)
+            .await
+            .expect_err("reject unknown current-version field");
+        assert!(matches!(error, AvailabilityError::InvalidData { .. }));
+        assert_eq!(
+            std::fs::read(store.path()).expect("read preserved unknown field state"),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_instance_mismatch_remains_untouched() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let first_id = instance_id(9);
+        let second_id = instance_id(10);
+        let mut first = fake_store(&fixture, first_id, clock).await;
+        first
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("persist first instance");
+        let content = std::fs::read(first.path()).expect("read first instance state");
+        let second_path = availability_path(&fixture.data_dir, second_id);
+        std::fs::create_dir_all(second_path.parent().expect("second availability parent"))
+            .expect("create second availability parent");
+        std::fs::write(&second_path, &content).expect("copy mismatched instance state");
+
+        let error = AvailabilityStore::load(&fixture.data_dir, second_id)
+            .await
+            .expect_err("reject mismatched project instance");
+        assert!(matches!(error, AvailabilityError::InvalidData { .. }));
+        assert_eq!(
+            std::fs::read(second_path).expect("read preserved mismatched state"),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn prepublication_failure_preserves_memory_and_cleans_temporary_file() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(11), clock).await;
+        let before = store.availability.clone();
+        let occupied_path = store.path().to_path_buf();
+
+        let error = store
+            .mutate(move |candidate, now| {
+                let result = candidate.ensure_demand(DemandKey::manual_cli(), now)?;
+                std::fs::create_dir_all(&occupied_path)
+                    .expect("occupy authoritative path after reload");
+                Ok((result, true))
+            })
+            .await
+            .expect_err("fail before publishing availability");
+        assert!(matches!(error, AvailabilityError::Io { .. }));
+        assert_eq!(store.availability, before);
+        assert!(temporary_files(store.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn parent_sync_failure_aligns_memory_with_published_state() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(12);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut candidate = store.availability.clone();
+        candidate
+            .ensure_demand(DemandKey::manual_cli(), clock.time())
+            .expect("prepare availability candidate");
+
+        let error = store
+            .commit_with_parent_sync(candidate.clone(), |path| async move {
+                Err(AvailabilityError::Io {
+                    operation: "test parent sync",
+                    path,
+                    source: io::Error::other("injected parent sync failure"),
+                })
+            })
+            .await
+            .expect_err("report published but unsynced availability");
+        assert!(matches!(
+            error,
+            AvailabilityError::PublishedNotDurable { .. }
+        ));
+        assert_eq!(store.availability, candidate);
+        assert!(temporary_files(store.path()).is_empty());
+
+        let reopened = fake_store(&fixture, project_instance_id, clock).await;
+        assert_eq!(reopened.availability, candidate);
+    }
+
+    #[tokio::test]
+    async fn generation_overflow_preserves_state_and_disk() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(13), clock).await;
+        store.availability.activity_generation = u64::MAX;
+        let exhausted = store.availability.clone();
+        store
+            .commit(exhausted)
+            .await
+            .expect("persist exhausted generation");
+        let before = store.availability.clone();
+
+        let error = store
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect_err("reject exhausted generation");
+        assert!(matches!(
+            error,
+            AvailabilityError::GenerationExhausted { current: u64::MAX }
+        ));
+        assert_eq!(store.availability, before);
+        let persisted = AvailabilityStore::load(&fixture.data_dir, store.project_instance_id())
+            .await
+            .expect("reopen exhausted generation");
+        assert_eq!(persisted.availability, before);
+    }
+}
