@@ -107,7 +107,12 @@ impl ExecController {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if let Some(child) = child.as_mut() {
-                let _ = child.try_wait();
+                child.try_wait().with_context(|| {
+                    format!(
+                        "failed to inspect retained child for service {} PID {pid} during owned cleanup",
+                        self.id
+                    )
+                })?;
             }
             if !self.runtime.owned_process_or_group_exists(pid, identity)? {
                 return Ok(true);
@@ -705,6 +710,7 @@ mod tests {
         ExitOnKill,
         KillFails,
         ConfirmationFails,
+        OwnedCleanupObservationFails,
         NeverExits,
     }
 
@@ -768,6 +774,14 @@ mod tests {
                 .lock()
                 .expect("pidless child state is not poisoned");
             state.wait_calls += 1;
+            if matches!(
+                state.behavior,
+                PidlessChildBehavior::OwnedCleanupObservationFails
+            ) {
+                return Err(std::io::Error::other(
+                    "injected owned-child observation failure",
+                ));
+            }
             if matches!(state.behavior, PidlessChildBehavior::AlreadyExited) {
                 return Ok(Some(ExitStatus::with_exit_code(0)));
             }
@@ -1200,6 +1214,59 @@ mod tests {
             .expect("pidless child state is not poisoned");
         assert_eq!(child_state.kill_calls, 1);
         assert_eq!(child_state.wait_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn owned_cleanup_observation_failure_is_reported_without_releasing_the_child() {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let controller = ExecController::new(
+            "owned-cleanup-observation:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "unused".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+        let pid = u32::MAX;
+        let (spawned, child_state) = spawned_test_process(
+            PidlessChildBehavior::OwnedCleanupObservationFails,
+            Some(pid),
+        );
+        let (child, _master, _writer, _container_id, _log_rx, _pty_tx) = spawned;
+        let mut child = Some(child);
+        let identity = PersistedProcessIdentity {
+            birth: None,
+            process_group_id: i32::MAX,
+            executable: None,
+        };
+
+        let error = controller
+            .wait_for_owned_cleanup(&mut child, pid, &identity, std::time::Duration::ZERO)
+            .await
+            .expect_err("child observation failure must fail owned cleanup");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&format!(
+                "failed to inspect retained child for service {} PID {pid} during owned cleanup",
+                controller.id
+            )),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("injected owned-child observation failure"),
+            "unexpected error: {error}"
+        );
+        assert!(child.is_some());
+        assert_eq!(
+            child_state
+                .lock()
+                .expect("pidless child state is not poisoned")
+                .wait_calls,
+            1
+        );
     }
 
     #[tokio::test]
