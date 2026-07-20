@@ -119,13 +119,16 @@ impl ExecController {
         }
     }
 
-    async fn confirm_pidless_child_stopped(
+    async fn stop_through_retained_child(
         child: &mut Box<dyn Child + Send>,
         timeout: std::time::Duration,
     ) -> Result<()> {
+        // Keep the child unreaped until immediately before signaling it. A
+        // live or unreaped child cannot have its PID reused; once `try_wait`
+        // reaps an exited child, returning here avoids signaling that PID.
         if child
             .try_wait()
-            .context("failed to inspect child without a process ID before cleanup")?
+            .context("failed to inspect retained child before cleanup")?
             .is_some()
         {
             return Ok(());
@@ -133,20 +136,20 @@ impl ExecController {
 
         child
             .kill()
-            .context("failed to terminate child without a process ID")?;
+            .context("failed to terminate process through its retained child handle")?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if child
                 .try_wait()
-                .context("failed to confirm exit for child without a process ID")?
+                .context("failed to confirm exit through the retained child handle")?
                 .is_some()
             {
                 return Ok(());
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
-                "child without a process ID remained live after its kill request"
+                "process remained live after its retained child handle was killed"
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -398,14 +401,21 @@ impl ServiceController for ExecController {
                 }
                 (Some(pid), None) => {
                     if let Some(child) = child.as_mut() {
-                        crate::runtime::process::ProcessRuntime::terminate_process(
-                            child, &self.id, signal,
+                        Self::stop_through_retained_child(
+                            child,
+                            std::time::Duration::from_secs(5),
                         )
-                        .await;
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to stop service {} after its process identity could not be captured",
+                                self.id
+                            )
+                        })?;
                     }
                     anyhow::ensure!(
                         !self.runtime.unverified_stale_process_exists(pid)?,
-                        "service {} still has a live process or process group, but locald could not capture an ownership identity; stop it manually",
+                        "service {} still has a live process or process group after retained-child cleanup, but locald could not capture an ownership identity; stop it manually",
                         self.id
                     );
                 }
@@ -417,7 +427,7 @@ impl ServiceController for ExecController {
                 }
                 (None, None) => {
                     if let Some(child) = child.as_mut() {
-                        Self::confirm_pidless_child_stopped(
+                        Self::stop_through_retained_child(
                             child,
                             std::time::Duration::from_secs(5),
                         )
@@ -663,7 +673,7 @@ impl ServiceFactory for ExecFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use locald_core::config::WorkerServiceConfig;
+    use locald_core::config::{CommonServiceConfig, WorkerServiceConfig};
     use locald_core::state::PersistedProcessBirth;
     use portable_pty::{ChildKiller, ExitStatus};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -690,6 +700,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum PidlessChildBehavior {
+        AlreadyExited,
         ExitOnKill,
         KillFails,
         ConfirmationFails,
@@ -707,6 +718,7 @@ mod tests {
     #[derive(Debug)]
     struct PidlessChild {
         state: Arc<StdMutex<PidlessChildState>>,
+        process_id: Option<u32>,
     }
 
     #[derive(Debug)]
@@ -755,6 +767,9 @@ mod tests {
                 .lock()
                 .expect("pidless child state is not poisoned");
             state.wait_calls += 1;
+            if matches!(state.behavior, PidlessChildBehavior::AlreadyExited) {
+                return Ok(Some(ExitStatus::with_exit_code(0)));
+            }
             if !state.killed {
                 return Ok(None);
             }
@@ -779,7 +794,7 @@ mod tests {
         }
 
         fn process_id(&self) -> Option<u32> {
-            None
+            self.process_id
         }
 
         #[cfg(windows)]
@@ -833,8 +848,9 @@ mod tests {
         }
     }
 
-    fn pidless_spawned_process(
+    fn spawned_test_process(
         behavior: PidlessChildBehavior,
+        process_id: Option<u32>,
     ) -> (SpawnedProcess, Arc<StdMutex<PidlessChildState>>) {
         let state = Arc::new(StdMutex::new(PidlessChildState {
             behavior,
@@ -844,6 +860,7 @@ mod tests {
         }));
         let child: Box<dyn Child + Send> = Box::new(PidlessChild {
             state: state.clone(),
+            process_id,
         });
         let (_log_tx, log_rx) = mpsc::channel(1);
         let (pty_tx, _pty_rx) = broadcast::channel(1);
@@ -858,6 +875,48 @@ mod tests {
             ),
             state,
         )
+    }
+
+    fn pidless_spawned_process(
+        behavior: PidlessChildBehavior,
+    ) -> (SpawnedProcess, Arc<StdMutex<PidlessChildState>>) {
+        spawned_test_process(behavior, None)
+    }
+
+    #[cfg(unix)]
+    struct SentinelProcess(std::process::Child);
+
+    #[cfg(unix)]
+    impl SentinelProcess {
+        fn spawn_group_leader() -> Self {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30").process_group(0);
+            Self(command.spawn().expect("spawn sentinel process group"))
+        }
+
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn is_running(&mut self) -> bool {
+            self.0
+                .try_wait()
+                .expect("inspect sentinel process")
+                .is_none()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SentinelProcess {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     async fn assert_identity_capture_failure_cleanup(
@@ -935,6 +994,59 @@ mod tests {
             "exited before its identity could be captured",
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_capture_cleanup_never_signals_an_unverified_reused_process_group() {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let mut controller = ExecController::new(
+            "capture-reused-group:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                common: CommonServiceConfig {
+                    stop_signal: Some("SIGKILL".to_owned()),
+                    ..Default::default()
+                },
+                command: "unused".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+        let mut sentinel = SentinelProcess::spawn_group_leader();
+        let sentinel_pid = sentinel.id();
+        let (spawned, child_state) =
+            spawned_test_process(PidlessChildBehavior::AlreadyExited, Some(sentinel_pid));
+
+        let error = controller
+            .adopt_spawned_process(spawned, |_runtime, _pid| {
+                Err(anyhow::anyhow!("injected identity capture failure"))
+            })
+            .await
+            .expect_err("unverified reused process group must fail closed");
+        let error = format!("{error:#}");
+        assert!(error.contains("injected identity capture failure"));
+        assert!(error.contains("still has a live process or process group"));
+        assert!(error.contains("cleanup also failed"));
+
+        let child_state = child_state
+            .lock()
+            .expect("test child state is not poisoned");
+        assert_eq!(child_state.kill_calls, 0);
+        assert_eq!(child_state.wait_calls, 1);
+        drop(child_state);
+        for _ in 0..25 {
+            assert!(
+                sentinel.is_running(),
+                "identity-less cleanup signaled an unrelated reused process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(controller.child.is_some());
+        assert_eq!(controller.owned_process_id(), Some(sentinel_pid));
+        assert!(controller.process_identity().is_none());
     }
 
     #[tokio::test]
@@ -1041,11 +1153,12 @@ mod tests {
         let (mut child, _master, _writer, _container_id, _log_rx, _pty_tx) = spawned;
 
         let error =
-            ExecController::confirm_pidless_child_stopped(&mut child, std::time::Duration::ZERO)
+            ExecController::stop_through_retained_child(&mut child, std::time::Duration::ZERO)
                 .await
                 .expect_err("a pidless child that remains live must time out");
         assert!(
-            format!("{error:#}").contains("remained live after its kill request"),
+            format!("{error:#}")
+                .contains("remained live after its retained child handle was killed"),
             "unexpected error: {error:#}"
         );
 
