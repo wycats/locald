@@ -4426,6 +4426,39 @@ mod tests {
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
+    struct ProcessGroupCleanup {
+        group: i32,
+        armed: bool,
+    }
+
+    impl ProcessGroupCleanup {
+        fn new(pid: u32) -> Self {
+            Self {
+                group: i32::try_from(pid).expect("test process-group ID fits i32"),
+                armed: true,
+            }
+        }
+
+        fn group(&self) -> i32 {
+            self.group
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ProcessGroupCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-self.group),
+                    Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct TestController {
         id: String,
@@ -7308,16 +7341,18 @@ command = "ignored"
             .start()
             .await
             .expect("start process-group leader");
-        let (spawn_pid, spawn_identity) = {
+        let spawn_pid = {
             let controller = controller.lock().await;
-            (
-                controller
-                    .owned_process_id()
-                    .expect("capture process-group leader PID"),
-                controller
-                    .process_identity()
-                    .expect("capture process-group identity"),
-            )
+            controller
+                .owned_process_id()
+                .expect("capture process-group leader PID")
+        };
+        let mut cleanup = ProcessGroupCleanup::new(spawn_pid);
+        let spawn_identity = {
+            let controller = controller.lock().await;
+            controller
+                .process_identity()
+                .expect("capture process-group identity")
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -7367,10 +7402,48 @@ command = "ignored"
         assert_eq!(persisted.pid, Some(spawn_pid));
         assert_eq!(persisted.process_identity.as_ref(), Some(&spawn_identity));
 
+        let error = manager
+            .stop("leaderless-group:web")
+            .await
+            .expect_err("leaderless process group must fail closed");
+        assert!(format!("{error:#}").contains("ownership cannot be revalidated"));
+        let retained = manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload retained leaderless ownership");
+        let retained = retained
+            .services
+            .iter()
+            .find(|service| service.name == "leaderless-group:web")
+            .expect("retain leaderless service evidence");
+        assert_eq!(retained.pid, Some(spawn_pid));
+        assert_eq!(retained.process_identity.as_ref(), Some(&spawn_identity));
+
+        let group = cleanup.group();
+        assert!(matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), None),
+            Ok(()) | Err(nix::errno::Errno::EPERM)
+        ));
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => panic!("terminate leaderless test process group: {error}"),
+        }
+        for _ in 0..100 {
+            if matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), None),
+                Err(nix::errno::Errno::ESRCH)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         manager
             .stop("leaderless-group:web")
             .await
-            .expect("stop and confirm the leaderless process group");
+            .expect("clear ownership after the leaderless group is gone");
+        cleanup.disarm();
         let stopped = manager
             .state_manager
             .load()

@@ -118,43 +118,23 @@ impl ProcessRuntime {
     }
 
     /// Signal a process or process group that a live controller identified at
-    /// spawn time. Unlike restart reconciliation, the controller has retained
-    /// continuous ownership even after its leader exits, so a recorded group
-    /// whose ID equals the spawn PID remains an authorized target.
+    /// spawn time. The process leader must still match its captured identity
+    /// before locald can authorize either target. Once the leader disappears,
+    /// a surviving group cannot be distinguished from a later PGID reuse and
+    /// cleanup therefore fails closed while retaining ownership evidence.
     pub fn signal_owned_process(
         &self,
         pid: u32,
         expected: &PersistedProcessIdentity,
         signal: Signal,
     ) -> Result<()> {
-        let pid = Self::validated_stale_pid(pid)?;
-        let observed = self.observed_process_identity(pid)?;
-        if let Some(observed) = &observed {
-            anyhow::ensure!(
-                observed.start_time == expected.start_time,
-                "owned PID {pid} was reused before {signal:?}: expected start time {}, observed {}",
-                expected.start_time,
-                observed.start_time
-            );
-            anyhow::ensure!(
-                observed.process_group_id == expected.process_group_id,
-                "owned PID {pid} changed process group before {signal:?}: expected {}, observed {}",
-                expected.process_group_id,
-                observed.process_group_id
-            );
-        }
-
-        let target = if expected.process_group_id == pid
-            && expected.process_group_id > 1
-            && expected.process_group_id != getpgrp().as_raw()
-        {
-            Pid::from_raw(-expected.process_group_id)
+        let Some(verified) = self.verify_stale_process(pid, expected)? else {
+            return Ok(());
+        };
+        let target = if Self::can_signal_verified_group(&verified) {
+            Pid::from_raw(-verified.identity.process_group_id)
         } else {
-            anyhow::ensure!(
-                observed.is_some(),
-                "owned PID {pid} exited without a distinct authorized process group"
-            );
-            Pid::from_raw(pid)
+            Pid::from_raw(verified.pid)
         };
 
         match kill(target, signal) {
@@ -845,6 +825,38 @@ impl ProcessRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    struct ProcessGroupCleanup {
+        group: i32,
+        armed: bool,
+    }
+
+    impl ProcessGroupCleanup {
+        fn new(pid: u32) -> Self {
+            Self {
+                group: i32::try_from(pid).expect("test process-group ID fits i32"),
+                armed: true,
+            }
+        }
+
+        fn group(&self) -> i32 {
+            self.group
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ProcessGroupCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = kill(Pid::from_raw(-self.group), Signal::SIGKILL);
+            }
+        }
+    }
 
     #[test]
     fn cloned_runtime_reuses_process_observation_state() {
@@ -852,5 +864,52 @@ mod tests {
         let cloned = runtime.clone();
 
         assert!(Arc::ptr_eq(&runtime.process_system, &cloned.process_system));
+    }
+
+    #[test]
+    fn owned_signal_refuses_a_group_after_its_leader_cannot_be_revalidated() {
+        let runtime = ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut leader = Command::new("sh");
+        leader
+            .arg("-c")
+            .arg("sleep 30 & exec sleep 0.2")
+            .process_group(0);
+        let mut leader = leader.spawn().expect("spawn process-group leader");
+        let pid = leader.id();
+        let mut cleanup = ProcessGroupCleanup::new(pid);
+        let identity = runtime
+            .capture_process_identity(pid)
+            .expect("inspect process-group leader")
+            .expect("process-group leader is live");
+        leader.wait().expect("reap process-group leader");
+
+        let group = cleanup.group();
+        assert!(matches!(
+            kill(Pid::from_raw(-group), None),
+            Ok(()) | Err(Errno::EPERM)
+        ));
+        let error = runtime
+            .signal_owned_process(pid, &identity, Signal::SIGTERM)
+            .expect_err("leaderless group must not be signaled");
+        assert!(format!("{error:#}").contains("ownership cannot be revalidated"));
+        assert!(matches!(
+            kill(Pid::from_raw(-group), None),
+            Ok(()) | Err(Errno::EPERM)
+        ));
+
+        match kill(Pid::from_raw(-group), Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => panic!("terminate test process group: {error}"),
+        }
+        for _ in 0..100 {
+            if matches!(kill(Pid::from_raw(-group), None), Err(Errno::ESRCH)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        runtime
+            .signal_owned_process(pid, &identity, Signal::SIGTERM)
+            .expect("a fully exited owned process requires no signal");
+        cleanup.disarm();
     }
 }
