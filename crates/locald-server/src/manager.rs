@@ -4480,6 +4480,7 @@ impl ServiceResolver for ProcessManager {
 mod tests {
     use super::*;
     use crate::service::exec::ExecController;
+    use crate::state::StateSaveFault;
     use async_trait::async_trait;
     use axum::{
         body::Body,
@@ -4710,6 +4711,7 @@ mod tests {
         state: RuntimeState,
         process_identity: Option<PersistedProcessIdentity>,
         start_entered: Option<Arc<tokio::sync::Notify>>,
+        start_release: Option<Arc<tokio::sync::Notify>>,
         fail_prepare: bool,
         stop_count: Arc<AtomicUsize>,
     }
@@ -4730,6 +4732,9 @@ mod tests {
         async fn start(&mut self) -> Result<()> {
             if let Some(entered) = &self.start_entered {
                 entered.notify_one();
+                if let Some(release) = &self.start_release {
+                    release.notified().await;
+                }
                 self.state.status = ServiceState::Running;
                 return Ok(());
             }
@@ -4785,6 +4790,7 @@ mod tests {
     #[derive(Debug)]
     struct UnreadyStartFactory {
         entered: Arc<tokio::sync::Notify>,
+        release: Option<Arc<tokio::sync::Notify>>,
         stop_count: Arc<AtomicUsize>,
     }
 
@@ -4809,6 +4815,7 @@ mod tests {
                 },
                 process_identity: Some(test_process_identity(1_234, 41, "/test/unready-worker")),
                 start_entered: Some(self.entered.clone()),
+                start_release: self.release.clone(),
                 fail_prepare: false,
                 stop_count: self.stop_count.clone(),
             }))
@@ -5044,6 +5051,7 @@ mod tests {
                     "/test/retry-prepare-worker",
                 )),
                 start_entered: None,
+                start_release: None,
                 fail_prepare,
                 stop_count: self.stop_count.clone(),
             }))
@@ -5083,6 +5091,7 @@ mod tests {
                 },
                 process_identity: None,
                 start_entered: None,
+                start_release: None,
                 fail_prepare: false,
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }))
@@ -5112,6 +5121,7 @@ mod tests {
                 },
                 process_identity: None,
                 start_entered: None,
+                start_release: None,
                 fail_prepare,
                 stop_count: self.stop_count.clone(),
             }))
@@ -5702,6 +5712,7 @@ command = "sleep 30"
             0,
             Arc::new(UnreadyStartFactory {
                 entered: entered.clone(),
+                release: None,
                 stop_count: stop_count.clone(),
             }),
         );
@@ -5753,6 +5764,7 @@ command = "sleep 30"
             0,
             Arc::new(UnreadyStartFactory {
                 entered: entered.clone(),
+                release: None,
                 stop_count: stop_count.clone(),
             }),
         );
@@ -5841,6 +5853,75 @@ command = "sleep 30"
     }
 
     #[tokio::test]
+    async fn uncertain_spawn_ownership_publication_stops_child_and_persists_cleanup() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("uncertain-publication-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "uncertain-publication").await;
+        write_availability_worker_config(
+            &project_path,
+            "uncertain-publication",
+            "uncertain-publication.localhost",
+            &["web"],
+        );
+        let start_entered = Arc::new(tokio::sync::Notify::new());
+        let release_start = Arc::new(tokio::sync::Notify::new());
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: start_entered.clone(),
+                release: Some(release_start.clone()),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), start_entered.notified())
+            .await
+            .expect("service reaches the controlled spawn boundary");
+        manager
+            .state_manager
+            .inject_save_fault(StateSaveFault::ParentDirectorySync)
+            .await;
+        release_start.notify_one();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), start)
+            .await
+            .expect("failed ownership publication returns promptly")
+            .expect("start task joins")
+            .expect_err("uncertain ownership publication must fail startup");
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to persist ownership"));
+        assert!(message.contains("was published and its parent-directory sync failed"));
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("uncertain-publication:web")
+                .await
+                .is_none()
+        );
+
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load cleaned runtime state");
+        let service = persisted
+            .services
+            .iter()
+            .find(|service| service.name == "uncertain-publication:web")
+            .expect("cleaned service remains in the runtime projection");
+        assert_eq!(service.status, ServiceState::Stopped);
+        assert!(service.pid.is_none());
+        assert!(service.process_identity.is_none());
+    }
+
+    #[tokio::test]
     async fn availability_convergence_pause_is_not_blocked_by_unrelated_startup() {
         let dir = tempdir().expect("create temporary directory");
         let first_path = dir.path().join("pause-now-project");
@@ -5886,6 +5967,7 @@ command = "sleep 30"
             0,
             Arc::new(UnreadyStartFactory {
                 entered: start_entered.clone(),
+                release: None,
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }),
         );
@@ -6773,6 +6855,7 @@ command = "ignored"
                     "/test/unhealthy-retry-worker",
                 )),
                 start_entered: None,
+                start_release: None,
                 fail_prepare: false,
                 stop_count: stop_count.clone(),
             }));
@@ -7142,6 +7225,7 @@ command = "ignored"
             0,
             Arc::new(UnreadyStartFactory {
                 entered: start_entered.clone(),
+                release: None,
                 stop_count: stop_count.clone(),
             }),
         );
