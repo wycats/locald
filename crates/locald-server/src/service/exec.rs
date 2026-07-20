@@ -1,5 +1,5 @@
 use crate::runtime::process::ProcessRuntime;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -16,8 +16,17 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::warn;
+
+type SpawnedProcess = (
+    Box<dyn Child + Send>,
+    Box<dyn MasterPty + Send>,
+    Box<dyn std::io::Write + Send>,
+    String,
+    mpsc::Receiver<LogEntry>,
+    broadcast::Sender<Vec<u8>>,
+);
 
 pub struct ExecController {
     id: String,
@@ -108,6 +117,104 @@ impl ExecController {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    async fn confirm_pidless_child_stopped(
+        child: &mut Box<dyn Child + Send>,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if child
+            .try_wait()
+            .context("failed to inspect child without a process ID before cleanup")?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        child
+            .kill()
+            .context("failed to terminate child without a process ID")?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if child
+                .try_wait()
+                .context("failed to confirm exit for child without a process ID")?
+                .is_some()
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "child without a process ID remained live after its kill request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn adopt_spawned_process<F>(
+        &mut self,
+        spawned: SpawnedProcess,
+        capture_identity: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&ProcessRuntime, u32) -> Result<Option<PersistedProcessIdentity>>,
+    {
+        let (child, master, writer, container_id, mut log_rx, pty_tx) = spawned;
+        let owned_process_id = child.process_id();
+
+        // Adopt every successfully spawned handle before the first fallible
+        // ownership step. A failed identity capture can then use the same
+        // controller cleanup path and retain the handles if cleanup itself
+        // cannot be confirmed.
+        self.child = Some(StdMutex::new(child));
+        self.pty_master = Some(StdMutex::new(master));
+        self.pty_writer = Some(StdMutex::new(writer));
+        self.container_id = Some(container_id);
+        self.owned_process_id = owned_process_id;
+        self.process_identity = None;
+        self.pty_tx = Some(pty_tx);
+
+        let identity_result = owned_process_id
+            .context("spawned child did not expose a process ID")
+            .and_then(|pid| {
+                capture_identity(&self.runtime, pid)?.with_context(|| {
+                    format!("spawned process {pid} exited before its identity could be captured")
+                })
+            });
+
+        match identity_result {
+            Ok(identity) => self.process_identity = Some(identity),
+            Err(capture_error) => {
+                // `stop` terminates through the retained child handle and, for
+                // a known PID, verifies that neither the PID nor its process
+                // group remains before clearing controller ownership.
+                if let Err(cleanup_error) = self.stop().await {
+                    return Err(cleanup_error).context(format!(
+                        "failed to establish durable process ownership for service `{}`: {capture_error:#}; synchronous cleanup also failed and controller ownership was retained for retry",
+                        self.id
+                    ));
+                }
+                self.pty_tx = None;
+                return Err(capture_error).context(format!(
+                    "failed to establish durable process ownership for service `{}`; the spawned process was synchronously stopped",
+                    self.id
+                ));
+            }
+        }
+
+        // Spawn log forwarder only after durable ownership can be published.
+        let log_tx = self.log_tx.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            while let Some(entry) = log_rx.recv().await {
+                if let Err(_e) = log_tx.send(entry) {
+                    tracing::trace!("Failed to broadcast log for {}: no subscribers", id);
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 
@@ -200,77 +307,43 @@ impl ServiceController for ExecController {
     }
 
     async fn start(&mut self) -> Result<()> {
-        let (child, master, writer, container_id, mut log_rx, pty_tx) =
-            if let Some(bundle_dir) = &self.bundle_dir {
-                self.runtime
-                    .start_container_process(self.id.clone(), bundle_dir)?
-            } else {
-                let (command, workdir) = match &self.config {
-                    ServiceConfig::Typed(TypedServiceConfig::Exec(c))
-                    | ServiceConfig::Legacy(c) => (c.command.clone(), c.workdir.clone()),
-                    ServiceConfig::Typed(TypedServiceConfig::Worker(c)) => {
-                        (Some(c.command.clone()), c.workdir.clone())
-                    }
-                    ServiceConfig::Typed(
-                        TypedServiceConfig::Container(_)
-                        | TypedServiceConfig::Postgres(_)
-                        | TypedServiceConfig::Site(_),
-                    ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
-                };
-
-                let service_path = workdir.map_or_else(
-                    || self.project_root.clone(),
-                    |wd| self.project_root.join(wd),
-                );
-
-                let env = self.resolve_env();
-
-                let cmd_str = command.ok_or_else(|| anyhow::anyhow!("Command is required"))?;
-                self.runtime.start_host_process(
-                    self.id.clone(),
-                    &service_path,
-                    &cmd_str,
-                    &env,
-                    self.port,
-                )?
+        let spawned = if let Some(bundle_dir) = &self.bundle_dir {
+            self.runtime
+                .start_container_process(self.id.clone(), bundle_dir)?
+        } else {
+            let (command, workdir) = match &self.config {
+                ServiceConfig::Typed(TypedServiceConfig::Exec(c)) | ServiceConfig::Legacy(c) => {
+                    (c.command.clone(), c.workdir.clone())
+                }
+                ServiceConfig::Typed(TypedServiceConfig::Worker(c)) => {
+                    (Some(c.command.clone()), c.workdir.clone())
+                }
+                ServiceConfig::Typed(
+                    TypedServiceConfig::Container(_)
+                    | TypedServiceConfig::Postgres(_)
+                    | TypedServiceConfig::Site(_),
+                ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
             };
 
-        // Capture the ownership fingerprint before the child is ever polled or
-        // reaped. Even if it exited immediately, the OS cannot reuse its PID
-        // while this child handle still owns the unreaped process record.
-        let owned_process_id = child.process_id();
-        let process_identity =
-            owned_process_id.and_then(|pid| match self.runtime.capture_process_identity(pid) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    warn!(
-                        "Failed to capture process identity for service {} PID {pid}: {error:#}",
-                        self.id
-                    );
-                    None
-                }
-            });
+            let service_path = workdir.map_or_else(
+                || self.project_root.clone(),
+                |wd| self.project_root.join(wd),
+            );
 
-        self.child = Some(StdMutex::new(child));
-        self.pty_master = Some(StdMutex::new(master));
-        self.pty_writer = Some(StdMutex::new(writer));
-        self.container_id = Some(container_id);
-        self.owned_process_id = owned_process_id;
-        self.process_identity = process_identity;
-        self.pty_tx = Some(pty_tx);
+            let env = self.resolve_env();
 
-        // Spawn log forwarder
-        let log_tx = self.log_tx.clone();
-        let id = self.id.clone();
-        tokio::spawn(async move {
-            while let Some(entry) = log_rx.recv().await {
-                if let Err(_e) = log_tx.send(entry) {
-                    tracing::trace!("Failed to broadcast log for {}: no subscribers", id);
-                }
-            }
-        });
+            let cmd_str = command.ok_or_else(|| anyhow::anyhow!("Command is required"))?;
+            self.runtime.start_host_process(
+                self.id.clone(),
+                &service_path,
+                &cmd_str,
+                &env,
+                self.port,
+            )?
+        };
 
-        Ok(())
+        self.adopt_spawned_process(spawned, ProcessRuntime::capture_process_identity)
+            .await
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -344,10 +417,17 @@ impl ServiceController for ExecController {
                 }
                 (None, None) => {
                     if let Some(child) = child.as_mut() {
-                        crate::runtime::process::ProcessRuntime::terminate_process(
-                            child, &self.id, signal,
+                        Self::confirm_pidless_child_stopped(
+                            child,
+                            std::time::Duration::from_secs(5),
                         )
-                        .await;
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to stop service {} whose child exposed no process ID",
+                                self.id
+                            )
+                        })?;
                     }
                 }
             }
@@ -480,6 +560,7 @@ impl ServiceController for ExecController {
         match key {
             "port" => self.port.map(|p| p.to_string()),
             "cgroup_path" => self.cgroup_path.clone(),
+            "container_id" => self.container_id.clone(),
             _ => None,
         }
     }
@@ -583,7 +664,377 @@ impl ServiceFactory for ExecFactory {
 mod tests {
     use super::*;
     use locald_core::config::WorkerServiceConfig;
+    use portable_pty::{ChildKiller, ExitStatus};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::tempdir;
+
+    #[derive(Clone, Copy, Debug)]
+    enum PidlessChildBehavior {
+        ExitOnKill,
+        KillFails,
+        ConfirmationFails,
+        NeverExits,
+    }
+
+    #[derive(Debug)]
+    struct PidlessChildState {
+        behavior: PidlessChildBehavior,
+        kill_calls: usize,
+        wait_calls: usize,
+        killed: bool,
+    }
+
+    #[derive(Debug)]
+    struct PidlessChild {
+        state: Arc<StdMutex<PidlessChildState>>,
+    }
+
+    #[derive(Debug)]
+    struct PidlessChildKiller {
+        state: Arc<StdMutex<PidlessChildState>>,
+    }
+
+    fn kill_pidless_child(state: &Arc<StdMutex<PidlessChildState>>) -> std::io::Result<()> {
+        let mut state = state.lock().expect("pidless child state is not poisoned");
+        state.kill_calls += 1;
+        if matches!(state.behavior, PidlessChildBehavior::KillFails) {
+            return Err(std::io::Error::other("injected pidless child kill failure"));
+        }
+        state.killed = true;
+        Ok(())
+    }
+
+    impl ChildKiller for PidlessChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            kill_pidless_child(&self.state)
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(PidlessChildKiller {
+                state: self.state.clone(),
+            })
+        }
+    }
+
+    impl ChildKiller for PidlessChildKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            kill_pidless_child(&self.state)
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self {
+                state: self.state.clone(),
+            })
+        }
+    }
+
+    impl Child for PidlessChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("pidless child state is not poisoned");
+            state.wait_calls += 1;
+            if !state.killed {
+                return Ok(None);
+            }
+            if matches!(state.behavior, PidlessChildBehavior::ConfirmationFails) {
+                return Err(std::io::Error::other(
+                    "injected pidless child confirmation failure",
+                ));
+            }
+            if matches!(state.behavior, PidlessChildBehavior::NeverExits) {
+                return Ok(None);
+            }
+            Ok(Some(ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            self.try_wait()?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "pidless test child is still running",
+                )
+            })
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestMasterPty;
+
+    impl MasterPty for TestMasterPty {
+        fn resize(&self, _size: PtySize) -> std::result::Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> std::result::Result<PtySize, anyhow::Error> {
+            Ok(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+
+        fn try_clone_reader(
+            &self,
+        ) -> std::result::Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(
+            &self,
+        ) -> std::result::Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<portable_pty::unix::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    fn pidless_spawned_process(
+        behavior: PidlessChildBehavior,
+    ) -> (SpawnedProcess, Arc<StdMutex<PidlessChildState>>) {
+        let state = Arc::new(StdMutex::new(PidlessChildState {
+            behavior,
+            kill_calls: 0,
+            wait_calls: 0,
+            killed: false,
+        }));
+        let child: Box<dyn Child + Send> = Box::new(PidlessChild {
+            state: state.clone(),
+        });
+        let (_log_tx, log_rx) = mpsc::channel(1);
+        let (pty_tx, _pty_rx) = broadcast::channel(1);
+        (
+            (
+                child,
+                Box::new(TestMasterPty),
+                Box::new(std::io::sink()),
+                "pidless-test".to_owned(),
+                log_rx,
+                pty_tx,
+            ),
+            state,
+        )
+    }
+
+    async fn assert_identity_capture_failure_cleanup(
+        capture_result: Result<Option<PersistedProcessIdentity>>,
+        expected_error: &str,
+    ) {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let mut controller = ExecController::new(
+            "capture-failure:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "sleep 30".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+        let captured_pid = Arc::new(AtomicU32::new(0));
+        let recorded_pid = captured_pid.clone();
+
+        let spawned = controller
+            .runtime
+            .start_host_process(
+                controller.id.clone(),
+                dir.path(),
+                "sleep 30",
+                &std::collections::HashMap::new(),
+                None,
+            )
+            .expect("spawn process for identity-capture failure");
+        let error = controller
+            .adopt_spawned_process(spawned, move |_runtime, pid| {
+                recorded_pid.store(pid, Ordering::SeqCst);
+                capture_result
+            })
+            .await
+            .expect_err("identity capture failure must fail the start");
+        let error = format!("{error:#}");
+        assert!(error.contains(expected_error), "unexpected error: {error}");
+        assert!(error.contains("spawned process was synchronously stopped"));
+
+        let pid = captured_pid.load(Ordering::SeqCst);
+        assert!(pid > 1, "capture hook did not observe the spawned PID");
+        assert!(
+            !controller
+                .runtime
+                .unverified_stale_process_exists(pid)
+                .expect("confirm spawned PID and process group are absent"),
+            "failed start left PID {pid} or its process group alive"
+        );
+        assert!(controller.child.is_none());
+        assert!(controller.pty_master.is_none());
+        assert!(controller.pty_writer.is_none());
+        assert!(controller.container_id.is_none());
+        assert!(controller.get_metadata("container_id").is_none());
+        assert!(controller.owned_process_id().is_none());
+        assert!(controller.process_identity().is_none());
+        assert!(controller.pty_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_capture_failure_stops_and_confirms_the_spawned_process_is_gone() {
+        assert_identity_capture_failure_cleanup(
+            Err(anyhow::anyhow!("injected identity capture failure")),
+            "injected identity capture failure",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn vanished_identity_capture_stops_and_confirms_the_spawned_process_is_gone() {
+        assert_identity_capture_failure_cleanup(
+            Ok(None),
+            "exited before its identity could be captured",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn missing_pid_child_is_killed_and_confirmed_before_handles_are_cleared() {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let mut controller = ExecController::new(
+            "pidless-success:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "unused".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+        let (spawned, child_state) = pidless_spawned_process(PidlessChildBehavior::ExitOnKill);
+
+        let error = controller
+            .adopt_spawned_process(spawned, |_runtime, _pid| {
+                panic!("identity capture must not run without a process ID")
+            })
+            .await
+            .expect_err("missing process ID must fail the start");
+        let error = format!("{error:#}");
+        assert!(error.contains("did not expose a process ID"));
+        assert!(error.contains("spawned process was synchronously stopped"));
+
+        let child_state = child_state
+            .lock()
+            .expect("pidless child state is not poisoned");
+        assert_eq!(child_state.kill_calls, 1);
+        assert_eq!(child_state.wait_calls, 2);
+        drop(child_state);
+        assert!(controller.child.is_none());
+        assert!(controller.pty_master.is_none());
+        assert!(controller.pty_writer.is_none());
+        assert!(controller.container_id.is_none());
+        assert!(controller.get_metadata("container_id").is_none());
+        assert!(controller.owned_process_id().is_none());
+        assert!(controller.process_identity().is_none());
+        assert!(controller.pty_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_pid_cleanup_failure_retains_every_controller_handle_for_retry() {
+        for (behavior, expected_error) in [
+            (
+                PidlessChildBehavior::KillFails,
+                "injected pidless child kill failure",
+            ),
+            (
+                PidlessChildBehavior::ConfirmationFails,
+                "injected pidless child confirmation failure",
+            ),
+        ] {
+            let dir = tempdir().expect("create exec-controller test directory");
+            let mut controller = ExecController::new(
+                format!("pidless-failure-{behavior:?}:web"),
+                ProcessRuntime::new(dir.path().join("notify.sock")),
+                ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                    command: "unused".to_owned(),
+                    ..Default::default()
+                })),
+                dir.path().to_path_buf(),
+                None,
+                std::collections::HashMap::new(),
+            );
+            let (spawned, child_state) = pidless_spawned_process(behavior);
+
+            let error = controller
+                .adopt_spawned_process(spawned, |_runtime, _pid| {
+                    panic!("identity capture must not run without a process ID")
+                })
+                .await
+                .expect_err("pidless cleanup failure must fail the start");
+            let error = format!("{error:#}");
+            assert!(error.contains(expected_error), "unexpected error: {error}");
+            assert!(error.contains("cleanup also failed"));
+
+            let child_state = child_state
+                .lock()
+                .expect("pidless child state is not poisoned");
+            assert_eq!(child_state.kill_calls, 1);
+            assert!(child_state.wait_calls >= 1);
+            drop(child_state);
+            assert!(controller.child.is_some());
+            assert!(controller.pty_master.is_some());
+            assert!(controller.pty_writer.is_some());
+            assert!(controller.container_id.is_some());
+            assert_eq!(
+                controller.get_metadata("container_id").as_deref(),
+                Some("pidless-test")
+            );
+            assert!(controller.owned_process_id().is_none());
+            assert!(controller.process_identity().is_none());
+            assert!(controller.pty_tx.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_pid_exit_confirmation_has_a_bounded_deadline() {
+        let (spawned, child_state) = pidless_spawned_process(PidlessChildBehavior::NeverExits);
+        let (mut child, _master, _writer, _container_id, _log_rx, _pty_tx) = spawned;
+
+        let error =
+            ExecController::confirm_pidless_child_stopped(&mut child, std::time::Duration::ZERO)
+                .await
+                .expect_err("a pidless child that remains live must time out");
+        assert!(
+            format!("{error:#}").contains("remained live after its kill request"),
+            "unexpected error: {error:#}"
+        );
+
+        let child_state = child_state
+            .lock()
+            .expect("pidless child state is not poisoned");
+        assert_eq!(child_state.kill_calls, 1);
+        assert_eq!(child_state.wait_calls, 2);
+    }
 
     #[tokio::test]
     async fn exited_child_never_reports_a_reusable_pid_or_loses_its_spawn_identity() {

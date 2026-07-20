@@ -10,9 +10,11 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getpgid, getpgrp};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid as SysinfoPid, ProcessesToUpdate, System};
+use sysinfo::{Pid as SysinfoPid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
@@ -25,9 +27,18 @@ type ProcessHandle = (
     broadcast::Sender<Vec<u8>>,
 );
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProcessRuntime {
     notify_socket_path: PathBuf,
+    process_system: Arc<StdMutex<System>>,
+}
+
+impl fmt::Debug for ProcessRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessRuntime")
+            .field("notify_socket_path", &self.notify_socket_path)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +50,10 @@ pub struct VerifiedStaleProcess {
 impl ProcessRuntime {
     #[must_use]
     pub fn new(notify_socket_path: PathBuf) -> Self {
-        Self { notify_socket_path }
+        Self {
+            notify_socket_path,
+            process_system: Arc::new(StdMutex::new(System::new())),
+        }
     }
 
     pub fn kill_pid(&self, pid: i32, signal: Signal) -> Result<()> {
@@ -60,13 +74,25 @@ impl ProcessRuntime {
         Ok(pid)
     }
 
-    fn observed_process_identity(pid: i32) -> Result<Option<PersistedProcessIdentity>> {
+    fn observed_process_identity(&self, pid: i32) -> Result<Option<PersistedProcessIdentity>> {
         let sysinfo_pid = SysinfoPid::from_u32(
             u32::try_from(pid).context("validated process ID became negative")?,
         );
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::Some(&[sysinfo_pid]), true);
-        let Some(process) = system.process(sysinfo_pid) else {
+        let observed = {
+            let mut system = self
+                .process_system
+                .lock()
+                .map_err(|_| anyhow::anyhow!("process observation state is poisoned"))?;
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[sysinfo_pid]),
+                true,
+                ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+            );
+            system
+                .process(sysinfo_pid)
+                .map(|process| (process.start_time(), process.exe().map(Path::to_path_buf)))
+        };
+        let Some((start_time, executable)) = observed else {
             return Ok(None);
         };
         let process_group_id = match getpgid(Some(Pid::from_raw(pid))) {
@@ -79,16 +105,16 @@ impl ProcessRuntime {
             }
         };
         Ok(Some(PersistedProcessIdentity {
-            start_time: process.start_time(),
+            start_time,
             process_group_id,
-            executable: process.exe().map(Path::to_path_buf),
+            executable,
         }))
     }
 
     /// Capture an ownership fingerprint while locald still owns the process.
     pub fn capture_process_identity(&self, pid: u32) -> Result<Option<PersistedProcessIdentity>> {
         let pid = Self::validated_stale_pid(pid)?;
-        Self::observed_process_identity(pid)
+        self.observed_process_identity(pid)
     }
 
     /// Signal a process or process group that a live controller identified at
@@ -102,7 +128,7 @@ impl ProcessRuntime {
         signal: Signal,
     ) -> Result<()> {
         let pid = Self::validated_stale_pid(pid)?;
-        let observed = Self::observed_process_identity(pid)?;
+        let observed = self.observed_process_identity(pid)?;
         if let Some(observed) = &observed {
             anyhow::ensure!(
                 observed.start_time == expected.start_time,
@@ -162,7 +188,7 @@ impl ProcessRuntime {
         expected: &PersistedProcessIdentity,
     ) -> Result<Option<VerifiedStaleProcess>> {
         let pid = Self::validated_stale_pid(pid)?;
-        let Some(observed) = Self::observed_process_identity(pid)? else {
+        let Some(observed) = self.observed_process_identity(pid)? else {
             if expected.process_group_id == pid
                 && expected.process_group_id > 1
                 && expected.process_group_id != getpgrp().as_raw()
@@ -242,7 +268,7 @@ impl ProcessRuntime {
     /// Return whether a previously verified process or its owned group remains
     /// live. If the PID is reused while cleanup is in flight, fail closed.
     pub fn verified_stale_process_exists(&self, process: &VerifiedStaleProcess) -> Result<bool> {
-        if let Some(observed) = Self::observed_process_identity(process.pid)? {
+        if let Some(observed) = self.observed_process_identity(process.pid)? {
             anyhow::ensure!(
                 observed.start_time == process.identity.start_time
                     && observed.process_group_id == process.identity.process_group_id,
@@ -813,5 +839,18 @@ impl ProcessRuntime {
 
     pub async fn terminate_process(child: &mut Box<dyn Child + Send>, name: &str, signal: Signal) {
         locald_utils::process::terminate_gracefully(child, name, signal).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloned_runtime_reuses_process_observation_state() {
+        let runtime = ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let cloned = runtime.clone();
+
+        assert!(Arc::ptr_eq(&runtime.process_system, &cloned.process_system));
     }
 }

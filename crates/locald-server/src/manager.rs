@@ -673,6 +673,18 @@ impl ProcessManager {
             .unwrap_or(full_name)
     }
 
+    fn requires_durable_process_ownership(service_config: &ServiceConfig) -> bool {
+        matches!(
+            service_config,
+            ServiceConfig::Legacy(_)
+                | ServiceConfig::Typed(
+                    TypedServiceConfig::Exec(_)
+                        | TypedServiceConfig::Worker(_)
+                        | TypedServiceConfig::Container(_)
+                )
+        )
+    }
+
     pub(crate) fn advance_service_projection(service: &mut Service) -> u64 {
         service.projection_generation = service.projection_generation.wrapping_add(1);
         service.projection_generation
@@ -752,8 +764,13 @@ impl ProcessManager {
                     );
                 }
                 Some((_, _, current_config, current_env, Some(controller))) => {
-                    let is_running = controller.lock().await.read_state().await.status
+                    let controller = controller.lock().await;
+                    let is_running = controller.read_state().await.status
                         == locald_core::state::ServiceState::Running;
+                    let has_durable_process_ownership =
+                        !Self::requires_durable_process_ownership(service_config)
+                            || (controller.owned_process_id().is_some()
+                                && controller.process_identity().is_some());
                     let environment_matches = resolved_env
                         .as_ref()
                         .is_some_and(|resolved_env| current_env == *resolved_env);
@@ -761,6 +778,7 @@ impl ProcessManager {
                         true,
                         !dependency_will_change
                             && is_running
+                            && has_durable_process_ownership
                             && current_config == *service_config
                             && environment_matches,
                     )
@@ -2078,9 +2096,35 @@ impl ProcessManager {
                     self.availability_allows_inflight_transition(instance_id)
                         .await?;
 
-                    {
+                    let start_result = {
                         let mut c = controller.lock().await;
-                        c.start().await.context("Failed to start service")?;
+                        c.start().await.context("Failed to start service")
+                    };
+                    if let Err(start_error) = start_result {
+                        if let Err(persistence_error) = self.persist_state_checked().await {
+                            let rollback_result = self
+                                .stop_service_instance_runtime_locked(&name, instance_id)
+                                .await;
+                            let retry_persistence_result = self.persist_state_checked().await;
+                            self.broadcast_service_update(&name).await;
+
+                            let recovery = match (rollback_result, retry_persistence_result) {
+                                (Ok(()), Ok(())) => format!(
+                                    "failed to persist retained ownership after service `{name}` start failure: {persistence_error:#}; the retained controller was stopped and the cleaned state was persisted"
+                                ),
+                                (Ok(()), Err(retry_persistence_error)) => format!(
+                                    "failed to persist retained ownership after service `{name}` start failure: {persistence_error:#}; the retained controller was stopped, but persisting the cleaned state also failed: {retry_persistence_error:#}"
+                                ),
+                                (Err(rollback_error), Ok(())) => format!(
+                                    "failed to persist retained ownership after service `{name}` start failure: {persistence_error:#}; rollback stop failed: {rollback_error:#}; the still-retained ownership was persisted on retry"
+                                ),
+                                (Err(rollback_error), Err(retry_persistence_error)) => format!(
+                                    "failed to persist retained ownership after service `{name}` start failure: {persistence_error:#}; rollback stop failed: {rollback_error:#}; persisting the still-retained ownership also failed: {retry_persistence_error:#}"
+                                ),
+                            };
+                            return Err(start_error.context(recovery));
+                        }
+                        return Err(start_error);
                     }
 
                     let state = controller.lock().await.read_state().await;
@@ -4386,8 +4430,11 @@ mod tests {
     struct TestController {
         id: String,
         state: RuntimeState,
+        fail_start: bool,
         fail_stop: bool,
+        owned_process_id: Option<u32>,
         process_identity: Option<PersistedProcessIdentity>,
+        container_id: Option<String>,
     }
 
     impl TestController {
@@ -4395,8 +4442,11 @@ mod tests {
             Self {
                 id: id.into(),
                 state,
+                fail_start: false,
                 fail_stop: false,
+                owned_process_id: None,
                 process_identity: None,
+                container_id: None,
             }
         }
 
@@ -4404,8 +4454,48 @@ mod tests {
             Self {
                 id: id.into(),
                 state,
+                fail_start: false,
                 fail_stop: true,
+                owned_process_id: None,
                 process_identity: None,
+                container_id: None,
+            }
+        }
+
+        fn retained_start_failure(id: impl Into<String>, pid: u32) -> Self {
+            Self {
+                id: id.into(),
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Stopped,
+                    health_status: HealthStatus::Unknown,
+                },
+                fail_start: true,
+                fail_stop: false,
+                owned_process_id: Some(pid),
+                process_identity: None,
+                container_id: None,
+            }
+        }
+
+        fn retained_pidless_start_failure(
+            id: impl Into<String>,
+            container_id: impl Into<String>,
+        ) -> Self {
+            Self {
+                id: id.into(),
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Stopped,
+                    health_status: HealthStatus::Unknown,
+                },
+                fail_start: true,
+                fail_stop: false,
+                owned_process_id: None,
+                process_identity: None,
+                container_id: Some(container_id.into()),
             }
         }
     }
@@ -4421,6 +4511,9 @@ mod tests {
         }
 
         async fn start(&mut self) -> Result<()> {
+            if self.fail_start {
+                anyhow::bail!("injected retained start failure");
+            }
             Ok(())
         }
 
@@ -4428,11 +4521,16 @@ mod tests {
             if self.fail_stop {
                 anyhow::bail!("injected stop failure");
             }
+            self.owned_process_id = None;
             Ok(())
         }
 
         async fn read_state(&self) -> RuntimeState {
             self.state
+        }
+
+        fn owned_process_id(&self) -> Option<u32> {
+            self.owned_process_id
         }
 
         fn process_identity(&self) -> Option<PersistedProcessIdentity> {
@@ -4443,8 +4541,10 @@ mod tests {
             stream::empty().boxed()
         }
 
-        fn get_metadata(&self, _key: &str) -> Option<String> {
-            None
+        fn get_metadata(&self, key: &str) -> Option<String> {
+            (key == "container_id")
+                .then(|| self.container_id.clone())
+                .flatten()
         }
 
         async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
@@ -4585,6 +4685,201 @@ mod tests {
         stop_count: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct RetainedStartFailureFactory {
+        pid: u32,
+    }
+
+    #[derive(Debug)]
+    struct RetainedPidlessStartFailureFactory {
+        container_id: String,
+    }
+
+    #[derive(Debug)]
+    struct RetainedStartRetryFactory {
+        create_count: Arc<AtomicUsize>,
+        start_count: Arc<AtomicUsize>,
+        stop_count: Arc<AtomicUsize>,
+        state_path_failure_fixture: Option<PathBuf>,
+    }
+
+    #[derive(Debug)]
+    struct RetainedStartRetryController {
+        id: String,
+        state: RuntimeState,
+        fail_start: bool,
+        owned_process_id: Option<u32>,
+        process_identity: Option<PersistedProcessIdentity>,
+        start_count: Arc<AtomicUsize>,
+        stop_count: Arc<AtomicUsize>,
+        state_path_failure_fixture: Option<PathBuf>,
+    }
+
+    #[async_trait]
+    impl ServiceController for RetainedStartRetryController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            self.start_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_start {
+                if let Some(state_path) = &self.state_path_failure_fixture {
+                    std::fs::remove_file(state_path).with_context(|| {
+                        format!(
+                            "remove runtime state before injecting persistence failure at {}",
+                            state_path.display()
+                        )
+                    })?;
+                    std::fs::create_dir(state_path).with_context(|| {
+                        format!(
+                            "inject runtime state persistence blocker at {}",
+                            state_path.display()
+                        )
+                    })?;
+                }
+                anyhow::bail!("injected retained start failure");
+            }
+            self.state.status = ServiceState::Running;
+            self.state.health_status = HealthStatus::Healthy;
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.stop_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(state_path) = self.state_path_failure_fixture.take() {
+                std::fs::remove_dir_all(&state_path).with_context(|| {
+                    format!(
+                        "remove injected state persistence blocker at {}",
+                        state_path.display()
+                    )
+                })?;
+            }
+            self.state.pid = None;
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            self.owned_process_id = None;
+            self.process_identity = None;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        fn owned_process_id(&self) -> Option<u32> {
+            self.owned_process_id
+        }
+
+        fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+            self.process_identity.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    impl ServiceFactory for RetainedStartFailureFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            Arc::new(Mutex::new(TestController::retained_start_failure(
+                name, self.pid,
+            )))
+        }
+    }
+
+    impl ServiceFactory for RetainedPidlessStartFailureFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            Arc::new(Mutex::new(TestController::retained_pidless_start_failure(
+                name,
+                self.container_id.clone(),
+            )))
+        }
+    }
+
+    impl ServiceFactory for RetainedStartRetryFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            let creation = self.create_count.fetch_add(1, Ordering::SeqCst);
+            let pid = u32::try_from(42 + creation).expect("test creation count fits in a PID");
+            let fail_start = creation == 0;
+            Arc::new(Mutex::new(RetainedStartRetryController {
+                id: name,
+                state: RuntimeState {
+                    pid: Some(pid),
+                    port: None,
+                    status: if fail_start {
+                        ServiceState::Running
+                    } else {
+                        ServiceState::Stopped
+                    },
+                    health_status: HealthStatus::Unknown,
+                },
+                fail_start,
+                owned_process_id: Some(pid),
+                process_identity: (!fail_start).then_some(PersistedProcessIdentity {
+                    start_time: 1_234
+                        + u64::try_from(creation).expect("test creation count fits in u64"),
+                    process_group_id: i32::try_from(pid).expect("test PID fits in i32"),
+                    executable: Some(PathBuf::from("/test/retry-controller")),
+                }),
+                start_count: self.start_count.clone(),
+                stop_count: self.stop_count.clone(),
+                state_path_failure_fixture: self.state_path_failure_fixture.clone(),
+            }))
+        }
+    }
+
     impl ServiceFactory for RetryPrepareFactory {
         fn can_handle(&self, config: &ServiceConfig) -> bool {
             matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
@@ -4606,7 +4901,11 @@ mod tests {
                     status: ServiceState::Building,
                     health_status: HealthStatus::Unknown,
                 },
-                process_identity: None,
+                process_identity: Some(PersistedProcessIdentity {
+                    start_time: 1_234,
+                    process_group_id: 42,
+                    executable: Some(PathBuf::from("/test/retry-prepare-worker")),
+                }),
                 start_entered: None,
                 fail_prepare,
                 stop_count: self.stop_count.clone(),
@@ -6697,6 +6996,239 @@ command = "ignored"
     }
 
     #[tokio::test]
+    async fn start_failure_persists_retained_unverified_process_evidence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("retained-start-failure-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retained-start-failure").await;
+        let retained_pid = 42;
+        manager.factories.insert(
+            0,
+            Arc::new(RetainedStartFailureFactory { pid: retained_pid }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "retained-start-failure",
+            "retained-start-failure.localhost",
+            &["web"],
+        );
+
+        let error = manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect_err("injected retained start failure must surface");
+        assert!(format!("{error:#}").contains("injected retained start failure"));
+
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load retained start-failure evidence");
+        let retained = persisted
+            .services
+            .iter()
+            .find(|service| service.name == "retained-start-failure:web")
+            .expect("persist retained start-failure service evidence");
+        assert_eq!(retained.pid, Some(retained_pid));
+        assert_eq!(retained.process_identity, None);
+        assert_eq!(retained.status, ServiceState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn retained_start_failure_rolls_back_when_its_first_persistence_attempt_fails() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir
+            .path()
+            .join("retained-start-persistence-failure-project");
+        let state_path = dir.path().join("state.json");
+        let (mut manager, _instance_id, _availability_data_dir) = availability_manager(
+            dir.path(),
+            &project_path,
+            "retained-start-persistence-failure",
+        )
+        .await;
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetainedStartRetryFactory {
+                create_count: create_count.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+                state_path_failure_fixture: Some(state_path.clone()),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "retained-start-persistence-failure",
+            "retained-start-persistence-failure.localhost",
+            &["web"],
+        );
+
+        let error = manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect_err("retained start failure with failed persistence must surface");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("injected retained start failure"),
+            "unexpected start error: {error}"
+        );
+        assert!(
+            error.contains("failed to persist retained ownership"),
+            "missing first persistence error: {error}"
+        );
+        assert!(
+            error.contains(
+                "the retained controller was stopped and the cleaned state was persisted"
+            ),
+            "missing rollback outcome: {error}"
+        );
+        assert_eq!(create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("retained-start-persistence-failure:web")
+                .await
+                .is_none(),
+            "successful rollback must release the retained controller"
+        );
+
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load cleaned state after rollback");
+        let cleaned = persisted
+            .services
+            .iter()
+            .find(|service| service.name == "retained-start-persistence-failure:web")
+            .expect("persist cleaned service state");
+        assert_eq!(cleaned.pid, None);
+        assert_eq!(cleaned.process_identity, None);
+        assert_eq!(cleaned.container_id, None);
+        assert_eq!(cleaned.status, ServiceState::Stopped);
+        assert!(state_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn retained_start_failure_is_stopped_before_a_retry_starts_a_replacement() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("retained-start-retry-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retained-start-retry").await;
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetainedStartRetryFactory {
+                create_count: create_count.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+                state_path_failure_fixture: None,
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "retained-start-retry",
+            "retained-start-retry.localhost",
+            &["web"],
+        );
+
+        let first_error = manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect_err("first controller retains incomplete ownership");
+        assert!(format!("{first_error:#}").contains("injected retained start failure"));
+        assert_eq!(create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 0);
+
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("retry stops the incomplete controller and starts a replacement");
+
+        assert_eq!(create_count.load(Ordering::SeqCst), 2);
+        assert_eq!(start_count.load(Ordering::SeqCst), 2);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        let replacement = manager
+            .get_service_controller("retained-start-retry:web")
+            .await
+            .expect("replacement controller is installed");
+        let replacement = replacement.lock().await;
+        assert!(replacement.owned_process_id().is_some());
+        assert!(replacement.process_identity().is_some());
+        assert_eq!(replacement.read_state().await.status, ServiceState::Running);
+    }
+
+    #[tokio::test]
+    async fn pidless_start_failure_marker_survives_for_fresh_reconciliation() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("pidless-start-failure-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "pidless-start-failure").await;
+        let retained_marker = "host-pidless-start-failure";
+        manager.factories.insert(
+            0,
+            Arc::new(RetainedPidlessStartFailureFactory {
+                container_id: retained_marker.to_owned(),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "pidless-start-failure",
+            "pidless-start-failure.localhost",
+            &["web"],
+        );
+
+        let error = manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect_err("pidless retained start failure must surface");
+        assert!(format!("{error:#}").contains("injected retained start failure"));
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load pidless retained start-failure evidence");
+        assert_eq!(persisted.services.len(), 1);
+        assert_eq!(persisted.services[0].pid, None);
+        assert_eq!(
+            persisted.services[0].container_id.as_deref(),
+            Some(retained_marker)
+        );
+        drop(manager);
+
+        let (fresh_manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "pidless-start-failure").await;
+        let reconcile_error = fresh_manager
+            .reconcile_stale_runtime_state()
+            .await
+            .expect_err("fresh daemon must preserve a pidless retained marker");
+        let reconcile_error = format!("{reconcile_error:#}");
+        assert!(
+            reconcile_error.contains(
+                "service `pidless-start-failure:web` has container evidence without a confirmable PID"
+            ),
+            "unexpected reconciliation error: {reconcile_error}"
+        );
+        let preserved = fresh_manager
+            .state_manager
+            .load()
+            .await
+            .expect("reload preserved pidless evidence");
+        assert_eq!(preserved.services[0].pid, None);
+        assert_eq!(
+            preserved.services[0].container_id.as_deref(),
+            Some(retained_marker)
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_persistence_ignores_status_pids_without_a_cleanup_handle() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("process-identity-project");
@@ -6715,8 +7247,11 @@ command = "ignored"
                 status: ServiceState::Running,
                 health_status: HealthStatus::Healthy,
             },
+            fail_start: false,
             fail_stop: false,
+            owned_process_id: None,
             process_identity: Some(identity.clone()),
+            container_id: None,
         }));
         let runtime_controller: Arc<Mutex<dyn ServiceController>> = controller.clone();
         let mut service =
@@ -10434,6 +10969,83 @@ command = "api"
             ["reload:api", "reload:web", "reload:db"]
         );
         assert!(plan.reusable_service_envs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepublication_plan_reuses_non_process_services_without_process_identity() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("managed-reload-project");
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "managed-reload"
+
+[services.db]
+type = "postgres"
+
+[services.docs]
+type = "site"
+path = "docs"
+"#,
+        )
+        .expect("parse managed service config");
+        let running_state = RuntimeState {
+            pid: None,
+            port: None,
+            status: ServiceState::Running,
+            health_status: HealthStatus::Healthy,
+        };
+        {
+            let mut services = manager.services.lock().await;
+            for name in ["db", "docs"] {
+                let controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(
+                    TestController::new(format!("managed-reload:{name}"), running_state.clone()),
+                ));
+                services.insert(
+                    format!("managed-reload:{name}"),
+                    test_service(
+                        config.clone(),
+                        config.services[name].clone(),
+                        ServiceRuntime::Controller(controller),
+                        project_path.clone(),
+                    ),
+                );
+            }
+        }
+        let desired_service_names = HashSet::from([
+            "managed-reload:db".to_owned(),
+            "managed-reload:docs".to_owned(),
+        ]);
+
+        let plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &config,
+                &HashMap::new(),
+                &["db".to_owned(), "docs".to_owned()],
+                &desired_service_names,
+            )
+            .await
+            .expect("build managed-service reuse plan");
+
+        assert!(plan.removed_service_names.is_empty());
+        assert!(plan.restart_service_names.is_empty());
+        assert_eq!(plan.reusable_service_envs.len(), 2);
+        assert!(plan.reusable_service_envs.contains_key("managed-reload:db"));
+        assert!(
+            plan.reusable_service_envs
+                .contains_key("managed-reload:docs")
+        );
     }
 
     #[tokio::test]
