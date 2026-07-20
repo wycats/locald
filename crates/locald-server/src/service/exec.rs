@@ -496,6 +496,7 @@ impl ServiceController for ExecController {
 
         self.pty_master = None;
         self.pty_writer = None;
+        self.pty_tx = None;
         self.container_id = None;
         self.owned_process_id = None;
         self.process_identity = None;
@@ -1145,6 +1146,38 @@ mod tests {
             assert!(controller.process_identity().is_none());
             assert!(controller.pty_tx.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn successful_stop_closes_the_current_pty_generation() {
+        let dir = tempdir().expect("create exec-controller test directory");
+        let mut controller = ExecController::new(
+            "pty-teardown:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "unused".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::new(),
+        );
+        let (spawned, _child_state) = pidless_spawned_process(PidlessChildBehavior::ExitOnKill);
+        let (child, master, writer, container_id, _log_rx, pty_tx) = spawned;
+        let mut old_generation = pty_tx.subscribe();
+        controller.child = Some(StdMutex::new(child));
+        controller.pty_master = Some(StdMutex::new(master));
+        controller.pty_writer = Some(StdMutex::new(writer));
+        controller.container_id = Some(container_id);
+        controller.pty_tx = Some(pty_tx);
+
+        controller.stop().await.expect("stop test controller");
+
+        assert!(controller.subscribe_pty().is_none());
+        assert!(matches!(
+            old_generation.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid as SysinfoPid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tokio::sync::{broadcast, mpsc};
@@ -26,6 +26,70 @@ type ProcessHandle = (
     mpsc::Receiver<LogEntry>,
     broadcast::Sender<Vec<u8>>,
 );
+
+type PtyReader = Box<dyn std::io::Read + Send>;
+
+struct LogReaderHandoff {
+    reader: Option<PtyReader>,
+    cancelled: bool,
+}
+
+struct PreparedLogStreamer {
+    handoff: Arc<(StdMutex<LogReaderHandoff>, Condvar)>,
+    log_rx: Option<mpsc::Receiver<LogEntry>>,
+    pty_tx: Option<broadcast::Sender<Vec<u8>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    activated: bool,
+}
+
+impl PreparedLogStreamer {
+    fn activate(
+        mut self,
+        reader: PtyReader,
+    ) -> (mpsc::Receiver<LogEntry>, broadcast::Sender<Vec<u8>>) {
+        let log_rx = self
+            .log_rx
+            .take()
+            .expect("prepared log streamer retains its log receiver until activation");
+        let pty_tx = self
+            .pty_tx
+            .take()
+            .expect("prepared log streamer retains its PTY sender until activation");
+        let (handoff, wake) = &*self.handoff;
+        let mut handoff = handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handoff.reader = Some(reader);
+        drop(handoff);
+        self.activated = true;
+        wake.notify_one();
+        (log_rx, pty_tx)
+    }
+}
+
+impl Drop for PreparedLogStreamer {
+    fn drop(&mut self) {
+        if self.activated {
+            return;
+        }
+
+        let (handoff, wake) = &*self.handoff;
+        let mut handoff = handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handoff.cancelled = true;
+        drop(handoff);
+        wake.notify_one();
+
+        if self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err())
+        {
+            warn!("Cancelled PTY log-reader thread panicked before activation");
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ProcessRuntime {
@@ -190,6 +254,10 @@ impl ProcessRuntime {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "small /proc pseudo-files provide the synchronous kernel identity snapshot used immediately before process authorization"
+    )]
     fn observed_process_authority(pid: i32) -> Result<Option<PersistedProcessIdentity>> {
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
@@ -475,17 +543,36 @@ impl ProcessRuntime {
             .context("Failed to create PTY")
     }
 
-    fn spawn_log_streamer(
-        reader: Box<dyn std::io::Read + Send>,
-        service_name: String,
-    ) -> Result<(mpsc::Receiver<LogEntry>, broadcast::Sender<Vec<u8>>)> {
+    fn prepare_log_streamer(service_name: String) -> Result<PreparedLogStreamer> {
         let (tx, rx) = mpsc::channel(100);
         let (pty_tx, _) = broadcast::channel(100);
         let pty_tx_clone = pty_tx.clone();
+        let handoff = Arc::new((
+            StdMutex::new(LogReaderHandoff {
+                reader: None,
+                cancelled: false,
+            }),
+            Condvar::new(),
+        ));
+        let thread_handoff = handoff.clone();
 
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .spawn(move || {
-                let mut reader = reader;
+                let mut reader = {
+                    let (handoff, wake) = &*thread_handoff;
+                    let mut handoff = handoff
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while handoff.reader.is_none() && !handoff.cancelled {
+                        handoff = wake
+                            .wait(handoff)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    let Some(reader) = handoff.reader.take() else {
+                        return;
+                    };
+                    reader
+                };
                 let mut buffer = Vec::new();
                 let mut buf = [0u8; 4096];
 
@@ -531,7 +618,13 @@ impl ProcessRuntime {
                 }
             })
             .context("Failed to start PTY log reader")?;
-        Ok((rx, pty_tx))
+        Ok(PreparedLogStreamer {
+            handoff,
+            log_rx: Some(rx),
+            pty_tx: Some(pty_tx),
+            thread: Some(thread),
+            activated: false,
+        })
     }
 
     fn spawn_bundle_process(name: String, bundle_dir: &Path) -> Result<ProcessHandle> {
@@ -561,11 +654,15 @@ impl ProcessRuntime {
             .master
             .take_writer()
             .context("Failed to take PTY writer")?;
-        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name)?;
+        // The prepared thread owns no PTY reader until the child exists. A
+        // failed spawn drops this guard, cancels the waiter, and closes every
+        // local PTY handle without leaving a blocking reader thread behind.
+        let log_streamer = Self::prepare_log_streamer(name)?;
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn process")?;
+        let (rx, pty_tx) = log_streamer.activate(reader);
 
         let master = pair.master;
 
@@ -612,11 +709,15 @@ impl ProcessRuntime {
             .master
             .take_writer()
             .context("Failed to take PTY writer")?;
-        let (rx, pty_tx) = Self::spawn_log_streamer(reader, name)?;
+        // Prepare the thread before spawning, but transfer the blocking PTY
+        // reader only after the child exists. Dropping an unactivated guard
+        // cancels and joins the waiting thread.
+        let log_streamer = Self::prepare_log_streamer(name)?;
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn process")?;
+        let (rx, pty_tx) = log_streamer.activate(reader);
 
         let master = pair.master;
 
@@ -1036,12 +1137,70 @@ mod tests {
         }
     }
 
+    fn assert_test_thread_completes(action: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        std::thread::spawn(move || {
+            action();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("test thread completed before timeout");
+    }
+
     #[test]
     fn cloned_runtime_reuses_process_observation_state() {
         let runtime = ProcessRuntime::new(PathBuf::from("notify.sock"));
         let cloned = runtime.clone();
 
         assert!(Arc::ptr_eq(&runtime.process_system, &cloned.process_system));
+    }
+
+    #[test]
+    fn prepared_log_streamer_cancels_before_reader_handoff() {
+        assert_test_thread_completes(|| {
+            let streamer = ProcessRuntime::prepare_log_streamer("cancelled:test".to_owned())
+                .expect("prepare log streamer");
+
+            drop(streamer);
+        });
+    }
+
+    #[test]
+    fn failed_child_spawn_cancels_the_waiting_log_streamer() {
+        assert_test_thread_completes(|| {
+            let pair = ProcessRuntime::create_pty().expect("create test PTY");
+            let _reader = pair
+                .master
+                .try_clone_reader()
+                .expect("clone test PTY reader");
+            let _writer = pair.master.take_writer().expect("take test PTY writer");
+            let _streamer = ProcessRuntime::prepare_log_streamer("failed-spawn:test".to_owned())
+                .expect("prepare log streamer");
+            let command = CommandBuilder::new(format!(
+                "/locald-test-missing-executable-{}",
+                uuid::Uuid::new_v4()
+            ));
+
+            pair.slave
+                .spawn_command(command)
+                .expect_err("missing executable must fail before reader handoff");
+        });
+    }
+
+    #[tokio::test]
+    async fn prepared_log_streamer_reads_after_child_side_activation() {
+        let streamer = ProcessRuntime::prepare_log_streamer("activated:test".to_owned())
+            .expect("prepare log streamer");
+        let reader: PtyReader = Box::new(std::io::Cursor::new(b"ready\n".to_vec()));
+        let (mut log_rx, _pty_tx) = streamer.activate(reader);
+
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log streamer produced output before timeout")
+            .expect("log streamer kept its output channel open");
+        assert_eq!(entry.service, "activated:test");
+        assert_eq!(entry.message, "ready");
     }
 
     #[test]
