@@ -21,7 +21,7 @@ Commands:
   up            Start the daemon (if needed) and register the current project
   dashboard     Open the dashboard in the default browser
   doctor        Diagnose host readiness for running locald
-  stop          Stop a running service. If no name is provided, stops all services defined in locald.toml in the current directory
+  stop          Pause the current project. With a name, stop only that service
   restart       Restart a running service
   status        List running services
   logs          Stream logs from services

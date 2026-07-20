@@ -281,6 +281,22 @@ impl ProjectCatalog {
         data_dir().join("catalog.json")
     }
 
+    /// Return the persistence path owned by this in-memory catalog image.
+    ///
+    /// Lifecycle transaction journals intentionally omit this locator from
+    /// their serialized catalog images. Recovery restores the live writer's
+    /// path before comparing or publishing a prepared image.
+    #[must_use]
+    pub fn storage_path(&self) -> &Path {
+        &self.storage_path
+    }
+
+    /// Rebind a deserialized catalog image to the live writer's persistence
+    /// path before validation and publication.
+    pub fn set_storage_path(&mut self, storage_path: PathBuf) {
+        self.storage_path = storage_path;
+    }
+
     /// Get the predecessor path-keyed registry path.
     #[must_use]
     pub fn legacy_registry_path() -> PathBuf {
@@ -296,6 +312,45 @@ impl ProjectCatalog {
         Self::load_from_paths(CatalogPaths::for_data_dir(&data_dir())).await
     }
 
+    /// Load the exact durable catalog image before lifecycle-journal recovery.
+    ///
+    /// Existing state is intentionally not reconciled with the filesystem:
+    /// doing so could publish a third image while a lifecycle transaction is
+    /// waiting to replay its recorded base or target. Once recovery completes,
+    /// the manager reconciles presence through the same journaled publication
+    /// boundary as every other catalog mutation.
+    pub async fn load_for_lifecycle_recovery(
+        allow_legacy_bootstrap: bool,
+    ) -> Result<Self, CatalogError> {
+        Self::load_from_paths_for_lifecycle_recovery(
+            CatalogPaths::for_data_dir(&data_dir()),
+            allow_legacy_bootstrap,
+        )
+        .await
+    }
+
+    /// Explicit-path variant of [`Self::load_for_lifecycle_recovery`].
+    pub async fn load_from_paths_for_lifecycle_recovery(
+        paths: CatalogPaths,
+        allow_legacy_bootstrap: bool,
+    ) -> Result<Self, CatalogError> {
+        if file_exists(&paths.catalog).await? {
+            return Self::load_existing_for_lifecycle_recovery(&paths.catalog).await;
+        }
+        if allow_legacy_bootstrap {
+            // Recovery needs the complete imported image in memory, but the
+            // lifecycle migration journal owns its first durable publication
+            // after the raw v1 inputs have been backed up.
+            Self::build_legacy_candidate(paths).await
+        } else {
+            Err(CatalogError::InvalidData {
+                path: paths.catalog,
+                reason: "authoritative catalog is missing after lifecycle-v2 state was published"
+                    .to_owned(),
+            })
+        }
+    }
+
     /// Load from explicit catalog and legacy paths.
     pub async fn load_from_paths(paths: CatalogPaths) -> Result<Self, CatalogError> {
         if file_exists(&paths.catalog).await? {
@@ -306,8 +361,19 @@ impl ProjectCatalog {
             return Ok(catalog);
         }
 
-        let evidence = collect_legacy_evidence(&paths).await?;
-        let mut candidate = Self::empty_at(paths.catalog.clone());
+        let catalog_path = paths.catalog.clone();
+        let candidate = Self::build_legacy_candidate(paths).await?;
+
+        if publish_new_catalog(&candidate, &catalog_path).await? {
+            Ok(candidate)
+        } else {
+            Self::load_existing(&catalog_path).await
+        }
+    }
+
+    async fn build_legacy_candidate(paths: CatalogPaths) -> Result<Self, CatalogError> {
+        let evidence = normalize_legacy_evidence(collect_legacy_evidence(&paths).await?)?;
+        let mut candidate = Self::empty_at(paths.catalog);
 
         for (path, legacy) in evidence {
             match tokio::fs::canonicalize(&path).await {
@@ -336,16 +402,53 @@ impl ProjectCatalog {
         }
 
         candidate.validate()?;
-        if publish_new_catalog(&candidate, &paths.catalog).await? {
-            Ok(candidate)
-        } else {
-            Self::load_existing(&paths.catalog).await
-        }
+        Ok(candidate)
     }
 
     async fn load_existing(path: &Path) -> Result<Self, CatalogError> {
         Self::load_existing_with_parent_sync(path, |path| async move { sync_parent(&path).await })
             .await
+    }
+
+    async fn load_existing_for_lifecycle_recovery(path: &Path) -> Result<Self, CatalogError> {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|source| CatalogError::Io {
+                operation: "read catalog for lifecycle recovery",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if content.trim().is_empty() {
+            return Err(CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "existing catalog is empty".to_owned(),
+            });
+        }
+        let value: Value =
+            serde_json::from_str(&content).map_err(|source| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: source.to_string(),
+            })?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "missing unsigned `version`".to_owned(),
+            })?;
+        match version {
+            version if version == u64::from(CATALOG_VERSION) => {
+                Self::deserialize_current(value, path)
+            }
+            version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
+                Self::migrate_v2(value, path)
+            }
+            found => Err(CatalogError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                found,
+                expected: CATALOG_VERSION,
+            }),
+        }
     }
 
     async fn load_existing_with_parent_sync<Sync, SyncFuture>(
@@ -927,11 +1030,15 @@ impl ProjectCatalog {
     }
 
     fn matching_unresolved_paths(&self, path: &Path) -> Vec<PathBuf> {
+        let normalized =
+            crate::normalize_project_locator(path).unwrap_or_else(|_| path.to_path_buf());
         self.unresolved_legacy
             .keys()
             .filter(|candidate| {
                 *candidate == path
-                    || std::fs::canonicalize(candidate).is_ok_and(|resolved| resolved == path)
+                    || candidate.as_path() == normalized.as_path()
+                    || crate::normalize_project_locator(candidate)
+                        .is_ok_and(|resolved| resolved == normalized)
             })
             .cloned()
             .collect()
@@ -944,7 +1051,8 @@ impl ProjectCatalog {
     }
 
     fn instance_for_path(&self, path: &Path) -> Option<ProjectInstanceId> {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical =
+            crate::normalize_project_locator(path).unwrap_or_else(|_| path.to_path_buf());
         self.current_instance_at(&canonical)
             .or_else(|| self.legacy_paths.get(&canonical).copied())
             .or_else(|| self.legacy_paths.get(path).copied())
@@ -977,7 +1085,8 @@ impl ProjectCatalog {
         if let Some(instance_id) = self.instance_for_path(path) {
             return self.entry_for_instance(instance_id);
         }
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical =
+            crate::normalize_project_locator(path).unwrap_or_else(|_| path.to_path_buf());
         self.unresolved_legacy
             .get(&canonical)
             .or_else(|| self.unresolved_legacy.get(path))
@@ -1050,8 +1159,15 @@ impl ProjectCatalog {
             record.pinned = true;
             return true;
         }
-        if let Some(record) = self.unresolved_legacy.get_mut(path) {
-            record.pinned = true;
+        let unresolved_paths = self.matching_unresolved_paths(path);
+        let mut changed = false;
+        for unresolved_path in unresolved_paths {
+            if let Some(record) = self.unresolved_legacy.get_mut(&unresolved_path) {
+                record.pinned = true;
+                changed = true;
+            }
+        }
+        if changed {
             return true;
         }
         false
@@ -1065,8 +1181,15 @@ impl ProjectCatalog {
             record.pinned = false;
             return true;
         }
-        if let Some(record) = self.unresolved_legacy.get_mut(path) {
-            record.pinned = false;
+        let unresolved_paths = self.matching_unresolved_paths(path);
+        let mut changed = false;
+        for unresolved_path in unresolved_paths {
+            if let Some(record) = self.unresolved_legacy.get_mut(&unresolved_path) {
+                record.pinned = false;
+                changed = true;
+            }
+        }
+        if changed {
             return true;
         }
         false
@@ -1074,7 +1197,11 @@ impl ProjectCatalog {
 
     /// Explicitly forget a project catalog record while leaving resources alone.
     pub fn unregister_project(&mut self, path: &Path) -> Result<bool, CatalogError> {
-        if self.unresolved_legacy.remove(path).is_some() {
+        let unresolved_paths = self.matching_unresolved_paths(path);
+        if !unresolved_paths.is_empty() {
+            for unresolved_path in unresolved_paths {
+                self.unresolved_legacy.remove(&unresolved_path);
+            }
             return Ok(true);
         }
         let Some(instance_id) = self.instance_for_path(path) else {
@@ -1767,6 +1894,39 @@ async fn collect_legacy_evidence(
     Ok(evidence)
 }
 
+fn normalize_legacy_evidence(
+    evidence: BTreeMap<PathBuf, UnresolvedLegacyProject>,
+) -> Result<BTreeMap<PathBuf, UnresolvedLegacyProject>, CatalogError> {
+    let mut normalized = BTreeMap::<PathBuf, UnresolvedLegacyProject>::new();
+    for (source_path, mut record) in evidence {
+        let path = crate::normalize_project_locator(&source_path)
+            .or_else(|_| crate::locator::absolute_project_locator(&source_path))
+            .map_err(|source| CatalogError::Io {
+                operation: "normalize legacy project locator",
+                path: source_path,
+                source,
+            })?;
+        record.path.clone_from(&path);
+        match normalized.entry(path) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if record.display_name.is_some()
+                    && (existing.display_name.is_none() || record.last_seen > existing.last_seen)
+                {
+                    existing.display_name = record.display_name;
+                }
+                existing.pinned |= record.pinned;
+                existing.last_seen = existing.last_seen.max(record.last_seen);
+                existing.sources.extend(record.sources);
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 type CompatibilityEvidenceCollector =
     fn(&Path, &Value, &mut BTreeMap<PathBuf, UnresolvedLegacyProject>) -> Result<(), CatalogError>;
 
@@ -2261,6 +2421,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_recovery_builds_legacy_catalog_without_publishing_it() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let missing = fixture._temp.path().join("legacy-only-project");
+        let registry = serde_json::json!({
+            "projects": {
+                missing.to_string_lossy().as_ref(): {
+                    "path": missing,
+                    "name": "legacy-only",
+                    "pinned": true,
+                    "last_seen": UNIX_EPOCH
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize legacy registry"),
+        )
+        .await
+        .expect("write legacy registry");
+
+        let candidate = ProjectCatalog::load_from_paths_for_lifecycle_recovery(paths.clone(), true)
+            .await
+            .expect("build read-only legacy candidate");
+
+        assert_eq!(candidate.storage_path(), paths.catalog);
+        assert_eq!(candidate.unresolved_legacy.len(), 1);
+        assert!(!paths.catalog.exists());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_recovery_does_not_reimport_legacy_state_when_catalog_is_missing() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        tokio::fs::write(&paths.legacy_registry, br#"{"projects":{}}"#)
+            .await
+            .expect("write stale legacy registry");
+
+        let error = ProjectCatalog::load_from_paths_for_lifecycle_recovery(paths.clone(), false)
+            .await
+            .expect_err("v2 recovery must require its authoritative catalog");
+
+        assert!(matches!(error, CatalogError::InvalidData { .. }));
+        assert!(error.to_string().contains("lifecycle-v2"));
+        assert!(!paths.catalog.exists());
+    }
+
+    #[tokio::test]
     async fn legacy_locator_sources_are_unioned_without_parsing_attachment_variants() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
@@ -2313,7 +2521,7 @@ mod tests {
             .expect("import locator evidence");
         let record = catalog
             .unresolved_legacy
-            .get(&missing)
+            .get(&crate::normalize_project_locator(&missing).expect("normalize missing locator"))
             .expect("missing path is unresolved");
 
         assert_eq!(record.display_name.as_deref(), Some("legacy"));
@@ -2360,8 +2568,65 @@ mod tests {
             .await
             .expect("preserve dangling legacy evidence");
 
-        assert!(catalog.unresolved_legacy.contains_key(&dangling));
+        assert!(catalog.unresolved_legacy.contains_key(
+            &crate::normalize_project_locator(&dangling).expect("normalize dangling locator")
+        ));
         assert!(catalog.instances.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn current_v3_unresolved_alias_mutations_match_the_normalized_locator() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let real_parent = fixture._temp.path().join("real-parent");
+        let alias_parent = fixture._temp.path().join("alias-parent");
+        std::fs::create_dir(&real_parent).expect("create real locator parent");
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).expect("create locator alias");
+        let raw_alias = alias_parent.join("missing-project");
+        let normalized = crate::normalize_project_locator(&raw_alias)
+            .expect("normalize missing locator through alias");
+        assert_ne!(raw_alias, normalized);
+
+        let mut catalog = ProjectCatalog::with_path(paths.catalog.clone());
+        catalog.unresolved_legacy.insert(
+            raw_alias.clone(),
+            UnresolvedLegacyProject {
+                path: raw_alias.clone(),
+                display_name: Some("aliased legacy project".to_owned()),
+                pinned: false,
+                last_seen: Some(UNIX_EPOCH),
+                sources: BTreeSet::from([LegacyLocatorSource::Registry]),
+            },
+        );
+        catalog.save().await.expect("persist current v3 catalog");
+        let before_reload = tokio::fs::read(&paths.catalog)
+            .await
+            .expect("read current v3 catalog before reload");
+
+        let mut reopened = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("reload current v3 catalog");
+
+        assert_eq!(
+            tokio::fs::read(&paths.catalog)
+                .await
+                .expect("read current v3 catalog after reload"),
+            before_reload
+        );
+        assert!(reopened.unresolved_legacy.contains_key(&raw_alias));
+        assert!(!reopened.unresolved_legacy.contains_key(&normalized));
+
+        assert!(reopened.pin_project(&normalized));
+        assert!(reopened.unresolved_legacy[&raw_alias].pinned);
+        assert!(reopened.unpin_project(&normalized));
+        assert!(!reopened.unresolved_legacy[&raw_alias].pinned);
+        assert!(
+            reopened
+                .unregister_project(&normalized)
+                .expect("unregister normalized unresolved alias")
+        );
+        assert!(!reopened.unresolved_legacy.contains_key(&raw_alias));
     }
 
     #[cfg(unix)]
@@ -2446,7 +2711,7 @@ mod tests {
             .expect("preserve unavailable Git identity as legacy evidence");
         let record = catalog
             .unresolved_legacy
-            .get(&linked)
+            .get(&crate::normalize_project_locator(&linked).expect("normalize linked locator"))
             .expect("unavailable linked worktree remains unresolved");
 
         assert_eq!(record.display_name.as_deref(), Some("legacy-linked"));
@@ -2583,7 +2848,9 @@ mod tests {
                 .contains_key(&expected.identity.project_instance_id)
         );
         assert_eq!(
-            catalog.legacy_paths.get(&project),
+            catalog
+                .legacy_paths
+                .get(&crate::normalize_project_locator(&project).expect("normalize Git locator")),
             Some(&expected.identity.project_instance_id)
         );
     }
@@ -3479,7 +3746,10 @@ mod tests {
 
         let record = catalog
             .unresolved_legacy
-            .get(&registry_path)
+            .get(
+                &crate::normalize_project_locator(&registry_path)
+                    .expect("normalize registry locator"),
+            )
             .expect("preserve registry evidence");
         assert_eq!(
             record.sources,

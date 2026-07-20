@@ -42,9 +42,14 @@ pub async fn run_ipc_server(
                 let shutdown_tx = shutdown_tx.clone();
                 let version = version.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(stream, manager, container_manager, shutdown_tx, version)
-                            .await
+                    if let Err(e) = Box::pin(handle_connection(
+                        stream,
+                        manager,
+                        container_manager,
+                        shutdown_tx,
+                        version,
+                    ))
+                    .await
                     {
                         error!("Error handling connection: {}", e);
                     }
@@ -258,10 +263,10 @@ async fn handle_connection(
             let context = serde_json::to_string_pretty(&status)?;
             IpcResponse::AiContext(context)
         }
-        IpcRequest::RegistryList => {
-            let projects = manager.registry_list().await;
-            IpcResponse::RegistryList(projects)
-        }
+        IpcRequest::RegistryList => match manager.registry_list().await {
+            Ok(projects) => IpcResponse::RegistryList(projects),
+            Err(error) => IpcResponse::Error(error.to_string()),
+        },
         IpcRequest::RegistryPin { project_path } => match manager.registry_pin(&project_path).await
         {
             Ok(()) => IpcResponse::Ok,

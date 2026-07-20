@@ -1,13 +1,21 @@
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::SystemTime;
+use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
-const LEGACY_EDITOR_TTL: Duration = Duration::from_mins(30);
+use crate::{MANUAL_DEMAND_TTL, ProjectInstanceId, VSCODE_DEMAND_TTL};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub enum AttachmentSource {
     Editor {
         name: String,
@@ -27,6 +35,7 @@ pub enum AttachmentSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Attachment {
     pub project_path: PathBuf,
     pub source: AttachmentSource,
@@ -72,20 +81,83 @@ pub enum ProjectSection {
     Recent,
 }
 
-#[derive(Debug, Default, Serialize)]
-struct AttachmentStoreData {
+/// An exact, deterministically ordered attachment compatibility projection.
+///
+/// This is suitable for embedding as the before or after image in a lifecycle
+/// transaction journal. Project keys and manual-stop markers serialize in path
+/// order while attachment order remains exactly as it appeared in the store.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentStoreSnapshot {
+    pub attachments: BTreeMap<PathBuf, Vec<Attachment>>,
+    pub manually_stopped: BTreeSet<PathBuf>,
+    pub instance_owners: BTreeMap<PathBuf, ProjectInstanceId>,
+}
+
+/// The complete attachment compatibility state owned by one project path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentProjectSnapshot {
+    pub project_path: PathBuf,
     #[serde(default)]
-    attachments: HashMap<PathBuf, Vec<Attachment>>,
+    pub attachments: Vec<Attachment>,
+    pub manually_stopped: bool,
     #[serde(default)]
-    manually_stopped: HashSet<PathBuf>,
+    pub instance_owner: Option<ProjectInstanceId>,
+}
+
+/// The exact effect of replacing one project's compatibility projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentProjectDelta {
+    pub before: AttachmentProjectSnapshot,
+    pub after: AttachmentProjectSnapshot,
+    #[serde(default)]
+    pub removed: Vec<Attachment>,
+    #[serde(default)]
+    pub added: Vec<Attachment>,
+}
+
+/// One legacy attachment together with its liveness at a caller-selected time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentLivenessEvidence {
+    pub attachment: Attachment,
+    pub alive: bool,
+}
+
+/// Deterministic legacy lifecycle evidence for one compatibility-store project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentCompatibilityEvidence {
+    pub project_path: PathBuf,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentLivenessEvidence>,
+    pub manually_stopped: bool,
+}
+
+/// A compatibility-store load or persistence failure.
+#[derive(Debug, Error)]
+pub enum AttachmentStoreError {
+    #[error("invalid attachment state at {path}: {reason}")]
+    InvalidData { path: PathBuf, reason: String },
+    #[error("failed to {operation} at {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "attachment state at {path} was published but may not be durable because its parent directory could not be synced: {reason}"
+    )]
+    PublishedNotDurable { path: PathBuf, reason: String },
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct LegacyAttachmentStoreData {
     #[serde(default)]
-    attachments: HashMap<PathBuf, Vec<serde_json::Value>>,
+    attachments: BTreeMap<PathBuf, Vec<serde_json::Value>>,
     #[serde(default)]
-    manually_stopped: HashSet<PathBuf>,
+    manually_stopped: BTreeSet<PathBuf>,
+    #[serde(default)]
+    instance_owners: BTreeMap<PathBuf, ProjectInstanceId>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -93,6 +165,147 @@ pub struct AttachmentStore {
     path: PathBuf,
     attachments: HashMap<PathBuf, Vec<Attachment>>,
     manually_stopped: HashSet<PathBuf>,
+    instance_owners: HashMap<PathBuf, ProjectInstanceId>,
+}
+
+impl AttachmentStoreSnapshot {
+    /// Return the exact compatibility projection for one canonicalized target.
+    pub fn project(&self, project_path: &Path) -> AttachmentProjectSnapshot {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        AttachmentProjectSnapshot {
+            attachments: self
+                .attachments
+                .get(&project_path)
+                .cloned()
+                .unwrap_or_default(),
+            manually_stopped: self.manually_stopped.contains(&project_path),
+            instance_owner: self.instance_owners.get(&project_path).copied(),
+            project_path,
+        }
+    }
+
+    /// Replace one project's complete compatibility projection and return its
+    /// exact before/after delta.
+    ///
+    /// This intentionally accepts parked `Runtime` evidence: unlike the live
+    /// `attach` operation, whole-target replacement is the privileged seam used
+    /// by migration planning and journal replay.
+    pub fn replace_project(
+        &mut self,
+        project_path: &Path,
+        mut attachments: Vec<Attachment>,
+        manually_stopped: bool,
+    ) -> AttachmentProjectDelta {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        let before = self.project(&project_path);
+        for attachment in &mut attachments {
+            attachment.project_path.clone_from(&project_path);
+        }
+
+        if attachments.is_empty() {
+            self.attachments.remove(&project_path);
+        } else {
+            self.attachments
+                .insert(project_path.clone(), attachments.clone());
+        }
+        if manually_stopped {
+            self.manually_stopped.insert(project_path.clone());
+        } else {
+            self.manually_stopped.remove(&project_path);
+        }
+        if attachments.is_empty() && !manually_stopped {
+            self.instance_owners.remove(&project_path);
+        }
+
+        let instance_owner = self.instance_owners.get(&project_path).copied();
+        let after = AttachmentProjectSnapshot {
+            project_path,
+            attachments,
+            manually_stopped,
+            instance_owner,
+        };
+        let removed = exact_attachment_difference(&before.attachments, &after.attachments);
+        let added = exact_attachment_difference(&after.attachments, &before.attachments);
+        AttachmentProjectDelta {
+            before,
+            after,
+            removed,
+            added,
+        }
+    }
+
+    #[must_use]
+    pub fn instance_owner(&self, project_path: &Path) -> Option<ProjectInstanceId> {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        self.instance_owners.get(&project_path).copied()
+    }
+
+    pub fn set_instance_owner(&mut self, project_path: &Path, instance_id: ProjectInstanceId) {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        self.instance_owners.insert(project_path, instance_id);
+    }
+
+    pub fn clear_instance_owner(&mut self, project_path: &Path) {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        self.instance_owners.remove(&project_path);
+    }
+
+    /// Derive liveness for one exact snapshot projection using a caller-owned
+    /// clock and PID probe.
+    pub fn compatibility_evidence_at<F>(
+        &self,
+        project_path: &Path,
+        now: SystemTime,
+        mut pid_alive: F,
+    ) -> AttachmentCompatibilityEvidence
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let project = self.project(project_path);
+        let attachments = project
+            .attachments
+            .into_iter()
+            .map(|attachment| {
+                let alive =
+                    AttachmentStore::attachment_alive_with(&attachment, now, &mut pid_alive);
+                AttachmentLivenessEvidence { attachment, alive }
+            })
+            .collect();
+        AttachmentCompatibilityEvidence {
+            project_path: project.project_path,
+            attachments,
+            manually_stopped: project.manually_stopped,
+        }
+    }
+
+    /// Remove only the exact observed compatibility record.
+    ///
+    /// Reapers use this compare-and-remove seam so a refreshed editor owner
+    /// with the same stable window identity cannot be detached by stale PID
+    /// evidence captured before the refresh.
+    pub fn remove_exact_attachment(
+        &mut self,
+        project_path: &Path,
+        attachment: &Attachment,
+    ) -> bool {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        let Some(existing) = self.attachments.get_mut(&project_path) else {
+            return false;
+        };
+        let mut expected = attachment.clone();
+        expected.project_path.clone_from(&project_path);
+        let Some(index) = existing.iter().position(|item| item == &expected) else {
+            return false;
+        };
+        existing.remove(index);
+        if existing.is_empty() {
+            self.attachments.remove(&project_path);
+            if !self.manually_stopped.contains(&project_path) {
+                self.instance_owners.remove(&project_path);
+            }
+        }
+        true
+    }
 }
 
 impl AttachmentStore {
@@ -101,11 +314,17 @@ impl AttachmentStore {
             path,
             attachments: HashMap::new(),
             manually_stopped: HashSet::new(),
+            instance_owners: HashMap::new(),
         }
     }
 
     pub fn path() -> PathBuf {
         crate::storage::data_dir().join("attachments.json")
+    }
+
+    /// Return the concrete persistence target owned by this store.
+    pub fn storage_path(&self) -> &Path {
+        &self.path
     }
 
     #[allow(clippy::disallowed_methods)]
@@ -115,37 +334,156 @@ impl AttachmentStore {
             if content.trim().is_empty() {
                 self.attachments.clear();
                 self.manually_stopped.clear();
+                self.instance_owners.clear();
                 return Ok(());
             }
             let data: LegacyAttachmentStoreData = serde_json::from_str(&content)?;
-            self.attachments = data
-                .attachments
+            let mut attachments_by_path = HashMap::<PathBuf, Vec<Attachment>>::new();
+            for (path, attachments) in data.attachments {
+                let path = Self::canonicalize_path(&path);
+                let mut attachments = attachments
+                    .into_iter()
+                    .filter_map(Self::parse_legacy_attachment)
+                    .collect::<Result<Vec<_>>>()?;
+                for attachment in &mut attachments {
+                    attachment.project_path.clone_from(&path);
+                }
+                attachments_by_path
+                    .entry(path)
+                    .or_default()
+                    .extend(attachments);
+            }
+            self.attachments = attachments_by_path;
+            self.manually_stopped = data
+                .manually_stopped
                 .into_iter()
-                .map(|(path, attachments)| {
-                    let attachments = attachments
-                        .into_iter()
-                        .filter_map(Self::parse_legacy_attachment)
-                        .collect::<Result<Vec<_>>>();
-                    attachments.map(|attachments| (path, attachments))
-                })
-                .collect::<Result<_>>()?;
-            self.manually_stopped = data.manually_stopped;
+                .map(|path| Self::canonicalize_path(&path))
+                .collect();
+            let mut instance_owners = HashMap::new();
+            for (path, instance_id) in data.instance_owners {
+                let path = Self::canonicalize_path(&path);
+                anyhow::ensure!(
+                    instance_owners
+                        .insert(path.clone(), instance_id)
+                        .is_none_or(|existing| existing == instance_id),
+                    "legacy attachment aliases for `{}` disagree about their project instance owner",
+                    path.display()
+                );
+            }
+            self.instance_owners = instance_owners;
         }
+        Ok(())
+    }
+
+    /// Load the exact post-migration compatibility projection.
+    ///
+    /// Unlike [`Self::load`], this rejects missing, empty, unknown, or legacy
+    /// attachment state. Once lifecycle-v2 authority exists, compatibility
+    /// state is a replay image rather than best-effort legacy evidence.
+    pub async fn load_exact(&mut self) -> Result<()> {
+        let content = tokio::fs::read_to_string(&self.path).await?;
+        anyhow::ensure!(
+            !content.trim().is_empty(),
+            "authoritative attachment state `{}` is empty",
+            self.path.display()
+        );
+        let snapshot: AttachmentStoreSnapshot = serde_json::from_str(&content)?;
+        self.apply_snapshot(snapshot);
         Ok(())
     }
 
     #[allow(clippy::disallowed_methods)]
     pub async fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        persist_attachment_snapshot(&self.snapshot(), &self.path)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Return the exact compatibility-store state in deterministic key order.
+    pub fn snapshot(&self) -> AttachmentStoreSnapshot {
+        AttachmentStoreSnapshot {
+            attachments: self
+                .attachments
+                .iter()
+                .map(|(path, attachments)| (path.clone(), attachments.clone()))
+                .collect(),
+            manually_stopped: self.manually_stopped.iter().cloned().collect(),
+            instance_owners: self
+                .instance_owners
+                .iter()
+                .map(|(path, instance_id)| (path.clone(), *instance_id))
+                .collect(),
         }
-        let data = AttachmentStoreData {
-            attachments: self.attachments.clone(),
-            manually_stopped: self.manually_stopped.clone(),
-        };
-        let content = serde_json::to_string_pretty(&data)?;
-        tokio::fs::write(&self.path, content).await?;
-        Ok(())
+    }
+
+    /// Atomically publish a complete candidate projection before making it the
+    /// in-memory authority.
+    ///
+    /// A parent-directory sync failure means the rename already published the
+    /// candidate. In that case the in-memory state follows the published file
+    /// while the typed error tells the transaction journal that durability is
+    /// uncertain and replay is still required.
+    pub async fn replace_snapshot(
+        &mut self,
+        snapshot: AttachmentStoreSnapshot,
+    ) -> std::result::Result<(), AttachmentStoreError> {
+        self.replace_snapshot_with_parent_sync(snapshot, |path| async move {
+            sync_attachment_parent(&path).await
+        })
+        .await
+    }
+
+    async fn replace_snapshot_with_parent_sync<Sync, SyncFuture>(
+        &mut self,
+        snapshot: AttachmentStoreSnapshot,
+        parent_sync: Sync,
+    ) -> std::result::Result<(), AttachmentStoreError>
+    where
+        Sync: FnOnce(PathBuf) -> SyncFuture,
+        SyncFuture: Future<Output = std::result::Result<(), AttachmentStoreError>>,
+    {
+        let publication =
+            persist_attachment_snapshot_with_parent_sync(&snapshot, &self.path, parent_sync).await;
+        if publication.is_ok()
+            || matches!(
+                &publication,
+                Err(AttachmentStoreError::PublishedNotDurable { .. })
+            )
+        {
+            self.apply_snapshot(snapshot);
+        }
+        publication
+    }
+
+    /// Replace one project's in-memory compatibility projection and return the
+    /// exact delta. Journaled callers should prefer applying this to a cloned
+    /// [`AttachmentStoreSnapshot`] and then call [`Self::replace_snapshot`].
+    pub fn replace_project(
+        &mut self,
+        project_path: &Path,
+        attachments: Vec<Attachment>,
+        manually_stopped: bool,
+    ) -> AttachmentProjectDelta {
+        let mut snapshot = self.snapshot();
+        let delta = snapshot.replace_project(project_path, attachments, manually_stopped);
+        self.apply_snapshot(snapshot);
+        delta
+    }
+
+    pub fn set_instance_owner(&mut self, project_path: &Path, instance_id: ProjectInstanceId) {
+        let project_path = Self::canonicalize_path(project_path);
+        self.instance_owners.insert(project_path, instance_id);
+    }
+
+    pub fn clear_instance_owner(&mut self, project_path: &Path) {
+        let project_path = Self::canonicalize_path(project_path);
+        self.instance_owners.remove(&project_path);
+    }
+
+    fn apply_snapshot(&mut self, snapshot: AttachmentStoreSnapshot) {
+        self.attachments = snapshot.attachments.into_iter().collect();
+        self.manually_stopped = snapshot.manually_stopped.into_iter().collect();
+        self.instance_owners = snapshot.instance_owners.into_iter().collect();
     }
 
     pub fn attach(&mut self, mut attachment: Attachment) -> Result<bool> {
@@ -183,6 +521,9 @@ impl AttachmentStore {
 
         if entry.is_empty() {
             self.attachments.remove(&path);
+            if !self.manually_stopped.contains(&path) {
+                self.instance_owners.remove(&path);
+            }
         }
         live_before && !live_after
     }
@@ -204,6 +545,9 @@ impl AttachmentStore {
 
         if entry.is_empty() {
             self.attachments.remove(&path);
+            if !self.manually_stopped.contains(&path) {
+                self.instance_owners.remove(&path);
+            }
         }
         live_before && !live_after
     }
@@ -216,6 +560,9 @@ impl AttachmentStore {
     pub fn clear_stopped(&mut self, project_path: &Path) {
         let path = Self::canonicalize_path(project_path);
         self.manually_stopped.remove(&path);
+        if !self.attachments.contains_key(&path) {
+            self.instance_owners.remove(&path);
+        }
     }
 
     pub fn is_stopped(&self, project_path: &Path) -> bool {
@@ -240,17 +587,34 @@ impl AttachmentStore {
         let path = Self::canonicalize_path(project_path);
         let removed_attachments = self.attachments.remove(&path).is_some();
         let removed_stop = self.manually_stopped.remove(&path);
-        removed_attachments || removed_stop
+        let removed_owner = self.instance_owners.remove(&path).is_some();
+        removed_attachments || removed_stop || removed_owner
     }
 
     pub fn reap_stale_attachments(&mut self) -> Vec<PathBuf> {
+        self.reap_stale_attachments_with(SystemTime::now(), Self::pid_alive)
+    }
+
+    /// Reap stale compatibility owners using a caller-selected clock and
+    /// process-liveness probe.
+    ///
+    /// The returned project paths are sorted so journal evidence and tests do
+    /// not depend on `HashMap` iteration order.
+    pub fn reap_stale_attachments_with<F>(
+        &mut self,
+        now: SystemTime,
+        mut pid_alive: F,
+    ) -> Vec<PathBuf>
+    where
+        F: FnMut(u32) -> bool,
+    {
         let mut emptied = Vec::new();
-        let now = SystemTime::now();
 
         let mut to_remove = Vec::new();
         for (path, attachments) in &mut self.attachments {
             let live_before = Self::has_live_attachment(attachments);
-            attachments.retain(|attachment| Self::attachment_alive(attachment, now));
+            attachments
+                .retain(|attachment| Self::attachment_alive_with(attachment, now, &mut pid_alive));
             let live_after = Self::has_live_attachment(attachments);
 
             if attachments.is_empty() {
@@ -263,30 +627,92 @@ impl AttachmentStore {
 
         for path in to_remove {
             self.attachments.remove(&path);
+            if !self.manually_stopped.contains(&path) {
+                self.instance_owners.remove(&path);
+            }
         }
 
+        emptied.sort();
         emptied
     }
 
     pub fn reap_stale_attachments_for(&mut self, project_path: &Path) -> bool {
+        self.reap_stale_attachments_for_with(project_path, SystemTime::now(), Self::pid_alive)
+    }
+
+    /// Reap one target using a caller-selected clock and liveness probe.
+    pub fn reap_stale_attachments_for_with<F>(
+        &mut self,
+        project_path: &Path,
+        now: SystemTime,
+        mut pid_alive: F,
+    ) -> bool
+    where
+        F: FnMut(u32) -> bool,
+    {
         let path = Self::canonicalize_path(project_path);
         let Some(attachments) = self.attachments.get_mut(&path) else {
             return false;
         };
 
-        let now = SystemTime::now();
         let live_before = Self::has_live_attachment(attachments);
-        attachments.retain(|attachment| Self::attachment_alive(attachment, now));
+        attachments
+            .retain(|attachment| Self::attachment_alive_with(attachment, now, &mut pid_alive));
         let live_after = Self::has_live_attachment(attachments);
 
         if attachments.is_empty() {
             self.attachments.remove(&path);
+            if !self.manually_stopped.contains(&path) {
+                self.instance_owners.remove(&path);
+            }
         }
         live_before && !live_after
     }
 
     pub fn reap_stale_pids(&mut self) -> Vec<PathBuf> {
         self.reap_stale_attachments()
+    }
+
+    /// Return deterministic per-project legacy evidence without mutating the
+    /// compatibility store.
+    pub fn compatibility_evidence_at<F>(
+        &self,
+        now: SystemTime,
+        mut pid_alive: F,
+    ) -> Vec<AttachmentCompatibilityEvidence>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let snapshot = self.snapshot();
+        let project_paths: BTreeSet<_> = snapshot
+            .attachments
+            .keys()
+            .chain(snapshot.manually_stopped.iter())
+            .cloned()
+            .collect();
+
+        project_paths
+            .into_iter()
+            .map(|project_path| {
+                let attachments = snapshot
+                    .attachments
+                    .get(&project_path)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .map(|attachment| {
+                        let alive = Self::attachment_alive_with(&attachment, now, &mut pid_alive);
+                        AttachmentLivenessEvidence { attachment, alive }
+                    })
+                    .collect();
+                let manually_stopped = snapshot.manually_stopped.contains(&project_path);
+                AttachmentCompatibilityEvidence {
+                    project_path,
+                    attachments,
+                    manually_stopped,
+                }
+            })
+            .collect()
     }
 
     pub fn section_for(&self, project_path: &Path) -> ProjectSection {
@@ -318,7 +744,7 @@ impl AttachmentStore {
     }
 
     fn canonicalize_path(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        crate::normalize_project_locator(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Decode a persisted attachment while keeping lifecycle decisions tied to
@@ -391,15 +817,21 @@ impl AttachmentStore {
             .any(|attachment| !matches!(attachment.source, AttachmentSource::Runtime))
     }
 
-    fn attachment_alive(attachment: &Attachment, now: SystemTime) -> bool {
+    fn attachment_alive_with<F>(attachment: &Attachment, now: SystemTime, pid_alive: &mut F) -> bool
+    where
+        F: FnMut(u32) -> bool,
+    {
         match attachment.source {
             AttachmentSource::CLI { pid } | AttachmentSource::Editor { pid: Some(pid), .. } => {
-                Self::pid_alive(pid)
+                pid_alive(pid)
             }
             AttachmentSource::Editor { pid: None, .. } => now
                 .duration_since(attachment.created_at)
-                .map_or(true, |age| age <= LEGACY_EDITOR_TTL),
-            AttachmentSource::Runtime | AttachmentSource::Pin => true,
+                .map_or(true, |age| age < VSCODE_DEMAND_TTL),
+            AttachmentSource::Runtime => now
+                .duration_since(attachment.created_at)
+                .map_or(true, |age| age < MANUAL_DEMAND_TTL),
+            AttachmentSource::Pin => true,
         }
     }
 
@@ -419,11 +851,226 @@ impl AttachmentStore {
     }
 }
 
+fn exact_attachment_difference(
+    candidates: &[Attachment],
+    comparison: &[Attachment],
+) -> Vec<Attachment> {
+    let mut unmatched = comparison.to_vec();
+    let mut difference = Vec::new();
+    for candidate in candidates {
+        if let Some(index) = unmatched.iter().position(|item| item == candidate) {
+            unmatched.remove(index);
+        } else {
+            difference.push(candidate.clone());
+        }
+    }
+    difference
+}
+
+async fn persist_attachment_snapshot(
+    snapshot: &AttachmentStoreSnapshot,
+    path: &Path,
+) -> std::result::Result<(), AttachmentStoreError> {
+    persist_attachment_snapshot_with_parent_sync(snapshot, path, |path| async move {
+        sync_attachment_parent(&path).await
+    })
+    .await
+}
+
+async fn persist_attachment_snapshot_with_parent_sync<Sync, SyncFuture>(
+    snapshot: &AttachmentStoreSnapshot,
+    path: &Path,
+    parent_sync: Sync,
+) -> std::result::Result<(), AttachmentStoreError>
+where
+    Sync: FnOnce(PathBuf) -> SyncFuture,
+    SyncFuture: Future<Output = std::result::Result<(), AttachmentStoreError>>,
+{
+    let temporary = write_temporary_attachment_snapshot(snapshot, path).await?;
+    if let Err(source) = tokio::fs::rename(&temporary, path).await {
+        let cleanup = tokio::fs::remove_file(&temporary).await;
+        let reason = cleanup.err().map_or_else(
+            || source.to_string(),
+            |cleanup_error| format!("{source}; temporary cleanup also failed: {cleanup_error}"),
+        );
+        return Err(AttachmentStoreError::Io {
+            operation: "atomically replace attachment state",
+            path: path.to_path_buf(),
+            source: io::Error::new(source.kind(), reason),
+        });
+    }
+
+    parent_sync(path.to_path_buf()).await.map_err(|error| {
+        AttachmentStoreError::PublishedNotDurable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })
+}
+
+async fn write_temporary_attachment_snapshot(
+    snapshot: &AttachmentStoreSnapshot,
+    path: &Path,
+) -> std::result::Result<PathBuf, AttachmentStoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AttachmentStoreError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "attachment state path has no parent directory".to_owned(),
+        })?;
+    let destination_unpublished = match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => false,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => true,
+        Err(source) => {
+            return Err(AttachmentStoreError::Io {
+                operation: "inspect attachment state destination",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    create_attachment_parent_durably(parent, destination_unpublished).await?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachments.json");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let mut content = serde_json::to_vec_pretty(snapshot).map_err(|source| {
+        AttachmentStoreError::InvalidData {
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    })?;
+    content.push(b'\n');
+
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await
+        .map_err(|source| AttachmentStoreError::Io {
+            operation: "create temporary attachment state",
+            path: temporary.clone(),
+            source,
+        })?;
+    let write_result = async {
+        output.write_all(&content).await?;
+        output.sync_all().await
+    }
+    .await;
+    drop(output);
+    if let Err(source) = write_result {
+        let cleanup = tokio::fs::remove_file(&temporary).await;
+        let reason = cleanup.err().map_or_else(
+            || source.to_string(),
+            |cleanup_error| format!("{source}; temporary cleanup also failed: {cleanup_error}"),
+        );
+        return Err(AttachmentStoreError::Io {
+            operation: "write and sync temporary attachment state",
+            path: temporary,
+            source: io::Error::new(source.kind(), reason),
+        });
+    }
+
+    Ok(temporary)
+}
+
+async fn create_attachment_parent_durably(
+    parent: &Path,
+    destination_unpublished: bool,
+) -> std::result::Result<(), AttachmentStoreError> {
+    let mut cursor = parent;
+    loop {
+        match tokio::fs::symlink_metadata(cursor).await {
+            Ok(_) => break,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| AttachmentStoreError::InvalidData {
+                        path: parent.to_path_buf(),
+                        reason: "attachment state directory has no existing ancestor".to_owned(),
+                    })?;
+            }
+            Err(source) => {
+                return Err(AttachmentStoreError::Io {
+                    operation: "inspect attachment state directory",
+                    path: cursor.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|source| AttachmentStoreError::Io {
+            operation: "create attachment state directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+
+    // When no authoritative file exists yet, this may be a retry after an
+    // earlier attempt created the hierarchy and then failed one of these
+    // syncs. The retry cannot distinguish those directories from older ones,
+    // so repair every owning ancestor before publishing the first file.
+    if destination_unpublished {
+        for owning_parent in attachment_hierarchy_owners(parent) {
+            sync_attachment_directory(&owning_parent).await?;
+        }
+    }
+    Ok(())
+}
+
+fn attachment_hierarchy_owners(parent: &Path) -> Vec<PathBuf> {
+    parent
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+async fn sync_attachment_parent(path: &Path) -> std::result::Result<(), AttachmentStoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AttachmentStoreError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "attachment state path has no parent directory".to_owned(),
+        })?;
+    sync_attachment_directory(parent).await
+}
+
+async fn sync_attachment_directory(
+    directory_path: &Path,
+) -> std::result::Result<(), AttachmentStoreError> {
+    let directory = tokio::fs::File::open(directory_path)
+        .await
+        .map_err(|source| AttachmentStoreError::Io {
+            operation: "open attachment state directory for sync",
+            path: directory_path.to_path_buf(),
+            source,
+        })?;
+    directory
+        .sync_all()
+        .await
+        .map_err(|source| AttachmentStoreError::Io {
+            operation: "sync attachment state directory",
+            path: directory_path.to_path_buf(),
+            source,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::time::UNIX_EPOCH;
     use tempfile::tempdir;
+
+    fn normalized_locator(path: &Path) -> PathBuf {
+        crate::normalize_project_locator(path).expect("normalize test project locator")
+    }
 
     #[test]
     fn attach_and_detach_updates_counts() {
@@ -553,7 +1200,7 @@ mod tests {
         let _ = child.wait();
 
         let removed = store.reap_stale_pids();
-        let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
+        let canonical = normalized_locator(&project);
         assert_eq!(removed, vec![canonical]);
         assert!(store.attachments_for(&project).is_empty());
     }
@@ -577,7 +1224,7 @@ mod tests {
             .expect("attach old editor");
 
         let removed = store.reap_stale_attachments();
-        let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
+        let canonical = normalized_locator(&project);
         assert_eq!(removed, vec![canonical]);
         assert!(store.attachments_for(&project).is_empty());
     }
@@ -606,6 +1253,55 @@ mod tests {
     }
 
     #[test]
+    fn pidless_editor_compatibility_expires_with_the_authoritative_editor_lease() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_owned(),
+                    id: "window".to_owned(),
+                    pid: None,
+                },
+                created_at: now - VSCODE_DEMAND_TTL,
+            })
+            .expect("attach editor at expiry boundary");
+
+        assert_eq!(
+            store.reap_stale_attachments_with(now, |_| false),
+            vec![normalized_locator(&project)]
+        );
+    }
+
+    #[test]
+    fn deferred_runtime_evidence_expires_after_its_migration_window() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+        let now = UNIX_EPOCH + Duration::from_secs(20_000);
+        store.replace_project(
+            &project,
+            vec![Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Runtime,
+                created_at: now - MANUAL_DEMAND_TTL + Duration::from_secs(1),
+            }],
+            false,
+        );
+
+        assert!(store.compatibility_evidence_at(now, |_| false)[0].attachments[0].alive);
+        let after_deadline = now + Duration::from_secs(1);
+        assert_eq!(
+            store.reap_stale_attachments_with(after_deadline, |_| false),
+            Vec::<PathBuf>::new()
+        );
+        assert!(store.attachments_for(&project).is_empty());
+    }
+
+    #[test]
     fn reap_stale_attachments_prunes_dead_editor_pid() {
         let dir = tempdir().unwrap();
         let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
@@ -624,7 +1320,7 @@ mod tests {
             .expect("attach dead editor");
 
         let removed = store.reap_stale_attachments();
-        let canonical = std::fs::canonicalize(&project).unwrap_or(project.clone());
+        let canonical = normalized_locator(&project);
         assert_eq!(removed, vec![canonical]);
         assert!(store.attachments_for(&project).is_empty());
     }
@@ -679,6 +1375,177 @@ mod tests {
         assert!(store.attachments_for(&project).is_empty());
     }
 
+    #[test]
+    fn exact_snapshot_removal_preserves_refreshed_editor_owner() {
+        let project = PathBuf::from("/projects/editor-refresh");
+        let stale = Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Editor {
+                name: "Code".to_owned(),
+                id: "window-a".to_owned(),
+                pid: Some(10),
+            },
+            created_at: UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let refreshed = Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Editor {
+                name: "Code".to_owned(),
+                id: "window-a".to_owned(),
+                pid: Some(20),
+            },
+            created_at: UNIX_EPOCH + Duration::from_secs(2),
+        };
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.replace_project(&project, vec![refreshed.clone()], false);
+
+        assert!(!snapshot.remove_exact_attachment(&project, &stale));
+        assert_eq!(snapshot.project(&project).attachments, vec![refreshed]);
+    }
+
+    #[test]
+    fn compatibility_projection_persists_instance_provenance_and_clears_it_with_state() {
+        let project = PathBuf::from("/projects/owned");
+        let instance_id: ProjectInstanceId = "00000000-0000-4000-8000-000000000123"
+            .parse()
+            .expect("parse project instance ID");
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.replace_project(
+            &project,
+            vec![Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH,
+            }],
+            false,
+        );
+        snapshot.set_instance_owner(&project, instance_id);
+
+        let encoded = serde_json::to_vec(&snapshot).expect("serialize owned projection");
+        let mut decoded: AttachmentStoreSnapshot =
+            serde_json::from_slice(&encoded).expect("deserialize owned projection");
+        assert_eq!(decoded.instance_owner(&project), Some(instance_id));
+
+        decoded.replace_project(&project, Vec::new(), false);
+        assert_eq!(decoded.instance_owner(&project), None);
+    }
+
+    #[test]
+    fn exact_compatibility_snapshot_rejects_unknown_and_missing_fields() {
+        let encoded =
+            serde_json::to_value(AttachmentStoreSnapshot::default()).expect("serialize snapshot");
+        let mut unknown = encoded.clone();
+        unknown["unexpected"] = serde_json::json!(true);
+
+        assert!(serde_json::from_value::<AttachmentStoreSnapshot>(unknown).is_err());
+
+        for field in ["attachments", "manually_stopped", "instance_owners"] {
+            let mut missing = encoded.clone();
+            missing
+                .as_object_mut()
+                .expect("snapshot serializes as an object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<AttachmentStoreSnapshot>(missing).is_err(),
+                "exact snapshot must require {field}"
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<AttachmentSource>(serde_json::json!({
+                "Editor": {
+                    "name": "Code",
+                    "id": "window-a",
+                    "unexpected": true
+                }
+            }))
+            .is_err()
+        );
+        let mut attachment = serde_json::to_value(Attachment {
+            project_path: PathBuf::from("/project"),
+            source: AttachmentSource::Pin,
+            created_at: UNIX_EPOCH,
+        })
+        .expect("serialize attachment");
+        attachment["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Attachment>(attachment).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_load_rejects_missing_empty_and_legacy_state() {
+        let dir = tempdir().expect("create temporary directory");
+        let store_path = dir.path().join("attachments.json");
+        let mut store = AttachmentStore::new(store_path.clone());
+        assert!(store.load_exact().await.is_err());
+
+        tokio::fs::write(&store_path, b"\n")
+            .await
+            .expect("write empty authoritative state");
+        assert!(store.load_exact().await.is_err());
+
+        tokio::fs::write(&store_path, br#"{"attachments": {}}"#)
+            .await
+            .expect("write legacy attachment state");
+        assert!(store.load_exact().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_alias_collisions_merge_in_stable_source_key_order() {
+        let dir = tempdir().expect("create legacy alias fixture");
+        let store_path = dir.path().join("attachments.json");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("create canonical project path");
+
+        let mut legacy_attachments = BTreeMap::<PathBuf, Vec<serde_json::Value>>::new();
+        for index in 0..8 {
+            let alias = dir.path().join(format!("alias-{index:02}"));
+            std::os::unix::fs::symlink(&real, &alias).expect("create project path alias");
+            let attachment = Attachment {
+                project_path: alias.clone(),
+                source: AttachmentSource::CLI { pid: index },
+                created_at: UNIX_EPOCH + Duration::from_secs(u64::from(index)),
+            };
+            legacy_attachments.insert(
+                alias,
+                vec![serde_json::to_value(attachment).expect("serialize legacy attachment")],
+            );
+        }
+        let legacy = serde_json::json!({
+            "attachments": legacy_attachments,
+            "manually_stopped": []
+        });
+        tokio::fs::write(
+            &store_path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy store"),
+        )
+        .await
+        .expect("write legacy store");
+
+        let mut expected = None;
+        for _ in 0..8 {
+            let mut store = AttachmentStore::new(store_path.clone());
+            store.load().await.expect("load legacy aliases");
+            let snapshot = store.snapshot();
+            if let Some(expected) = &expected {
+                assert_eq!(&snapshot, expected);
+            } else {
+                expected = Some(snapshot);
+            }
+            assert_eq!(
+                store
+                    .attachments_for(&real)
+                    .into_iter()
+                    .map(|attachment| match &attachment.source {
+                        AttachmentSource::CLI { pid } => *pid,
+                        source => panic!("expected CLI attachment, found {source:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                (0..8).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn manually_stopped_persists() {
         let dir = tempdir().unwrap();
@@ -699,6 +1566,300 @@ mod tests {
         let mut reloaded = AttachmentStore::new(store_path);
         reloaded.load().await.unwrap();
         assert!(!reloaded.is_stopped(&project));
+    }
+
+    #[test]
+    fn snapshot_target_replacement_reports_an_exact_multiset_delta() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).expect("create project");
+        let canonical = std::fs::canonicalize(&project).expect("canonical project");
+        let first = Attachment {
+            project_path: canonical.clone(),
+            source: AttachmentSource::CLI { pid: 1 },
+            created_at: UNIX_EPOCH + Duration::from_secs(10),
+        };
+        let duplicate = first.clone();
+        let retained = Attachment {
+            project_path: canonical.clone(),
+            source: AttachmentSource::Pin,
+            created_at: UNIX_EPOCH + Duration::from_secs(20),
+        };
+        let added = Attachment {
+            project_path: canonical.clone(),
+            source: AttachmentSource::Editor {
+                name: "vscode".to_owned(),
+                id: "window".to_owned(),
+                pid: None,
+            },
+            created_at: UNIX_EPOCH + Duration::from_secs(30),
+        };
+
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.attachments.insert(
+            canonical.clone(),
+            vec![first.clone(), duplicate, retained.clone()],
+        );
+
+        let delta = snapshot.replace_project(
+            &project,
+            vec![first.clone(), retained.clone(), added.clone()],
+            true,
+        );
+
+        assert_eq!(delta.before.attachments.len(), 3);
+        assert_eq!(
+            delta.after.attachments,
+            vec![first, retained, added.clone()]
+        );
+        assert_eq!(delta.removed.len(), 1);
+        assert!(matches!(
+            delta.removed[0].source,
+            AttachmentSource::CLI { pid: 1 }
+        ));
+        assert_eq!(delta.added, vec![added]);
+        assert!(delta.after.manually_stopped);
+        assert_eq!(snapshot.project(&project), delta.after);
+    }
+
+    #[test]
+    fn compatibility_evidence_uses_injected_time_and_process_liveness() {
+        let dir = tempdir().unwrap();
+        let first_project = dir.path().join("a-project");
+        let stopped_project = dir.path().join("b-stopped");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let attachments = vec![
+            Attachment {
+                project_path: first_project.clone(),
+                source: AttachmentSource::CLI { pid: 10 },
+                created_at: now,
+            },
+            Attachment {
+                project_path: first_project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_owned(),
+                    id: "old-window".to_owned(),
+                    pid: None,
+                },
+                created_at: now - Duration::from_secs(31 * 60),
+            },
+            Attachment {
+                project_path: first_project.clone(),
+                source: AttachmentSource::Runtime,
+                created_at: UNIX_EPOCH,
+            },
+        ];
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        store.replace_project(&first_project, attachments, false);
+        store.mark_stopped(&stopped_project);
+
+        let evidence = store.compatibility_evidence_at(now, |pid| pid == 10);
+
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].project_path, normalized_locator(&first_project));
+        assert_eq!(
+            evidence[0]
+                .attachments
+                .iter()
+                .map(|item| item.alive)
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        assert!(!evidence[0].manually_stopped);
+        assert_eq!(
+            evidence[1].project_path,
+            normalized_locator(&stopped_project)
+        );
+        assert!(evidence[1].attachments.is_empty());
+        assert!(evidence[1].manually_stopped);
+    }
+
+    #[test]
+    fn deterministic_reaper_keeps_parked_evidence_and_reports_orphaned_projects() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        store.replace_project(
+            &project,
+            vec![
+                Attachment {
+                    project_path: project.clone(),
+                    source: AttachmentSource::Runtime,
+                    created_at: UNIX_EPOCH,
+                },
+                Attachment {
+                    project_path: project.clone(),
+                    source: AttachmentSource::CLI { pid: 22 },
+                    created_at: now,
+                },
+            ],
+            false,
+        );
+
+        let orphaned = store.reap_stale_attachments_with(now, |_| false);
+
+        assert_eq!(orphaned, vec![normalized_locator(&project)]);
+        assert_eq!(store.attachments_for(&project).len(), 1);
+        assert!(matches!(
+            store.attachments_for(&project)[0].source,
+            AttachmentSource::Runtime
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_replacement_round_trips_and_leaves_no_temporary_file() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+        let attachment = Attachment {
+            project_path: project.clone(),
+            source: AttachmentSource::Pin,
+            created_at: UNIX_EPOCH + Duration::from_secs(5),
+        };
+        let mut candidate = AttachmentStoreSnapshot::default();
+        candidate.replace_project(&project, vec![attachment], true);
+        let mut store = AttachmentStore::new(store_path.clone());
+
+        store
+            .replace_snapshot(candidate.clone())
+            .await
+            .expect("publish candidate");
+
+        assert_eq!(store.snapshot(), candidate);
+        let mut reloaded = AttachmentStore::new(store_path.clone());
+        reloaded.load_exact().await.expect("reload exact candidate");
+        assert_eq!(reloaded.snapshot(), candidate);
+        assert_eq!(reloaded.storage_path(), store_path);
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read store directory")
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+    }
+
+    #[tokio::test]
+    async fn first_snapshot_publication_creates_a_reloadable_missing_hierarchy() {
+        let dir = tempdir().unwrap();
+        let store_path = dir
+            .path()
+            .join("missing")
+            .join("nested")
+            .join("attachments.json");
+        let project = dir.path().join("project");
+        let mut candidate = AttachmentStoreSnapshot::default();
+        candidate.replace_project(
+            &project,
+            vec![Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH + Duration::from_secs(5),
+            }],
+            false,
+        );
+        let mut store = AttachmentStore::new(store_path.clone());
+
+        store
+            .replace_snapshot(candidate.clone())
+            .await
+            .expect("publish through a missing hierarchy");
+
+        let mut reloaded = AttachmentStore::new(store_path);
+        reloaded.load().await.expect("reload first publication");
+        assert_eq!(reloaded.snapshot(), candidate);
+    }
+
+    #[test]
+    fn first_snapshot_publication_repairs_every_hierarchy_owner() {
+        assert_eq!(
+            attachment_hierarchy_owners(Path::new("/existing/missing/nested/attachment-state")),
+            vec![
+                PathBuf::from("/existing/missing/nested"),
+                PathBuf::from("/existing/missing"),
+                PathBuf::from("/existing"),
+                PathBuf::from("/"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn published_not_durable_replacement_aligns_memory_with_the_published_candidate() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.mark_stopped(&dir.path().join("old-project"));
+        store.save().await.expect("persist baseline");
+        let mut candidate = AttachmentStoreSnapshot::default();
+        candidate.replace_project(
+            &project,
+            vec![Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH + Duration::from_secs(5),
+            }],
+            true,
+        );
+
+        let error = store
+            .replace_snapshot_with_parent_sync(candidate.clone(), |path| async move {
+                Err(AttachmentStoreError::Io {
+                    operation: "injected parent-directory sync",
+                    path,
+                    source: io::Error::other("injected failure"),
+                })
+            })
+            .await
+            .expect_err("parent sync must report uncertain durability");
+
+        assert!(matches!(
+            error,
+            AttachmentStoreError::PublishedNotDurable { .. }
+        ));
+        assert_eq!(store.snapshot(), candidate);
+        let mut reloaded = AttachmentStore::new(store_path);
+        reloaded
+            .load()
+            .await
+            .expect("reload already-published candidate");
+        assert_eq!(reloaded.snapshot(), candidate);
+    }
+
+    #[tokio::test]
+    async fn prepublication_failure_preserves_memory_and_cleans_the_temporary_file() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("attachments.json");
+        std::fs::create_dir(&store_path).expect("block replacement with a directory");
+        let baseline_project = dir.path().join("baseline");
+        let candidate_project = dir.path().join("candidate");
+        let mut store = AttachmentStore::new(store_path);
+        store.mark_stopped(&baseline_project);
+        let baseline = store.snapshot();
+        let mut candidate = AttachmentStoreSnapshot::default();
+        candidate.replace_project(
+            &candidate_project,
+            vec![Attachment {
+                project_path: candidate_project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH + Duration::from_secs(5),
+            }],
+            false,
+        );
+
+        let error = store
+            .replace_snapshot(candidate)
+            .await
+            .expect_err("directory destination must reject atomic replacement");
+
+        assert!(matches!(error, AttachmentStoreError::Io { .. }));
+        assert_eq!(store.snapshot(), baseline);
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read store directory")
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
     }
 
     #[tokio::test]
@@ -864,15 +2025,13 @@ mod tests {
         let store_path = dir.path().join("attachments.json");
         let project = dir.path().join("project");
         let project_text = project.to_string_lossy();
+        let runtime_created_at = SystemTime::now();
         let legacy = serde_json::json!({
             "attachments": {
                 project_text.as_ref(): [{
                     "project_path": project,
                     "source": "Runtime",
-                    "created_at": {
-                        "secs_since_epoch": 1,
-                        "nanos_since_epoch": 0
-                    }
+                    "created_at": runtime_created_at
                 }]
             },
             "manually_stopped": []
@@ -896,7 +2055,7 @@ mod tests {
 
         let orphaned = store.reap_stale_attachments();
 
-        assert_eq!(orphaned, vec![project.clone()]);
+        assert_eq!(orphaned, vec![normalized_locator(&project)]);
         assert_eq!(store.attachments_for(&project).len(), 1);
         assert!(matches!(
             store.attachments_for(&project)[0].source,

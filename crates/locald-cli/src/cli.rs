@@ -188,7 +188,7 @@ pub enum Commands {
         #[arg(long)]
         verbose: bool,
     },
-    /// Stop a running service. If no name is provided, stops all services defined in locald.toml in the current directory.
+    /// Pause the current project. With a name, stop only that service.
     Stop {
         /// Name of the service to stop
         name: Option<String>,
