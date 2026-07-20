@@ -2150,8 +2150,15 @@ impl ProcessManager {
                     }
                     self.broadcast_service_update(&name).await;
 
-                    self.availability_allows_inflight_transition(instance_id)
-                        .await?;
+                    if let Err(superseded) = self.availability_authorizes_start(instance_id).await {
+                        let cleanup = self.stop_service_instance_locked(&name, instance_id).await;
+                        if let Err(cleanup_error) = cleanup {
+                            return Err(superseded.context(format!(
+                                "failed to stop service `{name}` after availability superseded its prepared start: {cleanup_error:#}"
+                            )));
+                        }
+                        return Err(superseded);
+                    }
 
                     let start_result = {
                         let mut c = controller.lock().await;
@@ -4710,8 +4717,11 @@ mod tests {
         id: String,
         state: RuntimeState,
         process_identity: Option<PersistedProcessIdentity>,
+        prepare_entered: Option<Arc<tokio::sync::Notify>>,
+        release_prepare: Option<Arc<tokio::sync::Notify>>,
         start_entered: Option<Arc<tokio::sync::Notify>>,
         start_release: Option<Arc<tokio::sync::Notify>>,
+        start_count: Option<Arc<AtomicUsize>>,
         fail_prepare: bool,
         stop_count: Arc<AtomicUsize>,
     }
@@ -4726,10 +4736,19 @@ mod tests {
             if self.fail_prepare {
                 anyhow::bail!("injected prepare failure");
             }
+            if let Some(entered) = &self.prepare_entered {
+                entered.notify_one();
+            }
+            if let Some(release) = &self.release_prepare {
+                release.notified().await;
+            }
             Ok(())
         }
 
         async fn start(&mut self) -> Result<()> {
+            if let Some(start_count) = &self.start_count {
+                start_count.fetch_add(1, Ordering::SeqCst);
+            }
             if let Some(entered) = &self.start_entered {
                 entered.notify_one();
                 if let Some(release) = &self.start_release {
@@ -4814,8 +4833,50 @@ mod tests {
                     health_status: HealthStatus::Unknown,
                 },
                 process_identity: Some(test_process_identity(1_234, 41, "/test/unready-worker")),
+                prepare_entered: None,
+                release_prepare: None,
                 start_entered: Some(self.entered.clone()),
                 start_release: self.release.clone(),
+                start_count: None,
+                fail_prepare: false,
+                stop_count: self.stop_count.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingPrepareFactory {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        start_count: Arc<AtomicUsize>,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    impl ServiceFactory for BlockingPrepareFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: None,
+                prepare_entered: Some(self.entered.clone()),
+                release_prepare: Some(self.release.clone()),
+                start_entered: None,
+                start_release: None,
+                start_count: Some(self.start_count.clone()),
                 fail_prepare: false,
                 stop_count: self.stop_count.clone(),
             }))
@@ -5050,8 +5111,11 @@ mod tests {
                     42,
                     "/test/retry-prepare-worker",
                 )),
+                prepare_entered: None,
+                release_prepare: None,
                 start_entered: None,
                 start_release: None,
+                start_count: None,
                 fail_prepare,
                 stop_count: self.stop_count.clone(),
             }))
@@ -5090,8 +5154,11 @@ mod tests {
                     health_status: HealthStatus::Unknown,
                 },
                 process_identity: None,
+                prepare_entered: None,
+                release_prepare: None,
                 start_entered: None,
                 start_release: None,
+                start_count: None,
                 fail_prepare: false,
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }))
@@ -5120,8 +5187,11 @@ mod tests {
                     health_status: HealthStatus::Unknown,
                 },
                 process_identity: None,
+                prepare_entered: None,
+                release_prepare: None,
                 start_entered: None,
                 start_release: None,
+                start_count: None,
                 fail_prepare,
                 stop_count: self.stop_count.clone(),
             }))
@@ -5744,6 +5814,87 @@ command = "sleep 30"
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn released_demand_during_prepare_prevents_service_spawn() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("released-prepare-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "released-prepare").await;
+        write_availability_worker_config(
+            &project_path,
+            "released-prepare",
+            "released-prepare.localhost",
+            &["web"],
+        );
+
+        let demand = DemandKey::manual_cli();
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load project availability");
+        availability
+            .ensure_demand(demand.clone())
+            .await
+            .expect("acquire demand before startup");
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_entered.notified(),
+        )
+        .await
+        .expect("startup reaches the prepared pre-spawn boundary");
+
+        availability
+            .release_demand(&demand)
+            .await
+            .expect("release demand while prepare is blocked");
+        release_prepare.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), start)
+            .await
+            .expect("superseded startup returns promptly")
+            .expect("startup task joins")
+            .expect("startup converges to the released demand");
+
+        assert_eq!(start_count.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("released-prepare:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            !availability
+                .desired_up()
+                .await
+                .expect("reload released availability")
+        );
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("reload released cooldown");
+        assert!(snapshot.shutdown_cooldown_until().is_some());
     }
 
     #[tokio::test]
@@ -6854,8 +7005,11 @@ command = "ignored"
                     42,
                     "/test/unhealthy-retry-worker",
                 )),
+                prepare_entered: None,
+                release_prepare: None,
                 start_entered: None,
                 start_release: None,
+                start_count: None,
                 fail_prepare: false,
                 stop_count: stop_count.clone(),
             }));
