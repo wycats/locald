@@ -805,12 +805,13 @@ impl ProcessManager {
                         service.service_config.clone(),
                         service.resolved_env.clone(),
                         controller,
+                        service.health_status,
                     )
                 })
             };
 
             let (has_controller, is_up_to_date) = match service_snapshot {
-                Some((loaded_instance, loaded_path, _, _, Some(_)))
+                Some((loaded_instance, loaded_path, _, _, Some(_), _))
                     if loaded_instance != instance_id =>
                 {
                     anyhow::bail!(
@@ -818,7 +819,7 @@ impl ProcessManager {
                         loaded_path.display()
                     );
                 }
-                Some((_, _, current_config, current_env, Some(controller))) => {
+                Some((_, _, current_config, current_env, Some(controller), health_status)) => {
                     let controller = controller.lock().await;
                     let is_running = controller.read_state().await.status
                         == locald_core::state::ServiceState::Running;
@@ -833,12 +834,13 @@ impl ProcessManager {
                         true,
                         !dependency_will_change
                             && is_running
+                            && health_status == HealthStatus::Healthy
                             && has_durable_process_ownership
                             && current_config == *service_config
                             && environment_matches,
                     )
                 }
-                Some((_, _, _, _, None)) | None => (false, false),
+                Some((_, _, _, _, None, _)) | None => (false, false),
             };
 
             if !is_up_to_date {
@@ -3998,7 +4000,7 @@ impl ProcessManager {
                         || snapshot.last_convergence_error().is_some()
                         || !self.project_runtime_is_ready(instance_id).await;
                     if should_apply {
-                        (
+                        let action = async {
                             self.apply_config_for_instance(
                                 project_path,
                                 event_tx.clone(),
@@ -4006,10 +4008,15 @@ impl ProcessManager {
                                 Some(instance_id),
                                 false,
                             )
-                            .await,
-                            true,
-                            true,
-                        )
+                            .await?;
+                            anyhow::ensure!(
+                                self.project_runtime_is_ready(instance_id).await,
+                                "project instance {instance_id} did not become ready after availability convergence"
+                            );
+                            Ok(())
+                        }
+                        .await;
+                        (action, true, true)
                     } else {
                         (Ok(()), true, false)
                     }
@@ -6725,6 +6732,105 @@ command = "ignored"
             .project_pause_availability(&project_path)
             .await
             .expect("clean up retry runtimes");
+    }
+
+    #[tokio::test]
+    async fn availability_convergence_restarts_unhealthy_runtime_before_clearing_error() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unhealthy-retry-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "unhealthy-retry").await;
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "unhealthy-retry",
+            "unhealthy-retry.localhost",
+            &["web"],
+        );
+        let (config, _) = ConfigLoader::load_project_config(&project_path)
+            .await
+            .expect("load unhealthy retry config");
+        let service_config = config.services["web"].clone();
+        let old_controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(ScriptedController {
+                id: "unhealthy-retry:web".to_owned(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+                process_identity: Some(test_process_identity(
+                    1_234,
+                    42,
+                    "/test/unhealthy-retry-worker",
+                )),
+                start_entered: None,
+                fail_prepare: false,
+                stop_count: stop_count.clone(),
+            }));
+        let mut service = test_service(
+            config,
+            service_config,
+            ServiceRuntime::Controller(old_controller.clone()),
+            std::fs::canonicalize(&project_path).expect("canonical unhealthy retry path"),
+        );
+        service.instance_id = instance_id;
+        service.health_status = HealthStatus::Unhealthy;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("unhealthy-retry:web".to_owned(), service);
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load unhealthy retry availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable unhealthy retry Always On");
+        availability
+            .record_convergence_error("injected unhealthy runtime".to_owned())
+            .await
+            .expect("record unhealthy convergence error");
+
+        assert!(!manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("repair unhealthy runtime"),
+            Some(ConvergenceDecision::EnsureUp)
+        );
+
+        let replacement = manager
+            .get_service_controller("unhealthy-retry:web")
+            .await
+            .expect("replacement controller is running");
+        assert!(!Arc::ptr_eq(&old_controller, &replacement));
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload repaired availability")
+                .last_convergence_error(),
+            None
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up repaired runtime");
     }
 
     #[tokio::test]
