@@ -427,28 +427,46 @@ impl ProcessRuntime {
             && process.identity.process_group_id != getpgrp().as_raw()
     }
 
+    fn signal_target_for_verified_process(
+        process: &VerifiedStaleProcess,
+        observed: Option<&PersistedProcessIdentity>,
+    ) -> Result<Option<Pid>> {
+        if let Some(observed) = observed {
+            Self::ensure_same_process_identity(process.pid, observed, &process.identity)
+                .context("recorded process changed identity before a verified cleanup signal")?;
+        } else if !Self::can_signal_verified_group(process) {
+            return Ok(None);
+        }
+
+        Ok(Some(if Self::can_signal_verified_group(process) {
+            Pid::from_raw(-process.identity.process_group_id)
+        } else {
+            Pid::from_raw(process.pid)
+        }))
+    }
+
     /// Signal a process whose persisted ownership fingerprint was verified in
-    /// this reconciliation pass. Group signaling is used only for a distinct,
-    /// recorded process group; otherwise locald signals the verified PID.
+    /// this reconciliation pass. The verified authority remains valid for the
+    /// bounded cleanup pass for a continuously observed group even if its
+    /// leader exits before escalation. A leader that remains live is
+    /// revalidated before every signal so PID reuse still fails closed. Group
+    /// signaling is used only for a distinct, recorded process group;
+    /// otherwise locald signals the revalidated PID.
     pub fn signal_verified_stale_process(
         &self,
         process: &VerifiedStaleProcess,
         signal: Signal,
     ) -> Result<()> {
-        let pid = u32::try_from(process.pid).context("verified process ID became negative")?;
-        let Some(current) = self.verify_stale_process(pid, &process.identity)? else {
+        let observed = Self::observed_process_authority(process.pid)?;
+        let Some(target) = Self::signal_target_for_verified_process(process, observed.as_ref())?
+        else {
             return Ok(());
-        };
-        let target = if Self::can_signal_verified_group(&current) {
-            Pid::from_raw(-current.identity.process_group_id)
-        } else {
-            Pid::from_raw(current.pid)
         };
         match kill(target, signal) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(error) => Err(anyhow::anyhow!(
                 "failed to signal verified stale process {} (target {}): {error}",
-                current.pid,
+                process.pid,
                 target.as_raw()
             )),
         }
@@ -1258,6 +1276,73 @@ mod tests {
         runtime
             .signal_verified_stale_process(&verified, Signal::SIGTERM)
             .expect("a fully vanished verified process requires no signal");
+    }
+
+    #[test]
+    fn verified_signal_target_rejects_a_reused_live_pid() {
+        let process = VerifiedStaleProcess {
+            pid: 42_424,
+            identity: PersistedProcessIdentity {
+                birth: Some(PersistedProcessBirth::Linux {
+                    boot_id: "test-boot".to_owned(),
+                    start_ticks: 100,
+                }),
+                process_group_id: 42_424,
+                executable: None,
+            },
+        };
+        let observed = PersistedProcessIdentity {
+            birth: Some(PersistedProcessBirth::Linux {
+                boot_id: "test-boot".to_owned(),
+                start_ticks: 101,
+            }),
+            process_group_id: 42_424,
+            executable: None,
+        };
+
+        let error = ProcessRuntime::signal_target_for_verified_process(&process, Some(&observed))
+            .expect_err("a reused live PID must invalidate the cleanup authority");
+        assert!(format!("{error:#}").contains("was reused"));
+    }
+
+    #[test]
+    fn verified_signal_escalates_to_a_live_group_after_its_leader_exits() {
+        let runtime = ProcessRuntime::new(PathBuf::from("notify.sock"));
+        let mut leader = Command::new("sh");
+        leader
+            .arg("-c")
+            .arg("sleep 30 & exec sleep 0.2")
+            .process_group(0);
+        let mut leader = leader.spawn().expect("spawn process-group leader");
+        let pid = leader.id();
+        let mut cleanup = ProcessGroupCleanup::new(pid);
+        let identity = runtime
+            .capture_process_identity(pid)
+            .expect("capture process-group leader identity")
+            .expect("process-group leader is live");
+        let verified = runtime
+            .verify_stale_process(pid, &identity)
+            .expect("verify process-group leader")
+            .expect("process-group leader remains live");
+
+        leader.wait().expect("reap process-group leader");
+        let group = cleanup.group();
+        assert!(matches!(
+            kill(Pid::from_raw(-group), None),
+            Ok(()) | Err(Errno::EPERM)
+        ));
+
+        runtime
+            .signal_verified_stale_process(&verified, Signal::SIGKILL)
+            .expect("escalate cleanup against the previously verified group");
+        for _ in 0..100 {
+            if matches!(kill(Pid::from_raw(-group), None), Err(Errno::ESRCH)) {
+                cleanup.disarm();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("verified process group remained live after SIGKILL escalation");
     }
 
     #[test]
