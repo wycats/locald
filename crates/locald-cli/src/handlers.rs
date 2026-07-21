@@ -1,6 +1,6 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
-use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
+use locald_core::attachments::{AttachmentSource, ManualCliSession, ProjectFilter, ProjectSection};
 #[cfg(target_os = "macos")]
 use locald_core::{DomainName, HostsFileSection};
 use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
@@ -76,6 +76,9 @@ fn format_attachment_source(source: &AttachmentSource) -> String {
     match source {
         AttachmentSource::Editor { name, id, .. } => format!("editor:{name} ({id})"),
         AttachmentSource::CLI { pid } => format!("cli:{pid}"),
+        AttachmentSource::ManualCLI(session) => {
+            format!("cli:{} (manual session)", session.pid())
+        }
         AttachmentSource::Runtime => "runtime (legacy)".to_string(),
         AttachmentSource::Pin => "pin".to_string(),
     }
@@ -93,33 +96,20 @@ fn resolve_project_locator(path: &std::path::Path) -> anyhow::Result<std::path::
     locald_core::normalize_project_locator(path).map_err(Into::into)
 }
 
-fn stream_up_start_then_attach<StreamStart, Attach>(
+fn stream_up_start<StreamStart>(
     project_path: &std::path::Path,
     verbose: bool,
-    exit_after_register: bool,
+    manual_cli_session: Option<ManualCliSession>,
     mut stream_start: StreamStart,
-    mut attach: Attach,
 ) -> CliResult<()>
 where
     StreamStart: FnMut(&IpcRequest) -> CliResult<()>,
-    Attach: FnMut(&IpcRequest),
 {
     stream_start(&IpcRequest::Start {
         project_path: project_path.to_path_buf(),
         verbose,
-    })?;
-    if !exit_after_register {
-        // Start owns the semantic Manual demand. The process-bound
-        // compatibility projection exists only while this CLI follows logs,
-        // and is published after cold-start progress has remained observable.
-        attach(&IpcRequest::ProjectAttach {
-            project_path: project_path.to_path_buf(),
-            source: AttachmentSource::CLI {
-                pid: std::process::id(),
-            },
-        });
-    }
-    Ok(())
+        manual_cli_session,
+    })
 }
 
 fn warn_if_daemon_identity_mismatch() {
@@ -479,18 +469,17 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
+            let manual_cli_session =
+                (!*exit_after_register).then(|| ManualCliSession::new(std::process::id()));
 
             // Start services with streaming output.
             let mut attempts = 0;
             loop {
-                match stream_up_start_then_attach(
+                match stream_up_start(
                     &abs_path,
                     *verbose,
-                    *exit_after_register,
+                    manual_cli_session,
                     client::stream_boot_events,
-                    |request| {
-                        let _ = client::send_request(request);
-                    },
                 ) {
                     Ok(()) => {
                         cliclack::outro("Project registered")?;
@@ -523,13 +512,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             let detach_path = abs_path;
+            let detach_source = manual_cli_session
+                .context("log-following locald up did not create a Manual CLI session")?
+                .attachment_source();
             let _ = ctrlc::set_handler(move || {
                 // Best-effort detach on Ctrl+C
                 let _ = client::send_request(&IpcRequest::ProjectDetach {
                     project_path: detach_path.clone(),
-                    source: Some(AttachmentSource::CLI {
-                        pid: std::process::id(),
-                    }),
+                    source: Some(detach_source.clone()),
                 });
                 std::process::exit(0);
             });
@@ -2263,51 +2253,38 @@ mod tests {
     }
 
     #[test]
-    fn normal_up_streams_start_to_completion_before_attaching() {
+    fn normal_up_streams_a_start_paired_with_its_manual_cli_owner() {
         let project = std::path::Path::new("/projects/example");
-        let events = std::cell::RefCell::new(Vec::new());
+        let session = ManualCliSession::new(std::process::id());
 
-        stream_up_start_then_attach(
-            project,
-            false,
-            false,
-            |request| {
-                assert!(matches!(request, IpcRequest::Start { .. }));
-                events.borrow_mut().push("start-entered");
-                events.borrow_mut().push("start-complete");
-                Ok(())
-            },
-            |request| {
-                assert!(matches!(request, IpcRequest::ProjectAttach { .. }));
-                events.borrow_mut().push("attach");
-            },
-        )
-        .expect("sequence normal up lifecycle requests");
-
-        assert_eq!(
-            events.into_inner(),
-            ["start-entered", "start-complete", "attach"]
-        );
+        stream_up_start(project, false, Some(session), |request| {
+            assert!(matches!(
+                request,
+                IpcRequest::Start {
+                    manual_cli_session: Some(actual),
+                    ..
+                } if *actual == session
+            ));
+            Ok(())
+        })
+        .expect("stream paired normal-up lifecycle request");
     }
 
     #[test]
-    fn exit_after_register_streams_start_without_attaching() {
+    fn exit_after_register_streams_start_without_a_manual_cli_owner() {
         let project = std::path::Path::new("/projects/example");
-        let attached = std::cell::Cell::new(false);
 
-        stream_up_start_then_attach(
-            project,
-            false,
-            true,
-            |request| {
-                assert!(matches!(request, IpcRequest::Start { .. }));
-                Ok(())
-            },
-            |_| attached.set(true),
-        )
-        .expect("sequence exit-after-register lifecycle request");
-
-        assert!(!attached.get());
+        stream_up_start(project, false, None, |request| {
+            assert!(matches!(
+                request,
+                IpcRequest::Start {
+                    manual_cli_session: None,
+                    ..
+                }
+            ));
+            Ok(())
+        })
+        .expect("stream non-following lifecycle request");
     }
 
     #[test]

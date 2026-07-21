@@ -7,7 +7,9 @@
 
 #![allow(clippy::redundant_pub_crate)] // Explicitly mark the crate-internal planning surface.
 
-use locald_core::attachments::{Attachment, AttachmentCompatibilityEvidence, AttachmentSource};
+use locald_core::attachments::{
+    Attachment, AttachmentCompatibilityEvidence, AttachmentSource, ManualCliSession,
+};
 use locald_core::{AvailabilityBatch, AvailabilityBatchOperation, DemandKey, DemandKeyError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -74,6 +76,22 @@ pub(crate) fn plan_project_lifecycle_migration(
                     &item.attachment,
                 );
             }
+            AttachmentSource::ManualCLI(session) if item.alive => {
+                if let Some(demand) =
+                    availability_demand_for_attachment_source(&item.attachment.source)?
+                {
+                    demands.insert(demand);
+                }
+                demands.insert(manual_cli_session_demand(session)?);
+                retain_preferred_attachment(
+                    &mut compatibility,
+                    CompatibilityOwner::ManualCli {
+                        id: session.id().to_string(),
+                    },
+                    &evidence.project_path,
+                    &item.attachment,
+                );
+            }
             AttachmentSource::Editor { name, id, .. } if item.alive => {
                 if let Some(demand) =
                     availability_demand_for_attachment_source(&item.attachment.source)?
@@ -92,6 +110,7 @@ pub(crate) fn plan_project_lifecycle_migration(
             }
             AttachmentSource::Editor { .. }
             | AttachmentSource::CLI { .. }
+            | AttachmentSource::ManualCLI(_)
             | AttachmentSource::Runtime
             | AttachmentSource::Pin => {}
         }
@@ -137,8 +156,18 @@ pub(crate) fn availability_demand_for_attachment_source(
         AttachmentSource::CLI { pid } => {
             DemandKey::legacy_process_attachment(&format!("legacy-cli-pid:{pid}")).map(Some)
         }
+        AttachmentSource::ManualCLI(session) => {
+            DemandKey::legacy_process_attachment(&format!("legacy-cli-pid:{}", session.pid()))
+                .map(Some)
+        }
         AttachmentSource::Runtime | AttachmentSource::Pin => Ok(None),
     }
+}
+
+pub(crate) fn manual_cli_session_demand(
+    session: &ManualCliSession,
+) -> Result<DemandKey, DemandKeyError> {
+    DemandKey::manual_cli_session(&format!("manual-cli-session:{}", session.id()))
 }
 
 /// A stable compatibility owner key independent of file order and mutable PID
@@ -148,6 +177,7 @@ enum CompatibilityOwner {
     Pin,
     Editor { name: String, id: String },
     Cli { pid: u32 },
+    ManualCli { id: String },
 }
 
 fn editor_private_identity(name: &str, id: &str) -> String {
@@ -180,6 +210,7 @@ fn attachment_preference(attachment: &Attachment) -> (SystemTime, Option<u32>) {
     let pid = match &attachment.source {
         AttachmentSource::Editor { pid, .. } => *pid,
         AttachmentSource::CLI { pid } => Some(*pid),
+        AttachmentSource::ManualCLI(session) => Some(session.pid()),
         AttachmentSource::Runtime | AttachmentSource::Pin => None,
     };
     (attachment.created_at, pid)
@@ -281,6 +312,32 @@ mod tests {
                 },
                 &AttachmentSource::CLI { pid: 41 },
             ]
+        );
+    }
+
+    #[test]
+    fn manual_cli_session_migration_preserves_both_session_demands() {
+        let session = ManualCliSession::new(41);
+        let evidence = evidence(vec![item(session.attachment_source(), 4, true)], false);
+
+        let plan = plan_project_lifecycle_migration(false, &evidence, time(100))
+            .expect("manual CLI migration plan should be valid");
+        let manual =
+            manual_cli_session_demand(&session).expect("manual CLI session key should be valid");
+        let process = DemandKey::legacy_process_attachment("legacy-cli-pid:41")
+            .expect("CLI process key should be valid");
+
+        assert_eq!(
+            plan.availability_batch.operations(),
+            &[
+                AvailabilityBatchOperation::Initialize,
+                AvailabilityBatchOperation::EnsureDemand(manual),
+                AvailabilityBatchOperation::EnsureDemand(process),
+            ]
+        );
+        assert_eq!(
+            plan.compatibility_attachments,
+            vec![attachment(session.attachment_source(), 4)]
         );
     }
 
@@ -458,6 +515,33 @@ mod tests {
             plan_for_pid(100).availability_batch,
             plan_for_pid(200).availability_batch
         );
+    }
+
+    #[test]
+    fn pidless_editor_compatibility_preserves_its_timestamp_until_claimed() {
+        let plan = plan_project_lifecycle_migration(
+            false,
+            &evidence(
+                vec![item(
+                    AttachmentSource::Editor {
+                        name: "Code".to_owned(),
+                        id: "legacy-window".to_owned(),
+                        pid: None,
+                    },
+                    10,
+                    true,
+                )],
+                false,
+            ),
+            time(100),
+        )
+        .expect("migration plan should be valid");
+
+        assert_eq!(plan.compatibility_attachments.len(), 1);
+        assert_eq!(plan.compatibility_attachments[0].created_at, time(10));
+        assert!(plan.availability_batch.operations().iter().any(|operation| {
+            matches!(operation, AvailabilityBatchOperation::EnsureDemand(key) if key.kind() == DemandKind::VsCodeWindow)
+        }));
     }
 
     #[test]

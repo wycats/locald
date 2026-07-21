@@ -157,11 +157,14 @@ impl DemandKind {
         }
     }
 
-    const fn requires_owner(self) -> bool {
-        matches!(
-            self,
-            Self::VsCodeWindow | Self::AgentConversation | Self::LegacyProcessAttachment
-        )
+    const fn accepts_owner_state(self, has_owner: bool) -> bool {
+        match self {
+            Self::ManualCli => true,
+            Self::VsCodeWindow | Self::AgentConversation | Self::LegacyProcessAttachment => {
+                has_owner
+            }
+            Self::StoppedPageResume => !has_owner,
+        }
     }
 
     const fn persistence_tag(self) -> &'static [u8] {
@@ -232,6 +235,11 @@ impl DemandKey {
         }
     }
 
+    /// A Manual CLI demand owned by one retry-stable log-following session.
+    pub fn manual_cli_session(private_identity: &str) -> Result<Self, DemandKeyError> {
+        Self::owned(DemandKind::ManualCli, private_identity)
+    }
+
     /// A demand owned by one trusted VS Code window identity.
     pub fn vs_code_window(private_identity: &str) -> Result<Self, DemandKeyError> {
         Self::owned(DemandKind::VsCodeWindow, private_identity)
@@ -276,7 +284,7 @@ impl DemandKey {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.kind.requires_owner() != self.owner.is_some() {
+        if !self.kind.accepts_owner_state(self.owner.is_some()) {
             return Err(format!(
                 "{:?} demand has an invalid owner representation",
                 self.kind
@@ -2084,6 +2092,19 @@ mod tests {
             DemandKeyError::EmptyPrivateIdentity {
                 kind: DemandKind::VsCodeWindow
             }
+        );
+        let manual_session = DemandKey::manual_cli_session("manual-session-123")
+            .expect("construct owned Manual CLI demand");
+        let serialized_manual =
+            serde_json::to_string(&manual_session).expect("serialize owned Manual CLI demand");
+        assert_eq!(manual_session.kind(), DemandKind::ManualCli);
+        assert_eq!(manual_session.safe_label(), "Manual CLI");
+        assert_ne!(manual_session, DemandKey::manual_cli());
+        assert!(!serialized_manual.contains("manual-session-123"));
+        assert_eq!(
+            serde_json::from_str::<DemandKey>(&serialized_manual)
+                .expect("deserialize owned Manual CLI demand"),
+            manual_session
         );
         assert_eq!(AGENT_DEMAND_TTL, AGENT_ACTIVE_TTL + AGENT_REVIEW_GRACE);
     }

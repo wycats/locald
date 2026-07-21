@@ -5,14 +5,48 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::{MANUAL_DEMAND_TTL, ProjectInstanceId, VSCODE_DEMAND_TTL};
+
+const LEGACY_EDITOR_MIGRATION_TTL: Duration = Duration::from_mins(30);
+
+/// Retry-stable identity for one log-following `locald up` session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualCliSession {
+    pid: u32,
+    #[schemars(with = "String")]
+    id: Uuid,
+}
+
+impl ManualCliSession {
+    #[must_use]
+    pub fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            id: Uuid::new_v4(),
+        }
+    }
+
+    #[must_use]
+    pub const fn pid(self) -> u32 {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn id(self) -> Uuid {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn attachment_source(self) -> AttachmentSource {
+        AttachmentSource::ManualCLI(self)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +60,13 @@ pub enum AttachmentSource {
     CLI {
         pid: u32,
     },
+    /// Process owner paired with the `Start` request that acquired the
+    /// semantic Manual CLI demand for a log-following `locald up` session.
+    ///
+    /// Unlike a generic legacy CLI attachment, detaching this exact owner may
+    /// release that Manual demand. Keeping the provenance in durable
+    /// compatibility state makes the behavior stable across daemon restarts.
+    ManualCLI(ManualCliSession),
     /// Parked quiet-up hold retained for the availability-store migration.
     ///
     /// It is preserved as legacy evidence and does not count as a current live
@@ -262,12 +303,17 @@ impl AttachmentStoreSnapshot {
         F: FnMut(u32) -> bool,
     {
         let project = self.project(project_path);
+        let legacy_migration = project.instance_owner.is_none();
         let attachments = project
             .attachments
             .into_iter()
             .map(|attachment| {
-                let alive =
-                    AttachmentStore::attachment_alive_with(&attachment, now, &mut pid_alive);
+                let alive = AttachmentStore::attachment_alive_for_owner_with(
+                    &attachment,
+                    now,
+                    &mut pid_alive,
+                    legacy_migration,
+                );
                 AttachmentLivenessEvidence { attachment, alive }
             })
             .collect();
@@ -612,9 +658,16 @@ impl AttachmentStore {
 
         let mut to_remove = Vec::new();
         for (path, attachments) in &mut self.attachments {
+            let legacy_migration = !self.instance_owners.contains_key(path);
             let live_before = Self::has_live_attachment(attachments);
-            attachments
-                .retain(|attachment| Self::attachment_alive_with(attachment, now, &mut pid_alive));
+            attachments.retain(|attachment| {
+                Self::attachment_alive_for_owner_with(
+                    attachment,
+                    now,
+                    &mut pid_alive,
+                    legacy_migration,
+                )
+            });
             let live_after = Self::has_live_attachment(attachments);
 
             if attachments.is_empty() {
@@ -651,13 +704,15 @@ impl AttachmentStore {
         F: FnMut(u32) -> bool,
     {
         let path = Self::canonicalize_path(project_path);
+        let legacy_migration = !self.instance_owners.contains_key(&path);
         let Some(attachments) = self.attachments.get_mut(&path) else {
             return false;
         };
 
         let live_before = Self::has_live_attachment(attachments);
-        attachments
-            .retain(|attachment| Self::attachment_alive_with(attachment, now, &mut pid_alive));
+        attachments.retain(|attachment| {
+            Self::attachment_alive_for_owner_with(attachment, now, &mut pid_alive, legacy_migration)
+        });
         let live_after = Self::has_live_attachment(attachments);
 
         if attachments.is_empty() {
@@ -694,6 +749,7 @@ impl AttachmentStore {
         project_paths
             .into_iter()
             .map(|project_path| {
+                let legacy_migration = snapshot.instance_owner(&project_path).is_none();
                 let attachments = snapshot
                     .attachments
                     .get(&project_path)
@@ -701,7 +757,12 @@ impl AttachmentStore {
                     .flatten()
                     .cloned()
                     .map(|attachment| {
-                        let alive = Self::attachment_alive_with(&attachment, now, &mut pid_alive);
+                        let alive = Self::attachment_alive_for_owner_with(
+                            &attachment,
+                            now,
+                            &mut pid_alive,
+                            legacy_migration,
+                        );
                         AttachmentLivenessEvidence { attachment, alive }
                     })
                     .collect();
@@ -781,7 +842,7 @@ impl AttachmentStore {
             "Runtime" | "Pin" if source.is_object() => {
                 *source = serde_json::Value::String(variant.clone());
             }
-            "Editor" | "CLI" | "Runtime" | "Pin" => {}
+            "Editor" | "CLI" | "ManualCLI" | "Runtime" | "Pin" => {}
             _ => return None,
         }
 
@@ -825,6 +886,7 @@ impl AttachmentStore {
             AttachmentSource::CLI { pid } | AttachmentSource::Editor { pid: Some(pid), .. } => {
                 pid_alive(pid)
             }
+            AttachmentSource::ManualCLI(session) => pid_alive(session.pid()),
             AttachmentSource::Editor { pid: None, .. } => now
                 .duration_since(attachment.created_at)
                 .map_or(true, |age| age < VSCODE_DEMAND_TTL),
@@ -832,6 +894,41 @@ impl AttachmentStore {
                 .duration_since(attachment.created_at)
                 .map_or(true, |age| age < MANUAL_DEMAND_TTL),
             AttachmentSource::Pin => true,
+        }
+    }
+
+    fn legacy_migration_attachment_alive_with<F>(
+        attachment: &Attachment,
+        now: SystemTime,
+        pid_alive: &mut F,
+    ) -> bool
+    where
+        F: FnMut(u32) -> bool,
+    {
+        if matches!(
+            attachment.source,
+            AttachmentSource::Editor { pid: None, .. }
+        ) {
+            return now
+                .duration_since(attachment.created_at)
+                .map_or(true, |age| age <= LEGACY_EDITOR_MIGRATION_TTL);
+        }
+        Self::attachment_alive_with(attachment, now, pid_alive)
+    }
+
+    fn attachment_alive_for_owner_with<F>(
+        attachment: &Attachment,
+        now: SystemTime,
+        pid_alive: &mut F,
+        legacy_migration: bool,
+    ) -> bool
+    where
+        F: FnMut(u32) -> bool,
+    {
+        if legacy_migration {
+            Self::legacy_migration_attachment_alive_with(attachment, now, pid_alive)
+        } else {
+            Self::attachment_alive_with(attachment, now, pid_alive)
         }
     }
 
@@ -1269,7 +1366,46 @@ mod tests {
                 created_at: now - VSCODE_DEMAND_TTL,
             })
             .expect("attach editor at expiry boundary");
+        store.set_instance_owner(
+            &project,
+            "00000000-0000-4000-8000-000000000123"
+                .parse()
+                .expect("parse project instance ID"),
+        );
 
+        assert_eq!(
+            store.reap_stale_attachments_with(now, |_| false),
+            vec![normalized_locator(&project)]
+        );
+    }
+
+    #[test]
+    fn unclaimed_pidless_editor_uses_legacy_liveness_until_instance_claim() {
+        let dir = tempdir().unwrap();
+        let mut store = AttachmentStore::new(dir.path().join("attachments.json"));
+        let project = dir.path().join("project");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        store
+            .attach(Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_owned(),
+                    id: "legacy-window".to_owned(),
+                    pid: None,
+                },
+                created_at: now - Duration::from_secs(5 * 60),
+            })
+            .expect("attach five-minute-old legacy editor");
+
+        assert!(store.compatibility_evidence_at(now, |_| false)[0].attachments[0].alive);
+        assert!(store.reap_stale_attachments_with(now, |_| false).is_empty());
+
+        store.set_instance_owner(
+            &project,
+            "00000000-0000-4000-8000-000000000123"
+                .parse()
+                .expect("parse project instance ID"),
+        );
         assert_eq!(
             store.reap_stale_attachments_with(now, |_| false),
             vec![normalized_locator(&project)]
@@ -2081,6 +2217,22 @@ mod tests {
 
         assert_eq!(decoded.project_path, attachment.project_path);
         assert_eq!(decoded.source, attachment.source);
+    }
+
+    #[test]
+    fn manual_cli_session_provenance_round_trips() {
+        let dir = tempdir().unwrap();
+        let session = ManualCliSession::new(42);
+        let attachment = Attachment {
+            project_path: dir.path().join("project"),
+            source: session.attachment_source(),
+            created_at: UNIX_EPOCH + Duration::from_secs(10),
+        };
+
+        let json = serde_json::to_string(&attachment).unwrap();
+        let decoded: Attachment = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, attachment);
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use crate::attachments::{AttachmentSource, ProjectFilter, ProjectListEntry, ProjectStatusInfo};
+use crate::attachments::{
+    AttachmentSource, ManualCliSession, ProjectFilter, ProjectListEntry, ProjectStatusInfo,
+};
 use crate::config::{ServiceConfig, TypedServiceConfig};
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
@@ -244,6 +246,13 @@ pub enum IpcRequest {
         /// Enable verbose output for build steps.
         #[serde(default)]
         verbose: bool,
+        /// Retry-stable log-following CLI session paired with this Start.
+        ///
+        /// Older and non-following clients omit it. The daemon journals the
+        /// compatibility owner and both of its demands as one lifecycle
+        /// mutation before runtime convergence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manual_cli_session: Option<ManualCliSession>,
     },
     /// Stop a service by name.
     ///

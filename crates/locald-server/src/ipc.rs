@@ -2,6 +2,7 @@ use crate::ShutdownReason;
 use crate::container::ContainerManager;
 use crate::manager::ProcessManager;
 use anyhow::Result;
+use locald_core::attachments::AttachmentSource;
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::DaemonIdentity;
 use locald_core::{IpcRequest, IpcResponse};
@@ -181,13 +182,17 @@ async fn handle_connection(
     if let IpcRequest::Start {
         project_path,
         verbose,
+        manual_cli_session,
     } = request
     {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let manager = manager.clone();
 
-        let handle =
-            tokio::spawn(async move { manager.start(project_path, Some(tx), verbose).await });
+        let handle = tokio::spawn(async move {
+            manager
+                .start_with_manual_cli_session(project_path, Some(tx), verbose, manual_cli_session)
+                .await
+        });
 
         while let Some(event) = rx.recv().await {
             let mut bytes = serde_json::to_vec(&event)?;
@@ -285,10 +290,18 @@ async fn handle_connection(
         IpcRequest::ProjectAttach {
             project_path,
             source,
-        } => match manager.project_attach(project_path, source).await {
-            Ok(()) => IpcResponse::Ok,
-            Err(e) => IpcResponse::Error(e.to_string()),
-        },
+        } => {
+            if matches!(source, AttachmentSource::ManualCLI(_)) {
+                IpcResponse::Error(
+                    "ManualCLI owners are created only by their paired Start request".to_owned(),
+                )
+            } else {
+                match manager.project_attach(project_path, source).await {
+                    Ok(()) => IpcResponse::Ok,
+                    Err(e) => IpcResponse::Error(e.to_string()),
+                }
+            }
+        }
         IpcRequest::ProjectDetach {
             project_path,
             source,

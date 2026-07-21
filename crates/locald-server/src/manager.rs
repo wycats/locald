@@ -3,7 +3,8 @@
 use crate::config_loader::ConfigLoader;
 use crate::health::HealthMonitor;
 use crate::lifecycle_migration::{
-    availability_demand_for_attachment_source, plan_project_lifecycle_migration,
+    availability_demand_for_attachment_source, manual_cli_session_demand,
+    plan_project_lifecycle_migration,
 };
 use crate::lifecycle_transaction::{
     AttachmentTransactionImages, CatalogTransactionImages, LegacyV1File, LifecycleJournal,
@@ -19,7 +20,8 @@ use directories::ProjectDirs;
 use futures_util::StreamExt;
 use locald_core::attachments::{
     Attachment, AttachmentCompatibilityEvidence, AttachmentSource, AttachmentStore,
-    AttachmentStoreSnapshot, ProjectFilter, ProjectListEntry, ProjectSection, ProjectStatusInfo,
+    AttachmentStoreSnapshot, ManualCliSession, ProjectFilter, ProjectListEntry, ProjectSection,
+    ProjectStatusInfo,
 };
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{BootEvent, Event, LogEntry, ServiceStatus};
@@ -489,6 +491,10 @@ pub struct ProcessManager {
     availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
     forgotten_reload_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    // A named service stop is a daemon-memory, one-off runtime override. It
+    // survives automatic availability convergence without rewriting project
+    // availability, and explicit lifecycle actions or daemon restart clear it.
+    service_stop_suppressions: Arc<Mutex<HashSet<(ProjectInstanceId, String)>>>,
     availability_data_dir: PathBuf,
     lifecycle_journal: LifecycleJournal,
     runtime_projection_lock: Arc<Mutex<()>>,
@@ -686,6 +692,7 @@ impl ProcessManager {
             availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
             forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
+            service_stop_suppressions: Arc::new(Mutex::new(HashSet::new())),
             availability_data_dir,
             lifecycle_journal,
             runtime_projection_lock: Arc::new(Mutex::new(())),
@@ -938,6 +945,34 @@ impl ProcessManager {
             .strip_prefix(config.project.name.as_str())
             .and_then(|suffix| suffix.strip_prefix(':'))
             .unwrap_or(full_name)
+    }
+
+    fn service_activation_closure(
+        config: &LocaldConfig,
+        selected_service: &str,
+    ) -> Result<HashSet<String>> {
+        let selected = Self::configured_service_name(selected_service, config);
+        anyhow::ensure!(
+            config.services.contains_key(selected),
+            "service `{selected_service}` is not present in the current project configuration"
+        );
+
+        let mut pending = vec![selected.to_owned()];
+        let mut local_names = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if !local_names.insert(name.clone()) {
+                continue;
+            }
+            let service = config.services.get(&name).with_context(|| {
+                format!("service `{name}` disappeared from its dependency graph")
+            })?;
+            pending.extend(service.depends_on().iter().cloned());
+        }
+
+        Ok(local_names
+            .into_iter()
+            .map(|name| format!("{}:{name}", config.project.name))
+            .collect())
     }
 
     fn requires_durable_process_ownership(service_config: &ServiceConfig) -> bool {
@@ -1680,12 +1715,29 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
     ) -> Result<()> {
+        self.start_with_manual_cli_session(path, event_tx, verbose, None)
+            .await
+    }
+
+    pub async fn start_with_manual_cli_session(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+    ) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
         let path = Self::canonicalize_path(&path);
         let expected_initial = match self.resolve_lifecycle_target(&path).await? {
             LifecycleTargetResolution::Catalogued(target) => {
                 return self
-                    .start_catalogued_instance(target.instance_id, path, event_tx, verbose)
+                    .start_catalogued_instance(
+                        target.instance_id,
+                        path,
+                        event_tx,
+                        verbose,
+                        manual_cli_session,
+                    )
                     .await;
             }
             LifecycleTargetResolution::UnregisteredPhysical { instance_id } => {
@@ -1702,7 +1754,7 @@ impl ProcessManager {
             .start_runtime(path.clone(), None, false, expected_initial)
             .await?;
         let result = self
-            .start_catalogued_instance(instance_id, path, event_tx, verbose)
+            .start_catalogued_instance(instance_id, path, event_tx, verbose, manual_cli_session)
             .await;
         drop(pending);
         result
@@ -1731,6 +1783,7 @@ impl ProcessManager {
                 verbose,
                 Some(ConfigIdentityExpectation::Initial(initial_identity)),
                 false,
+                None,
             )
             .await?;
         let pending = outcome
@@ -1896,6 +1949,7 @@ impl ProcessManager {
             verbose,
             expected_instance.map(ConfigIdentityExpectation::Existing),
             true,
+            None,
         )
         .await
         .map(|_| ())
@@ -1908,6 +1962,7 @@ impl ProcessManager {
         verbose: bool,
         expected_instance: Option<ConfigIdentityExpectation>,
         start_services: bool,
+        service_activation: Option<&str>,
     ) -> Result<ConfigApplyOutcome> {
         self.ensure_accepting_lifecycle_requests()?;
         let discovery_before_config = Registry::discover(path.clone()).await?;
@@ -1974,6 +2029,9 @@ impl ProcessManager {
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
+        let service_activation = service_activation
+            .map(|selected| Self::service_activation_closure(&config, selected))
+            .transpose()?;
         for (service_name, service_config) in &config.services {
             let (effective_env, _) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config);
@@ -2106,9 +2164,17 @@ impl ProcessManager {
                 let commit_result = self
                     .create_and_apply_lifecycle_transaction_locked(&transaction)
                     .await;
-                let published_domain_index = commit_result
-                    .is_ok()
-                    .then(|| self.domain_index.snapshot().as_ref().clone());
+                // The catalog rename is the ownership commit point even when
+                // a later journal phase reports incomplete durability or
+                // fails. Observe the authoritative catalog image directly so
+                // hosts and runtime projections converge before the error is
+                // surfaced to the caller.
+                let published_domain_index = {
+                    let registry = self.registry.lock().await;
+                    transaction.catalog().and_then(|images| {
+                        (*registry == *images.target()).then(|| registry.domain_index().clone())
+                    })
+                };
                 (commit_result, published_domain_index)
             } else {
                 // `commit_candidate` advances the in-memory catalog at the
@@ -2164,6 +2230,11 @@ impl ProcessManager {
         }
         commit_result?;
 
+        if let Some(service_names) = &service_activation {
+            self.clear_service_stop_suppressions_for(instance_id, service_names)
+                .await;
+        }
+
         if let Some(tx) = &event_tx {
             let _ = tx
                 .send(BootEvent::StepFinished {
@@ -2193,6 +2264,15 @@ impl ProcessManager {
                 config.project.name, service_name, service_config
             );
             let name = format!("{}:{}", config.project.name, service_name);
+            if self
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, name.clone()))
+            {
+                info!("Service {name} remains stopped until an explicit lifecycle action");
+                continue;
+            }
 
             // A domain-only reload updates the shared claim snapshot and the
             // service's display configuration using the authoritative
@@ -2525,13 +2605,70 @@ impl ProcessManager {
     /// Returns an error if the service state cannot be persisted, though
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
-        if let Some((path, _transition_guard, _runtime_projection_guard)) =
-            self.lock_service_runtime_transition(name).await
-        {
+        loop {
+            let Some(instance_id) = self.service_instance_id(name).await else {
+                return Ok(());
+            };
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _availability_guard = coordinator.runtime.lock().await;
+            let Some((path, _transition_guard, _runtime_projection_guard)) =
+                self.lock_service_runtime_transition(name).await
+            else {
+                return Ok(());
+            };
+            if self.service_instance_id(name).await != Some(instance_id) {
+                continue;
+            }
             self.ensure_accepting_lifecycle_requests()?;
-            return self.stop_service_locked(name, &path).await;
+            self.stop_service_locked(name, &path).await?;
+            self.service_stop_suppressions
+                .lock()
+                .await
+                .insert((instance_id, name.to_owned()));
+            return Ok(());
         }
-        Ok(())
+    }
+
+    /// Starts one explicitly selected service while preserving independent
+    /// service-stop overrides in the same project.
+    pub async fn start_service(&self, name: &str) -> Result<()> {
+        self.run_admitted_availability_transition(|| self.start_service_admitted(name))
+            .await
+    }
+
+    async fn start_service_admitted(&self, name: &str) -> Result<()> {
+        loop {
+            let Some(instance_id) = self.service_instance_id(name).await else {
+                return Err(ServiceNotFoundError.into());
+            };
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _availability_guard = coordinator.runtime.lock().await;
+            let Some((path, _transition_guard, _runtime_projection_guard)) =
+                self.lock_service_runtime_transition(name).await
+            else {
+                return Err(ServiceNotFoundError.into());
+            };
+            if self.service_instance_id(name).await != Some(instance_id) {
+                continue;
+            }
+            self.ensure_accepting_lifecycle_requests()?;
+            let durability_error = self
+                .ensure_service_start_availability_locked(instance_id)
+                .await?;
+            self.watch_config(path.clone()).await;
+            let start = self
+                .apply_config_locked(
+                    path,
+                    None,
+                    false,
+                    Some(ConfigIdentityExpectation::Existing(instance_id)),
+                    true,
+                    Some(name),
+                )
+                .await
+                .map(|_| ());
+            return Self::surface_availability_durability(start, durability_error);
+        }
     }
 
     async fn stop_service_locked(&self, name: &str, project_path: &Path) -> Result<()> {
@@ -2726,6 +2863,92 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// Stop an unresolved legacy project before retiring its last durable
+    /// compatibility owner.
+    ///
+    /// The attachment projection is the retry authority for a project that
+    /// does not yet have a catalog identity. Keep it published until both the
+    /// runtime stop and its state snapshot are durable. If either operation
+    /// fails, the next reconciliation sweep observes the same owner evidence
+    /// and retries the stop. A daemon exit after the stop but before lifecycle
+    /// publication is likewise harmless: the retry performs an idempotent stop
+    /// before retiring the stale owner.
+    async fn stop_unresolved_project_and_publish_attachment_transaction(
+        &self,
+        project_path: &Path,
+        expected_resolution: LifecycleTargetIdentity,
+        transaction: &LifecycleTransaction,
+    ) -> Result<()> {
+        let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.ensure_lifecycle_publication_available()?;
+
+        let resolution = self.resolve_lifecycle_target(&project_path).await?;
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution
+                && matches!(resolution, LifecycleTargetResolution::UnresolvedLegacy),
+            "project identity changed while unresolved owner cleanup was waiting for runtime ownership; retry the cleanup"
+        );
+
+        self.stop_project_locked(&project_path).await?;
+        self.persist_state_checked().await?;
+
+        // The caller must release the publication lock before waiting for the
+        // path/runtime stop boundary. An unrelated project may publish new
+        // catalog and compatibility images in that interval, so reapply only
+        // this project's intended compatibility projection to the complete
+        // authoritative state after publication is reacquired. This keeps a
+        // normal cross-project race from creating a journal whose stale base
+        // can never be replayed.
+        anyhow::ensure!(
+            transaction.kind() == LifecycleTransactionKind::LifecycleMutation
+                && transaction.availability().is_empty(),
+            "unresolved owner cleanup requires an attachment-only lifecycle mutation"
+        );
+        let intended_project = transaction.attachments().target().project(&project_path);
+        let mut intended_only = transaction.attachments().base().clone();
+        intended_only.replace_project(
+            &project_path,
+            intended_project.attachments.clone(),
+            intended_project.manually_stopped,
+        );
+        if let Some(instance_id) = intended_project.instance_owner {
+            intended_only.set_instance_owner(&project_path, instance_id);
+        } else {
+            intended_only.clear_instance_owner(&project_path);
+        }
+        anyhow::ensure!(
+            intended_only == *transaction.attachments().target(),
+            "unresolved owner cleanup may mutate only its exact project compatibility projection"
+        );
+
+        let catalog = self.registry.lock().await.clone();
+        let attachment_base = self.attachments.lock().await.snapshot();
+        let mut attachment_target = attachment_base.clone();
+        attachment_target.replace_project(
+            &project_path,
+            intended_project.attachments,
+            intended_project.manually_stopped,
+        );
+        if let Some(instance_id) = intended_project.instance_owner {
+            attachment_target.set_instance_owner(&project_path, instance_id);
+        } else {
+            attachment_target.clear_instance_owner(&project_path);
+        }
+        let rebased = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            transaction.effective_at(),
+            Some(CatalogTransactionImages::new(catalog.clone(), catalog)?),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachment_base, attachment_target),
+        )?;
+        self.create_and_apply_lifecycle_transaction_locked(&rebased)
+            .await
+    }
+
     async fn stop_project_instance_locked(&self, instance_id: ProjectInstanceId) -> Result<()> {
         let service_names: Vec<String> = {
             let services = self.services.lock().await;
@@ -2778,6 +3001,7 @@ impl ProcessManager {
             self.ensure_accepting_lifecycle_requests()?;
             self.availability_authorizes_start(instance_id).await?;
             self.stop_service_locked(name, &path).await?;
+            self.clear_service_stop_suppression(instance_id, name).await;
             self.watch_config(path.clone()).await;
             return self
                 .apply_config_locked(
@@ -2786,6 +3010,7 @@ impl ProcessManager {
                     false,
                     Some(ConfigIdentityExpectation::Existing(instance_id)),
                     true,
+                    None,
                 )
                 .await
                 .map(|_| ());
@@ -2810,6 +3035,7 @@ impl ProcessManager {
         );
         self.availability_authorizes_start(instance_id).await?;
         self.stop_project_instance_locked(instance_id).await?;
+        self.clear_service_stop_suppressions(instance_id).await;
         self.watch_config(project_path.clone()).await;
         self.apply_config_locked(
             project_path,
@@ -2817,6 +3043,7 @@ impl ProcessManager {
             false,
             Some(ConfigIdentityExpectation::Existing(instance_id)),
             true,
+            None,
         )
         .await
         .map(|_| ())
@@ -2878,6 +3105,7 @@ impl ProcessManager {
 
         // 1. Stop the service
         self.stop_service_locked(name, &path).await?;
+        self.clear_service_stop_suppression(instance_id, name).await;
 
         // Clear sticky port on reset
         {
@@ -2929,6 +3157,7 @@ impl ProcessManager {
             false,
             Some(ConfigIdentityExpectation::Existing(instance_id)),
             true,
+            None,
         )
         .await?;
 
@@ -3314,12 +3543,23 @@ impl ProcessManager {
         snapshot: &mut AttachmentStoreSnapshot,
         project_path: &Path,
         instance_id: ProjectInstanceId,
-        attachments: Vec<Attachment>,
+        mut attachments: Vec<Attachment>,
         manually_stopped: bool,
+        claimed_at: SystemTime,
     ) {
+        let claims_owner = !attachments.is_empty() || manually_stopped;
+        if claims_owner {
+            for attachment in &mut attachments {
+                if matches!(
+                    attachment.source,
+                    AttachmentSource::Editor { pid: None, .. }
+                ) {
+                    attachment.created_at = claimed_at;
+                }
+            }
+        }
         snapshot.replace_project(project_path, attachments, manually_stopped);
-        let projection = snapshot.project(project_path);
-        if !projection.attachments.is_empty() || projection.manually_stopped {
+        if claims_owner {
             snapshot.set_instance_owner(project_path, instance_id);
         }
     }
@@ -3343,6 +3583,41 @@ impl ProcessManager {
         }
     }
 
+    fn retain_explicit_attachment_owners_for_initial_migration(
+        evidence: &mut AttachmentCompatibilityEvidence,
+        availability_batch: &AvailabilityBatch,
+    ) -> Result<()> {
+        let ensured_demands = availability_batch
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                AvailabilityBatchOperation::EnsureDemand(demand) => Some(demand),
+                AvailabilityBatchOperation::Initialize
+                | AvailabilityBatchOperation::RenewDemand(_)
+                | AvailabilityBatchOperation::RevalidateDemand(_)
+                | AvailabilityBatchOperation::ImportDemand { .. }
+                | AvailabilityBatchOperation::ReleaseDemand(_)
+                | AvailabilityBatchOperation::SetAlwaysOn(_)
+                | AvailabilityBatchOperation::PauseProject
+                | AvailabilityBatchOperation::SetTrustedLaunchPath(_)
+                | AvailabilityBatchOperation::Retire => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for item in &mut evidence.attachments {
+            if let Some(demand) =
+                availability_demand_for_attachment_source(&item.attachment.source)?
+                && ensured_demands.contains(&demand)
+            {
+                // This owner was admitted by the lifecycle request being
+                // journaled, rather than merely discovered in legacy state.
+                // Publish the owner and its demand together; the normal reaper
+                // handles a process that exits at this boundary.
+                item.alive = true;
+            }
+        }
+        Ok(())
+    }
+
     fn compatibility_projection_for_existing_availability(
         attachments: Vec<Attachment>,
         availability: &ProjectAvailability,
@@ -3356,7 +3631,9 @@ impl ProcessManager {
             .into_iter()
             .filter_map(|attachment| match &attachment.source {
                 AttachmentSource::Pin => availability.always_on().then_some(Ok(attachment)),
-                AttachmentSource::Editor { .. } | AttachmentSource::CLI { .. } => {
+                AttachmentSource::Editor { .. }
+                | AttachmentSource::CLI { .. }
+                | AttachmentSource::ManualCLI(_) => {
                     match availability_demand_for_attachment_source(&attachment.source) {
                         Ok(Some(key)) if demand_keys.contains(&key) => Some(Ok(attachment)),
                         Ok(_) => None,
@@ -3412,11 +3689,15 @@ impl ProcessManager {
                     .instances
                     .get(&target.instance_id)
                     .is_some_and(|record| record.pinned);
-            let evidence = Self::compatibility_evidence_for_target(
+            let mut evidence = Self::compatibility_evidence_for_target(
                 &attachment_target,
                 &target,
                 availability_batch.effective_at(),
             );
+            Self::retain_explicit_attachment_owners_for_initial_migration(
+                &mut evidence,
+                availability_batch,
+            )?;
             let plan = plan_project_lifecycle_migration(
                 inherited_always_on,
                 &evidence,
@@ -3436,6 +3717,7 @@ impl ProcessManager {
                 target.instance_id,
                 plan.compatibility_attachments,
                 plan.compatibility_manually_stopped,
+                availability_batch.effective_at(),
             );
 
             let mut combined = plan.availability_batch;
@@ -3494,6 +3776,31 @@ impl ProcessManager {
             .map_err(Into::into)
     }
 
+    fn removed_manual_cli_demands(
+        base: &AttachmentStoreSnapshot,
+        target: &AttachmentStoreSnapshot,
+        project_paths: &BTreeSet<PathBuf>,
+    ) -> Result<BTreeSet<DemandKey>> {
+        project_paths
+            .iter()
+            .flat_map(|path| {
+                let retained = target.project(path).attachments;
+                base.project(path)
+                    .attachments
+                    .into_iter()
+                    .filter(move |attachment| !retained.contains(attachment))
+            })
+            .filter_map(|attachment| match &attachment.source {
+                AttachmentSource::ManualCLI(session) => Some(manual_cli_session_demand(session)),
+                AttachmentSource::Editor { .. }
+                | AttachmentSource::CLI { .. }
+                | AttachmentSource::Runtime
+                | AttachmentSource::Pin => None,
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
+    }
+
     fn live_owner_renewal_operations(
         demands: &BTreeSet<DemandKey>,
     ) -> Vec<AvailabilityBatchOperation> {
@@ -3513,6 +3820,10 @@ impl ProcessManager {
         anyhow::ensure!(
             !matches!(&source, AttachmentSource::Runtime),
             "Runtime attachment evidence is accepted only from persisted legacy state"
+        );
+        anyhow::ensure!(
+            !matches!(&source, AttachmentSource::ManualCLI(_)),
+            "Manual CLI owners are published atomically by their paired Start request"
         );
         if matches!(&source, AttachmentSource::Pin) {
             return self.registry_set_always_on(&project_path, true).await;
@@ -3638,9 +3949,21 @@ impl ProcessManager {
             &lifecycle_paths,
             include_deferred,
         )?;
+        let removed_manual_cli_demands = Self::removed_manual_cli_demands(
+            &attachment_base,
+            &attachment_target,
+            &lifecycle_paths,
+        )?;
         let mut batch = AvailabilityBatch::new(effective_at);
         for removed in before_demands.difference(&after_demands) {
             batch.push(AvailabilityBatchOperation::ReleaseDemand(removed.clone()));
+        }
+        for demand in removed_manual_cli_demands {
+            // Opportunistic stale-owner reaping must retire both halves of a
+            // paired Manual CLI session before the new attachment is
+            // published. The process demand appears in the generic delta;
+            // the session-owned Manual demand is provenance-specific.
+            batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
         }
         if renews_existing_owner {
             // Legacy ProjectAttach is also used automatically after VS Code
@@ -3667,8 +3990,16 @@ impl ProcessManager {
         drop(pending_initial);
         drop(publication_guard);
         drop(transition_guard);
-        self.converge_managed_instance(instance_id, None, false, false)
-            .await?;
+        if renews_existing_owner {
+            self.converge_managed_instance(instance_id, None, false, false)
+                .await?;
+        } else {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
+            self.converge_managed_instance_locked(instance_id, None, false, false)
+                .await?;
+        }
         Ok(())
     }
 
@@ -3739,6 +4070,11 @@ impl ProcessManager {
             }
             (base, candidate.snapshot(), stop_unresolved_legacy)
         };
+        let removed_manual_cli_demands = Self::removed_manual_cli_demands(
+            &attachment_base,
+            &attachment_target,
+            &lifecycle_paths,
+        )?;
         let (before_demands, after_demands) = if let Some(target) = &target {
             (
                 Self::attachment_demands_for_target(
@@ -3761,6 +4097,14 @@ impl ProcessManager {
         for removed in before_demands.difference(&after_demands) {
             batch.push(AvailabilityBatchOperation::ReleaseDemand(removed.clone()));
         }
+        if expected_instance.is_some() {
+            for demand in removed_manual_cli_demands {
+                // Exact and bulk detach release only the Manual sessions
+                // removed by this attachment transaction. Singleton Manual
+                // policy from ForceStart or Runtime migration is independent.
+                batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
+            }
+        }
         let transaction = if let Some(target) = target {
             self.prepare_project_lifecycle_transaction(
                 target,
@@ -3779,18 +4123,25 @@ impl ProcessManager {
                 AttachmentTransactionImages::new(attachment_base, attachment_target),
             )?
         };
+        if stop_unresolved_legacy {
+            drop(publication_guard);
+            self.stop_unresolved_project_and_publish_attachment_transaction(
+                &canonical,
+                expected_resolution,
+                &transaction,
+            )
+            .await?;
+            drop(transition_guard);
+            return Ok(());
+        }
+
         self.create_and_apply_lifecycle_transaction_locked(&transaction)
             .await?;
         drop(publication_guard);
+        drop(transition_guard);
         if let Some(instance_id) = expected_instance {
-            drop(transition_guard);
             self.converge_managed_instance(instance_id, None, false, false)
                 .await?;
-        } else if stop_unresolved_legacy {
-            self.stop_project(&canonical).await?;
-            drop(transition_guard);
-        } else {
-            drop(transition_guard);
         }
         Ok(())
     }
@@ -3834,7 +4185,7 @@ impl ProcessManager {
             Some(instance_id) => !self.availability_record_exists(instance_id).await?,
             None => false,
         };
-        let (attachment_base, attachment_target, renewed_demands) = {
+        let (attachment_base, attachment_target, renewed_demands, stop_unresolved_legacy) = {
             let attachments = self.attachments.lock().await;
             let base = attachments.snapshot();
             let evidence = lifecycle_paths
@@ -3852,7 +4203,12 @@ impl ProcessManager {
                 .collect::<Vec<_>>();
             let mut candidate = base.clone();
             let mut renewed_demands = BTreeSet::new();
+            let mut stop_unresolved_legacy = false;
             for evidence in evidence {
+                let projected_owner_before_reap = evidence
+                    .attachments
+                    .iter()
+                    .any(|item| !matches!(item.attachment.source, AttachmentSource::Runtime));
                 for item in evidence.attachments {
                     if !item.alive {
                         candidate.remove_exact_attachment(&evidence.project_path, &item.attachment);
@@ -3861,19 +4217,31 @@ impl ProcessManager {
                     if matches!(
                         item.attachment.source,
                         AttachmentSource::CLI { .. }
+                            | AttachmentSource::ManualCLI(_)
                             | AttachmentSource::Editor { pid: Some(_), .. }
                     ) && let Some(demand) =
                         availability_demand_for_attachment_source(&item.attachment.source)?
                     {
                         renewed_demands.insert(demand);
+                        if let AttachmentSource::ManualCLI(session) = &item.attachment.source {
+                            renewed_demands.insert(manual_cli_session_demand(session)?);
+                        }
                     }
                 }
                 let projection = candidate.project(&evidence.project_path);
+                let projected_owner_after_reap = projection
+                    .attachments
+                    .iter()
+                    .any(|attachment| !matches!(attachment.source, AttachmentSource::Runtime));
+                stop_unresolved_legacy |= target.is_none()
+                    && projected_owner_before_reap
+                    && !projected_owner_after_reap
+                    && !projection.manually_stopped;
                 if projection.attachments.is_empty() && !projection.manually_stopped {
                     candidate.clear_instance_owner(&evidence.project_path);
                 }
             }
-            (base, candidate, renewed_demands)
+            (base, candidate, renewed_demands, stop_unresolved_legacy)
         };
         let (before_demands, after_demands) = if let Some(target) = &target {
             (
@@ -3893,9 +4261,19 @@ impl ProcessManager {
         } else {
             (BTreeSet::new(), BTreeSet::new())
         };
+        let removed_manual_cli_demands = Self::removed_manual_cli_demands(
+            &attachment_base,
+            &attachment_target,
+            &lifecycle_paths,
+        )?;
         let mut batch = AvailabilityBatch::new(effective_at);
         for removed in before_demands.difference(&after_demands) {
             batch.push(AvailabilityBatchOperation::ReleaseDemand(removed.clone()));
+        }
+        if expected_instance.is_some() {
+            for demand in removed_manual_cli_demands {
+                batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
+            }
         }
         let live_demands = renewed_demands
             .intersection(&after_demands)
@@ -3927,6 +4305,18 @@ impl ProcessManager {
                 AttachmentTransactionImages::new(attachment_base, attachment_target),
             )?
         };
+        if stop_unresolved_legacy {
+            drop(publication_guard);
+            self.stop_unresolved_project_and_publish_attachment_transaction(
+                &canonical,
+                expected_resolution,
+                &transaction,
+            )
+            .await?;
+            drop(transition_guard);
+            return Ok(());
+        }
+
         self.create_and_apply_lifecycle_transaction_locked(&transaction)
             .await?;
         drop(publication_guard);
@@ -4020,6 +4410,7 @@ impl ProcessManager {
             .await?;
         self.create_and_apply_lifecycle_transaction_locked(&transaction)
             .await?;
+        self.clear_service_stop_suppressions(instance_id).await;
         drop(pending_initial);
         drop(publication_guard);
         drop(availability_guard);
@@ -4112,9 +4503,11 @@ impl ProcessManager {
             let (result, durability_error) =
                 Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
             drop(publication_guard);
-            self.watch_active_instance(instance_id).await;
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_managed_instance(instance_id, None, false, false)
+                .converge_managed_instance_locked(instance_id, None, false, false)
                 .await;
             Self::surface_availability_durability(convergence, durability_error)?;
             Ok(result.expect("successful availability publication returns its demand result"))
@@ -4140,10 +4533,16 @@ impl ProcessManager {
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
             drop(publication_guard);
-            self.watch_active_instance(instance_id).await;
-            let convergence = self
-                .converge_managed_instance(instance_id, None, false, false)
-                .await;
+            let convergence = if enabled {
+                let coordinator = self.availability_coordinator(instance_id).await;
+                let _runtime_guard = coordinator.runtime.lock().await;
+                self.clear_service_stop_suppressions(instance_id).await;
+                self.converge_managed_instance_locked(instance_id, None, false, false)
+                    .await
+            } else {
+                self.converge_managed_instance(instance_id, None, false, false)
+                    .await
+            };
             Self::surface_availability_durability(convergence, durability_error)?;
             Ok(changed.expect("successful availability publication returns its change result"))
         })
@@ -4326,6 +4725,7 @@ impl ProcessManager {
                 *instance_id,
                 compatibility_attachments,
                 compatibility_manually_stopped,
+                effective_at,
             );
         }
         for mut evidence in deferred_evidence {
@@ -4625,7 +5025,19 @@ impl ProcessManager {
             _ => false,
         };
         if visible {
-            projection.attachments
+            projection
+                .attachments
+                .into_iter()
+                .map(|mut attachment| {
+                    if let AttachmentSource::ManualCLI(session) = attachment.source {
+                        // The retry-stable session UUID is daemon-owned lifecycle
+                        // provenance. Compatibility status keeps the safe owner
+                        // category and process label without publishing that ID.
+                        attachment.source = AttachmentSource::CLI { pid: session.pid() };
+                    }
+                    attachment
+                })
+                .collect()
         } else {
             Vec::new()
         }
@@ -4778,6 +5190,9 @@ impl ProcessManager {
         };
         self.create_and_apply_lifecycle_transaction_locked(&transaction)
             .await?;
+        if let Some(instance_id) = expected_instance {
+            self.clear_service_stop_suppressions(instance_id).await;
+        }
 
         let retired_instances = expected_instance
             .into_iter()
@@ -5129,8 +5544,16 @@ impl ProcessManager {
             .await?;
         drop(publication_guard);
         drop(transition_guard);
-        self.converge_managed_instance(instance_id, None, false, false)
-            .await?;
+        if enabled {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
+            self.converge_managed_instance_locked(instance_id, None, false, false)
+                .await?;
+        } else {
+            self.converge_managed_instance(instance_id, None, false, false)
+                .await?;
+        }
         Ok(())
     }
 
@@ -5294,6 +5717,10 @@ impl ProcessManager {
             !removed_set.contains(&service.instance_id)
                 && !retired_paths.contains(&Self::canonicalize_path(&service.path))
         });
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .retain(|(owner, _)| !removed_set.contains(owner));
         self.persist_state().await;
         drop(publication_guard);
         drop(runtime_projection_guard);
@@ -5498,6 +5925,34 @@ impl ProcessManager {
         }
     }
 
+    async fn ensure_service_start_availability_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<Option<anyhow::Error>> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.ensure_lifecycle_publication_available()?;
+        match self.availability_management_state(instance_id).await? {
+            AvailabilityManagementState::Managed => {}
+            AvailabilityManagementState::PendingInitial => anyhow::bail!(
+                "project instance {instance_id} is awaiting its initial availability publication"
+            ),
+            AvailabilityManagementState::LegacyUnmanaged => return Ok(None),
+        }
+        anyhow::ensure!(
+            self.active_path_for_instance(instance_id).await.is_some(),
+            "project instance {instance_id} is no longer active"
+        );
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let (_, durability_error) = Self::capture_availability_publication(
+            availability
+                .ensure_demand(DemandKey::stopped_page_resume())
+                .await,
+        )?;
+        Ok(durability_error)
+    }
+
     async fn availability_authorizes_start(&self, instance_id: ProjectInstanceId) -> Result<()> {
         let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.availability_authorizes_start_locked(instance_id).await
@@ -5615,19 +6070,35 @@ impl ProcessManager {
     }
 
     async fn project_runtime_is_ready(&self, instance_id: ProjectInstanceId) -> bool {
+        let suppressed = self
+            .service_stop_suppressions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(owner, name)| (*owner == instance_id).then_some(name.clone()))
+            .collect::<HashSet<_>>();
         let runtimes = {
             let services = self.services.lock().await;
             services
-                .values()
-                .filter(|service| service.instance_id == instance_id)
-                .map(|service| (service.runtime_state.clone(), service.health_status))
+                .iter()
+                .filter(|(_, service)| service.instance_id == instance_id)
+                .map(|(name, service)| {
+                    (
+                        name.clone(),
+                        service.runtime_state.clone(),
+                        service.health_status,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         if runtimes.is_empty() {
             return false;
         }
 
-        for (runtime, health_status) in runtimes {
+        for (name, runtime, health_status) in runtimes {
+            if suppressed.contains(&name) {
+                continue;
+            }
             if health_status != HealthStatus::Healthy {
                 return false;
             }
@@ -5641,6 +6112,31 @@ impl ProcessManager {
             }
         }
         true
+    }
+
+    async fn clear_service_stop_suppression(&self, instance_id: ProjectInstanceId, name: &str) {
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .remove(&(instance_id, name.to_owned()));
+    }
+
+    async fn clear_service_stop_suppressions_for(
+        &self,
+        instance_id: ProjectInstanceId,
+        service_names: &HashSet<String>,
+    ) {
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .retain(|(owner, name)| *owner != instance_id || !service_names.contains(name));
+    }
+
+    async fn clear_service_stop_suppressions(&self, instance_id: ProjectInstanceId) {
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .retain(|(owner, _)| *owner != instance_id);
     }
 
     async fn stop_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
@@ -5682,6 +6178,7 @@ impl ProcessManager {
         requested_path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
     ) -> Result<()> {
         let transition_guard = self.attachment_transition_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
@@ -5745,12 +6242,39 @@ impl ProcessManager {
                 }
                 continue;
             }
-            let compatibility = attachment_target.project(path);
+            let mut compatibility = attachment_target.project(path);
+            if let Some(session) = manual_cli_session {
+                let source = session.attachment_source();
+                compatibility
+                    .attachments
+                    .retain(|attachment| attachment.source != source);
+            }
             attachment_target.replace_project(path, compatibility.attachments, false);
         }
-        let batch = AvailabilityBatch::new(effective_at).with_operation(
-            AvailabilityBatchOperation::EnsureDemand(DemandKey::manual_cli()),
-        );
+        let mut batch = AvailabilityBatch::new(effective_at);
+        if let Some(session) = manual_cli_session {
+            let source = session.attachment_source();
+            let mut compatibility = attachment_target.project(&requested_path).attachments;
+            compatibility.retain(|attachment| attachment.source != source);
+            compatibility.push(Attachment {
+                project_path: requested_path.clone(),
+                source: source.clone(),
+                created_at: effective_at,
+            });
+            attachment_target.replace_project(&requested_path, compatibility, false);
+            attachment_target.set_instance_owner(&requested_path, instance_id);
+            batch.push(AvailabilityBatchOperation::EnsureDemand(
+                manual_cli_session_demand(&session)?,
+            ));
+            batch.push(AvailabilityBatchOperation::EnsureDemand(
+                availability_demand_for_attachment_source(&source)?
+                    .context("Manual CLI session must have a process-bound demand")?,
+            ));
+        } else {
+            batch.push(AvailabilityBatchOperation::EnsureDemand(
+                DemandKey::manual_cli(),
+            ));
+        }
         let transaction = self
             .prepare_project_lifecycle_transaction(
                 *target,
@@ -5761,6 +6285,7 @@ impl ProcessManager {
             .await?;
         self.create_and_apply_lifecycle_transaction_locked(&transaction)
             .await?;
+        self.clear_service_stop_suppressions(instance_id).await;
         drop(publication_guard);
         drop(availability_guard);
         drop(transition_guard);
@@ -5781,6 +6306,7 @@ impl ProcessManager {
         let coordinator = self.availability_coordinator(instance_id).await;
         let _runtime_guard = coordinator.runtime.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
+        self.clear_service_stop_suppressions(instance_id).await;
         let requested_path = if self
             .path_matches_instance(&requested_path, instance_id)
             .await
@@ -5845,6 +6371,17 @@ impl ProcessManager {
     ) -> Result<ConvergenceDecision> {
         let coordinator = self.availability_coordinator(instance_id).await;
         let _runtime_guard = coordinator.runtime.lock().await;
+        self.converge_managed_instance_locked(instance_id, event_tx, verbose, apply_config_when_up)
+            .await
+    }
+
+    async fn converge_managed_instance_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        apply_config_when_up: bool,
+    ) -> Result<ConvergenceDecision> {
         self.ensure_accepting_lifecycle_requests()?;
         self.watch_active_instance(instance_id).await;
         let decision = self
@@ -6478,6 +7015,36 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_STARTUP_BOUNDARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn compatibility_status_keeps_manual_cli_session_identity_private() {
+        let project_path = PathBuf::from("/tmp/manual-cli-status");
+        let session = ManualCliSession::new(42);
+        let session_id = session.id().to_string();
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.replace_project(
+            &project_path,
+            vec![Attachment {
+                project_path: project_path.clone(),
+                source: session.attachment_source(),
+                created_at: SystemTime::UNIX_EPOCH,
+            }],
+            false,
+        );
+
+        let visible =
+            ProcessManager::compatibility_attachments_for_display(&snapshot, &project_path, None);
+
+        assert!(matches!(
+            visible.first().map(|attachment| &attachment.source),
+            Some(AttachmentSource::CLI { pid: 42 })
+        ));
+        assert!(
+            !serde_json::to_string(&visible)
+                .expect("serialize compatibility status")
+                .contains(&session_id)
+        );
+    }
 
     struct ProcessGroupCleanup {
         group: i32,
@@ -7193,6 +7760,132 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct BlockingFailOnceStopController {
+        id: String,
+        state: RuntimeState,
+        stop_attempts: Arc<AtomicUsize>,
+        first_stop_entered: Arc<tokio::sync::Notify>,
+        release_first_stop: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingFailOnceStopController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            self.state.status = ServiceState::Running;
+            self.state.health_status = HealthStatus::Healthy;
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            let attempt = self.stop_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.first_stop_entered.notify_one();
+                self.release_first_stop.notified().await;
+                anyhow::bail!("injected first stop failure");
+            }
+            self.state.pid = None;
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingSuccessfulStopController {
+        id: String,
+        state: RuntimeState,
+        stop_entered: Arc<tokio::sync::Notify>,
+        release_stop: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingSuccessfulStopController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.stop_entered.notify_one();
+            self.release_stop.notified().await;
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
     struct BlockingMetricsController {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -7679,6 +8372,548 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn cli_detach_releases_the_manual_demand_created_by_legacy_start() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("cli-detach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "cli-detach").await;
+        write_availability_worker_config(
+            &project_path,
+            "cli-detach",
+            "cli-detach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let session = ManualCliSession::new(std::process::id());
+        let source = session.attachment_source();
+
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("paired Start publishes the Manual CLI session");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load CLI availability");
+        let attached = availability
+            .snapshot()
+            .await
+            .expect("read attached CLI demands");
+        let session_demand =
+            manual_cli_session_demand(&session).expect("manual CLI session demand should be valid");
+        assert!(
+            attached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &session_demand)
+        );
+        assert!(attached.demands().iter().any(|demand| {
+            demand.key().kind() == locald_core::DemandKind::LegacyProcessAttachment
+        }));
+
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("Ctrl-C compatibility detach releases the CLI session");
+
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read detached CLI demands");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn retried_paired_start_reuses_one_manual_cli_owner_and_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("retried-cli-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retried-cli-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "retried-cli-start",
+            "retried-cli-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let session = ManualCliSession::new(std::process::id());
+
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("publish paired Manual CLI start");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load first paired-start availability");
+        let first = availability
+            .snapshot()
+            .await
+            .expect("read first paired-start availability");
+
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("retry the same paired Manual CLI start");
+        let retried = availability
+            .snapshot()
+            .await
+            .expect("read retried paired-start availability");
+        assert_eq!(retried.activity_generation(), first.activity_generation());
+        assert_eq!(retried.demands().len(), 2);
+        let session_demand = manual_cli_session_demand(&session)
+            .expect("construct retried Manual CLI session demand");
+        let process_demand =
+            availability_demand_for_attachment_source(&session.attachment_source())
+                .expect("construct retried process demand")
+                .expect("Manual CLI session has a process demand");
+        assert!(
+            retried
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &session_demand)
+        );
+        assert!(
+            retried
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &process_demand)
+        );
+        let attachments = manager
+            .attachments
+            .lock()
+            .await
+            .snapshot()
+            .project(&project_path)
+            .attachments;
+        assert_eq!(
+            attachments
+                .iter()
+                .filter(|attachment| attachment.source == session.attachment_source())
+                .count(),
+            1
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up retried paired-start project");
+    }
+
+    #[tokio::test]
+    async fn detaching_one_manual_cli_session_preserves_other_owners() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("multiple-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "multiple-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "multiple-cli-session",
+            "multiple-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let first_session = ManualCliSession::new(std::process::id());
+        let second_session = ManualCliSession::new(std::process::id().saturating_add(1));
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(first_session))
+            .await
+            .expect("publish first Manual CLI session");
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(second_session))
+            .await
+            .expect("publish second Manual CLI session");
+
+        manager
+            .project_detach(
+                project_path.clone(),
+                Some(first_session.attachment_source()),
+            )
+            .await
+            .expect("detach only the first Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load multiple-session availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read availability after one session detaches");
+        let first_demand = manual_cli_session_demand(&first_session)
+            .expect("construct first Manual CLI session demand");
+        let second_demand = manual_cli_session_demand(&second_session)
+            .expect("construct second Manual CLI session demand");
+        let first_process =
+            availability_demand_for_attachment_source(&first_session.attachment_source())
+                .expect("construct first process demand")
+                .expect("first session has a process demand");
+        let second_process =
+            availability_demand_for_attachment_source(&second_session.attachment_source())
+                .expect("construct second process demand")
+                .expect("second session has a process demand");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &first_demand)
+        );
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &first_process)
+        );
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &second_demand)
+        );
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &second_process)
+        );
+        assert!(detached.desired_up_at(SystemTime::now()));
+        assert!(
+            manager
+                .get_service_controller("multiple-cli-session:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up multiple-session project");
+    }
+
+    #[tokio::test]
+    async fn manual_cli_detach_preserves_independent_singleton_manual_policy() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("manual-policy-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "manual-policy-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "manual-policy-cli-session",
+            "manual-policy-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("publish independent singleton Manual demand");
+        let session = ManualCliSession::new(std::process::id());
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("publish paired Manual CLI session");
+
+        manager
+            .project_detach(project_path.clone(), Some(session.attachment_source()))
+            .await
+            .expect("detach paired Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load singleton policy availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read singleton policy availability");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &DemandKey::manual_cli())
+        );
+        let session_demand = manual_cli_session_demand(&session)
+            .expect("construct detached Manual CLI session demand");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &session_demand)
+        );
+        assert!(detached.desired_up_at(SystemTime::now()));
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up singleton policy project");
+    }
+
+    #[tokio::test]
+    async fn dead_manual_cli_session_reaper_releases_both_owned_demands() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("dead-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "dead-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "dead-cli-session",
+            "dead-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let session = ManualCliSession::new(u32::MAX);
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("publish eventually stale Manual CLI session");
+        let evidence = manager
+            .attachments
+            .lock()
+            .await
+            .snapshot()
+            .compatibility_evidence_at(
+                &ProcessManager::canonicalize_path(&project_path),
+                SystemTime::now(),
+                ProcessManager::legacy_pid_alive,
+            );
+        assert_eq!(evidence.attachments.len(), 1);
+        assert!(!evidence.attachments[0].alive);
+
+        manager
+            .reconcile_legacy_attachment_project(project_path.clone())
+            .await
+            .expect("reap dead Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load reaped Manual CLI availability");
+        let reaped = availability
+            .snapshot()
+            .await
+            .expect("read reaped Manual CLI availability");
+        assert!(
+            reaped.demands().is_empty(),
+            "dead session left availability demands: {:#?}",
+            reaped.demands()
+        );
+        assert!(reaped.shutdown_cooldown_until().is_some());
+        assert!(
+            manager
+                .attachments
+                .lock()
+                .await
+                .snapshot()
+                .project(&project_path)
+                .attachments
+                .is_empty()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up reaped Manual CLI project");
+    }
+
+    #[tokio::test]
+    async fn new_attachment_reaping_a_dead_manual_cli_session_releases_both_owned_demands() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reattached-dead-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "reattached-dead-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "reattached-dead-cli-session",
+            "reattached-dead-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let stale_session = ManualCliSession::new(u32::MAX);
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(stale_session))
+            .await
+            .expect("publish eventually stale Manual CLI session");
+        let editor = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "replacement-window".to_owned(),
+            pid: Some(std::process::id()),
+        };
+
+        manager
+            .project_attach(project_path.clone(), editor.clone())
+            .await
+            .expect("new editor attachment reaps the stale Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load reattached availability");
+        let reattached = availability
+            .snapshot()
+            .await
+            .expect("read reattached availability");
+        let stale_manual =
+            manual_cli_session_demand(&stale_session).expect("construct stale Manual CLI demand");
+        let stale_process =
+            availability_demand_for_attachment_source(&stale_session.attachment_source())
+                .expect("construct stale process demand")
+                .expect("Manual CLI session has a process demand");
+        assert!(
+            reattached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &stale_manual && lease.key() != &stale_process)
+        );
+        assert!(
+            reattached
+                .demands()
+                .iter()
+                .any(|lease| { lease.key().kind() == locald_core::DemandKind::VsCodeWindow })
+        );
+
+        manager
+            .project_detach(project_path, Some(editor))
+            .await
+            .expect("detach replacement editor");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read fully detached availability");
+        assert!(
+            detached.demands().is_empty(),
+            "replacement detach left orphan demands: {:#?}",
+            detached.demands()
+        );
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn bulk_detach_releases_a_removed_manual_cli_session() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("bulk-cli-detach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "bulk-cli-detach").await;
+        write_availability_worker_config(
+            &project_path,
+            "bulk-cli-detach",
+            "bulk-cli-detach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let session = ManualCliSession::new(std::process::id());
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("paired Start publishes the Manual CLI session");
+        manager
+            .project_detach(project_path, None)
+            .await
+            .expect("bulk detach releases every compatibility owner");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load bulk-detach availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read bulk-detached availability");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn generic_cli_detach_preserves_an_independently_owned_manual_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("generic-cli-detach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "generic-cli-detach").await;
+        write_availability_worker_config(
+            &project_path,
+            "generic-cli-detach",
+            "generic-cli-detach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("legacy Start acquires an independent Manual demand");
+        manager
+            .project_attach(project_path.clone(), source.clone())
+            .await
+            .expect("attach generic compatibility CLI owner");
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("detach generic compatibility owner");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load generic CLI availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read availability after generic CLI detach");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &DemandKey::manual_cli())
+        );
+        assert!(detached.demands().iter().all(|demand| {
+            demand.key().kind() != locald_core::DemandKind::LegacyProcessAttachment
+        }));
     }
 
     #[tokio::test]
@@ -8271,8 +9506,9 @@ mod tests {
         let editor_source = AttachmentSource::Editor {
             name: "vscode".to_owned(),
             id: "cold-v1-window".to_owned(),
-            pid: Some(std::process::id()),
+            pid: None,
         };
+        let migration_started_at = SystemTime::now();
         let mut legacy_attachments = AttachmentStore::new(paths.legacy_attachments.clone());
         legacy_attachments.replace_project(
             &project_path,
@@ -8295,7 +9531,7 @@ mod tests {
                 Attachment {
                     project_path: project_path.clone(),
                     source: editor_source.clone(),
-                    created_at: SystemTime::now(),
+                    created_at: migration_started_at - std::time::Duration::from_secs(5 * 60),
                 },
             ],
             true,
@@ -8386,6 +9622,16 @@ mod tests {
                 "missing migrated demand {expected:?}"
             );
         }
+        let migrated_editor = manager
+            .attachments
+            .lock()
+            .await
+            .attachments_for(&project_path)
+            .into_iter()
+            .find(|attachment| attachment.source == editor_source)
+            .cloned()
+            .expect("retain migrated pidless editor compatibility owner");
+        assert!(migrated_editor.created_at >= migration_started_at);
         let backup_dir = availability_data_dir.join("v1-backups");
         assert!(!backup_dir.join("catalog.json").exists());
         assert_eq!(
@@ -8443,6 +9689,87 @@ mod tests {
         assert_eq!(
             std::fs::read(&paths.legacy_attachments).expect("reread migrated compatibility state"),
             attachments_after
+        );
+    }
+
+    #[test]
+    fn deferred_pidless_editor_keeps_its_original_expiry_until_instance_claim() {
+        let project_path = PathBuf::from("/projects/deferred-editor");
+        let original = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let migration_at = original + std::time::Duration::from_secs(5 * 60);
+        let claim_at = original + std::time::Duration::from_secs(29 * 60);
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "legacy-window".to_owned(),
+            pid: None,
+        };
+        let attachment = Attachment {
+            project_path: project_path.clone(),
+            source,
+            created_at: original,
+        };
+        let mut deferred = AttachmentStoreSnapshot::default();
+        deferred.replace_project(&project_path, vec![attachment], false);
+
+        let migration_evidence =
+            deferred.compatibility_evidence_at(&project_path, migration_at, |_| false);
+        let migration_plan =
+            plan_project_lifecycle_migration(false, &migration_evidence, migration_at)
+                .expect("plan deferred migration");
+        assert_eq!(
+            migration_plan.compatibility_attachments[0].created_at,
+            original
+        );
+        deferred.replace_project(
+            &project_path,
+            migration_plan.compatibility_attachments,
+            false,
+        );
+
+        let after_original_expiry = original + std::time::Duration::from_secs(30 * 60 + 1);
+        assert!(
+            !deferred
+                .compatibility_evidence_at(&project_path, after_original_expiry, |_| false)
+                .attachments[0]
+                .alive,
+            "unclaimed evidence must not receive a fresh legacy retention window"
+        );
+
+        let claim_evidence = deferred.compatibility_evidence_at(&project_path, claim_at, |_| false);
+        let claim_plan = plan_project_lifecycle_migration(false, &claim_evidence, claim_at)
+            .expect("plan deferred claim");
+        let instance_id = "00000000-0000-4000-8000-000000000123"
+            .parse()
+            .expect("parse project instance ID");
+        ProcessManager::claim_compatibility_projection(
+            &mut deferred,
+            &project_path,
+            instance_id,
+            claim_plan.compatibility_attachments,
+            false,
+            claim_at,
+        );
+        assert_eq!(deferred.instance_owner(&project_path), Some(instance_id));
+        assert_eq!(
+            deferred.project(&project_path).attachments[0].created_at,
+            claim_at
+        );
+        assert!(
+            deferred
+                .compatibility_evidence_at(&project_path, after_original_expiry, |_| false)
+                .attachments[0]
+                .alive,
+            "claim starts the v2 editor lease from the claim epoch"
+        );
+        assert!(
+            !deferred
+                .compatibility_evidence_at(
+                    &project_path,
+                    claim_at + locald_core::VSCODE_DEMAND_TTL,
+                    |_| false,
+                )
+                .attachments[0]
+                .alive
         );
     }
 
@@ -10320,6 +11647,748 @@ command = "sleep 30"
     }
 
     #[tokio::test]
+    async fn named_service_stop_survives_automatic_project_convergence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "service-stop").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "service-stop",
+            "service-stop.localhost",
+            &["web", "worker"],
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded two-service project");
+        let sibling = manager
+            .get_service_controller("service-stop:worker")
+            .await
+            .expect("running sibling service");
+
+        manager
+            .stop("service-stop:web")
+            .await
+            .expect("stop only the selected service");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_none()
+        );
+
+        manager.converge_all_project_availability().await;
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_none(),
+            "automatic convergence must respect the one-off service stop"
+        );
+        assert!(Arc::ptr_eq(
+            &sibling,
+            &manager
+                .get_service_controller("service-stop:worker")
+                .await
+                .expect("sibling remains running")
+        ));
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("explicit project start clears service stop suppression");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "service-stop:web".to_owned()))
+        );
+
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_stop = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut services = manager.services.lock().await;
+            let service = services
+                .get_mut("service-stop:web")
+                .expect("replace running web controller");
+            service.runtime_state = ServiceRuntime::Controller(Arc::new(Mutex::new(
+                BlockingSuccessfulStopController {
+                    id: "service-stop:web".to_owned(),
+                    state: RuntimeState {
+                        pid: Some(42),
+                        port: None,
+                        status: ServiceState::Running,
+                        health_status: HealthStatus::Healthy,
+                    },
+                    stop_entered: stop_entered.clone(),
+                    release_stop: release_stop.clone(),
+                },
+            )));
+            service.health_status = HealthStatus::Healthy;
+        }
+
+        let stop_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.stop("service-stop:web").await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, stop_entered.notified())
+            .await
+            .expect("service stop enters its controller");
+        let start_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !start_task.is_finished(),
+            "later explicit start waits for the in-flight service stop"
+        );
+
+        release_stop.notify_one();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, stop_task)
+            .await
+            .expect("service stop completes")
+            .expect("service stop task joins")
+            .expect("service stop succeeds");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_task)
+            .await
+            .expect("explicit start completes")
+            .expect("explicit start task joins")
+            .expect("later explicit start succeeds");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "service-stop:web".to_owned()))
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up service-stop project");
+    }
+
+    #[tokio::test]
+    async fn service_start_route_resumes_only_the_selected_stopped_service() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("selective-service-start-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "selective-service-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "selective-service-start",
+            "selective-service-start.localhost",
+            &["web", "worker"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded two-service project");
+        manager
+            .stop("selective-service-start:web")
+            .await
+            .expect("stop selected web service");
+        manager
+            .stop("selective-service-start:worker")
+            .await
+            .expect("stop independent worker service");
+
+        let response = crate::api::router(manager.clone())
+            .oneshot(
+                Request::post("/services/selective-service-start:web/start")
+                    .body(Body::empty())
+                    .expect("build service-start request"),
+            )
+            .await
+            .expect("service-start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            manager
+                .get_service_controller("selective-service-start:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_service_controller("selective-service-start:worker")
+                .await
+                .is_none(),
+            "starting web must preserve worker's independent stop override"
+        );
+        let suppressions = manager.service_stop_suppressions.lock().await;
+        assert!(!suppressions.contains(&(instance_id, "selective-service-start:web".to_owned())));
+        assert!(suppressions.contains(&(instance_id, "selective-service-start:worker".to_owned())));
+        drop(suppressions);
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up selective service-start project");
+    }
+
+    #[tokio::test]
+    async fn service_start_route_semantically_resumes_a_paused_project() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("paused-service-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "paused-service-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "paused-service-start",
+            "paused-service-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded project");
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause project before service-start action");
+        assert!(
+            manager
+                .get_service_controller("paused-service-start:web")
+                .await
+                .is_none()
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load paused availability");
+        let paused_generation = availability
+            .snapshot()
+            .await
+            .expect("read paused availability")
+            .activity_generation();
+
+        let response = crate::api::router(manager.clone())
+            .oneshot(
+                Request::post("/services/paused-service-start:web/start")
+                    .body(Body::empty())
+                    .expect("build paused service-start request"),
+            )
+            .await
+            .expect("paused service-start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            manager
+                .get_service_controller("paused-service-start:web")
+                .await
+                .is_some()
+        );
+
+        let resumed = availability
+            .snapshot()
+            .await
+            .expect("read resumed availability");
+        assert!(!resumed.is_paused());
+        assert_eq!(resumed.activity_generation(), paused_generation + 1);
+        assert!(
+            resumed.demands().iter().any(|demand| {
+                demand.key().kind() == locald_core::DemandKind::StoppedPageResume
+            })
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed service-start project");
+    }
+
+    #[tokio::test]
+    async fn service_start_route_resumes_required_dependencies_only() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("dependency-service-start-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "dependency-service-start").await;
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "dependency-service-start"
+domain = "dependency-service-start.localhost"
+
+[services.db]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["api"]
+
+[services.api]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["db"]
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write dependency service-start config");
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start dependency project");
+        for service in ["web", "api", "db", "worker"] {
+            manager
+                .stop(&format!("dependency-service-start:{service}"))
+                .await
+                .expect("stop service before selective dependency start");
+        }
+
+        let response = crate::api::router(manager.clone())
+            .oneshot(
+                Request::post("/services/dependency-service-start:web/start")
+                    .body(Body::empty())
+                    .expect("build dependency service-start request"),
+            )
+            .await
+            .expect("dependency service-start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:db")
+                .await
+                .is_some(),
+            "a selected service must restore its dependency closure"
+        );
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:api")
+                .await
+                .is_some(),
+            "dependency activation must include transitive prerequisites"
+        );
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:worker")
+                .await
+                .is_none(),
+            "an unrelated stopped service remains suppressed"
+        );
+        let suppressions = manager.service_stop_suppressions.lock().await;
+        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:db".to_owned())));
+        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:api".to_owned())));
+        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:web".to_owned())));
+        assert!(
+            suppressions.contains(&(instance_id, "dependency-service-start:worker".to_owned()))
+        );
+        drop(suppressions);
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up dependency service-start project");
+    }
+
+    #[tokio::test]
+    async fn later_project_pause_supersedes_service_start_at_config_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("pause-service-start-race-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "pause-service-start-race").await;
+        write_availability_worker_config(
+            &project_path,
+            "pause-service-start-race",
+            "pause-service-start-race.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start project before pause-vs-service-start race");
+        manager
+            .stop("pause-service-start-race:web")
+            .await
+            .expect("stop service before pause-vs-service-start race");
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_config_publication_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let start_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start_service("pause-service-start-race:web").await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, reached.notified())
+            .await
+            .expect("service start reaches config publication boundary");
+
+        let pause_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+                    .await
+                    .expect("load availability while waiting for pause publication");
+                if availability
+                    .snapshot()
+                    .await
+                    .expect("read availability while waiting for pause publication")
+                    .is_paused()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later pause publishes while service start is held");
+
+        resume.notify_one();
+        let start_error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_task)
+            .await
+            .expect("superseded service start returns")
+            .expect("service start task joins")
+            .expect_err("later pause supersedes service start");
+        assert!(start_error.is::<AvailabilityStartSuperseded>());
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, pause_task)
+            .await
+            .expect("pause convergence completes")
+            .expect("pause task joins")
+            .expect("pause succeeds");
+        assert!(
+            manager
+                .get_service_controller("pause-service-start-race:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "pause-service-start-race:web".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn new_attachment_resumes_a_service_stop_while_owner_renewal_preserves_it() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("attachment-service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "attachment-service-stop").await;
+        write_availability_worker_config(
+            &project_path,
+            "attachment-service-stop",
+            "attachment-service-stop.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let first_owner = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+
+        manager
+            .project_attach(project_path.clone(), first_owner.clone())
+            .await
+            .expect("attach first owner");
+        manager
+            .stop("attachment-service-stop:web")
+            .await
+            .expect("stop service under first owner");
+        manager
+            .project_attach(project_path.clone(), first_owner.clone())
+            .await
+            .expect("renew existing owner");
+        assert!(
+            manager
+                .get_service_controller("attachment-service-stop:web")
+                .await
+                .is_none(),
+            "passive owner renewal preserves the one-off service stop"
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "attachment-service-stop:web".to_owned()))
+        );
+
+        manager
+            .project_detach(project_path.clone(), Some(first_owner))
+            .await
+            .expect("detach first owner");
+        manager
+            .project_attach(
+                project_path.clone(),
+                AttachmentSource::Editor {
+                    name: "Code".to_owned(),
+                    id: "window-b".to_owned(),
+                    pid: None,
+                },
+            )
+            .await
+            .expect("new owner resumes automatic service management");
+        assert!(
+            manager
+                .get_service_controller("attachment-service-stop:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "attachment-service-stop:web".to_owned()))
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up attachment service-stop project");
+    }
+
+    #[tokio::test]
+    async fn explicit_availability_actions_resume_a_named_service_stop() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("availability-service-stop-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "availability-service-stop").await;
+        write_availability_worker_config(
+            &project_path,
+            "availability-service-stop",
+            "availability-service-stop.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded project");
+
+        manager
+            .stop("availability-service-stop:web")
+            .await
+            .expect("stop service before explicit ensure");
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("explicit ensure resumes service management");
+        assert!(
+            manager
+                .get_service_controller("availability-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .stop("availability-service-stop:web")
+            .await
+            .expect("stop service before Always On activation");
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("Always On activation resumes service management");
+        assert!(
+            manager
+                .get_service_controller("availability-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_set_always_on(&project_path, false)
+            .await
+            .expect("disable direct Always On policy");
+        manager
+            .stop("availability-service-stop:web")
+            .await
+            .expect("stop service before compatibility pin");
+        manager
+            .registry_pin(&project_path)
+            .await
+            .expect("compatibility pin resumes service management");
+        assert!(
+            manager
+                .get_service_controller("availability-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up explicit availability project");
+    }
+
+    #[tokio::test]
+    async fn remove_clears_service_stop_before_stable_identity_reregistration() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("remove-service-stop-project");
+        std::fs::create_dir(&project_path).expect("create Git project");
+        git(&project_path, &["init", "-b", "main"]);
+        write_availability_worker_config(
+            &project_path,
+            "remove-service-stop",
+            "remove-service-stop.localhost",
+            &["web"],
+        );
+        let availability_data_dir = dir.path().join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                dir.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create remove/re-register manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start stable-identity project");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve stable project instance");
+        manager
+            .stop("remove-service-stop:web")
+            .await
+            .expect("stop named service before removal");
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove project");
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .iter()
+                .any(|(owner, _)| *owner == instance_id)
+        );
+
+        manager
+            .project_attach(
+                project_path.clone(),
+                AttachmentSource::Editor {
+                    name: "Code".to_owned(),
+                    id: "window-after-remove".to_owned(),
+                    pid: None,
+                },
+            )
+            .await
+            .expect("re-register removed project through a new owner");
+        let (reregistered, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve re-registered stable identity");
+        assert_eq!(reregistered, instance_id);
+        assert!(
+            manager
+                .get_service_controller("remove-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up re-registered project");
+    }
+
+    #[tokio::test]
     async fn availability_convergence_first_pause_cancels_in_flight_legacy_start() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("pause-race-project");
@@ -11695,7 +13764,7 @@ command = "sleep 30"
             .await
             .expect("remove project before stale start");
         let error = manager
-            .start_catalogued_instance(instance_id, project_path, None, false)
+            .start_catalogued_instance(instance_id, project_path, None, false, None)
             .await
             .expect_err("captured start cannot restore removed identity");
 
@@ -15339,6 +17408,370 @@ command = "unused-by-test-factory"
         assert_eq!(
             manager.services.lock().await["project:web"].health_status,
             HealthStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_project_reaper_keeps_owner_evidence_until_stop_succeeds() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unresolved-reaper-project");
+        std::fs::create_dir(&project_path).expect("create unresolved project directory");
+        let canonical =
+            std::fs::canonicalize(&project_path).expect("canonical unresolved project path");
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                dir.path().join("catalog.json"),
+            ))),
+            attachments.clone(),
+            None,
+        )
+        .expect("create unresolved reaper manager");
+        attachments
+            .lock()
+            .await
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::CLI { pid: u32::MAX },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach expired legacy CLI owner");
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let first_stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first_stop = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingFailOnceStopController {
+                id: "unresolved-reaper:web".to_owned(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+                stop_attempts: stop_attempts.clone(),
+                first_stop_entered: first_stop_entered.clone(),
+                release_first_stop: release_first_stop.clone(),
+            }));
+        manager.services.lock().await.insert(
+            "unresolved-reaper:web".to_owned(),
+            Service {
+                instance_id: test_instance_id(),
+                controller_generation: 1,
+                projection_generation: 1,
+                config: LocaldConfig::default(),
+                service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::Controller(controller.clone()),
+                sticky_port: None,
+                path: canonical.clone(),
+                health_status: HealthStatus::Healthy,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+
+        let first_reap = tokio::spawn({
+            let manager = manager.clone();
+            let canonical = canonical.clone();
+            async move { manager.reconcile_legacy_attachment_project(canonical).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, first_stop_entered.notified())
+            .await
+            .expect("first unresolved stop reaches its controller");
+
+        assert!(
+            !attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty(),
+            "a daemon exit while stop is in flight leaves retry evidence durable"
+        );
+
+        release_first_stop.notify_one();
+        let first_error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, first_reap)
+            .await
+            .expect("first unresolved reap completes")
+            .expect("first unresolved reap task joins")
+            .expect_err("first unresolved stop failure surfaces");
+        assert!(format!("{first_error:#}").contains("injected first stop failure"));
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty(),
+            "failed stop preserves the owner evidence for the next sweep"
+        );
+
+        manager
+            .reconcile_legacy_attachment_project(canonical)
+            .await
+            .expect("later sweep retries and completes the unresolved stop");
+
+        assert!(
+            attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty()
+        );
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            controller.lock().await.read_state().await.status,
+            ServiceState::Stopped
+        );
+        assert_eq!(
+            manager.services.lock().await["unresolved-reaper:web"].health_status,
+            HealthStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_owner_cleanup_rebases_unrelated_catalog_and_attachment_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unresolved-publication-race-project");
+        std::fs::create_dir(&project_path).expect("create unresolved project directory");
+        let canonical =
+            std::fs::canonicalize(&project_path).expect("canonical unresolved project path");
+        let unrelated_path = dir.path().join("unrelated-registration-project");
+        std::fs::create_dir(&unrelated_path).expect("create unrelated project directory");
+        git(&unrelated_path, &["init", "-b", "main"]);
+        let unrelated_discovery = Registry::discover(unrelated_path.clone())
+            .await
+            .expect("discover unrelated project");
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                dir.path().join("catalog.json"),
+            ))),
+            attachments.clone(),
+            None,
+        )
+        .expect("create unresolved publication-race manager");
+        attachments
+            .lock()
+            .await
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::CLI { pid: u32::MAX },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach expired legacy CLI owner");
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_stop = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingSuccessfulStopController {
+                id: "unresolved-publication-race:web".to_owned(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+                stop_entered: stop_entered.clone(),
+                release_stop: release_stop.clone(),
+            }));
+        manager.services.lock().await.insert(
+            "unresolved-publication-race:web".to_owned(),
+            Service {
+                instance_id: test_instance_id(),
+                controller_generation: 1,
+                projection_generation: 1,
+                config: LocaldConfig::default(),
+                service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::Controller(controller.clone()),
+                sticky_port: None,
+                path: canonical.clone(),
+                health_status: HealthStatus::Healthy,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+
+        // Model an unrelated first registration that already owns the global
+        // runtime transition while this cleanup releases publication and waits
+        // to stop its unresolved service.
+        let runtime_projection_guard = manager.runtime_projection_lock.lock().await;
+        let (_, project_transition) = manager.transition_lock_for_path(&canonical).await;
+        let reap = tokio::spawn({
+            let manager = manager.clone();
+            let canonical = canonical.clone();
+            async move { manager.reconcile_legacy_attachment_project(canonical).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if project_transition.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unresolved cleanup reaches the runtime publication boundary");
+
+        let publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let unrelated_instance = {
+            let mut registry = manager.registry.lock().await;
+            let mut candidate = registry.clone();
+            let instance_id = candidate
+                .register_project(
+                    unrelated_discovery,
+                    Some("unrelated-registration".to_owned()),
+                )
+                .expect("register unrelated project candidate");
+            registry
+                .commit_candidate(candidate)
+                .await
+                .expect("publish unrelated catalog mutation");
+            manager.domain_index.store(registry.domain_index().clone());
+            instance_id
+        };
+        {
+            let mut store = attachments.lock().await;
+            let mut snapshot = store.snapshot();
+            snapshot.replace_project(
+                &unrelated_path,
+                vec![Attachment {
+                    project_path: unrelated_path.clone(),
+                    source: AttachmentSource::Editor {
+                        name: "Code".to_owned(),
+                        id: "unrelated-window".to_owned(),
+                        pid: Some(std::process::id()),
+                    },
+                    created_at: SystemTime::now(),
+                }],
+                false,
+            );
+            snapshot.set_instance_owner(&unrelated_path, unrelated_instance);
+            store
+                .replace_snapshot(snapshot)
+                .await
+                .expect("publish unrelated compatibility mutation");
+        }
+        drop(publication_guard);
+        drop(runtime_projection_guard);
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, stop_entered.notified())
+            .await
+            .expect("rebased cleanup reaches the unresolved service stop");
+        release_stop.notify_one();
+
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, reap)
+            .await
+            .expect("unresolved cleanup completes after unrelated publication")
+            .expect("unresolved cleanup task joins")
+            .expect("unresolved cleanup rebases its complete lifecycle transaction");
+
+        let snapshot = attachments.lock().await.snapshot();
+        assert!(snapshot.project(&project_path).attachments.is_empty());
+        let unrelated = snapshot.project(&unrelated_path);
+        assert_eq!(unrelated.instance_owner, Some(unrelated_instance));
+        assert_eq!(unrelated.attachments.len(), 1);
+        assert_eq!(
+            controller.lock().await.read_state().await.status,
+            ServiceState::Stopped
+        );
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&unrelated_instance)
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect lifecycle journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .lifecycle_recovery_required
+                .load(AtomicOrdering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn first_registration_syncs_hosts_after_catalog_publish_before_later_failure() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("partial-registration-project");
+        std::fs::create_dir(&project_path).expect("create registration project");
+        git(&project_path, &["init", "-b", "main"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "partial-registration"
+domain = "partial-registration.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+        )
+        .expect("write registration config");
+
+        let availability_data_dir = dir.path().join("availability-data");
+        let attachments_path = dir.path().join("attachments.json");
+        std::fs::create_dir(&attachments_path)
+            .expect("block compatibility publication after catalog commit");
+
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(attachments_path))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create partial registration manager");
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+
+        manager
+            .start(project_path, None, false)
+            .await
+            .expect_err("blocked compatibility publication surfaces after catalog commit");
+
+        let registry = registry.lock().await;
+        assert_eq!(registry.instances.len(), 1);
+        assert!(
+            registry
+                .domain_index()
+                .resolve("partial-registration.localhost")
+                .is_some()
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("partial-registration.localhost")
+                .is_some()
+        );
+        assert_eq!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[expected_hosts(&["partial-registration.localhost"])]
         );
     }
 
