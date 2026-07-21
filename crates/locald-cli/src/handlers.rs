@@ -93,7 +93,13 @@ const fn section_label(section: ProjectSection) -> &'static str {
 }
 
 fn resolve_project_locator(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    locald_core::normalize_project_locator(path).map_err(Into::into)
+    locald_core::normalize_project_locator(path).map_err(|source| {
+        let message = format!(
+            "Failed to resolve project path `{}`: {source}",
+            path.display()
+        );
+        anyhow::Error::new(source).context(message)
+    })
 }
 
 fn stream_up_start<StreamStart>(
@@ -2251,6 +2257,18 @@ mod tests {
                 .expect("canonicalize real locator ancestor")
                 .join("missing-project")
         );
+    }
+
+    #[test]
+    fn invalid_project_locator_error_names_the_requested_path() {
+        let locator = std::path::Path::new("/invalid\0project");
+
+        let error = resolve_project_locator(locator).expect_err("reject invalid locator");
+        let source = error.root_cause().to_string();
+        let message = CliError::from(error).to_string();
+        assert!(message.contains("Failed to resolve project path"));
+        assert!(message.contains(&locator.display().to_string()));
+        assert!(message.contains(&source));
     }
 
     #[test]
