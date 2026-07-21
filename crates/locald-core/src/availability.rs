@@ -2628,6 +2628,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_demand_deadlines_expire_at_the_exact_wall_clock_boundary() {
+        let cases = [
+            (instance_id(101), DemandKey::manual_cli(), MANUAL_DEMAND_TTL),
+            (
+                instance_id(102),
+                DemandKey::vs_code_window("deadline-window").expect("construct editor demand"),
+                VSCODE_DEMAND_TTL,
+            ),
+            (
+                instance_id(103),
+                DemandKey::agent_conversation("deadline-conversation")
+                    .expect("construct agent demand"),
+                AGENT_DEMAND_TTL,
+            ),
+        ];
+
+        for (project_instance_id, demand, ttl) in cases {
+            let fixture = Fixture::new();
+            let clock = FakeClock::new(START_SECONDS);
+            let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+            let acquired = store
+                .ensure_demand(demand)
+                .await
+                .expect("acquire canonical demand");
+            let expires_at = clock.time() + ttl;
+            assert_eq!(acquired.lease.expires_at(), Some(expires_at));
+
+            clock.advance(ttl - Duration::from_secs(1));
+            assert!(store.desired_up().await.expect("demand remains live"));
+
+            clock.advance(Duration::from_secs(1));
+            assert!(!store.desired_up().await.expect("demand reaches expiry"));
+            assert_eq!(
+                store
+                    .sweep_and_decide()
+                    .await
+                    .expect("sweep exact demand expiry"),
+                ConvergenceDecision::PreserveRuntimeUntil {
+                    deadline: expires_at + SHUTDOWN_COOLDOWN,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vscode_heartbeat_cadence_renews_then_expires_after_silence() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(104), clock.clone()).await;
+        let editor =
+            DemandKey::vs_code_window("heartbeat-window").expect("construct editor demand");
+
+        store
+            .ensure_demand(editor.clone())
+            .await
+            .expect("acquire editor demand");
+        for _ in 0..3 {
+            clock.advance(VSCODE_RENEWAL_INTERVAL);
+            let renewed = store
+                .renew_demand(&editor)
+                .await
+                .expect("renew editor heartbeat");
+            let lease = match renewed {
+                RenewDemandResult::Renewed(lease) => lease,
+                other => {
+                    assert!(matches!(other, RenewDemandResult::Renewed(_)));
+                    continue;
+                }
+            };
+            assert_eq!(lease.renewed_at(), clock.time());
+            assert_eq!(lease.expires_at(), Some(clock.time() + VSCODE_DEMAND_TTL));
+        }
+
+        clock.advance(VSCODE_DEMAND_TTL - Duration::from_secs(1));
+        assert!(store.desired_up().await.expect("editor remains live"));
+        clock.advance(Duration::from_secs(1));
+        assert!(!store.desired_up().await.expect("silent editor expires"));
+    }
+
+    #[tokio::test]
+    async fn agent_demand_spans_active_time_and_review_grace() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let mut store = fake_store(&fixture, instance_id(105), clock.clone()).await;
+
+        store
+            .ensure_demand(
+                DemandKey::agent_conversation("review-conversation")
+                    .expect("construct agent demand"),
+            )
+            .await
+            .expect("acquire agent demand");
+        clock.advance(AGENT_ACTIVE_TTL);
+        assert!(store.desired_up().await.expect("agent enters review grace"));
+        clock.advance(AGENT_REVIEW_GRACE - Duration::from_secs(1));
+        assert!(
+            store
+                .desired_up()
+                .await
+                .expect("agent remains live through review grace")
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(
+            !store
+                .desired_up()
+                .await
+                .expect("agent expires after review grace")
+        );
+    }
+
+    #[tokio::test]
     async fn new_owner_advances_generation_and_demands_coexist() {
         let fixture = Fixture::new();
         let clock = FakeClock::new(START_SECONDS);
@@ -2685,6 +2796,59 @@ mod tests {
         assert_eq!(resumed.lease.generation(), 2);
         assert!(!store.availability.is_paused());
         assert!(store.desired_up().await.expect("derive resumed state"));
+    }
+
+    #[tokio::test]
+    async fn pause_and_always_on_survive_reopen_until_semantic_activity_resumes() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(106);
+        let editor = DemandKey::vs_code_window("paused-window").expect("construct editor demand");
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+
+        store.set_always_on(true).await.expect("enable Always On");
+        store
+            .ensure_demand(editor.clone())
+            .await
+            .expect("acquire editor demand");
+        store.pause_project().await.expect("pause project");
+        drop(store);
+
+        let mut reopened = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let paused = reopened.snapshot().await.expect("reload paused policy");
+        let paused_generation = paused.activity_generation();
+        assert!(paused.always_on());
+        assert!(paused.is_paused());
+        assert!(!paused.desired_up_at(clock.time()));
+
+        clock.advance(VSCODE_RENEWAL_INTERVAL);
+        let renewed = reopened
+            .renew_demand(&editor)
+            .await
+            .expect("passively renew paused editor");
+        let lease = match renewed {
+            RenewDemandResult::Renewed(lease) => lease,
+            other => return assert!(matches!(other, RenewDemandResult::Renewed(_))),
+        };
+        assert_eq!(lease.generation(), paused_generation);
+        assert!(
+            reopened
+                .snapshot()
+                .await
+                .expect("reload renewed pause")
+                .is_paused()
+        );
+
+        let resumed = reopened
+            .ensure_demand(editor)
+            .await
+            .expect("resume through semantic editor activity");
+        assert_eq!(resumed.effect, EnsureDemandEffect::Resumed);
+        assert_eq!(resumed.lease.generation(), paused_generation + 1);
+        let resumed = reopened.snapshot().await.expect("reload resumed policy");
+        assert!(resumed.always_on());
+        assert!(!resumed.is_paused());
+        assert!(resumed.desired_up_at(clock.time()));
     }
 
     #[tokio::test]
