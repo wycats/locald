@@ -214,7 +214,10 @@ mod tests {
         let Message::Dictionary(probe) = request_message(HelperCommand::Probe, None) else {
             panic!("probe request must be a dictionary");
         };
-        assert_eq!(response_int(&probe, "protocol_version"), Some(1));
+        assert_eq!(
+            response_int(&probe, "protocol_version"),
+            Some(i64::from(PROTOCOL_VERSION))
+        );
         assert_eq!(response_string(&probe, "command").as_deref(), Some("probe"));
         assert_eq!(response_int(&probe, "port"), None);
 
