@@ -959,25 +959,29 @@ async fn persist_bytes_create_once(
     }
 
     let link_result = fs::hard_link(&temporary, path).await;
-    let cleanup_result = fs::remove_file(&temporary).await;
+    finish_create_once_publication(path, content, &temporary, link_result).await
+}
+
+async fn finish_create_once_publication(
+    path: &Path,
+    content: &[u8],
+    temporary: &Path,
+    link_result: io::Result<()>,
+) -> Result<V1BackupDisposition, LifecycleJournalError> {
+    let cleanup_result = fs::remove_file(temporary).await;
     match link_result {
         Ok(()) => {
-            cleanup_result.map_err(|source| LifecycleJournalError::Io {
-                operation: "remove linked temporary v1 backup",
-                path: temporary,
-                source,
-            })?;
+            // The create-once path is authoritative once the link succeeds.
+            // A leftover private temporary file is recoverable debris rather
+            // than a failed backup publication.
+            let _ = cleanup_result;
             sync_parent(path, "create v1 backup").await?;
             Ok(V1BackupDisposition::Created)
         }
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            if let Err(cleanup_source) = cleanup_result {
-                return Err(LifecycleJournalError::Io {
-                    operation: "remove unlinked temporary v1 backup",
-                    path: temporary,
-                    source: cleanup_source,
-                });
-            }
+            // A matching existing path already satisfies idempotent replay.
+            // Temporary cleanup remains best effort after publication wins.
+            let _ = cleanup_result;
             let existing = fs::read(path)
                 .await
                 .map_err(|source| LifecycleJournalError::Io {
@@ -1237,7 +1241,7 @@ mod tests {
         JournalClearDisposition, JournalCreateDisposition, LegacyV1File, LifecycleJournal,
         LifecycleJournalError, LifecycleRecoveryPreflight, LifecycleTransaction,
         LifecycleTransactionKind, LifecycleTransactionPhase, MigrationMarkerDisposition,
-        V1BackupDisposition,
+        V1BackupDisposition, finish_create_once_publication,
     };
     use locald_core::attachments::{Attachment, AttachmentSource, AttachmentStoreSnapshot};
     use locald_core::{
@@ -1802,6 +1806,99 @@ mod tests {
                 .expect("read preserved backup"),
             original
         );
+    }
+
+    #[tokio::test]
+    async fn successful_backup_publication_ignores_temporary_cleanup_failure() {
+        let fixture = Fixture::new();
+        let backup = fixture.directory.path().join("backup.json");
+        let temporary = fixture.directory.path().join("temporary-directory");
+        let content = b"published";
+        tokio::fs::write(&backup, content)
+            .await
+            .expect("represent the successful hard-link publication");
+        tokio::fs::create_dir(&temporary)
+            .await
+            .expect("make remove_file fail for the temporary path");
+
+        assert_eq!(
+            finish_create_once_publication(&backup, content, &temporary, Ok(()))
+                .await
+                .expect("published backup remains successful"),
+            V1BackupDisposition::Created
+        );
+        assert_eq!(
+            tokio::fs::read(&backup)
+                .await
+                .expect("read published backup"),
+            content
+        );
+        assert!(temporary.is_dir());
+    }
+
+    #[tokio::test]
+    async fn matching_concurrent_backup_ignores_temporary_cleanup_failure() {
+        let fixture = Fixture::new();
+        let backup = fixture.directory.path().join("backup.json");
+        let temporary = fixture.directory.path().join("temporary-directory");
+        let content = b"published";
+        tokio::fs::write(&backup, content)
+            .await
+            .expect("represent the concurrent create-once winner");
+        tokio::fs::create_dir(&temporary)
+            .await
+            .expect("make remove_file fail for the temporary path");
+
+        assert_eq!(
+            finish_create_once_publication(
+                &backup,
+                content,
+                &temporary,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "simulated concurrent publication",
+                )),
+            )
+            .await
+            .expect("matching concurrent backup remains idempotent"),
+            V1BackupDisposition::AlreadyCreated
+        );
+        assert_eq!(
+            tokio::fs::read(&backup)
+                .await
+                .expect("read existing backup"),
+            content
+        );
+        assert!(temporary.is_dir());
+    }
+
+    #[tokio::test]
+    async fn conflicting_concurrent_backup_still_fails_when_temporary_cleanup_fails() {
+        let fixture = Fixture::new();
+        let backup = fixture.directory.path().join("backup.json");
+        let temporary = fixture.directory.path().join("temporary-directory");
+        tokio::fs::write(&backup, b"other")
+            .await
+            .expect("represent a conflicting create-once winner");
+        tokio::fs::create_dir(&temporary)
+            .await
+            .expect("make remove_file fail for the temporary path");
+
+        assert!(matches!(
+            finish_create_once_publication(
+                &backup,
+                b"expected",
+                &temporary,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "simulated concurrent publication",
+                )),
+            )
+            .await
+            .expect_err("conflicting backup must remain fatal"),
+            LifecycleJournalError::BackupConflict { path } if path == backup
+        ));
+        assert!(temporary.is_dir());
     }
 
     #[tokio::test]

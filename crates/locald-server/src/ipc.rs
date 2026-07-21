@@ -57,8 +57,8 @@ pub async fn run_ipc_server(
     }
 }
 
-// Tokio already owns this spawned future in its task allocation. Keeping the
-// large connection future inline avoids a second per-connection allocation.
+// Keep the spawned connection boundary named so the accept loop and its
+// per-connection error reporting remain explicit.
 #[allow(clippy::large_futures)]
 async fn handle_connection_task(
     stream: UnixStream,
