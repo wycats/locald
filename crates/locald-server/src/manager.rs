@@ -34,9 +34,9 @@ use locald_core::state::{
 };
 use locald_core::{
     AvailabilityBatch, AvailabilityBatchOperation, AvailabilityError, AvailabilityStore,
-    CatalogError, CatalogPresence, ConvergenceDecision, DemandKey, DomainClaim, DomainName,
+    CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DomainClaim, DomainName,
     DomainTarget, EnsureDemandResult, ProjectAvailability, ProjectDiscovery, ProjectInstanceId,
-    SharedDomainIndex, availability_path, sanitize_project_name_for_dns,
+    SharedDomainIndex, SystemClock, availability_path, sanitize_project_name_for_dns,
     sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
@@ -440,6 +440,32 @@ struct AvailabilityConvergenceOptions {
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeRestorePlan;
 
+#[derive(Clone)]
+struct SharedAvailabilityClock(Arc<dyn Clock>);
+
+impl SharedAvailabilityClock {
+    fn system() -> Self {
+        Self(Arc::new(SystemClock))
+    }
+
+    #[cfg(test)]
+    fn new(clock: impl Clock + 'static) -> Self {
+        Self(Arc::new(clock))
+    }
+}
+
+impl fmt::Debug for SharedAvailabilityClock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedAvailabilityClock")
+    }
+}
+
+impl Clock for SharedAvailabilityClock {
+    fn now(&self) -> SystemTime {
+        self.0.now()
+    }
+}
+
 impl ServiceProjectionToken {
     fn matches(self, service: &Service) -> bool {
         self.instance_id == service.instance_id
@@ -497,6 +523,7 @@ pub struct ProcessManager {
     // availability, and explicit lifecycle actions or daemon restart clear it.
     service_stop_suppressions: Arc<Mutex<HashSet<(ProjectInstanceId, String)>>>,
     availability_data_dir: PathBuf,
+    availability_clock: SharedAvailabilityClock,
     lifecycle_journal: LifecycleJournal,
     runtime_projection_lock: Arc<Mutex<()>>,
     state_persistence_lock: Arc<Mutex<()>>,
@@ -515,6 +542,22 @@ impl ProcessManager {
 
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(AtomicOrdering::Acquire)
+    }
+
+    fn availability_now(&self) -> SystemTime {
+        self.availability_clock.now()
+    }
+
+    async fn load_availability(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> std::result::Result<AvailabilityStore<SharedAvailabilityClock>, AvailabilityError> {
+        AvailabilityStore::load_with_clock(
+            &self.availability_data_dir,
+            instance_id,
+            self.availability_clock.clone(),
+        )
+        .await
     }
 
     fn availability_transition_key(&self) -> usize {
@@ -632,6 +675,26 @@ impl ProcessManager {
         external_log_sender: Option<broadcast::Sender<LogEntry>>,
         availability_data_dir: PathBuf,
     ) -> Result<Self> {
+        Self::new_with_availability_data_dir_and_clock(
+            notify_socket_path,
+            state_manager,
+            registry,
+            attachments,
+            external_log_sender,
+            availability_data_dir,
+            SharedAvailabilityClock::system(),
+        )
+    }
+
+    fn new_with_availability_data_dir_and_clock(
+        notify_socket_path: PathBuf,
+        state_manager: Arc<StateManager>,
+        registry: Arc<Mutex<Registry>>,
+        attachments: Arc<Mutex<AttachmentStore>>,
+        external_log_sender: Option<broadcast::Sender<LogEntry>>,
+        availability_data_dir: PathBuf,
+        availability_clock: SharedAvailabilityClock,
+    ) -> Result<Self> {
         let (tx, _) = if let Some(tx) = external_log_sender {
             (tx, broadcast::channel(1).1) // Dummy receiver
         } else {
@@ -695,6 +758,7 @@ impl ProcessManager {
             forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
             service_stop_suppressions: Arc::new(Mutex::new(HashSet::new())),
             availability_data_dir,
+            availability_clock,
             lifecycle_journal,
             runtime_projection_lock: Arc::new(Mutex::new(())),
             state_persistence_lock: Arc::new(Mutex::new(())),
@@ -2208,7 +2272,7 @@ impl ProcessManager {
                 let transaction = self
                     .prepare_project_lifecycle_transaction(
                         target,
-                        &AvailabilityBatch::new(SystemTime::now()),
+                        &AvailabilityBatch::new(self.availability_now()),
                         attachment_base.clone(),
                         attachment_base,
                     )
@@ -3861,8 +3925,7 @@ impl ProcessManager {
             }
             combined
         };
-        let mut availability =
-            AvailabilityStore::load(&self.availability_data_dir, target.instance_id).await?;
+        let mut availability = self.load_availability(target.instance_id).await?;
         let prepared = availability.prepare_batch(&effective_batch).await?;
         Ok(LifecycleTransaction::new(
             LifecycleTransactionKind::LifecycleMutation,
@@ -4037,7 +4100,7 @@ impl ProcessManager {
         );
         let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
         let instance_id = target.instance_id;
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = !self.availability_record_exists(instance_id).await?;
         let (attachment_base, attachment_target, renews_existing_owner) = {
             let attachments = self.attachments.lock().await;
@@ -4208,7 +4271,7 @@ impl ProcessManager {
             || BTreeSet::from([canonical.clone()]),
             Self::catalogued_lifecycle_paths,
         );
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = match expected_instance {
             Some(instance_id) => !self.availability_record_exists(instance_id).await?,
             None => false,
@@ -4351,7 +4414,7 @@ impl ProcessManager {
             || BTreeSet::from([canonical.clone()]),
             Self::catalogued_lifecycle_paths,
         );
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = match expected_instance {
             Some(instance_id) => !self.availability_record_exists(instance_id).await?,
             None => false,
@@ -4550,7 +4613,7 @@ impl ProcessManager {
         );
         let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
         let instance_id = target.instance_id;
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = !self.availability_record_exists(instance_id).await?;
         let (attachment_base, attachment_target) = {
             let attachments = self.attachments.lock().await;
@@ -4610,7 +4673,7 @@ impl ProcessManager {
             .context("project stop requires a catalogued project instance")?;
         let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
         let instance_id = target.instance_id;
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = !self.availability_record_exists(instance_id).await?;
         let (attachment_base, attachment_target) = {
             let attachments = self.attachments.lock().await;
@@ -4669,8 +4732,7 @@ impl ProcessManager {
                 self.active_path_for_instance(instance_id).await.is_some(),
                 "project instance {instance_id} is no longer active"
             );
-            let mut availability =
-                AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+            let mut availability = self.load_availability(instance_id).await?;
             let (result, durability_error) =
                 Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
             drop(publication_guard);
@@ -4699,8 +4761,7 @@ impl ProcessManager {
                 self.active_path_for_instance(instance_id).await.is_some(),
                 "project instance {instance_id} is no longer active"
             );
-            let mut availability =
-                AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+            let mut availability = self.load_availability(instance_id).await?;
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
             drop(publication_guard);
@@ -4729,8 +4790,7 @@ impl ProcessManager {
             self.ensure_accepting_lifecycle_requests()?;
             let publication_guard = self.lifecycle_publication_lock.lock().await;
             self.ensure_lifecycle_publication_available()?;
-            let mut availability =
-                AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+            let mut availability = self.load_availability(instance_id).await?;
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.pause_project().await)?;
             drop(publication_guard);
@@ -4780,7 +4840,7 @@ impl ProcessManager {
             return Ok(());
         }
 
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let (catalog_base, catalog_path) = {
             let registry = self.registry.lock().await;
             (registry.clone(), registry.storage_path().to_path_buf())
@@ -4860,8 +4920,7 @@ impl ProcessManager {
                 Self::normalize_runtime_evidence_for_initial_migration(&mut evidence, effective_at);
             }
             let plan = plan_project_lifecycle_migration(record.pinned, &evidence, effective_at)?;
-            let mut availability =
-                AvailabilityStore::load(&self.availability_data_dir, *instance_id).await?;
+            let mut availability = self.load_availability(*instance_id).await?;
             let (always_on, compatibility_attachments, compatibility_manually_stopped) =
                 if availability_exists {
                     let authoritative = availability.snapshot().await?;
@@ -4974,13 +5033,11 @@ impl ProcessManager {
                 "missing availability state after lifecycle-v2 migration for project instance {instance_id} at `{}`",
                 path.display()
             );
-            AvailabilityStore::load(&self.availability_data_dir, instance_id)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to validate availability authority for project instance {instance_id}"
-                    )
-                })?;
+            self.load_availability(instance_id).await.with_context(|| {
+                format!(
+                    "failed to validate availability authority for project instance {instance_id}"
+                )
+            })?;
         }
         Ok(())
     }
@@ -4995,7 +5052,7 @@ impl ProcessManager {
         let attachments = self.attachments.lock().await.snapshot();
         let transaction = LifecycleTransaction::new(
             LifecycleTransactionKind::LifecycleMutation,
-            SystemTime::now(),
+            self.availability_now(),
             Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
             Vec::new(),
             AttachmentTransactionImages::new(attachments.clone(), attachments),
@@ -5058,11 +5115,9 @@ impl ProcessManager {
 
         if phase == LifecycleTransactionPhase::CatalogPublished {
             for prepared in transaction.availability() {
-                let mut availability = AvailabilityStore::load(
-                    &self.availability_data_dir,
-                    prepared.project_instance_id(),
-                )
-                .await?;
+                let mut availability = self
+                    .load_availability(prepared.project_instance_id())
+                    .await?;
                 availability.apply_prepared_batch(prepared).await?;
             }
             self.lifecycle_journal
@@ -5136,11 +5191,9 @@ impl ProcessManager {
         }
         if phase.requires_availability_targets() {
             for prepared in transaction.availability() {
-                let mut availability = AvailabilityStore::load(
-                    &self.availability_data_dir,
-                    prepared.project_instance_id(),
-                )
-                .await?;
+                let mut availability = self
+                    .load_availability(prepared.project_instance_id())
+                    .await?;
                 let observed = availability
                     .prepare_batch(&AvailabilityBatch::new(transaction.effective_at()))
                     .await?;
@@ -5338,7 +5391,7 @@ impl ProcessManager {
         }
 
         let mut retired_paths = transition_paths.iter().cloned().collect::<HashSet<_>>();
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let transaction = if let Some(mut target) = target {
             target.catalog_target.unregister_project(&canonical)?;
             let surviving_paths = Self::catalog_paths(&target.catalog_target);
@@ -5654,7 +5707,7 @@ impl ProcessManager {
             );
             let transaction = LifecycleTransaction::new(
                 LifecycleTransactionKind::LifecycleMutation,
-                SystemTime::now(),
+                self.availability_now(),
                 Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
                 Vec::new(),
                 AttachmentTransactionImages::new(attachment_base, attachment_target),
@@ -5684,7 +5737,7 @@ impl ProcessManager {
         };
         anyhow::ensure!(changed, "Project not found in registry");
         let instance_id = target.instance_id;
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = !self.availability_record_exists(instance_id).await?;
         let attachment_base = self.attachments.lock().await.snapshot();
         let mut attachment_target = attachment_base.clone();
@@ -5818,8 +5871,7 @@ impl ProcessManager {
                     )
                 })?;
             let always_on = if availability_exists {
-                let mut availability =
-                    AvailabilityStore::load(&self.availability_data_dir, *instance_id).await?;
+                let mut availability = self.load_availability(*instance_id).await?;
                 availability.snapshot().await?.always_on()
             } else {
                 record.pinned
@@ -5875,11 +5927,10 @@ impl ProcessManager {
             self.stop_project_locked(path).await?;
         }
 
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let mut prepared_availability = Vec::with_capacity(removed_instance_ids.len());
         for instance_id in &removed_instance_ids {
-            let mut availability =
-                AvailabilityStore::load(&self.availability_data_dir, *instance_id).await?;
+            let mut availability = self.load_availability(*instance_id).await?;
             prepared_availability.push(
                 availability
                     .prepare_batch(
@@ -5936,7 +5987,7 @@ impl ProcessManager {
         if self.is_shutting_down() {
             return Ok(());
         }
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let project_paths = {
             let attachments = self.attachments.lock().await;
             attachments
@@ -6070,7 +6121,7 @@ impl ProcessManager {
     }
 
     async fn sweep_availability(
-        availability: &mut AvailabilityStore,
+        availability: &mut AvailabilityStore<SharedAvailabilityClock>,
     ) -> Result<(ConvergenceDecision, Option<anyhow::Error>)> {
         match availability.sweep_and_decide().await {
             Ok(decision) => Ok((decision, None)),
@@ -6144,8 +6195,7 @@ impl ProcessManager {
             self.active_path_for_instance(instance_id).await.is_some(),
             "project instance {instance_id} is no longer active"
         );
-        let mut availability =
-            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let mut availability = self.load_availability(instance_id).await?;
         let (_, durability_error) = Self::capture_availability_publication(
             availability
                 .ensure_demand(DemandKey::stopped_page_resume())
@@ -6172,8 +6222,7 @@ impl ProcessManager {
             ),
             AvailabilityManagementState::LegacyUnmanaged => return Ok(()),
         }
-        let mut availability =
-            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let mut availability = self.load_availability(instance_id).await?;
         let decision = availability.sweep_and_decide().await?;
         if matches!(decision, ConvergenceDecision::EnsureUp) {
             Ok(())
@@ -6200,8 +6249,7 @@ impl ProcessManager {
             ),
             AvailabilityManagementState::LegacyUnmanaged => return Ok(()),
         }
-        let mut availability =
-            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let mut availability = self.load_availability(instance_id).await?;
         let snapshot = availability.snapshot().await?;
         if snapshot.is_paused() {
             Err(AvailabilityStartSuperseded {
@@ -6430,7 +6478,7 @@ impl ProcessManager {
             }
         };
         let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
-        let effective_at = SystemTime::now();
+        let effective_at = self.availability_now();
         let include_deferred = !self.availability_record_exists(instance_id).await?;
         let attachment_base = self.attachments.lock().await.snapshot();
         let mut attachment_target = attachment_base.clone();
@@ -6653,16 +6701,15 @@ impl ProcessManager {
             self.ensure_accepting_lifecycle_requests()?;
             let publication_guard = self.lifecycle_publication_lock.lock().await;
             self.ensure_lifecycle_publication_available()?;
-            let mut availability =
-                match AvailabilityStore::load(&self.availability_data_dir, instance_id).await {
-                    Ok(availability) => availability,
-                    Err(error) => {
-                        return Self::surface_availability_durability(
-                            Err(error.into()),
-                            durability_error,
-                        );
-                    }
-                };
+            let mut availability = match self.load_availability(instance_id).await {
+                Ok(availability) => availability,
+                Err(error) => {
+                    return Self::surface_availability_durability(
+                        Err(error.into()),
+                        durability_error,
+                    );
+                }
+            };
             let (decision, sweep_durability_error) =
                 match Self::sweep_availability(&mut availability).await {
                     Ok(result) => result,
@@ -6866,7 +6913,7 @@ impl ProcessManager {
 
     async fn finish_availability_action_locked(
         &self,
-        availability: &mut AvailabilityStore,
+        availability: &mut AvailabilityStore<SharedAvailabilityClock>,
         decision: ConvergenceDecision,
         action: Result<()>,
         clear_on_success: bool,
@@ -7251,12 +7298,41 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::time::{Duration, UNIX_EPOCH};
     use tempfile::tempdir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
     const TEST_STARTUP_BOUNDARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const TEST_AVAILABILITY_START_SECONDS: u64 = 1_000_000;
+
+    #[derive(Clone, Debug)]
+    struct FakeAvailabilityClock {
+        seconds: Arc<AtomicU64>,
+    }
+
+    impl FakeAvailabilityClock {
+        fn new(seconds: u64) -> Self {
+            Self {
+                seconds: Arc::new(AtomicU64::new(seconds)),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.seconds.fetch_add(duration.as_secs(), Ordering::SeqCst);
+        }
+
+        fn time(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(self.seconds.load(Ordering::SeqCst))
+        }
+    }
+
+    impl Clock for FakeAvailabilityClock {
+        fn now(&self) -> SystemTime {
+            self.time()
+        }
+    }
 
     #[test]
     fn compatibility_status_keeps_manual_cli_session_identity_private() {
@@ -8298,6 +8374,21 @@ mod tests {
         project_path: &Path,
         project_name: &str,
     ) -> (ProcessManager, ProjectInstanceId, PathBuf) {
+        availability_manager_with_clock(
+            root,
+            project_path,
+            project_name,
+            SharedAvailabilityClock::system(),
+        )
+        .await
+    }
+
+    async fn availability_manager_with_clock(
+        root: &Path,
+        project_path: &Path,
+        project_name: &str,
+        clock: SharedAvailabilityClock,
+    ) -> (ProcessManager, ProjectInstanceId, PathBuf) {
         std::fs::create_dir_all(project_path).expect("create availability project");
         let canonical = std::fs::canonicalize(project_path).expect("canonical availability path");
         let mut catalog = Registry::with_path(root.join("catalog.json"));
@@ -8310,7 +8401,7 @@ mod tests {
         catalog.save().await.expect("save availability catalog");
 
         let availability_data_dir = root.join("availability-data");
-        let mut manager = ProcessManager::new_with_availability_data_dir(
+        let mut manager = ProcessManager::new_with_availability_data_dir_and_clock(
             root.join("notify.sock"),
             Arc::new(StateManager::with_path(root.join("state.json"))),
             Arc::new(Mutex::new(catalog)),
@@ -8319,10 +8410,35 @@ mod tests {
             ))),
             None,
             availability_data_dir.clone(),
+            clock,
         )
         .expect("create availability process manager");
         manager.set_host_syncer(Arc::new(NoopHostSyncer));
         (manager, instance_id, availability_data_dir)
+    }
+
+    async fn reopen_availability_manager_with_clock(
+        root: &Path,
+        availability_data_dir: PathBuf,
+        clock: SharedAvailabilityClock,
+    ) -> ProcessManager {
+        let catalog = Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(root))
+            .await
+            .expect("reload availability catalog");
+        let mut manager = ProcessManager::new_with_availability_data_dir_and_clock(
+            root.join("reopened-notify.sock"),
+            Arc::new(StateManager::with_path(root.join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                root.join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+            clock,
+        )
+        .expect("reopen availability process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager
     }
 
     async fn journal_transaction_at_phase(
@@ -12032,6 +12148,394 @@ command = "unused-by-test-factory"
                 .instances
                 .contains_key(&instance_id)
         );
+    }
+
+    #[tokio::test]
+    async fn fake_clock_final_owner_expiry_preserves_then_stops_running_project() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("timed-shutdown-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "timed-shutdown",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "timed-shutdown",
+            "timed-shutdown.localhost",
+            &["web"],
+        );
+
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("start project through manual demand");
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+
+        clock.advance(locald_core::MANUAL_DEMAND_TTL);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("converge exact manual expiry"),
+            Some(ConvergenceDecision::PreserveRuntimeUntil {
+                deadline: clock.time() + locald_core::SHUTDOWN_COOLDOWN,
+            })
+        );
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 0);
+
+        clock.advance(locald_core::SHUTDOWN_COOLDOWN);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("converge exact cooldown expiry"),
+            Some(ConvergenceDecision::EnsureDown)
+        );
+        assert!(!manager.project_runtime_exists(instance_id).await);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fake_clock_expiring_one_owner_preserves_runtime_until_the_last_owner_expires() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("timed-owners-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "timed-owners",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "timed-owners",
+            "timed-owners.localhost",
+            &["web"],
+        );
+
+        manager
+            .project_ensure_availability(
+                &project_path,
+                DemandKey::vs_code_window("owner-window").expect("construct editor demand"),
+            )
+            .await
+            .expect("start through editor owner");
+        manager
+            .project_ensure_availability(
+                &project_path,
+                DemandKey::agent_conversation("owner-conversation")
+                    .expect("construct agent demand"),
+            )
+            .await
+            .expect("add agent owner");
+
+        clock.advance(locald_core::VSCODE_DEMAND_TTL);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("expire only editor owner"),
+            Some(ConvergenceDecision::EnsureUp)
+        );
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 0);
+
+        clock.advance(locald_core::AGENT_DEMAND_TTL - locald_core::VSCODE_DEMAND_TTL);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("expire final agent owner"),
+            Some(ConvergenceDecision::PreserveRuntimeUntil {
+                deadline: clock.time() + locald_core::SHUTDOWN_COOLDOWN,
+            })
+        );
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+
+        clock.advance(locald_core::SHUTDOWN_COOLDOWN);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("stop after final-owner cooldown"),
+            Some(ConvergenceDecision::EnsureDown)
+        );
+        assert!(!manager.project_runtime_exists(instance_id).await);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fake_clock_restart_restores_a_still_live_persisted_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("live-demand-restore-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "live-demand-restore",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "live-demand-restore",
+            "live-demand-restore.localhost",
+            &["web"],
+        );
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("persist live manual demand");
+        manager
+            .state_manager
+            .save(&ServerState::default())
+            .await
+            .expect("persist empty runtime evidence for restart");
+        drop(manager);
+
+        clock.advance(locald_core::MANUAL_DEMAND_TTL - Duration::from_secs(1));
+        let mut reopened = reopen_availability_manager_with_clock(
+            dir.path(),
+            availability_data_dir,
+            SharedAvailabilityClock::new(clock),
+        )
+        .await;
+        reopened.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let restore_plan = reopened
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile empty restart evidence");
+        reopened.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(reopened.project_runtime_is_ready(instance_id).await);
+        reopened
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up restored demand runtime");
+    }
+
+    #[tokio::test]
+    async fn fake_clock_restart_never_restores_expired_demand_or_cooldown() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("expired-demand-restore-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "expired-demand-restore",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        write_availability_worker_config(
+            &project_path,
+            "expired-demand-restore",
+            "expired-demand-restore.localhost",
+            &["web"],
+        );
+        manager
+            .load_availability(instance_id)
+            .await
+            .expect("load expiring availability")
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("persist expiring manual demand");
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    name: "expired-demand-restore:web".to_owned(),
+                    config: test_config_with_domain(
+                        "expired-demand-restore",
+                        "expired-demand-restore.localhost",
+                    ),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist stale running evidence");
+        drop(manager);
+
+        clock.advance(locald_core::MANUAL_DEMAND_TTL);
+        let reopened = reopen_availability_manager_with_clock(
+            dir.path(),
+            availability_data_dir,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let restore_plan = reopened
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("retire stale runtime evidence");
+        reopened.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(!reopened.project_runtime_exists(instance_id).await);
+        let snapshot = reopened
+            .load_availability(instance_id)
+            .await
+            .expect("reload expired availability")
+            .snapshot()
+            .await
+            .expect("read expired availability");
+        assert!(snapshot.demands().is_empty());
+        assert_eq!(
+            snapshot.shutdown_cooldown_until(),
+            Some(clock.time() + locald_core::SHUTDOWN_COOLDOWN)
+        );
+
+        clock.advance(locald_core::SHUTDOWN_COOLDOWN);
+        assert_eq!(
+            reopened
+                .converge_project_availability(&project_path)
+                .await
+                .expect("converge elapsed restart cooldown"),
+            Some(ConvergenceDecision::EnsureDown)
+        );
+        assert!(!reopened.project_runtime_exists(instance_id).await);
+    }
+
+    #[tokio::test]
+    async fn fake_clock_restart_restores_always_on_but_preserves_its_pause() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("always-on-pause-restore-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "always-on-pause-restore",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        write_availability_worker_config(
+            &project_path,
+            "always-on-pause-restore",
+            "always-on-pause-restore.localhost",
+            &["web"],
+        );
+        manager
+            .load_availability(instance_id)
+            .await
+            .expect("load Always On availability")
+            .set_always_on(true)
+            .await
+            .expect("persist Always On policy");
+        manager
+            .state_manager
+            .save(&ServerState::default())
+            .await
+            .expect("persist empty Always On runtime evidence");
+        drop(manager);
+
+        let mut reopened = reopen_availability_manager_with_clock(
+            dir.path(),
+            availability_data_dir.clone(),
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        reopened.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let restore_plan = reopened
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile Always On restart evidence");
+        reopened.restore_policy_owned_projects(restore_plan).await;
+        assert!(reopened.project_runtime_is_ready(instance_id).await);
+
+        reopened
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause restored Always On project");
+        assert!(!reopened.project_runtime_exists(instance_id).await);
+        drop(reopened);
+
+        let mut paused_reopen = reopen_availability_manager_with_clock(
+            dir.path(),
+            availability_data_dir,
+            SharedAvailabilityClock::new(clock),
+        )
+        .await;
+        paused_reopen.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let restore_plan = paused_reopen
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile paused Always On restart evidence");
+        paused_reopen
+            .restore_policy_owned_projects(restore_plan)
+            .await;
+        assert!(!paused_reopen.project_runtime_exists(instance_id).await);
+        let paused = paused_reopen
+            .load_availability(instance_id)
+            .await
+            .expect("reload paused Always On availability")
+            .snapshot()
+            .await
+            .expect("read paused Always On availability");
+        assert!(paused.always_on());
+        assert!(paused.is_paused());
+
+        assert!(
+            paused_reopen
+                .project_set_always_on(&project_path, true)
+                .await
+                .expect("semantic Always On activity resumes project")
+        );
+        assert!(paused_reopen.project_runtime_is_ready(instance_id).await);
+        paused_reopen
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed Always On runtime");
     }
 
     #[tokio::test]
