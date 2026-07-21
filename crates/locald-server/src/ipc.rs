@@ -1,8 +1,8 @@
 use crate::ShutdownReason;
 use crate::container::ContainerManager;
 use crate::manager::ProcessManager;
-use anyhow::Result;
-use locald_core::attachments::AttachmentSource;
+use anyhow::{Context, Result};
+use locald_core::attachments::{AttachmentSource, ManualCliSession};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::DaemonIdentity;
 use locald_core::{IpcRequest, IpcResponse};
@@ -71,6 +71,46 @@ async fn handle_connection_task(
         handle_connection(stream, manager, container_manager, shutdown_tx, version).await
     {
         error!("Error handling connection: {}", error);
+    }
+}
+
+fn authenticated_peer_pid(stream: &UnixStream) -> Result<u32> {
+    let credentials = stream
+        .peer_cred()
+        .context("failed to read kernel-authenticated IPC peer credentials")?;
+    let pid = credentials
+        .pid()
+        .context("kernel-authenticated IPC peer credentials did not include a process ID")?;
+    let pid = u32::try_from(pid).context("kernel-authenticated IPC peer process ID was invalid")?;
+    anyhow::ensure!(pid > 0, "kernel-authenticated IPC peer process ID was zero");
+    Ok(pid)
+}
+
+fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -> Result<()> {
+    let peer_pid = authenticated_peer_pid(stream)?;
+    anyhow::ensure!(
+        session.pid() == peer_pid,
+        "Manual CLI session PID {} does not match kernel-authenticated IPC peer PID {peer_pid}",
+        session.pid()
+    );
+    Ok(())
+}
+
+fn authenticate_process_bound_attachment_source(
+    stream: &UnixStream,
+    source: AttachmentSource,
+) -> Result<AttachmentSource> {
+    match source {
+        AttachmentSource::CLI { .. } => Ok(AttachmentSource::CLI {
+            pid: authenticated_peer_pid(stream)?,
+        }),
+        AttachmentSource::ManualCLI(session) => {
+            validate_manual_cli_session(stream, session)?;
+            Ok(AttachmentSource::ManualCLI(session))
+        }
+        source @ (AttachmentSource::Editor { .. }
+        | AttachmentSource::Runtime
+        | AttachmentSource::Pin) => Ok(source),
     }
 }
 
@@ -196,14 +236,24 @@ async fn handle_connection(
         manual_cli_session,
     } = request
     {
-        let legacy_cli_peer_pid = if manual_cli_session.is_none() {
-            stream
-                .peer_cred()
-                .ok()
-                .and_then(|credentials| credentials.pid())
-                .and_then(|pid| u32::try_from(pid).ok())
-        } else {
+        let legacy_cli_peer_pid = if let Some(session) = manual_cli_session {
+            if let Err(error) = validate_manual_cli_session(&stream, session) {
+                let mut bytes = serde_json::to_vec(&IpcResponse::Error(format!("{error:#}")))?;
+                bytes.push(b'\n');
+                stream.write_all(&bytes).await?;
+                return Ok(());
+            }
             None
+        } else {
+            match authenticated_peer_pid(&stream) {
+                Ok(peer_pid) => Some(peer_pid),
+                Err(error) => {
+                    tracing::debug!(
+                        "Legacy Start request has no authenticated peer PID for attachment pairing: {error:#}"
+                    );
+                    None
+                }
+            }
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let manager = manager.clone();
@@ -323,21 +373,30 @@ async fn handle_connection(
                     "ManualCLI owners are created only by their paired Start request".to_owned(),
                 )
             } else {
-                match manager
-                    .project_attach_from_ipc(project_path, source, standalone)
-                    .await
-                {
-                    Ok(()) => IpcResponse::Ok,
-                    Err(e) => IpcResponse::Error(e.to_string()),
+                match authenticate_process_bound_attachment_source(&stream, source) {
+                    Ok(source) => match manager
+                        .project_attach_from_ipc(project_path, source, standalone)
+                        .await
+                    {
+                        Ok(()) => IpcResponse::Ok,
+                        Err(e) => IpcResponse::Error(e.to_string()),
+                    },
+                    Err(error) => IpcResponse::Error(format!("{error:#}")),
                 }
             }
         }
         IpcRequest::ProjectDetach {
             project_path,
             source,
-        } => match manager.project_detach(project_path, source).await {
-            Ok(()) => IpcResponse::Ok,
-            Err(e) => IpcResponse::Error(e.to_string()),
+        } => match source
+            .map(|source| authenticate_process_bound_attachment_source(&stream, source))
+            .transpose()
+        {
+            Ok(source) => match manager.project_detach(project_path, source).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(e) => IpcResponse::Error(e.to_string()),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectStatus { project_path } => {
             match manager.project_status(&project_path).await {
@@ -373,4 +432,55 @@ async fn handle_connection(
     stream.write_all(&response_bytes).await?;
 
     Ok(())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    fn different_pid(pid: u32) -> u32 {
+        pid.wrapping_add(1)
+    }
+
+    #[tokio::test]
+    async fn unix_stream_peer_pid_is_kernel_authenticated() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+
+        assert_eq!(
+            authenticated_peer_pid(&server).expect("authenticate IPC peer PID"),
+            std::process::id()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_cli_session_rejects_a_spoofed_pid() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let peer_pid = authenticated_peer_pid(&server).expect("authenticate IPC peer PID");
+        let session = ManualCliSession::new(different_pid(peer_pid));
+
+        let error = validate_manual_cli_session(&server, session)
+            .expect_err("spoofed Manual CLI PID must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match kernel-authenticated IPC peer PID")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_attachment_uses_the_authenticated_peer_pid() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let peer_pid = authenticated_peer_pid(&server).expect("authenticate IPC peer PID");
+
+        let source = authenticate_process_bound_attachment_source(
+            &server,
+            AttachmentSource::CLI {
+                pid: different_pid(peer_pid),
+            },
+        )
+        .expect("authenticate CLI attachment source");
+
+        assert_eq!(source, AttachmentSource::CLI { pid: peer_pid });
+    }
 }
