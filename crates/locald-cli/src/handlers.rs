@@ -541,7 +541,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 } else {
                     None
                 };
-                let project_path = std::fs::canonicalize(&current_dir).unwrap_or(current_dir);
+                let project_path = resolve_project_locator(&current_dir)?;
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::ProjectForceStop {
                     project_path: project_path.clone(),

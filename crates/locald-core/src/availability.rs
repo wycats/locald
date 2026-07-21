@@ -1935,7 +1935,7 @@ fn availability_hierarchy_owners(project_state_directory: &Path) -> Vec<PathBuf>
     project_state_directory
         .ancestors()
         .skip(1)
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .take_while(|ancestor| ancestor.parent().is_some())
         .map(Path::to_path_buf)
         .collect()
 }
@@ -2033,7 +2033,7 @@ mod tests {
     }
 
     #[test]
-    fn first_publication_repairs_every_hierarchy_owner() {
+    fn first_publication_repairs_every_non_root_hierarchy_owner() {
         assert_eq!(
             availability_hierarchy_owners(Path::new(
                 "/existing/missing/nested/instances/instance-id"
@@ -2043,7 +2043,6 @@ mod tests {
                 PathBuf::from("/existing/missing/nested"),
                 PathBuf::from("/existing/missing"),
                 PathBuf::from("/existing"),
-                PathBuf::from("/"),
             ]
         );
     }

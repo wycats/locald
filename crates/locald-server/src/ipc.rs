@@ -42,24 +42,35 @@ pub async fn run_ipc_server(
                 let container_manager = container_manager.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 let version = version.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Box::pin(handle_connection(
-                        stream,
-                        manager,
-                        container_manager,
-                        shutdown_tx,
-                        version,
-                    ))
-                    .await
-                    {
-                        error!("Error handling connection: {}", e);
-                    }
-                });
+                tokio::spawn(handle_connection_task(
+                    stream,
+                    manager,
+                    container_manager,
+                    shutdown_tx,
+                    version,
+                ));
             }
             Err(e) => {
                 error!("Error accepting connection: {}", e);
             }
         }
+    }
+}
+
+// Tokio already owns this spawned future in its task allocation. Keeping the
+// large connection future inline avoids a second per-connection allocation.
+#[allow(clippy::large_futures)]
+async fn handle_connection_task(
+    stream: UnixStream,
+    manager: ProcessManager,
+    container_manager: Arc<ContainerManager>,
+    shutdown_tx: Sender<ShutdownReason>,
+    version: String,
+) {
+    if let Err(error) =
+        handle_connection(stream, manager, container_manager, shutdown_tx, version).await
+    {
+        error!("Error handling connection: {}", error);
     }
 }
 

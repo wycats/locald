@@ -1123,7 +1123,7 @@ fn attachment_hierarchy_owners(parent: &Path) -> Vec<PathBuf> {
     parent
         .ancestors()
         .skip(1)
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .take_while(|ancestor| ancestor.parent().is_some())
         .map(Path::to_path_buf)
         .collect()
 }
@@ -1907,14 +1907,13 @@ mod tests {
     }
 
     #[test]
-    fn first_snapshot_publication_repairs_every_hierarchy_owner() {
+    fn first_snapshot_publication_repairs_every_non_root_hierarchy_owner() {
         assert_eq!(
             attachment_hierarchy_owners(Path::new("/existing/missing/nested/attachment-state")),
             vec![
                 PathBuf::from("/existing/missing/nested"),
                 PathBuf::from("/existing/missing"),
                 PathBuf::from("/existing"),
-                PathBuf::from("/"),
             ]
         );
     }
