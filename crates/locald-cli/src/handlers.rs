@@ -92,13 +92,12 @@ const fn section_label(section: ProjectSection) -> &'static str {
     }
 }
 
-fn resolve_project_locator(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+fn resolve_project_locator(path: &std::path::Path) -> CliResult<std::path::PathBuf> {
     locald_core::normalize_project_locator(path).map_err(|source| {
-        let message = format!(
+        CliError::message(format!(
             "Failed to resolve project path `{}`: {source}",
             path.display()
-        );
-        anyhow::Error::new(source).context(message)
+        ))
     })
 }
 
@@ -2264,11 +2263,13 @@ mod tests {
         let locator = std::path::Path::new("/invalid\0project");
 
         let error = resolve_project_locator(locator).expect_err("reject invalid locator");
-        let source = error.root_cause().to_string();
-        let message = CliError::from(error).to_string();
+        let source = locald_core::normalize_project_locator(locator)
+            .expect_err("invalid locator has an I/O cause")
+            .to_string();
+        let message = error.to_string();
         assert!(message.contains("Failed to resolve project path"));
         assert!(message.contains(&locator.display().to_string()));
-        assert!(message.contains(&source));
+        assert_eq!(message.matches(&source).count(), 1);
     }
 
     #[test]
