@@ -255,6 +255,7 @@ struct ConfigTransitionPlan {
     removed_service_names: Vec<String>,
     restart_service_names: Vec<String>,
     reusable_service_envs: HashMap<String, HashMap<String, String>>,
+    stopped_service_projections: HashMap<String, (ServiceConfig, Option<HashMap<String, String>>)>,
 }
 
 #[derive(Debug)]
@@ -1016,6 +1017,7 @@ impl ProcessManager {
         let mut changed_services = HashSet::new();
         let mut restart_service_names = Vec::new();
         let mut reusable_service_envs = HashMap::new();
+        let mut stopped_service_projections = HashMap::new();
 
         for service_name in sorted_services {
             let service_config = &config.services[service_name];
@@ -1057,7 +1059,7 @@ impl ProcessManager {
                 })
             };
 
-            let (has_controller, is_up_to_date) = match service_snapshot {
+            let (has_controller, is_up_to_date, is_stopped_projection) = match service_snapshot {
                 Some((loaded_instance, loaded_path, _, _, Some(_), _))
                     if loaded_instance != instance_id =>
                 {
@@ -1085,10 +1087,19 @@ impl ProcessManager {
                             && has_durable_process_ownership
                             && current_config == *service_config
                             && environment_matches,
+                        false,
                     )
                 }
-                Some((_, _, _, _, None, _)) | None => (false, false),
+                Some((_, _, _, _, None, _)) => (false, false, true),
+                None => (false, false, false),
             };
+
+            if is_stopped_projection {
+                stopped_service_projections.insert(
+                    full_name.clone(),
+                    (service_config.clone(), resolved_env.clone()),
+                );
+            }
 
             if !is_up_to_date {
                 changed_services.insert(service_name.clone());
@@ -1106,6 +1117,7 @@ impl ProcessManager {
             removed_service_names,
             restart_service_names,
             reusable_service_envs,
+            stopped_service_projections,
         })
     }
 
@@ -2101,6 +2113,7 @@ impl ProcessManager {
             removed_service_names,
             published_domain_index,
             mut reusable_service_envs,
+            stopped_service_projections,
             pending_initial,
         ) = {
             let mut registry = self.registry.lock().await;
@@ -2152,6 +2165,7 @@ impl ProcessManager {
                 removed_service_names,
                 restart_service_names,
                 reusable_service_envs,
+                stopped_service_projections,
             } = self
                 .prepublication_stop_plan(
                     instance_id,
@@ -2233,6 +2247,7 @@ impl ProcessManager {
                 removed_service_names,
                 published_domain_index,
                 reusable_service_envs,
+                stopped_service_projections,
                 pending_initial,
             )
         };
@@ -2242,6 +2257,7 @@ impl ProcessManager {
         // PublishedNotDurable, then surface the durability result. Removed
         // service records leave runtime state at the same publication point.
         if let Some(published_domain_index) = published_domain_index {
+            let mut published_stopped_service_names = Vec::new();
             {
                 let mut services = self.services.lock().await;
                 for (name, resolved_env) in &reusable_service_envs {
@@ -2255,10 +2271,37 @@ impl ProcessManager {
                         Self::advance_service_projection(service);
                     }
                 }
+                for (name, (service_config, resolved_env)) in &stopped_service_projections {
+                    if let Some(service) = services.get_mut(name).filter(|service| {
+                        service.instance_id == instance_id
+                            && matches!(&service.runtime_state, ServiceRuntime::None)
+                    }) {
+                        service.config = config.clone();
+                        service.service_config.clone_from(service_config);
+                        service.path.clone_from(&path);
+                        service.resolved_env = resolved_env.clone().unwrap_or_default();
+                        service.health_status = HealthStatus::Unknown;
+                        service.health_source = HealthSource::None;
+                        service.warnings.clear();
+                        Self::advance_service_projection(service);
+                        published_stopped_service_names.push(name.clone());
+                    }
+                }
                 for name in &removed_service_names {
                     services.remove(name);
                 }
                 self.domain_index.store(published_domain_index);
+            }
+            for name in &published_stopped_service_names {
+                self.broadcast_service_update(name).await;
+            }
+            if !removed_service_names.is_empty() {
+                let removed_service_names = removed_service_names
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                self.clear_service_stop_suppressions_for(instance_id, &removed_service_names)
+                    .await;
             }
             drop(lifecycle_publication_guard);
             self.persist_state().await;
@@ -3398,7 +3441,7 @@ impl ProcessManager {
         let mut resolved = Vec::with_capacity(projects.len());
         for project in projects {
             let canonical = Self::canonicalize_path(&project.path);
-            let entry = match self.resolve_lifecycle_target(&canonical).await? {
+            let entry = match self.resolve_lifecycle_projection(&canonical).await {
                 LifecycleTargetResolution::Catalogued(target) => {
                     let record = target
                         .catalog_target
@@ -3425,6 +3468,53 @@ impl ProcessManager {
         }
         resolved.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(resolved)
+    }
+
+    /// Resolve live identity when possible while retaining the durable catalog
+    /// projection when a saved locator cannot currently be inspected.
+    /// Lifecycle mutations continue to use `resolve_lifecycle_target` directly
+    /// so discovery failures remain fail-closed.
+    async fn resolve_lifecycle_projection(&self, project_path: &Path) -> LifecycleTargetResolution {
+        match self.resolve_lifecycle_target(project_path).await {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let path = Self::canonicalize_path(project_path);
+                warn!(
+                    "Failed to refresh project identity for read-only projection at {}: {error}",
+                    path.display()
+                );
+                self.catalog_projection_for_path(path).await
+            }
+        }
+    }
+
+    async fn catalog_projection_for_path(&self, path: PathBuf) -> LifecycleTargetResolution {
+        let catalog_base = self.registry.lock().await.clone();
+        let mut candidates = catalog_base
+            .instances
+            .iter()
+            .filter_map(|(id, record)| {
+                (record.current_path.as_deref() == Some(path.as_path())
+                    || Self::canonicalize_path(&record.last_known_path) == path)
+                    .then_some(*id)
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(instance_id) = catalog_base.legacy_paths.get(&path) {
+            candidates.insert(*instance_id);
+        }
+        match candidates.len() {
+            0 => LifecycleTargetResolution::UnresolvedLegacy,
+            1 => LifecycleTargetResolution::Catalogued(Box::new(CataloguedLifecycleTarget {
+                instance_id: candidates
+                    .into_iter()
+                    .next()
+                    .expect("one projection candidate exists"),
+                path,
+                catalog_target: catalog_base.clone(),
+                catalog_base,
+            })),
+            _ => LifecycleTargetResolution::Ambiguous,
+        }
     }
 
     async fn resolve_lifecycle_target(
@@ -5333,7 +5423,7 @@ impl ProcessManager {
 
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
         let canonical = Self::canonicalize_path(project_path);
-        let resolution = self.resolve_lifecycle_target(&canonical).await?;
+        let resolution = self.resolve_lifecycle_projection(&canonical).await;
         let (project_name, instance_id) = match &resolution {
             LifecycleTargetResolution::Catalogued(target) => (
                 target
@@ -5437,7 +5527,7 @@ impl ProcessManager {
         let filter = filter.unwrap_or(ProjectFilter::All);
         for path in all_projects {
             let canonical = Self::canonicalize_path(&path);
-            let resolution = self.resolve_lifecycle_target(&canonical).await?;
+            let resolution = self.resolve_lifecycle_projection(&canonical).await;
             let (instance_id, project_name, pinned, attachments_for) = match resolution {
                 LifecycleTargetResolution::Catalogued(target) => {
                     let record = target.catalog_target.instances.get(&target.instance_id);
@@ -6459,7 +6549,6 @@ impl ProcessManager {
         let coordinator = self.availability_coordinator(instance_id).await;
         let _runtime_guard = coordinator.runtime.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
-        self.clear_service_stop_suppressions(instance_id).await;
         let requested_path = if self
             .path_matches_instance(&requested_path, instance_id)
             .await
@@ -11297,6 +11386,142 @@ command = "unused-by-test-factory"
     }
 
     #[tokio::test]
+    async fn registry_list_preserves_saved_entries_when_git_discovery_fails() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("registry-list-repository");
+        std::fs::create_dir(&repository).expect("create registry-list repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n")
+            .expect("write registry-list fixture");
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = dir.path().join("registry-list-worktree");
+        let worktree_arg = worktree
+            .to_str()
+            .expect("UTF-8 registry-list worktree path");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "registry-list", worktree_arg],
+        );
+        let worktree = std::fs::canonicalize(worktree).expect("canonical registry-list worktree");
+        let healthy = dir.path().join("healthy-project");
+        std::fs::create_dir(&healthy).expect("create healthy project");
+        let healthy = std::fs::canonicalize(healthy).expect("canonical healthy project");
+
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let broken_instance = catalog
+            .register_project(
+                Registry::discover(worktree.clone())
+                    .await
+                    .expect("discover registry-list worktree"),
+                Some("saved-worktree".to_owned()),
+            )
+            .expect("register registry-list worktree");
+        assert!(catalog.pin_project(&worktree));
+        catalog
+            .register_project(
+                Registry::discover(healthy.clone())
+                    .await
+                    .expect("discover healthy project"),
+                Some("healthy".to_owned()),
+            )
+            .expect("register healthy project");
+        catalog.save().await.expect("persist registry-list catalog");
+        let saved_entries = catalog.project_entries();
+        let saved_worktree = saved_entries
+            .iter()
+            .find(|entry| entry.path == worktree)
+            .expect("saved worktree entry")
+            .clone();
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create registry-list manager");
+        let catalog_before = registry.lock().await.clone();
+
+        let git_locator = std::fs::read_to_string(worktree.join(".git"))
+            .expect("read linked-worktree Git locator");
+        let git_admin = PathBuf::from(
+            git_locator
+                .trim()
+                .strip_prefix("gitdir: ")
+                .expect("linked-worktree locator prefix"),
+        );
+        std::fs::rename(&git_admin, git_admin.with_extension("unavailable"))
+            .expect("make linked-worktree Git metadata unavailable");
+        let discovery_error = Registry::discover(worktree.clone())
+            .await
+            .expect_err("broken linked worktree discovery fails");
+        assert!(format!("{discovery_error:#}").contains("git worktree repair"));
+
+        let listed = manager
+            .registry_list()
+            .await
+            .expect("list retains saved entries when one discovery fails");
+        assert!(listed.contains(&saved_worktree));
+        let listed_healthy = listed
+            .iter()
+            .find(|entry| entry.path == healthy)
+            .expect("healthy sibling remains visible");
+        assert_eq!(listed_healthy.name.as_deref(), Some("healthy"));
+        assert!(!listed_healthy.pinned);
+        assert_eq!(*registry.lock().await, catalog_before);
+        assert!(
+            registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&broken_instance)
+        );
+
+        let status = manager
+            .project_status(&worktree)
+            .await
+            .expect("status retains saved identity when discovery fails");
+        assert_eq!(status.project_path, worktree);
+        assert_eq!(status.project_name.as_deref(), Some("saved-worktree"));
+        assert!(!status.is_running);
+
+        let projects = manager
+            .project_list(Some(ProjectFilter::All))
+            .await
+            .expect("project list retains all saved entries when discovery fails");
+        let listed_worktree = projects
+            .iter()
+            .find(|entry| entry.project_path == worktree)
+            .expect("broken saved worktree remains in project list");
+        assert_eq!(
+            listed_worktree.project_name.as_deref(),
+            Some("saved-worktree")
+        );
+        assert_eq!(listed_worktree.section, ProjectSection::AlwaysOn);
+        assert!(
+            projects.iter().any(|entry| entry.project_path == healthy),
+            "healthy sibling remains in the project list"
+        );
+
+        let mutation_error = manager
+            .registry_unpin(&worktree)
+            .await
+            .expect_err("lifecycle mutation remains fail-closed");
+        assert!(format!("{mutation_error:#}").contains("git worktree repair"));
+    }
+
+    #[tokio::test]
     async fn unregistered_replacement_cannot_observe_or_mutate_historical_instance() {
         let dir = tempdir().expect("create temporary directory");
         let fixture = unregistered_replacement_fixture(dir.path()).await;
@@ -12158,6 +12383,87 @@ command = "sleep 30"
                 .await
                 .expect("sibling remains running")
         ));
+        let mut service_events = manager.event_sender.subscribe();
+
+        let reloaded_config_source = r#"
+[project]
+name = "service-stop"
+domain = "service-stop-reloaded.localhost"
+
+[services.web]
+type = "worker"
+command = "updated-but-still-stopped"
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+"#;
+        let reloaded_config: LocaldConfig =
+            toml::from_str(reloaded_config_source).expect("parse reloaded stopped-service config");
+        std::fs::write(project_path.join("locald.toml"), reloaded_config_source)
+            .expect("write reloaded stopped-service config");
+
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("passive config reload preserves service stop intent");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_none(),
+            "watcher reload must not reactivate an explicitly stopped service"
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "service-stop:web".to_owned()))
+        );
+        {
+            let services = manager.services.lock().await;
+            let stopped = services
+                .get("service-stop:web")
+                .expect("stopped service projection remains available");
+            assert!(matches!(&stopped.runtime_state, ServiceRuntime::None));
+            assert_eq!(stopped.config, reloaded_config);
+            assert_eq!(stopped.service_config, reloaded_config.services["web"]);
+        }
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("service-stop-reloaded.localhost")
+                .is_some()
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("service-stop.localhost")
+                .is_none()
+        );
+        let event = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, service_events.recv())
+            .await
+            .expect("stopped projection update is broadcast")
+            .expect("stopped projection event channel remains open");
+        let Event::ServiceUpdate(status) = event else {
+            panic!("stopped projection publishes a service update");
+        };
+        assert_eq!(status.name, "service-stop:web");
+        assert_eq!(status.status, ServiceState::Stopped);
+        assert_eq!(
+            status.domain.as_deref(),
+            Some("service-stop-reloaded.localhost")
+        );
+        assert!(Arc::ptr_eq(
+            &sibling,
+            &manager
+                .get_service_controller("service-stop:worker")
+                .await
+                .expect("sibling remains running after watcher reload")
+        ));
 
         manager
             .start(project_path.clone(), None, false)
@@ -12249,6 +12555,96 @@ command = "sleep 30"
             .project_pause_availability(&project_path)
             .await
             .expect("clean up service-stop project");
+    }
+
+    #[tokio::test]
+    async fn removed_service_retires_its_stop_override_after_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("removed-service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "removed-service-stop").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "removed-service-stop",
+            "removed-service-stop.localhost",
+            &["web", "worker"],
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start two-service project");
+        manager
+            .stop("removed-service-stop:web")
+            .await
+            .expect("stop service before removing it");
+        manager
+            .stop("removed-service-stop:worker")
+            .await
+            .expect("stop sibling independently");
+
+        write_availability_worker_config(
+            &project_path,
+            "removed-service-stop",
+            "removed-service-stop.localhost",
+            &["worker"],
+        );
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("publish stopped service removal");
+        {
+            let suppressions = manager.service_stop_suppressions.lock().await;
+            assert!(!suppressions.contains(&(instance_id, "removed-service-stop:web".to_owned())));
+            assert!(
+                suppressions.contains(&(instance_id, "removed-service-stop:worker".to_owned()))
+            );
+        }
+        assert!(
+            manager
+                .services
+                .lock()
+                .await
+                .get("removed-service-stop:web")
+                .is_none()
+        );
+
+        write_availability_worker_config(
+            &project_path,
+            "removed-service-stop",
+            "removed-service-stop.localhost",
+            &["web", "worker"],
+        );
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("re-add service after its retired stop override");
+        assert!(
+            manager
+                .get_service_controller("removed-service-stop:web")
+                .await
+                .is_some(),
+            "a re-added service starts under the project's live demand"
+        );
+        assert!(
+            manager
+                .get_service_controller("removed-service-stop:worker")
+                .await
+                .is_none(),
+            "an unrelated service stop remains in force"
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up removed-service-stop project");
     }
 
     #[tokio::test]
@@ -18784,6 +19180,11 @@ domain = "reload.localhost"
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: host_sync_calls.clone(),
         }));
+        manager
+            .service_stop_suppressions
+            .lock()
+            .await
+            .insert((instance_id, "reload:a".to_owned()));
 
         let error = manager
             .apply_config(project_path, None, false)
@@ -18817,6 +19218,14 @@ domain = "reload.localhost"
         };
         assert!(Arc::ptr_eq(restored_controller, &failing_controller));
         drop(services);
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "reload:a".to_owned())),
+            "failed publication preserves existing service stop intent"
+        );
         assert!(
             host_sync_calls
                 .lock()
