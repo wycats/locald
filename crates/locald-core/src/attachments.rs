@@ -403,10 +403,40 @@ impl AttachmentStore {
         &self.path
     }
 
-    #[allow(clippy::disallowed_methods)]
     pub async fn load(&mut self) -> Result<()> {
-        if self.path.exists() {
-            let content = tokio::fs::read_to_string(&self.path).await?;
+        let content = match tokio::fs::read_to_string(&self.path).await {
+            Ok(content) => Some(content),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                match tokio::fs::symlink_metadata(&self.path).await {
+                    Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => None,
+                    Ok(_) => {
+                        return Err(source).with_context(|| {
+                            format!(
+                                "failed to read legacy attachment state `{}`",
+                                self.path.display()
+                            )
+                        });
+                    }
+                    Err(metadata_error) => {
+                        return Err(metadata_error).with_context(|| {
+                            format!(
+                                "failed to inspect legacy attachment state `{}`",
+                                self.path.display()
+                            )
+                        });
+                    }
+                }
+            }
+            Err(source) => {
+                return Err(source).with_context(|| {
+                    format!(
+                        "failed to read legacy attachment state `{}`",
+                        self.path.display()
+                    )
+                });
+            }
+        };
+        if let Some(content) = content {
             if content.trim().is_empty() {
                 self.attachments.clear();
                 self.manually_stopped.clear();
@@ -1708,6 +1738,38 @@ mod tests {
             .await
             .expect("write legacy attachment state");
         assert!(store.load_exact().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_legacy_attachment_entry_is_not_treated_as_absent() {
+        let dir = tempdir().expect("create temporary directory");
+        let store_path = dir.path().join("attachments.json");
+        let missing_target = dir.path().join("missing-attachments");
+        std::os::unix::fs::symlink(&missing_target, &store_path)
+            .expect("create dangling attachment-state symlink");
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.mark_stopped(&dir.path().join("known-project"));
+        let before = store.snapshot();
+
+        store
+            .load()
+            .await
+            .expect_err("dangling attachment state must block loading");
+        assert_eq!(store.snapshot(), before);
+        assert!(
+            tokio::fs::symlink_metadata(&store_path)
+                .await
+                .expect("inspect preserved attachment state")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            tokio::fs::read_link(&store_path)
+                .await
+                .expect("read preserved attachment-state symlink"),
+            missing_target
+        );
     }
 
     #[tokio::test]
