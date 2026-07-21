@@ -106,7 +106,9 @@ impl StateManager {
                         });
                     }
                     Err(metadata_error) => {
-                        return Err(metadata_error).context("Failed to inspect state file");
+                        return Err(metadata_error).with_context(|| {
+                            format!("Failed to inspect state file {}", self.state_path.display())
+                        });
                     }
                 }
             }
