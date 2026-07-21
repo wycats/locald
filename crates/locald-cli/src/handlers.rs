@@ -552,6 +552,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     None
                 };
                 let project_path = std::fs::canonicalize(&current_dir).unwrap_or(current_dir);
+                utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::ProjectForceStop {
                     project_path: project_path.clone(),
                 }) {
@@ -559,17 +560,13 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         if let Some(json_actions) = json_actions {
                             println!("{}", serde_json::to_string_pretty(&json_actions)?);
                         } else {
-                            println!(
-                                "{} Stopped project {}",
-                                style::CHECK,
-                                project_path.display()
-                            );
+                            println!("{} Paused project {}", style::CHECK, project_path.display());
                         }
                         return Ok(());
                     }
                     Ok(IpcResponse::Error(message)) => {
                         return Err(CliError::message(format!(
-                            "{} Failed to stop project: {message}",
+                            "{} Failed to pause project: {message}",
                             style::CROSS
                         )));
                     }
@@ -586,6 +583,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             };
             let names = vec![name.clone()];
 
+            utils::ensure_daemon_running()?;
             let mut actions = Vec::new();
 
             for service_name in names {

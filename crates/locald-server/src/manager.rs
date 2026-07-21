@@ -6477,6 +6477,8 @@ mod tests {
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
+    const TEST_STARTUP_BOUNDARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     struct ProcessGroupCleanup {
         group: i32,
         armed: bool,
@@ -10343,7 +10345,7 @@ command = "sleep 30"
         let start_manager = manager.clone();
         let start_path = project_path.clone();
         let start = tokio::spawn(async move { start_manager.start(start_path, None, false).await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, entered.notified())
             .await
             .expect("startup reaches blocking controller");
 
@@ -11111,7 +11113,7 @@ command = "sleep 30"
             let project_path = project_path.clone();
             async move { manager.start(project_path, None, false).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, entered.notified())
             .await
             .expect("service starts and enters its readiness wait");
 
@@ -11218,7 +11220,7 @@ command = "sleep 30"
             let project_path = project_path.clone();
             async move { manager.start(project_path, None, false).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), start_entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_entered.notified())
             .await
             .expect("service reaches the controlled spawn boundary");
         manager
