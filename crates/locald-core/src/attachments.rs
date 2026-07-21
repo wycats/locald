@@ -477,6 +477,10 @@ impl AttachmentStore {
                 );
             }
             self.instance_owners = instance_owners;
+        } else {
+            self.attachments.clear();
+            self.manually_stopped.clear();
+            self.instance_owners.clear();
         }
         Ok(())
     }
@@ -1738,6 +1742,32 @@ mod tests {
             .await
             .expect("write legacy attachment state");
         assert!(store.load_exact().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn absent_legacy_attachment_state_clears_the_in_memory_projection() {
+        let dir = tempdir().expect("create temporary directory");
+        let store_path = dir.path().join("attachments.json");
+        let project_path = dir.path().join("project");
+        let mut store = AttachmentStore::new(store_path.clone());
+        store
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH,
+            })
+            .expect("seed in-memory attachment authority");
+        store.mark_stopped(&project_path);
+        store.set_instance_owner(&project_path, ProjectInstanceId::random());
+        assert_ne!(store.snapshot(), AttachmentStoreSnapshot::default());
+
+        store
+            .load()
+            .await
+            .expect("load absent legacy attachment state");
+
+        assert_eq!(store.snapshot(), AttachmentStoreSnapshot::default());
+        assert!(!store_path.exists());
     }
 
     #[cfg(unix)]
