@@ -7,7 +7,7 @@ use locald_helper_protocol::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -96,6 +96,7 @@ impl Launchctl for SystemLaunchctl {
 
 /// Build authority for the exact executable running explicit setup.
 pub fn authority_for_current_executable(configured_uid: u32) -> Result<HelperAuthority> {
+    ensure_configured_console_user(configured_uid)?;
     let executable_path = std::env::current_exe()
         .context("could not resolve the locald executable used for setup")?
         .canonicalize()
@@ -109,6 +110,22 @@ pub fn authority_for_current_executable(configured_uid: u32) -> Result<HelperAut
         env!("LOCALD_BUILD_VERSION").to_string(),
     )
     .context("could not construct helper authority")
+}
+
+fn ensure_configured_console_user(configured_uid: u32) -> Result<()> {
+    let console_uid = std::fs::metadata("/dev/console")
+        .context("could not inspect /dev/console during helper setup")?
+        .uid();
+    validate_configured_console_user(configured_uid, console_uid)
+}
+
+fn validate_configured_console_user(configured_uid: u32, console_uid: u32) -> Result<()> {
+    if configured_uid != console_uid {
+        anyhow::bail!(
+            "setup user UID {configured_uid} does not own /dev/console (owner UID {console_uid}); run `sudo locald admin setup` from the intended user's active console session"
+        );
+    }
+    Ok(())
 }
 
 /// Atomically install helper authority, executable, and `LaunchDaemon`, then restart it.
@@ -300,7 +317,6 @@ fn render_launch_daemon_plist() -> String {
 )]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -444,6 +460,15 @@ mod tests {
         assert!(install_with(&paths, owner, b"helper", &invalid, &launchctl).is_err());
         assert!(!paths.helper.exists());
         assert!(launchctl.calls.lock().expect("launchctl calls").is_empty());
+    }
+
+    #[test]
+    fn configured_user_must_own_the_console_before_setup() {
+        validate_configured_console_user(501, 501).expect("matching console owner");
+        let error = validate_configured_console_user(501, 502)
+            .expect_err("mismatched console owner must fail setup");
+        assert!(error.to_string().contains("does not own /dev/console"));
+        assert!(error.to_string().contains("active console session"));
     }
 
     #[test]
