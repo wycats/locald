@@ -69,12 +69,14 @@ fn xpc_request(command: HelperCommand, port: Option<u16>) -> Result<Option<RawFd
         .enable_all()
         .build()
         .context("Failed to build tokio runtime for XPC")?;
-    let response = runtime.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.next())
-            .await
-            .context("Timed out waiting for helper response")?
-            .context("Helper connection closed without response")
-    })?;
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), client.next())
+                .await
+                .context("Timed out waiting for helper response")?
+                .context("Helper connection closed without response")
+        })
+        .map_err(|error| helper_unavailable(&error))?;
 
     parse_response(command, &response)
 }
@@ -127,6 +129,10 @@ fn parse_response(command: HelperCommand, response: &Message) -> Result<Option<R
 
 fn setup_required(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("{detail}. Run `sudo locald admin setup` to repair the installation.")
+}
+
+fn helper_unavailable(error: &anyhow::Error) -> anyhow::Error {
+    setup_required(&format!("privileged helper is unavailable: {error}"))
 }
 
 fn helper_rejection(command: HelperCommand, code: HelperErrorCode, message: &str) -> anyhow::Error {
@@ -268,6 +274,13 @@ mod tests {
         let error = parse_response(HelperCommand::Probe, &Message::Dictionary(dict))
             .expect_err("authentication must fail");
         assert!(error.to_string().contains("authentication_failed"));
+        assert!(error.to_string().contains("sudo locald admin setup"));
+    }
+
+    #[test]
+    fn unavailable_helper_requires_setup() {
+        let error = helper_unavailable(&anyhow::anyhow!("connection closed"));
+        assert!(error.to_string().contains("connection closed"));
         assert!(error.to_string().contains("sudo locald admin setup"));
     }
 

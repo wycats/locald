@@ -168,9 +168,7 @@ mod macos {
         if protocol_version != i64::from(PROTOCOL_VERSION) {
             return CommandResponse::message(error_response(
                 HelperErrorCode::ProtocolMismatch,
-                &format!(
-                    "helper protocol version {PROTOCOL_VERSION} required; run `sudo locald admin setup`"
-                ),
+                &format!("helper protocol version {PROTOCOL_VERSION} required"),
             ));
         }
 
@@ -433,6 +431,12 @@ mod macos {
             assert_error(
                 &handle_command(&wrong, &authority(), 501, &Ok(501)),
                 HelperErrorCode::ProtocolMismatch,
+            );
+            let response = handle_command(&wrong, &authority(), 501, &Ok(501));
+            let expected = format!("helper protocol version {PROTOCOL_VERSION} required");
+            assert_eq!(
+                response_string(&response.message, "message").as_deref(),
+                Some(expected.as_str())
             );
         }
 

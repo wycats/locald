@@ -1042,8 +1042,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                 Err(error) => {
                                     s.error(format!("Privileged helper probe failed: {error}"));
                                     return Err(CliError::message(format!(
-                                        "Privileged helper postflight failed: {error}\n\
-                                         Run `sudo locald admin setup` to repair the installation."
+                                        "Privileged helper postflight failed: {error}"
                                     )));
                                 }
                             }
