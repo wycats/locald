@@ -404,16 +404,11 @@ async fn load_attachment_store_for_lifecycle_recovery(
     preflight: &lifecycle_transaction::LifecycleRecoveryPreflight,
 ) -> Result<()> {
     if let Some(images) = preflight.pending_legacy_attachment_images() {
-        let exact_error = match store.load_exact().await {
-            Ok(()) => {
-                let current = store.snapshot();
-                anyhow::ensure!(
-                    current == *images.base() || current == *images.target(),
-                    "exact compatibility state `{}` matches neither the journal base nor target",
-                    store.storage_path().display()
-                );
-                return Ok(());
-            }
+        let exact_error = match store
+            .load_exact_transaction_image(images.base(), images.target())
+            .await
+        {
+            Ok(()) => return Ok(()),
             Err(error) => error,
         };
 

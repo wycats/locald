@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -291,6 +291,36 @@ impl AttachmentStoreSnapshot {
         self.instance_owners.remove(&project_path);
     }
 
+    /// Validate the invariants required of exact compatibility authority.
+    pub fn validate_exact(&self) -> Result<()> {
+        for (project_path, attachments) in &self.attachments {
+            anyhow::ensure!(
+                !attachments.is_empty(),
+                "attachment state contains an empty compatibility entry at `{}`",
+                project_path.display()
+            );
+            anyhow::ensure!(
+                attachments
+                    .iter()
+                    .all(|attachment| attachment.project_path == *project_path),
+                "attachment state at `{}` contains an attachment owned by a different project path",
+                project_path.display()
+            );
+        }
+        for project_path in self.instance_owners.keys() {
+            let has_attachments = self
+                .attachments
+                .get(project_path)
+                .is_some_and(|attachments| !attachments.is_empty());
+            anyhow::ensure!(
+                has_attachments || self.manually_stopped.contains(project_path),
+                "attachment state contains an instance owner without compatibility state at `{}`",
+                project_path.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Derive liveness for one exact snapshot projection using a caller-owned
     /// clock and PID probe.
     pub fn compatibility_evidence_at<F>(
@@ -427,20 +457,63 @@ impl AttachmentStore {
     /// attachment state. Once lifecycle-v2 authority exists, compatibility
     /// state is a replay image rather than best-effort legacy evidence.
     pub async fn load_exact(&mut self) -> Result<()> {
+        let snapshot = self.read_exact_snapshot().await?;
+        snapshot.validate_exact().with_context(|| {
+            format!(
+                "authoritative attachment state `{}` violates exact-state invariants",
+                self.path.display()
+            )
+        })?;
+        self.apply_snapshot(snapshot);
+        Ok(())
+    }
+
+    /// Load an exact before or after image from a prevalidated lifecycle
+    /// transaction.
+    ///
+    /// Legacy migration before-images may contain invariants that the target
+    /// repairs. Equality with one of the journal images is therefore the
+    /// authority check at this recovery-only boundary; the target must always
+    /// satisfy exact-state invariants.
+    pub async fn load_exact_transaction_image(
+        &mut self,
+        base: &AttachmentStoreSnapshot,
+        target: &AttachmentStoreSnapshot,
+    ) -> Result<()> {
+        target
+            .validate_exact()
+            .context("lifecycle transaction attachment target violates exact-state invariants")?;
+        let snapshot = self.read_exact_snapshot().await?;
+        anyhow::ensure!(
+            snapshot == *base || snapshot == *target,
+            "exact compatibility state `{}` matches neither the journal base nor target",
+            self.path.display()
+        );
+        self.apply_snapshot(snapshot);
+        Ok(())
+    }
+
+    async fn read_exact_snapshot(&self) -> Result<AttachmentStoreSnapshot> {
         let content = tokio::fs::read_to_string(&self.path).await?;
         anyhow::ensure!(
             !content.trim().is_empty(),
             "authoritative attachment state `{}` is empty",
             self.path.display()
         );
-        let snapshot: AttachmentStoreSnapshot = serde_json::from_str(&content)?;
-        self.apply_snapshot(snapshot);
-        Ok(())
+        serde_json::from_str(&content).map_err(Into::into)
     }
 
+    /// Persist compatibility state through the exact-state publication boundary.
+    ///
+    /// Empty buckets left by ignored legacy attachment sources carry no
+    /// compatibility evidence, so they are omitted from the published image.
     #[allow(clippy::disallowed_methods)]
     pub async fn save(&self) -> Result<()> {
-        persist_attachment_snapshot(&self.snapshot(), &self.path)
+        let mut snapshot = self.snapshot();
+        snapshot
+            .attachments
+            .retain(|_, attachments| !attachments.is_empty());
+        persist_attachment_snapshot(&snapshot, &self.path)
             .await
             .map_err(Into::into)
     }
@@ -488,6 +561,12 @@ impl AttachmentStore {
         Sync: FnOnce(PathBuf) -> SyncFuture,
         SyncFuture: Future<Output = std::result::Result<(), AttachmentStoreError>>,
     {
+        snapshot
+            .validate_exact()
+            .map_err(|error| AttachmentStoreError::InvalidData {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            })?;
         let publication =
             persist_attachment_snapshot_with_parent_sync(&snapshot, &self.path, parent_sync).await;
         if publication.is_ok()
@@ -983,6 +1062,12 @@ where
     Sync: FnOnce(PathBuf) -> SyncFuture,
     SyncFuture: Future<Output = std::result::Result<(), AttachmentStoreError>>,
 {
+    snapshot
+        .validate_exact()
+        .map_err(|error| AttachmentStoreError::InvalidData {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?;
     let temporary = write_temporary_attachment_snapshot(snapshot, path).await?;
     if let Err(source) = tokio::fs::rename(&temporary, path).await {
         let cleanup = tokio::fs::remove_file(&temporary).await;
@@ -1625,6 +1710,204 @@ mod tests {
         assert!(store.load_exact().await.is_err());
     }
 
+    #[tokio::test]
+    async fn exact_load_rejects_invariant_violations_without_mutating_memory() {
+        let dir = tempdir().expect("create exact-state invariant fixture");
+        let store_path = dir.path().join("attachments.json");
+        let baseline_project = dir.path().join("baseline");
+        let project = dir.path().join("project");
+        let foreign_project = dir.path().join("foreign");
+        let instance_id: ProjectInstanceId = "00000000-0000-4000-8000-000000000123"
+            .parse()
+            .expect("parse project instance ID");
+
+        let mut stop_only = AttachmentStoreSnapshot::default();
+        stop_only.manually_stopped.insert(project.clone());
+        stop_only
+            .instance_owners
+            .insert(project.clone(), instance_id);
+        stop_only
+            .validate_exact()
+            .expect("a manual-stop marker is compatibility state for an owner");
+
+        let mut empty_bucket = AttachmentStoreSnapshot::default();
+        empty_bucket.attachments.insert(project.clone(), Vec::new());
+        empty_bucket
+            .instance_owners
+            .insert(project.clone(), instance_id);
+
+        let mut mismatched_path = AttachmentStoreSnapshot::default();
+        mismatched_path.attachments.insert(
+            project.clone(),
+            vec![Attachment {
+                project_path: foreign_project,
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH,
+            }],
+        );
+
+        let mut orphaned_owner = AttachmentStoreSnapshot::default();
+        orphaned_owner.instance_owners.insert(project, instance_id);
+
+        for (label, candidate, expected_error) in [
+            (
+                "empty attachment bucket",
+                empty_bucket,
+                "empty compatibility entry",
+            ),
+            (
+                "mismatched embedded path",
+                mismatched_path,
+                "different project path",
+            ),
+            (
+                "orphaned instance owner",
+                orphaned_owner,
+                "instance owner without compatibility state",
+            ),
+        ] {
+            let preserved =
+                serde_json::to_vec_pretty(&candidate).expect("serialize invalid exact state");
+            tokio::fs::write(&store_path, &preserved)
+                .await
+                .expect("write invalid exact state");
+            let mut store = AttachmentStore::new(store_path.clone());
+            store.mark_stopped(&baseline_project);
+            let baseline = store.snapshot();
+
+            let error = store
+                .load_exact()
+                .await
+                .expect_err("invalid exact state must fail closed");
+
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{label}: {error:#}"
+            );
+            assert_eq!(store.snapshot(), baseline, "{label} changed memory");
+            assert_eq!(
+                tokio::fs::read(&store_path)
+                    .await
+                    .expect("reread invalid exact state"),
+                preserved,
+                "{label} changed disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_replacement_rejects_invalid_authority_before_publication() {
+        let dir = tempdir().expect("create exact replacement fixture");
+        let store_path = dir.path().join("attachments.json");
+        let baseline_project = dir.path().join("baseline");
+        let candidate_project = dir.path().join("candidate");
+        let mut baseline = AttachmentStoreSnapshot::default();
+        baseline.replace_project(
+            &baseline_project,
+            vec![Attachment {
+                project_path: baseline_project.clone(),
+                source: AttachmentSource::Pin,
+                created_at: UNIX_EPOCH,
+            }],
+            false,
+        );
+        let mut store = AttachmentStore::new(store_path.clone());
+        store
+            .replace_snapshot(baseline.clone())
+            .await
+            .expect("publish valid baseline");
+        let preserved = tokio::fs::read(&store_path)
+            .await
+            .expect("read valid baseline");
+
+        let mut invalid = AttachmentStoreSnapshot::default();
+        invalid.attachments.insert(candidate_project, Vec::new());
+        let error = store
+            .replace_snapshot(invalid)
+            .await
+            .expect_err("invalid exact replacement must fail before publication");
+
+        assert!(matches!(error, AttachmentStoreError::InvalidData { .. }));
+        assert_eq!(store.snapshot(), baseline);
+        assert_eq!(
+            tokio::fs::read(&store_path)
+                .await
+                .expect("reread preserved baseline"),
+            preserved
+        );
+    }
+
+    #[tokio::test]
+    async fn save_rejects_an_orphaned_owner_before_publication() {
+        let dir = tempdir().expect("create exact save fixture");
+        let store_path = dir.path().join("attachments.json");
+        let baseline_project = dir.path().join("baseline");
+        let orphaned_project = dir.path().join("orphaned");
+        let instance_id: ProjectInstanceId = "00000000-0000-4000-8000-000000000456"
+            .parse()
+            .expect("parse project instance ID");
+        let mut store = AttachmentStore::new(store_path.clone());
+        store.mark_stopped(&baseline_project);
+        store.save().await.expect("publish valid baseline");
+        let preserved = tokio::fs::read(&store_path)
+            .await
+            .expect("read valid baseline");
+
+        store.set_instance_owner(&orphaned_project, instance_id);
+        let error = store
+            .save()
+            .await
+            .expect_err("an orphaned owner must fail before publication");
+
+        assert!(
+            format!("{error:#}").contains("instance owner without compatibility state"),
+            "{error:#}"
+        );
+        assert_eq!(
+            tokio::fs::read(&store_path)
+                .await
+                .expect("reread preserved baseline"),
+            preserved
+        );
+        let mut reloaded = AttachmentStore::new(store_path);
+        reloaded
+            .load_exact()
+            .await
+            .expect("the previously published exact baseline remains valid");
+        assert!(reloaded.is_stopped(&baseline_project));
+    }
+
+    #[tokio::test]
+    async fn transaction_image_load_accepts_an_exact_legacy_base_for_repair() {
+        let dir = tempdir().expect("create transaction image fixture");
+        let store_path = dir.path().join("attachments.json");
+        let project = dir.path().join("project");
+        let mut legacy_base = AttachmentStoreSnapshot::default();
+        legacy_base.attachments.insert(
+            project,
+            vec![Attachment {
+                project_path: dir.path().join("embedded-legacy-project"),
+                source: AttachmentSource::Runtime,
+                created_at: UNIX_EPOCH,
+            }],
+        );
+        let target = AttachmentStoreSnapshot::default();
+        tokio::fs::write(
+            &store_path,
+            serde_json::to_vec_pretty(&legacy_base).expect("serialize legacy base"),
+        )
+        .await
+        .expect("write legacy base");
+        let mut store = AttachmentStore::new(store_path);
+
+        store
+            .load_exact_transaction_image(&legacy_base, &target)
+            .await
+            .expect("load exact journal base for target repair");
+
+        assert_eq!(store.snapshot(), legacy_base);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_alias_collisions_merge_in_stable_source_key_order() {
@@ -2149,9 +2432,13 @@ mod tests {
 
         store.save().await.expect("save compatible store");
         let mut reloaded = AttachmentStore::new(store_path);
-        reloaded.load().await.expect("reload compatible store");
+        reloaded
+            .load_exact()
+            .await
+            .expect("reload normalized exact compatibility store");
         assert!(reloaded.attachments_for(&project).is_empty());
         assert!(reloaded.is_stopped(&project));
+        assert!(!reloaded.snapshot().attachments.contains_key(&project));
     }
 
     #[tokio::test]

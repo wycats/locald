@@ -351,32 +351,11 @@ fn validate_attachment_snapshot(
     snapshot: &AttachmentStoreSnapshot,
     image: &'static str,
 ) -> Result<(), LifecycleJournalError> {
-    for (project_path, attachments) in &snapshot.attachments {
-        if attachments
-            .iter()
-            .any(|attachment| attachment.project_path != *project_path)
-        {
-            return Err(LifecycleJournalError::InvalidPlan {
-                reason: format!(
-                    "attachment {image} image contains an attachment owned by a different path than `{}`",
-                    project_path.display()
-                ),
-            });
-        }
-    }
-    for project_path in snapshot.instance_owners.keys() {
-        if !snapshot.attachments.contains_key(project_path)
-            && !snapshot.manually_stopped.contains(project_path)
-        {
-            return Err(LifecycleJournalError::InvalidPlan {
-                reason: format!(
-                    "attachment {image} image contains an owner without compatibility state at `{}`",
-                    project_path.display()
-                ),
-            });
-        }
-    }
-    Ok(())
+    snapshot
+        .validate_exact()
+        .map_err(|error| LifecycleJournalError::InvalidPlan {
+            reason: format!("attachment {image} image is invalid: {error}"),
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1553,6 +1532,27 @@ mod tests {
             AttachmentTransactionImages::new(legacy_base, AttachmentStoreSnapshot::default()),
         )
         .expect("exact legacy base must remain journalable");
+    }
+
+    #[test]
+    fn empty_attachment_target_is_rejected_before_journaling() {
+        let fixture = Fixture::new();
+        let mut target = AttachmentStoreSnapshot::default();
+        target
+            .attachments
+            .insert(fixture.directory.path().join("empty-project"), Vec::new());
+
+        assert!(matches!(
+            LifecycleTransaction::new(
+                LifecycleTransactionKind::LifecycleMutation,
+                UNIX_EPOCH,
+                None,
+                Vec::new(),
+                AttachmentTransactionImages::new(AttachmentStoreSnapshot::default(), target),
+            )
+            .expect_err("empty exact attachment target must fail closed"),
+            LifecycleJournalError::InvalidPlan { .. }
+        ));
     }
 
     #[tokio::test]
