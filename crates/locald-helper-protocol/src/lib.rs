@@ -410,6 +410,8 @@ pub mod code_signing {
         let token = CFData::from_buffer(audit_token);
         let mut attributes = GuestAttributes::new();
         attributes.set_audit_token(token.as_concrete_TypeRef());
+        // `security-framework` 2.x publishes this method with the upstream
+        // `attribues` spelling.
         let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)?;
         let requirement: SecRequirement = requirement.parse()?;
         code.check_validity(validation_flags(), &requirement)?;

@@ -109,11 +109,7 @@ fn parse_response(command: HelperCommand, response: &Message) -> Result<Option<R
             .unwrap_or_else(|| HelperErrorCode::InternalError.as_str().to_string());
         let code = HelperErrorCode::parse(&raw_code).unwrap_or(HelperErrorCode::InternalError);
         let message = response_string(dict, "message").unwrap_or_else(|| "no detail".to_string());
-        return Err(setup_required(&format!(
-            "helper rejected {} ({}): {message}",
-            command.as_str(),
-            code.as_str()
-        )));
+        return Err(helper_rejection(command, code, &message));
     }
     if status != HelperStatus::Success.as_str() {
         return Err(setup_required(&format!(
@@ -131,6 +127,34 @@ fn parse_response(command: HelperCommand, response: &Message) -> Result<Option<R
 
 fn setup_required(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("{detail}. Run `sudo locald admin setup` to repair the installation.")
+}
+
+fn helper_rejection(command: HelperCommand, code: HelperErrorCode, message: &str) -> anyhow::Error {
+    let detail = format!(
+        "helper rejected {} ({}): {message}",
+        command.as_str(),
+        code.as_str()
+    );
+    match code {
+        HelperErrorCode::ProtocolMismatch
+        | HelperErrorCode::AuthorityUnavailable
+        | HelperErrorCode::AuthorityInvalid
+        | HelperErrorCode::AuthenticationFailed => setup_required(&detail),
+        HelperErrorCode::RootBindDenied => {
+            anyhow::anyhow!("{detail}. Run locald without sudo as the configured user.")
+        }
+        HelperErrorCode::CallerUserMismatch => anyhow::anyhow!(
+            "{detail}. Run locald as the configured user, or rerun `sudo locald admin setup` from the intended console-user session."
+        ),
+        HelperErrorCode::ConsoleUserMismatch => anyhow::anyhow!(
+            "{detail}. Run locald from the configured user's active console session."
+        ),
+        HelperErrorCode::InvalidRequest
+        | HelperErrorCode::UnknownCommand
+        | HelperErrorCode::UnsupportedPort
+        | HelperErrorCode::BindFailed
+        | HelperErrorCode::InternalError => anyhow::anyhow!(detail),
+    }
 }
 
 fn insert_string(dict: &mut HashMap<CString, Message>, key: &str, value: &str) {
@@ -242,5 +266,37 @@ mod tests {
             .expect_err("authentication must fail");
         assert!(error.to_string().contains("authentication_failed"));
         assert!(error.to_string().contains("sudo locald admin setup"));
+    }
+
+    #[test]
+    fn policy_and_bind_errors_have_specific_remediation() {
+        for (code, expected, excludes_setup) in [
+            (
+                HelperErrorCode::RootBindDenied,
+                "without sudo as the configured user",
+                true,
+            ),
+            (
+                HelperErrorCode::CallerUserMismatch,
+                "intended console-user session",
+                false,
+            ),
+            (
+                HelperErrorCode::ConsoleUserMismatch,
+                "active console session",
+                true,
+            ),
+            (HelperErrorCode::BindFailed, "address already in use", true),
+        ] {
+            let mut dict = response(HelperStatus::Error);
+            insert_string(&mut dict, "error_code", code.as_str());
+            insert_string(&mut dict, "message", "address already in use");
+            let error = parse_response(HelperCommand::Bind, &Message::Dictionary(dict))
+                .expect_err("helper rejection must fail");
+            assert!(error.to_string().contains(expected));
+            if excludes_setup {
+                assert!(!error.to_string().contains("sudo locald admin setup"));
+            }
+        }
     }
 }
