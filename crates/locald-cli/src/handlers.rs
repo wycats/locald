@@ -1007,10 +1007,21 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             const HELPER_BYTES: &[u8] =
                                 include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
 
+                            let sudo_uid = std::env::var("SUDO_UID").ok();
+                            let configured_uid = invoking_user_uid(sudo_uid.as_deref())?;
+                            let authority = crate::macos_helper::authority_for_current_executable(
+                                configured_uid,
+                            )
+                            .map_err(|error| {
+                                CliError::message(format!(
+                                    "Failed to authorize the privileged helper: {error}"
+                                ))
+                            })?;
+
                             let s = cliclack::spinner();
                             s.start("Installing privileged helper...");
 
-                            match install_privileged_helper(HELPER_BYTES) {
+                            match crate::macos_helper::install(HELPER_BYTES, &authority) {
                                 Ok(()) => {
                                     s.stop("Privileged helper installed (binds ports 80/443)");
                                 }
@@ -1020,6 +1031,19 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                         "Failed to install privileged helper: {e}\n\
                                          The helper is required for locald to serve on ports 80/443.\n\
                                          Run `locald admin setup` to retry."
+                                    )));
+                                }
+                            }
+
+                            let s = cliclack::spinner();
+                            s.start("Verifying privileged helper authorization...");
+                            match crate::macos_helper::probe() {
+                                Ok(()) => s.stop("Privileged helper authorization verified"),
+                                Err(error) => {
+                                    s.error(format!("Privileged helper probe failed: {error}"));
+                                    return Err(CliError::message(format!(
+                                        "Privileged helper postflight failed: {error}\n\
+                                         Run `sudo locald admin setup` to repair the installation."
                                     )));
                                 }
                             }
@@ -1104,8 +1128,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         {
                             let s = cliclack::spinner();
                             s.start("Removing privileged helper...");
-                            remove_privileged_helper();
-                            s.stop("Privileged helper removed");
+                            match crate::macos_helper::remove() {
+                                Ok(()) => s.stop("Privileged helper removed"),
+                                Err(error) => {
+                                    s.error(format!("Privileged helper removal failed: {error}"));
+                                    return Err(CliError::message(format!(
+                                        "Failed to remove privileged helper: {error}"
+                                    )));
+                                }
+                            }
                         }
 
                         cliclack::outro("Teardown complete")?;
@@ -2189,14 +2220,14 @@ fn invoking_user_uid(sudo_uid: Option<&str>) -> CliResult<u32> {
     let uid = sudo_uid
         .ok_or_else(|| {
             CliError::message(
-                "Could not identify the invoking user. Run `sudo locald admin sync-hosts` from your user session.",
+                "Could not identify the invoking user. Run the requested `sudo locald admin ...` command from your user session.",
             )
         })?
         .parse::<u32>()
         .map_err(|_| CliError::message("SUDO_UID is not a valid user ID."))?;
     if uid == 0 {
         return Err(CliError::message(
-            "Privileged hosts synchronization requires a non-root invoking user.",
+            "Privileged locald administration requires a non-root invoking user.",
         ));
     }
     Ok(uid)
@@ -2453,78 +2484,4 @@ fn uninstall_launch_agent() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Install the privileged helper binary and its `LaunchDaemon` plist.
-///
-/// Writes the helper to `/Library/PrivilegedHelperTools/com.locald.helper` and
-/// registers it as a `LaunchDaemon` with a Mach service endpoint.
-#[cfg(target_os = "macos")]
-#[allow(clippy::disallowed_methods)]
-fn install_privileged_helper(helper_bytes: &[u8]) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let helper_path = std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
-    std::fs::create_dir_all(
-        helper_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid helper path"))?,
-    )?;
-    std::fs::write(helper_path, helper_bytes)?;
-    std::fs::set_permissions(helper_path, std::fs::Permissions::from_mode(0o755))?;
-
-    let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>com.locald.helper</string>
-	<key>MachServices</key>
-	<dict>
-		<key>com.locald.helper</key>
-		<true/>
-	</dict>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/Library/PrivilegedHelperTools/com.locald.helper</string>
-	</array>
-	<key>StandardOutPath</key>
-	<string>/var/log/com.locald.helper.log</string>
-	<key>StandardErrorPath</key>
-	<string>/var/log/com.locald.helper.log</string>
-</dict>
-</plist>"#;
-
-    let plist_path = std::path::Path::new("/Library/LaunchDaemons/com.locald.helper.plist");
-    std::fs::write(plist_path, plist_content)?;
-
-    // Unload any existing, then load.
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(plist_path)
-        .output();
-
-    let status = std::process::Command::new("launchctl")
-        .args(["load", "-w"])
-        .arg(plist_path)
-        .status()
-        .context("Failed to run launchctl load for helper")?;
-
-    if !status.success() {
-        anyhow::bail!("launchctl load for helper failed with status: {status}");
-    }
-
-    Ok(())
-}
-
-/// Remove the privileged helper binary and its `LaunchDaemon` plist.
-#[cfg(target_os = "macos")]
-#[allow(clippy::disallowed_methods)]
-fn remove_privileged_helper() {
-    let plist_path = "/Library/LaunchDaemons/com.locald.helper.plist";
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w", plist_path])
-        .output();
-    let _ = std::fs::remove_file(plist_path);
-    let _ = std::fs::remove_file("/Library/PrivilegedHelperTools/com.locald.helper");
 }
