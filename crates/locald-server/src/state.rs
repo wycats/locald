@@ -54,6 +54,11 @@ impl StateManager {
         }
     }
 
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.state_path
+    }
+
     #[cfg(test)]
     pub(crate) async fn inject_save_fault(&self, fault: StateSaveFault) {
         *self.next_save_fault.lock().await = Some(fault);
@@ -86,15 +91,33 @@ impl StateManager {
     pub async fn load(&self) -> Result<ServerState> {
         self.ensure_dir().await?;
 
-        if !self.state_path.exists() {
-            debug!("No state file found, returning default state");
-            return Ok(ServerState::default());
-        }
-
         debug!("Loading state from {:?}", self.state_path);
-        let content = fs::read_to_string(&self.state_path)
-            .await
-            .context("Failed to read state file")?;
+        let content = match fs::read_to_string(&self.state_path).await {
+            Ok(content) => content,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(&self.state_path).await {
+                    Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {
+                        debug!("No state file found, returning default state");
+                        return Ok(ServerState::default());
+                    }
+                    Ok(_) => {
+                        return Err(source).with_context(|| {
+                            format!("Failed to read state file {}", self.state_path.display())
+                        });
+                    }
+                    Err(metadata_error) => {
+                        return Err(metadata_error).with_context(|| {
+                            format!("Failed to inspect state file {}", self.state_path.display())
+                        });
+                    }
+                }
+            }
+            Err(source) => {
+                return Err(source).with_context(|| {
+                    format!("Failed to read state file {}", self.state_path.display())
+                });
+            }
+        };
 
         let state: ServerState =
             serde_json::from_str(&content).context("Failed to parse state file")?;
@@ -289,5 +312,33 @@ mod tests {
             .expect("atomically published runtime state remains visible");
         assert!(published.services.is_empty());
         assert!(temporary_files(&path).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_runtime_state_entry_is_not_treated_as_absent() {
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("state.json");
+        std::os::unix::fs::symlink(directory.path().join("missing-state"), &path)
+            .expect("create dangling runtime state symlink");
+        let manager = StateManager::with_path(path.clone());
+
+        let error = manager
+            .load()
+            .await
+            .expect_err("dangling runtime state must block loading");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Failed to read state file {}", path.display())),
+            "unexpected dangling runtime state diagnostic: {error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .await
+                .expect("inspect preserved runtime state")
+                .file_type()
+                .is_symlink()
+        );
     }
 }

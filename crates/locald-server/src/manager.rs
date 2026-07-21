@@ -2,6 +2,15 @@
 #![allow(clippy::option_if_let_else)]
 use crate::config_loader::ConfigLoader;
 use crate::health::HealthMonitor;
+use crate::lifecycle_migration::{
+    availability_demand_for_attachment_source, manual_cli_session_demand,
+    plan_project_lifecycle_migration,
+};
+use crate::lifecycle_transaction::{
+    AttachmentTransactionImages, CatalogTransactionImages, LegacyV1File, LifecycleJournal,
+    LifecycleTransaction, LifecycleTransactionKind, LifecycleTransactionPhase,
+    validate_attachment_authority,
+};
 use crate::plugins;
 use crate::port_allocator::PortAllocator;
 use crate::runtime::Runtime;
@@ -10,7 +19,8 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
 use locald_core::attachments::{
-    Attachment, AttachmentSource, AttachmentStore, ProjectFilter, ProjectListEntry, ProjectSection,
+    Attachment, AttachmentCompatibilityEvidence, AttachmentSource, AttachmentStore,
+    AttachmentStoreSnapshot, ManualCliSession, ProjectFilter, ProjectListEntry, ProjectSection,
     ProjectStatusInfo,
 };
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
@@ -23,14 +33,15 @@ use locald_core::state::{
     ServiceState,
 };
 use locald_core::{
-    AvailabilityError, AvailabilityStore, CatalogError, CatalogPresence, ConvergenceDecision,
-    DemandKey, DomainClaim, DomainName, DomainTarget, EnsureDemandResult, ProjectInstanceId,
+    AvailabilityBatch, AvailabilityBatchOperation, AvailabilityError, AvailabilityStore,
+    CatalogError, CatalogPresence, ConvergenceDecision, DemandKey, DomainClaim, DomainName,
+    DomainTarget, EnsureDemandResult, ProjectAvailability, ProjectDiscovery, ProjectInstanceId,
     SharedDomainIndex, availability_path, sanitize_project_name_for_dns,
     sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -99,15 +110,6 @@ struct DaemonShuttingDown;
 #[error("availability transitions cannot be nested")]
 struct ReentrantAvailabilityTransition;
 
-#[derive(Clone, Debug, thiserror::Error)]
-#[error(
-    "service `{name}` belongs to project instance {instance_id}, whose legacy runtime restore is pending; wait for restoration and retry"
-)]
-struct ServiceRestorePending {
-    name: String,
-    instance_id: ProjectInstanceId,
-}
-
 #[async_trait::async_trait]
 pub trait HostSyncer: Send + Sync + 'static {
     async fn sync(&self, domains: Vec<String>) -> Result<()>;
@@ -166,6 +168,15 @@ impl HostSyncer for DefaultHostSyncer {
             anyhow::bail!("Failed to sync hosts: {}", stderr);
         }
 
+        Ok(())
+    }
+}
+
+struct SandboxHostSyncer;
+
+#[async_trait::async_trait]
+impl HostSyncer for SandboxHostSyncer {
+    async fn sync(&self, _domains: Vec<String>) -> Result<()> {
         Ok(())
     }
 }
@@ -244,6 +255,158 @@ struct ConfigTransitionPlan {
     removed_service_names: Vec<String>,
     restart_service_names: Vec<String>,
     reusable_service_envs: HashMap<String, HashMap<String, String>>,
+    stopped_service_projections: HashMap<String, (ServiceConfig, Option<HashMap<String, String>>)>,
+}
+
+#[derive(Debug)]
+struct CataloguedLifecycleTarget {
+    instance_id: ProjectInstanceId,
+    path: PathBuf,
+    catalog_base: Registry,
+    catalog_target: Registry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleTargetIdentity {
+    Catalogued(ProjectInstanceId),
+    UnregisteredPhysical(ProjectInstanceId),
+    UnresolvedLegacy,
+    Ambiguous,
+}
+
+#[derive(Debug)]
+enum LifecycleTargetResolution {
+    Catalogued(Box<CataloguedLifecycleTarget>),
+    UnregisteredPhysical { instance_id: ProjectInstanceId },
+    UnresolvedLegacy,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfigIdentityExpectation {
+    Existing(ProjectInstanceId),
+    Initial(ConfigPhysicalIdentity),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigPhysicalIdentity {
+    Git(ProjectInstanceId),
+    NonGit,
+}
+
+impl ConfigPhysicalIdentity {
+    fn from_discovery(discovery: &ProjectDiscovery) -> Self {
+        match discovery {
+            ProjectDiscovery::Git { resolved, .. } => {
+                Self::Git(resolved.identity.project_instance_id)
+            }
+            ProjectDiscovery::NonGit { .. } => Self::NonGit,
+        }
+    }
+}
+
+impl ConfigIdentityExpectation {
+    const fn expected_instance_id(self) -> Option<ProjectInstanceId> {
+        match self {
+            Self::Existing(instance_id)
+            | Self::Initial(ConfigPhysicalIdentity::Git(instance_id)) => Some(instance_id),
+            Self::Initial(ConfigPhysicalIdentity::NonGit) => None,
+        }
+    }
+
+    const fn requires_existing_catalog(self) -> bool {
+        matches!(self, Self::Existing(_))
+    }
+
+    const fn is_initial(self) -> bool {
+        matches!(self, Self::Initial(_))
+    }
+
+    const fn initial_physical_identity(self) -> Option<ConfigPhysicalIdentity> {
+        match self {
+            Self::Initial(identity) => Some(identity),
+            Self::Existing(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AvailabilityManagementState {
+    Managed,
+    PendingInitial,
+    LegacyUnmanaged,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ConfigPublicationHook {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+impl LifecycleTargetResolution {
+    fn identity(&self) -> LifecycleTargetIdentity {
+        match self {
+            Self::Catalogued(target) => LifecycleTargetIdentity::Catalogued(target.instance_id),
+            Self::UnregisteredPhysical { instance_id } => {
+                LifecycleTargetIdentity::UnregisteredPhysical(*instance_id)
+            }
+            Self::UnresolvedLegacy => LifecycleTargetIdentity::UnresolvedLegacy,
+            Self::Ambiguous => LifecycleTargetIdentity::Ambiguous,
+        }
+    }
+
+    fn catalogued_instance_id(&self) -> Option<ProjectInstanceId> {
+        match self {
+            Self::Catalogued(target) => Some(target.instance_id),
+            Self::UnregisteredPhysical { .. } | Self::UnresolvedLegacy | Self::Ambiguous => None,
+        }
+    }
+
+    fn into_catalogued(self) -> Option<CataloguedLifecycleTarget> {
+        match self {
+            Self::Catalogued(target) => Some(*target),
+            Self::UnregisteredPhysical { .. } | Self::UnresolvedLegacy | Self::Ambiguous => None,
+        }
+    }
+
+    fn into_mutation_target(
+        self,
+        project_path: &Path,
+        operation: &str,
+    ) -> Result<Option<CataloguedLifecycleTarget>> {
+        match self {
+            Self::Catalogued(target) => Ok(Some(*target)),
+            Self::UnresolvedLegacy => Ok(None),
+            Self::UnregisteredPhysical { instance_id } => anyhow::bail!(
+                "{operation} requires the physical project at `{}` to be registered as {instance_id}; run `locald up` from that worktree first",
+                project_path.display()
+            ),
+            Self::Ambiguous => anyhow::bail!(
+                "{operation} cannot resolve `{}` because it matches multiple catalogued project instances",
+                project_path.display()
+            ),
+        }
+    }
+}
+
+struct PendingInitialAvailabilityGuard {
+    instance_id: ProjectInstanceId,
+    pending: Arc<StdMutex<HashSet<ProjectInstanceId>>>,
+}
+
+struct ConfigApplyOutcome {
+    instance_id: ProjectInstanceId,
+    pending_initial: Option<PendingInitialAvailabilityGuard>,
+}
+
+impl Drop for PendingInitialAvailabilityGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.instance_id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,13 +419,13 @@ struct ServiceProjectionToken {
 
 #[derive(Debug)]
 struct AvailabilityCoordinator {
-    runtime: Mutex<()>,
+    runtime: Arc<Mutex<()>>,
 }
 
 impl AvailabilityCoordinator {
     fn new() -> Self {
         Self {
-            runtime: Mutex::new(()),
+            runtime: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -275,9 +438,7 @@ struct AvailabilityConvergenceOptions {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct RuntimeRestorePlan {
-    legacy_instances: HashSet<ProjectInstanceId>,
-}
+pub(crate) struct RuntimeRestorePlan;
 
 impl ServiceProjectionToken {
     fn matches(self, service: &Service) -> bool {
@@ -318,6 +479,9 @@ pub struct ProcessManager {
     domain_index: SharedDomainIndex,
     attachments: Arc<Mutex<AttachmentStore>>,
     attachment_transition_lock: Arc<Mutex<()>>,
+    lifecycle_publication_lock: Arc<Mutex<()>>,
+    lifecycle_recovery_required: Arc<AtomicBool>,
+    pending_initial_availability: Arc<StdMutex<HashSet<ProjectInstanceId>>>,
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
     hosts_sync_guard: ConcurrencyGuard,
@@ -328,12 +492,18 @@ pub struct ProcessManager {
     availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
     forgotten_reload_paths: Arc<Mutex<HashSet<PathBuf>>>,
-    legacy_restore_evidence: Arc<Mutex<HashMap<ProjectInstanceId, Vec<PersistedServiceState>>>>,
+    // A named service stop is a daemon-memory, one-off runtime override. It
+    // survives automatic availability convergence without rewriting project
+    // availability, and explicit lifecycle actions or daemon restart clear it.
+    service_stop_suppressions: Arc<Mutex<HashSet<(ProjectInstanceId, String)>>>,
     availability_data_dir: PathBuf,
+    lifecycle_journal: LifecycleJournal,
     runtime_projection_lock: Arc<Mutex<()>>,
     state_persistence_lock: Arc<Mutex<()>>,
     next_controller_generation: Arc<AtomicU64>,
     shutting_down: Arc<AtomicBool>,
+    #[cfg(test)]
+    config_publication_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
 }
 
 impl ProcessManager {
@@ -368,6 +538,16 @@ impl ProcessManager {
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_lifecycle_publication_available(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .lifecycle_recovery_required
+                .load(AtomicOrdering::Acquire),
+            "lifecycle state requires daemon restart so the active transaction can be recovered before more lifecycle changes"
+        );
+        Ok(())
     }
 
     /// Admit one availability transition and drain it before teardown.
@@ -426,13 +606,21 @@ impl ProcessManager {
         attachments: Arc<Mutex<AttachmentStore>>,
         external_log_sender: Option<broadcast::Sender<LogEntry>>,
     ) -> Result<Self> {
+        #[cfg(test)]
+        let availability_data_dir = state_manager
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("locald-test-data");
+        #[cfg(not(test))]
+        let availability_data_dir = locald_core::storage::data_dir();
         Self::new_with_availability_data_dir(
             notify_socket_path,
             state_manager,
             registry,
             attachments,
             external_log_sender,
-            locald_core::storage::data_dir(),
+            availability_data_dir,
         )
     }
 
@@ -478,6 +666,7 @@ impl ProcessManager {
             )),
         ];
 
+        let lifecycle_journal = LifecycleJournal::at(&availability_data_dir);
         Ok(Self {
             services,
             log_sender: tx,
@@ -491,6 +680,9 @@ impl ProcessManager {
             domain_index,
             attachments,
             attachment_transition_lock: Arc::new(Mutex::new(())),
+            lifecycle_publication_lock: Arc::new(Mutex::new(())),
+            lifecycle_recovery_required: Arc::new(AtomicBool::new(false)),
+            pending_initial_availability: Arc::new(StdMutex::new(HashSet::new())),
             health_monitor,
             factories,
             hosts_sync_guard: ConcurrencyGuard::new(),
@@ -501,18 +693,46 @@ impl ProcessManager {
             availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
             forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
-            legacy_restore_evidence: Arc::new(Mutex::new(HashMap::new())),
+            service_stop_suppressions: Arc::new(Mutex::new(HashSet::new())),
             availability_data_dir,
+            lifecycle_journal,
             runtime_projection_lock: Arc::new(Mutex::new(())),
             state_persistence_lock: Arc::new(Mutex::new(())),
             next_controller_generation: Arc::new(AtomicU64::new(1)),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            config_publication_hook: Arc::new(StdMutex::new(None)),
         })
     }
 
     #[cfg(test)]
     pub fn set_host_syncer(&mut self, syncer: Arc<dyn HostSyncer>) {
         self.host_syncer = syncer;
+    }
+
+    #[cfg(test)]
+    fn set_config_publication_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .config_publication_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_config_publication_hook(&self) {
+        let hook = self
+            .config_publication_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    pub(crate) fn use_sandbox_host_syncer(&mut self) {
+        self.host_syncer = Arc::new(SandboxHostSyncer);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -728,6 +948,34 @@ impl ProcessManager {
             .unwrap_or(full_name)
     }
 
+    fn service_activation_closure(
+        config: &LocaldConfig,
+        selected_service: &str,
+    ) -> Result<HashSet<String>> {
+        let selected = Self::configured_service_name(selected_service, config);
+        anyhow::ensure!(
+            config.services.contains_key(selected),
+            "service `{selected_service}` is not present in the current project configuration"
+        );
+
+        let mut pending = vec![selected.to_owned()];
+        let mut local_names = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if !local_names.insert(name.clone()) {
+                continue;
+            }
+            let service = config.services.get(&name).with_context(|| {
+                format!("service `{name}` disappeared from its dependency graph")
+            })?;
+            pending.extend(service.depends_on().iter().cloned());
+        }
+
+        Ok(local_names
+            .into_iter()
+            .map(|name| format!("{}:{name}", config.project.name))
+            .collect())
+    }
+
     fn requires_durable_process_ownership(service_config: &ServiceConfig) -> bool {
         matches!(
             service_config,
@@ -769,6 +1017,7 @@ impl ProcessManager {
         let mut changed_services = HashSet::new();
         let mut restart_service_names = Vec::new();
         let mut reusable_service_envs = HashMap::new();
+        let mut stopped_service_projections = HashMap::new();
 
         for service_name in sorted_services {
             let service_config = &config.services[service_name];
@@ -810,7 +1059,7 @@ impl ProcessManager {
                 })
             };
 
-            let (has_controller, is_up_to_date) = match service_snapshot {
+            let (has_controller, is_up_to_date, is_stopped_projection) = match service_snapshot {
                 Some((loaded_instance, loaded_path, _, _, Some(_), _))
                     if loaded_instance != instance_id =>
                 {
@@ -838,10 +1087,19 @@ impl ProcessManager {
                             && has_durable_process_ownership
                             && current_config == *service_config
                             && environment_matches,
+                        false,
                     )
                 }
-                Some((_, _, _, _, None, _)) | None => (false, false),
+                Some((_, _, _, _, None, _)) => (false, false, true),
+                None => (false, false, false),
             };
+
+            if is_stopped_projection {
+                stopped_service_projections.insert(
+                    full_name.clone(),
+                    (service_config.clone(), resolved_env.clone()),
+                );
+            }
 
             if !is_up_to_date {
                 changed_services.insert(service_name.clone());
@@ -859,6 +1117,7 @@ impl ProcessManager {
             removed_service_names,
             restart_service_names,
             reusable_service_envs,
+            stopped_service_projections,
         })
     }
 
@@ -1083,28 +1342,6 @@ impl ProcessManager {
             ));
         }
 
-        // While the compatibility restore bridge is active, every global
-        // snapshot retains not-yet-restored legacy Running evidence. This
-        // prevents a successful or partial start of one project from erasing
-        // the retry intent for another before a.2.3 migrates it.
-        let legacy_evidence = self.legacy_restore_evidence.lock().await.clone();
-        for (instance_id, evidence) in legacy_evidence {
-            for pending in evidence {
-                match service_states
-                    .iter_mut()
-                    .find(|(current_instance, current)| {
-                        *current_instance == instance_id && current.name == pending.name
-                    }) {
-                    Some((_, current))
-                        if current.pid.is_some()
-                            || current.container_id.is_some()
-                            || current.status == ServiceState::Running => {}
-                    Some((_, current)) => *current = pending,
-                    None => service_states.push((instance_id, pending)),
-                }
-            }
-        }
-
         let state = ServerState {
             services: service_states
                 .into_iter()
@@ -1305,120 +1542,18 @@ impl ProcessManager {
             );
         }
 
-        // Availability migration lands in the next productization task. Until
-        // then, preserve the old restart promise only for identities that are
-        // still active in the catalog. A path/status record alone can never
-        // recreate a forgotten project.
-        let registry = self.registry.lock().await;
-        let mut legacy_evidence = HashMap::<ProjectInstanceId, Vec<PersistedServiceState>>::new();
-        for service in state
-            .services
-            .iter()
-            .filter(|service| service.status == ServiceState::Running)
-        {
-            if let Some(instance_id) =
-                Self::active_catalog_instance_for_path(&registry, &service.path)
-            {
-                legacy_evidence
-                    .entry(instance_id)
-                    .or_default()
-                    .push(service.clone());
-            }
-        }
-        let legacy_instances = legacy_evidence.keys().copied().collect();
-        drop(registry);
-        *self.legacy_restore_evidence.lock().await = legacy_evidence;
-        Ok(RuntimeRestorePlan { legacy_instances })
+        // Runtime snapshots authorize stale-process cleanup only. Availability
+        // migration establishes every future restart decision before IPC is
+        // admitted, so no Running bit is carried forward as lifecycle intent.
+        Ok(RuntimeRestorePlan)
     }
 
-    fn active_catalog_instance_for_path(
-        registry: &Registry,
-        path: &Path,
-    ) -> Option<ProjectInstanceId> {
-        let path = Self::canonicalize_path(path);
-        let mut candidates = registry
-            .instances
-            .iter()
-            .filter_map(|(instance_id, record)| {
-                (record.current_path.as_deref() == Some(path.as_path())
-                    || record.last_known_path == path)
-                    .then_some(*instance_id)
-            })
-            .collect::<HashSet<_>>();
-        if let Some(instance_id) = registry.legacy_paths.get(&path).copied() {
-            candidates.insert(instance_id);
-        }
-        let instance_id = (candidates.len() == 1)
-            .then(|| candidates.into_iter().next())
-            .flatten()?;
-        registry.instances.get(&instance_id).and_then(|record| {
-            (record.presence == CatalogPresence::Active && record.current_path.is_some())
-                .then_some(instance_id)
-        })
-    }
-
-    /// Restore daemon-owned availability first, then the catalog-gated legacy
-    /// restart promise that remains until availability migration is complete.
-    /// The whole phase runs after IPC is online.
-    pub(crate) async fn restore_policy_owned_projects(&self, plan: RuntimeRestorePlan) {
+    /// Restore only daemon-owned availability policy.
+    pub(crate) async fn restore_policy_owned_projects(&self, _plan: RuntimeRestorePlan) {
         if self.is_shutting_down() {
             return;
         }
         self.converge_all_project_availability().await;
-
-        for instance_id in plan.legacy_instances {
-            if self.is_shutting_down() {
-                break;
-            }
-            let coordinator = self.availability_coordinator(instance_id).await;
-            let _runtime_guard = coordinator.runtime.lock().await;
-            if self.is_shutting_down() {
-                break;
-            }
-            if !self
-                .legacy_restore_evidence
-                .lock()
-                .await
-                .contains_key(&instance_id)
-            {
-                continue;
-            }
-            match self.availability_is_managed(instance_id).await {
-                Ok(true) => {
-                    self.legacy_restore_evidence
-                        .lock()
-                        .await
-                        .remove(&instance_id);
-                    continue;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    warn!(
-                        "Failed to inspect legacy restoration policy for {instance_id}: {error:#}"
-                    );
-                    continue;
-                }
-            }
-            let Some(path) = self.active_path_for_instance(instance_id).await else {
-                continue;
-            };
-            info!("Restoring catalogued legacy project instance {instance_id} at {path:?}");
-            if self.forgotten_reload_paths.lock().await.contains(&path) {
-                continue;
-            }
-            if let Err(error) = self
-                .apply_config_for_instance(path.clone(), None, false, Some(instance_id), true)
-                .await
-            {
-                warn!("Failed to restore legacy project instance {instance_id}: {error:#}");
-                continue;
-            }
-            self.watch_active_instance(instance_id).await;
-            self.legacy_restore_evidence
-                .lock()
-                .await
-                .remove(&instance_id);
-        }
 
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
         if !self.is_shutting_down() {
@@ -1592,15 +1727,87 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
     ) -> Result<()> {
+        self.start_with_manual_cli_session(path, event_tx, verbose, None)
+            .await
+    }
+
+    pub async fn start_with_manual_cli_session(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+    ) -> Result<()> {
+        self.start_with_request_provenance(path, event_tx, verbose, manual_cli_session, None)
+            .await
+    }
+
+    pub(crate) async fn start_from_ipc(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+        legacy_cli_peer_pid: Option<u32>,
+    ) -> Result<()> {
+        self.start_with_request_provenance(
+            path,
+            event_tx,
+            verbose,
+            manual_cli_session,
+            legacy_cli_peer_pid,
+        )
+        .await
+    }
+
+    async fn start_with_request_provenance(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+        legacy_cli_peer_pid: Option<u32>,
+    ) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
         let path = Self::canonicalize_path(&path);
-        if let Some((instance_id, _)) = self.availability_instance_for_path(&path).await {
-            return self
-                .start_catalogued_instance(instance_id, path, event_tx, verbose)
-                .await;
-        }
+        let expected_initial = match self.resolve_lifecycle_target(&path).await? {
+            LifecycleTargetResolution::Catalogued(target) => {
+                return self
+                    .start_catalogued_instance(
+                        target.instance_id,
+                        path,
+                        event_tx,
+                        verbose,
+                        manual_cli_session,
+                        legacy_cli_peer_pid,
+                    )
+                    .await;
+            }
+            LifecycleTargetResolution::UnregisteredPhysical { instance_id } => {
+                ConfigPhysicalIdentity::Git(instance_id)
+            }
+            LifecycleTargetResolution::UnresolvedLegacy => ConfigPhysicalIdentity::NonGit,
+            LifecycleTargetResolution::Ambiguous => anyhow::bail!(
+                "project start cannot resolve `{}` because it matches multiple catalogued project instances",
+                path.display()
+            ),
+        };
 
-        self.start_runtime(path, event_tx, verbose).await
+        let (instance_id, pending) = self
+            .start_runtime(path.clone(), None, false, expected_initial)
+            .await?;
+        let result = self
+            .start_catalogued_instance(
+                instance_id,
+                path,
+                event_tx,
+                verbose,
+                manual_cli_session,
+                legacy_cli_peer_pid,
+            )
+            .await;
+        drop(pending);
+        result
     }
 
     async fn start_runtime(
@@ -1608,7 +1815,8 @@ impl ProcessManager {
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
-    ) -> Result<()> {
+        initial_identity: ConfigPhysicalIdentity,
+    ) -> Result<(ProjectInstanceId, PendingInitialAvailabilityGuard)> {
         let (path, transition_lock) = self.transition_lock_for_path(&path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
@@ -1618,8 +1826,20 @@ impl ProcessManager {
         // reactivation. Events during a slow build/readiness wait are queued;
         // their reload will take this lock after the initial apply finishes.
         self.watch_config(path.clone()).await;
-        self.apply_config_locked(path, event_tx, verbose, None)
-            .await
+        let outcome = self
+            .apply_config_locked(
+                path,
+                event_tx,
+                verbose,
+                Some(ConfigIdentityExpectation::Initial(initial_identity)),
+                false,
+                None,
+            )
+            .await?;
+        let pending = outcome
+            .pending_initial
+            .context("initial config publication did not retain availability ownership")?;
+        Ok((outcome.instance_id, pending))
     }
 
     async fn reload_config(&self, path: PathBuf) -> Result<()> {
@@ -1627,12 +1847,15 @@ impl ProcessManager {
         if self.forgotten_reload_paths.lock().await.contains(&path) {
             return Ok(());
         }
-        if let Some((instance_id, _)) = self.availability_instance_for_path(&path).await {
-            return self.reload_catalogued_instance(instance_id, path).await;
+        match self.resolve_lifecycle_target(&path).await? {
+            LifecycleTargetResolution::Catalogued(target) => {
+                self.reload_catalogued_instance(target.instance_id, path)
+                    .await
+            }
+            LifecycleTargetResolution::UnregisteredPhysical { .. }
+            | LifecycleTargetResolution::UnresolvedLegacy
+            | LifecycleTargetResolution::Ambiguous => Ok(()),
         }
-
-        self.apply_config_for_instance(path, None, false, None, true)
-            .await
     }
 
     async fn watch_config(&self, path: PathBuf) {
@@ -1770,8 +1993,16 @@ impl ProcessManager {
         if reject_forgotten && self.forgotten_reload_paths.lock().await.contains(&path) {
             return Ok(());
         }
-        self.apply_config_locked(path, event_tx, verbose, expected_instance)
-            .await
+        self.apply_config_locked(
+            path,
+            event_tx,
+            verbose,
+            expected_instance.map(ConfigIdentityExpectation::Existing),
+            true,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn apply_config_locked(
@@ -1779,9 +2010,22 @@ impl ProcessManager {
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
-        expected_instance: Option<ProjectInstanceId>,
-    ) -> Result<()> {
+        expected_instance: Option<ConfigIdentityExpectation>,
+        start_services: bool,
+        service_activation: Option<&str>,
+    ) -> Result<ConfigApplyOutcome> {
         self.ensure_accepting_lifecycle_requests()?;
+        let discovery_before_config = Registry::discover(path.clone()).await?;
+        let physical_identity_before_config =
+            ConfigPhysicalIdentity::from_discovery(&discovery_before_config);
+        if let Some(expected_initial) =
+            expected_instance.and_then(ConfigIdentityExpectation::initial_physical_identity)
+        {
+            anyhow::ensure!(
+                physical_identity_before_config == expected_initial,
+                "project identity changed before initial config loading"
+            );
+        }
         // Setup log forwarding if verbose
         let _log_guard = if verbose {
             event_tx.as_ref().map(|tx| {
@@ -1835,6 +2079,9 @@ impl ProcessManager {
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
+        let service_activation = service_activation
+            .map(|selected| Self::service_activation_closure(&config, selected))
+            .transpose()?;
         for (service_name, service_config) in &config.services {
             let (effective_env, _) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config);
@@ -1848,28 +2095,66 @@ impl ProcessManager {
             .keys()
             .map(|service_name| format!("{}:{service_name}", config.project.name))
             .collect::<HashSet<_>>();
+        #[cfg(test)]
+        self.wait_at_config_publication_hook().await;
+        let lifecycle_publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
         let discovery = Registry::discover(path.clone()).await?;
+        let physical_identity_at_publication = ConfigPhysicalIdentity::from_discovery(&discovery);
+        anyhow::ensure!(
+            physical_identity_at_publication == physical_identity_before_config,
+            "project identity changed while loading configuration"
+        );
+        let initial_registration =
+            expected_instance.is_some_and(ConfigIdentityExpectation::is_initial);
         let (
             commit_result,
             instance_id,
             removed_service_names,
             published_domain_index,
             mut reusable_service_envs,
+            stopped_service_projections,
+            pending_initial,
         ) = {
             let mut registry = self.registry.lock().await;
-            let mut candidate = registry.clone();
+            let catalog_base = registry.clone();
+            let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
-            if let Some(expected_instance) = expected_instance {
-                anyhow::ensure!(
-                    registry.instances.contains_key(&expected_instance),
-                    "project instance {expected_instance} is no longer catalogued"
-                );
-                anyhow::ensure!(
-                    instance_id == expected_instance,
-                    "project identity changed while applying config: expected {expected_instance}, discovered {instance_id}"
-                );
+            if let Some(expectation) = expected_instance {
+                if expectation.requires_existing_catalog() {
+                    let expected_instance = expectation
+                        .expected_instance_id()
+                        .expect("existing config expectation has an instance ID");
+                    anyhow::ensure!(
+                        registry.instances.contains_key(&expected_instance),
+                        "project instance {expected_instance} is no longer catalogued"
+                    );
+                }
+                if let Some(expected_instance) = expectation.expected_instance_id() {
+                    anyhow::ensure!(
+                        instance_id == expected_instance,
+                        "project identity changed while applying config: expected {expected_instance}, discovered {instance_id}"
+                    );
+                }
             }
+            let pending_initial = if initial_registration {
+                let inserted = self
+                    .pending_initial_availability
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(instance_id);
+                anyhow::ensure!(
+                    inserted,
+                    "initial availability publication is already pending for project instance {instance_id}"
+                );
+                Some(PendingInitialAvailabilityGuard {
+                    instance_id,
+                    pending: Arc::clone(&self.pending_initial_availability),
+                })
+            } else {
+                None
+            };
             let claims = Self::build_domain_claims(instance_id, &config, &path)?;
             candidate.replace_domain_claims(instance_id, claims)?;
 
@@ -1880,6 +2165,7 @@ impl ProcessManager {
                 removed_service_names,
                 restart_service_names,
                 reusable_service_envs,
+                stopped_service_projections,
             } = self
                 .prepublication_stop_plan(
                     instance_id,
@@ -1889,8 +2175,9 @@ impl ProcessManager {
                     &desired_service_names,
                 )
                 .await?;
-            if expected_instance.is_some() {
-                self.availability_authorizes_start(instance_id).await?;
+            if expected_instance.is_some_and(ConfigIdentityExpectation::requires_existing_catalog) {
+                self.availability_authorizes_start_locked(instance_id)
+                    .await?;
             }
             for name in &removed_service_names {
                 info!("Service {name} removed from config, stopping before domain publication...");
@@ -1901,21 +2188,67 @@ impl ProcessManager {
                 self.stop_service_instance_locked(name, instance_id).await?;
             }
 
-            // `commit_candidate` advances the in-memory catalog at the atomic
-            // rename commit point, including PublishedNotDurable.
-            let commit_result = registry.commit_candidate(candidate).await;
-            let catalog_published = commit_result.is_ok()
-                || matches!(
-                    &commit_result,
-                    Err(CatalogError::PublishedNotDurable { .. })
-                );
-            let published_domain_index = catalog_published.then(|| registry.domain_index().clone());
+            let (commit_result, published_domain_index) = if initial_registration {
+                // A first registration must not leave a catalogued instance
+                // without availability authority if the daemon exits before
+                // the caller publishes its first demand. Establish an idle
+                // availability record in the same replayable transaction as
+                // the catalog and compatibility projection; the immediately
+                // following lifecycle operation adds the caller's demand. A
+                // deferred legacy project receives its already-planned policy,
+                // live demands, and pause in this same transaction.
+                drop(registry);
+                let attachment_base = self.attachments.lock().await.snapshot();
+                let target = CataloguedLifecycleTarget {
+                    instance_id,
+                    path: path.clone(),
+                    catalog_base,
+                    catalog_target: candidate,
+                };
+                let transaction = self
+                    .prepare_project_lifecycle_transaction(
+                        target,
+                        &AvailabilityBatch::new(SystemTime::now()),
+                        attachment_base.clone(),
+                        attachment_base,
+                    )
+                    .await?;
+                let commit_result = self
+                    .create_and_apply_lifecycle_transaction_locked(&transaction)
+                    .await;
+                // The catalog rename is the ownership commit point even when
+                // a later journal phase reports incomplete durability or
+                // fails. Observe the authoritative catalog image directly so
+                // hosts and runtime projections converge before the error is
+                // surfaced to the caller.
+                let published_domain_index = {
+                    let registry = self.registry.lock().await;
+                    transaction.catalog().and_then(|images| {
+                        (*registry == *images.target()).then(|| registry.domain_index().clone())
+                    })
+                };
+                (commit_result, published_domain_index)
+            } else {
+                // `commit_candidate` advances the in-memory catalog at the
+                // atomic rename commit point, including PublishedNotDurable.
+                let commit_result = registry.commit_candidate(candidate).await;
+                let catalog_published = commit_result.is_ok()
+                    || matches!(
+                        &commit_result,
+                        Err(CatalogError::PublishedNotDurable { .. })
+                    );
+                let published_domain_index =
+                    catalog_published.then(|| registry.domain_index().clone());
+                (commit_result.map_err(Into::into), published_domain_index)
+            };
             (
                 commit_result,
                 instance_id,
                 removed_service_names,
                 published_domain_index,
                 reusable_service_envs,
+                stopped_service_projections,
+                pending_initial,
             )
         };
 
@@ -1924,6 +2257,7 @@ impl ProcessManager {
         // PublishedNotDurable, then surface the durability result. Removed
         // service records leave runtime state at the same publication point.
         if let Some(published_domain_index) = published_domain_index {
+            let mut published_stopped_service_names = Vec::new();
             {
                 let mut services = self.services.lock().await;
                 for (name, resolved_env) in &reusable_service_envs {
@@ -1937,15 +2271,50 @@ impl ProcessManager {
                         Self::advance_service_projection(service);
                     }
                 }
+                for (name, (service_config, resolved_env)) in &stopped_service_projections {
+                    if let Some(service) = services.get_mut(name).filter(|service| {
+                        service.instance_id == instance_id
+                            && matches!(&service.runtime_state, ServiceRuntime::None)
+                    }) {
+                        service.config = config.clone();
+                        service.service_config.clone_from(service_config);
+                        service.path.clone_from(&path);
+                        service.resolved_env = resolved_env.clone().unwrap_or_default();
+                        service.health_status = HealthStatus::Unknown;
+                        service.health_source = HealthSource::None;
+                        service.warnings.clear();
+                        Self::advance_service_projection(service);
+                        published_stopped_service_names.push(name.clone());
+                    }
+                }
                 for name in &removed_service_names {
                     services.remove(name);
                 }
                 self.domain_index.store(published_domain_index);
             }
+            for name in &published_stopped_service_names {
+                self.broadcast_service_update(name).await;
+            }
+            if !removed_service_names.is_empty() {
+                let removed_service_names = removed_service_names
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                self.clear_service_stop_suppressions_for(instance_id, &removed_service_names)
+                    .await;
+            }
+            drop(lifecycle_publication_guard);
             self.persist_state().await;
             self.sync_hosts_after_catalog_publish().await;
+        } else {
+            drop(lifecycle_publication_guard);
         }
         commit_result?;
+
+        if let Some(service_names) = &service_activation {
+            self.clear_service_stop_suppressions_for(instance_id, service_names)
+                .await;
+        }
 
         if let Some(tx) = &event_tx {
             let _ = tx
@@ -1956,7 +2325,18 @@ impl ProcessManager {
                 .await;
         }
 
+        if !start_services {
+            return Ok(ConfigApplyOutcome {
+                instance_id,
+                pending_initial,
+            });
+        }
+
         for service_name in sorted_services {
+            anyhow::ensure!(
+                self.path_matches_instance(&path, instance_id).await,
+                "project identity changed before service runtime creation for instance {instance_id}"
+            );
             self.availability_allows_inflight_transition(instance_id)
                 .await?;
             let service_config = &config.services[&service_name];
@@ -1965,6 +2345,15 @@ impl ProcessManager {
                 config.project.name, service_name, service_config
             );
             let name = format!("{}:{}", config.project.name, service_name);
+            if self
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, name.clone()))
+            {
+                info!("Service {name} remains stopped until an explicit lifecycle action");
+                continue;
+            }
 
             // A domain-only reload updates the shared claim snapshot and the
             // service's display configuration using the authoritative
@@ -2150,7 +2539,16 @@ impl ProcessManager {
                     }
                     self.broadcast_service_update(&name).await;
 
-                    if let Err(superseded) = self.availability_authorizes_start(instance_id).await {
+                    let start_authorization = async {
+                        self.availability_authorizes_start(instance_id).await?;
+                        anyhow::ensure!(
+                            self.path_matches_instance(&path, instance_id).await,
+                            "project identity changed while preparing service `{name}` for instance {instance_id}"
+                        );
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(superseded) = start_authorization {
                         let cleanup = self.stop_service_instance_locked(&name, instance_id).await;
                         if let Err(cleanup_error) = cleanup {
                             return Err(superseded.context(format!(
@@ -2268,12 +2666,11 @@ impl ProcessManager {
             }
         }
 
-        self.legacy_restore_evidence
-            .lock()
-            .await
-            .remove(&instance_id);
         self.persist_state().await;
-        Ok(())
+        Ok(ConfigApplyOutcome {
+            instance_id,
+            pending_initial,
+        })
     }
 
     /// Stops a specific service by name.
@@ -2290,42 +2687,68 @@ impl ProcessManager {
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
         loop {
-            if let Some((path, _transition_guard, _runtime_projection_guard)) =
-                self.lock_service_runtime_transition(name).await
-            {
-                self.ensure_accepting_lifecycle_requests()?;
-                return self.stop_service_locked(name, &path).await;
-            }
-
-            let pending_instance = {
-                let evidence = self.legacy_restore_evidence.lock().await;
-                evidence.iter().find_map(|(instance_id, services)| {
-                    services
-                        .iter()
-                        .any(|service| service.name == name)
-                        .then_some(*instance_id)
-                })
-            };
-            let Some(instance_id) = pending_instance else {
+            let Some(instance_id) = self.service_instance_id(name).await else {
                 return Ok(());
             };
-
             let coordinator = self.availability_coordinator(instance_id).await;
             let _availability_guard = coordinator.runtime.lock().await;
+            let Some((path, _transition_guard, _runtime_projection_guard)) =
+                self.lock_service_runtime_transition(name).await
+            else {
+                return Ok(());
+            };
+            if self.service_instance_id(name).await != Some(instance_id) {
+                continue;
+            }
             self.ensure_accepting_lifecycle_requests()?;
-            let still_pending = self
-                .legacy_restore_evidence
+            self.stop_service_locked(name, &path).await?;
+            self.service_stop_suppressions
                 .lock()
                 .await
-                .get(&instance_id)
-                .is_some_and(|services| services.iter().any(|service| service.name == name));
-            if still_pending {
-                return Err(ServiceRestorePending {
-                    name: name.to_owned(),
-                    instance_id,
-                }
-                .into());
+                .insert((instance_id, name.to_owned()));
+            return Ok(());
+        }
+    }
+
+    /// Starts one explicitly selected service while preserving independent
+    /// service-stop overrides in the same project.
+    pub async fn start_service(&self, name: &str) -> Result<()> {
+        self.run_admitted_availability_transition(|| self.start_service_admitted(name))
+            .await
+    }
+
+    async fn start_service_admitted(&self, name: &str) -> Result<()> {
+        loop {
+            let Some(instance_id) = self.service_instance_id(name).await else {
+                return Err(ServiceNotFoundError.into());
+            };
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _availability_guard = coordinator.runtime.lock().await;
+            let Some((path, _transition_guard, _runtime_projection_guard)) =
+                self.lock_service_runtime_transition(name).await
+            else {
+                return Err(ServiceNotFoundError.into());
+            };
+            if self.service_instance_id(name).await != Some(instance_id) {
+                continue;
             }
+            self.ensure_accepting_lifecycle_requests()?;
+            let durability_error = self
+                .ensure_service_start_availability_locked(instance_id)
+                .await?;
+            self.watch_config(path.clone()).await;
+            let start = self
+                .apply_config_locked(
+                    path,
+                    None,
+                    false,
+                    Some(ConfigIdentityExpectation::Existing(instance_id)),
+                    true,
+                    Some(name),
+                )
+                .await
+                .map(|_| ());
+            return Self::surface_availability_durability(start, durability_error);
         }
     }
 
@@ -2334,7 +2757,7 @@ impl ProcessManager {
             let services = self.services.lock().await;
             if let Some(service) = services.get(name) {
                 anyhow::ensure!(
-                    service.path == project_path,
+                    Self::canonicalize_path(&service.path) == project_path,
                     "service `{name}` changed project during lifecycle transition"
                 );
                 service.instance_id
@@ -2420,43 +2843,58 @@ impl ProcessManager {
 
     pub async fn stop_all(&self) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
-        let (pending_instances, pending_paths) = {
-            let evidence = self.legacy_restore_evidence.lock().await;
-            (
-                evidence.keys().copied().collect::<Vec<_>>(),
-                evidence
-                    .values()
-                    .flatten()
-                    .map(|service| Self::canonicalize_path(&service.path))
-                    .collect::<HashSet<_>>(),
-            )
+        let catalog_instances = {
+            let registry = self.registry.lock().await;
+            registry
+                .instances
+                .iter()
+                .map(|(instance_id, record)| {
+                    (
+                        *instance_id,
+                        record
+                            .current_path
+                            .clone()
+                            .unwrap_or_else(|| record.last_known_path.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-        for instance_id in pending_instances {
-            let coordinator = self.availability_coordinator(instance_id).await;
-            let _availability_guard = coordinator.runtime.lock().await;
-            let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
-            self.ensure_accepting_lifecycle_requests()?;
-            self.legacy_restore_evidence
+        let mut managed_instances = Vec::new();
+        let mut managed_ids = HashSet::new();
+        for (instance_id, path) in catalog_instances {
+            if self.availability_is_managed(instance_id).await? {
+                managed_ids.insert(instance_id);
+                managed_instances.push((instance_id, path));
+            }
+        }
+        let mut uncatalogued_paths = {
+            let services = self
+                .services
                 .lock()
                 .await
-                .remove(&instance_id);
-            self.persist_state().await;
+                .values()
+                .map(|service| (service.instance_id, service.path.clone()))
+                .collect::<Vec<_>>();
+            let mut uncatalogued_paths = HashSet::new();
+            for (instance_id, path) in services {
+                if !managed_ids.contains(&instance_id) {
+                    uncatalogued_paths.insert(Self::canonicalize_path(&path));
+                }
+            }
+            uncatalogued_paths.into_iter().collect::<Vec<_>>()
+        };
+        managed_instances.sort_by_key(|(instance_id, _)| *instance_id);
+        uncatalogued_paths.sort();
+
+        for (instance_id, path) in managed_instances {
+            if let Err(error) = self.project_force_stop(path).await {
+                error!("Failed to stop project instance {instance_id}: {error}");
+            }
         }
 
-        let mut paths = {
-            let services = self.services.lock().await;
-            services
-                .values()
-                .map(|service| Self::canonicalize_path(&service.path))
-                .collect::<HashSet<_>>()
-        };
-        paths.extend(pending_paths);
-        let mut paths = paths.into_iter().collect::<Vec<_>>();
-        paths.sort();
-
-        for path in paths {
-            if let Err(e) = self.stop_project(&path).await {
-                error!("Failed to stop project at {}: {e}", path.display());
+        for path in uncatalogued_paths {
+            if let Err(error) = self.stop_project(&path).await {
+                error!("Failed to stop project at {}: {error}", path.display());
             }
         }
         Ok(())
@@ -2485,23 +2923,9 @@ impl ProcessManager {
         if self.is_shutting_down() {
             return Ok(());
         }
-        self.retire_legacy_restore_for_path(&project_path).await;
         self.stop_project_locked(&project_path).await?;
         self.persist_state().await;
         Ok(())
-    }
-
-    async fn retire_legacy_restore_for_path(&self, project_path: &Path) {
-        let instance_id = {
-            let registry = self.registry.lock().await;
-            Self::active_catalog_instance_for_path(&registry, project_path)
-        };
-        if let Some(instance_id) = instance_id {
-            self.legacy_restore_evidence
-                .lock()
-                .await
-                .remove(&instance_id);
-        }
     }
 
     async fn stop_project_locked(&self, project_path: &Path) -> Result<()> {
@@ -2509,7 +2933,7 @@ impl ProcessManager {
             let services = self.services.lock().await;
             services
                 .iter()
-                .filter(|(_, service)| service.path == project_path)
+                .filter(|(_, service)| Self::canonicalize_path(&service.path) == project_path)
                 .map(|(name, _)| name.clone())
                 .collect()
         };
@@ -2518,6 +2942,92 @@ impl ProcessManager {
             self.stop_service_locked(&name, project_path).await?;
         }
         Ok(())
+    }
+
+    /// Stop an unresolved legacy project before retiring its last durable
+    /// compatibility owner.
+    ///
+    /// The attachment projection is the retry authority for a project that
+    /// does not yet have a catalog identity. Keep it published until both the
+    /// runtime stop and its state snapshot are durable. If either operation
+    /// fails, the next reconciliation sweep observes the same owner evidence
+    /// and retries the stop. A daemon exit after the stop but before lifecycle
+    /// publication is likewise harmless: the retry performs an idempotent stop
+    /// before retiring the stale owner.
+    async fn stop_unresolved_project_and_publish_attachment_transaction(
+        &self,
+        project_path: &Path,
+        expected_resolution: LifecycleTargetIdentity,
+        transaction: &LifecycleTransaction,
+    ) -> Result<()> {
+        let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
+        let _transition_guard = transition_lock.lock().await;
+        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.ensure_lifecycle_publication_available()?;
+
+        let resolution = self.resolve_lifecycle_target(&project_path).await?;
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution
+                && matches!(resolution, LifecycleTargetResolution::UnresolvedLegacy),
+            "project identity changed while unresolved owner cleanup was waiting for runtime ownership; retry the cleanup"
+        );
+
+        self.stop_project_locked(&project_path).await?;
+        self.persist_state_checked().await?;
+
+        // The caller must release the publication lock before waiting for the
+        // path/runtime stop boundary. An unrelated project may publish new
+        // catalog and compatibility images in that interval, so reapply only
+        // this project's intended compatibility projection to the complete
+        // authoritative state after publication is reacquired. This keeps a
+        // normal cross-project race from creating a journal whose stale base
+        // can never be replayed.
+        anyhow::ensure!(
+            transaction.kind() == LifecycleTransactionKind::LifecycleMutation
+                && transaction.availability().is_empty(),
+            "unresolved owner cleanup requires an attachment-only lifecycle mutation"
+        );
+        let intended_project = transaction.attachments().target().project(&project_path);
+        let mut intended_only = transaction.attachments().base().clone();
+        intended_only.replace_project(
+            &project_path,
+            intended_project.attachments.clone(),
+            intended_project.manually_stopped,
+        );
+        if let Some(instance_id) = intended_project.instance_owner {
+            intended_only.set_instance_owner(&project_path, instance_id);
+        } else {
+            intended_only.clear_instance_owner(&project_path);
+        }
+        anyhow::ensure!(
+            intended_only == *transaction.attachments().target(),
+            "unresolved owner cleanup may mutate only its exact project compatibility projection"
+        );
+
+        let catalog = self.registry.lock().await.clone();
+        let attachment_base = self.attachments.lock().await.snapshot();
+        let mut attachment_target = attachment_base.clone();
+        attachment_target.replace_project(
+            &project_path,
+            intended_project.attachments,
+            intended_project.manually_stopped,
+        );
+        if let Some(instance_id) = intended_project.instance_owner {
+            attachment_target.set_instance_owner(&project_path, instance_id);
+        } else {
+            attachment_target.clear_instance_owner(&project_path);
+        }
+        let rebased = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            transaction.effective_at(),
+            Some(CatalogTransactionImages::new(catalog.clone(), catalog)?),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachment_base, attachment_target),
+        )?;
+        self.create_and_apply_lifecycle_transaction_locked(&rebased)
+            .await
     }
 
     async fn stop_project_instance_locked(&self, instance_id: ProjectInstanceId) -> Result<()> {
@@ -2555,45 +3065,86 @@ impl ProcessManager {
     }
 
     pub async fn restart(&self, name: &str) -> Result<()> {
-        let Some((path, _transition_guard, _runtime_projection_guard)) =
-            self.lock_service_runtime_transition(name).await
-        else {
-            return Err(ServiceNotFoundError.into());
-        };
-        self.ensure_accepting_lifecycle_requests()?;
-        self.stop_service_locked(name, &path).await?;
-        self.watch_config(path.clone()).await;
-        self.apply_config_locked(path, None, false, None).await
+        loop {
+            let Some(instance_id) = self.service_instance_id(name).await else {
+                return Err(ServiceNotFoundError.into());
+            };
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _availability_guard = coordinator.runtime.lock().await;
+            let Some((path, _transition_guard, _runtime_projection_guard)) =
+                self.lock_service_runtime_transition(name).await
+            else {
+                return Err(ServiceNotFoundError.into());
+            };
+            if self.service_instance_id(name).await != Some(instance_id) {
+                continue;
+            }
+            self.ensure_accepting_lifecycle_requests()?;
+            self.availability_authorizes_start(instance_id).await?;
+            self.stop_service_locked(name, &path).await?;
+            self.clear_service_stop_suppression(instance_id, name).await;
+            self.watch_config(path.clone()).await;
+            return self
+                .apply_config_locked(
+                    path,
+                    None,
+                    false,
+                    Some(ConfigIdentityExpectation::Existing(instance_id)),
+                    true,
+                    None,
+                )
+                .await
+                .map(|_| ());
+        }
     }
 
-    async fn restart_project(&self, project_path: &Path) -> Result<()> {
-        let (project_path, transition_lock) = self.transition_lock_for_path(project_path).await;
+    async fn restart_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _availability_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.availability_authorizes_start(instance_id).await?;
+        let project_path = self
+            .active_path_for_instance(instance_id)
+            .await
+            .context("catalogued project instance has no active path")?;
+        let (project_path, transition_lock) = self.transition_lock_for_path(&project_path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
-        self.ensure_accepting_lifecycle_requests()?;
-        self.stop_project_locked(&project_path).await?;
+        anyhow::ensure!(
+            self.path_matches_instance(&project_path, instance_id).await,
+            "project instance {instance_id} changed path during restart"
+        );
+        self.availability_authorizes_start(instance_id).await?;
+        self.stop_project_instance_locked(instance_id).await?;
+        self.clear_service_stop_suppressions(instance_id).await;
         self.watch_config(project_path.clone()).await;
-        self.apply_config_locked(project_path, None, false, None)
-            .await
+        self.apply_config_locked(
+            project_path,
+            None,
+            false,
+            Some(ConfigIdentityExpectation::Existing(instance_id)),
+            true,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn restart_all(&self) -> Result<()> {
-        // 1. Collect unique project paths
-        let mut paths: Vec<PathBuf> = {
+        let mut instance_ids = {
             let services = self.services.lock().await;
             services
                 .values()
-                .map(|service| Self::canonicalize_path(&service.path))
+                .map(|service| service.instance_id)
                 .collect::<HashSet<_>>()
                 .into_iter()
-                .collect()
+                .collect::<Vec<_>>()
         };
-        paths.sort();
+        instance_ids.sort();
 
-        // Restart one project transition at a time.
-        for path in paths {
-            if let Err(e) = self.restart_project(&path).await {
-                error!("Failed to restart project at {:?}: {}", path, e);
+        for instance_id in instance_ids {
+            if let Err(error) = self.restart_project_instance(instance_id).await {
+                error!("Failed to restart project instance {instance_id}: {error}");
             }
         }
         Ok(())
@@ -2616,15 +3167,26 @@ impl ProcessManager {
     pub async fn reset(&self, name: &str) -> Result<()> {
         info!("Resetting service {}", name);
 
+        let Some(instance_id) = self.service_instance_id(name).await else {
+            anyhow::bail!("Service {name} not found");
+        };
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _availability_guard = coordinator.runtime.lock().await;
         let Some((path, _transition_guard, _runtime_projection_guard)) =
             self.lock_service_runtime_transition(name).await
         else {
             anyhow::bail!("Service {name} not found");
         };
+        anyhow::ensure!(
+            self.service_instance_id(name).await == Some(instance_id),
+            "service `{name}` changed project instance during reset"
+        );
         self.ensure_accepting_lifecycle_requests()?;
+        self.availability_authorizes_start(instance_id).await?;
 
         // 1. Stop the service
         self.stop_service_locked(name, &path).await?;
+        self.clear_service_stop_suppression(instance_id, name).await;
 
         // Clear sticky port on reset
         {
@@ -2670,12 +3232,31 @@ impl ProcessManager {
 
         // 3. Restart while retaining the same project transition boundary.
         self.watch_config(path.clone()).await;
-        self.apply_config_locked(path, None, false, None).await?;
+        self.apply_config_locked(
+            path,
+            None,
+            false,
+            Some(ConfigIdentityExpectation::Existing(instance_id)),
+            true,
+            None,
+        )
+        .await?;
 
         Ok(())
     }
 
     pub async fn list(&self) -> Vec<ServiceStatus> {
+        self.list_with_instance_owners(None)
+            .await
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect()
+    }
+
+    async fn list_with_instance_owners(
+        &self,
+        instance_filter: Option<ProjectInstanceId>,
+    ) -> Vec<(ProjectInstanceId, ServiceStatus)> {
         let proxy_ports = { *self.proxy_ports.lock().await };
         let mut snapshots = Vec::new();
 
@@ -2689,6 +3270,9 @@ impl ProcessManager {
 
             // Second pass: Collect snapshots
             for (name, service) in services.iter() {
+                if instance_filter.is_some_and(|instance_id| service.instance_id != instance_id) {
+                    continue;
+                }
                 let snapshot = match &service.runtime_state {
                     ServiceRuntime::Controller(c) => RuntimeSnapshot::Controller(c.clone()),
                     ServiceRuntime::None => RuntimeSnapshot::Static {
@@ -2699,6 +3283,7 @@ impl ProcessManager {
                 };
 
                 snapshots.push((
+                    service.instance_id,
                     name.clone(),
                     self.domain_for_service(service.instance_id, name),
                     Some(service.path.clone()),
@@ -2715,6 +3300,7 @@ impl ProcessManager {
 
         let mut results = Vec::new();
         for (
+            instance_id,
             name,
             domain,
             path,
@@ -2727,7 +3313,8 @@ impl ProcessManager {
             warnings,
         ) in snapshots
         {
-            results.push(
+            results.push((
+                instance_id,
                 Self::build_service_status(
                     name,
                     domain,
@@ -2742,7 +3329,7 @@ impl ProcessManager {
                     warnings,
                 )
                 .await,
-            );
+            ));
         }
         results
     }
@@ -2849,56 +3436,740 @@ impl ProcessManager {
         }
     }
 
-    pub async fn registry_list(&self) -> Vec<locald_core::registry::ProjectEntry> {
-        let registry = self.registry.lock().await;
-        registry.project_entries()
+    pub async fn registry_list(&self) -> Result<Vec<locald_core::registry::ProjectEntry>> {
+        let projects = self.registry.lock().await.project_entries();
+        let mut resolved = Vec::with_capacity(projects.len());
+        for project in projects {
+            let canonical = Self::canonicalize_path(&project.path);
+            let entry = match self.resolve_lifecycle_projection(&canonical).await {
+                LifecycleTargetResolution::Catalogued(target) => {
+                    let record = target
+                        .catalog_target
+                        .instances
+                        .get(&target.instance_id)
+                        .context("resolved catalog instance is missing from its target image")?;
+                    locald_core::registry::ProjectEntry {
+                        path: canonical,
+                        name: record.display_name.clone(),
+                        pinned: record.pinned,
+                        last_seen: record.last_seen,
+                    }
+                }
+                LifecycleTargetResolution::UnresolvedLegacy => project,
+                LifecycleTargetResolution::UnregisteredPhysical { .. }
+                | LifecycleTargetResolution::Ambiguous => locald_core::registry::ProjectEntry {
+                    path: canonical,
+                    name: None,
+                    pinned: false,
+                    last_seen: project.last_seen,
+                },
+            };
+            resolved.push(entry);
+        }
+        resolved.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(resolved)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
+    /// Resolve live identity when possible while retaining the durable catalog
+    /// projection when a saved locator cannot currently be inspected.
+    /// Lifecycle mutations continue to use `resolve_lifecycle_target` directly
+    /// so discovery failures remain fail-closed.
+    async fn resolve_lifecycle_projection(&self, project_path: &Path) -> LifecycleTargetResolution {
+        match self.resolve_lifecycle_target(project_path).await {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let path = Self::canonicalize_path(project_path);
+                warn!(
+                    "Failed to refresh project identity for read-only projection at {}: {error}",
+                    path.display()
+                );
+                self.catalog_projection_for_path(path).await
+            }
+        }
+    }
+
+    async fn catalog_projection_for_path(&self, path: PathBuf) -> LifecycleTargetResolution {
+        let catalog_base = self.registry.lock().await.clone();
+        let mut candidates = catalog_base
+            .instances
+            .iter()
+            .filter_map(|(id, record)| {
+                (record.current_path.as_deref() == Some(path.as_path())
+                    || Self::canonicalize_path(&record.last_known_path) == path)
+                    .then_some(*id)
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(instance_id) = catalog_base.legacy_paths.get(&path) {
+            candidates.insert(*instance_id);
+        }
+        match candidates.len() {
+            0 => LifecycleTargetResolution::UnresolvedLegacy,
+            1 => LifecycleTargetResolution::Catalogued(Box::new(CataloguedLifecycleTarget {
+                instance_id: candidates
+                    .into_iter()
+                    .next()
+                    .expect("one projection candidate exists"),
+                path,
+                catalog_target: catalog_base.clone(),
+                catalog_base,
+            })),
+            _ => LifecycleTargetResolution::Ambiguous,
+        }
+    }
+
+    async fn resolve_lifecycle_target(
+        &self,
+        project_path: &Path,
+    ) -> Result<LifecycleTargetResolution> {
+        let path = Self::canonicalize_path(project_path);
+        let discovery = match Registry::discover(path.clone()).await {
+            Ok(discovery) => Some(discovery),
+            Err(error) if path.exists() => return Err(error.into()),
+            Err(_) => None,
+        };
+        let registry = self.registry.lock().await;
+        let catalog_base = registry.clone();
+        let mut catalog_target = catalog_base.clone();
+        let instance_id = if let Some(discovery) = discovery {
+            let stable_physical_identity = matches!(&discovery, ProjectDiscovery::Git { .. });
+            let instance_id = catalog_target.register_project(discovery, None)?;
+            if !catalog_base.instances.contains_key(&instance_id) {
+                return Ok(if stable_physical_identity {
+                    LifecycleTargetResolution::UnregisteredPhysical { instance_id }
+                } else {
+                    LifecycleTargetResolution::UnresolvedLegacy
+                });
+            }
+            instance_id
+        } else {
+            let mut candidates = catalog_base
+                .instances
+                .iter()
+                .filter_map(|(id, record)| {
+                    (record.current_path.as_deref() == Some(path.as_path())
+                        || Self::canonicalize_path(&record.last_known_path) == path)
+                        .then_some(*id)
+                })
+                .collect::<BTreeSet<_>>();
+            if let Some(instance_id) = catalog_base.legacy_paths.get(&path) {
+                candidates.insert(*instance_id);
+            }
+            match candidates.len() {
+                0 => return Ok(LifecycleTargetResolution::UnresolvedLegacy),
+                1 => candidates
+                    .into_iter()
+                    .next()
+                    .expect("one lifecycle candidate exists"),
+                _ => return Ok(LifecycleTargetResolution::Ambiguous),
+            }
+        };
+        Ok(LifecycleTargetResolution::Catalogued(Box::new(
+            CataloguedLifecycleTarget {
+                instance_id,
+                path,
+                catalog_base,
+                catalog_target,
+            },
+        )))
+    }
+
+    fn catalogued_lifecycle_paths(target: &CataloguedLifecycleTarget) -> BTreeSet<PathBuf> {
+        let mut paths = BTreeSet::from([Self::canonicalize_path(&target.path)]);
+        for catalog in [&target.catalog_base, &target.catalog_target] {
+            if let Some(record) = catalog.instances.get(&target.instance_id) {
+                paths.insert(Self::canonicalize_path(&record.last_known_path));
+                paths.extend(
+                    record
+                        .current_path
+                        .iter()
+                        .map(|path| Self::canonicalize_path(path)),
+                );
+            }
+            paths.extend(
+                catalog
+                    .legacy_paths
+                    .iter()
+                    .filter(|(_, instance_id)| **instance_id == target.instance_id)
+                    .map(|(path, _)| Self::canonicalize_path(path)),
+            );
+        }
+        paths
+    }
+
+    fn catalog_paths(catalog: &Registry) -> HashSet<PathBuf> {
+        catalog
+            .instances
+            .values()
+            .flat_map(|record| {
+                std::iter::once(record.last_known_path.clone())
+                    .chain(record.current_path.iter().cloned())
+            })
+            .chain(catalog.legacy_paths.keys().cloned())
+            .chain(catalog.unresolved_legacy.keys().cloned())
+            .map(|path| Self::canonicalize_path(&path))
+            .collect()
+    }
+
+    fn catalog_maps_legacy_path_to_instance(
+        catalog: &Registry,
+        project_path: &Path,
+        instance_id: ProjectInstanceId,
+    ) -> bool {
+        let project_path = Self::canonicalize_path(project_path);
+        catalog.legacy_paths.get(&project_path) == Some(&instance_id)
+    }
+
+    fn attachment_path_is_owned_by_target(
+        snapshot: &AttachmentStoreSnapshot,
+        target: &CataloguedLifecycleTarget,
+        project_path: &Path,
+    ) -> bool {
+        snapshot.instance_owner(project_path) == Some(target.instance_id)
+    }
+
+    fn attachment_path_can_initialize_target(
+        snapshot: &AttachmentStoreSnapshot,
+        target: &CataloguedLifecycleTarget,
+        project_path: &Path,
+    ) -> bool {
+        Self::attachment_path_is_owned_by_target(snapshot, target, project_path)
+            || (snapshot.instance_owner(project_path).is_none()
+                && (Self::catalog_maps_legacy_path_to_instance(
+                    &target.catalog_base,
+                    project_path,
+                    target.instance_id,
+                ) || Self::catalog_maps_legacy_path_to_instance(
+                    &target.catalog_target,
+                    project_path,
+                    target.instance_id,
+                )))
+    }
+
+    fn compatibility_evidence_for_target(
+        snapshot: &AttachmentStoreSnapshot,
+        target: &CataloguedLifecycleTarget,
+        effective_at: SystemTime,
+    ) -> AttachmentCompatibilityEvidence {
+        let mut combined = AttachmentCompatibilityEvidence {
+            project_path: Self::canonicalize_path(&target.path),
+            attachments: Vec::new(),
+            manually_stopped: false,
+        };
+        for path in Self::catalogued_lifecycle_paths(target) {
+            if !Self::attachment_path_can_initialize_target(snapshot, target, &path) {
+                continue;
+            }
+            let evidence =
+                snapshot.compatibility_evidence_at(&path, effective_at, Self::legacy_pid_alive);
+            combined.attachments.extend(evidence.attachments);
+            combined.manually_stopped |= evidence.manually_stopped;
+        }
+        combined
+    }
+
+    fn claim_compatibility_projection(
+        snapshot: &mut AttachmentStoreSnapshot,
+        project_path: &Path,
+        instance_id: ProjectInstanceId,
+        mut attachments: Vec<Attachment>,
+        manually_stopped: bool,
+        claimed_at: SystemTime,
+    ) {
+        let claims_owner = !attachments.is_empty() || manually_stopped;
+        if claims_owner {
+            for attachment in &mut attachments {
+                if matches!(
+                    attachment.source,
+                    AttachmentSource::Editor { pid: None, .. }
+                ) {
+                    attachment.created_at = claimed_at;
+                }
+            }
+        }
+        snapshot.replace_project(project_path, attachments, manually_stopped);
+        if claims_owner {
+            snapshot.set_instance_owner(project_path, instance_id);
+        }
+    }
+
+    async fn availability_record_exists(&self, instance_id: ProjectInstanceId) -> Result<bool> {
+        let path = availability_path(&self.availability_data_dir, instance_id);
+        tokio::fs::try_exists(&path)
+            .await
+            .with_context(|| format!("failed to inspect availability state `{}`", path.display()))
+    }
+
+    fn normalize_runtime_evidence_for_initial_migration(
+        evidence: &mut AttachmentCompatibilityEvidence,
+        effective_at: SystemTime,
+    ) {
+        for item in &mut evidence.attachments {
+            if matches!(item.attachment.source, AttachmentSource::Runtime) {
+                item.attachment.created_at = effective_at;
+                item.alive = true;
+            }
+        }
+    }
+
+    fn retain_explicit_attachment_owners_for_initial_migration(
+        evidence: &mut AttachmentCompatibilityEvidence,
+        availability_batch: &AvailabilityBatch,
+    ) -> Result<()> {
+        let ensured_demands = availability_batch
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                AvailabilityBatchOperation::EnsureDemand(demand) => Some(demand),
+                AvailabilityBatchOperation::Initialize
+                | AvailabilityBatchOperation::RenewDemand(_)
+                | AvailabilityBatchOperation::RevalidateDemand(_)
+                | AvailabilityBatchOperation::ImportDemand { .. }
+                | AvailabilityBatchOperation::ReleaseDemand(_)
+                | AvailabilityBatchOperation::SetAlwaysOn(_)
+                | AvailabilityBatchOperation::PauseProject
+                | AvailabilityBatchOperation::SetTrustedLaunchPath(_)
+                | AvailabilityBatchOperation::Retire => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for item in &mut evidence.attachments {
+            if let Some(demand) =
+                availability_demand_for_attachment_source(&item.attachment.source)?
+                && ensured_demands.contains(&demand)
+            {
+                // This owner was admitted by the lifecycle request being
+                // journaled, rather than merely discovered in legacy state.
+                // Publish the owner and its demand together; the normal reaper
+                // handles a process that exits at this boundary.
+                item.alive = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn compatibility_projection_for_existing_availability(
+        attachments: Vec<Attachment>,
+        availability: &ProjectAvailability,
+    ) -> Result<Vec<Attachment>> {
+        let demand_keys = availability
+            .demands()
+            .iter()
+            .map(|lease| lease.key().clone())
+            .collect::<BTreeSet<_>>();
+        attachments
+            .into_iter()
+            .filter_map(|attachment| match &attachment.source {
+                AttachmentSource::Pin => availability.always_on().then_some(Ok(attachment)),
+                AttachmentSource::Editor { .. }
+                | AttachmentSource::CLI { .. }
+                | AttachmentSource::ManualCLI(_) => {
+                    match availability_demand_for_attachment_source(&attachment.source) {
+                        Ok(Some(key)) if demand_keys.contains(&key) => Some(Ok(attachment)),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                }
+                AttachmentSource::Runtime => None,
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    async fn prepare_project_lifecycle_transaction(
+        &self,
+        mut target: CataloguedLifecycleTarget,
+        availability_batch: &AvailabilityBatch,
+        attachment_base: AttachmentStoreSnapshot,
+        mut attachment_target: AttachmentStoreSnapshot,
+    ) -> Result<LifecycleTransaction> {
+        let retires = availability_batch
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, AvailabilityBatchOperation::Retire));
+        let availability_state = if retires {
+            None
+        } else {
+            Some(
+                self.availability_management_state(target.instance_id)
+                    .await?,
+            )
+        };
+        let effective_batch = if retires
+            || matches!(
+                availability_state,
+                Some(AvailabilityManagementState::Managed)
+            ) {
+            availability_batch.clone()
+        } else {
+            debug_assert!(matches!(
+                availability_state,
+                Some(
+                    AvailabilityManagementState::PendingInitial
+                        | AvailabilityManagementState::LegacyUnmanaged
+                )
+            ));
+            let inherited_always_on = target
+                .catalog_base
+                .instances
+                .get(&target.instance_id)
+                .is_some_and(|record| record.pinned)
+                || target
+                    .catalog_target
+                    .instances
+                    .get(&target.instance_id)
+                    .is_some_and(|record| record.pinned);
+            let mut evidence = Self::compatibility_evidence_for_target(
+                &attachment_target,
+                &target,
+                availability_batch.effective_at(),
+            );
+            Self::retain_explicit_attachment_owners_for_initial_migration(
+                &mut evidence,
+                availability_batch,
+            )?;
+            let plan = plan_project_lifecycle_migration(
+                inherited_always_on,
+                &evidence,
+                availability_batch.effective_at(),
+            )?;
+
+            for path in Self::catalogued_lifecycle_paths(&target) {
+                if Self::attachment_path_can_initialize_target(&attachment_target, &target, &path)
+                    || path == Self::canonicalize_path(&target.path)
+                {
+                    attachment_target.replace_project(&path, Vec::new(), false);
+                }
+            }
+            Self::claim_compatibility_projection(
+                &mut attachment_target,
+                &target.path,
+                target.instance_id,
+                plan.compatibility_attachments,
+                plan.compatibility_manually_stopped,
+                availability_batch.effective_at(),
+            );
+
+            let mut combined = plan.availability_batch;
+            let mut final_always_on = plan.always_on;
+            for operation in availability_batch.operations() {
+                if let AvailabilityBatchOperation::SetAlwaysOn(enabled) = operation {
+                    final_always_on = *enabled;
+                }
+                combined.push(operation.clone());
+            }
+            if let Some(record) = target.catalog_target.instances.get_mut(&target.instance_id) {
+                record.pinned = final_always_on;
+            }
+            combined
+        };
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, target.instance_id).await?;
+        let prepared = availability.prepare_batch(&effective_batch).await?;
+        Ok(LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            effective_batch.effective_at(),
+            Some(CatalogTransactionImages::new(
+                target.catalog_base,
+                target.catalog_target,
+            )?),
+            vec![prepared],
+            AttachmentTransactionImages::new(attachment_base, attachment_target),
+        )?)
+    }
+
+    fn attachment_demands_for_target(
+        snapshot: &AttachmentStoreSnapshot,
+        target: &CataloguedLifecycleTarget,
+        project_paths: &BTreeSet<PathBuf>,
+        include_deferred: bool,
+    ) -> Result<BTreeSet<DemandKey>> {
+        project_paths
+            .iter()
+            .filter(|project_path| {
+                if include_deferred {
+                    Self::attachment_path_can_initialize_target(snapshot, target, project_path)
+                } else {
+                    Self::attachment_path_is_owned_by_target(snapshot, target, project_path)
+                }
+            })
+            .flat_map(|project_path| snapshot.project(project_path).attachments)
+            .map(|attachment| attachment.source)
+            .filter_map(
+                |attachment| match availability_demand_for_attachment_source(&attachment) {
+                    Ok(Some(demand)) => Some(Ok(demand)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    fn removed_manual_cli_demands(
+        base: &AttachmentStoreSnapshot,
+        target: &AttachmentStoreSnapshot,
+        project_paths: &BTreeSet<PathBuf>,
+    ) -> Result<BTreeSet<DemandKey>> {
+        project_paths
+            .iter()
+            .flat_map(|path| {
+                let retained = target.project(path).attachments;
+                base.project(path)
+                    .attachments
+                    .into_iter()
+                    .filter(move |attachment| !retained.contains(attachment))
+            })
+            .filter_map(|attachment| match &attachment.source {
+                AttachmentSource::ManualCLI(session) => Some(manual_cli_session_demand(session)),
+                AttachmentSource::Editor { .. }
+                | AttachmentSource::CLI { .. }
+                | AttachmentSource::Runtime
+                | AttachmentSource::Pin => None,
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    fn live_owner_renewal_operations(
+        demands: &BTreeSet<DemandKey>,
+    ) -> Vec<AvailabilityBatchOperation> {
+        demands
+            .iter()
+            .cloned()
+            .map(AvailabilityBatchOperation::RevalidateDemand)
+            .collect()
+    }
+
     pub async fn project_attach(
         &self,
         project_path: PathBuf,
         source: AttachmentSource,
     ) -> Result<()> {
+        self.project_attach_with_convergence(project_path, source, true)
+            .await
+    }
+
+    pub(crate) async fn project_attach_from_ipc(
+        &self,
+        project_path: PathBuf,
+        source: AttachmentSource,
+        standalone: bool,
+    ) -> Result<()> {
+        let converge_after_publication =
+            standalone || !matches!(&source, AttachmentSource::CLI { .. });
+        self.project_attach_with_convergence(project_path, source, converge_after_publication)
+            .await
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn project_attach_with_convergence(
+        &self,
+        project_path: PathBuf,
+        source: AttachmentSource,
+        converge_after_publication: bool,
+    ) -> Result<()> {
         anyhow::ensure!(
             !matches!(&source, AttachmentSource::Runtime),
             "Runtime attachment evidence is accepted only from persisted legacy state"
         );
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        anyhow::ensure!(
+            !matches!(&source, AttachmentSource::ManualCLI(_)),
+            "Manual CLI owners are published atomically by their paired Start request"
+        );
+        if matches!(&source, AttachmentSource::Pin) {
+            return self.registry_set_always_on(&project_path, true).await;
+        }
         self.ensure_accepting_lifecycle_requests()?;
-        // Canonicalize to prevent duplicate attachments from different relative paths.
-        let canonical =
-            std::fs::canonicalize(&project_path).unwrap_or_else(|_| project_path.clone());
-
-        let is_first = {
-            let mut attachments = self.attachments.lock().await;
-            attachments.reap_stale_attachments_for(&canonical);
-            let attachment = Attachment {
-                project_path: canonical.clone(),
-                source,
-                created_at: SystemTime::now(),
-            };
-            let first = attachments.attach(attachment)?;
-            attachments.clear_stopped(&canonical);
-            if let Err(e) = attachments.save().await {
-                error!("Failed to save attachments: {e}");
+        let demand = availability_demand_for_attachment_source(&source)?
+            .context("only editor and CLI sources may create a live project attachment")?;
+        let canonical = Self::canonicalize_path(&project_path);
+        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+        let pending_initial = match initial_resolution {
+            LifecycleTargetResolution::Catalogued(_) => None,
+            LifecycleTargetResolution::UnregisteredPhysical { instance_id } => {
+                // First registration keeps complete config validation ahead of
+                // identity publication. The new availability owner is published
+                // immediately after that validated transition.
+                let (_, pending) = self
+                    .start_runtime(
+                        canonical.clone(),
+                        None,
+                        false,
+                        ConfigPhysicalIdentity::Git(instance_id),
+                    )
+                    .await?;
+                Some(pending)
             }
-            first
+            LifecycleTargetResolution::UnresolvedLegacy => {
+                let (_, pending) = self
+                    .start_runtime(
+                        canonical.clone(),
+                        None,
+                        false,
+                        ConfigPhysicalIdentity::NonGit,
+                    )
+                    .await?;
+                Some(pending)
+            }
+            LifecycleTargetResolution::Ambiguous => anyhow::bail!(
+                "project attach cannot resolve `{}` because it matches multiple catalogued project instances",
+                canonical.display()
+            ),
         };
 
-        if is_first {
-            info!(
-                "First attachment for {}, starting services",
-                canonical.display()
-            );
-            if let Err(e) = self.start(canonical.clone(), None, false).await {
-                // Roll back attachment so future attaches retry start.
-                warn!("Failed to start project on attach: {e}");
-                let mut attachments = self.attachments.lock().await;
-                attachments.detach_all_non_pin(&canonical);
-                let _ = attachments.save().await;
-                return Err(e);
+        let transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let expected_instance = self
+            .resolve_lifecycle_target(&canonical)
+            .await?
+            .into_catalogued()
+            .context("validated project registration did not produce a catalog instance")?
+            .instance_id;
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let target = self
+            .resolve_lifecycle_target(&canonical)
+            .await?
+            .into_catalogued()
+            .context("validated project registration did not produce a catalog instance")?;
+        anyhow::ensure!(
+            target.instance_id == expected_instance,
+            "project identity changed during attachment publication"
+        );
+        let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
+        let instance_id = target.instance_id;
+        let effective_at = SystemTime::now();
+        let include_deferred = !self.availability_record_exists(instance_id).await?;
+        let (attachment_base, attachment_target, renews_existing_owner) = {
+            let attachments = self.attachments.lock().await;
+            let base = attachments.snapshot();
+            let mut candidate = attachments.clone();
+            for path in &lifecycle_paths {
+                if Self::attachment_path_is_owned_by_target(&base, &target, path)
+                    || (include_deferred
+                        && Self::attachment_path_can_initialize_target(&base, &target, path))
+                {
+                    candidate.reap_stale_attachments_for_with(
+                        path,
+                        effective_at,
+                        Self::legacy_pid_alive,
+                    );
+                } else if path == &canonical {
+                    candidate.forget_project(path);
+                }
             }
+            let reaped = candidate.snapshot();
+            let renews_existing_owner = Self::attachment_demands_for_target(
+                &reaped,
+                &target,
+                &lifecycle_paths,
+                include_deferred,
+            )?
+            .contains(&demand);
+            for path in &lifecycle_paths {
+                if Self::attachment_path_is_owned_by_target(&reaped, &target, path)
+                    || (include_deferred
+                        && Self::attachment_path_can_initialize_target(&reaped, &target, path))
+                {
+                    candidate.detach(path, &source);
+                    if !renews_existing_owner {
+                        candidate.clear_stopped(path);
+                    }
+                }
+            }
+            candidate.attach(Attachment {
+                project_path: canonical.clone(),
+                source: source.clone(),
+                created_at: effective_at,
+            })?;
+            candidate.set_instance_owner(&canonical, instance_id);
+            if !renews_existing_owner {
+                candidate.clear_stopped(&canonical);
+            }
+            (base, candidate.snapshot(), renews_existing_owner)
+        };
+        let before_demands = Self::attachment_demands_for_target(
+            &attachment_base,
+            &target,
+            &lifecycle_paths,
+            include_deferred,
+        )?;
+        let after_demands = Self::attachment_demands_for_target(
+            &attachment_target,
+            &target,
+            &lifecycle_paths,
+            include_deferred,
+        )?;
+        let removed_manual_cli_demands = Self::removed_manual_cli_demands(
+            &attachment_base,
+            &attachment_target,
+            &lifecycle_paths,
+        )?;
+        let mut batch = AvailabilityBatch::new(effective_at);
+        for removed in before_demands.difference(&after_demands) {
+            batch.push(AvailabilityBatchOperation::ReleaseDemand(removed.clone()));
+        }
+        for demand in removed_manual_cli_demands {
+            // Opportunistic stale-owner reaping must retire both halves of a
+            // paired Manual CLI session before the new attachment is
+            // published. The process demand appears in the generic delta;
+            // the session-owned Manual demand is provenance-specific.
+            batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
+        }
+        if renews_existing_owner {
+            // Legacy ProjectAttach is also used automatically after VS Code
+            // rediscovers a daemon. Keep an established owner passive so that
+            // recovery cannot cross a user pause. a.3.5 splits semantic editor
+            // activation/refocus from heartbeat and recovery renewal.
+            let renewal = BTreeSet::from([demand]);
+            for operation in Self::live_owner_renewal_operations(&renewal) {
+                batch.push(operation);
+            }
+        } else {
+            batch.push(AvailabilityBatchOperation::EnsureDemand(demand));
+        }
+        let transaction = self
+            .prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        drop(pending_initial);
+        drop(publication_guard);
+        drop(transition_guard);
+        if !converge_after_publication {
+            if !renews_existing_owner {
+                // A new semantic owner resumes normal project management even
+                // when an older field-less CLI reserves startup for its
+                // immediately following Start request. Clear one-off service
+                // stops at this attach boundary so a later explicit stop still
+                // wins while the bounded compatibility fallback is waiting.
+                let coordinator = self.availability_coordinator(instance_id).await;
+                let _runtime_guard = coordinator.runtime.lock().await;
+                self.clear_service_stop_suppressions(instance_id).await;
+            }
+            // Older CLIs publish this process owner immediately before opening
+            // their streamed Start request. Keep this adapter to publication so
+            // startup and its boot events remain owned by that next request. If
+            // the process exits without sending Start, preserve the legacy
+            // standalone command by converging after its owner is gone.
+            if let AttachmentSource::CLI { pid } = source {
+                self.converge_legacy_cli_after_process_exit(instance_id, pid);
+            }
+            return Ok(());
+        }
+        if renews_existing_owner {
+            self.converge_managed_instance(instance_id, None, false, false)
+                .await?;
+        } else {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
+            self.converge_managed_instance_locked(instance_id, None, false, false)
+                .await?;
         }
         Ok(())
     }
@@ -2913,52 +4184,469 @@ impl ProcessManager {
             !matches!(&source, Some(AttachmentSource::Runtime)),
             "Runtime attachment evidence is retained for the availability migration"
         );
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        if matches!(&source, Some(AttachmentSource::Pin)) {
+            return self.registry_set_always_on(&project_path, false).await;
+        }
         self.ensure_accepting_lifecycle_requests()?;
         let canonical = Self::canonicalize_path(&project_path);
-        let should_stop = {
-            let mut attachments = self.attachments.lock().await;
-            let is_last = if let Some(source) = &source {
-                attachments.detach(&canonical, source)
-            } else {
-                attachments.detach_all_non_pin(&canonical)
-            };
-            if let Err(e) = attachments.save().await {
-                error!("Failed to save attachments: {e}");
-            }
-            is_last && !attachments.is_stopped(&canonical)
+        let transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+        let expected_resolution = initial_resolution.identity();
+        let initial_target =
+            initial_resolution.into_mutation_target(&canonical, "project detach")?;
+        let expected_instance = initial_target.as_ref().map(|target| target.instance_id);
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let resolution = self.resolve_lifecycle_target(&canonical).await?;
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution,
+            "project identity changed during attachment release"
+        );
+        let target = resolution.into_mutation_target(&canonical, "project detach")?;
+        let lifecycle_paths = target.as_ref().map_or_else(
+            || BTreeSet::from([canonical.clone()]),
+            Self::catalogued_lifecycle_paths,
+        );
+        let effective_at = SystemTime::now();
+        let include_deferred = match expected_instance {
+            Some(instance_id) => !self.availability_record_exists(instance_id).await?,
+            None => false,
         };
+        let (attachment_base, attachment_target, stop_unresolved_legacy) = {
+            let attachments = self.attachments.lock().await;
+            let base = attachments.snapshot();
+            let mut candidate = attachments.clone();
+            let mut stop_unresolved_legacy = false;
+            for path in &lifecycle_paths {
+                let attributable = target.as_ref().is_none_or(|target| {
+                    Self::attachment_path_is_owned_by_target(&base, target, path)
+                        || (include_deferred
+                            && Self::attachment_path_can_initialize_target(&base, target, path))
+                });
+                if !attributable {
+                    continue;
+                }
+                let removed_last_live_owner = if let Some(source) = &source {
+                    candidate.detach(path, source)
+                } else {
+                    candidate.detach_all_non_pin(path)
+                };
+                stop_unresolved_legacy |=
+                    target.is_none() && removed_last_live_owner && !candidate.is_stopped(path);
+                let projection = candidate.snapshot().project(path);
+                if projection.attachments.is_empty() && !projection.manually_stopped {
+                    candidate.clear_instance_owner(path);
+                }
+            }
+            (base, candidate.snapshot(), stop_unresolved_legacy)
+        };
+        let removed_manual_cli_demands = Self::removed_manual_cli_demands(
+            &attachment_base,
+            &attachment_target,
+            &lifecycle_paths,
+        )?;
+        let (before_demands, after_demands) = if let Some(target) = &target {
+            (
+                Self::attachment_demands_for_target(
+                    &attachment_base,
+                    target,
+                    &lifecycle_paths,
+                    include_deferred,
+                )?,
+                Self::attachment_demands_for_target(
+                    &attachment_target,
+                    target,
+                    &lifecycle_paths,
+                    include_deferred,
+                )?,
+            )
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
+        let mut batch = AvailabilityBatch::new(effective_at);
+        for removed in before_demands.difference(&after_demands) {
+            batch.push(AvailabilityBatchOperation::ReleaseDemand(removed.clone()));
+        }
+        if expected_instance.is_some() {
+            for demand in removed_manual_cli_demands {
+                // Exact and bulk detach release only the Manual sessions
+                // removed by this attachment transaction. Singleton Manual
+                // policy from ForceStart or Runtime migration is independent.
+                batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
+            }
+        }
+        let transaction = if let Some(target) = target {
+            self.prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?
+        } else {
+            let catalog = self.registry.lock().await.clone();
+            LifecycleTransaction::new(
+                LifecycleTransactionKind::LifecycleMutation,
+                effective_at,
+                Some(CatalogTransactionImages::new(catalog.clone(), catalog)?),
+                Vec::new(),
+                AttachmentTransactionImages::new(attachment_base, attachment_target),
+            )?
+        };
+        if stop_unresolved_legacy {
+            drop(publication_guard);
+            self.stop_unresolved_project_and_publish_attachment_transaction(
+                &canonical,
+                expected_resolution,
+                &transaction,
+            )
+            .await?;
+            drop(transition_guard);
+            return Ok(());
+        }
 
-        if should_stop {
-            info!(
-                "Last attachment removed for {}, stopping services",
-                canonical.display()
-            );
-            self.stop_project(&canonical).await?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        drop(publication_guard);
+        drop(transition_guard);
+        if let Some(instance_id) = expected_instance {
+            self.converge_managed_instance(instance_id, None, false, false)
+                .await?;
         }
         Ok(())
     }
 
-    pub async fn project_force_start(&self, project_path: PathBuf) -> Result<()> {
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+    async fn reconcile_legacy_attachment_project(&self, project_path: PathBuf) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
-        {
-            let mut attachments = self.attachments.lock().await;
-            attachments.clear_stopped(&project_path);
-            let _ = attachments.save().await;
+        let canonical = Self::canonicalize_path(&project_path);
+        let transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+        if matches!(
+            initial_resolution,
+            LifecycleTargetResolution::UnregisteredPhysical { .. }
+                | LifecycleTargetResolution::Ambiguous
+        ) {
+            return Ok(());
         }
-        self.start(project_path, None, false).await
+        let expected_resolution = initial_resolution.identity();
+        let expected_instance = initial_resolution.catalogued_instance_id();
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let resolution = self.resolve_lifecycle_target(&canonical).await?;
+        if matches!(
+            resolution,
+            LifecycleTargetResolution::UnregisteredPhysical { .. }
+                | LifecycleTargetResolution::Ambiguous
+        ) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution,
+            "project identity changed during compatibility attachment reconciliation"
+        );
+        let target = resolution.into_catalogued();
+        let lifecycle_paths = target.as_ref().map_or_else(
+            || BTreeSet::from([canonical.clone()]),
+            Self::catalogued_lifecycle_paths,
+        );
+        let effective_at = SystemTime::now();
+        let include_deferred = match expected_instance {
+            Some(instance_id) => !self.availability_record_exists(instance_id).await?,
+            None => false,
+        };
+        let (attachment_base, attachment_target, renewed_demands, stop_unresolved_legacy) = {
+            let attachments = self.attachments.lock().await;
+            let base = attachments.snapshot();
+            let evidence = lifecycle_paths
+                .iter()
+                .filter(|path| {
+                    target.as_ref().is_none_or(|target| {
+                        Self::attachment_path_is_owned_by_target(&base, target, path)
+                            || (include_deferred
+                                && Self::attachment_path_can_initialize_target(&base, target, path))
+                    })
+                })
+                .map(|path| {
+                    base.compatibility_evidence_at(path, effective_at, Self::legacy_pid_alive)
+                })
+                .collect::<Vec<_>>();
+            let mut candidate = base.clone();
+            let mut renewed_demands = BTreeSet::new();
+            let mut stop_unresolved_legacy = false;
+            for evidence in evidence {
+                let projected_owner_before_reap = evidence
+                    .attachments
+                    .iter()
+                    .any(|item| !matches!(item.attachment.source, AttachmentSource::Runtime));
+                for item in evidence.attachments {
+                    if !item.alive {
+                        candidate.remove_exact_attachment(&evidence.project_path, &item.attachment);
+                        continue;
+                    }
+                    if matches!(
+                        item.attachment.source,
+                        AttachmentSource::CLI { .. }
+                            | AttachmentSource::ManualCLI(_)
+                            | AttachmentSource::Editor { pid: Some(_), .. }
+                    ) && let Some(demand) =
+                        availability_demand_for_attachment_source(&item.attachment.source)?
+                    {
+                        renewed_demands.insert(demand);
+                        if let AttachmentSource::ManualCLI(session) = &item.attachment.source {
+                            renewed_demands.insert(manual_cli_session_demand(session)?);
+                        }
+                    }
+                }
+                let projection = candidate.project(&evidence.project_path);
+                let projected_owner_after_reap = projection
+                    .attachments
+                    .iter()
+                    .any(|attachment| !matches!(attachment.source, AttachmentSource::Runtime));
+                stop_unresolved_legacy |= target.is_none()
+                    && projected_owner_before_reap
+                    && !projected_owner_after_reap
+                    && !projection.manually_stopped;
+                if projection.attachments.is_empty() && !projection.manually_stopped {
+                    candidate.clear_instance_owner(&evidence.project_path);
+                }
+            }
+            (base, candidate, renewed_demands, stop_unresolved_legacy)
+        };
+        let (before_demands, after_demands) = if let Some(target) = &target {
+            (
+                Self::attachment_demands_for_target(
+                    &attachment_base,
+                    target,
+                    &lifecycle_paths,
+                    include_deferred,
+                )?,
+                Self::attachment_demands_for_target(
+                    &attachment_target,
+                    target,
+                    &lifecycle_paths,
+                    include_deferred,
+                )?,
+            )
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
+        let removed_manual_cli_demands = Self::removed_manual_cli_demands(
+            &attachment_base,
+            &attachment_target,
+            &lifecycle_paths,
+        )?;
+        let mut batch = AvailabilityBatch::new(effective_at);
+        for removed in before_demands.difference(&after_demands) {
+            batch.push(AvailabilityBatchOperation::ReleaseDemand(removed.clone()));
+        }
+        if expected_instance.is_some() {
+            for demand in removed_manual_cli_demands {
+                batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
+            }
+        }
+        let live_demands = renewed_demands
+            .intersection(&after_demands)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if expected_instance.is_some() {
+            for operation in Self::live_owner_renewal_operations(&live_demands) {
+                batch.push(operation);
+            }
+        }
+        if batch.is_empty() && attachment_base == attachment_target {
+            return Ok(());
+        }
+        let transaction = if let Some(target) = target {
+            self.prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?
+        } else {
+            let catalog = self.registry.lock().await.clone();
+            LifecycleTransaction::new(
+                LifecycleTransactionKind::LifecycleMutation,
+                effective_at,
+                Some(CatalogTransactionImages::new(catalog.clone(), catalog)?),
+                Vec::new(),
+                AttachmentTransactionImages::new(attachment_base, attachment_target),
+            )?
+        };
+        if stop_unresolved_legacy {
+            drop(publication_guard);
+            self.stop_unresolved_project_and_publish_attachment_transaction(
+                &canonical,
+                expected_resolution,
+                &transaction,
+            )
+            .await?;
+            drop(transition_guard);
+            return Ok(());
+        }
+
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        drop(publication_guard);
+        drop(transition_guard);
+        Ok(())
+    }
+
+    pub async fn project_force_start(&self, project_path: PathBuf) -> Result<()> {
+        self.ensure_accepting_lifecycle_requests()?;
+        let canonical = Self::canonicalize_path(&project_path);
+        let pending_initial = match self.resolve_lifecycle_target(&canonical).await? {
+            LifecycleTargetResolution::Catalogued(_) => None,
+            LifecycleTargetResolution::UnregisteredPhysical { instance_id } => {
+                let (_, pending) = self
+                    .start_runtime(
+                        canonical.clone(),
+                        None,
+                        false,
+                        ConfigPhysicalIdentity::Git(instance_id),
+                    )
+                    .await?;
+                Some(pending)
+            }
+            LifecycleTargetResolution::UnresolvedLegacy => {
+                let (_, pending) = self
+                    .start_runtime(
+                        canonical.clone(),
+                        None,
+                        false,
+                        ConfigPhysicalIdentity::NonGit,
+                    )
+                    .await?;
+                Some(pending)
+            }
+            LifecycleTargetResolution::Ambiguous => anyhow::bail!(
+                "project start cannot resolve `{}` because it matches multiple catalogued project instances",
+                canonical.display()
+            ),
+        };
+        let transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let expected_instance = self
+            .resolve_lifecycle_target(&canonical)
+            .await?
+            .into_catalogued()
+            .context("validated project registration did not produce a catalog instance")?
+            .instance_id;
+        let coordinator = self.availability_coordinator(expected_instance).await;
+        let availability_guard = coordinator.runtime.lock().await;
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let target = self
+            .resolve_lifecycle_target(&canonical)
+            .await?
+            .into_catalogued()
+            .context("validated project registration did not produce a catalog instance")?;
+        anyhow::ensure!(
+            target.instance_id == expected_instance,
+            "project identity changed during forced start"
+        );
+        let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
+        let instance_id = target.instance_id;
+        let effective_at = SystemTime::now();
+        let include_deferred = !self.availability_record_exists(instance_id).await?;
+        let (attachment_base, attachment_target) = {
+            let attachments = self.attachments.lock().await;
+            let base = attachments.snapshot();
+            let mut candidate = attachments.clone();
+            for path in &lifecycle_paths {
+                if Self::attachment_path_is_owned_by_target(&base, &target, path)
+                    || (include_deferred
+                        && Self::attachment_path_can_initialize_target(&base, &target, path))
+                {
+                    candidate.clear_stopped(path);
+                } else if path == &canonical {
+                    candidate.forget_project(path);
+                }
+            }
+            (base, candidate.snapshot())
+        };
+        let batch = AvailabilityBatch::new(effective_at).with_operation(
+            AvailabilityBatchOperation::EnsureDemand(DemandKey::manual_cli()),
+        );
+        let transaction = self
+            .prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        self.clear_service_stop_suppressions(instance_id).await;
+        drop(pending_initial);
+        drop(publication_guard);
+        drop(availability_guard);
+        drop(transition_guard);
+        self.converge_managed_instance(instance_id, None, false, false)
+            .await?;
+        Ok(())
     }
 
     pub async fn project_force_stop(&self, project_path: PathBuf) -> Result<()> {
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
-        {
-            let mut attachments = self.attachments.lock().await;
-            attachments.mark_stopped(&project_path);
-            let _ = attachments.save().await;
-        }
-        self.stop_project(&project_path).await
+        let canonical = Self::canonicalize_path(&project_path);
+        let transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+        let expected_resolution = initial_resolution.identity();
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let resolution = self.resolve_lifecycle_target(&canonical).await?;
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution,
+            "project identity changed during forced stop"
+        );
+        let target = resolution
+            .into_mutation_target(&canonical, "project stop")?
+            .context("project stop requires a catalogued project instance")?;
+        let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
+        let instance_id = target.instance_id;
+        let effective_at = SystemTime::now();
+        let include_deferred = !self.availability_record_exists(instance_id).await?;
+        let (attachment_base, attachment_target) = {
+            let attachments = self.attachments.lock().await;
+            let base = attachments.snapshot();
+            let mut candidate = attachments.clone();
+            for path in &lifecycle_paths {
+                if Self::attachment_path_is_owned_by_target(&base, &target, path)
+                    || (include_deferred
+                        && Self::attachment_path_can_initialize_target(&base, &target, path))
+                {
+                    candidate.clear_stopped(path);
+                } else if path == &canonical {
+                    candidate.forget_project(path);
+                }
+            }
+            candidate.mark_stopped(&canonical);
+            candidate.set_instance_owner(&canonical, instance_id);
+            (base, candidate.snapshot())
+        };
+        let batch = AvailabilityBatch::new(effective_at)
+            .with_operation(AvailabilityBatchOperation::PauseProject);
+        let transaction = self
+            .prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        drop(publication_guard);
+        drop(transition_guard);
+        self.converge_managed_instance(instance_id, None, false, false)
+            .await?;
+        Ok(())
     }
 
     /// Acquire or renew semantic availability and converge the project runtime.
@@ -2973,30 +4661,24 @@ impl ProcessManager {
         let (instance_id, _) = self
             .required_availability_instance_for_path(project_path)
             .await?;
-        let coordinator = self.availability_coordinator(instance_id).await;
         self.run_admitted_availability_transition(|| async {
-            let _runtime_guard = coordinator.runtime.lock().await;
             self.ensure_accepting_lifecycle_requests()?;
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
             anyhow::ensure!(
                 self.active_path_for_instance(instance_id).await.is_some(),
                 "project instance {instance_id} is no longer active"
             );
-            self.watch_active_instance(instance_id).await;
             let mut availability =
                 AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
             let (result, durability_error) =
                 Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
+            drop(publication_guard);
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_availability_locked(
-                    instance_id,
-                    None,
-                    None,
-                    AvailabilityConvergenceOptions {
-                        verbose: false,
-                        apply_config_when_up: false,
-                        defer_config_reload_during_cooldown: false,
-                    },
-                )
+                .converge_managed_instance_locked(instance_id, None, false, false)
                 .await;
             Self::surface_availability_durability(convergence, durability_error)?;
             Ok(result.expect("successful availability publication returns its demand result"))
@@ -3009,31 +4691,29 @@ impl ProcessManager {
         let (instance_id, _) = self
             .required_availability_instance_for_path(project_path)
             .await?;
-        let coordinator = self.availability_coordinator(instance_id).await;
         self.run_admitted_availability_transition(|| async {
-            let _runtime_guard = coordinator.runtime.lock().await;
             self.ensure_accepting_lifecycle_requests()?;
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
             anyhow::ensure!(
                 self.active_path_for_instance(instance_id).await.is_some(),
                 "project instance {instance_id} is no longer active"
             );
-            self.watch_active_instance(instance_id).await;
             let mut availability =
                 AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
-            let convergence = self
-                .converge_availability_locked(
-                    instance_id,
-                    None,
-                    None,
-                    AvailabilityConvergenceOptions {
-                        verbose: false,
-                        apply_config_when_up: false,
-                        defer_config_reload_during_cooldown: false,
-                    },
-                )
-                .await;
+            drop(publication_guard);
+            let convergence = if enabled {
+                let coordinator = self.availability_coordinator(instance_id).await;
+                let _runtime_guard = coordinator.runtime.lock().await;
+                self.clear_service_stop_suppressions(instance_id).await;
+                self.converge_managed_instance_locked(instance_id, None, false, false)
+                    .await
+            } else {
+                self.converge_managed_instance(instance_id, None, false, false)
+                    .await
+            };
             Self::surface_availability_durability(convergence, durability_error)?;
             Ok(changed.expect("successful availability publication returns its change result"))
         })
@@ -3047,10 +4727,13 @@ impl ProcessManager {
             .await?;
         self.run_admitted_availability_transition(|| async {
             self.ensure_accepting_lifecycle_requests()?;
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
             let mut availability =
                 AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.pause_project().await)?;
+            drop(publication_guard);
             let convergence = self
                 .converge_managed_instance(instance_id, None, false, false)
                 .await;
@@ -3058,6 +4741,535 @@ impl ProcessManager {
             Ok(changed.expect("successful availability publication returns its change result"))
         })
         .await
+    }
+
+    /// Recover a published lifecycle intent before admitting IPC, then import
+    /// the legacy compatibility stores exactly once.
+    pub(crate) async fn recover_and_migrate_lifecycle_state(&self) -> Result<()> {
+        self.lifecycle_recovery_required
+            .store(true, AtomicOrdering::Release);
+        let result = self.recover_and_migrate_lifecycle_state_locked().await;
+        self.lifecycle_recovery_required
+            .store(result.is_err(), AtomicOrdering::Release);
+        result
+    }
+
+    async fn recover_and_migrate_lifecycle_state_locked(&self) -> Result<()> {
+        let _transition_guard = self.attachment_transition_lock.lock().await;
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        let preflight = self.lifecycle_journal.preflight().await?;
+        let (transaction, marker) = preflight.into_parts();
+        if let Some(mut transaction) = transaction {
+            let catalog_path = self.registry.lock().await.storage_path().to_path_buf();
+            transaction.normalize_catalog_storage_path(&catalog_path);
+            self.apply_lifecycle_transaction_locked(&transaction)
+                .await?;
+        }
+        let migration_complete =
+            marker.is_some() || self.lifecycle_journal.migration_marker().await?.is_some();
+        if migration_complete {
+            let catalog = self.registry.lock().await.clone();
+            let attachments = self.attachments.lock().await.snapshot();
+            validate_attachment_authority(&attachments, &catalog, "authoritative")?;
+            self.validate_catalogued_availability_authority(&catalog)
+                .await?;
+            self.reconcile_catalog_presence_locked().await?;
+            self.sync_hosts()
+                .await
+                .context("failed to reconcile domain claims after lifecycle recovery")?;
+            return Ok(());
+        }
+
+        let effective_at = SystemTime::now();
+        let (catalog_base, catalog_path) = {
+            let registry = self.registry.lock().await;
+            (registry.clone(), registry.storage_path().to_path_buf())
+        };
+        let (attachment_base, attachment_path, evidence) = {
+            let attachments = self.attachments.lock().await;
+            (
+                attachments.snapshot(),
+                attachments.storage_path().to_path_buf(),
+                attachments.compatibility_evidence_at(effective_at, Self::legacy_pid_alive),
+            )
+        };
+
+        self.lifecycle_journal
+            .backup_v1_file(LegacyV1File::Catalog, &catalog_path)
+            .await?;
+        let legacy_registry_path = catalog_path
+            .parent()
+            .map(|parent| parent.join("registry.json"))
+            .unwrap_or_else(Registry::legacy_registry_path);
+        self.lifecycle_journal
+            .backup_v1_file(LegacyV1File::Registry, &legacy_registry_path)
+            .await?;
+        self.lifecycle_journal
+            .backup_v1_file(LegacyV1File::Attachments, &attachment_path)
+            .await?;
+        self.lifecycle_journal
+            .backup_v1_file(LegacyV1File::RuntimeState, self.state_manager.path())
+            .await?;
+
+        let mut evidence_by_instance =
+            BTreeMap::<ProjectInstanceId, AttachmentCompatibilityEvidence>::new();
+        let mut deferred_evidence = Vec::new();
+        for item in evidence {
+            let Some(instance_id) =
+                Self::catalog_instance_for_legacy_path(&catalog_base, &item.project_path)
+            else {
+                deferred_evidence.push(item);
+                continue;
+            };
+            let entry = evidence_by_instance.entry(instance_id).or_insert_with(|| {
+                AttachmentCompatibilityEvidence {
+                    project_path: item.project_path.clone(),
+                    attachments: Vec::new(),
+                    manually_stopped: false,
+                }
+            });
+            entry.attachments.extend(item.attachments);
+            entry.manually_stopped |= item.manually_stopped;
+        }
+
+        let mut prepared_availability = Vec::with_capacity(catalog_base.instances.len());
+        let mut attachment_target = AttachmentStoreSnapshot::default();
+        let mut catalog_target = catalog_base.clone();
+        for (instance_id, record) in &catalog_base.instances {
+            let project_path = record
+                .current_path
+                .clone()
+                .unwrap_or_else(|| record.last_known_path.clone());
+            let mut evidence = evidence_by_instance.remove(instance_id).unwrap_or_else(|| {
+                AttachmentCompatibilityEvidence {
+                    project_path: project_path.clone(),
+                    attachments: Vec::new(),
+                    manually_stopped: false,
+                }
+            });
+            let availability_file = availability_path(&self.availability_data_dir, *instance_id);
+            let availability_exists = crate::path_entry_exists(&availability_file)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to inspect availability state `{}`",
+                        availability_file.display()
+                    )
+                })?;
+            if !availability_exists {
+                Self::normalize_runtime_evidence_for_initial_migration(&mut evidence, effective_at);
+            }
+            let plan = plan_project_lifecycle_migration(record.pinned, &evidence, effective_at)?;
+            let mut availability =
+                AvailabilityStore::load(&self.availability_data_dir, *instance_id).await?;
+            let (always_on, compatibility_attachments, compatibility_manually_stopped) =
+                if availability_exists {
+                    let authoritative = availability.snapshot().await?;
+                    prepared_availability.push(
+                        availability
+                            .prepare_batch(&AvailabilityBatch::new(effective_at))
+                            .await?,
+                    );
+                    (
+                        authoritative.always_on(),
+                        Self::compatibility_projection_for_existing_availability(
+                            plan.compatibility_attachments,
+                            &authoritative,
+                        )?,
+                        authoritative.is_paused(),
+                    )
+                } else {
+                    prepared_availability
+                        .push(availability.prepare_batch(&plan.availability_batch).await?);
+                    (
+                        plan.always_on,
+                        plan.compatibility_attachments,
+                        plan.compatibility_manually_stopped,
+                    )
+                };
+            if let Some(target_record) = catalog_target.instances.get_mut(instance_id) {
+                target_record.pinned = always_on;
+            }
+            Self::claim_compatibility_projection(
+                &mut attachment_target,
+                &project_path,
+                *instance_id,
+                compatibility_attachments,
+                compatibility_manually_stopped,
+                effective_at,
+            );
+        }
+        for mut evidence in deferred_evidence {
+            let evidence_path = Self::canonicalize_path(&evidence.project_path);
+            let unresolved_paths = catalog_base
+                .unresolved_legacy
+                .keys()
+                .filter(|path| Self::canonicalize_path(path) == evidence_path)
+                .cloned()
+                .collect::<Vec<_>>();
+            let catalog_pinned = unresolved_paths.iter().any(|path| {
+                catalog_base
+                    .unresolved_legacy
+                    .get(path)
+                    .is_some_and(|record| record.pinned)
+            });
+            Self::normalize_runtime_evidence_for_initial_migration(&mut evidence, effective_at);
+            let plan = plan_project_lifecycle_migration(catalog_pinned, &evidence, effective_at)?;
+            for path in unresolved_paths {
+                if let Some(record) = catalog_target.unresolved_legacy.get_mut(&path) {
+                    record.pinned = plan.always_on;
+                }
+            }
+            let mut compatibility_attachments = plan
+                .compatibility_attachments
+                .into_iter()
+                .filter(|attachment| !matches!(attachment.source, AttachmentSource::Pin))
+                .collect::<Vec<_>>();
+            if let Some(runtime) = evidence
+                .attachments
+                .iter()
+                .filter(|item| matches!(item.attachment.source, AttachmentSource::Runtime))
+                .max_by_key(|item| item.attachment.created_at)
+            {
+                let mut runtime = runtime.attachment.clone();
+                runtime.project_path.clone_from(&evidence.project_path);
+                compatibility_attachments.push(runtime);
+            }
+            attachment_target.replace_project(
+                &evidence.project_path,
+                compatibility_attachments,
+                plan.compatibility_manually_stopped,
+            );
+        }
+
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LegacyV1Migration,
+            effective_at,
+            Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+            prepared_availability,
+            AttachmentTransactionImages::new(attachment_base, attachment_target),
+        )?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        self.reconcile_catalog_presence_locked().await?;
+        let catalog = self.registry.lock().await.clone();
+        self.validate_catalogued_availability_authority(&catalog)
+            .await?;
+        self.sync_hosts()
+            .await
+            .context("failed to reconcile domain claims after lifecycle migration")
+    }
+
+    async fn validate_catalogued_availability_authority(&self, catalog: &Registry) -> Result<()> {
+        for instance_id in catalog.instances.keys().copied() {
+            let path = availability_path(&self.availability_data_dir, instance_id);
+            let exists = tokio::fs::try_exists(&path).await.with_context(|| {
+                format!(
+                    "failed to inspect availability state `{}` during lifecycle recovery",
+                    path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                exists,
+                "missing availability state after lifecycle-v2 migration for project instance {instance_id} at `{}`",
+                path.display()
+            );
+            AvailabilityStore::load(&self.availability_data_dir, instance_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to validate availability authority for project instance {instance_id}"
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_catalog_presence_locked(&self) -> Result<()> {
+        let catalog_base = self.registry.lock().await.clone();
+        let mut catalog_target = catalog_base.clone();
+        catalog_target.reconcile_missing()?;
+        if catalog_target == catalog_base {
+            return Ok(());
+        }
+        let attachments = self.attachments.lock().await.snapshot();
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            SystemTime::now(),
+            Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachments.clone(), attachments),
+        )?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await
+    }
+
+    async fn create_and_apply_lifecycle_transaction_locked(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> Result<()> {
+        if let Err(error) = self.lifecycle_journal.create(transaction).await {
+            self.lifecycle_recovery_required
+                .store(true, AtomicOrdering::Release);
+            return Err(error.into());
+        }
+        self.lifecycle_recovery_required
+            .store(true, AtomicOrdering::Release);
+        self.apply_lifecycle_transaction_locked(transaction).await?;
+        self.lifecycle_recovery_required
+            .store(false, AtomicOrdering::Release);
+        Ok(())
+    }
+
+    async fn apply_lifecycle_transaction_locked(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> Result<()> {
+        let id = transaction.id();
+        let mut phase = transaction.phase();
+        self.verify_completed_lifecycle_transaction_phases(transaction)
+            .await?;
+
+        if phase == LifecycleTransactionPhase::Prepared {
+            if let Some(images) = transaction.catalog() {
+                let mut registry = self.registry.lock().await;
+                let current = registry.clone();
+                anyhow::ensure!(
+                    current == *images.base() || current == *images.target(),
+                    "lifecycle transaction {id} catalog base no longer matches authoritative state"
+                );
+                let publication = registry.commit_candidate(images.target().clone()).await;
+                if publication.is_ok()
+                    || matches!(&publication, Err(CatalogError::PublishedNotDurable { .. }))
+                {
+                    self.domain_index.store(registry.domain_index().clone());
+                }
+                publication?;
+            }
+            self.lifecycle_journal
+                .advance(
+                    id,
+                    LifecycleTransactionPhase::Prepared,
+                    LifecycleTransactionPhase::CatalogPublished,
+                )
+                .await?;
+            phase = LifecycleTransactionPhase::CatalogPublished;
+        }
+
+        if phase == LifecycleTransactionPhase::CatalogPublished {
+            for prepared in transaction.availability() {
+                let mut availability = AvailabilityStore::load(
+                    &self.availability_data_dir,
+                    prepared.project_instance_id(),
+                )
+                .await?;
+                availability.apply_prepared_batch(prepared).await?;
+            }
+            self.lifecycle_journal
+                .advance(
+                    id,
+                    LifecycleTransactionPhase::CatalogPublished,
+                    LifecycleTransactionPhase::AvailabilityPublished,
+                )
+                .await?;
+            phase = LifecycleTransactionPhase::AvailabilityPublished;
+        }
+
+        if phase == LifecycleTransactionPhase::AvailabilityPublished {
+            let images = transaction.attachments();
+            let mut attachments = self.attachments.lock().await;
+            let current = attachments.snapshot();
+            anyhow::ensure!(
+                current == *images.base() || current == *images.target(),
+                "lifecycle transaction {id} attachment base no longer matches authoritative state"
+            );
+            attachments
+                .replace_snapshot(images.target().clone())
+                .await?;
+            self.lifecycle_journal
+                .advance(
+                    id,
+                    LifecycleTransactionPhase::AvailabilityPublished,
+                    LifecycleTransactionPhase::CompatibilityPublished,
+                )
+                .await?;
+            phase = LifecycleTransactionPhase::CompatibilityPublished;
+        }
+
+        if phase == LifecycleTransactionPhase::CompatibilityPublished {
+            if transaction.kind() == LifecycleTransactionKind::LegacyV1Migration {
+                self.lifecycle_journal
+                    .mark_migration_complete(id, transaction.effective_at())
+                    .await?;
+            }
+            self.lifecycle_journal
+                .advance(
+                    id,
+                    LifecycleTransactionPhase::CompatibilityPublished,
+                    LifecycleTransactionPhase::Complete,
+                )
+                .await?;
+            phase = LifecycleTransactionPhase::Complete;
+        }
+
+        if phase == LifecycleTransactionPhase::Complete {
+            self.lifecycle_journal.clear(id).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_completed_lifecycle_transaction_phases(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> Result<()> {
+        let phase = transaction.phase();
+
+        if phase.requires_catalog_target()
+            && let Some(images) = transaction.catalog()
+        {
+            let current = self.registry.lock().await.clone();
+            anyhow::ensure!(
+                current == *images.target(),
+                "lifecycle transaction {} is at phase {phase:?}, but its catalog target is not authoritative",
+                transaction.id()
+            );
+        }
+        if phase.requires_availability_targets() {
+            for prepared in transaction.availability() {
+                let mut availability = AvailabilityStore::load(
+                    &self.availability_data_dir,
+                    prepared.project_instance_id(),
+                )
+                .await?;
+                let observed = availability
+                    .prepare_batch(&AvailabilityBatch::new(transaction.effective_at()))
+                    .await?;
+                anyhow::ensure!(
+                    observed.expected() == prepared.target(),
+                    "lifecycle transaction {} is at phase {phase:?}, but availability for {} is not at its target",
+                    transaction.id(),
+                    prepared.project_instance_id()
+                );
+            }
+        }
+        if phase.requires_compatibility_target() {
+            let current = self.attachments.lock().await.snapshot();
+            anyhow::ensure!(
+                current == *transaction.attachments().target(),
+                "lifecycle transaction {} is at phase {phase:?}, but its compatibility target is not authoritative",
+                transaction.id()
+            );
+        }
+        Ok(())
+    }
+
+    fn catalog_instance_for_legacy_path(
+        catalog: &Registry,
+        path: &Path,
+    ) -> Option<ProjectInstanceId> {
+        let path = Self::canonicalize_path(path);
+        let mut candidates = BTreeSet::new();
+        for (instance_id, record) in &catalog.instances {
+            if record.current_path.as_deref() == Some(path.as_path())
+                || Self::canonicalize_path(&record.last_known_path) == path
+            {
+                candidates.insert(*instance_id);
+            }
+        }
+        if let Some(instance_id) = catalog.legacy_paths.get(&path) {
+            candidates.insert(*instance_id);
+        }
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
+    }
+
+    fn compatibility_attachments_for_display(
+        snapshot: &AttachmentStoreSnapshot,
+        project_path: &Path,
+        displayed_instance: Option<ProjectInstanceId>,
+    ) -> Vec<Attachment> {
+        let projection = snapshot.project(project_path);
+        let visible = match (projection.instance_owner, displayed_instance) {
+            (Some(owner), Some(instance_id)) => owner == instance_id,
+            (None, None) => true,
+            _ => false,
+        };
+        if visible {
+            projection
+                .attachments
+                .into_iter()
+                .map(|mut attachment| {
+                    if let AttachmentSource::ManualCLI(session) = attachment.source {
+                        // The retry-stable session UUID is daemon-owned lifecycle
+                        // provenance. Compatibility status keeps the safe owner
+                        // category and process label without publishing that ID.
+                        attachment.source = AttachmentSource::CLI { pid: session.pid() };
+                    }
+                    attachment
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn compatibility_section_for_display(attachments: &[Attachment]) -> ProjectSection {
+        if attachments.iter().any(|attachment| {
+            !matches!(
+                attachment.source,
+                AttachmentSource::Pin | AttachmentSource::Runtime
+            )
+        }) {
+            ProjectSection::Active
+        } else if attachments
+            .iter()
+            .any(|attachment| matches!(attachment.source, AttachmentSource::Pin))
+        {
+            ProjectSection::AlwaysOn
+        } else {
+            ProjectSection::Recent
+        }
+    }
+
+    fn legacy_pid_alive(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn converge_legacy_cli_after_process_exit(&self, instance_id: ProjectInstanceId, pid: u32) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // Historical `project attach --source cli` is a one-shot command,
+            // while historical `up` keeps the same process alive and follows
+            // immediately with Start. A bounded exit watch preserves the
+            // otherwise wire-identical standalone command without retaining a
+            // task for the lifetime of a log-following owner.
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if manager.is_shutting_down() {
+                    return;
+                }
+                if Self::legacy_pid_alive(pid) {
+                    continue;
+                }
+                if let Err(error) = manager
+                    .converge_managed_instance(instance_id, None, false, false)
+                    .await
+                    && !manager.is_shutting_down()
+                {
+                    warn!(
+                        "Failed to converge field-less CLI attachment for project instance {instance_id} after process {pid} exited: {error:#}"
+                    );
+                }
+                return;
+            }
+        });
     }
 
     /// Re-evaluate one availability-managed project from authoritative state.
@@ -3079,159 +5291,196 @@ impl ProcessManager {
     }
 
     pub async fn remove_project(&self, project_path: &Path) -> Result<()> {
-        let instance_id = self
-            .availability_instance_for_path(project_path)
-            .await
-            .map(|(instance_id, _)| instance_id);
-        let coordinator = match instance_id {
-            Some(instance_id) => Some(self.availability_coordinator(instance_id).await),
-            None => None,
-        };
-        let _availability_guard = match coordinator.as_ref() {
-            Some(coordinator) => Some(coordinator.runtime.lock().await),
-            None => None,
-        };
-        let (canonical, transition_lock) = self.transition_lock_for_path(project_path).await;
-        let _transition_guard = transition_lock.lock().await;
-        let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
-        let mut retired_paths = HashSet::from([canonical.clone()]);
-        let retired_instance_ids = instance_id.into_iter().collect::<HashSet<_>>();
-        if let Some(instance_id) = instance_id {
-            retired_paths.extend(
+        let canonical = Self::canonicalize_path(project_path);
+        let lifecycle_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+        let expected_resolution = initial_resolution.identity();
+        let initial_target =
+            initial_resolution.into_mutation_target(&canonical, "project removal")?;
+        let expected_instance = initial_target.as_ref().map(|target| target.instance_id);
+        let availability_guard = if let Some(instance_id) = expected_instance {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            Some(coordinator.runtime.clone().lock_owned().await)
+        } else {
+            None
+        };
+
+        let mut transition_paths = BTreeSet::from([canonical.clone()]);
+        if let Some(target) = &initial_target {
+            transition_paths.extend(Self::catalogued_lifecycle_paths(target));
+            transition_paths.extend(
                 self.services
                     .lock()
                     .await
                     .values()
-                    .filter(|service| service.instance_id == instance_id)
-                    .map(|service| service.path.clone()),
+                    .filter(|service| service.instance_id == target.instance_id)
+                    .map(|service| Self::canonicalize_path(&service.path)),
+            );
+        }
+        let transition_guards = self.lock_config_transition_paths(&transition_paths).await;
+        let runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+
+        let resolution = self.resolve_lifecycle_target(&canonical).await?;
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution,
+            "project identity changed while removal was waiting for lifecycle ownership; retry the removal"
+        );
+        let target = resolution.into_mutation_target(&canonical, "project removal")?;
+        if let Some(target) = &target {
+            anyhow::ensure!(
+                Self::catalogued_lifecycle_paths(target).is_subset(&transition_paths),
+                "project paths changed while removal was waiting for lifecycle ownership; retry the removal"
             );
         }
 
-        // Stop services by stable identity when one is available so a moved
-        // runtime cannot outlive removal at its current catalog locator.
-        if let Some(instance_id) = instance_id {
-            self.stop_project_instance_locked(instance_id).await?;
+        let mut retired_paths = transition_paths.iter().cloned().collect::<HashSet<_>>();
+        let effective_at = SystemTime::now();
+        let transaction = if let Some(mut target) = target {
+            target.catalog_target.unregister_project(&canonical)?;
+            let surviving_paths = Self::catalog_paths(&target.catalog_target);
+            retired_paths.retain(|path| !surviving_paths.contains(path));
+            let attachment_base = self.attachments.lock().await.snapshot();
+            let mut attachment_target = attachment_base.clone();
+            for path in &retired_paths {
+                attachment_target.replace_project(path, Vec::new(), false);
+            }
+            let owned_paths = attachment_base
+                .instance_owners
+                .iter()
+                .filter_map(|(path, owner)| (*owner == target.instance_id).then_some(path.clone()))
+                .collect::<Vec<_>>();
+            for path in owned_paths {
+                attachment_target.replace_project(&path, Vec::new(), false);
+            }
+            self.stop_project_instance_locked(target.instance_id)
+                .await?;
+            let batch = AvailabilityBatch::new(effective_at)
+                .with_operation(AvailabilityBatchOperation::Retire);
+            self.prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?
         } else {
+            let (catalog_base, mut catalog_target) = {
+                let registry = self.registry.lock().await;
+                (registry.clone(), registry.clone())
+            };
+            catalog_target.unregister_project(&canonical)?;
+            let surviving_paths = Self::catalog_paths(&catalog_target);
+            retired_paths.retain(|path| !surviving_paths.contains(path));
+            let attachment_base = self.attachments.lock().await.snapshot();
+            let mut attachment_target = attachment_base.clone();
+            for path in &retired_paths {
+                attachment_target.replace_project(path, Vec::new(), false);
+            }
             self.stop_project_locked(&canonical).await?;
-        }
-
-        // Keep both compatibility stores stable until each candidate is ready.
-        // Catalog removal is the authoritative commit point; recoverable
-        // failures before it restore the attachment file before releasing either
-        // store lock.
-        let mut registry = self.registry.lock().await;
-        let mut attachments = self.attachments.lock().await;
-        let original_attachments = attachments.clone();
-        let mut attachment_candidate = original_attachments.clone();
-        attachment_candidate.forget_project(&canonical);
-        let mut catalog_candidate = registry.clone();
-        if let Some(instance_id) = instance_id
-            && let Some(record) = registry.instances.get(&instance_id)
-        {
-            retired_paths.insert(record.last_known_path.clone());
-            retired_paths.extend(record.current_path.iter().cloned());
-            retired_paths.extend(
-                registry
-                    .legacy_paths
-                    .iter()
-                    .filter(|(_, candidate)| **candidate == instance_id)
-                    .map(|(path, _)| path.clone()),
-            );
-        }
-        catalog_candidate.unregister_project(&canonical)?;
-        let surviving_paths = catalog_candidate
-            .instances
-            .values()
-            .flat_map(|record| {
-                std::iter::once(record.last_known_path.clone())
-                    .chain(record.current_path.iter().cloned())
-            })
-            .chain(catalog_candidate.legacy_paths.keys().cloned())
-            .map(|path| Self::canonicalize_path(&path))
-            .collect::<HashSet<_>>();
-        retired_paths.retain(|path| !surviving_paths.contains(&Self::canonicalize_path(path)));
-
-        attachment_candidate.save().await?;
-        let commit_result = registry.commit_candidate(catalog_candidate).await;
-        self.domain_index.store(registry.domain_index().clone());
-        let durability_error = match commit_result {
-            Ok(()) => {
-                *attachments = attachment_candidate;
-                None
-            }
-            Err(error @ CatalogError::PublishedNotDurable { .. }) => {
-                *attachments = attachment_candidate;
-                Some(error)
-            }
-            Err(catalog_error) => {
-                original_attachments.save().await.with_context(|| {
-                    format!(
-                        "catalog removal failed ({catalog_error}); failed to restore attachment state"
-                    )
-                })?;
-                return Err(catalog_error.into());
-            }
+            LifecycleTransaction::new(
+                LifecycleTransactionKind::LifecycleMutation,
+                effective_at,
+                Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+                Vec::new(),
+                AttachmentTransactionImages::new(attachment_base, attachment_target),
+            )?
         };
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        if let Some(instance_id) = expected_instance {
+            self.clear_service_stop_suppressions(instance_id).await;
+        }
 
-        drop(attachments);
-        drop(registry);
-
-        self.retire_config_reload_paths(retired_paths, retired_instance_ids)
+        let retired_instances = expected_instance
+            .into_iter()
+            .collect::<HashSet<ProjectInstanceId>>();
+        self.retire_config_reload_paths(retired_paths, retired_instances)
             .await;
-        self.services.lock().await.retain(|_, service| {
-            instance_id.map_or(service.path != canonical, |instance_id| {
-                service.instance_id != instance_id
-            })
-        });
-        if let Some(instance_id) = instance_id {
-            self.legacy_restore_evidence
+        if let Some(instance_id) = expected_instance {
+            self.services
                 .lock()
                 .await
-                .remove(&instance_id);
+                .retain(|_, service| service.instance_id != instance_id);
+        } else {
+            self.services
+                .lock()
+                .await
+                .retain(|_, service| Self::canonicalize_path(&service.path) != canonical);
         }
         self.persist_state().await;
+        drop(publication_guard);
+        drop(runtime_projection_guard);
+        drop(transition_guards);
+        drop(availability_guard);
+        drop(lifecycle_guard);
         self.sync_hosts_after_catalog_publish().await;
-
-        if let Some(error) = durability_error {
-            return Err(error.into());
-        }
-
         Ok(())
     }
 
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
         let canonical = Self::canonicalize_path(project_path);
-
-        let project_name = {
-            let registry = self.registry.lock().await;
-            registry
-                .get_project(&canonical)
-                .and_then(|entry| entry.name)
+        let resolution = self.resolve_lifecycle_projection(&canonical).await;
+        let (project_name, instance_id) = match &resolution {
+            LifecycleTargetResolution::Catalogued(target) => (
+                target
+                    .catalog_target
+                    .instances
+                    .get(&target.instance_id)
+                    .and_then(|record| record.display_name.clone()),
+                Some(target.instance_id),
+            ),
+            LifecycleTargetResolution::UnresolvedLegacy => {
+                let registry = self.registry.lock().await;
+                (
+                    registry
+                        .unresolved_legacy
+                        .get(&canonical)
+                        .and_then(|record| record.display_name.clone()),
+                    None,
+                )
+            }
+            LifecycleTargetResolution::UnregisteredPhysical { .. }
+            | LifecycleTargetResolution::Ambiguous => (None, None),
         };
 
         let attachments = {
             let attachments = self.attachments.lock().await;
-            attachments
-                .attachments_for(&canonical)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
+            let snapshot = attachments.snapshot();
+            match resolution {
+                LifecycleTargetResolution::Catalogued(_) => {
+                    Self::compatibility_attachments_for_display(&snapshot, &canonical, instance_id)
+                }
+                LifecycleTargetResolution::UnresolvedLegacy => {
+                    Self::compatibility_attachments_for_display(&snapshot, &canonical, None)
+                }
+                LifecycleTargetResolution::UnregisteredPhysical { .. }
+                | LifecycleTargetResolution::Ambiguous => Vec::new(),
+            }
         };
 
-        let statuses = self.list().await;
+        let statuses = match instance_id {
+            Some(instance_id) => self
+                .list_with_instance_owners(Some(instance_id))
+                .await
+                .into_iter()
+                .map(|(_, status)| status)
+                .collect(),
+            None => Vec::new(),
+        };
         let mut services = Vec::new();
         let mut service_details = Vec::new();
         let mut is_running = false;
 
         for status in statuses {
-            if status.path.as_ref() == Some(&canonical) {
-                if status.status == ServiceState::Running {
-                    is_running = true;
-                }
-                services.push(status.name.clone());
-                service_details.push(status);
+            if status.status == ServiceState::Running {
+                is_running = true;
             }
+            services.push(status.name.clone());
+            service_details.push(status);
         }
 
         Ok(ProjectStatusInfo {
@@ -3248,53 +5497,82 @@ impl ProcessManager {
         &self,
         filter: Option<ProjectFilter>,
     ) -> Result<Vec<ProjectListEntry>> {
-        let registry_projects = {
+        let (registry, registry_projects) = {
             let registry = self.registry.lock().await;
-            registry.project_entries_by_path()
+            (registry.clone(), registry.project_entries_by_path())
         };
 
-        let attachment_projects = {
+        let attachment_snapshot = {
             let attachments = self.attachments.lock().await;
-            attachments.all_projects()
+            attachments.snapshot()
         };
 
         let mut all_projects = HashSet::new();
         for path in registry_projects.keys() {
             all_projects.insert(path.clone());
         }
-        for path in attachment_projects {
-            all_projects.insert(path);
-        }
+        all_projects.extend(attachment_snapshot.attachments.keys().cloned());
+        all_projects.extend(attachment_snapshot.manually_stopped.iter().cloned());
 
-        let statuses = self.list().await;
-        let mut running_by_path: HashMap<PathBuf, bool> = HashMap::new();
+        let statuses = self.list_with_instance_owners(None).await;
+        let mut running_instances = HashSet::new();
 
-        for status in statuses {
-            let Some(path) = status.path else {
-                continue;
-            };
+        for (instance_id, status) in statuses {
             if status.status == ServiceState::Running {
-                running_by_path.insert(path, true);
+                running_instances.insert(instance_id);
             }
         }
 
         let mut entries = Vec::new();
         let filter = filter.unwrap_or(ProjectFilter::All);
-        let attachments = self.attachments.lock().await;
         for path in all_projects {
-            let attachments_for = attachments
-                .attachments_for(&path)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            let section = attachments.section_for(&path);
-            let is_running = running_by_path.get(&path).copied().unwrap_or(false);
-            let project_name = registry_projects
-                .get(&path)
-                .and_then(|entry| entry.name.clone());
+            let canonical = Self::canonicalize_path(&path);
+            let resolution = self.resolve_lifecycle_projection(&canonical).await;
+            let (instance_id, project_name, pinned, attachments_for) = match resolution {
+                LifecycleTargetResolution::Catalogued(target) => {
+                    let record = target.catalog_target.instances.get(&target.instance_id);
+                    (
+                        Some(target.instance_id),
+                        record.and_then(|record| record.display_name.clone()),
+                        record.is_some_and(|record| record.pinned),
+                        Self::compatibility_attachments_for_display(
+                            &attachment_snapshot,
+                            &canonical,
+                            Some(target.instance_id),
+                        ),
+                    )
+                }
+                LifecycleTargetResolution::UnresolvedLegacy => {
+                    let record = registry
+                        .unresolved_legacy
+                        .get(&canonical)
+                        .or_else(|| registry.unresolved_legacy.get(&path));
+                    (
+                        None,
+                        record.and_then(|record| record.display_name.clone()),
+                        record.is_some_and(|record| record.pinned),
+                        Self::compatibility_attachments_for_display(
+                            &attachment_snapshot,
+                            &canonical,
+                            None,
+                        ),
+                    )
+                }
+                LifecycleTargetResolution::UnregisteredPhysical { .. }
+                | LifecycleTargetResolution::Ambiguous => (None, None, false, Vec::new()),
+            };
+            let attachment_section = Self::compatibility_section_for_display(&attachments_for);
+            let section = if attachment_section == ProjectSection::Active {
+                ProjectSection::Active
+            } else if pinned || attachment_section == ProjectSection::AlwaysOn {
+                ProjectSection::AlwaysOn
+            } else {
+                ProjectSection::Recent
+            };
+            let is_running = instance_id.is_some_and(|id| running_instances.contains(&id));
 
             let entry = ProjectListEntry {
-                project_path: path,
+                project_path: canonical,
                 project_name,
                 attachments: attachments_for,
                 is_running,
@@ -3319,169 +5597,374 @@ impl ProcessManager {
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_pin(&self, path: &std::path::Path) -> Result<()> {
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
-        self.ensure_accepting_lifecycle_requests()?;
-        let mut registry = self.registry.lock().await;
-        let mut updated = registry.clone();
-        if updated.pin_project(path) {
-            registry.commit_candidate(updated).await?;
-            Ok(())
-        } else {
-            anyhow::bail!("Project not found in registry")
-        }
+        self.registry_set_always_on(path, true).await
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_unpin(&self, path: &std::path::Path) -> Result<()> {
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
+        self.registry_set_always_on(path, false).await
+    }
+
+    async fn registry_set_always_on(&self, path: &Path, enabled: bool) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
-        let mut registry = self.registry.lock().await;
-        let mut updated = registry.clone();
-        if updated.unpin_project(path) {
-            registry.commit_candidate(updated).await?;
-            Ok(())
+        let canonical = Self::canonicalize_path(path);
+        let transition_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+        let expected_resolution = initial_resolution.identity();
+        let initial_target =
+            initial_resolution.into_mutation_target(&canonical, "Always On update")?;
+        let Some(_initial_target) = initial_target else {
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
+            let resolution = self.resolve_lifecycle_target(&canonical).await?;
+            anyhow::ensure!(
+                resolution.identity() == expected_resolution,
+                "project identity materialized while Always On was waiting for lifecycle ownership; retry the command"
+            );
+            let confirmed_target =
+                resolution.into_mutation_target(&canonical, "Always On update")?;
+            anyhow::ensure!(
+                confirmed_target.is_none(),
+                "project identity materialized while Always On was waiting for lifecycle ownership; retry the command"
+            );
+            let (catalog_base, mut catalog_target) = {
+                let registry = self.registry.lock().await;
+                (registry.clone(), registry.clone())
+            };
+            let changed = if enabled {
+                catalog_target.pin_project(&canonical)
+            } else {
+                catalog_target.unpin_project(&canonical)
+            };
+            anyhow::ensure!(changed, "Project not found in registry");
+            let attachment_base = self.attachments.lock().await.snapshot();
+            let mut attachment_target = attachment_base.clone();
+            let compatibility = attachment_target.project(&canonical);
+            attachment_target.replace_project(
+                &canonical,
+                compatibility
+                    .attachments
+                    .into_iter()
+                    .filter(|attachment| {
+                        enabled || !matches!(attachment.source, AttachmentSource::Pin)
+                    })
+                    .collect(),
+                compatibility.manually_stopped && !enabled,
+            );
+            let transaction = LifecycleTransaction::new(
+                LifecycleTransactionKind::LifecycleMutation,
+                SystemTime::now(),
+                Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+                Vec::new(),
+                AttachmentTransactionImages::new(attachment_base, attachment_target),
+            )?;
+            self.create_and_apply_lifecycle_transaction_locked(&transaction)
+                .await?;
+            drop(publication_guard);
+            drop(transition_guard);
+            self.sync_hosts_after_catalog_publish().await;
+            return Ok(());
+        };
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let resolution = self.resolve_lifecycle_target(&canonical).await?;
+        anyhow::ensure!(
+            resolution.identity() == expected_resolution,
+            "project identity changed during Always On update"
+        );
+        let mut target = resolution
+            .into_mutation_target(&canonical, "Always On update")?
+            .context("Project not found in registry")?;
+        let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
+        let changed = if enabled {
+            target.catalog_target.pin_project(&canonical)
         } else {
-            anyhow::bail!("Project not found in registry")
+            target.catalog_target.unpin_project(&canonical)
+        };
+        anyhow::ensure!(changed, "Project not found in registry");
+        let instance_id = target.instance_id;
+        let effective_at = SystemTime::now();
+        let include_deferred = !self.availability_record_exists(instance_id).await?;
+        let attachment_base = self.attachments.lock().await.snapshot();
+        let mut attachment_target = attachment_base.clone();
+        if enabled {
+            for path in &lifecycle_paths {
+                if Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
+                    || (include_deferred
+                        && Self::attachment_path_can_initialize_target(
+                            &attachment_base,
+                            &target,
+                            path,
+                        ))
+                {
+                    let compatibility = attachment_target.project(path);
+                    attachment_target.replace_project(path, compatibility.attachments, false);
+                } else if path == &canonical {
+                    attachment_target.replace_project(path, Vec::new(), false);
+                }
+            }
+        } else {
+            for path in &lifecycle_paths {
+                if !(Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
+                    || include_deferred
+                        && Self::attachment_path_can_initialize_target(
+                            &attachment_base,
+                            &target,
+                            path,
+                        ))
+                {
+                    if path == &canonical {
+                        attachment_target.replace_project(path, Vec::new(), false);
+                    }
+                    continue;
+                }
+                let compatibility = attachment_target.project(path);
+                attachment_target.replace_project(
+                    path,
+                    compatibility
+                        .attachments
+                        .into_iter()
+                        .filter(|attachment| !matches!(attachment.source, AttachmentSource::Pin))
+                        .collect(),
+                    compatibility.manually_stopped,
+                );
+            }
         }
+        let batch = AvailabilityBatch::new(effective_at)
+            .with_operation(AvailabilityBatchOperation::SetAlwaysOn(enabled));
+        let transaction = self
+            .prepare_project_lifecycle_transaction(
+                target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        drop(publication_guard);
+        drop(transition_guard);
+        if enabled {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
+            self.converge_managed_instance_locked(instance_id, None, false, false)
+                .await?;
+        } else {
+            self.converge_managed_instance(instance_id, None, false, false)
+                .await?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub async fn registry_clean(&self) -> Result<usize> {
-        loop {
-            // Snapshot before taking project locks so every operation observes
-            // the same transition -> registry lock order. Revalidate after all
-            // canonical project locks are held; a concurrent catalog change
-            // simply restarts the clean from a fresh snapshot.
-            let (baseline, mut project_paths) = {
-                let registry = self.registry.lock().await;
-                let paths = registry
-                    .instances
-                    .values()
-                    .map(|record| Self::canonicalize_path(&record.last_known_path))
-                    .collect::<Vec<_>>();
-                (registry.clone(), paths)
-            };
-            project_paths.sort();
-            project_paths.dedup();
+        self.ensure_accepting_lifecycle_requests()?;
+        let lifecycle_guard = self.attachment_transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        let initial_catalog = self.registry.lock().await.clone();
+        let initial_instance_ids = initial_catalog
+            .instances
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut availability_guards = Vec::with_capacity(initial_instance_ids.len());
+        for instance_id in &initial_instance_ids {
+            let coordinator = self.availability_coordinator(*instance_id).await;
+            availability_guards.push(coordinator.runtime.clone().lock_owned().await);
+        }
 
-            let mut transition_guards = Vec::with_capacity(project_paths.len());
-            for path in &project_paths {
-                let (_, transition_lock) = self.transition_lock_for_path(path).await;
-                transition_guards.push(transition_lock.lock_owned().await);
-            }
-            let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
-            self.ensure_accepting_lifecycle_requests()?;
+        let mut transition_paths = Self::catalog_paths(&initial_catalog)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        transition_paths.extend(
+            self.services
+                .lock()
+                .await
+                .values()
+                .map(|service| Self::canonicalize_path(&service.path)),
+        );
+        let transition_guards = self.lock_config_transition_paths(&transition_paths).await;
+        let runtime_projection_guard = self.runtime_projection_lock.lock().await;
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
 
-            let mut registry = self.registry.lock().await;
-            if *registry != baseline {
-                drop(registry);
-                drop(transition_guards);
-                continue;
-            }
-
-            let mut updated = registry.clone();
-            let count = updated.prune_missing_projects()?;
-            let removed_instance_ids = registry
+        let catalog_base = self.registry.lock().await.clone();
+        anyhow::ensure!(
+            catalog_base
                 .instances
                 .keys()
-                .filter(|instance_id| !updated.instances.contains_key(instance_id))
                 .copied()
-                .collect::<HashSet<_>>();
-            let mut removed_paths = registry
+                .eq(initial_instance_ids.iter().copied()),
+            "project catalog changed while cleanup was waiting for lifecycle ownership; retry cleanup"
+        );
+        anyhow::ensure!(
+            Self::catalog_paths(&catalog_base)
+                .into_iter()
+                .all(|path| transition_paths.contains(&path)),
+            "project paths changed while cleanup was waiting for lifecycle ownership; retry cleanup"
+        );
+
+        let mut catalog_target = catalog_base.clone();
+        for (instance_id, record) in &catalog_base.instances {
+            let availability_file = availability_path(&self.availability_data_dir, *instance_id);
+            let availability_exists = tokio::fs::try_exists(&availability_file)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to inspect availability state `{}`",
+                        availability_file.display()
+                    )
+                })?;
+            let always_on = if availability_exists {
+                let mut availability =
+                    AvailabilityStore::load(&self.availability_data_dir, *instance_id).await?;
+                availability.snapshot().await?.always_on()
+            } else {
+                record.pinned
+            };
+            catalog_target
                 .instances
-                .iter()
-                .filter(|(instance_id, _)| removed_instance_ids.contains(instance_id))
-                .flat_map(|(_, record)| {
-                    std::iter::once(record.last_known_path.clone())
-                        .chain(record.current_path.iter().cloned())
-                })
-                .collect::<HashSet<_>>();
-            removed_paths.extend(
-                registry
-                    .legacy_paths
-                    .iter()
-                    .filter(|(_, instance_id)| removed_instance_ids.contains(instance_id))
-                    .map(|(path, _)| path.clone()),
-            );
-            removed_paths.extend(
-                self.services
-                    .lock()
-                    .await
-                    .values()
-                    .filter(|service| removed_instance_ids.contains(&service.instance_id))
-                    .map(|service| service.path.clone()),
-            );
-            let surviving_paths = updated
-                .instances
-                .values()
-                .flat_map(|record| {
-                    std::iter::once(record.last_known_path.clone())
-                        .chain(record.current_path.iter().cloned())
-                })
-                .chain(updated.legacy_paths.keys().cloned())
-                .map(|path| Self::canonicalize_path(&path))
-                .collect::<HashSet<_>>();
-            removed_paths.retain(|path| !surviving_paths.contains(&Self::canonicalize_path(path)));
-
-            for instance_id in &removed_instance_ids {
-                self.stop_project_instance_locked(*instance_id).await?;
-            }
-
-            if updated == *registry {
-                return Ok(count);
-            }
-
-            let commit_result = registry.commit_candidate(updated).await;
-            self.domain_index.store(registry.domain_index().clone());
-            let catalog_published = commit_result.is_ok()
-                || matches!(
-                    &commit_result,
-                    Err(CatalogError::PublishedNotDurable { .. })
-                );
-            if catalog_published {
-                self.retire_config_reload_paths(
-                    removed_paths.clone(),
-                    removed_instance_ids.clone(),
-                )
-                .await;
-                self.services
-                    .lock()
-                    .await
-                    .retain(|_, service| !removed_instance_ids.contains(&service.instance_id));
-                self.legacy_restore_evidence
-                    .lock()
-                    .await
-                    .retain(|instance_id, _| !removed_instance_ids.contains(instance_id));
-                self.persist_state().await;
-                self.sync_hosts_after_catalog_publish().await;
-            }
-            commit_result?;
+                .get_mut(instance_id)
+                .expect("catalog target contains every base instance")
+                .pinned = always_on;
+        }
+        let count = catalog_target.prune_missing_projects()?;
+        let removed_instance_ids = catalog_base
+            .instances
+            .keys()
+            .filter(|instance_id| !catalog_target.instances.contains_key(instance_id))
+            .copied()
+            .collect::<Vec<_>>();
+        if catalog_target == catalog_base {
             return Ok(count);
         }
+
+        let removed_set = removed_instance_ids.iter().copied().collect::<HashSet<_>>();
+        let surviving_paths = Self::catalog_paths(&catalog_target);
+        let mut removed_paths = Self::catalog_paths(&catalog_base)
+            .into_iter()
+            .filter(|path| !surviving_paths.contains(path))
+            .collect::<HashSet<_>>();
+        removed_paths.extend(
+            self.services
+                .lock()
+                .await
+                .values()
+                .filter(|service| removed_set.contains(&service.instance_id))
+                .map(|service| Self::canonicalize_path(&service.path))
+                .filter(|path| !surviving_paths.contains(path)),
+        );
+
+        for instance_id in &removed_instance_ids {
+            self.stop_project_instance_locked(*instance_id).await?;
+        }
+        let uncatalogued_stop_paths = self
+            .services
+            .lock()
+            .await
+            .values()
+            .filter(|service| {
+                !removed_set.contains(&service.instance_id)
+                    && removed_paths.contains(&Self::canonicalize_path(&service.path))
+            })
+            .map(|service| Self::canonicalize_path(&service.path))
+            .collect::<BTreeSet<_>>();
+        for path in &uncatalogued_stop_paths {
+            self.stop_project_locked(path).await?;
+        }
+
+        let effective_at = SystemTime::now();
+        let mut prepared_availability = Vec::with_capacity(removed_instance_ids.len());
+        for instance_id in &removed_instance_ids {
+            let mut availability =
+                AvailabilityStore::load(&self.availability_data_dir, *instance_id).await?;
+            prepared_availability.push(
+                availability
+                    .prepare_batch(
+                        &AvailabilityBatch::new(effective_at)
+                            .with_operation(AvailabilityBatchOperation::Retire),
+                    )
+                    .await?,
+            );
+        }
+        let attachment_base = self.attachments.lock().await.snapshot();
+        let mut attachment_target = attachment_base.clone();
+        for path in &removed_paths {
+            attachment_target.replace_project(path, Vec::new(), false);
+        }
+        let removed_owner_paths = attachment_base
+            .instance_owners
+            .iter()
+            .filter_map(|(path, owner)| removed_set.contains(owner).then_some(path.clone()))
+            .collect::<Vec<_>>();
+        for path in removed_owner_paths {
+            attachment_target.replace_project(&path, Vec::new(), false);
+        }
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            effective_at,
+            Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+            prepared_availability,
+            AttachmentTransactionImages::new(attachment_base, attachment_target),
+        )?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        let retired_paths = removed_paths.clone();
+        self.retire_config_reload_paths(removed_paths, removed_set.clone())
+            .await;
+        self.services.lock().await.retain(|_, service| {
+            !removed_set.contains(&service.instance_id)
+                && !retired_paths.contains(&Self::canonicalize_path(&service.path))
+        });
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .retain(|(owner, _)| !removed_set.contains(owner));
+        self.persist_state().await;
+        drop(publication_guard);
+        drop(runtime_projection_guard);
+        drop(transition_guards);
+        drop(availability_guards);
+        drop(lifecycle_guard);
+        self.sync_hosts_after_catalog_publish().await;
+        Ok(count)
+    }
+
+    pub(crate) async fn reconcile_legacy_attachment_owners(&self) -> Result<()> {
+        if self.is_shutting_down() {
+            return Ok(());
+        }
+        let effective_at = SystemTime::now();
+        let project_paths = {
+            let attachments = self.attachments.lock().await;
+            attachments
+                .compatibility_evidence_at(effective_at, Self::legacy_pid_alive)
+                .into_iter()
+                .map(|evidence| evidence.project_path)
+                .collect::<Vec<_>>()
+        };
+
+        let mut failures = Vec::new();
+        for path in project_paths {
+            if let Err(error) = self.reconcile_legacy_attachment_project(path.clone()).await {
+                failures.push(format!("`{}`: {error:#}", path.display()));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "failed to reconcile {} legacy attachment project(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
+        Ok(())
     }
 
     pub async fn reap_and_stop_orphans(&self) {
-        let _attachment_transition_guard = self.attachment_transition_lock.lock().await;
-        if self.is_shutting_down() {
-            return;
-        }
-        let orphaned = {
-            let mut attachments = self.attachments.lock().await;
-            let orphaned = attachments.reap_stale_attachments();
-            if !orphaned.is_empty() {
-                let _ = attachments.save().await;
-            }
-            orphaned
-        };
-
-        for path in orphaned {
-            info!(
-                "Stale attachments reaped for {}, stopping services",
-                path.display()
-            );
-            if let Err(e) = self.stop_project_unless_shutting_down(&path).await {
-                warn!("Failed to stop orphaned project: {e}");
-            }
+        if let Err(error) = self.reconcile_legacy_attachment_owners().await {
+            warn!("Failed to reconcile legacy project attachments: {error:#}");
         }
     }
 
@@ -3553,11 +6036,37 @@ impl ProcessManager {
             })
     }
 
-    async fn availability_is_managed(&self, instance_id: ProjectInstanceId) -> Result<bool> {
+    async fn availability_management_state(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<AvailabilityManagementState> {
         let path = availability_path(&self.availability_data_dir, instance_id);
-        tokio::fs::try_exists(&path)
+        if tokio::fs::try_exists(&path)
             .await
-            .with_context(|| format!("failed to inspect availability state `{}`", path.display()))
+            .with_context(|| format!("failed to inspect availability state `{}`", path.display()))?
+        {
+            return Ok(AvailabilityManagementState::Managed);
+        }
+        if self
+            .pending_initial_availability
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&instance_id)
+        {
+            return Ok(AvailabilityManagementState::PendingInitial);
+        }
+        anyhow::ensure!(
+            self.lifecycle_journal.migration_marker().await?.is_none(),
+            "project instance {instance_id} is missing availability state after lifecycle-v2 migration; restart locald to recover authoritative lifecycle state"
+        );
+        Ok(AvailabilityManagementState::LegacyUnmanaged)
+    }
+
+    async fn availability_is_managed(&self, instance_id: ProjectInstanceId) -> Result<bool> {
+        Ok(matches!(
+            self.availability_management_state(instance_id).await?,
+            AvailabilityManagementState::Managed
+        ))
     }
 
     async fn sweep_availability(
@@ -3617,10 +6126,51 @@ impl ProcessManager {
         }
     }
 
-    async fn availability_authorizes_start(&self, instance_id: ProjectInstanceId) -> Result<()> {
+    async fn ensure_service_start_availability_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<Option<anyhow::Error>> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
-        if !self.availability_is_managed(instance_id).await? {
-            return Ok(());
+        self.ensure_lifecycle_publication_available()?;
+        match self.availability_management_state(instance_id).await? {
+            AvailabilityManagementState::Managed => {}
+            AvailabilityManagementState::PendingInitial => anyhow::bail!(
+                "project instance {instance_id} is awaiting its initial availability publication"
+            ),
+            AvailabilityManagementState::LegacyUnmanaged => return Ok(None),
+        }
+        anyhow::ensure!(
+            self.active_path_for_instance(instance_id).await.is_some(),
+            "project instance {instance_id} is no longer active"
+        );
+        let mut availability =
+            AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
+        let (_, durability_error) = Self::capture_availability_publication(
+            availability
+                .ensure_demand(DemandKey::stopped_page_resume())
+                .await,
+        )?;
+        Ok(durability_error)
+    }
+
+    async fn availability_authorizes_start(&self, instance_id: ProjectInstanceId) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.availability_authorizes_start_locked(instance_id).await
+    }
+
+    async fn availability_authorizes_start_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        self.ensure_accepting_lifecycle_requests()?;
+        self.ensure_lifecycle_publication_available()?;
+        match self.availability_management_state(instance_id).await? {
+            AvailabilityManagementState::Managed => {}
+            AvailabilityManagementState::PendingInitial => anyhow::bail!(
+                "project instance {instance_id} is awaiting its initial availability publication"
+            ),
+            AvailabilityManagementState::LegacyUnmanaged => return Ok(()),
         }
         let mut availability =
             AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
@@ -3640,9 +6190,15 @@ impl ProcessManager {
         &self,
         instance_id: ProjectInstanceId,
     ) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
-        if !self.availability_is_managed(instance_id).await? {
-            return Ok(());
+        self.ensure_lifecycle_publication_available()?;
+        match self.availability_management_state(instance_id).await? {
+            AvailabilityManagementState::Managed => {}
+            AvailabilityManagementState::PendingInitial => anyhow::bail!(
+                "project instance {instance_id} is awaiting its initial availability publication"
+            ),
+            AvailabilityManagementState::LegacyUnmanaged => return Ok(()),
         }
         let mut availability =
             AvailabilityStore::load(&self.availability_data_dir, instance_id).await?;
@@ -3715,19 +6271,35 @@ impl ProcessManager {
     }
 
     async fn project_runtime_is_ready(&self, instance_id: ProjectInstanceId) -> bool {
+        let suppressed = self
+            .service_stop_suppressions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(owner, name)| (*owner == instance_id).then_some(name.clone()))
+            .collect::<HashSet<_>>();
         let runtimes = {
             let services = self.services.lock().await;
             services
-                .values()
-                .filter(|service| service.instance_id == instance_id)
-                .map(|service| (service.runtime_state.clone(), service.health_status))
+                .iter()
+                .filter(|(_, service)| service.instance_id == instance_id)
+                .map(|(name, service)| {
+                    (
+                        name.clone(),
+                        service.runtime_state.clone(),
+                        service.health_status,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         if runtimes.is_empty() {
             return false;
         }
 
-        for (runtime, health_status) in runtimes {
+        for (name, runtime, health_status) in runtimes {
+            if suppressed.contains(&name) {
+                continue;
+            }
             if health_status != HealthStatus::Healthy {
                 return false;
             }
@@ -3741,6 +6313,31 @@ impl ProcessManager {
             }
         }
         true
+    }
+
+    async fn clear_service_stop_suppression(&self, instance_id: ProjectInstanceId, name: &str) {
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .remove(&(instance_id, name.to_owned()));
+    }
+
+    async fn clear_service_stop_suppressions_for(
+        &self,
+        instance_id: ProjectInstanceId,
+        service_names: &HashSet<String>,
+    ) {
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .retain(|(owner, name)| *owner != instance_id || !service_names.contains(name));
+    }
+
+    async fn clear_service_stop_suppressions(&self, instance_id: ProjectInstanceId) {
+        self.service_stop_suppressions
+            .lock()
+            .await
+            .retain(|(owner, _)| *owner != instance_id);
     }
 
     async fn stop_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
@@ -3782,61 +6379,166 @@ impl ProcessManager {
         requested_path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+        legacy_cli_peer_pid: Option<u32>,
     ) -> Result<()> {
-        let coordinator = self.availability_coordinator(instance_id).await;
-        let _runtime_guard = coordinator.runtime.lock().await;
+        let transition_guard = self.attachment_transition_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
-        let requested_path = if self
-            .path_matches_instance(&requested_path, instance_id)
-            .await
-        {
-            Some(Self::canonicalize_path(&requested_path))
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let availability_guard = coordinator.runtime.lock().await;
+        let publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let requested_path = Self::canonicalize_path(&requested_path);
+        let target = match self.resolve_lifecycle_target(&requested_path).await? {
+            LifecycleTargetResolution::Catalogued(target) if target.instance_id == instance_id => {
+                target
+            }
+            LifecycleTargetResolution::Catalogued(target) => anyhow::bail!(
+                "project identity changed during start: expected {instance_id}, discovered {}",
+                target.instance_id
+            ),
+            LifecycleTargetResolution::UnregisteredPhysical {
+                instance_id: discovered,
+            } => anyhow::bail!(
+                "project identity changed during start: expected {instance_id}, discovered unregistered physical instance {discovered}"
+            ),
+            LifecycleTargetResolution::UnresolvedLegacy | LifecycleTargetResolution::Ambiguous => {
+                let active_path = self
+                    .active_path_for_instance(instance_id)
+                    .await
+                    .context("catalogued project instance has no active path")?;
+                match self.resolve_lifecycle_target(&active_path).await? {
+                    LifecycleTargetResolution::Catalogued(target)
+                        if target.instance_id == instance_id =>
+                    {
+                        target
+                    }
+                    LifecycleTargetResolution::Catalogued(target) => anyhow::bail!(
+                        "catalogued project instance {instance_id} resolves to {} at its active path",
+                        target.instance_id
+                    ),
+                    LifecycleTargetResolution::UnregisteredPhysical {
+                        instance_id: discovered,
+                    } => anyhow::bail!(
+                        "catalogued project instance {instance_id} was replaced by unregistered physical instance {discovered} at its active path"
+                    ),
+                    LifecycleTargetResolution::UnresolvedLegacy
+                    | LifecycleTargetResolution::Ambiguous => anyhow::bail!(
+                        "catalogued project instance {instance_id} cannot be resolved at its active path"
+                    ),
+                }
+            }
+        };
+        let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
+        let effective_at = SystemTime::now();
+        let include_deferred = !self.availability_record_exists(instance_id).await?;
+        let attachment_base = self.attachments.lock().await.snapshot();
+        let mut attachment_target = attachment_base.clone();
+        for path in &lifecycle_paths {
+            if !(Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
+                || include_deferred
+                    && Self::attachment_path_can_initialize_target(&attachment_base, &target, path))
+            {
+                if path == &requested_path {
+                    attachment_target.replace_project(path, Vec::new(), false);
+                }
+                continue;
+            }
+            let mut compatibility = attachment_target.project(path);
+            if let Some(session) = manual_cli_session {
+                let source = session.attachment_source();
+                compatibility
+                    .attachments
+                    .retain(|attachment| attachment.source != source);
+            }
+            attachment_target.replace_project(path, compatibility.attachments, false);
+        }
+        let legacy_cli_demand = if manual_cli_session.is_none() {
+            legacy_cli_peer_pid
+                .and_then(|peer_pid| {
+                    lifecycle_paths
+                        .iter()
+                        .filter(|path| {
+                            Self::attachment_path_is_owned_by_target(
+                                &attachment_base,
+                                &target,
+                                path,
+                            ) || include_deferred
+                                && Self::attachment_path_can_initialize_target(
+                                    &attachment_base,
+                                    &target,
+                                    path,
+                                )
+                        })
+                        .flat_map(|path| attachment_base.project(path).attachments)
+                        .find_map(|attachment| match attachment.source {
+                            AttachmentSource::CLI { pid } if pid == peer_pid => {
+                                Some(AttachmentSource::CLI { pid })
+                            }
+                            AttachmentSource::Editor { .. }
+                            | AttachmentSource::CLI { .. }
+                            | AttachmentSource::ManualCLI(_)
+                            | AttachmentSource::Runtime
+                            | AttachmentSource::Pin => None,
+                        })
+                })
+                .map(|source| availability_demand_for_attachment_source(&source))
+                .transpose()?
+                .flatten()
         } else {
             None
         };
-
-        if self.availability_is_managed(instance_id).await? {
-            if let Some(path) = requested_path
-                .clone()
-                .or(self.active_path_for_instance(instance_id).await)
-            {
-                self.watch_config(path).await;
-            }
-            self.converge_availability_locked(
-                instance_id,
-                requested_path,
-                event_tx,
-                AvailabilityConvergenceOptions {
-                    verbose,
-                    apply_config_when_up: true,
-                    defer_config_reload_during_cooldown: false,
-                },
-            )
-            .await?;
-            return Ok(());
-        }
-
-        let path = requested_path
-            .or(self.active_path_for_instance(instance_id).await)
-            .context("catalogued project instance has no active path")?;
-        let action = self.start_runtime(path, event_tx, verbose).await;
-
-        if self.availability_is_managed(instance_id).await? {
-            self.converge_availability_locked(
-                instance_id,
-                None,
-                None,
-                AvailabilityConvergenceOptions {
-                    verbose: false,
-                    apply_config_when_up: false,
-                    defer_config_reload_during_cooldown: false,
-                },
-            )
-            .await?;
-            Ok(())
+        let mut batch = AvailabilityBatch::new(effective_at);
+        if let Some(session) = manual_cli_session {
+            let source = session.attachment_source();
+            let mut compatibility = attachment_target.project(&requested_path).attachments;
+            compatibility.retain(|attachment| attachment.source != source);
+            compatibility.push(Attachment {
+                project_path: requested_path.clone(),
+                source: source.clone(),
+                created_at: effective_at,
+            });
+            attachment_target.replace_project(&requested_path, compatibility, false);
+            attachment_target.set_instance_owner(&requested_path, instance_id);
+            batch.push(AvailabilityBatchOperation::EnsureDemand(
+                manual_cli_session_demand(&session)?,
+            ));
+            batch.push(AvailabilityBatchOperation::EnsureDemand(
+                availability_demand_for_attachment_source(&source)?
+                    .context("Manual CLI session must have a process-bound demand")?,
+            ));
+        } else if let Some(demand) = legacy_cli_demand {
+            // A pre-session CLI already published its process attachment on a
+            // preceding connection. Kernel peer provenance lets this streamed
+            // Start renew that exact owner instead of creating an ownerless
+            // four-hour Manual demand that its legacy Detach cannot release.
+            batch.push(AvailabilityBatchOperation::EnsureDemand(demand));
         } else {
-            action
+            batch.push(AvailabilityBatchOperation::EnsureDemand(
+                DemandKey::manual_cli(),
+            ));
         }
+        let transaction = self
+            .prepare_project_lifecycle_transaction(
+                *target,
+                &batch,
+                attachment_base,
+                attachment_target,
+            )
+            .await?;
+        self.create_and_apply_lifecycle_transaction_locked(&transaction)
+            .await?;
+        self.clear_service_stop_suppressions(instance_id).await;
+        drop(publication_guard);
+        drop(availability_guard);
+        drop(transition_guard);
+
+        if let Some(path) = self.active_path_for_instance(instance_id).await {
+            self.watch_config(path).await;
+        }
+        self.converge_managed_instance(instance_id, event_tx, verbose, true)
+            .await?;
+        Ok(())
     }
 
     async fn reload_catalogued_instance(
@@ -3856,43 +6558,49 @@ impl ProcessManager {
             None
         };
 
-        if self.availability_is_managed(instance_id).await? {
-            self.converge_availability_locked(
-                instance_id,
-                requested_path,
-                None,
-                AvailabilityConvergenceOptions {
-                    verbose: false,
-                    apply_config_when_up: true,
-                    defer_config_reload_during_cooldown: true,
-                },
-            )
-            .await?;
-            return Ok(());
+        match self.availability_management_state(instance_id).await? {
+            AvailabilityManagementState::Managed => {
+                self.converge_availability_locked(
+                    instance_id,
+                    requested_path,
+                    None,
+                    AvailabilityConvergenceOptions {
+                        verbose: false,
+                        apply_config_when_up: true,
+                        defer_config_reload_during_cooldown: true,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            AvailabilityManagementState::PendingInitial => return Ok(()),
+            AvailabilityManagementState::LegacyUnmanaged => {}
         }
 
         let path = requested_path
             .or(self.active_path_for_instance(instance_id).await)
             .context("catalogued project instance has no active path")?;
         let action = self
-            .apply_config_for_instance(path, None, false, None, true)
+            .apply_config_for_instance(path, None, false, Some(instance_id), true)
             .await;
 
-        if self.availability_is_managed(instance_id).await? {
-            self.converge_availability_locked(
-                instance_id,
-                None,
-                None,
-                AvailabilityConvergenceOptions {
-                    verbose: false,
-                    apply_config_when_up: true,
-                    defer_config_reload_during_cooldown: true,
-                },
-            )
-            .await?;
-            Ok(())
-        } else {
-            action
+        match self.availability_management_state(instance_id).await? {
+            AvailabilityManagementState::Managed => {
+                self.converge_availability_locked(
+                    instance_id,
+                    None,
+                    None,
+                    AvailabilityConvergenceOptions {
+                        verbose: false,
+                        apply_config_when_up: true,
+                        defer_config_reload_during_cooldown: true,
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+            AvailabilityManagementState::PendingInitial
+            | AvailabilityManagementState::LegacyUnmanaged => action,
         }
     }
 
@@ -3905,6 +6613,17 @@ impl ProcessManager {
     ) -> Result<ConvergenceDecision> {
         let coordinator = self.availability_coordinator(instance_id).await;
         let _runtime_guard = coordinator.runtime.lock().await;
+        self.converge_managed_instance_locked(instance_id, event_tx, verbose, apply_config_when_up)
+            .await
+    }
+
+    async fn converge_managed_instance_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        apply_config_when_up: bool,
+    ) -> Result<ConvergenceDecision> {
         self.ensure_accepting_lifecycle_requests()?;
         self.watch_active_instance(instance_id).await;
         let decision = self
@@ -3932,6 +6651,8 @@ impl ProcessManager {
         let mut durability_error = None;
         loop {
             self.ensure_accepting_lifecycle_requests()?;
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
             let mut availability =
                 match AvailabilityStore::load(&self.availability_data_dir, instance_id).await {
                     Ok(availability) => availability,
@@ -3959,12 +6680,15 @@ impl ProcessManager {
                     );
                 }
             };
+            drop(publication_guard);
             let project_path = requested_path
                 .take()
                 .or(self.active_path_for_instance(instance_id).await);
 
             let Some(project_path) = project_path else {
                 let action = self.stop_project_instance(instance_id).await;
+                let _publication_guard = self.lifecycle_publication_lock.lock().await;
+                self.ensure_lifecycle_publication_available()?;
                 if matches!(decision, ConvergenceDecision::EnsureUp) && action.is_ok() {
                     let message =
                         format!("project instance {instance_id} is missing from the filesystem");
@@ -3985,7 +6709,7 @@ impl ProcessManager {
                     return Self::surface_availability_durability(result, durability_error);
                 }
                 let result = self
-                    .finish_availability_action(
+                    .finish_availability_action_locked(
                         &mut availability,
                         decision,
                         action,
@@ -4050,6 +6774,8 @@ impl ProcessManager {
                     .remove(&instance_id);
             }
 
+            let _publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
             let (latest_decision, latest_durability_error) =
                 match Self::sweep_availability(&mut availability).await {
                     Ok(result) => result,
@@ -4127,19 +6853,25 @@ impl ProcessManager {
             }
 
             let result = self
-                .finish_availability_action(&mut availability, decision, action, clear_on_success)
+                .finish_availability_action_locked(
+                    &mut availability,
+                    decision,
+                    action,
+                    clear_on_success,
+                )
                 .await;
             return Self::surface_availability_durability(result, durability_error);
         }
     }
 
-    async fn finish_availability_action(
+    async fn finish_availability_action_locked(
         &self,
         availability: &mut AvailabilityStore,
         decision: ConvergenceDecision,
         action: Result<()>,
         clear_on_success: bool,
     ) -> Result<ConvergenceDecision> {
+        self.ensure_lifecycle_publication_available()?;
         match action {
             Ok(()) => {
                 if clear_on_success {
@@ -4160,7 +6892,7 @@ impl ProcessManager {
     }
 
     fn canonicalize_path(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        locald_core::normalize_project_locator(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     async fn transition_lock_for_path(&self, path: &Path) -> (PathBuf, Arc<Mutex<()>>) {
@@ -4173,6 +6905,18 @@ impl ProcessManager {
                 .clone()
         };
         (canonical, transition_lock)
+    }
+
+    async fn lock_config_transition_paths(
+        &self,
+        paths: &BTreeSet<PathBuf>,
+    ) -> Vec<OwnedMutexGuard<()>> {
+        let mut guards = Vec::with_capacity(paths.len());
+        for path in paths {
+            let (_, transition_lock) = self.transition_lock_for_path(path).await;
+            guards.push(transition_lock.lock_owned().await);
+        }
+        guards
     }
 
     async fn lock_service_runtime_transition(
@@ -4200,6 +6944,11 @@ impl ProcessManager {
     pub async fn get_service_path(&self, name: &str) -> Option<PathBuf> {
         let services = self.services.lock().await;
         services.get(name).map(|s| s.path.clone())
+    }
+
+    async fn service_instance_id(&self, name: &str) -> Option<ProjectInstanceId> {
+        let services = self.services.lock().await;
+        services.get(name).map(|service| service.instance_id)
     }
 
     pub async fn get_service_env(&self, name: &str) -> Result<HashMap<String, String>> {
@@ -4506,6 +7255,38 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
+
+    const TEST_STARTUP_BOUNDARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn compatibility_status_keeps_manual_cli_session_identity_private() {
+        let project_path = PathBuf::from("/tmp/manual-cli-status");
+        let session = ManualCliSession::new(42);
+        let session_id = session.id().to_string();
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.replace_project(
+            &project_path,
+            vec![Attachment {
+                project_path: project_path.clone(),
+                source: session.attachment_source(),
+                created_at: SystemTime::UNIX_EPOCH,
+            }],
+            false,
+        );
+
+        let visible =
+            ProcessManager::compatibility_attachments_for_display(&snapshot, &project_path, None);
+
+        assert!(matches!(
+            visible.first().map(|attachment| &attachment.source),
+            Some(AttachmentSource::CLI { pid: 42 })
+        ));
+        assert!(
+            !serde_json::to_string(&visible)
+                .expect("serialize compatibility status")
+                .contains(&session_id)
+        );
+    }
 
     struct ProcessGroupCleanup {
         group: i32,
@@ -5123,12 +7904,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct RetryPrepareWithoutPidFactory {
-        failure_consumed: Arc<AtomicBool>,
-        stop_count: Arc<AtomicUsize>,
-    }
-
-    #[derive(Debug)]
     struct CountingStartFactory {
         creates: Arc<AtomicUsize>,
     }
@@ -5165,39 +7940,6 @@ mod tests {
         }
     }
 
-    impl ServiceFactory for RetryPrepareWithoutPidFactory {
-        fn can_handle(&self, config: &ServiceConfig) -> bool {
-            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
-        }
-
-        fn create(
-            &self,
-            name: String,
-            _config: &ServiceConfig,
-            _ctx: &ServiceContext,
-        ) -> Arc<Mutex<dyn ServiceController>> {
-            let fail_prepare =
-                name.ends_with(":second") && !self.failure_consumed.swap(true, Ordering::SeqCst);
-            Arc::new(Mutex::new(ScriptedController {
-                id: name,
-                state: RuntimeState {
-                    pid: None,
-                    port: None,
-                    status: ServiceState::Building,
-                    health_status: HealthStatus::Unknown,
-                },
-                process_identity: None,
-                prepare_entered: None,
-                release_prepare: None,
-                start_entered: None,
-                start_release: None,
-                start_count: None,
-                fail_prepare,
-                stop_count: self.stop_count.clone(),
-            }))
-        }
-    }
-
     #[derive(Debug)]
     struct BlockingFailStopController {
         id: String,
@@ -5228,6 +7970,132 @@ mod tests {
                 self.release_first_stop.notified().await;
             }
             anyhow::bail!("injected stop failure")
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingFailOnceStopController {
+        id: String,
+        state: RuntimeState,
+        stop_attempts: Arc<AtomicUsize>,
+        first_stop_entered: Arc<tokio::sync::Notify>,
+        release_first_stop: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingFailOnceStopController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            self.state.status = ServiceState::Running;
+            self.state.health_status = HealthStatus::Healthy;
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            let attempt = self.stop_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.first_stop_entered.notify_one();
+                self.release_first_stop.notified().await;
+                anyhow::bail!("injected first stop failure");
+            }
+            self.state.pid = None;
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingSuccessfulStopController {
+        id: String,
+        state: RuntimeState,
+        stop_entered: Arc<tokio::sync::Notify>,
+        release_stop: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceController for BlockingSuccessfulStopController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.stop_entered.notify_one();
+            self.release_stop.notified().await;
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            Ok(())
         }
 
         async fn read_state(&self) -> RuntimeState {
@@ -5457,6 +8325,37 @@ mod tests {
         (manager, instance_id, availability_data_dir)
     }
 
+    async fn journal_transaction_at_phase(
+        manager: &ProcessManager,
+        transaction: &LifecycleTransaction,
+        target_phase: LifecycleTransactionPhase,
+    ) -> LifecycleTransaction {
+        manager
+            .lifecycle_journal
+            .create(transaction)
+            .await
+            .expect("create lifecycle transaction fixture");
+        let mut phase = LifecycleTransactionPhase::Prepared;
+        while phase != target_phase {
+            let next = phase.next().expect("target phase follows prepared");
+            manager
+                .lifecycle_journal
+                .advance(transaction.id(), phase, next)
+                .await
+                .expect("advance lifecycle transaction fixture");
+            phase = next;
+        }
+        let mut loaded = manager
+            .lifecycle_journal
+            .load()
+            .await
+            .expect("load lifecycle transaction fixture")
+            .expect("lifecycle transaction fixture exists");
+        let catalog_path = manager.registry.lock().await.storage_path().to_path_buf();
+        loaded.normalize_catalog_storage_path(&catalog_path);
+        loaded
+    }
+
     fn availability_test_service(
         instance_id: ProjectInstanceId,
         project_name: &str,
@@ -5502,6 +8401,3637 @@ mod tests {
         }
         std::fs::write(project_path.join("locald.toml"), config)
             .expect("write availability worker config");
+    }
+
+    struct UnregisteredReplacementFixture {
+        manager: ProcessManager,
+        repository: PathBuf,
+        worktree: PathBuf,
+        historical_instance: ProjectInstanceId,
+        replacement_instance: ProjectInstanceId,
+        availability_data_dir: PathBuf,
+        host_calls: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    async fn unregistered_replacement_fixture(root: &Path) -> UnregisteredReplacementFixture {
+        let repository = root.join("replacement-repository");
+        std::fs::create_dir(&repository).expect("create replacement repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n")
+            .expect("write replacement fixture");
+        write_availability_worker_config(
+            &repository,
+            "historical",
+            "historical.localhost",
+            &["web"],
+        );
+        git(&repository, &["add", "README.md", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = root.join("replacement-worktree");
+        let worktree_arg = worktree.to_str().expect("UTF-8 replacement worktree path");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "historical", worktree_arg],
+        );
+        let canonical =
+            std::fs::canonicalize(&worktree).expect("canonical historical worktree path");
+        let catalog_path = root.join("catalog.json");
+        let mut catalog = Registry::with_path(catalog_path);
+        let historical_instance = catalog
+            .register_project(
+                Registry::discover(canonical.clone())
+                    .await
+                    .expect("discover historical worktree"),
+                Some("historical".to_owned()),
+            )
+            .expect("register historical worktree");
+        assert!(catalog.pin_project(&canonical));
+        catalog
+            .replace_domain_claims(
+                historical_instance,
+                [DomainClaim::service(
+                    "historical.localhost"
+                        .parse()
+                        .expect("valid historical domain"),
+                    historical_instance,
+                    "historical:web".to_owned(),
+                )],
+            )
+            .expect("install historical domain claim");
+        catalog.save().await.expect("persist historical catalog");
+
+        let attachments_path = root.join("attachments.json");
+        let mut attachments = AttachmentStore::new(attachments_path);
+        let created_at = SystemTime::now();
+        attachments.replace_project(
+            &canonical,
+            vec![
+                Attachment {
+                    project_path: canonical.clone(),
+                    source: AttachmentSource::Pin,
+                    created_at,
+                },
+                Attachment {
+                    project_path: canonical.clone(),
+                    source: AttachmentSource::Editor {
+                        name: "vscode".to_owned(),
+                        id: "historical-window".to_owned(),
+                        pid: None,
+                    },
+                    created_at,
+                },
+                Attachment {
+                    project_path: canonical.clone(),
+                    source: AttachmentSource::CLI { pid: u32::MAX },
+                    created_at,
+                },
+            ],
+            false,
+        );
+        attachments.set_instance_owner(&canonical, historical_instance);
+        attachments
+            .save()
+            .await
+            .expect("persist historical attachments");
+
+        let availability_data_dir = root.join("availability-data");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, historical_instance)
+            .await
+            .expect("load historical availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable historical Always On");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed historical demand");
+
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            root.join("notify.sock"),
+            Arc::new(StateManager::with_path(root.join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create unregistered replacement manager");
+        let host_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: Arc::clone(&host_calls),
+        }));
+        manager.services.lock().await.insert(
+            "historical:web".to_owned(),
+            availability_test_service(historical_instance, "historical", &canonical, false),
+        );
+        manager
+            .persist_state_checked()
+            .await
+            .expect("persist historical runtime state");
+
+        git(&repository, &["worktree", "remove", worktree_arg]);
+        git(&repository, &["worktree", "prune"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "replacement", worktree_arg],
+        );
+        let replacement_discovery = Registry::discover(
+            std::fs::canonicalize(&worktree).expect("canonical replacement worktree path"),
+        )
+        .await
+        .expect("discover replacement worktree");
+        let mut probe_catalog = manager.registry.lock().await.clone();
+        let replacement_instance = probe_catalog
+            .register_project(replacement_discovery, Some("replacement".to_owned()))
+            .expect("derive replacement instance identity");
+        assert_ne!(historical_instance, replacement_instance);
+
+        UnregisteredReplacementFixture {
+            manager,
+            repository,
+            worktree,
+            historical_instance,
+            replacement_instance,
+            availability_data_dir,
+            host_calls,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_start_journals_manual_demand_and_clears_stop_mirror() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "legacy-start",
+            "legacy-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.mark_stopped(&project_path);
+            attachments.save().await.expect("persist stop mirror");
+        }
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("legacy Start should ensure manual availability");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load started availability");
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read started availability");
+        assert!(
+            snapshot
+                .demands()
+                .iter()
+                .any(|demand| demand.key().kind() == locald_core::DemandKind::ManualCli)
+        );
+        assert!(!snapshot.is_paused());
+        assert!(!manager.attachments.lock().await.is_stopped(&project_path));
+        assert!(
+            manager
+                .get_service_controller("legacy-start:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cli_attach_defers_convergence_to_its_streamed_start() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-streamed-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-streamed-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "legacy-streamed-start",
+            "legacy-streamed-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let peer_pid = std::process::id();
+        let source = AttachmentSource::CLI { pid: peer_pid };
+        let process_demand = availability_demand_for_attachment_source(&source)
+            .expect("map legacy CLI owner")
+            .expect("legacy CLI owner has a process demand");
+
+        manager
+            .project_attach_from_ipc(project_path.clone(), source.clone(), false)
+            .await
+            .expect("publish the pre-session CLI owner");
+        assert!(
+            manager
+                .get_service_controller("legacy-streamed-start:web")
+                .await
+                .is_none(),
+            "legacy attach must leave startup to the following streamed Start"
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load attached availability");
+        let attached = availability
+            .snapshot()
+            .await
+            .expect("read attached availability");
+        assert!(
+            attached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &process_demand)
+        );
+        assert!(
+            attached
+                .demands()
+                .iter()
+                .all(|demand| demand.key() != &DemandKey::manual_cli())
+        );
+
+        manager
+            .project_force_stop(project_path.clone())
+            .await
+            .expect("pause the pre-session owner generation");
+        let paused = availability.snapshot().await.expect("read paused owner");
+        assert!(paused.is_paused());
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                Some(event_tx),
+                false,
+                None,
+                Some(peer_pid),
+            )
+            .await
+            .expect("matching legacy Start resumes and converges the process owner");
+        assert!(
+            manager
+                .get_service_controller("legacy-streamed-start:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                BootEvent::StepStarted { id, .. } if id == "legacy-streamed-start:web"
+            )),
+            "service startup must be visible to the streamed Start"
+        );
+        let started = availability
+            .snapshot()
+            .await
+            .expect("read matching legacy Start availability");
+        assert!(!started.is_paused());
+        assert_eq!(
+            started.activity_generation(),
+            paused.activity_generation() + 1,
+            "matching streamed Start contributes one semantic activity generation"
+        );
+        assert!(
+            started
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &process_demand)
+        );
+        assert!(
+            started
+                .demands()
+                .iter()
+                .all(|demand| demand.key() != &DemandKey::manual_cli())
+        );
+
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("legacy Ctrl-C releases the process owner");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read detached legacy owner");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn mismatched_legacy_start_peer_keeps_an_independent_manual_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("mismatched-legacy-peer-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "mismatched-legacy-peer").await;
+        write_availability_worker_config(
+            &project_path,
+            "mismatched-legacy-peer",
+            "mismatched-legacy-peer.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let attached_pid = std::process::id();
+        let different_peer_pid = attached_pid
+            .checked_add(1)
+            .unwrap_or_else(|| attached_pid.saturating_sub(1));
+        let source = AttachmentSource::CLI { pid: attached_pid };
+
+        manager
+            .project_attach_from_ipc(project_path.clone(), source.clone(), false)
+            .await
+            .expect("publish unrelated legacy CLI owner");
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                None,
+                false,
+                None,
+                Some(different_peer_pid),
+            )
+            .await
+            .expect("mismatched legacy Start acquires independent Manual demand");
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("detach unrelated legacy CLI owner");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load mismatched-peer availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read mismatched-peer availability");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &DemandKey::manual_cli())
+        );
+        assert!(detached.demands().iter().all(|demand| {
+            demand.key().kind() != locald_core::DemandKind::LegacyProcessAttachment
+        }));
+    }
+
+    #[tokio::test]
+    async fn standalone_cli_attach_converges_immediately() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("standalone-cli-attach-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "standalone-cli-attach").await;
+        write_availability_worker_config(
+            &project_path,
+            "standalone-cli-attach",
+            "standalone-cli-attach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .project_attach_from_ipc(
+                project_path,
+                AttachmentSource::CLI {
+                    pid: std::process::id(),
+                },
+                true,
+            )
+            .await
+            .expect("standalone CLI attach converges its demand");
+
+        assert!(
+            manager
+                .get_service_controller("standalone-cli-attach:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn fieldless_cli_attach_converges_after_an_unpaired_owner_exits() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("fieldless-cli-attach-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "fieldless-cli-attach").await;
+        write_availability_worker_config(
+            &project_path,
+            "fieldless-cli-attach",
+            "fieldless-cli-attach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let prior_owner = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "prior-window".to_owned(),
+            pid: None,
+        };
+
+        manager
+            .project_attach(project_path.clone(), prior_owner.clone())
+            .await
+            .expect("start project under prior owner");
+        manager
+            .stop("fieldless-cli-attach:web")
+            .await
+            .expect("stop service under prior owner");
+        manager
+            .project_detach(project_path.clone(), Some(prior_owner))
+            .await
+            .expect("release prior owner");
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "fieldless-cli-attach:web".to_owned()))
+        );
+
+        manager
+            .project_attach_from_ipc(project_path, AttachmentSource::CLI { pid: u32::MAX }, false)
+            .await
+            .expect("publish field-less CLI attachment");
+        assert!(
+            manager
+                .get_service_controller("fieldless-cli-attach:web")
+                .await
+                .is_none(),
+            "field-less attachment initially reserves startup for a paired Start"
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "fieldless-cli-attach:web".to_owned())),
+            "new field-less owner resumes automatic service management at publication"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .get_service_controller("fieldless-cli-attach:web")
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an exited unpaired owner triggers standalone convergence");
+    }
+
+    #[tokio::test]
+    async fn cli_detach_releases_the_manual_demand_created_by_legacy_start() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("cli-detach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "cli-detach").await;
+        write_availability_worker_config(
+            &project_path,
+            "cli-detach",
+            "cli-detach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let session = ManualCliSession::new(std::process::id());
+        let source = session.attachment_source();
+
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("paired Start publishes the Manual CLI session");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load CLI availability");
+        let attached = availability
+            .snapshot()
+            .await
+            .expect("read attached CLI demands");
+        let session_demand =
+            manual_cli_session_demand(&session).expect("manual CLI session demand should be valid");
+        assert!(
+            attached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &session_demand)
+        );
+        assert!(attached.demands().iter().any(|demand| {
+            demand.key().kind() == locald_core::DemandKind::LegacyProcessAttachment
+        }));
+
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("Ctrl-C compatibility detach releases the CLI session");
+
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read detached CLI demands");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn retried_paired_start_reuses_one_manual_cli_owner_and_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("retried-cli-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retried-cli-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "retried-cli-start",
+            "retried-cli-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let session = ManualCliSession::new(std::process::id());
+
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("publish paired Manual CLI start");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load first paired-start availability");
+        let first = availability
+            .snapshot()
+            .await
+            .expect("read first paired-start availability");
+
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("retry the same paired Manual CLI start");
+        let retried = availability
+            .snapshot()
+            .await
+            .expect("read retried paired-start availability");
+        assert_eq!(retried.activity_generation(), first.activity_generation());
+        assert_eq!(retried.demands().len(), 2);
+        let session_demand = manual_cli_session_demand(&session)
+            .expect("construct retried Manual CLI session demand");
+        let process_demand =
+            availability_demand_for_attachment_source(&session.attachment_source())
+                .expect("construct retried process demand")
+                .expect("Manual CLI session has a process demand");
+        assert!(
+            retried
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &session_demand)
+        );
+        assert!(
+            retried
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &process_demand)
+        );
+        let attachments = manager
+            .attachments
+            .lock()
+            .await
+            .snapshot()
+            .project(&project_path)
+            .attachments;
+        assert_eq!(
+            attachments
+                .iter()
+                .filter(|attachment| attachment.source == session.attachment_source())
+                .count(),
+            1
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up retried paired-start project");
+    }
+
+    #[tokio::test]
+    async fn detaching_one_manual_cli_session_preserves_other_owners() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("multiple-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "multiple-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "multiple-cli-session",
+            "multiple-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let first_session = ManualCliSession::new(std::process::id());
+        let second_session = ManualCliSession::new(std::process::id().saturating_add(1));
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(first_session))
+            .await
+            .expect("publish first Manual CLI session");
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(second_session))
+            .await
+            .expect("publish second Manual CLI session");
+
+        manager
+            .project_detach(
+                project_path.clone(),
+                Some(first_session.attachment_source()),
+            )
+            .await
+            .expect("detach only the first Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load multiple-session availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read availability after one session detaches");
+        let first_demand = manual_cli_session_demand(&first_session)
+            .expect("construct first Manual CLI session demand");
+        let second_demand = manual_cli_session_demand(&second_session)
+            .expect("construct second Manual CLI session demand");
+        let first_process =
+            availability_demand_for_attachment_source(&first_session.attachment_source())
+                .expect("construct first process demand")
+                .expect("first session has a process demand");
+        let second_process =
+            availability_demand_for_attachment_source(&second_session.attachment_source())
+                .expect("construct second process demand")
+                .expect("second session has a process demand");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &first_demand)
+        );
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &first_process)
+        );
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &second_demand)
+        );
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &second_process)
+        );
+        assert!(detached.desired_up_at(SystemTime::now()));
+        assert!(
+            manager
+                .get_service_controller("multiple-cli-session:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up multiple-session project");
+    }
+
+    #[tokio::test]
+    async fn manual_cli_detach_preserves_independent_singleton_manual_policy() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("manual-policy-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "manual-policy-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "manual-policy-cli-session",
+            "manual-policy-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("publish independent singleton Manual demand");
+        let session = ManualCliSession::new(std::process::id());
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("publish paired Manual CLI session");
+
+        manager
+            .project_detach(project_path.clone(), Some(session.attachment_source()))
+            .await
+            .expect("detach paired Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load singleton policy availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read singleton policy availability");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &DemandKey::manual_cli())
+        );
+        let session_demand = manual_cli_session_demand(&session)
+            .expect("construct detached Manual CLI session demand");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &session_demand)
+        );
+        assert!(detached.desired_up_at(SystemTime::now()));
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up singleton policy project");
+    }
+
+    #[tokio::test]
+    async fn dead_manual_cli_session_reaper_releases_both_owned_demands() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("dead-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "dead-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "dead-cli-session",
+            "dead-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let session = ManualCliSession::new(u32::MAX);
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("publish eventually stale Manual CLI session");
+        let evidence = manager
+            .attachments
+            .lock()
+            .await
+            .snapshot()
+            .compatibility_evidence_at(
+                &ProcessManager::canonicalize_path(&project_path),
+                SystemTime::now(),
+                ProcessManager::legacy_pid_alive,
+            );
+        assert_eq!(evidence.attachments.len(), 1);
+        assert!(!evidence.attachments[0].alive);
+
+        manager
+            .reconcile_legacy_attachment_project(project_path.clone())
+            .await
+            .expect("reap dead Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load reaped Manual CLI availability");
+        let reaped = availability
+            .snapshot()
+            .await
+            .expect("read reaped Manual CLI availability");
+        assert!(
+            reaped.demands().is_empty(),
+            "dead session left availability demands: {:#?}",
+            reaped.demands()
+        );
+        assert!(reaped.shutdown_cooldown_until().is_some());
+        assert!(
+            manager
+                .attachments
+                .lock()
+                .await
+                .snapshot()
+                .project(&project_path)
+                .attachments
+                .is_empty()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up reaped Manual CLI project");
+    }
+
+    #[tokio::test]
+    async fn new_attachment_reaping_a_dead_manual_cli_session_releases_both_owned_demands() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("reattached-dead-cli-session-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "reattached-dead-cli-session").await;
+        write_availability_worker_config(
+            &project_path,
+            "reattached-dead-cli-session",
+            "reattached-dead-cli-session.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let stale_session = ManualCliSession::new(u32::MAX);
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(stale_session))
+            .await
+            .expect("publish eventually stale Manual CLI session");
+        let editor = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "replacement-window".to_owned(),
+            pid: Some(std::process::id()),
+        };
+
+        manager
+            .project_attach(project_path.clone(), editor.clone())
+            .await
+            .expect("new editor attachment reaps the stale Manual CLI session");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load reattached availability");
+        let reattached = availability
+            .snapshot()
+            .await
+            .expect("read reattached availability");
+        let stale_manual =
+            manual_cli_session_demand(&stale_session).expect("construct stale Manual CLI demand");
+        let stale_process =
+            availability_demand_for_attachment_source(&stale_session.attachment_source())
+                .expect("construct stale process demand")
+                .expect("Manual CLI session has a process demand");
+        assert!(
+            reattached
+                .demands()
+                .iter()
+                .all(|lease| lease.key() != &stale_manual && lease.key() != &stale_process)
+        );
+        assert!(
+            reattached
+                .demands()
+                .iter()
+                .any(|lease| { lease.key().kind() == locald_core::DemandKind::VsCodeWindow })
+        );
+
+        manager
+            .project_detach(project_path, Some(editor))
+            .await
+            .expect("detach replacement editor");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read fully detached availability");
+        assert!(
+            detached.demands().is_empty(),
+            "replacement detach left orphan demands: {:#?}",
+            detached.demands()
+        );
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn bulk_detach_releases_a_removed_manual_cli_session() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("bulk-cli-detach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "bulk-cli-detach").await;
+        write_availability_worker_config(
+            &project_path,
+            "bulk-cli-detach",
+            "bulk-cli-detach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let session = ManualCliSession::new(std::process::id());
+        manager
+            .start_with_manual_cli_session(project_path.clone(), None, false, Some(session))
+            .await
+            .expect("paired Start publishes the Manual CLI session");
+        manager
+            .project_detach(project_path, None)
+            .await
+            .expect("bulk detach releases every compatibility owner");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load bulk-detach availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read bulk-detached availability");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn generic_cli_detach_preserves_an_independently_owned_manual_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("generic-cli-detach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "generic-cli-detach").await;
+        write_availability_worker_config(
+            &project_path,
+            "generic-cli-detach",
+            "generic-cli-detach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("legacy Start acquires an independent Manual demand");
+        manager
+            .project_attach(project_path.clone(), source.clone())
+            .await
+            .expect("attach generic compatibility CLI owner");
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("detach generic compatibility owner");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load generic CLI availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read availability after generic CLI detach");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &DemandKey::manual_cli())
+        );
+        assert!(detached.demands().iter().all(|demand| {
+            demand.key().kind() != locald_core::DemandKind::LegacyProcessAttachment
+        }));
+    }
+
+    #[tokio::test]
+    async fn editor_attach_and_detach_project_exact_availability_owner() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("editor-owner-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "editor-owner").await;
+        write_availability_worker_config(
+            &project_path,
+            "editor-owner",
+            "editor-owner.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+
+        manager
+            .project_attach(project_path.clone(), source.clone())
+            .await
+            .expect("attach editor owner");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load editor availability");
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("read editor demand")
+                .demands()
+                .iter()
+                .any(|demand| demand.key().kind() == locald_core::DemandKind::VsCodeWindow)
+        );
+
+        manager
+            .project_detach(project_path.clone(), Some(source))
+            .await
+            .expect("detach exact editor owner");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read detached availability");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn compatibility_reattach_revalidates_existing_owner_without_crossing_pause() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("editor-reattach-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "editor-reattach").await;
+        write_availability_worker_config(
+            &project_path,
+            "editor-reattach",
+            "editor-reattach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+
+        manager
+            .project_attach(project_path.clone(), source.clone())
+            .await
+            .expect("attach editor owner");
+        manager
+            .project_force_stop(project_path.clone())
+            .await
+            .expect("pause attached project");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load paused availability");
+        let paused = availability
+            .snapshot()
+            .await
+            .expect("read paused availability");
+        assert_eq!(paused.activity_generation(), 1);
+        assert!(paused.is_paused());
+
+        manager
+            .project_attach(project_path.clone(), source)
+            .await
+            .expect("rediscover existing editor owner");
+        let revalidated = availability
+            .snapshot()
+            .await
+            .expect("read revalidated availability");
+        assert_eq!(revalidated.activity_generation(), 1);
+        assert!(revalidated.is_paused());
+        assert!(!revalidated.desired_up_at(SystemTime::now()));
+        assert!(manager.attachments.lock().await.is_stopped(&project_path));
+    }
+
+    #[tokio::test]
+    async fn startup_revalidates_an_expired_live_owner_without_crossing_pause() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("startup-owner-revalidation-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "startup-owner-revalidation").await;
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("seed completed migration authority");
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("map live process owner")
+            .expect("CLI owner has a demand");
+        let expired_at = SystemTime::now()
+            .checked_sub(locald_core::LEGACY_PROCESS_DEMAND_TTL + std::time::Duration::from_secs(1))
+            .expect("construct expired lease time");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load startup owner availability");
+        availability
+            .apply_batch(
+                &AvailabilityBatch::new(expired_at)
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand.clone())),
+            )
+            .await
+            .expect("seed expired process demand");
+        availability
+            .pause_project()
+            .await
+            .expect("pause startup owner generation");
+        let before = availability
+            .snapshot()
+            .await
+            .expect("read paused expired demand");
+        assert!(before.is_paused());
+        assert!(before.live_demands_at(SystemTime::now()).next().is_none());
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &project_path,
+                vec![Attachment {
+                    project_path: project_path.clone(),
+                    source,
+                    created_at: expired_at,
+                }],
+                true,
+            );
+            attachments.set_instance_owner(&project_path, instance_id);
+        }
+
+        manager
+            .reconcile_legacy_attachment_owners()
+            .await
+            .expect("revalidate live compatibility owner before first sweep");
+        manager.converge_all_project_availability().await;
+
+        let after = availability
+            .snapshot()
+            .await
+            .expect("read revalidated paused demand");
+        assert_eq!(after.activity_generation(), before.activity_generation());
+        assert!(after.is_paused());
+        assert!(!after.desired_up_at(SystemTime::now()));
+        let lease = after
+            .demands()
+            .iter()
+            .find(|lease| lease.key() == &demand)
+            .expect("revalidated demand remains present");
+        assert!(
+            lease
+                .expires_at()
+                .is_some_and(|expiry| expiry > SystemTime::now())
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_reconciliation_publishes_without_entering_runtime_prepare() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("publication-only-owner-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "publication-only-owner").await;
+        write_availability_worker_config(
+            &project_path,
+            "publication-only-owner",
+            "publication-only-owner.localhost",
+            &["web"],
+        );
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("seed completed migration authority");
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("map live process owner")
+            .expect("CLI owner has a demand");
+        let expired_at = SystemTime::now()
+            .checked_sub(locald_core::LEGACY_PROCESS_DEMAND_TTL + std::time::Duration::from_secs(1))
+            .expect("construct expired lease time");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load publication-only availability");
+        availability
+            .apply_batch(
+                &AvailabilityBatch::new(expired_at)
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand.clone())),
+            )
+            .await
+            .expect("seed expired process demand");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &project_path,
+                vec![Attachment {
+                    project_path: project_path.clone(),
+                    source,
+                    created_at: expired_at,
+                }],
+                false,
+            );
+            attachments.set_instance_owner(&project_path, instance_id);
+        }
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: Arc::new(AtomicUsize::new(0)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.reconcile_legacy_attachment_owners(),
+        )
+        .await
+        .expect("owner publication returns before runtime prepare")
+        .expect("owner publication succeeds");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                prepare_entered.notified()
+            )
+            .await
+            .is_err()
+        );
+        let renewed = availability
+            .snapshot()
+            .await
+            .expect("read publication-only renewal");
+        assert!(
+            renewed
+                .demands()
+                .iter()
+                .find(|lease| lease.key() == &demand)
+                .and_then(locald_core::DemandLease::expires_at)
+                .is_some_and(|expiry| expiry > SystemTime::now())
+        );
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_entered.notified(),
+        )
+        .await
+        .expect("explicit convergence enters runtime prepare");
+        release_prepare.notify_one();
+        convergence
+            .await
+            .expect("convergence task joins")
+            .expect("convergence completes after prepare release");
+    }
+
+    #[tokio::test]
+    async fn broken_legacy_owner_does_not_starve_later_owner_revalidation() {
+        let dir = tempdir().expect("create temporary directory");
+        let broken_path = dir.path().join("a-broken-owner-project");
+        let healthy_path = dir.path().join("z-healthy-owner-project");
+        std::fs::create_dir_all(&broken_path).expect("create broken owner project");
+        std::fs::create_dir_all(&healthy_path).expect("create healthy owner project");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let broken_instance = catalog
+            .register_project(
+                Registry::discover(broken_path.clone())
+                    .await
+                    .expect("discover broken owner project"),
+                Some("broken-owner".to_owned()),
+            )
+            .expect("register broken owner project");
+        let healthy_instance = catalog
+            .register_project(
+                Registry::discover(healthy_path.clone())
+                    .await
+                    .expect("discover healthy owner project"),
+                Some("healthy-owner".to_owned()),
+            )
+            .expect("register healthy owner project");
+        catalog.save().await.expect("save owner catalog");
+        let availability_data_dir = dir.path().join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create owner reconciliation manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("seed completed migration authority");
+
+        let source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("map owner demand")
+            .expect("CLI owner has a demand");
+        let expired_at = SystemTime::now()
+            .checked_sub(locald_core::LEGACY_PROCESS_DEMAND_TTL + std::time::Duration::from_secs(1))
+            .expect("construct expired owner lease time");
+        let mut healthy = AvailabilityStore::load(&availability_data_dir, healthy_instance)
+            .await
+            .expect("load healthy owner availability");
+        healthy
+            .apply_batch(
+                &AvailabilityBatch::new(expired_at)
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand.clone())),
+            )
+            .await
+            .expect("seed expired healthy owner demand");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            for (path, instance_id) in [
+                (&broken_path, broken_instance),
+                (&healthy_path, healthy_instance),
+            ] {
+                attachments.replace_project(
+                    path,
+                    vec![Attachment {
+                        project_path: path.clone(),
+                        source: source.clone(),
+                        created_at: expired_at,
+                    }],
+                    false,
+                );
+                attachments.set_instance_owner(path, instance_id);
+            }
+        }
+
+        let error = manager
+            .reconcile_legacy_attachment_owners()
+            .await
+            .expect_err("broken owner remains a strict aggregate failure");
+        assert!(format!("{error:#}").contains("a-broken-owner-project"));
+        assert!(!availability_path(&availability_data_dir, broken_instance).exists());
+        let renewed = healthy
+            .snapshot()
+            .await
+            .expect("read renewed healthy owner");
+        let lease = renewed
+            .demands()
+            .iter()
+            .find(|lease| lease.key() == &demand)
+            .expect("healthy owner remains present");
+        assert!(
+            lease
+                .expires_at()
+                .is_some_and(|expiry| expiry > SystemTime::now())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_cold_v1_journal_uses_exact_catalog_base_and_replays() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("prepared-cold-v1-project");
+        std::fs::create_dir_all(&project_path).expect("create prepared cold v1 project");
+        let paths = locald_core::CatalogPaths::for_data_dir(dir.path());
+        let registry = serde_json::json!({
+            "projects": {
+                project_path.to_string_lossy().as_ref(): {
+                    "path": project_path,
+                    "name": "prepared-cold-v1",
+                    "pinned": false,
+                    "last_seen": SystemTime::now()
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize prepared cold v1 registry"),
+        )
+        .await
+        .expect("write prepared cold v1 registry");
+        let legacy_attachments = AttachmentStore::new(paths.legacy_attachments.clone());
+        legacy_attachments
+            .save()
+            .await
+            .expect("persist prepared cold v1 attachments");
+        let catalog = Registry::load_from_paths_for_lifecycle_recovery(paths.clone(), true)
+            .await
+            .expect("build prepared cold v1 candidate");
+        let instance_id = *catalog
+            .instances
+            .keys()
+            .next()
+            .expect("prepared cold v1 candidate has one instance");
+        let prepared_catalog = catalog.clone();
+        let availability_data_dir = dir.path().join("availability-data");
+        let manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(paths.legacy_runtime_state.clone())),
+            Arc::new(Mutex::new(catalog.clone())),
+            Arc::new(Mutex::new(legacy_attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create prepared cold v1 manager");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load prepared cold v1 availability");
+        let effective_at = SystemTime::now();
+        let prepared = availability
+            .prepare_batch(
+                &AvailabilityBatch::new(effective_at)
+                    .with_operation(AvailabilityBatchOperation::Initialize),
+            )
+            .await
+            .expect("prepare cold v1 availability target");
+        let attachments = manager.attachments.lock().await.snapshot();
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LegacyV1Migration,
+            effective_at,
+            Some(
+                CatalogTransactionImages::new(catalog.clone(), catalog)
+                    .expect("prepare cold v1 catalog images"),
+            ),
+            vec![prepared],
+            AttachmentTransactionImages::new(attachments.clone(), attachments),
+        )
+        .expect("prepare cold v1 replay transaction");
+        manager
+            .lifecycle_journal
+            .backup_v1_file(LegacyV1File::Registry, &paths.legacy_registry)
+            .await
+            .expect("backup prepared cold v1 registry");
+        manager
+            .lifecycle_journal
+            .backup_v1_file(LegacyV1File::Attachments, &paths.legacy_attachments)
+            .await
+            .expect("backup prepared cold v1 attachments");
+        manager
+            .lifecycle_journal
+            .create(&transaction)
+            .await
+            .expect("persist Prepared cold v1 journal");
+        assert!(!paths.catalog.exists());
+
+        let preflight = manager
+            .lifecycle_journal
+            .preflight()
+            .await
+            .expect("preflight Prepared cold v1 journal");
+        assert!(!preflight.has_v2_authority());
+        let rebound_catalog_path = dir.path().join("rebound/catalog.json");
+        let exact_catalog_base = preflight
+            .prepared_legacy_catalog_base(&rebound_catalog_path)
+            .expect("Prepared cold v1 journal exposes its exact catalog base");
+        let mut rebound_prepared_catalog = prepared_catalog.clone();
+        rebound_prepared_catalog.set_storage_path(rebound_catalog_path.clone());
+        assert_eq!(exact_catalog_base, rebound_prepared_catalog);
+        assert_eq!(exact_catalog_base.storage_path(), rebound_catalog_path);
+        assert!(exact_catalog_base.instances.contains_key(&instance_id));
+
+        // Re-running legacy discovery would generate new non-Git identities.
+        // The startup preflight must instead seed replay from the exact base
+        // already recorded in the Prepared journal.
+        let rediscovered = Registry::load_from_paths_for_lifecycle_recovery(paths.clone(), true)
+            .await
+            .expect("rebuild a distinct cold v1 candidate for comparison");
+        let rediscovered_instance = *rediscovered
+            .instances
+            .keys()
+            .next()
+            .expect("rediscovered cold v1 candidate has one instance");
+        assert_ne!(rediscovered_instance, instance_id);
+        assert!(!paths.catalog.exists());
+        let mut attachments = AttachmentStore::new(paths.legacy_attachments.clone());
+        attachments
+            .load()
+            .await
+            .expect("reload legacy compatibility state before replay");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(paths.legacy_runtime_state.clone())),
+            Arc::new(Mutex::new(exact_catalog_base)),
+            Arc::new(Mutex::new(attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create fresh prepared cold v1 manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        fresh
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("replay Prepared cold v1 transaction");
+
+        assert!(rebound_catalog_path.exists());
+        assert!(!paths.catalog.exists());
+        assert!(availability_path(&availability_data_dir, instance_id).exists());
+        assert!(!availability_path(&availability_data_dir, rediscovered_instance).exists());
+        assert_eq!(*fresh.registry.lock().await, rebound_prepared_catalog);
+        assert!(
+            fresh
+                .lifecycle_journal
+                .migration_marker()
+                .await
+                .expect("load replayed cold v1 marker")
+                .is_some()
+        );
+        assert!(
+            fresh
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect cleared cold v1 journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_v1_migration_backs_up_and_publishes_one_restart_stable_authority() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("cold-v1-project");
+        std::fs::create_dir_all(&project_path).expect("create cold v1 project");
+        let paths = locald_core::CatalogPaths::for_data_dir(dir.path());
+        let registry = serde_json::json!({
+            "projects": {
+                project_path.to_string_lossy().as_ref(): {
+                    "path": project_path,
+                    "name": "cold-v1",
+                    "pinned": true,
+                    "last_seen": SystemTime::now()
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize cold v1 registry"),
+        )
+        .await
+        .expect("write cold v1 registry");
+        let cli_source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let editor_source = AttachmentSource::Editor {
+            name: "vscode".to_owned(),
+            id: "cold-v1-window".to_owned(),
+            pid: None,
+        };
+        let migration_started_at = SystemTime::now();
+        let mut legacy_attachments = AttachmentStore::new(paths.legacy_attachments.clone());
+        legacy_attachments.replace_project(
+            &project_path,
+            vec![
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: AttachmentSource::Runtime,
+                    created_at: SystemTime::UNIX_EPOCH,
+                },
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: AttachmentSource::Pin,
+                    created_at: SystemTime::now(),
+                },
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: cli_source.clone(),
+                    created_at: SystemTime::now(),
+                },
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: editor_source.clone(),
+                    created_at: migration_started_at - std::time::Duration::from_secs(5 * 60),
+                },
+            ],
+            true,
+        );
+        legacy_attachments
+            .save()
+            .await
+            .expect("persist cold v1 attachments");
+        let state_manager = Arc::new(StateManager::with_path(paths.legacy_runtime_state.clone()));
+        state_manager
+            .save(&ServerState::default())
+            .await
+            .expect("persist cold v1 runtime state");
+        let registry_bytes =
+            std::fs::read(&paths.legacy_registry).expect("read cold v1 registry source");
+        let attachment_bytes =
+            std::fs::read(&paths.legacy_attachments).expect("read cold v1 attachment source");
+        let runtime_bytes =
+            std::fs::read(&paths.legacy_runtime_state).expect("read cold v1 runtime source");
+
+        let catalog = Registry::load_from_paths_for_lifecycle_recovery(paths.clone(), true)
+            .await
+            .expect("build cold v1 catalog candidate");
+        assert!(!paths.catalog.exists());
+        let instance_id = *catalog
+            .instances
+            .keys()
+            .next()
+            .expect("cold v1 candidate has one instance");
+        let availability_data_dir = dir.path().join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            state_manager,
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(legacy_attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create cold v1 migration manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("migrate cold v1 authority");
+
+        assert!(paths.catalog.exists());
+        assert!(
+            manager
+                .lifecycle_journal
+                .migration_marker()
+                .await
+                .expect("load cold v1 migration marker")
+                .is_some()
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect cleared cold v1 journal")
+                .is_none()
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load cold v1 availability");
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read cold v1 availability");
+        assert!(snapshot.always_on());
+        assert!(snapshot.is_paused());
+        assert_eq!(snapshot.trusted_launch_path(), None);
+        for expected in [
+            DemandKey::manual_cli(),
+            availability_demand_for_attachment_source(&cli_source)
+                .expect("map cold v1 CLI")
+                .expect("cold v1 CLI has demand"),
+            availability_demand_for_attachment_source(&editor_source)
+                .expect("map cold v1 editor")
+                .expect("cold v1 editor has demand"),
+        ] {
+            assert!(
+                snapshot
+                    .demands()
+                    .iter()
+                    .any(|lease| lease.key() == &expected),
+                "missing migrated demand {expected:?}"
+            );
+        }
+        let migrated_editor = manager
+            .attachments
+            .lock()
+            .await
+            .attachments_for(&project_path)
+            .into_iter()
+            .find(|attachment| attachment.source == editor_source)
+            .cloned()
+            .expect("retain migrated pidless editor compatibility owner");
+        assert!(migrated_editor.created_at >= migration_started_at);
+        let backup_dir = availability_data_dir.join("v1-backups");
+        assert!(!backup_dir.join("catalog.json").exists());
+        assert_eq!(
+            std::fs::read(backup_dir.join("registry.json")).expect("read cold v1 registry backup"),
+            registry_bytes
+        );
+        assert_eq!(
+            std::fs::read(backup_dir.join("attachments.json"))
+                .expect("read cold v1 attachment backup"),
+            attachment_bytes
+        );
+        assert_eq!(
+            std::fs::read(backup_dir.join("state.json")).expect("read cold v1 runtime backup"),
+            runtime_bytes
+        );
+        let catalog_after = std::fs::read(&paths.catalog).expect("read migrated catalog");
+        let availability_after =
+            std::fs::read(availability_path(&availability_data_dir, instance_id))
+                .expect("read migrated availability");
+        let attachments_after =
+            std::fs::read(&paths.legacy_attachments).expect("read migrated compatibility state");
+
+        let catalog = Registry::load_from_paths_for_lifecycle_recovery(paths.clone(), false)
+            .await
+            .expect("reload exact migrated catalog");
+        let mut attachments = AttachmentStore::new(paths.legacy_attachments.clone());
+        attachments
+            .load_exact()
+            .await
+            .expect("reload exact migrated compatibility state");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(paths.legacy_runtime_state.clone())),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create fresh migrated manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        fresh
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("reopen migrated authority idempotently");
+
+        assert_eq!(
+            std::fs::read(&paths.catalog).expect("reread migrated catalog"),
+            catalog_after
+        );
+        assert_eq!(
+            std::fs::read(availability_path(&availability_data_dir, instance_id))
+                .expect("reread migrated availability"),
+            availability_after
+        );
+        assert_eq!(
+            std::fs::read(&paths.legacy_attachments).expect("reread migrated compatibility state"),
+            attachments_after
+        );
+    }
+
+    #[test]
+    fn deferred_pidless_editor_keeps_its_original_expiry_until_instance_claim() {
+        let project_path = PathBuf::from("/projects/deferred-editor");
+        let original = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let migration_at = original + std::time::Duration::from_secs(5 * 60);
+        let claim_at = original + std::time::Duration::from_secs(29 * 60);
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "legacy-window".to_owned(),
+            pid: None,
+        };
+        let attachment = Attachment {
+            project_path: project_path.clone(),
+            source,
+            created_at: original,
+        };
+        let mut deferred = AttachmentStoreSnapshot::default();
+        deferred.replace_project(&project_path, vec![attachment], false);
+
+        let migration_evidence =
+            deferred.compatibility_evidence_at(&project_path, migration_at, |_| false);
+        let migration_plan =
+            plan_project_lifecycle_migration(false, &migration_evidence, migration_at)
+                .expect("plan deferred migration");
+        assert_eq!(
+            migration_plan.compatibility_attachments[0].created_at,
+            original
+        );
+        deferred.replace_project(
+            &project_path,
+            migration_plan.compatibility_attachments,
+            false,
+        );
+
+        let after_original_expiry = original + std::time::Duration::from_secs(30 * 60 + 1);
+        assert!(
+            !deferred
+                .compatibility_evidence_at(&project_path, after_original_expiry, |_| false)
+                .attachments[0]
+                .alive,
+            "unclaimed evidence must not receive a fresh legacy retention window"
+        );
+
+        let claim_evidence = deferred.compatibility_evidence_at(&project_path, claim_at, |_| false);
+        let claim_plan = plan_project_lifecycle_migration(false, &claim_evidence, claim_at)
+            .expect("plan deferred claim");
+        let instance_id = "00000000-0000-4000-8000-000000000123"
+            .parse()
+            .expect("parse project instance ID");
+        ProcessManager::claim_compatibility_projection(
+            &mut deferred,
+            &project_path,
+            instance_id,
+            claim_plan.compatibility_attachments,
+            false,
+            claim_at,
+        );
+        assert_eq!(deferred.instance_owner(&project_path), Some(instance_id));
+        assert_eq!(
+            deferred.project(&project_path).attachments[0].created_at,
+            claim_at
+        );
+        assert!(
+            deferred
+                .compatibility_evidence_at(&project_path, after_original_expiry, |_| false)
+                .attachments[0]
+                .alive,
+            "claim starts the v2 editor lease from the claim epoch"
+        );
+        assert!(
+            !deferred
+                .compatibility_evidence_at(
+                    &project_path,
+                    claim_at + locald_core::VSCODE_DEMAND_TTL,
+                    |_| false,
+                )
+                .attachments[0]
+                .alive
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_v1_evidence_materializes_into_initial_availability_authority() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("deferred-v1-project");
+        let normalized_project_path = locald_core::normalize_project_locator(&project_path)
+            .expect("normalize deferred project locator");
+        let paths = locald_core::CatalogPaths::for_data_dir(dir.path());
+        let registry = serde_json::json!({
+            "projects": {
+                project_path.to_string_lossy().as_ref(): {
+                    "path": project_path,
+                    "name": "deferred-v1",
+                    "pinned": false,
+                    "last_seen": SystemTime::now()
+                }
+            }
+        });
+        tokio::fs::write(
+            &paths.legacy_registry,
+            serde_json::to_vec_pretty(&registry).expect("serialize deferred v1 registry"),
+        )
+        .await
+        .expect("write deferred v1 registry");
+        let cli_source = AttachmentSource::CLI {
+            pid: std::process::id(),
+        };
+        let mut legacy_attachments = AttachmentStore::new(paths.legacy_attachments.clone());
+        legacy_attachments.replace_project(
+            &project_path,
+            vec![
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: AttachmentSource::Runtime,
+                    created_at: SystemTime::UNIX_EPOCH,
+                },
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: AttachmentSource::Pin,
+                    created_at: SystemTime::now(),
+                },
+                Attachment {
+                    project_path: project_path.clone(),
+                    source: cli_source.clone(),
+                    created_at: SystemTime::now(),
+                },
+            ],
+            true,
+        );
+        legacy_attachments
+            .save()
+            .await
+            .expect("persist deferred v1 attachments");
+
+        let catalog = Registry::load_from_paths_for_lifecycle_recovery(paths.clone(), true)
+            .await
+            .expect("build deferred v1 catalog candidate");
+        assert!(catalog.instances.is_empty());
+        assert!(
+            catalog
+                .unresolved_legacy
+                .contains_key(&normalized_project_path)
+        );
+        let availability_data_dir = dir.path().join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(paths.legacy_runtime_state.clone())),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(legacy_attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create deferred v1 migration manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("retain unresolved v1 lifecycle evidence");
+        assert!(manager.registry.lock().await.instances.is_empty());
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .unresolved_legacy
+                .get(&normalized_project_path)
+                .is_some_and(|record| record.pinned)
+        );
+        assert!(manager.attachments.lock().await.is_stopped(&project_path));
+        {
+            let mut attachments = manager.attachments.lock().await;
+            let base = attachments.snapshot();
+            let mut target = base.clone();
+            let mut deferred = target.project(&project_path).attachments;
+            assert!(
+                deferred
+                    .iter()
+                    .any(|attachment| attachment.source == cli_source)
+            );
+            assert!(
+                deferred
+                    .iter()
+                    .any(|attachment| matches!(attachment.source, AttachmentSource::Runtime))
+            );
+            assert!(
+                !deferred
+                    .iter()
+                    .any(|attachment| matches!(attachment.source, AttachmentSource::Pin))
+            );
+            for attachment in &mut deferred {
+                if matches!(attachment.source, AttachmentSource::Runtime) {
+                    attachment.created_at = SystemTime::UNIX_EPOCH;
+                }
+            }
+            target.replace_project(&project_path, deferred, true);
+            attachments
+                .replace_snapshot(target)
+                .await
+                .expect("age deferred Runtime compatibility evidence");
+        }
+
+        std::fs::create_dir_all(&project_path).expect("materialize deferred project");
+        write_availability_worker_config(
+            &project_path,
+            "deferred-v1",
+            "deferred-v1.localhost",
+            &["web"],
+        );
+        let catalog_base = manager.registry.lock().await.clone();
+        let mut catalog_target = catalog_base.clone();
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("discover materialized deferred project");
+        let probe_instance = catalog_target
+            .register_project(discovery, Some("deferred-v1".to_owned()))
+            .expect("probe deferred registration target");
+        let probe_target = CataloguedLifecycleTarget {
+            instance_id: probe_instance,
+            path: project_path.clone(),
+            catalog_base,
+            catalog_target,
+        };
+        let probe_evidence = ProcessManager::compatibility_evidence_for_target(
+            &manager.attachments.lock().await.snapshot(),
+            &probe_target,
+            SystemTime::now(),
+        );
+        assert!(probe_evidence.manually_stopped);
+        assert_eq!(probe_evidence.attachments.len(), 2);
+        assert!(
+            probe_evidence
+                .attachments
+                .iter()
+                .any(|item| item.attachment.source == cli_source && item.alive)
+        );
+        assert!(probe_evidence.attachments.iter().any(|item| {
+            matches!(item.attachment.source, AttachmentSource::Runtime) && !item.alive
+        }));
+        let (instance_id, pending) = manager
+            .start_runtime(
+                project_path.clone(),
+                None,
+                false,
+                ConfigPhysicalIdentity::NonGit,
+            )
+            .await
+            .expect("materialize deferred project authority");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load materialized deferred availability");
+        let materialized = availability
+            .snapshot()
+            .await
+            .expect("read materialized deferred availability");
+        let cli_demand = availability_demand_for_attachment_source(&cli_source)
+            .expect("map deferred CLI owner")
+            .expect("deferred CLI owner has a demand");
+        assert!(materialized.always_on());
+        assert!(materialized.is_paused(), "{materialized:#?}");
+        assert_eq!(materialized.trusted_launch_path(), None);
+        assert!(
+            materialized
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &cli_demand)
+        );
+        assert!(
+            !materialized
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &DemandKey::manual_cli())
+        );
+        let attachments = manager.attachments.lock().await.snapshot();
+        assert_eq!(attachments.instance_owner(&project_path), Some(instance_id));
+        assert!(attachments.project(&project_path).manually_stopped);
+        assert!(
+            attachments
+                .project(&project_path)
+                .attachments
+                .iter()
+                .any(|attachment| attachment.source == cli_source)
+        );
+        assert!(
+            !attachments
+                .project(&project_path)
+                .attachments
+                .iter()
+                .any(|attachment| matches!(attachment.source, AttachmentSource::Runtime))
+        );
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .is_some_and(|record| record.pinned)
+        );
+        drop(pending);
+
+        manager
+            .project_force_start(project_path.clone())
+            .await
+            .expect("resume materialized deferred project");
+        let resumed = availability
+            .snapshot()
+            .await
+            .expect("read resumed deferred availability");
+        assert!(resumed.always_on());
+        assert!(!resumed.is_paused());
+        assert!(resumed.desired_up_at(SystemTime::now()));
+        assert!(
+            resumed
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &DemandKey::manual_cli())
+        );
+        assert!(
+            resumed
+                .demands()
+                .iter()
+                .any(|lease| lease.key() == &cli_demand)
+        );
+        let attachments = manager.attachments.lock().await.snapshot();
+        assert!(!attachments.project(&project_path).manually_stopped);
+        assert_eq!(attachments.instance_owner(&project_path), Some(instance_id));
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_existing_availability_as_lifecycle_authority() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("existing-availability-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "existing-availability").await;
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load existing availability");
+        availability
+            .apply_batch(
+                &AvailabilityBatch::new(SystemTime::now())
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(
+                        DemandKey::manual_cli(),
+                    ))
+                    .with_operation(AvailabilityBatchOperation::SetTrustedLaunchPath(Some(
+                        "/trusted/bin".to_owned(),
+                    )))
+                    .with_operation(AvailabilityBatchOperation::PauseProject),
+            )
+            .await
+            .expect("seed authoritative availability");
+        let authoritative = availability
+            .snapshot()
+            .await
+            .expect("read authoritative availability");
+
+        {
+            let mut registry = manager.registry.lock().await;
+            registry
+                .instances
+                .get_mut(&instance_id)
+                .expect("catalogued instance")
+                .pinned = true;
+            registry
+                .save()
+                .await
+                .expect("persist conflicting catalog pin");
+        }
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &project_path,
+                vec![
+                    Attachment {
+                        project_path: project_path.clone(),
+                        source: AttachmentSource::Runtime,
+                        created_at: SystemTime::UNIX_EPOCH,
+                    },
+                    Attachment {
+                        project_path: project_path.clone(),
+                        source: AttachmentSource::Pin,
+                        created_at: SystemTime::now(),
+                    },
+                    Attachment {
+                        project_path: project_path.clone(),
+                        source: AttachmentSource::CLI {
+                            pid: std::process::id(),
+                        },
+                        created_at: SystemTime::now(),
+                    },
+                ],
+                true,
+            );
+        }
+
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("migrate around existing authority");
+
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("reload preserved availability"),
+            authoritative
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .expect("catalogued instance after migration")
+                .pinned
+        );
+        let attachments = manager.attachments.lock().await;
+        assert!(attachments.attachments_for(&project_path).is_empty());
+        assert!(attachments.is_stopped(&project_path));
+        assert_eq!(
+            attachments.snapshot().instance_owner(&project_path),
+            Some(instance_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_migration_rejects_uncatalogued_attachment_authority_before_reconciliation() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("invalid-attachment-authority");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "invalid-authority").await;
+        let uncatalogued: ProjectInstanceId = "00000000-0000-4000-8000-000000000999"
+            .parse()
+            .expect("parse uncatalogued project instance");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &project_path,
+                vec![Attachment {
+                    project_path: project_path.clone(),
+                    source: AttachmentSource::Pin,
+                    created_at: SystemTime::now(),
+                }],
+                false,
+            );
+            attachments.set_instance_owner(&project_path, uncatalogued);
+        }
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("publish completed migration marker");
+        let catalog_before = manager.registry.lock().await.clone();
+        let attachments_before = manager.attachments.lock().await.snapshot();
+
+        let error = manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect_err("uncatalogued attachment authority must block startup recovery");
+
+        assert!(format!("{error:#}").contains("uncatalogued project instance"));
+        assert_eq!(*manager.registry.lock().await, catalog_before);
+        assert_eq!(
+            manager.attachments.lock().await.snapshot(),
+            attachments_before
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_migration_rejects_malformed_availability_before_reconciliation() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("malformed-availability-authority");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "malformed-availability").await;
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("publish completed migration marker");
+        let availability_file = availability_path(&availability_data_dir, instance_id);
+        std::fs::create_dir_all(
+            availability_file
+                .parent()
+                .expect("availability file has a parent directory"),
+        )
+        .expect("create availability parent directory");
+        let malformed = b"{ malformed availability";
+        std::fs::write(&availability_file, malformed).expect("write malformed availability");
+        let catalog_before = manager.registry.lock().await.clone();
+        let attachments_before = manager.attachments.lock().await.snapshot();
+
+        let error = manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect_err("malformed availability authority must block startup recovery");
+
+        assert!(format!("{error:#}").contains("failed to validate availability authority"));
+        assert_eq!(*manager.registry.lock().await, catalog_before);
+        assert_eq!(
+            manager.attachments.lock().await.snapshot(),
+            attachments_before
+        );
+        assert_eq!(
+            std::fs::read(availability_file).expect("read preserved malformed availability"),
+            malformed
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_published_replay_requires_the_catalog_target() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("catalog-phase-replay");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "catalog-phase").await;
+        let catalog_base = manager.registry.lock().await.clone();
+        let mut catalog_target = catalog_base.clone();
+        catalog_target
+            .instances
+            .get_mut(&instance_id)
+            .expect("catalogued replay instance")
+            .pinned = true;
+        let attachments = manager.attachments.lock().await.snapshot();
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            SystemTime::now(),
+            Some(
+                CatalogTransactionImages::new(catalog_base.clone(), catalog_target)
+                    .expect("prepare catalog replay images"),
+            ),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachments.clone(), attachments),
+        )
+        .expect("prepare catalog replay transaction");
+        let replay = journal_transaction_at_phase(
+            &manager,
+            &transaction,
+            LifecycleTransactionPhase::CatalogPublished,
+        )
+        .await;
+
+        let error = manager
+            .apply_lifecycle_transaction_locked(&replay)
+            .await
+            .expect_err("rolled-back catalog must block replay");
+
+        assert!(format!("{error:#}").contains("catalog target is not authoritative"));
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        assert_eq!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("reload blocked catalog journal")
+                .expect("blocked catalog journal remains")
+                .phase(),
+            LifecycleTransactionPhase::CatalogPublished
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_published_replay_requires_every_availability_target() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("availability-phase-replay");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "availability-phase").await;
+        let catalog = manager.registry.lock().await.clone();
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load replay availability");
+        let prepared = availability
+            .prepare_batch(
+                &AvailabilityBatch::new(SystemTime::now())
+                    .with_operation(AvailabilityBatchOperation::Initialize),
+            )
+            .await
+            .expect("prepare availability replay target");
+        let attachments = manager.attachments.lock().await.snapshot();
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            prepared.batch().effective_at(),
+            Some(
+                CatalogTransactionImages::new(catalog.clone(), catalog)
+                    .expect("prepare stable catalog images"),
+            ),
+            vec![prepared],
+            AttachmentTransactionImages::new(attachments.clone(), attachments),
+        )
+        .expect("prepare availability replay transaction");
+        let replay = journal_transaction_at_phase(
+            &manager,
+            &transaction,
+            LifecycleTransactionPhase::AvailabilityPublished,
+        )
+        .await;
+
+        let error = manager
+            .apply_lifecycle_transaction_locked(&replay)
+            .await
+            .expect_err("rolled-back availability must block replay");
+
+        assert!(format!("{error:#}").contains("availability for"));
+        assert!(!availability_path(&availability_data_dir, instance_id).exists());
+        assert_eq!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("reload blocked availability journal")
+                .expect("blocked availability journal remains")
+                .phase(),
+            LifecycleTransactionPhase::AvailabilityPublished
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_replay_requires_the_compatibility_target_before_clear() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("compatibility-phase-replay");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "compatibility-phase").await;
+        let catalog = manager.registry.lock().await.clone();
+        let attachment_base = manager.attachments.lock().await.snapshot();
+        let mut attachment_target = attachment_base.clone();
+        attachment_target.replace_project(
+            &project_path,
+            vec![Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            }],
+            false,
+        );
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            SystemTime::now(),
+            Some(
+                CatalogTransactionImages::new(catalog.clone(), catalog)
+                    .expect("prepare stable catalog images"),
+            ),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachment_base.clone(), attachment_target),
+        )
+        .expect("prepare compatibility replay transaction");
+        let replay = journal_transaction_at_phase(
+            &manager,
+            &transaction,
+            LifecycleTransactionPhase::Complete,
+        )
+        .await;
+
+        let error = manager
+            .apply_lifecycle_transaction_locked(&replay)
+            .await
+            .expect_err("rolled-back compatibility state must block journal clear");
+
+        assert!(format!("{error:#}").contains("compatibility target is not authoritative"));
+        assert_eq!(manager.attachments.lock().await.snapshot(), attachment_base);
+        assert_eq!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("reload blocked complete journal")
+                .expect("blocked complete journal remains")
+                .phase(),
+            LifecycleTransactionPhase::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn recreated_worktree_does_not_inherit_path_keyed_lifecycle_evidence() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
+        std::fs::write(
+            repository.join("locald.toml"),
+            r#"[project]
+name = "replacement"
+domain = "replacement.localhost"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write project config");
+        git(&repository, &["add", "README.md", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = dir.path().join("worktree");
+        let worktree_arg = worktree.to_str().expect("UTF-8 worktree path");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "first", worktree_arg],
+        );
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let first_instance = catalog
+            .register_project(
+                Registry::discover(
+                    std::fs::canonicalize(&worktree).expect("canonical first worktree"),
+                )
+                .await
+                .expect("discover first worktree"),
+                Some("first".to_owned()),
+            )
+            .expect("register first worktree");
+
+        git(&repository, &["worktree", "remove", worktree_arg]);
+        git(&repository, &["worktree", "prune"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "second", worktree_arg],
+        );
+        let canonical = std::fs::canonicalize(&worktree).expect("canonical replacement worktree");
+        let replacement_instance = catalog
+            .register_project(
+                Registry::discover(canonical.clone())
+                    .await
+                    .expect("discover replacement worktree"),
+                Some("replacement".to_owned()),
+            )
+            .expect("register replacement worktree");
+        assert_ne!(first_instance, replacement_instance);
+        catalog.save().await.expect("save replacement catalog");
+
+        let mut attachment_store = AttachmentStore::new(dir.path().join("attachments.json"));
+        attachment_store.replace_project(
+            &canonical,
+            vec![
+                Attachment {
+                    project_path: canonical.clone(),
+                    source: AttachmentSource::Runtime,
+                    created_at: SystemTime::now(),
+                },
+                Attachment {
+                    project_path: canonical.clone(),
+                    source: AttachmentSource::Pin,
+                    created_at: SystemTime::now(),
+                },
+                Attachment {
+                    project_path: canonical.clone(),
+                    source: AttachmentSource::CLI {
+                        pid: std::process::id(),
+                    },
+                    created_at: SystemTime::now(),
+                },
+            ],
+            true,
+        );
+        attachment_store.set_instance_owner(&canonical, first_instance);
+
+        let availability_data_dir = dir.path().join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(attachment_store)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create replacement manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let status = manager
+            .project_status(&canonical)
+            .await
+            .expect("inspect replacement before semantic activity");
+        assert_eq!(status.project_name.as_deref(), Some("replacement"));
+        assert!(status.attachments.is_empty());
+        assert!(!status.is_running);
+        let listed = manager
+            .project_list(None)
+            .await
+            .expect("list replacement before semantic activity");
+        let replacement_entry = listed
+            .iter()
+            .find(|entry| entry.project_path == canonical)
+            .expect("replacement project is listed");
+        assert!(replacement_entry.attachments.is_empty());
+        assert_eq!(replacement_entry.section, ProjectSection::Recent);
+        assert!(!replacement_entry.is_running);
+
+        manager
+            .project_force_start(canonical.clone())
+            .await
+            .expect("start replacement instance");
+
+        let mut replacement = AvailabilityStore::load(&availability_data_dir, replacement_instance)
+            .await
+            .expect("load replacement availability");
+        let snapshot = replacement
+            .snapshot()
+            .await
+            .expect("read replacement availability");
+        assert!(!snapshot.always_on());
+        assert!(!snapshot.is_paused());
+        assert_eq!(snapshot.demands().len(), 1);
+        assert_eq!(
+            snapshot.demands()[0].key().kind(),
+            locald_core::DemandKind::ManualCli
+        );
+        let attachments = manager.attachments.lock().await;
+        assert!(attachments.attachments_for(&canonical).is_empty());
+        assert!(!attachments.is_stopped(&canonical));
+        assert_eq!(attachments.snapshot().instance_owner(&canonical), None);
+    }
+
+    #[tokio::test]
+    async fn initial_config_publication_rejects_a_recreated_worktree() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("publication-race-repository");
+        std::fs::create_dir(&repository).expect("create publication race repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n")
+            .expect("write publication race fixture");
+        write_availability_worker_config(
+            &repository,
+            "publication-race",
+            "publication-race.localhost",
+            &["web"],
+        );
+        git(&repository, &["add", "README.md", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = dir.path().join("publication-race-worktree");
+        let worktree_arg = worktree.to_str().expect("UTF-8 worktree path");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "first", worktree_arg],
+        );
+        let initial_discovery =
+            Registry::discover(std::fs::canonicalize(&worktree).expect("canonical first worktree"))
+                .await
+                .expect("discover first worktree");
+        let initial_instance = match initial_discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.identity.project_instance_id,
+            ProjectDiscovery::NonGit { .. } => panic!("linked worktree must have Git identity"),
+        };
+
+        let catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            dir.path().join("availability-data"),
+        )
+        .expect("create publication race manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        let domain_index_before = manager.domain_index().snapshot();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_config_publication_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let worktree = worktree.clone();
+            async move { manager.start(worktree, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("initial config reaches the publication boundary");
+
+        git(&repository, &["worktree", "remove", worktree_arg]);
+        git(&repository, &["worktree", "prune"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "second", worktree_arg],
+        );
+        let replacement_discovery = Registry::discover(
+            std::fs::canonicalize(&worktree).expect("canonical replacement worktree"),
+        )
+        .await
+        .expect("discover replacement worktree");
+        let replacement_instance = match replacement_discovery {
+            ProjectDiscovery::Git { resolved, .. } => resolved.identity.project_instance_id,
+            ProjectDiscovery::NonGit { .. } => panic!("replacement must have Git identity"),
+        };
+        assert_ne!(replacement_instance, initial_instance);
+        resume.notify_one();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), start)
+            .await
+            .expect("initial config publication returns promptly")
+            .expect("initial config task joins")
+            .expect_err("recreated worktree must supersede initial config publication");
+        assert!(format!("{error:#}").contains("identity changed while loading configuration"));
+        let catalog = manager.registry.lock().await;
+        assert!(catalog.instances.is_empty());
+        drop(catalog);
+        assert!(manager.services.lock().await.is_empty());
+        assert_eq!(manager.domain_index().snapshot(), domain_index_before);
+    }
+
+    #[tokio::test]
+    async fn pending_initial_availability_defers_reload_and_start_authorization() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("pending-initial-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "pending-initial").await;
+        write_availability_worker_config(
+            &project_path,
+            "pending-initial",
+            "pending-initial.localhost",
+            &["web"],
+        );
+        manager
+            .pending_initial_availability
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(instance_id);
+
+        assert_eq!(
+            manager
+                .availability_management_state(instance_id)
+                .await
+                .expect("classify pending initial availability"),
+            AvailabilityManagementState::PendingInitial
+        );
+        let error = manager
+            .availability_authorizes_start(instance_id)
+            .await
+            .expect_err("pending initial availability cannot authorize start");
+        assert!(format!("{error:#}").contains("awaiting its initial availability publication"));
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("pending watcher reload is deferred");
+        assert!(manager.services.lock().await.is_empty());
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load pending initial availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("publish initial availability");
+        assert_eq!(
+            manager
+                .availability_management_state(instance_id)
+                .await
+                .expect("classify published initial availability"),
+            AvailabilityManagementState::Managed
+        );
+        manager
+            .availability_authorizes_start(instance_id)
+            .await
+            .expect("published demand authorizes start even before pending guard drops");
+    }
+
+    #[tokio::test]
+    async fn initial_config_publication_journals_catalog_with_idle_availability() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("initial-registration-project");
+        std::fs::create_dir_all(&project_path).expect("create initial project");
+        write_availability_worker_config(
+            &project_path,
+            "initial-registration",
+            "initial-registration.localhost",
+            &["web"],
+        );
+        let availability_data_dir = dir.path().join("availability-data");
+        let catalog_path = dir.path().join("catalog.json");
+        let attachments_path = dir.path().join("attachments.json");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(catalog_path.clone()))),
+            Arc::new(Mutex::new(AttachmentStore::new(attachments_path.clone()))),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create initial registration manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("seed completed migration authority");
+
+        let (instance_id, pending) = manager
+            .start_runtime(
+                project_path.clone(),
+                None,
+                false,
+                ConfigPhysicalIdentity::NonGit,
+            )
+            .await
+            .expect("publish initial config without its caller demand");
+
+        assert!(catalog_path.exists());
+        assert!(availability_path(&availability_data_dir, instance_id).exists());
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect completed initial journal")
+                .is_none()
+        );
+        drop(pending);
+
+        let catalog = Registry::load_from_paths_for_lifecycle_recovery(
+            locald_core::CatalogPaths::for_data_dir(dir.path()),
+            false,
+        )
+        .await
+        .expect("reload exact initial catalog");
+        let mut attachments = AttachmentStore::new(attachments_path);
+        attachments
+            .load_exact()
+            .await
+            .expect("reload exact initial compatibility state");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(attachments)),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create fresh initial registration manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        fresh
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("recover crash boundary between registration and first demand");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load recovered idle availability");
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read recovered idle availability");
+        assert!(snapshot.demands().is_empty());
+        assert!(!snapshot.always_on());
+        assert!(!snapshot.is_paused());
+        assert_eq!(snapshot.trusted_launch_path(), None);
+        assert!(!snapshot.desired_up_at(SystemTime::now()));
+    }
+
+    #[tokio::test]
+    async fn completed_migration_fails_closed_when_catalogued_availability_is_missing() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("missing-v2-availability-project");
+        let (manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "missing-v2-availability").await;
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("publish completed migration marker");
+        let catalog_before = manager.registry.lock().await.clone();
+        let attachments_before = manager.attachments.lock().await.snapshot();
+
+        let recovery_error = manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect_err("startup cannot reconstruct missing v2 authority from mirrors");
+        assert!(
+            format!("{recovery_error:#}")
+                .contains("missing availability state after lifecycle-v2 migration")
+        );
+        assert!(format!("{recovery_error:#}").contains(&instance_id.to_string()));
+        assert_eq!(*manager.registry.lock().await, catalog_before);
+        assert_eq!(
+            manager.attachments.lock().await.snapshot(),
+            attachments_before
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compatibility_mutation_cannot_reconstruct_missing_post_migration_authority() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("missing-compatibility-authority-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "missing-compatibility-authority")
+                .await;
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("publish completed migration marker");
+        let catalog_before = manager.registry.lock().await.clone();
+        let attachments_before = manager.attachments.lock().await.snapshot();
+
+        let error = manager
+            .project_force_start(project_path)
+            .await
+            .expect_err("legacy start cannot synthesize missing v2 authority");
+        let message = format!("{error:#}");
+        assert!(message.contains("missing availability state after lifecycle-v2 migration"));
+        assert!(message.contains(&instance_id.to_string()));
+        assert_eq!(*manager.registry.lock().await, catalog_before);
+        assert_eq!(
+            manager.attachments.lock().await.snapshot(),
+            attachments_before
+        );
+        assert!(!availability_path(&availability_data_dir, instance_id).exists());
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect lifecycle journal after rejected mutation")
+                .is_none()
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn registry_list_preserves_saved_entries_when_git_discovery_fails() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("registry-list-repository");
+        std::fs::create_dir(&repository).expect("create registry-list repository");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n")
+            .expect("write registry-list fixture");
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-m", "initial"]);
+
+        let worktree = dir.path().join("registry-list-worktree");
+        let worktree_arg = worktree
+            .to_str()
+            .expect("UTF-8 registry-list worktree path");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "registry-list", worktree_arg],
+        );
+        let worktree = std::fs::canonicalize(worktree).expect("canonical registry-list worktree");
+        let healthy = dir.path().join("healthy-project");
+        std::fs::create_dir(&healthy).expect("create healthy project");
+        let healthy = std::fs::canonicalize(healthy).expect("canonical healthy project");
+
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        let broken_instance = catalog
+            .register_project(
+                Registry::discover(worktree.clone())
+                    .await
+                    .expect("discover registry-list worktree"),
+                Some("saved-worktree".to_owned()),
+            )
+            .expect("register registry-list worktree");
+        assert!(catalog.pin_project(&worktree));
+        catalog
+            .register_project(
+                Registry::discover(healthy.clone())
+                    .await
+                    .expect("discover healthy project"),
+                Some("healthy".to_owned()),
+            )
+            .expect("register healthy project");
+        catalog.save().await.expect("persist registry-list catalog");
+        let saved_entries = catalog.project_entries();
+        let saved_worktree = saved_entries
+            .iter()
+            .find(|entry| entry.path == worktree)
+            .expect("saved worktree entry")
+            .clone();
+
+        let registry = Arc::new(Mutex::new(catalog));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create registry-list manager");
+        let catalog_before = registry.lock().await.clone();
+
+        let git_locator = std::fs::read_to_string(worktree.join(".git"))
+            .expect("read linked-worktree Git locator");
+        let git_admin = PathBuf::from(
+            git_locator
+                .trim()
+                .strip_prefix("gitdir: ")
+                .expect("linked-worktree locator prefix"),
+        );
+        std::fs::rename(&git_admin, git_admin.with_extension("unavailable"))
+            .expect("make linked-worktree Git metadata unavailable");
+        let discovery_error = Registry::discover(worktree.clone())
+            .await
+            .expect_err("broken linked worktree discovery fails");
+        assert!(format!("{discovery_error:#}").contains("git worktree repair"));
+
+        let listed = manager
+            .registry_list()
+            .await
+            .expect("list retains saved entries when one discovery fails");
+        assert!(listed.contains(&saved_worktree));
+        let listed_healthy = listed
+            .iter()
+            .find(|entry| entry.path == healthy)
+            .expect("healthy sibling remains visible");
+        assert_eq!(listed_healthy.name.as_deref(), Some("healthy"));
+        assert!(!listed_healthy.pinned);
+        assert_eq!(*registry.lock().await, catalog_before);
+        assert!(
+            registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&broken_instance)
+        );
+
+        let status = manager
+            .project_status(&worktree)
+            .await
+            .expect("status retains saved identity when discovery fails");
+        assert_eq!(status.project_path, worktree);
+        assert_eq!(status.project_name.as_deref(), Some("saved-worktree"));
+        assert!(!status.is_running);
+
+        let projects = manager
+            .project_list(Some(ProjectFilter::All))
+            .await
+            .expect("project list retains all saved entries when discovery fails");
+        let listed_worktree = projects
+            .iter()
+            .find(|entry| entry.project_path == worktree)
+            .expect("broken saved worktree remains in project list");
+        assert_eq!(
+            listed_worktree.project_name.as_deref(),
+            Some("saved-worktree")
+        );
+        assert_eq!(listed_worktree.section, ProjectSection::AlwaysOn);
+        assert!(
+            projects.iter().any(|entry| entry.project_path == healthy),
+            "healthy sibling remains in the project list"
+        );
+
+        let mutation_error = manager
+            .registry_unpin(&worktree)
+            .await
+            .expect_err("lifecycle mutation remains fail-closed");
+        assert!(format!("{mutation_error:#}").contains("git worktree repair"));
+    }
+
+    #[tokio::test]
+    async fn unregistered_replacement_cannot_observe_or_mutate_historical_instance() {
+        let dir = tempdir().expect("create temporary directory");
+        let fixture = unregistered_replacement_fixture(dir.path()).await;
+        let manager = &fixture.manager;
+        let canonical =
+            std::fs::canonicalize(&fixture.worktree).expect("canonical replacement path");
+        let catalog_path = dir.path().join("catalog.json");
+        let attachments_path = dir.path().join("attachments.json");
+        let state_path = dir.path().join("state.json");
+        let historical_availability_path =
+            availability_path(&fixture.availability_data_dir, fixture.historical_instance);
+        let catalog_before = manager.registry.lock().await.clone();
+        let catalog_bytes_before = std::fs::read(&catalog_path).expect("read catalog baseline");
+        let attachments_before = manager.attachments.lock().await.snapshot();
+        let attachment_bytes_before =
+            std::fs::read(&attachments_path).expect("read attachment baseline");
+        let mut historical_availability =
+            AvailabilityStore::load(&fixture.availability_data_dir, fixture.historical_instance)
+                .await
+                .expect("reload historical availability baseline");
+        let availability_before = historical_availability
+            .snapshot()
+            .await
+            .expect("snapshot historical availability baseline");
+        let availability_bytes_before = std::fs::read(&historical_availability_path)
+            .expect("read historical availability baseline");
+        let state_bytes_before = std::fs::read(&state_path).expect("read runtime baseline");
+        let domains_before = manager.domain_index.snapshot();
+        let historical_controller = manager
+            .get_service_controller("historical:web")
+            .await
+            .expect("historical controller exists");
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect lifecycle journal baseline")
+                .is_none()
+        );
+
+        let status = manager
+            .project_status(&canonical)
+            .await
+            .expect("inspect unregistered replacement");
+        assert!(status.project_name.is_none());
+        assert!(status.attachments.is_empty());
+        assert!(!status.is_running);
+        assert!(status.services.is_empty());
+        assert!(status.service_details.is_empty());
+
+        let listed = manager
+            .project_list(Some(ProjectFilter::All))
+            .await
+            .expect("list unregistered replacement");
+        let replacement_entry = listed
+            .iter()
+            .find(|entry| entry.project_path == canonical)
+            .expect("sanitized replacement entry remains visible");
+        assert!(replacement_entry.project_name.is_none());
+        assert!(replacement_entry.attachments.is_empty());
+        assert!(!replacement_entry.is_running);
+        assert_eq!(replacement_entry.section, ProjectSection::Recent);
+        for filter in [ProjectFilter::Active, ProjectFilter::Pinned] {
+            assert!(
+                manager
+                    .project_list(Some(filter))
+                    .await
+                    .expect("filter unregistered replacement")
+                    .iter()
+                    .all(|entry| entry.project_path != canonical)
+            );
+        }
+
+        let registered = manager
+            .registry_list()
+            .await
+            .expect("list compatibility registry");
+        let replacement_registry_entry = registered
+            .iter()
+            .find(|entry| entry.path == canonical)
+            .expect("sanitized compatibility registry entry remains visible");
+        assert!(replacement_registry_entry.name.is_none());
+        assert!(!replacement_registry_entry.pinned);
+
+        manager
+            .reconcile_legacy_attachment_project(canonical.clone())
+            .await
+            .expect("background attachment reconciliation is observational");
+        manager
+            .reload_config(canonical.clone())
+            .await
+            .expect("background config reload is observational");
+
+        let assert_unregistered = |error: anyhow::Error| {
+            let message = format!("{error:#}");
+            assert!(message.contains(&fixture.replacement_instance.to_string()));
+            assert!(message.contains("locald up"));
+        };
+        assert_unregistered(
+            manager
+                .project_detach(canonical.clone(), None)
+                .await
+                .expect_err("detach must reject an unregistered replacement"),
+        );
+        assert_unregistered(
+            manager
+                .project_force_stop(canonical.clone())
+                .await
+                .expect_err("stop must reject an unregistered replacement"),
+        );
+        assert_unregistered(
+            manager
+                .registry_pin(&canonical)
+                .await
+                .expect_err("pin must reject an unregistered replacement"),
+        );
+        assert_unregistered(
+            manager
+                .registry_unpin(&canonical)
+                .await
+                .expect_err("unpin must reject an unregistered replacement"),
+        );
+        assert_unregistered(
+            manager
+                .remove_project(&canonical)
+                .await
+                .expect_err("remove must reject an unregistered replacement"),
+        );
+
+        assert_eq!(*manager.registry.lock().await, catalog_before);
+        assert_eq!(
+            std::fs::read(&catalog_path).expect("read preserved catalog"),
+            catalog_bytes_before
+        );
+        assert_eq!(
+            manager.attachments.lock().await.snapshot(),
+            attachments_before
+        );
+        assert_eq!(
+            std::fs::read(&attachments_path).expect("read preserved attachments"),
+            attachment_bytes_before
+        );
+        let mut historical_availability =
+            AvailabilityStore::load(&fixture.availability_data_dir, fixture.historical_instance)
+                .await
+                .expect("reload preserved historical availability");
+        assert_eq!(
+            historical_availability
+                .snapshot()
+                .await
+                .expect("snapshot preserved historical availability"),
+            availability_before
+        );
+        assert_eq!(
+            std::fs::read(&historical_availability_path)
+                .expect("read preserved historical availability"),
+            availability_bytes_before
+        );
+        assert_eq!(
+            std::fs::read(&state_path).expect("read preserved runtime state"),
+            state_bytes_before
+        );
+        assert_eq!(manager.domain_index.snapshot(), domains_before);
+        let current_controller = manager
+            .get_service_controller("historical:web")
+            .await
+            .expect("historical controller remains installed");
+        assert!(Arc::ptr_eq(&historical_controller, &current_controller));
+        assert!(
+            fixture
+                .host_calls
+                .lock()
+                .expect("host sync calls mutex poisoned")
+                .is_empty()
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect preserved lifecycle journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&fixture.replacement_instance)
+        );
+    }
+
+    #[tokio::test]
+    async fn unmanaged_background_reload_cannot_register_a_physical_replacement() {
+        let dir = tempdir().expect("create temporary directory");
+        let fixture = unregistered_replacement_fixture(dir.path()).await;
+        let historical_availability_path =
+            availability_path(&fixture.availability_data_dir, fixture.historical_instance);
+        std::fs::remove_file(historical_availability_path)
+            .expect("make historical instance use the unmanaged reload path");
+        let catalog_before = fixture.manager.registry.lock().await.clone();
+        let historical_controller = fixture
+            .manager
+            .get_service_controller("historical:web")
+            .await
+            .expect("historical controller exists");
+
+        let error = fixture
+            .manager
+            .reload_catalogued_instance(fixture.historical_instance, fixture.worktree.clone())
+            .await
+            .expect_err("background reload must retain the established instance identity");
+
+        assert!(format!("{error:#}").contains("project identity changed"));
+        assert_eq!(*fixture.manager.registry.lock().await, catalog_before);
+        assert!(
+            !fixture
+                .manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&fixture.replacement_instance)
+        );
+        let current_controller = fixture
+            .manager
+            .get_service_controller("historical:web")
+            .await
+            .expect("historical controller remains installed");
+        assert!(Arc::ptr_eq(&historical_controller, &current_controller));
+    }
+
+    #[tokio::test]
+    async fn missing_reused_path_still_retires_the_unique_historical_instance() {
+        let dir = tempdir().expect("create temporary directory");
+        let fixture = unregistered_replacement_fixture(dir.path()).await;
+        let canonical_worktree =
+            std::fs::canonicalize(&fixture.worktree).expect("canonical replacement worktree path");
+        let worktree_arg = fixture
+            .worktree
+            .to_str()
+            .expect("UTF-8 replacement worktree path");
+        git(&fixture.repository, &["worktree", "remove", worktree_arg]);
+        git(&fixture.repository, &["worktree", "prune"]);
+        let historical_availability_path =
+            availability_path(&fixture.availability_data_dir, fixture.historical_instance);
+        assert!(historical_availability_path.exists());
+
+        fixture
+            .manager
+            .remove_project(&canonical_worktree)
+            .await
+            .expect("remove the unique missing historical instance");
+
+        let registry = fixture.manager.registry.lock().await;
+        assert!(
+            !registry
+                .instances
+                .contains_key(&fixture.historical_instance)
+        );
+        assert!(
+            !registry
+                .instances
+                .contains_key(&fixture.replacement_instance)
+        );
+        drop(registry);
+        assert!(!historical_availability_path.exists());
+        let attachments = fixture.manager.attachments.lock().await.snapshot();
+        assert!(
+            attachments
+                .project(&canonical_worktree)
+                .attachments
+                .is_empty()
+        );
+        assert_eq!(attachments.instance_owner(&canonical_worktree), None);
+        assert!(
+            fixture
+                .manager
+                .get_service_controller("historical:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            fixture
+                .manager
+                .state_manager
+                .load()
+                .await
+                .expect("load retired runtime state")
+                .services
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .manager
+                .domain_index
+                .snapshot()
+                .domains_for_instance(fixture.historical_instance)
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .host_calls
+                .lock()
+                .expect("host sync calls mutex poisoned")
+                .last(),
+            Some(&expected_hosts(&[]))
+        );
+        assert!(
+            fixture
+                .manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect completed lifecycle journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_pauses_desired_instance_without_runtime_projection() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("stop-all-policy-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "stop-all-policy").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load stop-all availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable policy without runtime");
+        assert!(manager.services.lock().await.is_empty());
+
+        manager.stop_all().await.expect("stop all projects");
+
+        let snapshot = availability.snapshot().await.expect("read stop-all result");
+        assert!(snapshot.always_on());
+        assert!(snapshot.is_paused());
+        assert!(manager.attachments.lock().await.is_stopped(&project_path));
+    }
+
+    #[tokio::test]
+    async fn registry_pin_projects_always_on_without_pin_attachment() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("registry-pin-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "registry-pin").await;
+        write_availability_worker_config(
+            &project_path,
+            "registry-pin",
+            "registry-pin.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .registry_pin(&project_path)
+            .await
+            .expect("pin project");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load pin availability");
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("read pin policy")
+                .always_on()
+        );
+        let attachments = manager.attachments.lock().await;
+        assert!(
+            !attachments
+                .attachments_for(&project_path)
+                .iter()
+                .any(|attachment| matches!(&attachment.source, AttachmentSource::Pin))
+        );
+        drop(attachments);
+        let entry = manager
+            .project_list(None)
+            .await
+            .expect("list pinned project")
+            .into_iter()
+            .find(|entry| entry.project_path == ProcessManager::canonicalize_path(&project_path))
+            .expect("pinned project entry");
+        assert_eq!(entry.section, ProjectSection::AlwaysOn);
+    }
+
+    #[tokio::test]
+    async fn legacy_pin_attachment_maps_owner_only_pause_to_always_on_policy() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-pin-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-pin").await;
+        write_availability_worker_config(
+            &project_path,
+            "legacy-pin",
+            "legacy-pin.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("seed completed migration authority");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load legacy pin availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed demand before pause");
+        availability
+            .pause_project()
+            .await
+            .expect("seed paused policy");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(&project_path, Vec::new(), true);
+            attachments.set_instance_owner(&project_path, instance_id);
+        }
+
+        manager
+            .project_attach(project_path.clone(), AttachmentSource::Pin)
+            .await
+            .expect("legacy Pin attach enables Always On");
+
+        let enabled = availability
+            .snapshot()
+            .await
+            .expect("read enabled Always On policy");
+        assert!(enabled.always_on());
+        assert!(!enabled.is_paused());
+        let compatibility = manager.attachments.lock().await.snapshot();
+        assert!(!compatibility.project(&project_path).manually_stopped);
+        assert_eq!(compatibility.instance_owner(&project_path), None);
+        assert!(compatibility.project(&project_path).attachments.is_empty());
+
+        manager
+            .project_detach(project_path.clone(), Some(AttachmentSource::Pin))
+            .await
+            .expect("legacy Pin detach disables Always On");
+
+        assert!(
+            !availability
+                .snapshot()
+                .await
+                .expect("read disabled Always On policy")
+                .always_on()
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .expect("catalogued legacy Pin project")
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_project_retires_authoritative_availability() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("retire-availability-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retire-availability").await;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load removable availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("persist removable availability");
+
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove project transactionally");
+
+        assert!(
+            !tokio::fs::try_exists(availability_path(&availability_data_dir, instance_id,))
+                .await
+                .expect("inspect retired availability")
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&instance_id)
+        );
     }
 
     #[tokio::test]
@@ -5715,10 +12245,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn availability_convergence_managed_start_cannot_bypass_pause() {
+    async fn legacy_start_resumes_a_paused_managed_project() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("start-paused-project");
-        let (manager, instance_id, availability_data_dir) =
+        let (mut manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "start-paused").await;
         std::fs::write(
             project_path.join("locald.toml"),
@@ -5733,6 +12263,13 @@ command = "sleep 30"
 "#,
         )
         .expect("write paused project config");
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load project availability");
@@ -5741,13 +12278,35 @@ command = "sleep 30"
             .await
             .expect("acquire manual demand");
         availability.pause_project().await.expect("pause project");
+        let paused_generation = availability
+            .snapshot()
+            .await
+            .expect("load paused availability")
+            .activity_generation();
 
         manager
             .start(project_path.clone(), None, false)
             .await
-            .expect("paused start converges down");
+            .expect("legacy Start resumes paused availability");
 
-        assert!(manager.services.lock().await.is_empty());
+        let resumed = availability
+            .snapshot()
+            .await
+            .expect("load resumed availability");
+        assert_eq!(resumed.activity_generation(), paused_generation + 1);
+        assert!(!resumed.is_paused());
+        assert!(
+            resumed
+                .demands()
+                .iter()
+                .any(|demand| { demand.key().kind() == locald_core::DemandKind::ManualCli })
+        );
+        assert!(
+            manager
+                .get_service_controller("start-paused:web")
+                .await
+                .is_some()
+        );
         assert!(
             manager
                 .watchers
@@ -5760,8 +12319,926 @@ command = "sleep 30"
                 .domain_index()
                 .snapshot()
                 .resolve("start-paused.localhost")
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed project");
+    }
+
+    #[tokio::test]
+    async fn named_service_stop_survives_automatic_project_convergence() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "service-stop").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "service-stop",
+            "service-stop.localhost",
+            &["web", "worker"],
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded two-service project");
+        let sibling = manager
+            .get_service_controller("service-stop:worker")
+            .await
+            .expect("running sibling service");
+
+        manager
+            .stop("service-stop:web")
+            .await
+            .expect("stop only the selected service");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
                 .is_none()
         );
+
+        manager.converge_all_project_availability().await;
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_none(),
+            "automatic convergence must respect the one-off service stop"
+        );
+        assert!(Arc::ptr_eq(
+            &sibling,
+            &manager
+                .get_service_controller("service-stop:worker")
+                .await
+                .expect("sibling remains running")
+        ));
+        let mut service_events = manager.event_sender.subscribe();
+
+        let reloaded_config_source = r#"
+[project]
+name = "service-stop"
+domain = "service-stop-reloaded.localhost"
+
+[services.web]
+type = "worker"
+command = "updated-but-still-stopped"
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+"#;
+        let reloaded_config: LocaldConfig =
+            toml::from_str(reloaded_config_source).expect("parse reloaded stopped-service config");
+        std::fs::write(project_path.join("locald.toml"), reloaded_config_source)
+            .expect("write reloaded stopped-service config");
+
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("passive config reload preserves service stop intent");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_none(),
+            "watcher reload must not reactivate an explicitly stopped service"
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "service-stop:web".to_owned()))
+        );
+        {
+            let services = manager.services.lock().await;
+            let stopped = services
+                .get("service-stop:web")
+                .expect("stopped service projection remains available");
+            assert!(matches!(&stopped.runtime_state, ServiceRuntime::None));
+            assert_eq!(stopped.config, reloaded_config);
+            assert_eq!(stopped.service_config, reloaded_config.services["web"]);
+        }
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("service-stop-reloaded.localhost")
+                .is_some()
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("service-stop.localhost")
+                .is_none()
+        );
+        let event = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, service_events.recv())
+            .await
+            .expect("stopped projection update is broadcast")
+            .expect("stopped projection event channel remains open");
+        let Event::ServiceUpdate(status) = event else {
+            panic!("stopped projection publishes a service update");
+        };
+        assert_eq!(status.name, "service-stop:web");
+        assert_eq!(status.status, ServiceState::Stopped);
+        assert_eq!(
+            status.domain.as_deref(),
+            Some("service-stop-reloaded.localhost")
+        );
+        assert!(Arc::ptr_eq(
+            &sibling,
+            &manager
+                .get_service_controller("service-stop:worker")
+                .await
+                .expect("sibling remains running after watcher reload")
+        ));
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("explicit project start clears service stop suppression");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "service-stop:web".to_owned()))
+        );
+
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_stop = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut services = manager.services.lock().await;
+            let service = services
+                .get_mut("service-stop:web")
+                .expect("replace running web controller");
+            service.runtime_state = ServiceRuntime::Controller(Arc::new(Mutex::new(
+                BlockingSuccessfulStopController {
+                    id: "service-stop:web".to_owned(),
+                    state: RuntimeState {
+                        pid: Some(42),
+                        port: None,
+                        status: ServiceState::Running,
+                        health_status: HealthStatus::Healthy,
+                    },
+                    stop_entered: stop_entered.clone(),
+                    release_stop: release_stop.clone(),
+                },
+            )));
+            service.health_status = HealthStatus::Healthy;
+        }
+
+        let stop_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.stop("service-stop:web").await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, stop_entered.notified())
+            .await
+            .expect("service stop enters its controller");
+        let start_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !start_task.is_finished(),
+            "later explicit start waits for the in-flight service stop"
+        );
+
+        release_stop.notify_one();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, stop_task)
+            .await
+            .expect("service stop completes")
+            .expect("service stop task joins")
+            .expect("service stop succeeds");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_task)
+            .await
+            .expect("explicit start completes")
+            .expect("explicit start task joins")
+            .expect("later explicit start succeeds");
+        assert!(
+            manager
+                .get_service_controller("service-stop:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "service-stop:web".to_owned()))
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up service-stop project");
+    }
+
+    #[tokio::test]
+    async fn removed_service_retires_its_stop_override_after_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("removed-service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "removed-service-stop").await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "removed-service-stop",
+            "removed-service-stop.localhost",
+            &["web", "worker"],
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start two-service project");
+        manager
+            .stop("removed-service-stop:web")
+            .await
+            .expect("stop service before removing it");
+        manager
+            .stop("removed-service-stop:worker")
+            .await
+            .expect("stop sibling independently");
+
+        write_availability_worker_config(
+            &project_path,
+            "removed-service-stop",
+            "removed-service-stop.localhost",
+            &["worker"],
+        );
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("publish stopped service removal");
+        {
+            let suppressions = manager.service_stop_suppressions.lock().await;
+            assert!(!suppressions.contains(&(instance_id, "removed-service-stop:web".to_owned())));
+            assert!(
+                suppressions.contains(&(instance_id, "removed-service-stop:worker".to_owned()))
+            );
+        }
+        assert!(
+            manager
+                .services
+                .lock()
+                .await
+                .get("removed-service-stop:web")
+                .is_none()
+        );
+
+        write_availability_worker_config(
+            &project_path,
+            "removed-service-stop",
+            "removed-service-stop.localhost",
+            &["web", "worker"],
+        );
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("re-add service after its retired stop override");
+        assert!(
+            manager
+                .get_service_controller("removed-service-stop:web")
+                .await
+                .is_some(),
+            "a re-added service starts under the project's live demand"
+        );
+        assert!(
+            manager
+                .get_service_controller("removed-service-stop:worker")
+                .await
+                .is_none(),
+            "an unrelated service stop remains in force"
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up removed-service-stop project");
+    }
+
+    #[tokio::test]
+    async fn service_start_route_resumes_only_the_selected_stopped_service() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("selective-service-start-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "selective-service-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "selective-service-start",
+            "selective-service-start.localhost",
+            &["web", "worker"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded two-service project");
+        manager
+            .stop("selective-service-start:web")
+            .await
+            .expect("stop selected web service");
+        manager
+            .stop("selective-service-start:worker")
+            .await
+            .expect("stop independent worker service");
+
+        let response = crate::api::router(manager.clone())
+            .oneshot(
+                Request::post("/services/selective-service-start:web/start")
+                    .body(Body::empty())
+                    .expect("build service-start request"),
+            )
+            .await
+            .expect("service-start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            manager
+                .get_service_controller("selective-service-start:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_service_controller("selective-service-start:worker")
+                .await
+                .is_none(),
+            "starting web must preserve worker's independent stop override"
+        );
+        let suppressions = manager.service_stop_suppressions.lock().await;
+        assert!(!suppressions.contains(&(instance_id, "selective-service-start:web".to_owned())));
+        assert!(suppressions.contains(&(instance_id, "selective-service-start:worker".to_owned())));
+        drop(suppressions);
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up selective service-start project");
+    }
+
+    #[tokio::test]
+    async fn service_start_route_semantically_resumes_a_paused_project() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("paused-service-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "paused-service-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "paused-service-start",
+            "paused-service-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded project");
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause project before service-start action");
+        assert!(
+            manager
+                .get_service_controller("paused-service-start:web")
+                .await
+                .is_none()
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load paused availability");
+        let paused_generation = availability
+            .snapshot()
+            .await
+            .expect("read paused availability")
+            .activity_generation();
+
+        let response = crate::api::router(manager.clone())
+            .oneshot(
+                Request::post("/services/paused-service-start:web/start")
+                    .body(Body::empty())
+                    .expect("build paused service-start request"),
+            )
+            .await
+            .expect("paused service-start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            manager
+                .get_service_controller("paused-service-start:web")
+                .await
+                .is_some()
+        );
+
+        let resumed = availability
+            .snapshot()
+            .await
+            .expect("read resumed availability");
+        assert!(!resumed.is_paused());
+        assert_eq!(resumed.activity_generation(), paused_generation + 1);
+        assert!(
+            resumed.demands().iter().any(|demand| {
+                demand.key().kind() == locald_core::DemandKind::StoppedPageResume
+            })
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed service-start project");
+    }
+
+    #[tokio::test]
+    async fn service_start_route_resumes_required_dependencies_only() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("dependency-service-start-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "dependency-service-start").await;
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "dependency-service-start"
+domain = "dependency-service-start.localhost"
+
+[services.db]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["api"]
+
+[services.api]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["db"]
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write dependency service-start config");
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start dependency project");
+        for service in ["web", "api", "db", "worker"] {
+            manager
+                .stop(&format!("dependency-service-start:{service}"))
+                .await
+                .expect("stop service before selective dependency start");
+        }
+
+        let response = crate::api::router(manager.clone())
+            .oneshot(
+                Request::post("/services/dependency-service-start:web/start")
+                    .body(Body::empty())
+                    .expect("build dependency service-start request"),
+            )
+            .await
+            .expect("dependency service-start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:db")
+                .await
+                .is_some(),
+            "a selected service must restore its dependency closure"
+        );
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:api")
+                .await
+                .is_some(),
+            "dependency activation must include transitive prerequisites"
+        );
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .get_service_controller("dependency-service-start:worker")
+                .await
+                .is_none(),
+            "an unrelated stopped service remains suppressed"
+        );
+        let suppressions = manager.service_stop_suppressions.lock().await;
+        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:db".to_owned())));
+        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:api".to_owned())));
+        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:web".to_owned())));
+        assert!(
+            suppressions.contains(&(instance_id, "dependency-service-start:worker".to_owned()))
+        );
+        drop(suppressions);
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up dependency service-start project");
+    }
+
+    #[tokio::test]
+    async fn later_project_pause_supersedes_service_start_at_config_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("pause-service-start-race-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "pause-service-start-race").await;
+        write_availability_worker_config(
+            &project_path,
+            "pause-service-start-race",
+            "pause-service-start-race.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start project before pause-vs-service-start race");
+        manager
+            .stop("pause-service-start-race:web")
+            .await
+            .expect("stop service before pause-vs-service-start race");
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_config_publication_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let start_task = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start_service("pause-service-start-race:web").await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, reached.notified())
+            .await
+            .expect("service start reaches config publication boundary");
+
+        let pause_task = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+                    .await
+                    .expect("load availability while waiting for pause publication");
+                if availability
+                    .snapshot()
+                    .await
+                    .expect("read availability while waiting for pause publication")
+                    .is_paused()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later pause publishes while service start is held");
+
+        resume.notify_one();
+        let start_error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_task)
+            .await
+            .expect("superseded service start returns")
+            .expect("service start task joins")
+            .expect_err("later pause supersedes service start");
+        assert!(start_error.is::<AvailabilityStartSuperseded>());
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, pause_task)
+            .await
+            .expect("pause convergence completes")
+            .expect("pause task joins")
+            .expect("pause succeeds");
+        assert!(
+            manager
+                .get_service_controller("pause-service-start-race:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "pause-service-start-race:web".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn new_attachment_resumes_a_service_stop_while_owner_renewal_preserves_it() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("attachment-service-stop-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "attachment-service-stop").await;
+        write_availability_worker_config(
+            &project_path,
+            "attachment-service-stop",
+            "attachment-service-stop.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let first_owner = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+
+        manager
+            .project_attach(project_path.clone(), first_owner.clone())
+            .await
+            .expect("attach first owner");
+        manager
+            .stop("attachment-service-stop:web")
+            .await
+            .expect("stop service under first owner");
+        manager
+            .project_attach(project_path.clone(), first_owner.clone())
+            .await
+            .expect("renew existing owner");
+        assert!(
+            manager
+                .get_service_controller("attachment-service-stop:web")
+                .await
+                .is_none(),
+            "passive owner renewal preserves the one-off service stop"
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "attachment-service-stop:web".to_owned()))
+        );
+
+        manager
+            .project_detach(project_path.clone(), Some(first_owner))
+            .await
+            .expect("detach first owner");
+        manager
+            .project_attach(
+                project_path.clone(),
+                AttachmentSource::Editor {
+                    name: "Code".to_owned(),
+                    id: "window-b".to_owned(),
+                    pid: None,
+                },
+            )
+            .await
+            .expect("new owner resumes automatic service management");
+        assert!(
+            manager
+                .get_service_controller("attachment-service-stop:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "attachment-service-stop:web".to_owned()))
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up attachment service-stop project");
+    }
+
+    #[tokio::test]
+    async fn explicit_availability_actions_resume_a_named_service_stop() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("availability-service-stop-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "availability-service-stop").await;
+        write_availability_worker_config(
+            &project_path,
+            "availability-service-stop",
+            "availability-service-stop.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start demanded project");
+
+        manager
+            .stop("availability-service-stop:web")
+            .await
+            .expect("stop service before explicit ensure");
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("explicit ensure resumes service management");
+        assert!(
+            manager
+                .get_service_controller("availability-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .stop("availability-service-stop:web")
+            .await
+            .expect("stop service before Always On activation");
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("Always On activation resumes service management");
+        assert!(
+            manager
+                .get_service_controller("availability-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_set_always_on(&project_path, false)
+            .await
+            .expect("disable direct Always On policy");
+        manager
+            .stop("availability-service-stop:web")
+            .await
+            .expect("stop service before compatibility pin");
+        manager
+            .registry_pin(&project_path)
+            .await
+            .expect("compatibility pin resumes service management");
+        assert!(
+            manager
+                .get_service_controller("availability-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up explicit availability project");
+    }
+
+    #[tokio::test]
+    async fn remove_clears_service_stop_before_stable_identity_reregistration() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("remove-service-stop-project");
+        std::fs::create_dir(&project_path).expect("create Git project");
+        git(&project_path, &["init", "-b", "main"]);
+        write_availability_worker_config(
+            &project_path,
+            "remove-service-stop",
+            "remove-service-stop.localhost",
+            &["web"],
+        );
+        let availability_data_dir = dir.path().join("availability-data");
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                dir.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create remove/re-register manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .start(project_path.clone(), None, false)
+            .await
+            .expect("start stable-identity project");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve stable project instance");
+        manager
+            .stop("remove-service-stop:web")
+            .await
+            .expect("stop named service before removal");
+        manager
+            .remove_project(&project_path)
+            .await
+            .expect("remove project");
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .iter()
+                .any(|(owner, _)| *owner == instance_id)
+        );
+
+        manager
+            .project_attach(
+                project_path.clone(),
+                AttachmentSource::Editor {
+                    name: "Code".to_owned(),
+                    id: "window-after-remove".to_owned(),
+                    pid: None,
+                },
+            )
+            .await
+            .expect("re-register removed project through a new owner");
+        let (reregistered, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve re-registered stable identity");
+        assert_eq!(reregistered, instance_id);
+        assert!(
+            manager
+                .get_service_controller("remove-service-stop:web")
+                .await
+                .is_some()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up re-registered project");
     }
 
     #[tokio::test]
@@ -5790,7 +13267,7 @@ command = "sleep 30"
         let start_manager = manager.clone();
         let start_path = project_path.clone();
         let start = tokio::spawn(async move { start_manager.start(start_path, None, false).await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, entered.notified())
             .await
             .expect("startup reaches blocking controller");
 
@@ -5813,6 +13290,515 @@ command = "sleep 30"
                 .get_service_controller("pause-race:web")
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_force_stop_publishes_pause_during_in_flight_start() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("force-stop-race-project");
+        let (mut manager, _instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "force-stop-race").await;
+        write_availability_worker_config(
+            &project_path,
+            "force-stop-race",
+            "force-stop-race.localhost",
+            &["web"],
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: entered.clone(),
+                release: None,
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("startup reaches blocking readiness");
+
+        let stop = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_force_stop(project_path).await }
+        });
+        let instance_id = manager
+            .availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve force-stop project")
+            .0;
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load force-stop availability");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if availability
+                    .snapshot()
+                    .await
+                    .expect("observe force-stop availability")
+                    .is_paused()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy force stop publishes pause promptly");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (start_result, stop_result) = tokio::join!(start, stop);
+            start_result
+                .expect("start task joins")
+                .expect("superseded start converges to stop");
+            stop_result
+                .expect("stop task joins")
+                .expect("legacy force stop converges");
+        })
+        .await
+        .expect("force stop cancels startup promptly");
+
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(manager.attachments.lock().await.is_stopped(&project_path));
+        assert!(
+            manager
+                .get_service_controller("force-stop-race:web")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_attach_renews_its_owner_during_prepare() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("attach-renew-prepare-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "attach-renew-prepare").await;
+        write_availability_worker_config(
+            &project_path,
+            "attach-renew-prepare",
+            "attach-renew-prepare.localhost",
+            &["web"],
+        );
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("derive editor demand")
+            .expect("editor owns an availability demand");
+        let original_attachment_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments.replace_project(
+                &project_path,
+                vec![Attachment {
+                    project_path: project_path.clone(),
+                    source: source.clone(),
+                    created_at: original_attachment_time,
+                }],
+                false,
+            );
+            attachments.set_instance_owner(&project_path, instance_id);
+            attachments
+                .save()
+                .await
+                .expect("persist original editor owner");
+        }
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load attach renewal availability");
+        availability
+            .ensure_demand(demand.clone())
+            .await
+            .expect("seed editor demand");
+        let original_expiry = availability
+            .snapshot()
+            .await
+            .expect("read original editor demand")
+            .demands()
+            .iter()
+            .find(|lease| lease.key() == &demand)
+            .and_then(locald_core::DemandLease::expires_at)
+            .expect("editor demand has an expiry");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_entered.notified(),
+        )
+        .await
+        .expect("editor-owned startup reaches blocking prepare");
+
+        let renewal = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            let source = source.clone();
+            async move { manager.project_attach(project_path, source).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let renewed_expiry = availability
+                    .snapshot()
+                    .await
+                    .expect("observe renewed editor demand")
+                    .demands()
+                    .iter()
+                    .find(|lease| lease.key() == &demand)
+                    .and_then(locald_core::DemandLease::expires_at);
+                let renewed_attachment = manager
+                    .attachments
+                    .lock()
+                    .await
+                    .attachments_for(&project_path)
+                    .iter()
+                    .find(|attachment| attachment.source == source)
+                    .map(|attachment| attachment.created_at);
+                if renewed_expiry.is_some_and(|expires_at| expires_at > original_expiry)
+                    && renewed_attachment
+                        .is_some_and(|created_at| created_at > original_attachment_time)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-owner attachment renewal publishes while prepare is blocked");
+        assert!(!renewal.is_finished());
+        release_prepare.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            convergence
+                .await
+                .expect("editor startup convergence task joins")
+                .expect("renewed editor owner authorizes startup");
+            renewal
+                .await
+                .expect("editor renewal task joins")
+                .expect("editor renewal converges");
+        })
+        .await
+        .expect("editor renewal and startup finish promptly");
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 0);
+        assert!(
+            manager
+                .get_service_controller("attach-renew-prepare:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn journaled_stop_and_direct_policy_change_share_one_publication_boundary() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("publication-boundary-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "publication-boundary").await;
+        manager.factories.insert(
+            0,
+            Arc::new(CountingStartFactory {
+                creates: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "publication-boundary",
+            "publication-boundary.localhost",
+            &["web"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load publication-boundary availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed manual demand");
+
+        let publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let stop = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_force_stop(project_path).await }
+        });
+        let policy = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_set_always_on(&project_path, true).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!stop.is_finished());
+        assert!(!policy.is_finished());
+        drop(publication_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            stop.await
+                .expect("stop task joins")
+                .expect("journaled stop publishes");
+            policy
+                .await
+                .expect("policy task joins")
+                .expect("direct policy publication succeeds");
+        })
+        .await
+        .expect("serialized lifecycle publications finish");
+
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read serialized availability");
+        assert!(snapshot.always_on());
+        assert_eq!(
+            snapshot.desired_up_at(SystemTime::now()),
+            !snapshot.is_paused(),
+            "the serialized winner determines whether Always On resumes or remains paused"
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect lifecycle journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .lifecycle_recovery_required
+                .load(AtomicOrdering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_always_on_disable_publishes_during_prepare() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("direct-unpin-prepare-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "direct-unpin-prepare").await;
+        write_availability_worker_config(
+            &project_path,
+            "direct-unpin-prepare",
+            "direct-unpin-prepare.localhost",
+            &["web"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load direct unpin availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed direct Always On policy");
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_entered.notified(),
+        )
+        .await
+        .expect("direct Always On startup reaches blocking prepare");
+
+        let disable = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_set_always_on(&project_path, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !availability
+                    .snapshot()
+                    .await
+                    .expect("observe direct Always On policy")
+                    .always_on()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("direct Always On disable publishes while prepare is blocked");
+        assert!(!disable.is_finished());
+        release_prepare.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            convergence
+                .await
+                .expect("startup convergence task joins")
+                .expect("superseded startup convergence succeeds");
+            disable
+                .await
+                .expect("direct disable task joins")
+                .expect("direct Always On disable converges");
+        })
+        .await
+        .expect("direct disable and superseded startup finish promptly");
+        assert_eq!(start_count.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("direct-unpin-prepare:web")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_unpin_publishes_always_on_disable_during_prepare() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("registry-unpin-prepare-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "registry-unpin-prepare").await;
+        write_availability_worker_config(
+            &project_path,
+            "registry-unpin-prepare",
+            "registry-unpin-prepare.localhost",
+            &["web"],
+        );
+        {
+            let mut registry = manager.registry.lock().await;
+            assert!(registry.pin_project(&project_path));
+            registry.save().await.expect("persist seeded registry pin");
+        }
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load registry unpin availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed registry Always On policy");
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_entered.notified(),
+        )
+        .await
+        .expect("registry-pinned startup reaches blocking prepare");
+
+        let unpin = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.registry_unpin(&project_path).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !availability
+                    .snapshot()
+                    .await
+                    .expect("observe registry Always On policy")
+                    .always_on()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registry unpin publishes while prepare is blocked");
+        assert!(!unpin.is_finished());
+        release_prepare.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            convergence
+                .await
+                .expect("registry startup convergence task joins")
+                .expect("registry superseded startup convergence succeeds");
+            unpin
+                .await
+                .expect("registry unpin task joins")
+                .expect("registry unpin converges");
+        })
+        .await
+        .expect("registry unpin and superseded startup finish promptly");
+        assert_eq!(start_count.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("registry-unpin-prepare:web")
+                .await
+                .is_none()
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .expect("registry-unpinned project remains catalogued")
+                .pinned
         );
     }
 
@@ -5898,6 +13884,130 @@ command = "sleep 30"
     }
 
     #[tokio::test]
+    async fn legacy_detach_publishes_last_owner_release_during_prepare() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("detach-prepare-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "detach-prepare").await;
+        write_availability_worker_config(
+            &project_path,
+            "detach-prepare",
+            "detach-prepare.localhost",
+            &["web"],
+        );
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("derive editor demand")
+            .expect("editor has an availability demand");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments
+                .attach(Attachment {
+                    project_path: project_path.clone(),
+                    source: source.clone(),
+                    created_at: SystemTime::now(),
+                })
+                .expect("seed editor attachment");
+            attachments.set_instance_owner(&project_path, instance_id);
+            attachments.save().await.expect("persist editor attachment");
+        }
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load detach availability");
+        availability
+            .ensure_demand(demand)
+            .await
+            .expect("seed editor demand");
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_entered.notified(),
+        )
+        .await
+        .expect("convergence reaches blocking prepare");
+
+        let detach = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            let source = source.clone();
+            async move { manager.project_detach(project_path, Some(source)).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let detached = manager
+                    .attachments
+                    .lock()
+                    .await
+                    .attachments_for(&project_path)
+                    .is_empty();
+                let released = availability
+                    .snapshot()
+                    .await
+                    .expect("observe detached availability")
+                    .demands()
+                    .is_empty();
+                if detached && released {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detach publishes attachment and demand release promptly");
+        release_prepare.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            convergence
+                .await
+                .expect("convergence task joins")
+                .expect("released owner supersedes startup");
+            detach
+                .await
+                .expect("detach task joins")
+                .expect("detach converges released owner");
+        })
+        .await
+        .expect("detach and convergence finish promptly");
+
+        assert_eq!(start_count.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("load detach cooldown")
+                .shutdown_cooldown_until()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn started_service_ownership_is_durable_while_readiness_is_blocked() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("durable-start-project");
@@ -5925,7 +14035,7 @@ command = "sleep 30"
             let project_path = project_path.clone();
             async move { manager.start(project_path, None, false).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, entered.notified())
             .await
             .expect("service starts and enters its readiness wait");
 
@@ -6032,7 +14142,7 @@ command = "sleep 30"
             let project_path = project_path.clone();
             async move { manager.start(project_path, None, false).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), start_entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_entered.notified())
             .await
             .expect("service reaches the controlled spawn boundary");
         manager
@@ -6507,7 +14617,7 @@ command = "sleep 30"
             .await
             .expect("remove project before stale start");
         let error = manager
-            .start_catalogued_instance(instance_id, project_path, None, false)
+            .start_catalogued_instance(instance_id, project_path, None, false, None, None)
             .await
             .expect_err("captured start cannot restore removed identity");
 
@@ -8318,7 +16428,7 @@ command = "ignored"
     }
 
     #[tokio::test]
-    async fn stale_runtime_reconciliation_restores_catalogued_legacy_project() {
+    async fn stale_runtime_reconciliation_does_not_restore_without_availability_policy() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("legacy-restore-project");
         let (mut manager, _instance_id, _availability_data_dir) =
@@ -8365,7 +16475,7 @@ command = "ignored"
             manager
                 .get_service_controller("legacy-restore:web")
                 .await
-                .is_some()
+                .is_none()
         );
     }
 
@@ -8451,118 +16561,10 @@ command = "ignored"
     }
 
     #[tokio::test]
-    async fn failed_legacy_restore_evidence_survives_for_fresh_retry() {
-        let dir = tempdir().expect("create temporary directory");
-        let project_path = dir.path().join("legacy-retry-project");
-        let (mut manager, _instance_id, availability_data_dir) =
-            availability_manager(dir.path(), &project_path, "legacy-retry").await;
-        write_availability_worker_config(
-            &project_path,
-            "legacy-retry",
-            "legacy-retry.localhost",
-            &["first", "second"],
-        );
-        let failure_consumed = Arc::new(AtomicBool::new(false));
-        manager.factories.insert(
-            0,
-            Arc::new(RetryPrepareWithoutPidFactory {
-                failure_consumed: failure_consumed.clone(),
-                stop_count: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
-        manager
-            .state_manager
-            .save(&ServerState {
-                services: vec![PersistedServiceState {
-                    name: "legacy-retry:intent".to_owned(),
-                    config: test_config_with_domain("legacy-retry", "legacy-retry.localhost"),
-                    path: project_path.clone(),
-                    pid: None,
-                    process_identity: None,
-                    container_id: None,
-                    port: None,
-                    status: ServiceState::Running,
-                    health_status: HealthStatus::Healthy,
-                    health_source: HealthSource::None,
-                }],
-            })
-            .await
-            .expect("persist retryable legacy intent");
-
-        let restore_plan = manager
-            .reconcile_stale_runtime_state()
-            .await
-            .expect("reconcile retryable legacy intent");
-        manager.restore_policy_owned_projects(restore_plan).await;
-        assert!(failure_consumed.load(Ordering::SeqCst));
-        let failed_snapshot = manager
-            .state_manager
-            .load()
-            .await
-            .expect("reload failed legacy restore snapshot");
-        assert!(failed_snapshot.services.iter().any(|service| {
-            service.name == "legacy-retry:intent" && service.status == ServiceState::Running
-        }));
-
-        let catalog =
-            Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(dir.path()))
-                .await
-                .expect("reload retry catalog");
-        let mut fresh = ProcessManager::new_with_availability_data_dir(
-            dir.path().join("fresh-notify.sock"),
-            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
-            Arc::new(Mutex::new(catalog)),
-            Arc::new(Mutex::new(AttachmentStore::new(
-                dir.path().join("attachments.json"),
-            ))),
-            None,
-            availability_data_dir,
-        )
-        .expect("create fresh retry manager");
-        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
-        fresh.factories.insert(
-            0,
-            Arc::new(RetryPrepareWithoutPidFactory {
-                failure_consumed,
-                stop_count: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
-
-        let retry_plan = fresh
-            .reconcile_stale_runtime_state()
-            .await
-            .expect("reconcile preserved retry intent");
-        fresh.restore_policy_owned_projects(retry_plan).await;
-
-        assert!(
-            fresh
-                .get_service_controller("legacy-retry:first")
-                .await
-                .is_some()
-        );
-        assert!(
-            fresh
-                .get_service_controller("legacy-retry:second")
-                .await
-                .is_some()
-        );
-        assert!(
-            !fresh
-                .state_manager
-                .load()
-                .await
-                .expect("reload successful retry snapshot")
-                .services
-                .iter()
-                .any(|service| service.name == "legacy-retry:intent")
-        );
-    }
-
-    #[tokio::test]
-    async fn service_stop_reports_legacy_restore_that_has_not_materialized() {
+    async fn service_stop_ignores_runtime_snapshot_that_has_not_materialized() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("legacy-service-stop-project");
-        let (mut manager, instance_id, _availability_data_dir) =
+        let (mut manager, _instance_id, _availability_data_dir) =
             availability_manager(dir.path(), &project_path, "legacy-service-stop").await;
         manager.factories.insert(
             0,
@@ -8603,15 +16605,10 @@ command = "ignored"
             .await
             .expect("reconcile pending service restore");
 
-        let error = manager
+        manager
             .stop("legacy-service-stop:web")
             .await
-            .expect_err("pending service stop must be explicit");
-        let pending = error
-            .downcast_ref::<ServiceRestorePending>()
-            .expect("pending restore error type");
-        assert_eq!(pending.name, "legacy-service-stop:web");
-        assert_eq!(pending.instance_id, instance_id);
+            .expect("a stale runtime snapshot is not a live service");
         assert!(manager.services.lock().await.is_empty());
 
         manager.restore_policy_owned_projects(restore_plan).await;
@@ -8619,7 +16616,7 @@ command = "ignored"
             manager
                 .get_service_controller("legacy-service-stop:web")
                 .await
-                .is_some()
+                .is_none()
         );
     }
 
@@ -10268,6 +18265,370 @@ command = "unused-by-test-factory"
     }
 
     #[tokio::test]
+    async fn unresolved_project_reaper_keeps_owner_evidence_until_stop_succeeds() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unresolved-reaper-project");
+        std::fs::create_dir(&project_path).expect("create unresolved project directory");
+        let canonical =
+            std::fs::canonicalize(&project_path).expect("canonical unresolved project path");
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                dir.path().join("catalog.json"),
+            ))),
+            attachments.clone(),
+            None,
+        )
+        .expect("create unresolved reaper manager");
+        attachments
+            .lock()
+            .await
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::CLI { pid: u32::MAX },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach expired legacy CLI owner");
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let first_stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first_stop = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingFailOnceStopController {
+                id: "unresolved-reaper:web".to_owned(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+                stop_attempts: stop_attempts.clone(),
+                first_stop_entered: first_stop_entered.clone(),
+                release_first_stop: release_first_stop.clone(),
+            }));
+        manager.services.lock().await.insert(
+            "unresolved-reaper:web".to_owned(),
+            Service {
+                instance_id: test_instance_id(),
+                controller_generation: 1,
+                projection_generation: 1,
+                config: LocaldConfig::default(),
+                service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::Controller(controller.clone()),
+                sticky_port: None,
+                path: canonical.clone(),
+                health_status: HealthStatus::Healthy,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+
+        let first_reap = tokio::spawn({
+            let manager = manager.clone();
+            let canonical = canonical.clone();
+            async move { manager.reconcile_legacy_attachment_project(canonical).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, first_stop_entered.notified())
+            .await
+            .expect("first unresolved stop reaches its controller");
+
+        assert!(
+            !attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty(),
+            "a daemon exit while stop is in flight leaves retry evidence durable"
+        );
+
+        release_first_stop.notify_one();
+        let first_error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, first_reap)
+            .await
+            .expect("first unresolved reap completes")
+            .expect("first unresolved reap task joins")
+            .expect_err("first unresolved stop failure surfaces");
+        assert!(format!("{first_error:#}").contains("injected first stop failure"));
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty(),
+            "failed stop preserves the owner evidence for the next sweep"
+        );
+
+        manager
+            .reconcile_legacy_attachment_project(canonical)
+            .await
+            .expect("later sweep retries and completes the unresolved stop");
+
+        assert!(
+            attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty()
+        );
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            controller.lock().await.read_state().await.status,
+            ServiceState::Stopped
+        );
+        assert_eq!(
+            manager.services.lock().await["unresolved-reaper:web"].health_status,
+            HealthStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_owner_cleanup_rebases_unrelated_catalog_and_attachment_publication() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("unresolved-publication-race-project");
+        std::fs::create_dir(&project_path).expect("create unresolved project directory");
+        let canonical =
+            std::fs::canonicalize(&project_path).expect("canonical unresolved project path");
+        let unrelated_path = dir.path().join("unrelated-registration-project");
+        std::fs::create_dir(&unrelated_path).expect("create unrelated project directory");
+        git(&unrelated_path, &["init", "-b", "main"]);
+        let unrelated_discovery = Registry::discover(unrelated_path.clone())
+            .await
+            .expect("discover unrelated project");
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            dir.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                dir.path().join("catalog.json"),
+            ))),
+            attachments.clone(),
+            None,
+        )
+        .expect("create unresolved publication-race manager");
+        attachments
+            .lock()
+            .await
+            .attach(Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::CLI { pid: u32::MAX },
+                created_at: SystemTime::now(),
+            })
+            .expect("attach expired legacy CLI owner");
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_stop = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingSuccessfulStopController {
+                id: "unresolved-publication-race:web".to_owned(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+                stop_entered: stop_entered.clone(),
+                release_stop: release_stop.clone(),
+            }));
+        manager.services.lock().await.insert(
+            "unresolved-publication-race:web".to_owned(),
+            Service {
+                instance_id: test_instance_id(),
+                controller_generation: 1,
+                projection_generation: 1,
+                config: LocaldConfig::default(),
+                service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::Controller(controller.clone()),
+                sticky_port: None,
+                path: canonical.clone(),
+                health_status: HealthStatus::Healthy,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+
+        // Model an unrelated first registration that already owns the global
+        // runtime transition while this cleanup releases publication and waits
+        // to stop its unresolved service.
+        let runtime_projection_guard = manager.runtime_projection_lock.lock().await;
+        let (_, project_transition) = manager.transition_lock_for_path(&canonical).await;
+        let reap = tokio::spawn({
+            let manager = manager.clone();
+            let canonical = canonical.clone();
+            async move { manager.reconcile_legacy_attachment_project(canonical).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if project_transition.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unresolved cleanup reaches the runtime publication boundary");
+
+        let publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let unrelated_instance = {
+            let mut registry = manager.registry.lock().await;
+            let mut candidate = registry.clone();
+            let instance_id = candidate
+                .register_project(
+                    unrelated_discovery,
+                    Some("unrelated-registration".to_owned()),
+                )
+                .expect("register unrelated project candidate");
+            registry
+                .commit_candidate(candidate)
+                .await
+                .expect("publish unrelated catalog mutation");
+            manager.domain_index.store(registry.domain_index().clone());
+            instance_id
+        };
+        {
+            let mut store = attachments.lock().await;
+            let mut snapshot = store.snapshot();
+            snapshot.replace_project(
+                &unrelated_path,
+                vec![Attachment {
+                    project_path: unrelated_path.clone(),
+                    source: AttachmentSource::Editor {
+                        name: "Code".to_owned(),
+                        id: "unrelated-window".to_owned(),
+                        pid: Some(std::process::id()),
+                    },
+                    created_at: SystemTime::now(),
+                }],
+                false,
+            );
+            snapshot.set_instance_owner(&unrelated_path, unrelated_instance);
+            store
+                .replace_snapshot(snapshot)
+                .await
+                .expect("publish unrelated compatibility mutation");
+        }
+        drop(publication_guard);
+        drop(runtime_projection_guard);
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, stop_entered.notified())
+            .await
+            .expect("rebased cleanup reaches the unresolved service stop");
+        release_stop.notify_one();
+
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, reap)
+            .await
+            .expect("unresolved cleanup completes after unrelated publication")
+            .expect("unresolved cleanup task joins")
+            .expect("unresolved cleanup rebases its complete lifecycle transaction");
+
+        let snapshot = attachments.lock().await.snapshot();
+        assert!(snapshot.project(&project_path).attachments.is_empty());
+        let unrelated = snapshot.project(&unrelated_path);
+        assert_eq!(unrelated.instance_owner, Some(unrelated_instance));
+        assert_eq!(unrelated.attachments.len(), 1);
+        assert_eq!(
+            controller.lock().await.read_state().await.status,
+            ServiceState::Stopped
+        );
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .contains_key(&unrelated_instance)
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect lifecycle journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .lifecycle_recovery_required
+                .load(AtomicOrdering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn first_registration_syncs_hosts_after_catalog_publish_before_later_failure() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("partial-registration-project");
+        std::fs::create_dir(&project_path).expect("create registration project");
+        git(&project_path, &["init", "-b", "main"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "partial-registration"
+domain = "partial-registration.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+"#,
+        )
+        .expect("write registration config");
+
+        let availability_data_dir = dir.path().join("availability-data");
+        let attachments_path = dir.path().join("attachments.json");
+        std::fs::create_dir(&attachments_path)
+            .expect("block compatibility publication after catalog commit");
+
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            dir.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(attachments_path))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create partial registration manager");
+        let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_sync_calls.clone(),
+        }));
+
+        manager
+            .start(project_path, None, false)
+            .await
+            .expect_err("blocked compatibility publication surfaces after catalog commit");
+
+        let registry = registry.lock().await;
+        assert_eq!(registry.instances.len(), 1);
+        assert!(
+            registry
+                .domain_index()
+                .resolve("partial-registration.localhost")
+                .is_some()
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("partial-registration.localhost")
+                .is_some()
+        );
+        assert_eq!(
+            host_sync_calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[expected_hosts(&["partial-registration.localhost"])]
+        );
+    }
+
+    #[tokio::test]
     async fn test_catalog_persistence_failure_prevents_service_mutation() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
@@ -10819,6 +19180,11 @@ domain = "reload.localhost"
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: host_sync_calls.clone(),
         }));
+        manager
+            .service_stop_suppressions
+            .lock()
+            .await
+            .insert((instance_id, "reload:a".to_owned()));
 
         let error = manager
             .apply_config(project_path, None, false)
@@ -10852,6 +19218,14 @@ domain = "reload.localhost"
         };
         assert!(Arc::ptr_eq(restored_controller, &failing_controller));
         drop(services);
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "reload:a".to_owned())),
+            "failed publication preserves existing service stop intent"
+        );
         assert!(
             host_sync_calls
                 .lock()
@@ -11284,7 +19658,7 @@ command = "sleep 30"
     }
 
     #[tokio::test]
-    async fn test_attachment_persistence_failure_preserves_catalog_on_remove() {
+    async fn attachment_persistence_failure_leaves_a_replayable_removal() {
         let dir = tempdir().unwrap();
         let notify_path = dir.path().join("notify.sock");
         let state_manager = Arc::new(StateManager::with_path(dir.path().join("state.json")));
@@ -11302,7 +19676,7 @@ command = "sleep 30"
 
         let attachment_path = dir.path().join("attachments.json");
         std::fs::create_dir(&attachment_path).expect("create blocking attachment directory");
-        let mut attachment_store = AttachmentStore::new(attachment_path);
+        let mut attachment_store = AttachmentStore::new(attachment_path.clone());
         attachment_store
             .attach(Attachment {
                 project_path: project_path.clone(),
@@ -11321,19 +19695,67 @@ command = "sleep 30"
         )
         .expect("create process manager");
         manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("publish completed migration marker");
 
         manager
             .remove_project(&project_path)
             .await
-            .expect_err("attachment persistence must block catalog removal");
+            .expect_err("attachment persistence failure remains replayable");
 
-        assert!(registry.lock().await.get_project(&project_path).is_some());
+        assert!(registry.lock().await.get_project(&project_path).is_none());
         let stored = attachments.lock().await;
         assert_eq!(stored.attachments_for(&project_path).len(), 1);
         assert!(matches!(
             stored.attachments_for(&project_path)[0].source,
             AttachmentSource::Pin
         ));
+        drop(stored);
+        let transaction = manager
+            .lifecycle_journal
+            .load()
+            .await
+            .expect("load replayable removal")
+            .expect("removal journal remains");
+        assert_eq!(
+            transaction.phase(),
+            LifecycleTransactionPhase::AvailabilityPublished
+        );
+        assert!(
+            manager
+                .lifecycle_recovery_required
+                .load(AtomicOrdering::Acquire)
+        );
+
+        std::fs::remove_dir(&attachment_path).expect("remove attachment failure fixture");
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("replay removal after attachment storage is repaired");
+
+        assert!(
+            attachments
+                .lock()
+                .await
+                .attachments_for(&project_path)
+                .is_empty()
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect cleared removal journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .lifecycle_recovery_required
+                .load(AtomicOrdering::Acquire)
+        );
     }
 
     #[tokio::test]

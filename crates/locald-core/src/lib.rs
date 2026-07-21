@@ -77,14 +77,17 @@ pub use state::{ServerState, ServiceState};
 pub mod availability;
 pub mod catalog;
 pub mod domain;
+pub mod locator;
 pub mod storage;
 #[doc(inline)]
 pub use availability::{
     AGENT_ACTIVE_TTL, AGENT_DEMAND_TTL, AGENT_REVIEW_GRACE, AVAILABILITY_VERSION,
-    AvailabilityError, AvailabilityStore, Clock, ConvergenceDecision, DemandKey, DemandKeyError,
-    DemandKind, DemandLease, EnsureDemandEffect, EnsureDemandResult, LEGACY_PROCESS_DEMAND_TTL,
-    MANUAL_DEMAND_TTL, ProjectAvailability, RenewDemandResult, SHUTDOWN_COOLDOWN, SystemClock,
-    VSCODE_DEMAND_TTL, VSCODE_RENEWAL_INTERVAL, availability_path,
+    AvailabilityBatch, AvailabilityBatchApplyResult, AvailabilityBatchDisposition,
+    AvailabilityBatchOperation, AvailabilityError, AvailabilityStateImage, AvailabilityStore,
+    Clock, ConvergenceDecision, DemandKey, DemandKeyError, DemandKind, DemandLease,
+    EnsureDemandEffect, EnsureDemandResult, LEGACY_PROCESS_DEMAND_TTL, MANUAL_DEMAND_TTL,
+    PreparedAvailabilityBatch, ProjectAvailability, RenewDemandResult, SHUTDOWN_COOLDOWN,
+    SystemClock, VSCODE_DEMAND_TTL, VSCODE_RENEWAL_INTERVAL, availability_path,
 };
 #[doc(inline)]
 pub use catalog::{
@@ -97,6 +100,8 @@ pub use domain::{
     DomainClaim, DomainError, DomainIndex, DomainName, DomainTarget, PlatformDomain,
     SharedDomainIndex, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
+#[doc(inline)]
+pub use locator::normalize_project_locator;
 pub mod registry;
 #[doc(inline)]
 pub use registry::Registry;

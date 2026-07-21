@@ -86,6 +86,8 @@ pub mod health;
 pub mod helper_client;
 #[doc(hidden)]
 pub mod ipc;
+pub(crate) mod lifecycle_migration;
+pub(crate) mod lifecycle_transaction;
 #[doc(hidden)]
 pub mod logging;
 #[doc(hidden)]
@@ -397,6 +399,107 @@ fn is_already_running() -> bool {
     locald_utils::ipc::socket_path().is_ok_and(|path| UnixStream::connect(path).is_ok())
 }
 
+async fn load_attachment_store_for_lifecycle_recovery(
+    store: &mut locald_core::attachments::AttachmentStore,
+    preflight: &lifecycle_transaction::LifecycleRecoveryPreflight,
+) -> Result<()> {
+    if let Some(images) = preflight.pending_legacy_attachment_images() {
+        let exact_error = match store
+            .load_exact_transaction_image(images.base(), images.target())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        let compatibility_path = store.storage_path();
+        let legacy_input = if path_entry_exists(compatibility_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to inspect lifecycle compatibility state `{}` after exact v2 parsing failed",
+                    compatibility_path.display()
+                )
+            })?
+        {
+            Some(tokio::fs::read(compatibility_path).await.with_context(|| {
+                format!(
+                    "Failed to read existing lifecycle compatibility state `{}` after exact v2 parsing failed: {exact_error:#}",
+                    compatibility_path.display()
+                )
+            })?)
+        } else {
+            None
+        };
+        let declares_exact_v2 = legacy_input.as_ref().is_some_and(|content| {
+            serde_json::from_slice::<serde_json::Value>(content)
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .as_object()
+                        .is_some_and(|object| object.contains_key("instance_owners"))
+                })
+        });
+        if declares_exact_v2 {
+            return Err(exact_error).with_context(|| {
+                format!(
+                    "Lifecycle compatibility state `{}` declares exact v2 shape and cannot fall back to legacy parsing",
+                    compatibility_path.display()
+                )
+            });
+        }
+
+        let mut legacy =
+            locald_core::attachments::AttachmentStore::new(store.storage_path().to_path_buf());
+        legacy.load().await.with_context(|| {
+            format!(
+                "Failed to parse legacy lifecycle compatibility state `{}` after exact v2 parsing failed: {exact_error:#}",
+                store.storage_path().display()
+            )
+        })?;
+        match legacy_input {
+            Some(expected) => {
+                let current = tokio::fs::read(store.storage_path()).await.with_context(|| {
+                    format!(
+                        "Failed to re-read lifecycle compatibility state `{}` after legacy parsing",
+                        store.storage_path().display()
+                    )
+                })?;
+                anyhow::ensure!(
+                    current == expected,
+                    "lifecycle compatibility state `{}` changed while legacy recovery was loading it",
+                    store.storage_path().display()
+                );
+            }
+            None => {
+                anyhow::ensure!(
+                    !path_entry_exists(store.storage_path()).await.with_context(|| {
+                        format!(
+                            "Failed to re-inspect absent lifecycle compatibility state `{}` after legacy parsing",
+                            store.storage_path().display()
+                        )
+                    })?,
+                    "lifecycle compatibility state `{}` appeared while legacy recovery was loading it",
+                    store.storage_path().display()
+                );
+            }
+        }
+        anyhow::ensure!(
+            legacy.snapshot() == *images.base(),
+            "compatibility state `{}` is not exact v2 and its permissive legacy projection does not match the journal base; exact v2 parsing failed: {exact_error:#}",
+            store.storage_path().display()
+        );
+        *store = legacy;
+        return Ok(());
+    }
+
+    if preflight.requires_exact_attachment_authority() {
+        store.load_exact().await
+    } else {
+        store.load().await
+    }
+}
+
 async fn async_main(
     version: String,
     log_tx: tokio::sync::broadcast::Sender<locald_core::ipc::LogEntry>,
@@ -431,27 +534,54 @@ async fn async_main(
         crate::state::StateManager::new().context("Failed to initialize state manager")?,
     );
 
-    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(
-        locald_core::registry::Registry::load()
+    let lifecycle_preflight =
+        lifecycle_transaction::LifecycleJournal::at(&locald_core::storage::data_dir())
+            .preflight()
             .await
-            .context("Failed to initialize project identity catalog")?,
-    ));
+            .context("Failed to preflight lifecycle recovery authority")?;
+    let allow_legacy_catalog_bootstrap = !lifecycle_preflight.has_v2_authority();
+    let catalog_path = locald_core::registry::Registry::path();
+    let catalog_exists = path_entry_exists(&catalog_path).await.with_context(|| {
+        format!(
+            "Failed to inspect project identity catalog `{}`",
+            catalog_path.display()
+        )
+    })?;
+    let prepared_legacy_catalog = (!catalog_exists)
+        .then(|| lifecycle_preflight.prepared_legacy_catalog_base(&catalog_path))
+        .flatten();
+    let registry = match prepared_legacy_catalog {
+        Some(catalog) => catalog,
+        None => locald_core::registry::Registry::load_for_lifecycle_recovery(
+            allow_legacy_catalog_bootstrap,
+        )
+        .await
+        .context("Failed to initialize project identity catalog")?,
+    };
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
 
     let mut attachment_store = locald_core::attachments::AttachmentStore::new(
         locald_core::attachments::AttachmentStore::path(),
     );
-    if let Err(e) = attachment_store.load().await {
-        warn!("Failed to load attachments store: {e}");
-    }
+    load_attachment_store_for_lifecycle_recovery(&mut attachment_store, &lifecycle_preflight)
+        .await
+        .context("Failed to initialize lifecycle compatibility state")?;
     let attachments = std::sync::Arc::new(tokio::sync::Mutex::new(attachment_store));
 
-    let manager = ProcessManager::new(
+    let mut manager = ProcessManager::new(
         notify_path.clone(),
         state_manager,
         registry,
         attachments,
         Some(log_tx),
     )?;
+    if config.server.is_sandbox() {
+        manager.use_sandbox_host_syncer();
+    }
+    manager
+        .recover_and_migrate_lifecycle_state()
+        .await
+        .context("Failed to recover or migrate lifecycle authority")?;
     manager.spawn_metrics_collector();
 
     // Initialize ContainerManager
@@ -499,6 +629,13 @@ async fn async_main(
         .reconcile_stale_runtime_state()
         .await
         .context("Failed to reconcile daemon runtime state")?;
+    // Renew still-live process-owned compatibility demands before the first
+    // availability sweep. Revalidation is passive and therefore preserves a
+    // user pause while preventing daemon downtime from expiring a live owner.
+    manager
+        .reconcile_legacy_attachment_owners()
+        .await
+        .context("Failed to reconcile legacy lifecycle owners")?;
 
     // Spawn attachment reaper — cleans up stale editor/CLI attachments
     let manager_reaper = manager.clone();
@@ -744,6 +881,14 @@ async fn async_main(
     Ok(())
 }
 
+async fn path_entry_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(source),
+    }
+}
+
 async fn watch_for_upgrade(
     container_manager: std::sync::Arc<crate::container::ContainerManager>,
     shutdown_tx: tokio::sync::mpsc::Sender<ShutdownReason>,
@@ -790,7 +935,9 @@ async fn watch_for_upgrade(
 
 #[cfg(test)]
 mod catalog_writer_lock_tests {
-    use super::{CatalogWriterLock, INHERITED_CATALOG_WRITER_LOCK_FD, restart_environment};
+    use super::{
+        CatalogWriterLock, INHERITED_CATALOG_WRITER_LOCK_FD, path_entry_exists, restart_environment,
+    };
     use std::os::fd::AsRawFd;
 
     #[allow(unsafe_code)]
@@ -812,6 +959,26 @@ mod catalog_writer_lock_tests {
 
         drop(first);
         CatalogWriterLock::acquire_at(&path).expect("reacquire released writer lock");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_treats_a_dangling_catalog_symlink_as_existing_state() {
+        let directory = tempfile::tempdir().expect("create catalog path fixture");
+        let catalog = directory.path().join("catalog.json");
+        std::os::unix::fs::symlink(directory.path().join("missing-target"), &catalog)
+            .expect("create dangling catalog symlink");
+
+        assert!(
+            path_entry_exists(&catalog)
+                .await
+                .expect("inspect dangling catalog symlink")
+        );
+        assert!(
+            !path_entry_exists(&directory.path().join("absent.json"))
+                .await
+                .expect("inspect absent catalog path")
+        );
     }
 
     #[test]
@@ -872,5 +1039,249 @@ mod catalog_writer_lock_tests {
             .collect();
 
         assert_eq!(markers, vec![format!("{prefix}42")]);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_startup_tests {
+    use super::load_attachment_store_for_lifecycle_recovery;
+    use crate::lifecycle_transaction::{
+        AttachmentTransactionImages, CatalogTransactionImages, LifecycleJournal,
+        LifecycleTransaction, LifecycleTransactionKind, LifecycleTransactionPhase,
+    };
+    use locald_core::ProjectCatalog;
+    use locald_core::attachments::{
+        Attachment, AttachmentSource, AttachmentStore, AttachmentStoreSnapshot,
+    };
+    use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn availability_published_startup_accepts_only_an_exact_target() {
+        let directory = tempfile::tempdir().expect("create lifecycle startup fixture");
+        let attachment_path = directory.path().join("attachments.json");
+        let catalog = ProjectCatalog::with_path(directory.path().join("catalog.json"));
+        let attachment_base = AttachmentStoreSnapshot::default();
+        let mut attachment_target = attachment_base.clone();
+        let project_path = directory.path().join("project");
+        attachment_target.replace_project(
+            &project_path,
+            vec![Attachment {
+                project_path: project_path.clone(),
+                source: AttachmentSource::Pin,
+                created_at: SystemTime::now(),
+            }],
+            false,
+        );
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LegacyV1Migration,
+            SystemTime::now(),
+            Some(
+                CatalogTransactionImages::new(catalog.clone(), catalog)
+                    .expect("prepare stable catalog images"),
+            ),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachment_base.clone(), attachment_target.clone()),
+        )
+        .expect("prepare AvailabilityPublished migration fixture");
+        let journal = LifecycleJournal::at(directory.path());
+        journal
+            .create(&transaction)
+            .await
+            .expect("create migration journal");
+        journal
+            .advance(
+                transaction.id(),
+                LifecycleTransactionPhase::Prepared,
+                LifecycleTransactionPhase::CatalogPublished,
+            )
+            .await
+            .expect("advance migration through catalog publication");
+        journal
+            .advance(
+                transaction.id(),
+                LifecycleTransactionPhase::CatalogPublished,
+                LifecycleTransactionPhase::AvailabilityPublished,
+            )
+            .await
+            .expect("advance migration through availability publication");
+        let preflight = journal
+            .preflight()
+            .await
+            .expect("preflight AvailabilityPublished migration");
+        assert!(preflight.pending_legacy_attachment_images().is_some());
+
+        // A permissive v1 document is accepted only because its normalized
+        // projection is the journal's exact base image.
+        let legacy_base = serde_json::json!({
+            "attachments": {},
+            "manually_stopped": []
+        });
+        tokio::fs::write(
+            &attachment_path,
+            serde_json::to_vec_pretty(&legacy_base).expect("serialize legacy base"),
+        )
+        .await
+        .expect("write legacy base");
+        let mut store = AttachmentStore::new(attachment_path.clone());
+        load_attachment_store_for_lifecycle_recovery(&mut store, &preflight)
+            .await
+            .expect("accept normalized legacy base");
+        assert_eq!(store.snapshot(), attachment_base);
+
+        // Once the target has been published, only its complete exact-v2 shape
+        // is accepted.
+        tokio::fs::write(
+            &attachment_path,
+            serde_json::to_vec_pretty(&attachment_target).expect("serialize exact target"),
+        )
+        .await
+        .expect("write exact target");
+        let mut store = AttachmentStore::new(attachment_path.clone());
+        load_attachment_store_for_lifecycle_recovery(&mut store, &preflight)
+            .await
+            .expect("accept exact compatibility target");
+        assert_eq!(store.snapshot(), attachment_target);
+
+        let target_value =
+            serde_json::to_value(&attachment_target).expect("encode target corruption fixtures");
+        let mut target_with_unknown = target_value.clone();
+        target_with_unknown["unexpected"] = serde_json::json!(true);
+        let mut target_missing_field = target_value;
+        target_missing_field
+            .as_object_mut()
+            .expect("compatibility target is an object")
+            .remove("instance_owners");
+
+        for (label, malformed_target, expected_error) in [
+            (
+                "unknown field",
+                target_with_unknown,
+                "declares exact v2 shape",
+            ),
+            (
+                "missing field",
+                target_missing_field,
+                "does not match the journal base",
+            ),
+        ] {
+            let preserved =
+                serde_json::to_vec_pretty(&malformed_target).expect("serialize malformed target");
+            tokio::fs::write(&attachment_path, &preserved)
+                .await
+                .expect("write malformed target");
+            let mut store = AttachmentStore::new(attachment_path.clone());
+            let error = load_attachment_store_for_lifecycle_recovery(&mut store, &preflight)
+                .await
+                .expect_err("non-exact target must block startup");
+            assert!(
+                error.to_string().contains(expected_error),
+                "{label}: {error:#}"
+            );
+            assert_eq!(
+                tokio::fs::read(&attachment_path)
+                    .await
+                    .expect("reread preserved malformed target"),
+                preserved,
+                "{label} must remain byte-for-byte preserved"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noop_availability_publication_preserves_strict_and_unreadable_state() {
+        let directory = tempfile::tempdir().expect("create no-op lifecycle startup fixture");
+        let attachment_path = directory.path().join("attachments.json");
+        let catalog = ProjectCatalog::with_path(directory.path().join("catalog.json"));
+        let attachments = AttachmentStoreSnapshot::default();
+        let transaction = LifecycleTransaction::new(
+            LifecycleTransactionKind::LegacyV1Migration,
+            SystemTime::now(),
+            Some(
+                CatalogTransactionImages::new(catalog.clone(), catalog)
+                    .expect("prepare stable catalog images"),
+            ),
+            Vec::new(),
+            AttachmentTransactionImages::new(attachments.clone(), attachments.clone()),
+        )
+        .expect("prepare no-op AvailabilityPublished migration fixture");
+        let journal = LifecycleJournal::at(directory.path());
+        journal
+            .create(&transaction)
+            .await
+            .expect("create no-op migration journal");
+        journal
+            .advance(
+                transaction.id(),
+                LifecycleTransactionPhase::Prepared,
+                LifecycleTransactionPhase::CatalogPublished,
+            )
+            .await
+            .expect("advance no-op migration through catalog publication");
+        journal
+            .advance(
+                transaction.id(),
+                LifecycleTransactionPhase::CatalogPublished,
+                LifecycleTransactionPhase::AvailabilityPublished,
+            )
+            .await
+            .expect("advance no-op migration through availability publication");
+        let preflight = journal
+            .preflight()
+            .await
+            .expect("preflight no-op AvailabilityPublished migration");
+
+        let mut malformed =
+            serde_json::to_value(&attachments).expect("encode no-op target corruption fixture");
+        malformed["unexpected"] = serde_json::json!(true);
+        let preserved = serde_json::to_vec_pretty(&malformed)
+            .expect("serialize malformed no-op compatibility target");
+        tokio::fs::write(&attachment_path, &preserved)
+            .await
+            .expect("write malformed no-op compatibility target");
+        let mut store = AttachmentStore::new(attachment_path.clone());
+        let error = load_attachment_store_for_lifecycle_recovery(&mut store, &preflight)
+            .await
+            .expect_err("strict-shaped no-op target must block legacy fallback");
+        assert!(
+            error.to_string().contains("declares exact v2 shape"),
+            "{error:#}"
+        );
+        assert_eq!(
+            tokio::fs::read(&attachment_path)
+                .await
+                .expect("reread preserved malformed no-op target"),
+            preserved
+        );
+
+        tokio::fs::remove_file(&attachment_path)
+            .await
+            .expect("remove malformed no-op target");
+        let missing_target = directory.path().join("missing-attachment-target");
+        std::os::unix::fs::symlink(&missing_target, &attachment_path)
+            .expect("create dangling compatibility-state symlink");
+        let mut store = AttachmentStore::new(attachment_path.clone());
+        let error = load_attachment_store_for_lifecycle_recovery(&mut store, &preflight)
+            .await
+            .expect_err("dangling compatibility-state entry must block legacy fallback");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to read existing lifecycle compatibility state"),
+            "{error:#}"
+        );
+        assert!(
+            tokio::fs::symlink_metadata(&attachment_path)
+                .await
+                .expect("inspect preserved dangling compatibility-state entry")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            tokio::fs::read_link(&attachment_path)
+                .await
+                .expect("read preserved dangling compatibility-state link"),
+            missing_target
+        );
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
-use locald_core::attachments::{AttachmentSource, ProjectFilter, ProjectSection};
+use locald_core::attachments::{AttachmentSource, ManualCliSession, ProjectFilter, ProjectSection};
 #[cfg(target_os = "macos")]
 use locald_core::{DomainName, HostsFileSection};
 use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
@@ -40,13 +40,13 @@ struct JsonServiceList {
     services: Vec<JsonServiceSummary>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct JsonServiceAction {
     service: String,
     status: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct JsonServiceActions {
     services: Vec<JsonServiceAction>,
 }
@@ -56,10 +56,29 @@ struct JsonProjectAction {
     status: String,
 }
 
+fn project_stop_json_actions(config_path: &std::path::Path) -> CliResult<JsonServiceActions> {
+    let config_content =
+        std::fs::read_to_string(config_path).context("Failed to read locald.toml")?;
+    let config: LocaldConfig =
+        toml::from_str(&config_content).context("Failed to parse locald.toml")?;
+    let services = config
+        .services
+        .keys()
+        .map(|service_name| JsonServiceAction {
+            service: format!("{}:{}", config.project.name, service_name),
+            status: "stopped".to_owned(),
+        })
+        .collect();
+    Ok(JsonServiceActions { services })
+}
+
 fn format_attachment_source(source: &AttachmentSource) -> String {
     match source {
         AttachmentSource::Editor { name, id, .. } => format!("editor:{name} ({id})"),
         AttachmentSource::CLI { pid } => format!("cli:{pid}"),
+        AttachmentSource::ManualCLI(session) => {
+            format!("cli:{} (manual session)", session.pid())
+        }
         AttachmentSource::Runtime => "runtime (legacy)".to_string(),
         AttachmentSource::Pin => "pin".to_string(),
     }
@@ -71,6 +90,29 @@ const fn section_label(section: ProjectSection) -> &'static str {
         ProjectSection::AlwaysOn => "always-on",
         ProjectSection::Recent => "recent",
     }
+}
+
+fn resolve_project_locator(path: &std::path::Path) -> CliResult<std::path::PathBuf> {
+    locald_core::normalize_project_locator(path).map_err(|source| {
+        CliError::message(format!(
+            "Failed to resolve project path `{}`: {source}",
+            path.display()
+        ))
+    })
+}
+
+fn prepare_up_start(
+    project_locator: &std::path::Path,
+    verbose: bool,
+    manual_cli_session: Option<ManualCliSession>,
+) -> CliResult<(std::path::PathBuf, IpcRequest)> {
+    let project_path = resolve_project_locator(project_locator)?;
+    let request = IpcRequest::Start {
+        project_path: project_path.clone(),
+        verbose,
+        manual_cli_session,
+    };
+    Ok((project_path, request))
 }
 
 fn warn_if_daemon_identity_mismatch() {
@@ -429,26 +471,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
-
-            // Register a CLI attachment so the project's lifecycle is tracked.
-            // The attachment is tied to this process's PID — when the CLI exits,
-            // the daemon's periodic reaper will detect the PID is gone and
-            // detach (stopping services if no other attachments remain).
-            let _ = client::send_request(&IpcRequest::ProjectAttach {
-                project_path: abs_path.clone(),
-                source: locald_core::attachments::AttachmentSource::CLI {
-                    pid: std::process::id(),
-                },
-            });
+            let manual_cli_session =
+                (!*exit_after_register).then(|| ManualCliSession::new(std::process::id()));
+            let (abs_path, start_request) =
+                prepare_up_start(&target_path, *verbose, manual_cli_session)?;
 
             // Start services with streaming output.
             let mut attempts = 0;
             loop {
-                match client::stream_boot_events(&IpcRequest::Start {
-                    project_path: abs_path.clone(),
-                    verbose: *verbose,
-                }) {
+                match client::stream_boot_events(&start_request) {
                     Ok(()) => {
                         cliclack::outro("Project registered")?;
                         break;
@@ -480,13 +511,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             let detach_path = abs_path;
+            let detach_source = manual_cli_session
+                .context("log-following locald up did not create a Manual CLI session")?
+                .attachment_source();
             let _ = ctrlc::set_handler(move || {
                 // Best-effort detach on Ctrl+C
                 let _ = client::send_request(&IpcRequest::ProjectDetach {
                     project_path: detach_path.clone(),
-                    source: Some(AttachmentSource::CLI {
-                        pid: std::process::id(),
-                    }),
+                    source: Some(detach_source.clone()),
                 });
                 std::process::exit(0);
             });
@@ -495,36 +527,52 @@ pub fn run(cli: Cli) -> CliResult<()> {
             client::stream_logs(None, true)?;
         }
         Commands::Stop { name, json } => {
-            let names = if let Some(n) = name {
-                vec![n.clone()]
-            } else {
-                let config_path = std::env::current_dir()?.join("locald.toml");
+            if name.is_none() {
+                let current_dir = std::env::current_dir()?;
+                let config_path = current_dir.join("locald.toml");
                 if !config_path.exists() {
                     return Err(CliError::message(
                         "No locald.toml found in current directory. Please specify a service name.",
                     ));
                 }
-
-                // Detach this project (removes CLI attachment, triggers stop if last).
-                if let Ok(abs_path) = std::fs::canonicalize(std::env::current_dir()?) {
-                    let _ = client::send_request(&IpcRequest::ProjectDetach {
-                        project_path: abs_path,
-                        source: None, // detach all non-pin sources
-                    });
+                let json_actions = if *json {
+                    Some(project_stop_json_actions(&config_path)?)
+                } else {
+                    None
+                };
+                let project_path = resolve_project_locator(&current_dir)?;
+                utils::ensure_daemon_running()?;
+                match client::send_request(&IpcRequest::ProjectForceStop {
+                    project_path: project_path.clone(),
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        if let Some(json_actions) = json_actions {
+                            println!("{}", serde_json::to_string_pretty(&json_actions)?);
+                        } else {
+                            println!("{} Paused project {}", style::CHECK, project_path.display());
+                        }
+                        return Ok(());
+                    }
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to pause project: {message}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
                 }
-
-                let config_content =
-                    std::fs::read_to_string(&config_path).context("Failed to read locald.toml")?;
-                let config: LocaldConfig =
-                    toml::from_str(&config_content).context("Failed to parse locald.toml")?;
-
-                config
-                    .services
-                    .keys()
-                    .map(|service_name| format!("{}:{}", config.project.name, service_name))
-                    .collect()
+            }
+            let Some(name) = name else {
+                unreachable!("project stop returns before service-name resolution")
             };
+            let names = vec![name.clone()];
 
+            utils::ensure_daemon_running()?;
             let mut actions = Vec::new();
 
             for service_name in names {
@@ -1487,7 +1535,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 json,
             } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 let source = match source.as_deref() {
                     Some("editor") => {
                         let name = editor_name
@@ -1515,6 +1563,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 match client::send_request(&IpcRequest::ProjectAttach {
                     project_path: abs_path,
                     source,
+                    standalone: true,
                 }) {
                     Ok(IpcResponse::Ok) => {
                         if *json {
@@ -1542,7 +1591,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 editor_id,
             } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 let source = match source.as_deref() {
                     None => None,
                     Some("editor") => {
@@ -1584,7 +1633,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
             ProjectCommands::Start { path } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 match client::send_request(&IpcRequest::ProjectForceStart {
                     project_path: abs_path,
                 }) {
@@ -1601,7 +1650,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
             ProjectCommands::Stop { path } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 match client::send_request(&IpcRequest::ProjectForceStop {
                     project_path: abs_path,
                 }) {
@@ -1618,7 +1667,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
             ProjectCommands::Status { path, json } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 match client::send_request(&IpcRequest::ProjectStatus {
                     project_path: abs_path,
                 }) {
@@ -1727,13 +1776,19 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             }
                         }
                     }
+                    Ok(IpcResponse::Error(msg)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to list registered projects: {msg}",
+                            style::CROSS
+                        )));
+                    }
                     Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
                 }
             }
             RegistryCommands::Pin { path } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 match client::send_request(&IpcRequest::RegistryPin {
                     project_path: abs_path,
                 }) {
@@ -1750,7 +1805,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
             RegistryCommands::Unpin { path } => {
                 utils::ensure_daemon_running()?;
-                let abs_path = std::fs::canonicalize(path).context("Failed to resolve path")?;
+                let abs_path = resolve_project_locator(path)?;
                 match client::send_request(&IpcRequest::RegistryUnpin {
                     project_path: abs_path,
                 }) {
@@ -2166,6 +2221,100 @@ fn sync_hosts_file(hosts: &HostsFileSection, domains: &[DomainName]) -> CliResul
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locald_up_resolves_a_missing_project_locator() {
+        let directory = tempfile::tempdir().expect("create locator directory");
+        let locator = directory.path().join("missing").join("..").join("project");
+        let expected = std::fs::canonicalize(directory.path())
+            .expect("canonicalize locator directory")
+            .join("project");
+        let (resolved, request) =
+            prepare_up_start(&locator, false, None).expect("prepare missing project start");
+
+        assert_eq!(resolved, expected);
+        assert!(matches!(
+            request,
+            IpcRequest::Start { project_path, .. } if project_path == expected
+        ));
+    }
+
+    #[test]
+    fn locald_up_normalizes_symlinked_project_spelling() {
+        let directory = tempfile::tempdir().expect("create locator directory");
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        let project = real.join("project");
+        std::fs::create_dir_all(&project).expect("create real project path");
+        std::os::unix::fs::symlink(&real, &alias).expect("create locator symlink");
+        let expected = std::fs::canonicalize(project).expect("canonicalize real project path");
+        let (resolved, request) = prepare_up_start(&alias.join("project"), false, None)
+            .expect("prepare project start through symlink spelling");
+
+        assert_eq!(resolved, expected);
+        assert!(matches!(
+            request,
+            IpcRequest::Start { project_path, .. } if project_path == expected
+        ));
+    }
+
+    #[test]
+    fn invalid_project_locator_error_names_the_requested_path() {
+        let locator = std::path::Path::new("/invalid\0project");
+
+        let error = resolve_project_locator(locator).expect_err("reject invalid locator");
+        let source = locald_core::normalize_project_locator(locator)
+            .expect_err("invalid locator has an I/O cause")
+            .to_string();
+        let message = error.to_string();
+        assert!(message.contains("Failed to resolve project path"));
+        assert!(message.contains(&locator.display().to_string()));
+        assert_eq!(message.matches(&source).count(), 1);
+    }
+
+    #[test]
+    fn normal_up_streams_a_start_paired_with_its_manual_cli_owner() {
+        let project = std::path::Path::new("/projects/example");
+        let session = ManualCliSession::new(std::process::id());
+
+        let (_, request) = prepare_up_start(project, false, Some(session))
+            .expect("prepare paired normal-up lifecycle request");
+        assert!(matches!(
+            request,
+            IpcRequest::Start {
+                manual_cli_session: Some(actual),
+                ..
+            } if actual == session
+        ));
+    }
+
+    #[test]
+    fn exit_after_register_streams_start_without_a_manual_cli_owner() {
+        let project = std::path::Path::new("/projects/example");
+
+        let (_, request) = prepare_up_start(project, false, None)
+            .expect("prepare non-following lifecycle request");
+        assert!(matches!(
+            request,
+            IpcRequest::Start {
+                manual_cli_session: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn project_stop_json_requires_a_valid_config_before_mutation() {
+        let directory = tempfile::tempdir().expect("create stop JSON directory");
+        let config_path = directory.path().join("locald.toml");
+        std::fs::write(&config_path, "[project\nmalformed")
+            .expect("write malformed stop JSON config");
+
+        let error = project_stop_json_actions(&config_path)
+            .expect_err("malformed config must fail before project stop is sent");
+
+        assert!(error.to_string().contains("Failed to parse locald.toml"));
+    }
 
     #[test]
     fn launch_agent_plist_pins_daemon_path() {

@@ -157,11 +157,14 @@ impl DemandKind {
         }
     }
 
-    const fn requires_owner(self) -> bool {
-        matches!(
-            self,
-            Self::VsCodeWindow | Self::AgentConversation | Self::LegacyProcessAttachment
-        )
+    const fn accepts_owner_state(self, has_owner: bool) -> bool {
+        match self {
+            Self::ManualCli => true,
+            Self::VsCodeWindow | Self::AgentConversation | Self::LegacyProcessAttachment => {
+                has_owner
+            }
+            Self::StoppedPageResume => !has_owner,
+        }
     }
 
     const fn persistence_tag(self) -> &'static [u8] {
@@ -232,6 +235,11 @@ impl DemandKey {
         }
     }
 
+    /// A Manual CLI demand owned by one retry-stable log-following session.
+    pub fn manual_cli_session(private_identity: &str) -> Result<Self, DemandKeyError> {
+        Self::owned(DemandKind::ManualCli, private_identity)
+    }
+
     /// A demand owned by one trusted VS Code window identity.
     pub fn vs_code_window(private_identity: &str) -> Result<Self, DemandKeyError> {
         Self::owned(DemandKind::VsCodeWindow, private_identity)
@@ -276,7 +284,7 @@ impl DemandKey {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.kind.requires_owner() != self.owner.is_some() {
+        if !self.kind.accepts_owner_state(self.owner.is_some()) {
             return Err(format!(
                 "{:?} demand has an invalid owner representation",
                 self.kind
@@ -578,6 +586,54 @@ impl ProjectAvailability {
         Ok(RenewDemandResult::Renewed(self.demands[index].clone()))
     }
 
+    fn revalidate_demand(
+        &mut self,
+        key: &DemandKey,
+        now: SystemTime,
+    ) -> Result<RenewDemandResult, AvailabilityError> {
+        let Some(index) = self.demands.iter().position(|demand| &demand.key == key) else {
+            return Ok(RenewDemandResult::Missing);
+        };
+        self.demands[index]
+            .renew(now)
+            .map_err(|reason| AvailabilityError::Invariant { reason })?;
+        if self.demand_generation_is_effective(self.demands[index].generation) {
+            self.shutdown_cooldown_until = None;
+        }
+        Ok(RenewDemandResult::Renewed(self.demands[index].clone()))
+    }
+
+    fn import_demand(
+        &mut self,
+        key: DemandKey,
+        acquired_at: SystemTime,
+        effective_at: SystemTime,
+    ) -> Result<bool, AvailabilityError> {
+        if self.demands.iter().any(|demand| demand.key == key) {
+            return Ok(false);
+        }
+
+        let acquired_at = acquired_at.min(effective_at);
+        let expires_at = deadline(acquired_at, key.kind().lease_duration())
+            .map_err(|reason| AvailabilityError::Invariant { reason })?;
+        if expires_at <= effective_at {
+            return Ok(false);
+        }
+
+        let generation = self.activity_generation.checked_add(1).ok_or(
+            AvailabilityError::GenerationExhausted {
+                current: self.activity_generation,
+            },
+        )?;
+        self.activity_generation = generation;
+        let lease = DemandLease::new(key, generation, acquired_at)
+            .map_err(|reason| AvailabilityError::Invariant { reason })?;
+        self.demands.push(lease);
+        self.demands.sort_by(|left, right| left.key.cmp(&right.key));
+        self.shutdown_cooldown_until = None;
+        Ok(true)
+    }
+
     fn release_demand(
         &mut self,
         key: &DemandKey,
@@ -765,6 +821,366 @@ pub enum RenewDemandResult {
     Expired,
 }
 
+/// One ordered mutation in an availability transaction.
+///
+/// Batch operations are evaluated at the enclosing batch's fixed
+/// [`AvailabilityBatch::effective_at`] time. A prepared batch stores the exact
+/// resulting state, so journal replay publishes that state instead of
+/// re-evaluating these operations against a later snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "operation",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum AvailabilityBatchOperation {
+    /// Materialize an empty authoritative record when none exists yet.
+    Initialize,
+    /// Explicitly acquire, renew, or resume one semantic demand.
+    EnsureDemand(DemandKey),
+    /// Passively renew a live demand without crossing a pause barrier.
+    RenewDemand(DemandKey),
+    /// Revalidate a process-proven demand at its existing generation, even
+    /// when its lease deadline elapsed. A demand removed by an earlier sweep
+    /// remains absent because its generation provenance no longer exists.
+    RevalidateDemand(DemandKey),
+    /// Import one legacy hold with its original acquisition time. An already
+    /// expired hold is ignored instead of receiving a fresh lease window.
+    ImportDemand {
+        key: DemandKey,
+        acquired_at: SystemTime,
+    },
+    /// Release one demand owner.
+    ReleaseDemand(DemandKey),
+    /// Enable or disable durable Always On policy.
+    SetAlwaysOn(bool),
+    /// Pause the project through the generation current at this point in the
+    /// ordered batch.
+    PauseProject,
+    /// Replace or clear trusted launch context.
+    SetTrustedLaunchPath(Option<String>),
+    /// Remove the authoritative availability record.
+    Retire,
+}
+
+/// An ordered availability transaction evaluated at one fixed wall-clock time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvailabilityBatch {
+    effective_at: SystemTime,
+    operations: Vec<AvailabilityBatchOperation>,
+}
+
+impl AvailabilityBatch {
+    /// Begin a batch whose time-dependent operations all use `effective_at`.
+    #[must_use]
+    pub const fn new(effective_at: SystemTime) -> Self {
+        Self {
+            effective_at,
+            operations: Vec::new(),
+        }
+    }
+
+    /// Append one operation, preserving caller order.
+    pub fn push(&mut self, operation: AvailabilityBatchOperation) {
+        self.operations.push(operation);
+    }
+
+    /// Append one operation and return the batch for fluent construction.
+    #[must_use]
+    pub fn with_operation(mut self, operation: AvailabilityBatchOperation) -> Self {
+        self.push(operation);
+        self
+    }
+
+    #[must_use]
+    pub const fn effective_at(&self) -> SystemTime {
+        self.effective_at
+    }
+
+    #[must_use]
+    pub fn operations(&self) -> &[AvailabilityBatchOperation] {
+        &self.operations
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+}
+
+/// Exact authoritative state before or after a prepared availability batch.
+///
+/// Keeping absence distinct from a persisted default record gives
+/// initialization and retirement deterministic, restart-stable semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "availability",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum AvailabilityStateImage {
+    /// No authoritative availability file exists.
+    Retired,
+    /// The authoritative file contains this validated state.
+    Present(ProjectAvailability),
+}
+
+impl AvailabilityStateImage {
+    #[must_use]
+    pub const fn availability(&self) -> Option<&ProjectAvailability> {
+        match self {
+            Self::Retired => None,
+            Self::Present(availability) => Some(availability),
+        }
+    }
+
+    fn cached_availability(&self) -> ProjectAvailability {
+        match self {
+            Self::Retired => ProjectAvailability::default(),
+            Self::Present(availability) => availability.clone(),
+        }
+    }
+}
+
+/// A journal-ready availability transaction with an exact compare-and-publish
+/// contract.
+///
+/// Persist this payload before applying it. On replay, the store publishes
+/// `target` only when the authoritative state still equals `expected`; if it
+/// already equals `target`, replay is a no-op. Operations are never re-run
+/// during replay, so deadlines and activity generations cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedAvailabilityBatch {
+    project_instance_id: ProjectInstanceId,
+    batch: AvailabilityBatch,
+    expected: AvailabilityStateImage,
+    target: AvailabilityStateImage,
+}
+
+impl PreparedAvailabilityBatch {
+    #[must_use]
+    pub const fn project_instance_id(&self) -> ProjectInstanceId {
+        self.project_instance_id
+    }
+
+    #[must_use]
+    pub const fn batch(&self) -> &AvailabilityBatch {
+        &self.batch
+    }
+
+    #[must_use]
+    pub const fn expected(&self) -> &AvailabilityStateImage {
+        &self.expected
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &AvailabilityStateImage {
+        &self.target
+    }
+
+    /// Validate that this journaled target is the exact result of replaying
+    /// its ordered operations against the captured base image.
+    ///
+    /// This is intentionally pure: transaction journals can reject malformed
+    /// or truncated prepared state before publishing any other authority.
+    pub fn validate(&self) -> Result<(), AvailabilityError> {
+        let validation_path = PathBuf::from(format!(
+            "<prepared-availability:{}>",
+            self.project_instance_id
+        ));
+        let recomputed = prepare_availability_batch(
+            self.project_instance_id,
+            self.expected.clone(),
+            &self.batch,
+            &validation_path,
+        )?;
+        if recomputed.target != self.target {
+            return Err(AvailabilityError::InvalidData {
+                path: validation_path,
+                reason: "prepared availability target does not match its ordered operations"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Whether a prepared availability publication changed the authoritative
+/// directory entry or observed that an earlier attempt already did so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityBatchDisposition {
+    Published,
+    AlreadyApplied,
+}
+
+/// Result of applying a direct or prepared availability batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailabilityBatchApplyResult {
+    disposition: AvailabilityBatchDisposition,
+    target: AvailabilityStateImage,
+}
+
+impl AvailabilityBatchApplyResult {
+    #[must_use]
+    pub const fn disposition(&self) -> AvailabilityBatchDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &AvailabilityStateImage {
+        &self.target
+    }
+}
+
+fn prepare_availability_batch(
+    project_instance_id: ProjectInstanceId,
+    expected: AvailabilityStateImage,
+    batch: &AvailabilityBatch,
+    path: &Path,
+) -> Result<PreparedAvailabilityBatch, AvailabilityError> {
+    validate_availability_image(&expected, path)?;
+    let mut target = expected.clone();
+    for operation in batch.operations() {
+        validate_batch_operation(operation, path)?;
+        apply_batch_operation(&mut target, operation, batch.effective_at())?;
+        if let AvailabilityStateImage::Present(availability) = &target {
+            availability
+                .validate()
+                .map_err(|reason| AvailabilityError::InvalidData {
+                    path: path.to_path_buf(),
+                    reason,
+                })?;
+        }
+    }
+
+    Ok(PreparedAvailabilityBatch {
+        project_instance_id,
+        batch: batch.clone(),
+        expected,
+        target,
+    })
+}
+
+fn validate_batch_operation(
+    operation: &AvailabilityBatchOperation,
+    path: &Path,
+) -> Result<(), AvailabilityError> {
+    let demand = match operation {
+        AvailabilityBatchOperation::EnsureDemand(key)
+        | AvailabilityBatchOperation::RenewDemand(key)
+        | AvailabilityBatchOperation::RevalidateDemand(key)
+        | AvailabilityBatchOperation::ReleaseDemand(key)
+        | AvailabilityBatchOperation::ImportDemand { key, .. } => Some(key),
+        AvailabilityBatchOperation::Initialize
+        | AvailabilityBatchOperation::SetAlwaysOn(_)
+        | AvailabilityBatchOperation::PauseProject
+        | AvailabilityBatchOperation::SetTrustedLaunchPath(_)
+        | AvailabilityBatchOperation::Retire => None,
+    };
+    if let Some(demand) = demand {
+        demand
+            .validate()
+            .map_err(|reason| AvailabilityError::InvalidData {
+                path: path.to_path_buf(),
+                reason: format!("invalid demand operation: {reason}"),
+            })?;
+    }
+    Ok(())
+}
+
+fn validate_availability_image(
+    image: &AvailabilityStateImage,
+    path: &Path,
+) -> Result<(), AvailabilityError> {
+    if let AvailabilityStateImage::Present(availability) = image {
+        availability
+            .validate()
+            .map_err(|reason| AvailabilityError::InvalidData {
+                path: path.to_path_buf(),
+                reason,
+            })?;
+    }
+    Ok(())
+}
+
+fn apply_batch_operation(
+    image: &mut AvailabilityStateImage,
+    operation: &AvailabilityBatchOperation,
+    effective_at: SystemTime,
+) -> Result<(), AvailabilityError> {
+    match operation {
+        AvailabilityBatchOperation::Initialize => {
+            if matches!(image, AvailabilityStateImage::Retired) {
+                *image = AvailabilityStateImage::Present(ProjectAvailability::default());
+            }
+        }
+        AvailabilityBatchOperation::EnsureDemand(key) => {
+            let availability = materialize_availability(image);
+            let _result = availability.ensure_demand(key.clone(), effective_at)?;
+        }
+        AvailabilityBatchOperation::RenewDemand(key) => {
+            if let AvailabilityStateImage::Present(availability) = image {
+                let _result = availability.renew_demand(key, effective_at)?;
+            }
+        }
+        AvailabilityBatchOperation::RevalidateDemand(key) => {
+            if let AvailabilityStateImage::Present(availability) = image {
+                let _result = availability.revalidate_demand(key, effective_at)?;
+            }
+        }
+        AvailabilityBatchOperation::ImportDemand { key, acquired_at } => {
+            let availability = materialize_availability(image);
+            let _imported = availability.import_demand(key.clone(), *acquired_at, effective_at)?;
+        }
+        AvailabilityBatchOperation::ReleaseDemand(key) => {
+            if let AvailabilityStateImage::Present(availability) = image {
+                let _released = availability.release_demand(key, effective_at)?;
+            }
+        }
+        AvailabilityBatchOperation::SetAlwaysOn(enabled) => {
+            if *enabled {
+                let availability = materialize_availability(image);
+                let _changed = availability.set_always_on(true, effective_at)?;
+            } else if let AvailabilityStateImage::Present(availability) = image {
+                let _changed = availability.set_always_on(false, effective_at)?;
+            }
+        }
+        AvailabilityBatchOperation::PauseProject => {
+            let availability = materialize_availability(image);
+            let _changed = availability.pause_project();
+        }
+        AvailabilityBatchOperation::SetTrustedLaunchPath(path) => match path {
+            Some(path) => {
+                let availability = materialize_availability(image);
+                let _changed = availability.set_trusted_launch_path(Some(path.clone()));
+            }
+            None => {
+                if let AvailabilityStateImage::Present(availability) = image {
+                    let _changed = availability.set_trusted_launch_path(None);
+                }
+            }
+        },
+        AvailabilityBatchOperation::Retire => {
+            *image = AvailabilityStateImage::Retired;
+        }
+    }
+    Ok(())
+}
+
+fn materialize_availability(image: &mut AvailabilityStateImage) -> &mut ProjectAvailability {
+    if matches!(image, AvailabilityStateImage::Retired) {
+        *image = AvailabilityStateImage::Present(ProjectAvailability::default());
+    }
+    let AvailabilityStateImage::Present(availability) = image else {
+        unreachable!("retired availability was materialized above");
+    };
+    availability
+}
+
 /// The authoritative runtime action derived from one availability snapshot.
 ///
 /// A cooldown preserves the runtime disposition that already exists: it keeps
@@ -809,6 +1225,17 @@ pub enum AvailabilityError {
 
     #[error("availability invariant failed: {reason}")]
     Invariant { reason: String },
+
+    #[error(
+        "prepared availability batch belongs to project instance {batch_instance}; store owns {store_instance}"
+    )]
+    BatchInstanceMismatch {
+        batch_instance: ProjectInstanceId,
+        store_instance: ProjectInstanceId,
+    },
+
+    #[error("authoritative availability `{path}` changed after its batch was prepared")]
+    BatchBaseMismatch { path: PathBuf },
 
     #[error("availability `{path}` was published and its parent-directory sync failed: {reason}")]
     PublishedNotDurable { path: PathBuf, reason: String },
@@ -876,6 +1303,71 @@ impl<C: Clock> AvailabilityStore<C> {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Prepare a journal-ready batch from one authoritative reload.
+    ///
+    /// Preparation does not publish. The returned payload captures both the
+    /// exact expected image and the deterministic target image and may be
+    /// serialized before [`Self::apply_prepared_batch`] is attempted.
+    pub async fn prepare_batch(
+        &mut self,
+        batch: &AvailabilityBatch,
+    ) -> Result<PreparedAvailabilityBatch, AvailabilityError> {
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        let _guard = mutation_lock.lock_owned().await;
+        let expected = load_availability_image(&self.path, self.project_instance_id).await?;
+        self.availability = expected.cached_availability();
+        prepare_availability_batch(self.project_instance_id, expected, batch, &self.path)
+    }
+
+    /// Apply an ordered batch using one authoritative reload and at most one
+    /// atomic directory-entry publication.
+    ///
+    /// This is the direct, non-journaled form. Durable transaction journals
+    /// should persist [`PreparedAvailabilityBatch`] and call
+    /// [`Self::apply_prepared_batch`] so restart replay compares the captured
+    /// base and target instead of preparing a new transaction.
+    pub async fn apply_batch(
+        &mut self,
+        batch: &AvailabilityBatch,
+    ) -> Result<AvailabilityBatchApplyResult, AvailabilityError> {
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        let _guard = mutation_lock.lock_owned().await;
+        let current = load_availability_image(&self.path, self.project_instance_id).await?;
+        self.availability = current.cached_availability();
+        let prepared = prepare_availability_batch(
+            self.project_instance_id,
+            current.clone(),
+            batch,
+            &self.path,
+        )?;
+        self.apply_prepared_from_current(&prepared, current).await
+    }
+
+    /// Compare and atomically publish a journaled availability transaction.
+    ///
+    /// If the authoritative image equals the prepared target, the earlier
+    /// publication already succeeded and replay returns `AlreadyApplied`. If
+    /// it equals the captured base, the target is published. Any third state
+    /// fails closed without modifying the authoritative file.
+    pub async fn apply_prepared_batch(
+        &mut self,
+        prepared: &PreparedAvailabilityBatch,
+    ) -> Result<AvailabilityBatchApplyResult, AvailabilityError> {
+        if prepared.project_instance_id != self.project_instance_id {
+            return Err(AvailabilityError::BatchInstanceMismatch {
+                batch_instance: prepared.project_instance_id,
+                store_instance: self.project_instance_id,
+            });
+        }
+        prepared.validate()?;
+
+        let mutation_lock = Arc::clone(&self.mutation_lock);
+        let _guard = mutation_lock.lock_owned().await;
+        let current = load_availability_image(&self.path, self.project_instance_id).await?;
+        self.availability = current.cached_availability();
+        self.apply_prepared_from_current(prepared, current).await
     }
 
     /// Explicitly acquire, renew, or resume one demand.
@@ -1073,6 +1565,37 @@ impl<C: Clock> AvailabilityStore<C> {
         Ok(result)
     }
 
+    async fn apply_prepared_from_current(
+        &mut self,
+        prepared: &PreparedAvailabilityBatch,
+        current: AvailabilityStateImage,
+    ) -> Result<AvailabilityBatchApplyResult, AvailabilityError> {
+        if current == prepared.target {
+            repair_availability_image_durability(&prepared.target, &self.path).await?;
+            return Ok(AvailabilityBatchApplyResult {
+                disposition: AvailabilityBatchDisposition::AlreadyApplied,
+                target: prepared.target.clone(),
+            });
+        }
+        if current != prepared.expected {
+            return Err(AvailabilityError::BatchBaseMismatch {
+                path: self.path.clone(),
+            });
+        }
+
+        let result =
+            publish_availability_image(&prepared.target, self.project_instance_id, &self.path)
+                .await;
+        if result.is_ok() || matches!(&result, Err(AvailabilityError::PublishedNotDurable { .. })) {
+            self.availability = prepared.target.cached_availability();
+        }
+        result?;
+        Ok(AvailabilityBatchApplyResult {
+            disposition: AvailabilityBatchDisposition::Published,
+            target: prepared.target.clone(),
+        })
+    }
+
     async fn commit(&mut self, candidate: ProjectAvailability) -> Result<(), AvailabilityError> {
         self.commit_with_parent_sync(candidate, |path| async move { sync_parent(&path).await })
             .await
@@ -1120,10 +1643,35 @@ async fn load_availability(
     path: &Path,
     project_instance_id: ProjectInstanceId,
 ) -> Result<ProjectAvailability, AvailabilityError> {
+    Ok(load_availability_image(path, project_instance_id)
+        .await?
+        .cached_availability())
+}
+
+async fn load_availability_image(
+    path: &Path,
+    project_instance_id: ProjectInstanceId,
+) -> Result<AvailabilityStateImage, AvailabilityError> {
     let content = match tokio::fs::read(path).await {
         Ok(content) => content,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(ProjectAvailability::default());
+            match availability_entry_exists(path).await {
+                Ok(false) => return Ok(AvailabilityStateImage::Retired),
+                Ok(true) => {
+                    return Err(AvailabilityError::Io {
+                        operation: "read availability state",
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+                Err(metadata_source) => {
+                    return Err(AvailabilityError::Io {
+                        operation: "inspect availability state after missing read",
+                        path: path.to_path_buf(),
+                        source: metadata_source,
+                    });
+                }
+            }
         }
         Err(source) => {
             return Err(AvailabilityError::Io {
@@ -1174,7 +1722,84 @@ async fn load_availability(
             path: path.to_path_buf(),
             reason,
         })?;
-    Ok(file.availability)
+    Ok(AvailabilityStateImage::Present(file.availability))
+}
+
+async fn availability_entry_exists(path: &Path) -> io::Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(source),
+    }
+}
+
+async fn publish_availability_image(
+    image: &AvailabilityStateImage,
+    project_instance_id: ProjectInstanceId,
+    path: &Path,
+) -> Result<(), AvailabilityError> {
+    match image {
+        AvailabilityStateImage::Present(availability) => {
+            replace_availability_with_parent_sync(
+                availability,
+                project_instance_id,
+                path,
+                |path| async move { sync_parent(&path).await },
+            )
+            .await
+        }
+        AvailabilityStateImage::Retired => retire_availability(path).await,
+    }
+}
+
+async fn retire_availability(path: &Path) -> Result<(), AvailabilityError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => sync_parent(path)
+            .await
+            .map_err(|error| AvailabilityError::PublishedNotDurable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            repair_availability_image_durability(&AvailabilityStateImage::Retired, path).await
+        }
+        Err(source) => Err(AvailabilityError::Io {
+            operation: "retire availability state",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+async fn repair_availability_image_durability(
+    image: &AvailabilityStateImage,
+    path: &Path,
+) -> Result<(), AvailabilityError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AvailabilityError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "availability path has no parent directory".to_owned(),
+        })?;
+    if matches!(image, AvailabilityStateImage::Retired) {
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(AvailabilityError::Io {
+                    operation: "inspect retired availability directory",
+                    path: parent.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    sync_directory(parent)
+        .await
+        .map_err(|error| AvailabilityError::PublishedNotDurable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })
 }
 
 async fn replace_availability_with_parent_sync<Sync, SyncFuture>(
@@ -1297,33 +1922,22 @@ async fn sync_new_availability_hierarchy(path: &Path) -> Result<(), Availability
             path: path.to_path_buf(),
             reason: "availability path has no instance directory".to_owned(),
         })?;
-    let instances_root =
-        project_state_directory
-            .parent()
-            .ok_or_else(|| AvailabilityError::InvalidData {
-                path: path.to_path_buf(),
-                reason: "availability path has no instances directory".to_owned(),
-            })?;
-    let data_directory = instances_root
-        .parent()
-        .ok_or_else(|| AvailabilityError::InvalidData {
-            path: path.to_path_buf(),
-            reason: "availability path has no data directory".to_owned(),
-        })?;
-    let data_parent = data_directory
-        .parent()
-        .ok_or_else(|| AvailabilityError::InvalidData {
-            path: path.to_path_buf(),
-            reason: "availability data directory has no parent".to_owned(),
-        })?;
+    // A retry may see directories created by an earlier failed first
+    // publication as already present. With no durable marker for the former
+    // boundary, repair every directory that can own an entry in the path.
+    for owning_parent in availability_hierarchy_owners(project_state_directory) {
+        sync_directory(&owning_parent).await?;
+    }
+    Ok(())
+}
 
-    // A successful first publication must make every newly introduced
-    // directory entry durable, not only the final availability.json entry.
-    // Syncing all three parents also repairs a hierarchy left by an earlier
-    // failed first-publication attempt.
-    sync_directory(instances_root).await?;
-    sync_directory(data_directory).await?;
-    sync_directory(data_parent).await
+fn availability_hierarchy_owners(project_state_directory: &Path) -> Vec<PathBuf> {
+    project_state_directory
+        .ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.parent().is_some())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 async fn sync_directory(path: &Path) -> Result<(), AvailabilityError> {
@@ -1418,6 +2032,21 @@ mod tests {
             .expect("load availability store")
     }
 
+    #[test]
+    fn first_publication_repairs_every_non_root_hierarchy_owner() {
+        assert_eq!(
+            availability_hierarchy_owners(Path::new(
+                "/existing/missing/nested/instances/instance-id"
+            )),
+            vec![
+                PathBuf::from("/existing/missing/nested/instances"),
+                PathBuf::from("/existing/missing/nested"),
+                PathBuf::from("/existing/missing"),
+                PathBuf::from("/existing"),
+            ]
+        );
+    }
+
     fn temporary_files(path: &Path) -> Vec<PathBuf> {
         let Some(parent) = path.parent() else {
             return Vec::new();
@@ -1463,6 +2092,19 @@ mod tests {
                 kind: DemandKind::VsCodeWindow
             }
         );
+        let manual_session = DemandKey::manual_cli_session("manual-session-123")
+            .expect("construct owned Manual CLI demand");
+        let serialized_manual =
+            serde_json::to_string(&manual_session).expect("serialize owned Manual CLI demand");
+        assert_eq!(manual_session.kind(), DemandKind::ManualCli);
+        assert_eq!(manual_session.safe_label(), "Manual CLI");
+        assert_ne!(manual_session, DemandKey::manual_cli());
+        assert!(!serialized_manual.contains("manual-session-123"));
+        assert_eq!(
+            serde_json::from_str::<DemandKey>(&serialized_manual)
+                .expect("deserialize owned Manual CLI demand"),
+            manual_session
+        );
         assert_eq!(AGENT_DEMAND_TTL, AGENT_ACTIVE_TTL + AGENT_REVIEW_GRACE);
     }
 
@@ -1489,6 +2131,470 @@ mod tests {
         lease.expires_at = Some(now + Duration::from_secs(1));
 
         assert!(lease.validate(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_initialization_materializes_one_authoritative_record() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(31);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let batch = AvailabilityBatch::new(clock.time())
+            .with_operation(AvailabilityBatchOperation::Initialize);
+
+        let prepared = store
+            .prepare_batch(&batch)
+            .await
+            .expect("prepare initialization");
+        assert_eq!(prepared.expected(), &AvailabilityStateImage::Retired);
+        assert_eq!(
+            prepared.target(),
+            &AvailabilityStateImage::Present(ProjectAvailability::default())
+        );
+        assert!(!store.path().exists());
+
+        let applied = store
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect("publish initialization");
+        assert_eq!(
+            applied.disposition(),
+            AvailabilityBatchDisposition::Published
+        );
+        assert!(store.path().is_file());
+
+        let replayed = store
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect("replay initialization");
+        assert_eq!(
+            replayed.disposition(),
+            AvailabilityBatchDisposition::AlreadyApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn serialized_prepared_replay_preserves_fixed_deadlines_and_generation() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(32);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let effective_at = clock.time();
+        let batch = AvailabilityBatch::new(effective_at).with_operation(
+            AvailabilityBatchOperation::EnsureDemand(DemandKey::manual_cli()),
+        );
+        let prepared = store
+            .prepare_batch(&batch)
+            .await
+            .expect("prepare fixed-time ensure");
+        let journal_bytes = serde_json::to_vec(&prepared).expect("serialize prepared batch");
+
+        clock.advance(Duration::from_hours(1));
+        let replay_payload: PreparedAvailabilityBatch =
+            serde_json::from_slice(&journal_bytes).expect("deserialize prepared batch");
+        store
+            .apply_prepared_batch(&replay_payload)
+            .await
+            .expect("apply prepared batch after clock advance");
+        let first_bytes = std::fs::read(store.path()).expect("read first publication");
+
+        clock.advance(Duration::from_hours(1));
+        let mut restarted = fake_store(&fixture, project_instance_id, clock).await;
+        let replayed = restarted
+            .apply_prepared_batch(&replay_payload)
+            .await
+            .expect("replay prepared batch after restart");
+        assert_eq!(
+            replayed.disposition(),
+            AvailabilityBatchDisposition::AlreadyApplied
+        );
+        assert_eq!(
+            std::fs::read(restarted.path()).expect("read replayed publication"),
+            first_bytes
+        );
+
+        let snapshot = restarted.snapshot().await.expect("load replayed snapshot");
+        assert_eq!(snapshot.activity_generation(), 1);
+        let demand = snapshot.demands().first().expect("manual demand exists");
+        assert_eq!(demand.acquired_at(), effective_at);
+        assert_eq!(demand.renewed_at(), effective_at);
+        assert_eq!(demand.expires_at(), Some(effective_at + MANUAL_DEMAND_TTL));
+    }
+
+    #[test]
+    fn prepared_validation_rejects_invalid_keys_in_noop_demand_operations() {
+        let effective_at = UNIX_EPOCH + Duration::from_secs(START_SECONDS);
+        let key =
+            DemandKey::legacy_process_attachment("process-42").expect("construct process demand");
+        let operations = [
+            AvailabilityBatchOperation::RenewDemand(key.clone()),
+            AvailabilityBatchOperation::RevalidateDemand(key.clone()),
+            AvailabilityBatchOperation::ReleaseDemand(key.clone()),
+            AvailabilityBatchOperation::ImportDemand {
+                key,
+                acquired_at: effective_at - LEGACY_PROCESS_DEMAND_TTL,
+            },
+        ];
+
+        for operation in operations {
+            let batch = AvailabilityBatch::new(effective_at).with_operation(operation);
+            let prepared = prepare_availability_batch(
+                instance_id(39),
+                AvailabilityStateImage::Retired,
+                &batch,
+                Path::new("<tampered-journal>"),
+            )
+            .expect("prepare valid no-op demand operation");
+            let mut encoded = serde_json::to_value(prepared).expect("serialize prepared batch");
+            let value = &mut encoded["batch"]["operations"][0]["value"];
+            let key = if value.get("key").is_some() {
+                &mut value["key"]
+            } else {
+                value
+            };
+            key["owner"] = serde_json::json!("not-a-canonical-digest");
+            let tampered: PreparedAvailabilityBatch =
+                serde_json::from_value(encoded).expect("decode structurally valid tampered batch");
+
+            assert!(matches!(
+                tampered.validate(),
+                Err(AvailabilityError::InvalidData { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn persisted_availability_enums_reject_unknown_fields() {
+        let effective_at = UNIX_EPOCH + Duration::from_secs(START_SECONDS);
+        let batch = AvailabilityBatch::new(effective_at)
+            .with_operation(AvailabilityBatchOperation::Initialize);
+        let prepared = prepare_availability_batch(
+            instance_id(40),
+            AvailabilityStateImage::Retired,
+            &batch,
+            Path::new("<unknown-fields>"),
+        )
+        .expect("prepare initialization");
+
+        let mut unknown_operation =
+            serde_json::to_value(&prepared).expect("serialize prepared operation");
+        unknown_operation["batch"]["operations"][0]["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<PreparedAvailabilityBatch>(unknown_operation).is_err(),
+            "operation payload must reject unknown fields"
+        );
+
+        let mut unknown_image = serde_json::to_value(prepared).expect("serialize prepared image");
+        unknown_image["expected"]["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<PreparedAvailabilityBatch>(unknown_image).is_err(),
+            "state image must reject unknown fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_operation_order_controls_pause_barrier_semantics() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(33);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let stop_batch = AvailabilityBatch::new(clock.time())
+            .with_operation(AvailabilityBatchOperation::EnsureDemand(
+                DemandKey::manual_cli(),
+            ))
+            .with_operation(AvailabilityBatchOperation::PauseProject);
+        let stopped = store
+            .apply_batch(&stop_batch)
+            .await
+            .expect("ensure then pause");
+        let AvailabilityStateImage::Present(stopped) = stopped.target() else {
+            panic!("stopped target should remain present");
+        };
+        assert_eq!(stopped.activity_generation(), 1);
+        assert!(stopped.is_paused());
+        assert!(!stopped.desired_up_at(clock.time()));
+
+        clock.advance(Duration::from_secs(1));
+        let resume_batch = AvailabilityBatch::new(clock.time())
+            .with_operation(AvailabilityBatchOperation::PauseProject)
+            .with_operation(AvailabilityBatchOperation::EnsureDemand(
+                DemandKey::manual_cli(),
+            ));
+        let prepared = store
+            .prepare_batch(&resume_batch)
+            .await
+            .expect("prepare pause then ensure");
+        store
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect("publish pause then ensure");
+        store
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect("replay pause then ensure");
+
+        let resumed = store.snapshot().await.expect("load resumed snapshot");
+        assert_eq!(resumed.activity_generation(), 2);
+        assert!(!resumed.is_paused());
+        assert!(resumed.desired_up_at(clock.time()));
+    }
+
+    #[tokio::test]
+    async fn process_revalidation_extends_an_expired_lease_at_its_original_generation() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(35);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let process =
+            DemandKey::legacy_process_attachment("pid-42").expect("construct process demand");
+        store
+            .apply_batch(
+                &AvailabilityBatch::new(clock.time())
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(process.clone()))
+                    .with_operation(AvailabilityBatchOperation::PauseProject),
+            )
+            .await
+            .expect("seed paused process demand");
+
+        clock.advance(LEGACY_PROCESS_DEMAND_TTL + Duration::from_secs(1));
+        store
+            .apply_batch(
+                &AvailabilityBatch::new(clock.time())
+                    .with_operation(AvailabilityBatchOperation::RevalidateDemand(process)),
+            )
+            .await
+            .expect("revalidate process-proven owner");
+
+        let snapshot = store.snapshot().await.expect("load revalidated state");
+        assert_eq!(snapshot.activity_generation(), 1);
+        assert!(snapshot.is_paused());
+        assert_eq!(snapshot.demands().len(), 1);
+        assert_eq!(
+            snapshot.demands()[0].expires_at(),
+            Some(clock.time() + LEGACY_PROCESS_DEMAND_TTL)
+        );
+        assert!(!snapshot.desired_up_at(clock.time()));
+    }
+
+    #[tokio::test]
+    async fn process_revalidation_does_not_recreate_a_swept_lease() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(36);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let process =
+            DemandKey::legacy_process_attachment("pid-42").expect("construct process demand");
+        store
+            .ensure_demand(process.clone())
+            .await
+            .expect("seed process demand");
+        clock.advance(LEGACY_PROCESS_DEMAND_TTL + Duration::from_secs(1));
+        store.expire_demands().await.expect("sweep expired demand");
+
+        store
+            .apply_batch(
+                &AvailabilityBatch::new(clock.time())
+                    .with_operation(AvailabilityBatchOperation::RevalidateDemand(process)),
+            )
+            .await
+            .expect("apply missing process revalidation");
+        let snapshot = store.snapshot().await.expect("load swept state");
+        assert_eq!(snapshot.activity_generation(), 1);
+        assert!(snapshot.demands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn imported_hold_keeps_its_original_deadline_and_expired_holds_stay_absent() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let acquired_at = clock.time() - Duration::from_hours(3);
+        let mut live = fake_store(&fixture, instance_id(37), clock.clone()).await;
+        live.apply_batch(&AvailabilityBatch::new(clock.time()).with_operation(
+            AvailabilityBatchOperation::ImportDemand {
+                key: DemandKey::manual_cli(),
+                acquired_at,
+            },
+        ))
+        .await
+        .expect("import live hold");
+        let snapshot = live.snapshot().await.expect("load imported hold");
+        assert_eq!(snapshot.activity_generation(), 1);
+        assert_eq!(
+            snapshot.demands()[0].expires_at(),
+            Some(acquired_at + MANUAL_DEMAND_TTL)
+        );
+
+        let mut expired = fake_store(&fixture, instance_id(38), clock.clone()).await;
+        expired
+            .apply_batch(&AvailabilityBatch::new(clock.time()).with_operation(
+                AvailabilityBatchOperation::ImportDemand {
+                    key: DemandKey::manual_cli(),
+                    acquired_at: clock.time() - MANUAL_DEMAND_TTL,
+                },
+            ))
+            .await
+            .expect("ignore expired hold");
+        let snapshot = expired.snapshot().await.expect("load expired import");
+        assert_eq!(snapshot.activity_generation(), 0);
+        assert!(snapshot.demands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_retirement_removes_state_and_replays_idempotently() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(34);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let seed = AvailabilityBatch::new(clock.time())
+            .with_operation(AvailabilityBatchOperation::EnsureDemand(
+                DemandKey::manual_cli(),
+            ))
+            .with_operation(AvailabilityBatchOperation::SetAlwaysOn(true))
+            .with_operation(AvailabilityBatchOperation::SetTrustedLaunchPath(Some(
+                "/usr/bin".to_owned(),
+            )));
+        store.apply_batch(&seed).await.expect("seed availability");
+        assert!(store.path().is_file());
+
+        let retire =
+            AvailabilityBatch::new(clock.time()).with_operation(AvailabilityBatchOperation::Retire);
+        let prepared = store
+            .prepare_batch(&retire)
+            .await
+            .expect("prepare retirement");
+        let applied = store
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect("retire availability");
+        assert_eq!(
+            applied.disposition(),
+            AvailabilityBatchDisposition::Published
+        );
+        assert!(!store.path().exists());
+
+        let mut restarted = fake_store(&fixture, project_instance_id, clock).await;
+        let replayed = restarted
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect("replay retirement");
+        assert_eq!(
+            replayed.disposition(),
+            AvailabilityBatchDisposition::AlreadyApplied
+        );
+        assert_eq!(
+            restarted.snapshot().await.expect("load retired state"),
+            ProjectAvailability::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_publication_fails_closed_after_base_changes() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(35);
+        let mut first = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let mut second = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let prepared = first
+            .prepare_batch(&AvailabilityBatch::new(clock.time()).with_operation(
+                AvailabilityBatchOperation::EnsureDemand(DemandKey::manual_cli()),
+            ))
+            .await
+            .expect("prepare manual demand");
+
+        second
+            .apply_batch(
+                &AvailabilityBatch::new(clock.time())
+                    .with_operation(AvailabilityBatchOperation::SetAlwaysOn(true)),
+            )
+            .await
+            .expect("publish intervening policy");
+        let intervening = std::fs::read(second.path()).expect("read intervening publication");
+
+        let error = first
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect_err("reject stale prepared base");
+        assert!(matches!(error, AvailabilityError::BatchBaseMismatch { .. }));
+        assert_eq!(
+            std::fs::read(first.path()).expect("reread authoritative state"),
+            intervening
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_default_base_preserves_a_dangling_availability_symlink() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(36);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let prepared = store
+            .prepare_batch(
+                &AvailabilityBatch::new(clock.time())
+                    .with_operation(AvailabilityBatchOperation::Initialize),
+            )
+            .await
+            .expect("prepare availability from the retired default base");
+        assert_eq!(prepared.expected(), &AvailabilityStateImage::Retired);
+
+        let availability_path = store.path().to_path_buf();
+        let parent = availability_path
+            .parent()
+            .expect("availability path has a parent");
+        std::fs::create_dir_all(parent).expect("create availability parent");
+        let missing_target = parent.join("missing-availability-target.json");
+        std::os::unix::fs::symlink(&missing_target, &availability_path)
+            .expect("create dangling availability symlink");
+
+        let error = store
+            .apply_prepared_batch(&prepared)
+            .await
+            .expect_err("dangling availability entry must not equal the retired base");
+        assert!(matches!(
+            error,
+            AvailabilityError::Io {
+                operation: "read availability state",
+                source,
+                ..
+            } if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(
+            std::fs::symlink_metadata(&availability_path)
+                .expect("inspect preserved availability entry")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&availability_path)
+                .expect("read preserved dangling availability symlink"),
+            missing_target
+        );
+        assert!(temporary_files(&availability_path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_malformed_authoritative_state_without_rewriting_it() {
+        let fixture = Fixture::new();
+        let clock = FakeClock::new(START_SECONDS);
+        let project_instance_id = instance_id(36);
+        let mut store = fake_store(&fixture, project_instance_id, clock.clone()).await;
+        let content = b"{ malformed availability";
+        std::fs::create_dir_all(store.path().parent().expect("availability parent"))
+            .expect("create availability parent");
+        std::fs::write(store.path(), content).expect("write malformed availability");
+
+        let error = store
+            .apply_batch(
+                &AvailabilityBatch::new(clock.time())
+                    .with_operation(AvailabilityBatchOperation::Retire),
+            )
+            .await
+            .expect_err("reject malformed authoritative state");
+        assert!(matches!(error, AvailabilityError::InvalidData { .. }));
+        assert_eq!(
+            std::fs::read(store.path()).expect("read preserved malformed state"),
+            content
+        );
     }
 
     #[tokio::test]

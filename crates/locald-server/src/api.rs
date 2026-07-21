@@ -199,13 +199,12 @@ async fn handle_service_start(
     Path(name): Path<String>,
     State(pm): State<Arc<ProcessManager>>,
 ) -> impl IntoResponse {
-    if let Some(path) = pm.get_service_path(&name).await {
-        match pm.start(path, None, false).await {
-            Ok(()) => StatusCode::OK.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    match pm.start_service(&name).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) if error.is::<ServiceNotFoundError>() => {
+            (StatusCode::NOT_FOUND, "Service not found").into_response()
         }
-    } else {
-        (StatusCode::NOT_FOUND, "Service not found").into_response()
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
