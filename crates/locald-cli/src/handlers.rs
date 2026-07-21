@@ -102,20 +102,18 @@ fn resolve_project_locator(path: &std::path::Path) -> anyhow::Result<std::path::
     })
 }
 
-fn stream_up_start<StreamStart>(
-    project_path: &std::path::Path,
+fn prepare_up_start(
+    project_locator: &std::path::Path,
     verbose: bool,
     manual_cli_session: Option<ManualCliSession>,
-    mut stream_start: StreamStart,
-) -> CliResult<()>
-where
-    StreamStart: FnMut(&IpcRequest) -> CliResult<()>,
-{
-    stream_start(&IpcRequest::Start {
-        project_path: project_path.to_path_buf(),
+) -> CliResult<(std::path::PathBuf, IpcRequest)> {
+    let project_path = resolve_project_locator(project_locator)?;
+    let request = IpcRequest::Start {
+        project_path: project_path.clone(),
         verbose,
         manual_cli_session,
-    })
+    };
+    Ok((project_path, request))
 }
 
 fn warn_if_daemon_identity_mismatch() {
@@ -474,19 +472,15 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let abs_path = std::fs::canonicalize(target_path).context("Failed to resolve path")?;
             let manual_cli_session =
                 (!*exit_after_register).then(|| ManualCliSession::new(std::process::id()));
+            let (abs_path, start_request) =
+                prepare_up_start(&target_path, *verbose, manual_cli_session)?;
 
             // Start services with streaming output.
             let mut attempts = 0;
             loop {
-                match stream_up_start(
-                    &abs_path,
-                    *verbose,
-                    manual_cli_session,
-                    client::stream_boot_events,
-                ) {
+                match client::stream_boot_events(&start_request) {
                     Ok(()) => {
                         cliclack::outro("Project registered")?;
                         break;
@@ -2230,33 +2224,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_project_locator_is_lexically_normalized() {
+    fn locald_up_resolves_a_missing_project_locator() {
         let directory = tempfile::tempdir().expect("create locator directory");
         let locator = directory.path().join("missing").join("..").join("project");
+        let expected = std::fs::canonicalize(directory.path())
+            .expect("canonicalize locator directory")
+            .join("project");
+        let (resolved, request) =
+            prepare_up_start(&locator, false, None).expect("prepare missing project start");
 
-        assert_eq!(
-            resolve_project_locator(&locator).expect("resolve missing locator"),
-            std::fs::canonicalize(directory.path())
-                .expect("canonicalize locator directory")
-                .join("project")
-        );
+        assert_eq!(resolved, expected);
+        assert!(matches!(
+            request,
+            IpcRequest::Start { project_path, .. } if project_path == expected
+        ));
     }
 
     #[test]
-    fn missing_project_locator_resolves_a_symlinked_ancestor() {
+    fn locald_up_normalizes_symlinked_project_spelling() {
         let directory = tempfile::tempdir().expect("create locator directory");
         let real = directory.path().join("real");
         let alias = directory.path().join("alias");
-        std::fs::create_dir(&real).expect("create real locator ancestor");
+        let project = real.join("project");
+        std::fs::create_dir_all(&project).expect("create real project path");
         std::os::unix::fs::symlink(&real, &alias).expect("create locator symlink");
+        let expected = std::fs::canonicalize(project).expect("canonicalize real project path");
+        let (resolved, request) = prepare_up_start(&alias.join("project"), false, None)
+            .expect("prepare project start through symlink spelling");
 
-        assert_eq!(
-            resolve_project_locator(&alias.join("missing-project"))
-                .expect("resolve locator through symlinked ancestor"),
-            std::fs::canonicalize(real)
-                .expect("canonicalize real locator ancestor")
-                .join("missing-project")
-        );
+        assert_eq!(resolved, expected);
+        assert!(matches!(
+            request,
+            IpcRequest::Start { project_path, .. } if project_path == expected
+        ));
     }
 
     #[test]
@@ -2276,34 +2276,30 @@ mod tests {
         let project = std::path::Path::new("/projects/example");
         let session = ManualCliSession::new(std::process::id());
 
-        stream_up_start(project, false, Some(session), |request| {
-            assert!(matches!(
-                request,
-                IpcRequest::Start {
-                    manual_cli_session: Some(actual),
-                    ..
-                } if *actual == session
-            ));
-            Ok(())
-        })
-        .expect("stream paired normal-up lifecycle request");
+        let (_, request) = prepare_up_start(project, false, Some(session))
+            .expect("prepare paired normal-up lifecycle request");
+        assert!(matches!(
+            request,
+            IpcRequest::Start {
+                manual_cli_session: Some(actual),
+                ..
+            } if actual == session
+        ));
     }
 
     #[test]
     fn exit_after_register_streams_start_without_a_manual_cli_owner() {
         let project = std::path::Path::new("/projects/example");
 
-        stream_up_start(project, false, None, |request| {
-            assert!(matches!(
-                request,
-                IpcRequest::Start {
-                    manual_cli_session: None,
-                    ..
-                }
-            ));
-            Ok(())
-        })
-        .expect("stream non-following lifecycle request");
+        let (_, request) = prepare_up_start(project, false, None)
+            .expect("prepare non-following lifecycle request");
+        assert!(matches!(
+            request,
+            IpcRequest::Start {
+                manual_cli_session: None,
+                ..
+            }
+        ));
     }
 
     #[test]

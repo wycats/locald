@@ -45,7 +45,12 @@ fn lexically_normalize(path: &Path) -> PathBuf {
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                }
             }
             Component::Normal(segment) => normalized.push(segment),
         }
@@ -57,6 +62,18 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn parent_components_are_clamped_at_the_filesystem_root() {
+        let normalized = lexically_normalize(Path::new("/../foo"));
+
+        assert_eq!(normalized, PathBuf::from("/foo"));
+        assert!(normalized.is_absolute());
+        assert_eq!(
+            lexically_normalize(Path::new("/one/../../../foo")),
+            PathBuf::from("/foo")
+        );
+    }
 
     #[test]
     fn missing_suffix_is_normalized_through_a_symlinked_ancestor() {

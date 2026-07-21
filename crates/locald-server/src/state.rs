@@ -100,13 +100,21 @@ impl StateManager {
                         debug!("No state file found, returning default state");
                         return Ok(ServerState::default());
                     }
-                    Ok(_) => return Err(source).context("Failed to read state file"),
+                    Ok(_) => {
+                        return Err(source).with_context(|| {
+                            format!("Failed to read state file {}", self.state_path.display())
+                        });
+                    }
                     Err(metadata_error) => {
                         return Err(metadata_error).context("Failed to inspect state file");
                     }
                 }
             }
-            Err(source) => return Err(source).context("Failed to read state file"),
+            Err(source) => {
+                return Err(source).with_context(|| {
+                    format!("Failed to read state file {}", self.state_path.display())
+                });
+            }
         };
 
         let state: ServerState =
@@ -313,10 +321,16 @@ mod tests {
             .expect("create dangling runtime state symlink");
         let manager = StateManager::with_path(path.clone());
 
-        manager
+        let error = manager
             .load()
             .await
             .expect_err("dangling runtime state must block loading");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Failed to read state file {}", path.display())),
+            "unexpected dangling runtime state diagnostic: {error:#}"
+        );
         assert!(
             fs::symlink_metadata(&path)
                 .await
