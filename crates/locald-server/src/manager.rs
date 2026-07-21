@@ -1726,6 +1726,36 @@ impl ProcessManager {
         verbose: bool,
         manual_cli_session: Option<ManualCliSession>,
     ) -> Result<()> {
+        self.start_with_request_provenance(path, event_tx, verbose, manual_cli_session, None)
+            .await
+    }
+
+    pub(crate) async fn start_from_ipc(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+        legacy_cli_peer_pid: Option<u32>,
+    ) -> Result<()> {
+        self.start_with_request_provenance(
+            path,
+            event_tx,
+            verbose,
+            manual_cli_session,
+            legacy_cli_peer_pid,
+        )
+        .await
+    }
+
+    async fn start_with_request_provenance(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        manual_cli_session: Option<ManualCliSession>,
+        legacy_cli_peer_pid: Option<u32>,
+    ) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
         let path = Self::canonicalize_path(&path);
         let expected_initial = match self.resolve_lifecycle_target(&path).await? {
@@ -1737,6 +1767,7 @@ impl ProcessManager {
                         event_tx,
                         verbose,
                         manual_cli_session,
+                        legacy_cli_peer_pid,
                     )
                     .await;
             }
@@ -1754,7 +1785,14 @@ impl ProcessManager {
             .start_runtime(path.clone(), None, false, expected_initial)
             .await?;
         let result = self
-            .start_catalogued_instance(instance_id, path, event_tx, verbose, manual_cli_session)
+            .start_catalogued_instance(
+                instance_id,
+                path,
+                event_tx,
+                verbose,
+                manual_cli_session,
+                legacy_cli_peer_pid,
+            )
             .await;
         drop(pending);
         result
@@ -3811,11 +3849,33 @@ impl ProcessManager {
             .collect()
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn project_attach(
         &self,
         project_path: PathBuf,
         source: AttachmentSource,
+    ) -> Result<()> {
+        self.project_attach_with_convergence(project_path, source, true)
+            .await
+    }
+
+    pub(crate) async fn project_attach_from_ipc(
+        &self,
+        project_path: PathBuf,
+        source: AttachmentSource,
+        standalone: bool,
+    ) -> Result<()> {
+        let converge_after_publication =
+            standalone || !matches!(&source, AttachmentSource::CLI { .. });
+        self.project_attach_with_convergence(project_path, source, converge_after_publication)
+            .await
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn project_attach_with_convergence(
+        &self,
+        project_path: PathBuf,
+        source: AttachmentSource,
+        converge_after_publication: bool,
     ) -> Result<()> {
         anyhow::ensure!(
             !matches!(&source, AttachmentSource::Runtime),
@@ -3990,6 +4050,27 @@ impl ProcessManager {
         drop(pending_initial);
         drop(publication_guard);
         drop(transition_guard);
+        if !converge_after_publication {
+            if !renews_existing_owner {
+                // A new semantic owner resumes normal project management even
+                // when an older field-less CLI reserves startup for its
+                // immediately following Start request. Clear one-off service
+                // stops at this attach boundary so a later explicit stop still
+                // wins while the bounded compatibility fallback is waiting.
+                let coordinator = self.availability_coordinator(instance_id).await;
+                let _runtime_guard = coordinator.runtime.lock().await;
+                self.clear_service_stop_suppressions(instance_id).await;
+            }
+            // Older CLIs publish this process owner immediately before opening
+            // their streamed Start request. Keep this adapter to publication so
+            // startup and its boot events remain owned by that next request. If
+            // the process exits without sending Start, preserve the legacy
+            // standalone command by converging after its owner is gone.
+            if let AttachmentSource::CLI { pid } = source {
+                self.converge_legacy_cli_after_process_exit(instance_id, pid);
+            }
+            return Ok(());
+        }
         if renews_existing_owner {
             self.converge_managed_instance(instance_id, None, false, false)
                 .await?;
@@ -5069,6 +5150,36 @@ impl ProcessManager {
             Ok(()) | Err(nix::errno::Errno::EPERM) => true,
             Err(_) => false,
         }
+    }
+
+    fn converge_legacy_cli_after_process_exit(&self, instance_id: ProjectInstanceId, pid: u32) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // Historical `project attach --source cli` is a one-shot command,
+            // while historical `up` keeps the same process alive and follows
+            // immediately with Start. A bounded exit watch preserves the
+            // otherwise wire-identical standalone command without retaining a
+            // task for the lifetime of a log-following owner.
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if manager.is_shutting_down() {
+                    return;
+                }
+                if Self::legacy_pid_alive(pid) {
+                    continue;
+                }
+                if let Err(error) = manager
+                    .converge_managed_instance(instance_id, None, false, false)
+                    .await
+                    && !manager.is_shutting_down()
+                {
+                    warn!(
+                        "Failed to converge field-less CLI attachment for project instance {instance_id} after process {pid} exited: {error:#}"
+                    );
+                }
+                return;
+            }
+        });
     }
 
     /// Re-evaluate one availability-managed project from authoritative state.
@@ -6179,6 +6290,7 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
         manual_cli_session: Option<ManualCliSession>,
+        legacy_cli_peer_pid: Option<u32>,
     ) -> Result<()> {
         let transition_guard = self.attachment_transition_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
@@ -6251,6 +6363,41 @@ impl ProcessManager {
             }
             attachment_target.replace_project(path, compatibility.attachments, false);
         }
+        let legacy_cli_demand = if manual_cli_session.is_none() {
+            legacy_cli_peer_pid
+                .and_then(|peer_pid| {
+                    lifecycle_paths
+                        .iter()
+                        .filter(|path| {
+                            Self::attachment_path_is_owned_by_target(
+                                &attachment_base,
+                                &target,
+                                path,
+                            ) || include_deferred
+                                && Self::attachment_path_can_initialize_target(
+                                    &attachment_base,
+                                    &target,
+                                    path,
+                                )
+                        })
+                        .flat_map(|path| attachment_base.project(path).attachments)
+                        .find_map(|attachment| match attachment.source {
+                            AttachmentSource::CLI { pid } if pid == peer_pid => {
+                                Some(AttachmentSource::CLI { pid })
+                            }
+                            AttachmentSource::Editor { .. }
+                            | AttachmentSource::CLI { .. }
+                            | AttachmentSource::ManualCLI(_)
+                            | AttachmentSource::Runtime
+                            | AttachmentSource::Pin => None,
+                        })
+                })
+                .map(|source| availability_demand_for_attachment_source(&source))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         let mut batch = AvailabilityBatch::new(effective_at);
         if let Some(session) = manual_cli_session {
             let source = session.attachment_source();
@@ -6270,6 +6417,12 @@ impl ProcessManager {
                 availability_demand_for_attachment_source(&source)?
                     .context("Manual CLI session must have a process-bound demand")?,
             ));
+        } else if let Some(demand) = legacy_cli_demand {
+            // A pre-session CLI already published its process attachment on a
+            // preceding connection. Kernel peer provenance lets this streamed
+            // Start renew that exact owner instead of creating an ownerless
+            // four-hour Manual demand that its legacy Detach cannot release.
+            batch.push(AvailabilityBatchOperation::EnsureDemand(demand));
         } else {
             batch.push(AvailabilityBatchOperation::EnsureDemand(
                 DemandKey::manual_cli(),
@@ -8372,6 +8525,310 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_cli_attach_defers_convergence_to_its_streamed_start() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("legacy-streamed-start-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "legacy-streamed-start").await;
+        write_availability_worker_config(
+            &project_path,
+            "legacy-streamed-start",
+            "legacy-streamed-start.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let peer_pid = std::process::id();
+        let source = AttachmentSource::CLI { pid: peer_pid };
+        let process_demand = availability_demand_for_attachment_source(&source)
+            .expect("map legacy CLI owner")
+            .expect("legacy CLI owner has a process demand");
+
+        manager
+            .project_attach_from_ipc(project_path.clone(), source.clone(), false)
+            .await
+            .expect("publish the pre-session CLI owner");
+        assert!(
+            manager
+                .get_service_controller("legacy-streamed-start:web")
+                .await
+                .is_none(),
+            "legacy attach must leave startup to the following streamed Start"
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load attached availability");
+        let attached = availability
+            .snapshot()
+            .await
+            .expect("read attached availability");
+        assert!(
+            attached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &process_demand)
+        );
+        assert!(
+            attached
+                .demands()
+                .iter()
+                .all(|demand| demand.key() != &DemandKey::manual_cli())
+        );
+
+        manager
+            .project_force_stop(project_path.clone())
+            .await
+            .expect("pause the pre-session owner generation");
+        let paused = availability.snapshot().await.expect("read paused owner");
+        assert!(paused.is_paused());
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                Some(event_tx),
+                false,
+                None,
+                Some(peer_pid),
+            )
+            .await
+            .expect("matching legacy Start resumes and converges the process owner");
+        assert!(
+            manager
+                .get_service_controller("legacy-streamed-start:web")
+                .await
+                .is_some()
+        );
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                BootEvent::StepStarted { id, .. } if id == "legacy-streamed-start:web"
+            )),
+            "service startup must be visible to the streamed Start"
+        );
+        let started = availability
+            .snapshot()
+            .await
+            .expect("read matching legacy Start availability");
+        assert!(!started.is_paused());
+        assert_eq!(
+            started.activity_generation(),
+            paused.activity_generation() + 1,
+            "matching streamed Start contributes one semantic activity generation"
+        );
+        assert!(
+            started
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &process_demand)
+        );
+        assert!(
+            started
+                .demands()
+                .iter()
+                .all(|demand| demand.key() != &DemandKey::manual_cli())
+        );
+
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("legacy Ctrl-C releases the process owner");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read detached legacy owner");
+        assert!(detached.demands().is_empty());
+        assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn mismatched_legacy_start_peer_keeps_an_independent_manual_demand() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("mismatched-legacy-peer-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "mismatched-legacy-peer").await;
+        write_availability_worker_config(
+            &project_path,
+            "mismatched-legacy-peer",
+            "mismatched-legacy-peer.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let attached_pid = std::process::id();
+        let different_peer_pid = attached_pid
+            .checked_add(1)
+            .unwrap_or_else(|| attached_pid.saturating_sub(1));
+        let source = AttachmentSource::CLI { pid: attached_pid };
+
+        manager
+            .project_attach_from_ipc(project_path.clone(), source.clone(), false)
+            .await
+            .expect("publish unrelated legacy CLI owner");
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                None,
+                false,
+                None,
+                Some(different_peer_pid),
+            )
+            .await
+            .expect("mismatched legacy Start acquires independent Manual demand");
+        manager
+            .project_detach(project_path, Some(source))
+            .await
+            .expect("detach unrelated legacy CLI owner");
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load mismatched-peer availability");
+        let detached = availability
+            .snapshot()
+            .await
+            .expect("read mismatched-peer availability");
+        assert!(
+            detached
+                .demands()
+                .iter()
+                .any(|demand| demand.key() == &DemandKey::manual_cli())
+        );
+        assert!(detached.demands().iter().all(|demand| {
+            demand.key().kind() != locald_core::DemandKind::LegacyProcessAttachment
+        }));
+    }
+
+    #[tokio::test]
+    async fn standalone_cli_attach_converges_immediately() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("standalone-cli-attach-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "standalone-cli-attach").await;
+        write_availability_worker_config(
+            &project_path,
+            "standalone-cli-attach",
+            "standalone-cli-attach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        manager
+            .project_attach_from_ipc(
+                project_path,
+                AttachmentSource::CLI {
+                    pid: std::process::id(),
+                },
+                true,
+            )
+            .await
+            .expect("standalone CLI attach converges its demand");
+
+        assert!(
+            manager
+                .get_service_controller("standalone-cli-attach:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn fieldless_cli_attach_converges_after_an_unpaired_owner_exits() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("fieldless-cli-attach-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "fieldless-cli-attach").await;
+        write_availability_worker_config(
+            &project_path,
+            "fieldless-cli-attach",
+            "fieldless-cli-attach.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let prior_owner = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "prior-window".to_owned(),
+            pid: None,
+        };
+
+        manager
+            .project_attach(project_path.clone(), prior_owner.clone())
+            .await
+            .expect("start project under prior owner");
+        manager
+            .stop("fieldless-cli-attach:web")
+            .await
+            .expect("stop service under prior owner");
+        manager
+            .project_detach(project_path.clone(), Some(prior_owner))
+            .await
+            .expect("release prior owner");
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "fieldless-cli-attach:web".to_owned()))
+        );
+
+        manager
+            .project_attach_from_ipc(project_path, AttachmentSource::CLI { pid: u32::MAX }, false)
+            .await
+            .expect("publish field-less CLI attachment");
+        assert!(
+            manager
+                .get_service_controller("fieldless-cli-attach:web")
+                .await
+                .is_none(),
+            "field-less attachment initially reserves startup for a paired Start"
+        );
+        assert!(
+            !manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&(instance_id, "fieldless-cli-attach:web".to_owned())),
+            "new field-less owner resumes automatic service management at publication"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .get_service_controller("fieldless-cli-attach:web")
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an exited unpaired owner triggers standalone convergence");
     }
 
     #[tokio::test]
@@ -13764,7 +14221,7 @@ command = "unused-by-test-factory"
             .await
             .expect("remove project before stale start");
         let error = manager
-            .start_catalogued_instance(instance_id, project_path, None, false, None)
+            .start_catalogued_instance(instance_id, project_path, None, false, None, None)
             .await
             .expect_err("captured start cannot restore removed identity");
 

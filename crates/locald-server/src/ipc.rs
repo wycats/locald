@@ -196,12 +196,27 @@ async fn handle_connection(
         manual_cli_session,
     } = request
     {
+        let legacy_cli_peer_pid = if manual_cli_session.is_none() {
+            stream
+                .peer_cred()
+                .ok()
+                .and_then(|credentials| credentials.pid())
+                .and_then(|pid| u32::try_from(pid).ok())
+        } else {
+            None
+        };
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let manager = manager.clone();
 
         let handle = tokio::spawn(async move {
             manager
-                .start_with_manual_cli_session(project_path, Some(tx), verbose, manual_cli_session)
+                .start_from_ipc(
+                    project_path,
+                    Some(tx),
+                    verbose,
+                    manual_cli_session,
+                    legacy_cli_peer_pid,
+                )
                 .await
         });
 
@@ -301,13 +316,17 @@ async fn handle_connection(
         IpcRequest::ProjectAttach {
             project_path,
             source,
+            standalone,
         } => {
             if matches!(source, AttachmentSource::ManualCLI(_)) {
                 IpcResponse::Error(
                     "ManualCLI owners are created only by their paired Start request".to_owned(),
                 )
             } else {
-                match manager.project_attach(project_path, source).await {
+                match manager
+                    .project_attach_from_ipc(project_path, source, standalone)
+                    .await
+                {
                     Ok(()) => IpcResponse::Ok,
                     Err(e) => IpcResponse::Error(e.to_string()),
                 }

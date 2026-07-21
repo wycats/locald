@@ -248,9 +248,12 @@ pub enum IpcRequest {
         verbose: bool,
         /// Retry-stable log-following CLI session paired with this Start.
         ///
-        /// Older and non-following clients omit it. The daemon journals the
-        /// compatibility owner and both of its demands as one lifecycle
-        /// mutation before runtime convergence.
+        /// Current following clients provide it so the daemon can journal the
+        /// compatibility owner and both of its demands before convergence.
+        /// Older clients omit it after publishing a generic CLI attachment;
+        /// the daemon pairs that owner through kernel-authenticated peer PID.
+        /// Non-following clients omit it without a process attachment and
+        /// receive the ordinary Manual CLI demand.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manual_cli_session: Option<ManualCliSession>,
     },
@@ -338,6 +341,13 @@ pub enum IpcRequest {
         project_path: PathBuf,
         /// The source of the attachment.
         source: AttachmentSource,
+        /// Whether this is a standalone attach rather than the prelude to an
+        /// older client's streamed Start request.
+        ///
+        /// This affects only generic CLI compatibility owners. Editor owners
+        /// always converge immediately. Older clients omit the field.
+        #[serde(default)]
+        standalone: bool,
     },
     /// Remove a project attachment.
     ///
@@ -512,5 +522,39 @@ impl ServiceStatus {
             constellation: None,
             warnings: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IpcRequest;
+    use crate::attachments::AttachmentSource;
+    use std::path::PathBuf;
+
+    #[test]
+    fn legacy_project_attach_defaults_to_a_start_prelude() {
+        let mut encoded = serde_json::to_value(IpcRequest::ProjectAttach {
+            project_path: PathBuf::from("/project"),
+            source: AttachmentSource::CLI { pid: 42 },
+            standalone: true,
+        })
+        .expect("serialize project attachment");
+        encoded
+            .get_mut("ProjectAttach")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("project attachment payload")
+            .remove("standalone");
+
+        let decoded: IpcRequest =
+            serde_json::from_value(encoded).expect("deserialize legacy project attachment");
+
+        assert!(matches!(
+            decoded,
+            IpcRequest::ProjectAttach {
+                source: AttachmentSource::CLI { pid: 42 },
+                standalone: false,
+                ..
+            }
+        ));
     }
 }

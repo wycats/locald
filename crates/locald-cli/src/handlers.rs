@@ -1564,6 +1564,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 match client::send_request(&IpcRequest::ProjectAttach {
                     project_path: abs_path,
                     source,
+                    standalone: true,
                 }) {
                     Ok(IpcResponse::Ok) => {
                         if *json {
