@@ -228,7 +228,7 @@ mod macos {
                 )),
                 Err(_) => Err((
                     HelperErrorCode::ConsoleUserMismatch,
-                    "could not verify /dev/console ownership",
+                    "could not inspect /dev/console to verify configured-user ownership",
                 )),
             },
         }
@@ -470,6 +470,14 @@ mod macos {
             assert_error(
                 &handle_command(&bind, &authority(), 501, &Ok(502)),
                 HelperErrorCode::ConsoleUserMismatch,
+            );
+
+            let console_error = Err(anyhow::anyhow!("injected console metadata failure"));
+            let response = handle_command(&bind, &authority(), 501, &console_error);
+            assert_error(&response, HelperErrorCode::ConsoleUserMismatch);
+            assert_eq!(
+                response_string(&response.message, "message").as_deref(),
+                Some("could not inspect /dev/console to verify configured-user ownership")
             );
         }
 
