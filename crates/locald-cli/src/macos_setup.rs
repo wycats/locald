@@ -839,8 +839,18 @@ fn ensure_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
                 .with_context(|| format!("could not create {} safely", current.display()))?;
                 nix::unistd::fsync(&directory)
                     .with_context(|| format!("could not sync {}", current.display()))?;
-                nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
-                    .with_context(|| format!("could not open {} safely", current.display()))?
+                let created =
+                    nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+                        .with_context(|| format!("could not open {} safely", current.display()))?;
+                nix::sys::stat::fchmod(&created, nix::sys::stat::Mode::from_bits_truncate(0o700))
+                    .with_context(|| format!("could not secure {}", current.display()))?;
+                nix::unistd::fchown(
+                    &created,
+                    Some(nix::unistd::Uid::from_raw(uid)),
+                    Some(nix::unistd::Gid::from_raw(gid)),
+                )
+                .with_context(|| format!("could not assign {}", current.display()))?;
+                created
             }
             Err(error) => {
                 return Err(error)

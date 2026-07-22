@@ -128,7 +128,7 @@ pub fn repair_root_ca_in_dir(
     owner_uid: u32,
     owner_gid: u32,
 ) -> Result<EnsureRootCaResult> {
-    let directory = open_or_create_real_directory(certs_dir)?;
+    let directory = open_or_create_real_directory(certs_dir, owner_uid, owner_gid)?;
 
     // Setup normally runs as root. Holding the directory under the effective
     // setup identity prevents the configured user from replacing entries while
@@ -259,7 +259,8 @@ pub fn validate_root_ca_permissions_in_dir(
 }
 
 #[cfg(target_os = "macos")]
-fn open_or_create_real_directory(path: &Path) -> Result<OwnedFd> {
+#[allow(clippy::similar_names)]
+fn open_or_create_real_directory(path: &Path, owner_uid: u32, owner_gid: u32) -> Result<OwnedFd> {
     if !path.is_absolute() {
         anyhow::bail!("Root CA directory must be absolute: {}", path.display());
     }
@@ -295,8 +296,11 @@ fn open_or_create_real_directory(path: &Path) -> Result<OwnedFd> {
                 .with_context(|| format!("Failed to create {} safely", current.display()))?;
                 nix::unistd::fsync(&directory)
                     .with_context(|| format!("Failed to sync {}", current.display()))?;
-                nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
-                    .with_context(|| format!("Failed to open {} safely", current.display()))?
+                let created =
+                    nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+                        .with_context(|| format!("Failed to open {} safely", current.display()))?;
+                set_fd_owner_and_mode(&created, owner_uid, owner_gid, 0o700, &current)?;
+                created
             }
             Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
                 anyhow::bail!(
