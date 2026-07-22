@@ -180,9 +180,10 @@ fn macos_hosts_domains(domains: Vec<String>) -> Vec<String> {
     domains
         .into_iter()
         .filter(|domain| {
-            domain != "localhost"
-                && !domain.ends_with(".localhost")
-                && !locald_core::LEGACY_MACOS_HOST_ALIASES.contains(&domain.as_str())
+            let canonical = domain.to_ascii_lowercase();
+            canonical != "localhost"
+                && !canonical.ends_with(".localhost")
+                && !locald_core::LEGACY_MACOS_HOST_ALIASES.contains(&canonical.as_str())
         })
         .collect()
 }
@@ -8378,14 +8379,16 @@ mod tests {
         assert_eq!(
             macos_hosts_domains(vec![
                 "app.localhost".to_owned(),
+                "Frame.App.Localhost".to_owned(),
                 "dev.docs.local".to_owned(),
                 "custom.example.test".to_owned(),
                 "locald.local".to_owned(),
+                "LOCALD.LOCAL".to_owned(),
             ]),
             ["custom.example.test"]
         );
         assert!(
-            macos_hosts_domains(vec!["app.localhost".to_owned(), "locald.local".to_owned(),])
+            macos_hosts_domains(vec!["app.localhost".to_owned(), "LOCALD.LOCAL".to_owned(),])
                 .is_empty()
         );
     }
