@@ -21,10 +21,7 @@ pub fn update_hosts_content(current_content: &str, domains: &[String]) -> String
         let end = start + relative_end + END_MARKER.len();
         let mut output = String::from(&current_content[..start]);
         output.push_str(&current_content[end..]);
-        while output.contains("\n\n\n") {
-            output = output.replace("\n\n\n", "\n\n");
-        }
-        return output;
+        return collapse_newline_runs(&output);
     }
 
     let mut new_section = String::new();
@@ -56,6 +53,25 @@ pub fn update_hosts_content(current_content: &str, domains: &[String]) -> String
     output
 }
 
+fn collapse_newline_runs(content: &str) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut consecutive_newlines = 0;
+
+    for character in content.chars() {
+        if character == '\n' {
+            consecutive_newlines += 1;
+            if consecutive_newlines > 2 {
+                continue;
+            }
+        } else {
+            consecutive_newlines = 0;
+        }
+        output.push(character);
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::update_hosts_content;
@@ -69,6 +85,18 @@ mod tests {
 
         assert_eq!(updated, "127.0.0.1 localhost\n\n");
         assert_eq!(update_hosts_content(&updated, &[]), updated);
+    }
+
+    #[test]
+    fn empty_domains_collapse_long_newline_runs_in_one_pass() {
+        let current = format!(
+            "before\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald{}after\n",
+            "\n".repeat(10_000)
+        );
+
+        let updated = update_hosts_content(&current, &[]);
+
+        assert_eq!(updated, "before\n\nafter\n");
     }
 
     #[test]
