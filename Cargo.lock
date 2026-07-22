@@ -3554,7 +3554,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
- "security-framework",
  "semver",
  "serde",
  "serde_json",

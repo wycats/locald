@@ -413,6 +413,19 @@ fn validate_port_override_policy(
     Ok(())
 }
 
+fn parse_sandbox_port_override(name: &str, value: Option<&std::ffi::OsStr>) -> Result<Option<u16>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{name} must be a UTF-8 integer from 0 through 65535"))?;
+    let port = value.parse::<u16>().with_context(|| {
+        format!("{name} must be an integer from 0 through 65535; got `{value}`")
+    })?;
+    Ok(Some(port))
+}
+
 #[cfg(target_os = "macos")]
 fn validate_macos_standard_preflight(ca_trusted: bool, helper_probe: Result<()>) -> Result<()> {
     if !ca_trusted {
@@ -526,6 +539,7 @@ async fn load_attachment_store_for_lifecycle_recovery(
     }
 }
 
+#[allow(clippy::similar_names)]
 async fn async_main(
     version: String,
     log_tx: tokio::sync::broadcast::Sender<locald_core::ipc::LogEntry>,
@@ -550,11 +564,22 @@ async fn async_main(
             locald_core::config::GlobalConfig::default()
         });
 
+    let http_port_override = std::env::var_os("LOCALD_HTTP_PORT");
+    let https_port_override = std::env::var_os("LOCALD_HTTPS_PORT");
+    let sandbox = config.server.is_sandbox();
     validate_port_override_policy(
-        config.server.is_sandbox(),
-        std::env::var_os("LOCALD_HTTP_PORT").is_some(),
-        std::env::var_os("LOCALD_HTTPS_PORT").is_some(),
+        sandbox,
+        http_port_override.is_some(),
+        https_port_override.is_some(),
     )?;
+    let http_port_override = sandbox
+        .then(|| parse_sandbox_port_override("LOCALD_HTTP_PORT", http_port_override.as_deref()))
+        .transpose()?
+        .flatten();
+    let https_port_override = sandbox
+        .then(|| parse_sandbox_port_override("LOCALD_HTTPS_PORT", https_port_override.as_deref()))
+        .transpose()?
+        .flatten();
 
     #[cfg(target_os = "macos")]
     if !config.server.is_sandbox() {
@@ -751,10 +776,7 @@ async fn async_main(
     ));
 
     // Bind HTTP
-    let listener_http = if config.server.is_sandbox()
-        && let Ok(port_str) = std::env::var("LOCALD_HTTP_PORT")
-    {
-        let port = port_str.parse::<u16>().unwrap_or(8080);
+    let listener_http = if let Some(port) = http_port_override {
         info!("Binding HTTP to configured port: {}", port);
         match proxy.bind_http(port).await {
             Ok(l) => Some(l),
@@ -812,10 +834,7 @@ async fn async_main(
     }
 
     // Bind HTTPS
-    let listener_https: Option<std::net::TcpListener> = if config.server.is_sandbox()
-        && let Ok(port_str) = std::env::var("LOCALD_HTTPS_PORT")
-    {
-        let port = port_str.parse::<u16>().unwrap_or(8443);
+    let listener_https: Option<std::net::TcpListener> = if let Some(port) = https_port_override {
         info!("Binding HTTPS to configured port: {}", port);
         match proxy.bind_https(port).await {
             Ok(l) => Some(l),
@@ -978,7 +997,8 @@ async fn watch_for_upgrade(
 mod privileged_startup_tests {
     #[cfg(target_os = "macos")]
     use super::validate_macos_standard_preflight;
-    use super::validate_port_override_policy;
+    use super::{parse_sandbox_port_override, validate_port_override_policy};
+    use std::ffi::OsStr;
 
     #[test]
     fn standard_mode_rejects_all_port_overrides() {
@@ -995,6 +1015,30 @@ mod privileged_startup_tests {
     fn sandbox_mode_retains_ephemeral_port_overrides() {
         validate_port_override_policy(true, true, true)
             .expect("sandbox mode may configure both proxy ports");
+    }
+
+    #[test]
+    fn sandbox_port_overrides_are_strictly_parsed() {
+        assert_eq!(
+            parse_sandbox_port_override("LOCALD_HTTP_PORT", None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_sandbox_port_override("LOCALD_HTTP_PORT", Some(OsStr::new("0"))).unwrap(),
+            Some(0)
+        );
+        assert!(
+            parse_sandbox_port_override("LOCALD_HTTP_PORT", Some(OsStr::new("not-a-port")))
+                .unwrap_err()
+                .to_string()
+                .contains("LOCALD_HTTP_PORT")
+        );
+        assert!(
+            parse_sandbox_port_override("LOCALD_HTTPS_PORT", Some(OsStr::new("65536")))
+                .unwrap_err()
+                .to_string()
+                .contains("LOCALD_HTTPS_PORT")
+        );
     }
 
     #[cfg(target_os = "macos")]

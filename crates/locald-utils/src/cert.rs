@@ -245,14 +245,27 @@ pub fn validate_root_ca_permissions_in_dir(
     owner_uid: u32,
     owner_gid: u32,
 ) -> Result<()> {
-    validate_owner_and_mode(certs_dir, owner_uid, owner_gid, 0o700)?;
+    validate_owner_and_mode(
+        certs_dir,
+        owner_uid,
+        owner_gid,
+        0o700,
+        ExpectedPathKind::Directory,
+    )?;
     validate_owner_and_mode(
         &certs_dir.join("rootCA-key.pem"),
         owner_uid,
         owner_gid,
         0o600,
+        ExpectedPathKind::RegularFile,
     )?;
-    validate_owner_and_mode(&certs_dir.join("rootCA.pem"), owner_uid, owner_gid, 0o644)
+    validate_owner_and_mode(
+        &certs_dir.join("rootCA.pem"),
+        owner_uid,
+        owner_gid,
+        0o644,
+        ExpectedPathKind::RegularFile,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -481,11 +494,35 @@ fn set_fd_owner_and_mode(
 }
 
 #[cfg(target_os = "macos")]
-fn validate_owner_and_mode(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+#[derive(Clone, Copy)]
+enum ExpectedPathKind {
+    Directory,
+    RegularFile,
+}
+
+#[cfg(target_os = "macos")]
+fn validate_owner_and_mode(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    expected_kind: ExpectedPathKind,
+) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("Failed to inspect {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         anyhow::bail!("Path must not be a symlink: {}", path.display());
+    }
+    let kind_matches = match expected_kind {
+        ExpectedPathKind::Directory => metadata.is_dir(),
+        ExpectedPathKind::RegularFile => metadata.is_file(),
+    };
+    if !kind_matches {
+        let expected = match expected_kind {
+            ExpectedPathKind::Directory => "directory",
+            ExpectedPathKind::RegularFile => "regular file",
+        };
+        anyhow::bail!("Expected {} to be a {expected}", path.display());
     }
     let actual_mode = metadata.mode() & 0o7777;
     if metadata.uid() != uid || metadata.gid() != gid || actual_mode != mode {
@@ -724,7 +761,7 @@ pub fn get_certs_dir() -> Result<PathBuf> {
 
 /// Check whether the locald Root CA is trusted by the system.
 ///
-/// On macOS, evaluates the certificate with Security.framework Trust Settings.
+/// On macOS, evaluates the certificate with the system certificate verifier.
 /// Returns `true` if the CA file exists and is trusted, `false` otherwise.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
@@ -735,57 +772,19 @@ pub fn is_ca_trusted() -> bool {
     is_ca_path_trusted(&certs_dir.join("rootCA.pem"))
 }
 
-/// Evaluate whether one CA certificate is trusted through macOS Trust Settings.
+/// Evaluate whether one CA certificate is trusted by macOS.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
-    use security_framework::certificate::SecCertificate;
-    use security_framework::policy::SecPolicy;
-    use security_framework::secure_transport::SslProtocolSide;
-    use security_framework::trust::SecTrust;
-
-    const TEST_DOMAIN: &str = "locald-doctor.localhost";
-    let Ok(ca_pem_bytes) = std::fs::read(ca_path) else {
-        return false;
-    };
-    let Ok(ca_pem) = pem::parse(ca_pem_bytes) else {
-        return false;
-    };
-    let Some(ca_key_path) = ca_path.parent().map(|parent| parent.join("rootCA-key.pem")) else {
-        return false;
-    };
-    let Ok(ca_key_pem) = std::fs::read_to_string(ca_key_path) else {
-        return false;
-    };
-    let Ok(ca_key) = KeyPair::from_pem(&ca_key_pem) else {
-        return false;
-    };
-    let Ok(issuer) = CertifiedIssuer::self_signed(root_ca_params(), ca_key) else {
-        return false;
-    };
-    let Ok(leaf_key) = KeyPair::generate() else {
-        return false;
-    };
-    let Ok(leaf_params) = CertificateParams::new(vec![TEST_DOMAIN.to_string()]) else {
-        return false;
-    };
-    let Ok(leaf) = leaf_params.signed_by(&leaf_key, &issuer) else {
-        return false;
-    };
-    let Ok(leaf) = SecCertificate::from_der(leaf.der().as_ref()) else {
-        return false;
-    };
-    let Ok(ca) = SecCertificate::from_der(ca_pem.contents()) else {
-        return false;
-    };
-    let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(TEST_DOMAIN));
-    let Ok(mut trust) = SecTrust::create_with_certificates(&[leaf, ca], &[policy]) else {
-        return false;
-    };
-    if trust.set_network_fetch_allowed(false).is_err() {
-        return false;
-    }
-    trust.evaluate_with_error().is_ok()
+    std::process::Command::new("/usr/bin/security")
+        .args(["verify-cert", "-c"])
+        .arg(ca_path)
+        .args(["-p", "basic"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Returns the platform-appropriate data directory for locald.
@@ -1072,6 +1071,78 @@ mod tests {
             0o644
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_permission_validation_requires_regular_ca_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(dir.join("rootCA.pem")).unwrap();
+        std::fs::write(dir.join("rootCA-key.pem"), b"key").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            dir.join("rootCA.pem"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            dir.join("rootCA-key.pem"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let error = validate_root_ca_permissions_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("a directory cannot satisfy the Root CA certificate check");
+
+        assert!(error.to_string().contains("regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_permission_validation_requires_a_real_ca_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_temp_dir();
+        std::fs::write(&path, b"not a directory").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = validate_root_ca_permissions_in_dir(
+            &path,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("a regular file cannot satisfy the Root CA directory check");
+
+        assert!(error.to_string().contains("directory"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires a trusted locald CA installed by admin setup"]
+    fn macos_trust_evaluation_requires_only_the_certificate() {
+        let certs_dir = get_certs_dir().expect("resolve installed Root CA directory");
+        assert!(is_ca_path_trusted(&certs_dir.join("rootCA.pem")));
+
+        let isolated = unique_temp_dir();
+        std::fs::create_dir_all(&isolated).unwrap();
+        let copied_certificate = isolated.join("copied-root.pem");
+        std::fs::copy(certs_dir.join("rootCA.pem"), &copied_certificate).unwrap();
+        assert!(is_ca_path_trusted(&copied_certificate));
+        assert!(!isolated.join("rootCA-key.pem").exists());
+
+        let untrusted = isolated.join("untrusted-root.pem");
+        let (untrusted_certificate, _) = generate_root_ca_pem().unwrap();
+        std::fs::write(&untrusted, untrusted_certificate).unwrap();
+        assert!(!is_ca_path_trusted(&untrusted));
+        let _ = std::fs::remove_dir_all(&isolated);
     }
 
     #[test]
