@@ -949,10 +949,17 @@ mod tests {
             .local_addr()
             .expect("assigned listener address")
             .port();
-        drop(assigned_reservation);
         let _unrelated_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("open unrelated listener in the same process");
+        assert_ne!(
+            _unrelated_listener
+                .local_addr()
+                .expect("unrelated listener address")
+                .port(),
+            assigned_port
+        );
+        drop(assigned_reservation);
 
         let instance_id = instance_id("00000000-0000-4000-8000-000000000003");
         let services = Arc::new(Mutex::new(HashMap::from([(

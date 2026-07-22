@@ -1681,6 +1681,10 @@ impl ProcessManager {
                     );
                     return;
                 };
+                // READY=1 remains observable compatibility input, but it
+                // cannot replace the service's authoritative readiness
+                // contract. Endpoint services prove their assigned endpoint;
+                // portless workers prove owned-process liveness.
                 info!(
                     "Ignoring readiness notification for service {name}; its {} remains authoritative",
                     requirement.description()
