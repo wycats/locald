@@ -135,6 +135,8 @@ fn main() {
         // Build locald-helper (privileged helper daemon) for macOS.
         println!("cargo:rerun-if-changed=../locald-helper/src");
         println!("cargo:rerun-if-changed=../locald-helper/Cargo.toml");
+        println!("cargo:rerun-if-changed=../locald-helper-protocol/src");
+        println!("cargo:rerun-if-changed=../locald-helper-protocol/Cargo.toml");
 
         let helper_dir = PathBuf::from("../locald-helper");
 

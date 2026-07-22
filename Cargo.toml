@@ -15,6 +15,7 @@ members = [
     "crates/locald-vmm",
     "crates/xtask",
     "crates/locald-helper",
+    "crates/locald-helper-protocol",
     "tools/fetch-kernel",
 ]
 # Cross-platform crates. Platform-specific crates (locald-shim, locald-vmm,

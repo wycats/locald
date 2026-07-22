@@ -330,81 +330,9 @@ mod macos {
             .spawn();
     }
 
-    /// Attempt privileged setup, preferring XPC helper, falling back to Terminal.
+    /// Open the explicit administrator setup flow in Terminal.
     fn run_admin_setup() {
-        if try_xpc_setup() {
-            return;
-        }
         run_admin_setup_via_terminal();
-    }
-
-    /// Try to perform setup via the privileged XPC helper.
-    ///
-    /// Connects to the `com.locald.helper` Mach service and sends a setup
-    /// command. Returns true if the helper responded with success.
-    fn try_xpc_setup() -> bool {
-        use std::sync::mpsc;
-
-        // XPC types aren't Send, so we run the entire XPC exchange on a
-        // dedicated thread and communicate the result back via a channel.
-        let (tx, rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let result = xpc_setup_on_thread();
-            let _ = tx.send(result);
-        });
-
-        // Wait up to 30s for the helper to respond.
-        rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false)
-    }
-
-    /// Perform the XPC setup exchange. Must run on the thread that created
-    /// the `XpcClient` (XPC types are not `Send`).
-    fn xpc_setup_on_thread() -> bool {
-        use futures::stream::StreamExt;
-        use std::ffi::CString;
-        use xpc_connection::{Message, XpcClient};
-
-        #[allow(clippy::expect_used)]
-        let name = CString::new("com.locald.helper").expect("static CString");
-        let mut client = XpcClient::connect(&name);
-
-        // Build { "command": "setup" } dictionary.
-        let mut dict = std::collections::HashMap::new();
-        #[allow(clippy::expect_used)]
-        {
-            dict.insert(
-                CString::new("command").expect("static CString"),
-                Message::String(CString::new("setup").expect("static CString")),
-            );
-        }
-        client.send_message(Message::Dictionary(dict));
-
-        // Drive the future to completion on a single-threaded runtime.
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return false;
-        };
-
-        let result = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(25), client.next())
-                .await
-                .ok()
-                .flatten()
-        });
-
-        match result {
-            Some(Message::Dictionary(ref dict)) => {
-                #[allow(clippy::expect_used)]
-                let status_key = CString::new("status").expect("static CString");
-                #[allow(clippy::expect_used)]
-                let success_val = CString::new("success").expect("static CString");
-                matches!(dict.get(&status_key), Some(Message::String(s)) if *s == success_val)
-            }
-            _ => false,
-        }
     }
 
     /// Launch `locald admin setup` in Terminal.app via osascript.
@@ -484,21 +412,57 @@ mod macos {
 
     /// Resolve the locald binary path for running admin setup.
     ///
-    /// Prefers `locald` on PATH if it exists, otherwise falls back to a
-    /// known install location.
+    /// Prefers `locald` on `PATH`, then an executable pinned into the
+    /// LaunchAgent, and finally the legacy install location. This lets a
+    /// package upgrade repair an older running agent while retaining the
+    /// installed path for locald builds that are not on the agent's `PATH`.
     #[allow(clippy::disallowed_methods)]
     fn locald_path_for_admin_setup() -> String {
-        // Check if locald is on PATH.
-        if let Ok(output) = std::process::Command::new("which").arg("locald").output()
+        let pinned = std::env::var(LOCALD_DAEMON_PATH_ENV).ok();
+        let pinned_is_executable = pinned
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .is_some_and(is_executable_file);
+        let discovered = if let Ok(output) =
+            std::process::Command::new("which").arg("locald").output()
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return path;
-            }
-        }
-        // Fallback: assume standard install location.
-        "/usr/local/bin/locald".to_string()
+            (!path.is_empty()).then_some(path)
+        } else {
+            None
+        };
+        locald_path_for_admin_setup_from_sources(
+            pinned.as_deref(),
+            pinned_is_executable,
+            discovered.as_deref(),
+        )
+    }
+
+    fn is_executable_file(path: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+
+    fn locald_path_for_admin_setup_from_sources(
+        pinned: Option<&str>,
+        pinned_is_executable: bool,
+        discovered: Option<&str>,
+    ) -> String {
+        discovered
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                pinned
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .filter(|_| pinned_is_executable)
+            })
+            .unwrap_or("/usr/local/bin/locald")
+            .to_string()
     }
 
     /// Resolve the pinned locald binary path for daemon auto-start.
@@ -674,6 +638,61 @@ mod macos {
         #[test]
         fn shell_quote_empty() {
             assert_eq!(shell_quote(""), "''");
+        }
+
+        #[test]
+        fn admin_setup_prefers_a_discovered_current_install() {
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(
+                    Some("  /opt/locald/bin/locald  "),
+                    true,
+                    Some("/usr/local/bin/locald"),
+                ),
+                "/usr/local/bin/locald"
+            );
+        }
+
+        #[test]
+        fn admin_setup_falls_back_to_path_then_legacy_location() {
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(
+                    None,
+                    false,
+                    Some("/opt/homebrew/bin/locald"),
+                ),
+                "/opt/homebrew/bin/locald"
+            );
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(
+                    Some("  /opt/locald/bin/locald  "),
+                    true,
+                    None,
+                ),
+                "/opt/locald/bin/locald"
+            );
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(Some("  "), false, None),
+                "/usr/local/bin/locald"
+            );
+        }
+
+        #[test]
+        fn admin_setup_ignores_a_stale_pinned_daemon_path() {
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(
+                    Some("/removed/locald"),
+                    false,
+                    Some("/opt/homebrew/bin/locald"),
+                ),
+                "/opt/homebrew/bin/locald"
+            );
+            assert!(!is_executable_file("/path/that/does/not/exist/locald"));
+            assert!(is_executable_file(
+                std::env::current_exe()
+                    .expect("current executable")
+                    .to_str()
+                    .expect("UTF-8 executable path")
+            ));
         }
 
         #[test]

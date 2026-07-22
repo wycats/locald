@@ -46,6 +46,8 @@ mod handlers;
 mod hints;
 mod history;
 mod init;
+#[cfg(target_os = "macos")]
+mod macos_helper;
 mod monitor;
 #[cfg(feature = "experimental-plugins")]
 mod plugin;
