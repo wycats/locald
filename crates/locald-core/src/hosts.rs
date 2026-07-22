@@ -91,16 +91,16 @@ impl HostsFileSection {
         output
     }
 
-    /// Remove only the named domains from locald's generated section while
-    /// preserving every other managed mapping.
+    /// Rebuild locald's generated section after removing the named domains
+    /// from its IPv4 loopback mappings.
     pub fn remove_domains_from_content(&self, current_content: &str, domains: &[&str]) -> String {
         self.remove_matching_domains_from_content(current_content, |domain| {
             domains.contains(&domain)
         })
     }
 
-    /// Remove host mappings that macOS resolves natively or that locald has
-    /// retired, while preserving explicit custom-domain mappings.
+    /// Rebuild locald's generated section after removing IPv4 loopback
+    /// mappings that macOS resolves natively or that locald has retired.
     pub fn remove_native_macos_domains_from_content(&self, current_content: &str) -> String {
         self.remove_matching_domains_from_content(current_content, |domain| {
             let canonical = domain.to_ascii_lowercase();

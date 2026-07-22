@@ -801,17 +801,59 @@ fn escape_xml(value: &str) -> String {
 }
 
 fn ensure_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if !path.is_absolute() {
         anyhow::bail!(
-            "installation directory is not a real directory: {}",
+            "installation directory must be absolute: {}",
             path.display()
         );
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    nix::unistd::chown(
-        path,
+
+    let flags = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_DIRECTORY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    let mut directory = nix::fcntl::open("/", flags, nix::sys::stat::Mode::empty())
+        .context("could not open the filesystem root safely")?;
+    let mut current = PathBuf::from("/");
+
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            anyhow::bail!(
+                "installation directory has an unsupported component: {}",
+                path.display()
+            );
+        };
+        current.push(name);
+        let next = match nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+        {
+            Ok(next) => next,
+            Err(nix::errno::Errno::ENOENT) => {
+                nix::sys::stat::mkdirat(
+                    &directory,
+                    name,
+                    nix::sys::stat::Mode::from_bits_truncate(0o700),
+                )
+                .with_context(|| format!("could not create {} safely", current.display()))?;
+                nix::unistd::fsync(&directory)
+                    .with_context(|| format!("could not sync {}", current.display()))?;
+                nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+                    .with_context(|| format!("could not open {} safely", current.display()))?
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not open {} safely", current.display()));
+            }
+        };
+        directory = next;
+    }
+
+    let mode = u16::try_from(mode).context("installation directory mode is out of range")?;
+    nix::sys::stat::fchmod(&directory, nix::sys::stat::Mode::from_bits_truncate(mode))?;
+    nix::unistd::fchown(
+        &directory,
         Some(nix::unistd::Uid::from_raw(uid)),
         Some(nix::unistd::Gid::from_raw(gid)),
     )?;
@@ -909,7 +951,7 @@ mod tests {
         let owner = SetupOwner {
             uid: nix::unistd::getuid().as_raw(),
             gid: nix::unistd::getgid().as_raw(),
-            home: root.path().to_path_buf(),
+            home: root.path().canonicalize().unwrap(),
         };
         let daemon = root.path().join("bin/locald");
         std::fs::create_dir_all(daemon.parent().unwrap()).unwrap();
@@ -974,6 +1016,26 @@ mod tests {
                 "probe"
             ]
         );
+    }
+
+    #[test]
+    fn setup_directory_creation_never_follows_a_symlinked_ancestor() {
+        let root = tempfile::tempdir().expect("create installation root");
+        let outside = tempfile::tempdir().expect("create symlink target");
+        let library = root.path().canonicalize().unwrap().join("Library");
+        std::os::unix::fs::symlink(outside.path(), &library)
+            .expect("create symlinked installation ancestor");
+        let target = library.join("Application Support/locald");
+
+        ensure_directory(
+            &target,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+            0o700,
+        )
+        .expect_err("symlinked installation ancestor must fail closed");
+
+        assert!(!outside.path().join("Application Support").exists());
     }
 
     #[test]
