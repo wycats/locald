@@ -128,12 +128,12 @@ impl ReadinessRequirement {
                 || Ok(Self::ProcessRunning),
                 |port| Ok(Self::AssignedPortTcp { port }),
             ),
+            // Container endpoint publication is not yet authoritative. Keep
+            // the existing controller-owned process contract until the
+            // container runtime owns `container_port` mapping explicitly.
+            ServiceConfig::Typed(TypedServiceConfig::Container(_)) => Ok(Self::ControllerHealth),
             ServiceConfig::Typed(TypedServiceConfig::Site(_)) => Ok(Self::ControllerHealth),
-            ServiceConfig::Typed(
-                TypedServiceConfig::Exec(_)
-                | TypedServiceConfig::Postgres(_)
-                | TypedServiceConfig::Container(_),
-            )
+            ServiceConfig::Typed(TypedServiceConfig::Exec(_) | TypedServiceConfig::Postgres(_))
             | ServiceConfig::Legacy(_) => Ok(Self::AssignedPortTcp {
                 port: port.ok_or_else(|| {
                     anyhow::anyhow!("portful service has no assigned port for TCP readiness")
@@ -156,6 +156,8 @@ impl ReadinessRequirement {
     }
 
     pub(crate) const fn accepts_notify(&self) -> bool {
+        // Explicit configured readiness is authoritative. Notify is an
+        // optimization only for the inferred assigned-port contract.
         matches!(self, Self::AssignedPortTcp { .. })
     }
 }
@@ -311,6 +313,7 @@ impl HealthMonitor {
             if let Some(service) = services
                 .get_mut(name)
                 .filter(|service| Self::matches_controller(service, controller))
+                .filter(|service| service.health_status == HealthStatus::Starting)
             {
                 if service.health_status != status || service.health_source != source {
                     info!(
@@ -527,7 +530,7 @@ impl HealthMonitor {
                         .get(&name)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
-                        if service.health_status == HealthStatus::Healthy {
+                        if service.health_status != HealthStatus::Starting {
                             break;
                         }
                     } else {
@@ -566,7 +569,7 @@ impl HealthMonitor {
                         .get(&name)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
-                        if service.health_status == HealthStatus::Healthy {
+                        if service.health_status != HealthStatus::Starting {
                             break;
                         }
                     } else {
@@ -617,8 +620,8 @@ impl HealthMonitor {
                         .get(&name)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
-                        if service.health_status == HealthStatus::Healthy {
-                            info!("Service {} is already healthy, stopping monitor", name);
+                        if service.health_status != HealthStatus::Starting {
+                            info!("Service {} readiness is terminal, stopping monitor", name);
                             break;
                         }
                     } else {
@@ -670,8 +673,8 @@ mod tests {
     use anyhow::Result;
     use futures_util::{StreamExt, stream};
     use locald_core::config::{
-        CommonServiceConfig, ExecServiceConfig, LocaldConfig, ProbeConfig, SiteServiceConfig,
-        WorkerServiceConfig,
+        CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, LocaldConfig, ProbeConfig,
+        SiteServiceConfig, WorkerServiceConfig,
     };
     use locald_core::ipc::LogEntry;
     use locald_core::service::{RuntimeState, ServiceCommand, ServiceController};
@@ -832,6 +835,17 @@ mod tests {
             .expect("derive site readiness"),
             ReadinessRequirement::ControllerHealth
         ));
+        assert!(matches!(
+            ReadinessRequirement::for_service(
+                &ServiceConfig::Typed(TypedServiceConfig::Container(ContainerServiceConfig {
+                    container_port: Some(6379),
+                    ..ContainerServiceConfig::default()
+                })),
+                Some(4125),
+            )
+            .expect("preserve controller readiness until container networking owns its endpoint"),
+            ReadinessRequirement::ControllerHealth
+        ));
     }
 
     #[test]
@@ -930,6 +944,73 @@ mod tests {
         assert_eq!(
             services.lock().await["app:web"].health_source,
             HealthSource::Tcp
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_tcp_monitor_cannot_resurrect_readiness() {
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve readiness port");
+        let port = reservation
+            .local_addr()
+            .expect("readiness reservation address")
+            .port();
+        drop(reservation);
+
+        let instance_id = instance_id("00000000-0000-4000-8000-000000000006");
+        let services = Arc::new(Mutex::new(HashMap::from([(
+            "app:web".to_owned(),
+            monitored_service(instance_id, legacy_config(None), Some(port)),
+        )])));
+        let (event_sender, _) = tokio::sync::broadcast::channel(8);
+        let monitor = HealthMonitor::new(
+            services.clone(),
+            event_sender,
+            Arc::new(Mutex::new((None, None))),
+            SharedDomainIndex::default(),
+        );
+        monitor.spawn_check(
+            "app:web".to_owned(),
+            instance_id,
+            1,
+            ReadinessRequirement::ExplicitTcp {
+                port,
+                interval: Duration::from_millis(10),
+                timeout: Duration::from_millis(10),
+            },
+            Some(port),
+            None,
+            None,
+            None,
+        );
+
+        services
+            .lock()
+            .await
+            .get_mut("app:web")
+            .expect("readiness service remains present")
+            .health_status = HealthStatus::Unhealthy;
+        let _listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("make endpoint available after readiness is terminal");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        monitor
+            .update_health(
+                "app:web",
+                ControllerIdentity {
+                    instance_id,
+                    controller_generation: 1,
+                },
+                HealthStatus::Healthy,
+                HealthSource::Tcp,
+            )
+            .await;
+
+        assert_eq!(
+            services.lock().await["app:web"].health_status,
+            HealthStatus::Unhealthy,
+            "a probe completing after the readiness deadline cannot publish Healthy"
         );
     }
 
