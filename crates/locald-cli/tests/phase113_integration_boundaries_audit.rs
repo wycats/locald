@@ -58,9 +58,14 @@ fn phase113_doctor_consolidates_privileged_repair_into_admin_setup() {
         return;
     }
 
+    let setup_command = if cfg!(target_os = "macos") {
+        "sudo locald admin setup"
+    } else {
+        "locald admin setup"
+    };
     assert!(
-        stdout.contains("sudo locald admin setup"),
-        "Expected doctor output to recommend sudo locald admin setup, but got:\n{stdout}"
+        stdout.contains(setup_command),
+        "Expected doctor output to recommend {setup_command}, but got:\n{stdout}"
     );
     assert!(
         !output.status.success(),

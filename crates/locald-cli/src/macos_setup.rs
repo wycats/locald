@@ -61,7 +61,7 @@ enum ReportCaller {
 
 trait SetupPlatform {
     fn install_system_trust(&self, certificate: &Path) -> Result<()>;
-    fn sync_hosts(&self, domains: &[String]) -> Result<()>;
+    fn retire_legacy_host_aliases(&self) -> Result<()>;
     fn restart_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()>;
     fn install_helper(&self, bytes: &[u8], authority: &HelperAuthority) -> Result<()>;
     fn probe_helper(&self) -> Result<()>;
@@ -74,11 +74,11 @@ impl SetupPlatform for SystemPlatform {
         crate::trust::install_ca_macos(certificate)
     }
 
-    fn sync_hosts(&self, domains: &[String]) -> Result<()> {
+    fn retire_legacy_host_aliases(&self) -> Result<()> {
         let hosts = locald_core::HostsFileSection::new();
         let path = Path::new("/etc/hosts");
         let current = std::fs::read_to_string(path).context("could not read /etc/hosts")?;
-        let updated = hosts.update_content(&current, domains);
+        let updated = retire_legacy_hosts_content(&hosts, &current);
         if updated != current {
             let metadata = std::fs::symlink_metadata(path)
                 .context("could not inspect /etc/hosts before synchronization")?;
@@ -105,7 +105,7 @@ impl SetupPlatform for SystemPlatform {
             .context("failed to run launchctl bootout for menu bar agent")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("No such process") && !stderr.contains("Could not find service") {
+            if !launchctl_service_absent(output.status.code(), &stderr) {
                 anyhow::bail!("launchctl bootout {service} failed: {}", stderr.trim());
             }
         }
@@ -139,6 +139,17 @@ impl SetupPlatform for SystemPlatform {
     fn probe_helper(&self) -> Result<()> {
         crate::macos_helper::probe()
     }
+}
+
+fn launchctl_service_absent(exit_code: Option<i32>, stderr: &str) -> bool {
+    exit_code == Some(113)
+        || stderr.contains("No such process")
+        || stderr.contains("Could not find service")
+        || stderr.contains("Could not find specified service")
+}
+
+fn retire_legacy_hosts_content(hosts: &locald_core::HostsFileSection, current: &str) -> String {
+    hosts.remove_domains_from_content(current, locald_core::LEGACY_MACOS_HOST_ALIASES)
 }
 
 /// Resolve and cross-check the non-root console user that owns this setup.
@@ -271,7 +282,7 @@ fn run_setup_with(
         .install_system_trust(&ca.paths.cert_path)
         .context("could not install Root CA into system trust")?;
     platform
-        .sync_hosts(&[])
+        .retire_legacy_host_aliases()
         .context("could not retire locald's legacy hosts-file aliases")?;
 
     ensure_directory(
@@ -867,8 +878,7 @@ mod tests {
             Ok(())
         }
 
-        fn sync_hosts(&self, domains: &[String]) -> Result<()> {
-            assert!(domains.is_empty());
+        fn retire_legacy_host_aliases(&self) -> Result<()> {
             self.calls.lock().unwrap().push("hosts-cleanup");
             Ok(())
         }
@@ -1008,6 +1018,29 @@ mod tests {
                 .to_string()
                 .contains("does not own /dev/console")
         );
+    }
+
+    #[test]
+    fn launch_agent_absence_is_a_clean_first_install() {
+        assert!(launchctl_service_absent(
+            Some(113),
+            "Boot-out failed: 113: Could not find specified service"
+        ));
+        assert!(launchctl_service_absent(
+            Some(1),
+            "Could not find specified service"
+        ));
+        assert!(!launchctl_service_absent(Some(1), "permission denied"));
+    }
+
+    #[test]
+    fn setup_retires_only_legacy_hosts_aliases() {
+        let hosts = locald_core::HostsFileSection::with_path(PathBuf::from("/etc/hosts"));
+        let current = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local\n127.0.0.1 workbench.example.test\n# END locald\n";
+
+        let updated = retire_legacy_hosts_content(&hosts, current);
+        assert!(!updated.contains("locald.local"));
+        assert!(updated.contains("127.0.0.1 workbench.example.test"));
     }
 
     #[test]

@@ -407,7 +407,7 @@ fn validate_port_override_policy(
 ) -> Result<()> {
     if !sandbox && (has_http_override || has_https_override) {
         anyhow::bail!(
-            "LOCALD_HTTP_PORT and LOCALD_HTTPS_PORT are available only in explicit sandbox mode; standard mode always uses trusted HTTPS on ports 80 and 443"
+            "LOCALD_HTTP_PORT and LOCALD_HTTPS_PORT are available only in explicit sandbox mode; standard mode always uses HTTP on port 80 and trusted HTTPS on port 443"
         );
     }
     Ok(())
@@ -982,7 +982,9 @@ mod privileged_startup_tests {
 
     #[test]
     fn standard_mode_rejects_all_port_overrides() {
-        assert!(validate_port_override_policy(false, true, false).is_err());
+        let error = validate_port_override_policy(false, true, false).unwrap_err();
+        assert!(error.to_string().contains("HTTP on port 80"));
+        assert!(error.to_string().contains("trusted HTTPS on port 443"));
         assert!(validate_port_override_policy(false, false, true).is_err());
         assert!(validate_port_override_policy(false, true, true).is_err());
         validate_port_override_policy(false, false, false)

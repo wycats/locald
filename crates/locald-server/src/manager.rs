@@ -122,10 +122,6 @@ impl HostSyncer for DefaultHostSyncer {
     async fn sync(&self, domains: Vec<String>) -> Result<()> {
         #[cfg(target_os = "macos")]
         let domains = macos_hosts_domains(domains);
-        if domains.is_empty() {
-            info!("No domains require explicit hosts-file synchronization");
-            return Ok(());
-        }
 
         // Try to read hosts file to see if we need to update
         let hosts = locald_core::HostsFileSection::new();
@@ -181,18 +177,12 @@ impl HostSyncer for DefaultHostSyncer {
 
 #[cfg(target_os = "macos")]
 fn macos_hosts_domains(domains: Vec<String>) -> Vec<String> {
-    const RETIRED_PLATFORM_ALIASES: &[&str] = &[
-        "dev.docs.local",
-        "dev.locald.local",
-        "docs.local",
-        "locald.local",
-    ];
     domains
         .into_iter()
         .filter(|domain| {
             domain != "localhost"
                 && !domain.ends_with(".localhost")
-                && !RETIRED_PLATFORM_ALIASES.contains(&domain.as_str())
+                && !locald_core::LEGACY_MACOS_HOST_ALIASES.contains(&domain.as_str())
         })
         .collect()
 }
@@ -8393,6 +8383,10 @@ mod tests {
                 "locald.local".to_owned(),
             ]),
             ["custom.example.test"]
+        );
+        assert!(
+            macos_hosts_domains(vec!["app.localhost".to_owned(), "locald.local".to_owned(),])
+                .is_empty()
         );
     }
 
