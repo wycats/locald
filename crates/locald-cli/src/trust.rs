@@ -149,7 +149,7 @@ pub fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
     // When root: add to System keychain with admin-domain trust (system-wide, no GUI prompt).
     // When user: add to login keychain with user-domain trust.
     let status = if nix::unistd::geteuid().is_root() {
-        std::process::Command::new("security")
+        std::process::Command::new("/usr/bin/security")
             .args(["add-trusted-cert", "-d", "-r", "trustRoot", "-k"])
             .arg("/Library/Keychains/System.keychain")
             .arg(cert_path)
@@ -157,7 +157,7 @@ pub fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
             .context("Failed to execute `security add-trusted-cert`")?
     } else {
         let home = dirs::home_dir().context("Could not determine home directory")?;
-        std::process::Command::new("security")
+        std::process::Command::new("/usr/bin/security")
             .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
             .arg(home.join("Library/Keychains/login.keychain-db"))
             .arg(cert_path)
