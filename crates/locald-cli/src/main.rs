@@ -48,6 +48,8 @@ mod history;
 mod init;
 #[cfg(target_os = "macos")]
 mod macos_helper;
+#[cfg(target_os = "macos")]
+mod macos_setup;
 mod monitor;
 #[cfg(feature = "experimental-plugins")]
 mod plugin;
@@ -96,14 +98,19 @@ fn run_main(cli: cli::Cli) -> error::CliResult<()> {
         utils::setup_sandbox(sandbox_name)?;
     }
 
-    // Skip verification for admin setup, as it's used to fix the shim
-    // Also skip for plugin commands that don't need daemon (create, install)
+    // Repair, inspection, and shutdown commands must remain available when the
+    // installation is incomplete. Other standard commands share the canonical
+    // fail-closed readiness preflight.
     #[cfg(feature = "experimental-plugins")]
     let skip_verify = matches!(
         cli.command,
         cli::Commands::Admin {
-            command: cli::AdminCommands::Setup
+            command: cli::AdminCommands::Setup | cli::AdminCommands::Teardown
         } | cli::Commands::Doctor { .. }
+            | cli::Commands::Server {
+                command: cli::ServerCommands::Shutdown
+            }
+            | cli::Commands::Trust
             | cli::Commands::Surface { .. }
             | cli::Commands::Init { .. }
             | cli::Commands::Selfupgrade { .. }
@@ -121,8 +128,12 @@ fn run_main(cli: cli::Cli) -> error::CliResult<()> {
     let skip_verify = matches!(
         cli.command,
         cli::Commands::Admin {
-            command: cli::AdminCommands::Setup
+            command: cli::AdminCommands::Setup | cli::AdminCommands::Teardown
         } | cli::Commands::Doctor { .. }
+            | cli::Commands::Server {
+                command: cli::ServerCommands::Shutdown
+            }
+            | cli::Commands::Trust
             | cli::Commands::Surface { .. }
             | cli::Commands::Init { .. }
             | cli::Commands::Selfupgrade { .. }

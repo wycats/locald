@@ -70,7 +70,7 @@ pub mod ipc;
 pub use ipc::{IpcRequest, IpcResponse};
 pub mod hosts;
 #[doc(inline)]
-pub use hosts::HostsFileSection;
+pub use hosts::{HostsFileSection, LEGACY_MACOS_HOST_ALIASES};
 pub mod state;
 #[doc(inline)]
 pub use state::{ServerState, ServiceState};

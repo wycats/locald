@@ -957,100 +957,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                     #[cfg(target_os = "macos")]
                     {
-                        // Resolve and validate the non-root console owner before
-                        // mutating trust, agent, or helper installation state.
-                        let sudo_uid = std::env::var("SUDO_UID").ok();
-                        let configured_uid = invoking_user_uid(sudo_uid.as_deref())?;
-                        let helper_authority =
-                            crate::macos_helper::authority_for_current_executable(configured_uid)
-                                .map_err(|error| {
-                                CliError::message(format!(
-                                    "Failed to authorize the privileged helper: {error}"
-                                ))
-                            })?;
-
-                        cliclack::intro("locald admin setup (macOS)")?;
-
-                        // Step 1: Generate and trust the Root CA certificate.
-                        {
-                            let s = cliclack::spinner();
-                            s.start("Configuring HTTPS trust...");
-                            match crate::trust::install_root_ca_into_trust_store() {
-                                Ok(()) => {
-                                    s.stop("HTTPS trust configured");
-                                }
-                                Err(e) => {
-                                    s.error(format!("HTTPS trust failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "HTTPS trust setup failed: {e}\n\
-                                         This is required for browsers to trust locald's HTTPS certificates.\n\
-                                         Run `locald admin setup` to retry."
-                                    )));
-                                }
-                            }
-                        }
-
-                        // Step 2: Extract embedded agent binary and install as LaunchAgent.
-                        {
-                            const AGENT_BYTES: &[u8] =
-                                include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
-
-                            let s = cliclack::spinner();
-                            s.start("Installing menu bar agent...");
-
-                            let agent_path = locald_utils::agent::agent_path()?;
-                            locald_utils::agent::install(&agent_path, AGENT_BYTES)?;
-
-                            match install_launch_agent(&agent_path) {
-                                Ok(()) => {
-                                    s.stop("Menu bar agent installed (starts at login)");
-                                }
-                                Err(e) => {
-                                    s.error(format!("Menu bar agent install failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Failed to install LaunchAgent: {e}"
-                                    )));
-                                }
-                            }
-                        }
-
-                        // Step 3: Install privileged helper (required for port 80/443 binding).
-                        {
-                            const HELPER_BYTES: &[u8] =
-                                include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
-
-                            let s = cliclack::spinner();
-                            s.start("Installing privileged helper...");
-
-                            match crate::macos_helper::install(HELPER_BYTES, &helper_authority) {
-                                Ok(()) => {
-                                    s.stop("Privileged helper installed (binds ports 80/443)");
-                                }
-                                Err(e) => {
-                                    s.error(format!("Privileged helper install failed: {e}"));
-                                    return Err(CliError::message(format!(
-                                        "Failed to install privileged helper: {e}\n\
-                                         The helper is required for locald to serve on ports 80/443.\n\
-                                         Run `locald admin setup` to retry."
-                                    )));
-                                }
-                            }
-
-                            let s = cliclack::spinner();
-                            s.start("Verifying privileged helper authorization...");
-                            match crate::macos_helper::probe() {
-                                Ok(()) => s.stop("Privileged helper authorization verified"),
-                                Err(error) => {
-                                    s.error(format!("Privileged helper probe failed: {error}"));
-                                    return Err(CliError::message(format!(
-                                        "Privileged helper postflight failed: {error}"
-                                    )));
-                                }
-                            }
-                        }
-
-                        cliclack::outro("Setup complete")?;
-                        println!("Next: run `locald up`.");
+                        crate::macos_setup::run_setup()?;
                     }
 
                     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2014,135 +1921,6 @@ pub fn run(cli: Cli) -> CliResult<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_launch_agent(agent_path: &std::path::Path) -> anyhow::Result<()> {
-    let label = "com.locald.agent";
-
-    // When running under sudo, resolve the real user's home and UID for
-    // correct plist placement and launchctl domain targeting.
-    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
-        if let Ok(sudo_user) = std::env::var("SUDO_USER")
-            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
-        {
-            (Some(user.dir), Some(user.uid.as_raw()))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
-    // Write the plist directly to the correct user's LaunchAgents directory.
-    let plist_dir = if let Some(ref home) = user_home {
-        home.join("Library/LaunchAgents")
-    } else {
-        dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-            .join("Library/LaunchAgents")
-    };
-    std::fs::create_dir_all(&plist_dir)?;
-
-    let plist_path = plist_dir.join(format!("{label}.plist"));
-
-    let daemon_path =
-        std::env::current_exe().context("Failed to resolve current executable path")?;
-    let plist_content = render_launch_agent_plist(label, agent_path, &daemon_path);
-    std::fs::write(&plist_path, plist_content)?;
-
-    // Load into the correct user's GUI domain.
-    // Under sudo, `launchctl load` targets root's domain — use
-    // `launchctl bootstrap gui/<uid>` to load into the invoking user's domain.
-    #[allow(clippy::disallowed_methods)]
-    if let Some(uid) = target_uid {
-        let service_target = format!("gui/{uid}/{label}");
-        // Unload any existing (ignore errors — "not found" is fine).
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &service_target])
-            .output();
-
-        let status = std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}")])
-            .arg(&plist_path)
-            .status()
-            .context("Failed to run launchctl bootstrap")?;
-
-        if !status.success() {
-            anyhow::bail!("launchctl bootstrap gui/{uid} failed with status: {status}");
-        }
-    } else {
-        // Not running as root — load into current user's domain (legacy syntax).
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&plist_path)
-            .output();
-
-        let status = std::process::Command::new("launchctl")
-            .args(["load", "-w"])
-            .arg(&plist_path)
-            .status()
-            .context("Failed to run launchctl load")?;
-
-        if !status.success() {
-            anyhow::bail!("launchctl load failed with status: {status}");
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn render_launch_agent_plist(
-    label: &str,
-    agent_path: &std::path::Path,
-    daemon_path: &std::path::Path,
-) -> String {
-    let label = escape_xml(label);
-    let program = escape_xml(&agent_path.display().to_string());
-    let daemon = escape_xml(&daemon_path.display().to_string());
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{program}</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>LOCALD_DAEMON_PATH</key>
-        <string>{daemon}</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>LimitLoadToSessionType</key>
-    <string>Aqua</string>
-</dict>
-</plist>"#,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn escape_xml(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&apos;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-#[cfg(target_os = "macos")]
 fn read_launch_agent_daemon_path(
     plist_path: &std::path::Path,
 ) -> anyhow::Result<Option<std::path::PathBuf>> {
@@ -2349,8 +2127,7 @@ mod tests {
 
     #[test]
     fn launch_agent_plist_pins_daemon_path() {
-        let plist = render_launch_agent_plist(
-            "com.locald.agent",
+        let plist = crate::macos_setup::render_launch_agent_plist(
             std::path::Path::new("/Applications/locald agent/locald-agent"),
             std::path::Path::new("/Users/me/bin/locald"),
         );
@@ -2365,8 +2142,7 @@ mod tests {
 
     #[test]
     fn launch_agent_plist_escapes_xml_values() {
-        let plist = render_launch_agent_plist(
-            "com.locald.agent",
+        let plist = crate::macos_setup::render_launch_agent_plist(
             std::path::Path::new("/Applications/A&B/locald-agent"),
             std::path::Path::new("/Users/me/<debug>/locald"),
         );
@@ -2426,15 +2202,19 @@ mod tests {
         sync_hosts_file(
             &hosts,
             &[
-                "app.localhost".parse().expect("valid project domain"),
-                "locald.local".parse().expect("valid platform domain"),
+                "custom.example.test"
+                    .parse()
+                    .expect("valid custom project domain"),
+                "docs.local"
+                    .parse()
+                    .expect("valid explicit legacy-spelling project domain"),
             ],
         )
         .expect("synchronize hosts fixture");
 
         let updated = std::fs::read_to_string(path).expect("read synchronized hosts fixture");
-        assert!(updated.contains("127.0.0.1 app.localhost"));
-        assert!(updated.contains("127.0.0.1 locald.local"));
+        assert!(updated.contains("127.0.0.1 custom.example.test"));
+        assert!(updated.contains("127.0.0.1 docs.local"));
         assert_eq!(updated.matches("# BEGIN locald").count(), 1);
     }
 }

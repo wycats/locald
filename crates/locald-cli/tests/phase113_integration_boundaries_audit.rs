@@ -47,7 +47,7 @@ fn phase113_doctor_mentions_virtualization_kvm_optional_integration() {
 }
 
 #[test]
-fn phase113_doctor_recommends_admin_setup_without_sudo_and_suggests_up_next() {
+fn phase113_doctor_consolidates_privileged_repair_into_admin_setup() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("locald"));
     cmd.arg("doctor");
 
@@ -58,21 +58,22 @@ fn phase113_doctor_recommends_admin_setup_without_sudo_and_suggests_up_next() {
         return;
     }
 
+    let setup_command = if cfg!(target_os = "macos") {
+        "sudo locald admin setup"
+    } else {
+        "locald admin setup"
+    };
     assert!(
-        stdout.contains("locald admin setup"),
-        "Expected doctor output to recommend locald admin setup, but got:\n{stdout}"
+        stdout.contains(setup_command),
+        "Expected doctor output to recommend {setup_command}, but got:\n{stdout}"
     );
     assert!(
-        !stdout.contains("sudo locald"),
-        "Expected doctor output to avoid sudo locald (it can restrict PATH), but got:\n{stdout}"
+        !output.status.success(),
+        "Expected doctor to exit nonzero while privileged repair is required, but got:\n{stdout}"
     );
 
     assert!(
         !stdout.contains("\n  Fix:\n"),
         "Expected doctor output to avoid per-problem Fix blocks (fixes should be consolidated), but got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("- Next: run locald up."),
-        "Expected doctor output to include Next: run locald up. as a structured list item, but got:\n{stdout}"
     );
 }

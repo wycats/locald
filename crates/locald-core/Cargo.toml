@@ -11,6 +11,7 @@ flate2 = "1.1.5"
 futures = "0.3.31"
 git2 = { version = "0.20", default-features = false }
 libc = "0.2.178"
+locald-hosts = { version = "0.1.0", path = "../locald-hosts" }
 oci-distribution = "0.11.0"
 portable-pty = "0.9.0"
 schemars = "1.1.0"

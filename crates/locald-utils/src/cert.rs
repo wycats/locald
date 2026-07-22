@@ -12,9 +12,22 @@ use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::{
+    fs::File,
+    io::{Read, Seek, Write},
+    os::fd::{AsFd, OwnedFd},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tracing::{debug, error, info};
 
 type ServerNameAuthorizer = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+#[cfg(target_os = "macos")]
+static ROOT_CA_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "macos")]
+const ROOT_CA_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Paths to the locald Root CA certificate and key files.
 #[derive(Debug, Clone)]
@@ -99,6 +112,491 @@ pub fn ensure_root_ca_in_dir(certs_dir: &Path) -> Result<EnsureRootCaResult> {
         },
         created: true,
     })
+}
+
+/// Ensure a macOS Root CA pair is valid and owned by the configured console user.
+///
+/// Existing valid material is retained while directory and file permissions are
+/// repaired. Partial, malformed, or mismatched material is never overwritten.
+///
+/// # Errors
+///
+/// Returns an error when the directory or pair is unsafe or invalid, or when
+/// ownership, permissions, or durable publication cannot be established.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods, clippy::similar_names)]
+pub fn repair_root_ca_in_dir(
+    certs_dir: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<EnsureRootCaResult> {
+    let directory = open_or_create_real_directory(certs_dir, owner_uid, owner_gid)?;
+
+    // Setup normally runs as root. Holding the directory under the effective
+    // setup identity prevents the configured user from replacing entries while
+    // root repairs them. Every file operation below is also anchored to this
+    // descriptor and uses O_NOFOLLOW.
+    set_fd_owner_and_mode(
+        &directory,
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+        0o700,
+        certs_dir,
+    )?;
+
+    let ca_cert_path = certs_dir.join("rootCA.pem");
+    let ca_key_path = certs_dir.join("rootCA-key.pem");
+
+    let repair = (|| -> Result<bool> {
+        let mut cert = open_regular_file_if_present(&directory, "rootCA.pem")?;
+        let mut key = open_regular_file_if_present(&directory, "rootCA-key.pem")?;
+
+        if let Some(file) = cert.as_ref() {
+            set_fd_owner_and_mode(file, owner_uid, owner_gid, 0o644, &ca_cert_path)?;
+        }
+        if let Some(file) = key.as_ref() {
+            set_fd_owner_and_mode(file, owner_uid, owner_gid, 0o600, &ca_key_path)?;
+        }
+
+        if cert.is_some() != key.is_some() {
+            anyhow::bail!(
+                "Root CA is partially configured; preserving {} and {} for explicit recovery",
+                ca_cert_path.display(),
+                ca_key_path.display()
+            );
+        }
+
+        if let (Some(cert), Some(key)) = (cert.as_mut(), key.as_mut()) {
+            validate_root_ca_pair_files(cert, key)?;
+            Ok(false)
+        } else {
+            let (cert_pem, key_pem) = generate_root_ca_pem()?;
+            publish_new_root_ca_pair(
+                &directory,
+                cert_pem.as_bytes(),
+                key_pem.as_bytes(),
+                owner_uid,
+                owner_gid,
+            )?;
+            Ok(true)
+        }
+    })();
+
+    let finalize = set_fd_owner_and_mode(&directory, owner_uid, owner_gid, 0o700, certs_dir);
+    let created = match (repair, finalize) {
+        (Ok(created), Ok(())) => created,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(repair), Err(finalize)) => {
+            return Err(repair.context(format!(
+                "also failed to restore Root CA directory ownership: {finalize:#}"
+            )));
+        }
+    };
+
+    Ok(EnsureRootCaResult {
+        paths: RootCaPaths {
+            cert_path: ca_cert_path,
+            key_path: ca_key_path,
+        },
+        created,
+    })
+}
+
+/// Validate an existing macOS Root CA pair without changing it.
+///
+/// # Errors
+///
+/// Returns an error when either file is missing, unsafe, malformed, or the
+/// certificate and private key do not match.
+#[cfg(target_os = "macos")]
+pub fn validate_root_ca_material_in_dir(certs_dir: &Path) -> Result<RootCaPaths> {
+    let ca_cert_path = certs_dir.join("rootCA.pem");
+    let ca_key_path = certs_dir.join("rootCA-key.pem");
+    let cert_metadata = regular_file_metadata_if_present(&ca_cert_path)?;
+    let key_metadata = regular_file_metadata_if_present(&ca_key_path)?;
+    if cert_metadata.is_none() || key_metadata.is_none() {
+        anyhow::bail!("Root CA certificate and private key are both required");
+    }
+    validate_root_ca_pair(&ca_cert_path, &ca_key_path)?;
+    Ok(RootCaPaths {
+        cert_path: ca_cert_path,
+        key_path: ca_key_path,
+    })
+}
+
+/// Validate exact macOS ownership and permissions for existing Root CA state.
+///
+/// # Errors
+///
+/// Returns an error unless the directory is `0700`, the private key is `0600`,
+/// the certificate is `0644`, and all three belong to the configured user.
+#[cfg(target_os = "macos")]
+#[allow(clippy::similar_names)]
+pub fn validate_root_ca_permissions_in_dir(
+    certs_dir: &Path,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<()> {
+    validate_owner_and_mode(
+        certs_dir,
+        owner_uid,
+        owner_gid,
+        0o700,
+        ExpectedPathKind::Directory,
+    )?;
+    validate_owner_and_mode(
+        &certs_dir.join("rootCA-key.pem"),
+        owner_uid,
+        owner_gid,
+        0o600,
+        ExpectedPathKind::RegularFile,
+    )?;
+    validate_owner_and_mode(
+        &certs_dir.join("rootCA.pem"),
+        owner_uid,
+        owner_gid,
+        0o644,
+        ExpectedPathKind::RegularFile,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::similar_names)]
+fn open_or_create_real_directory(path: &Path, owner_uid: u32, owner_gid: u32) -> Result<OwnedFd> {
+    if !path.is_absolute() {
+        anyhow::bail!("Root CA directory must be absolute: {}", path.display());
+    }
+
+    let flags = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_DIRECTORY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    let mut directory = nix::fcntl::open("/", flags, nix::sys::stat::Mode::empty())
+        .context("Failed to open the filesystem root safely")?;
+    let mut current = PathBuf::from("/");
+
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            anyhow::bail!(
+                "Root CA directory has an unsupported component: {}",
+                path.display()
+            );
+        };
+        current.push(name);
+        let next = match nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+        {
+            Ok(next) => next,
+            Err(nix::errno::Errno::ENOENT) => {
+                nix::sys::stat::mkdirat(
+                    &directory,
+                    name,
+                    nix::sys::stat::Mode::from_bits_truncate(0o700),
+                )
+                .with_context(|| format!("Failed to create {} safely", current.display()))?;
+                nix::unistd::fsync(&directory)
+                    .with_context(|| format!("Failed to sync {}", current.display()))?;
+                let created =
+                    nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+                        .with_context(|| format!("Failed to open {} safely", current.display()))?;
+                set_fd_owner_and_mode(&created, owner_uid, owner_gid, 0o700, &current)?;
+                created
+            }
+            Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+                anyhow::bail!(
+                    "Root CA directory is not a real directory: {}",
+                    current.display()
+                )
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to open {} safely", current.display()));
+            }
+        };
+        directory = next;
+    }
+
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn regular_file_metadata_if_present(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            anyhow::bail!("Root CA path is not a regular file: {}", path.display())
+        }
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to inspect Root CA path {}", path.display()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_root_ca_pair(cert_path: &Path, key_path: &Path) -> Result<()> {
+    let mut cert = open_regular_file_no_follow(cert_path, ROOT_CA_MAX_BYTES)?;
+    let mut key = open_regular_file_no_follow(key_path, ROOT_CA_MAX_BYTES)?;
+    validate_root_ca_pair_files(&mut cert, &mut key)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_root_ca_pair_files(cert: &mut File, key: &mut File) -> Result<()> {
+    cert.rewind()?;
+    key.rewind()?;
+    let mut cert_pem = String::new();
+    let mut key_pem = String::new();
+    cert.read_to_string(&mut cert_pem)?;
+    key.read_to_string(&mut key_pem)?;
+    let key_pair = KeyPair::from_pem(&key_pem).context("Root CA private key is malformed")?;
+    let cert = pem::parse(cert_pem.as_bytes()).context("Root CA certificate is malformed")?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.contents())
+        .map_err(|error| anyhow::anyhow!("Root CA certificate is malformed: {error}"))?;
+    if !parsed.tbs_certificate.is_ca()
+        || parsed.subject() != parsed.issuer()
+        || !parsed.validity().is_valid()
+        || parsed
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|name| name.as_str().ok())
+            != Some("locald Development CA")
+    {
+        anyhow::bail!("Root CA certificate does not match locald's CA profile");
+    }
+    let certificate_key = parsed.tbs_certificate.subject_pki.subject_public_key.data;
+    if certificate_key.as_ref() != key_pair.public_key_raw() {
+        anyhow::bail!(
+            "Root CA certificate and private key do not match; preserving both files for explicit recovery"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::similar_names)]
+fn publish_new_root_ca_pair(
+    directory: &OwnedFd,
+    cert_bytes: &[u8],
+    key_bytes: &[u8],
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<()> {
+    let cert_temp = write_root_ca_temp(
+        directory,
+        "rootCA.pem",
+        cert_bytes,
+        0o644,
+        owner_uid,
+        owner_gid,
+    )?;
+    let key_temp = match write_root_ca_temp(
+        directory,
+        "rootCA-key.pem",
+        key_bytes,
+        0o600,
+        owner_uid,
+        owner_gid,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            remove_root_ca_temp(directory, &cert_temp);
+            return Err(error);
+        }
+    };
+
+    let mut key_published = false;
+    let mut cert_published = false;
+    let result = (|| -> Result<()> {
+        nix::fcntl::renameat(directory, key_temp.as_str(), directory, "rootCA-key.pem")
+            .context("Failed to publish rootCA-key.pem")?;
+        key_published = true;
+        nix::unistd::fsync(directory)?;
+        nix::fcntl::renameat(directory, cert_temp.as_str(), directory, "rootCA.pem")
+            .context("Failed to publish rootCA.pem")?;
+        cert_published = true;
+        nix::unistd::fsync(directory)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        remove_root_ca_temp(directory, &cert_temp);
+        remove_root_ca_temp(directory, &key_temp);
+        let rollback = rollback_published_root_ca_pair(directory, key_published, cert_published);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(error.context(format!(
+                "also failed to roll back partially published Root CA material: {rollback:#}"
+            ))),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rollback_published_root_ca_pair(
+    directory: &OwnedFd,
+    key_published: bool,
+    cert_published: bool,
+) -> Result<()> {
+    if cert_published {
+        nix::unistd::unlinkat(
+            directory,
+            "rootCA.pem",
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .context("Failed to roll back rootCA.pem")?;
+    }
+    if key_published {
+        nix::unistd::unlinkat(
+            directory,
+            "rootCA-key.pem",
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .context("Failed to roll back rootCA-key.pem")?;
+    }
+    nix::unistd::fsync(directory).context("Failed to sync Root CA rollback")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_root_ca_temp(directory: &OwnedFd, name: &str) {
+    if let Err(error) =
+        nix::unistd::unlinkat(directory, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+        && error != nix::errno::Errno::ENOENT
+    {
+        debug!(%error, %name, "failed to remove Root CA temporary file");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::similar_names)]
+fn write_root_ca_temp(
+    directory: &OwnedFd,
+    destination: &str,
+    bytes: &[u8],
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<String> {
+    let mode = u16::try_from(mode).context("Root CA file mode is out of range")?;
+    let sequence = ROOT_CA_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = format!(".{}.tmp.{}.{}", destination, std::process::id(), sequence);
+    let fd = nix::fcntl::openat(
+        directory,
+        temporary.as_str(),
+        nix::fcntl::OFlag::O_WRONLY
+            | nix::fcntl::OFlag::O_CREAT
+            | nix::fcntl::OFlag::O_EXCL
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .with_context(|| format!("Failed to create {temporary}"))?;
+    let mut file = File::from(fd);
+    file.write_all(bytes)?;
+    nix::unistd::fchown(
+        &file,
+        Some(nix::unistd::Uid::from_raw(owner_uid)),
+        Some(nix::unistd::Gid::from_raw(owner_gid)),
+    )?;
+    nix::sys::stat::fchmod(&file, nix::sys::stat::Mode::from_bits_truncate(mode))?;
+    file.sync_all()?;
+    Ok(temporary)
+}
+
+#[cfg(target_os = "macos")]
+fn open_regular_file_if_present(directory: &OwnedFd, name: &str) -> Result<Option<File>> {
+    let fd = match nix::fcntl::openat(
+        directory,
+        name,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NONBLOCK
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("Failed to open {name} safely")),
+    };
+    let metadata = nix::sys::stat::fstat(&fd)?;
+    let kind = nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode);
+    if !kind.contains(nix::sys::stat::SFlag::S_IFREG) {
+        anyhow::bail!("Root CA path is not a regular file: {name}");
+    }
+    if metadata.st_size < 0 || metadata.st_size as u64 > ROOT_CA_MAX_BYTES {
+        anyhow::bail!("Root CA file {name} exceeds the maximum size of {ROOT_CA_MAX_BYTES} bytes");
+    }
+    Ok(Some(File::from(fd)))
+}
+
+#[cfg(target_os = "macos")]
+fn set_fd_owner_and_mode(
+    file: &impl AsFd,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    display: &Path,
+) -> Result<()> {
+    let mode = u16::try_from(mode).context("Root CA mode is out of range")?;
+    nix::unistd::fchown(
+        file,
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+    )?;
+    nix::sys::stat::fchmod(file, nix::sys::stat::Mode::from_bits_truncate(mode))?;
+    let metadata = nix::sys::stat::fstat(file)?;
+    if metadata.st_uid != uid || metadata.st_gid != gid || metadata.st_mode & 0o7777 != mode {
+        anyhow::bail!("Failed to establish owner/mode on {}", display.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum ExpectedPathKind {
+    Directory,
+    RegularFile,
+}
+
+#[cfg(target_os = "macos")]
+fn validate_owner_and_mode(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    expected_kind: ExpectedPathKind,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("Path must not be a symlink: {}", path.display());
+    }
+    let kind_matches = match expected_kind {
+        ExpectedPathKind::Directory => metadata.is_dir(),
+        ExpectedPathKind::RegularFile => metadata.is_file(),
+    };
+    if !kind_matches {
+        let expected = match expected_kind {
+            ExpectedPathKind::Directory => "directory",
+            ExpectedPathKind::RegularFile => "regular file",
+        };
+        anyhow::bail!("Expected {} to be a {expected}", path.display());
+    }
+    let actual_mode = metadata.mode() & 0o7777;
+    if metadata.uid() != uid || metadata.gid() != gid || actual_mode != mode {
+        anyhow::bail!(
+            "Expected {} to be owned by {uid}:{gid} with mode {mode:04o}; found {}:{} with mode {actual_mode:04o}",
+            path.display(),
+            metadata.uid(),
+            metadata.gid()
+        );
+    }
+    Ok(())
 }
 
 /// Ensure a Root CA exists in the default locald certs directory.
@@ -326,7 +824,7 @@ pub fn get_certs_dir() -> Result<PathBuf> {
 
 /// Check whether the locald Root CA is trusted by the system.
 ///
-/// On macOS, uses `security verify-cert` which works without root.
+/// On macOS, evaluates the certificate with the system certificate verifier.
 /// Returns `true` if the CA file exists and is trusted, `false` otherwise.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
@@ -334,19 +832,127 @@ pub fn is_ca_trusted() -> bool {
     let Ok(certs_dir) = get_certs_dir() else {
         return false;
     };
-    let ca_path = certs_dir.join("rootCA.pem");
-    if !ca_path.exists() {
-        return false;
-    }
+    is_ca_path_trusted(&certs_dir.join("rootCA.pem"))
+}
 
-    // `security verify-cert` exits 0 if the cert is trusted.
-    std::process::Command::new("security")
+/// Verify that the installed Root CA pair is trusted by macOS for HTTPS.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
+    let Some(certs_dir) = ca_path.parent() else {
+        return false;
+    };
+    let Ok((probe_pem, ca_pem)) = ssl_trust_probe_pems(ca_path, &certs_dir.join("rootCA-key.pem"))
+    else {
+        return false;
+    };
+    let Ok(probe_file) = TemporarySecurityFile::new("ssl-trust-leaf", probe_pem.as_bytes()) else {
+        return false;
+    };
+    let Ok(ca_file) = TemporarySecurityFile::new("ssl-trust-root", &ca_pem) else {
+        return false;
+    };
+
+    std::process::Command::new("/usr/bin/security")
         .args(["verify-cert", "-c"])
-        .arg(&ca_path)
+        .arg(&probe_file.path)
+        .arg("-c")
+        .arg(&ca_file.path)
+        .args(["-p", "ssl", "-n", "localhost", "-L", "-q"])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn ssl_trust_probe_pems(ca_path: &Path, ca_key_path: &Path) -> Result<(String, Vec<u8>)> {
+    let ca_pem = read_regular_file_no_follow(ca_path, ROOT_CA_MAX_BYTES)?;
+    let ca_key_pem =
+        String::from_utf8(read_regular_file_no_follow(ca_key_path, ROOT_CA_MAX_BYTES)?)
+            .context("rootCA-key.pem is not UTF-8 PEM data")?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem).context("Failed to parse rootCA-key.pem")?;
+    let issuer = CertifiedIssuer::self_signed(root_ca_params(), ca_key)
+        .context("Failed to construct Root CA issuer")?;
+    let leaf_key = KeyPair::generate()?;
+    let leaf =
+        CertificateParams::new(vec!["localhost".to_owned()])?.signed_by(&leaf_key, &issuer)?;
+    Ok((leaf.pem(), ca_pem))
+}
+
+#[cfg(target_os = "macos")]
+fn read_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>> {
+    let mut file = open_regular_file_no_follow(path, maximum_bytes)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum_bytes {
+        anyhow::bail!(
+            "File exceeds the {maximum_bytes}-byte safety limit: {}",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn open_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open {} safely", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        anyhow::bail!("Path is not a regular file: {}", path.display());
+    }
+    if metadata.len() > maximum_bytes {
+        anyhow::bail!(
+            "File exceeds the {maximum_bytes}-byte safety limit: {}",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+struct TemporarySecurityFile {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl TemporarySecurityFile {
+    #[allow(clippy::disallowed_methods)]
+    fn new(label: &str, bytes: &[u8]) -> Result<Self> {
+        let temporary = Self {
+            path: Path::new("/private/tmp").join(format!(
+                "locald-{label}-{}.pem",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary.path)
+            .with_context(|| format!("Failed to create {}", temporary.path.display()))?;
+        file.write_all(bytes)?;
+        Ok(temporary)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TemporarySecurityFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            debug!(%error, path = %self.path.display(), "failed to remove Security.framework input");
+        }
+    }
 }
 
 /// Returns the platform-appropriate data directory for locald.
@@ -412,7 +1018,8 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir() -> PathBuf {
-        let base = std::env::temp_dir();
+        let configured = std::env::temp_dir();
+        let base = configured.canonicalize().unwrap_or(configured);
         base.join(format!("locald-utils-cert-test-{}", uuid::Uuid::new_v4()))
     }
 
@@ -468,6 +1075,398 @@ mod tests {
         let err = ensure_root_ca_in_dir(&dir).unwrap_err();
         assert!(err.to_string().contains("partially configured"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_retains_valid_material_and_repairs_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir();
+        let first = repair_root_ca_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect("create macOS Root CA");
+        let cert_before = std::fs::read(&first.paths.cert_path).expect("read certificate");
+        let key_before = std::fs::read(&first.paths.key_path).expect("read private key");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen directory");
+        std::fs::set_permissions(
+            &first.paths.key_path,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("loosen private key");
+
+        let repaired = repair_root_ca_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect("repair macOS Root CA");
+
+        assert!(!repaired.created);
+        assert_eq!(
+            std::fs::read(&repaired.paths.cert_path).unwrap(),
+            cert_before
+        );
+        assert_eq!(std::fs::read(&repaired.paths.key_path).unwrap(), key_before);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&repaired.paths.key_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&repaired.paths.cert_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_publication_rolls_back_a_key_when_certificate_publish_fails() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(dir.join("rootCA.pem"))
+            .expect("create conflicting certificate destination");
+        let directory = nix::fcntl::open(
+            &dir,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open Root CA directory");
+
+        publish_new_root_ca_pair(
+            &directory,
+            b"certificate",
+            b"private-key",
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("certificate publication must fail");
+
+        assert!(dir.join("rootCA.pem").is_dir());
+        assert!(!dir.join("rootCA-key.pem").exists());
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("read Root CA directory")
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp."))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_preserves_partial_material() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("create Root CA directory");
+        let evidence = b"partial-certificate-evidence";
+        std::fs::write(dir.join("rootCA.pem"), evidence).expect("write partial evidence");
+
+        let error = repair_root_ca_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("partial Root CA must fail closed");
+
+        assert!(error.to_string().contains("partially configured"));
+        assert_eq!(std::fs::read(dir.join("rootCA.pem")).unwrap(), evidence);
+        assert!(!dir.join("rootCA-key.pem").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_secures_partial_private_key_before_returning_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("create Root CA directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = dir.join("rootCA-key.pem");
+        let evidence = b"partial-private-key-evidence";
+        std::fs::write(&key, evidence).expect("write partial private-key evidence");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("partial Root CA must fail closed");
+
+        assert!(error.to_string().contains("partially configured"));
+        assert_eq!(std::fs::read(&key).unwrap(), evidence);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_a_symlinked_directory_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir();
+        let target = root.join("target");
+        let certs = root.join("certs");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, &certs).unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("symlinked Root CA directory must fail closed");
+
+        assert!(error.to_string().contains("not a real directory"));
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_a_symlinked_ancestor_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir();
+        let target = root.join("target");
+        let redirect = root.join("redirect");
+        let certs = redirect.join("certs");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, &redirect).unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("symlinked Root CA ancestor must fail closed");
+
+        assert!(error.to_string().contains("not a real directory"));
+        assert!(!target.join("certs").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_never_follows_a_symlinked_ca_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = unique_temp_dir();
+        let certs = root.join("certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        let target = root.join("target-key");
+        std::fs::write(&target, b"unrelated").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(certs.join("rootCA.pem"), b"certificate").unwrap();
+        symlink(&target, certs.join("rootCA-key.pem")).unwrap();
+
+        repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("symlinked Root CA file must fail closed");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_a_fifo_without_blocking() {
+        let certs = unique_temp_dir();
+        std::fs::create_dir_all(&certs).unwrap();
+        nix::unistd::mkfifo(
+            &certs.join("rootCA-key.pem"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        std::fs::write(certs.join("rootCA.pem"), b"certificate").unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("FIFO Root CA entry must fail closed without waiting for a writer");
+
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&certs);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_oversized_regular_files_before_reading() {
+        let certs = unique_temp_dir();
+        std::fs::create_dir_all(&certs).unwrap();
+        std::fs::File::create(certs.join("rootCA.pem"))
+            .unwrap()
+            .set_len(ROOT_CA_MAX_BYTES + 1)
+            .unwrap();
+        std::fs::write(certs.join("rootCA-key.pem"), b"private key").unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("oversized Root CA entries must fail before parsing");
+
+        assert!(error.to_string().contains("exceeds the maximum size"));
+        let _ = std::fs::remove_dir_all(&certs);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_root_ca_pair_validation_rejects_a_fifo_without_blocking() {
+        let certs = unique_temp_dir();
+        std::fs::create_dir_all(&certs).unwrap();
+        nix::unistd::mkfifo(
+            &certs.join("rootCA.pem"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        std::fs::write(certs.join("rootCA-key.pem"), b"private key").unwrap();
+
+        let error = validate_root_ca_pair(&certs.join("rootCA.pem"), &certs.join("rootCA-key.pem"))
+            .expect_err("FIFO Root CA entry must fail closed without waiting for a writer");
+
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&certs);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_permission_validation_requires_regular_ca_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(dir.join("rootCA.pem")).unwrap();
+        std::fs::write(dir.join("rootCA-key.pem"), b"key").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            dir.join("rootCA.pem"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            dir.join("rootCA-key.pem"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let error = validate_root_ca_permissions_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("a directory cannot satisfy the Root CA certificate check");
+
+        assert!(error.to_string().contains("regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_permission_validation_requires_a_real_ca_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_temp_dir();
+        std::fs::write(&path, b"not a directory").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = validate_root_ca_permissions_in_dir(
+            &path,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("a regular file cannot satisfy the Root CA directory check");
+
+        assert!(error.to_string().contains("directory"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires a trusted locald CA installed by admin setup"]
+    fn macos_trust_evaluation_uses_an_ssl_leaf_signed_by_the_installed_ca() {
+        let certs_dir = get_certs_dir().expect("resolve installed Root CA directory");
+        assert!(is_ca_path_trusted(&certs_dir.join("rootCA.pem")));
+
+        let isolated = unique_temp_dir();
+        std::fs::create_dir_all(&isolated).unwrap();
+        let copied_certificate = isolated.join("copied-root.pem");
+        std::fs::copy(certs_dir.join("rootCA.pem"), &copied_certificate).unwrap();
+        assert!(!is_ca_path_trusted(&copied_certificate));
+        assert!(!isolated.join("rootCA-key.pem").exists());
+
+        let untrusted = isolated.join("untrusted-root.pem");
+        let (untrusted_certificate, _) = generate_root_ca_pem().unwrap();
+        std::fs::write(&untrusted, untrusted_certificate).unwrap();
+        assert!(!is_ca_path_trusted(&untrusted));
+        let _ = std::fs::remove_dir_all(&isolated);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_preserves_mismatched_material() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("create Root CA directory");
+        let (cert_pem, _) = generate_root_ca_pem().expect("generate certificate pair");
+        let (_, other_key_pem) = generate_root_ca_pem().expect("generate other certificate pair");
+        std::fs::write(dir.join("rootCA.pem"), &cert_pem).expect("write certificate");
+        std::fs::write(dir.join("rootCA-key.pem"), &other_key_pem).expect("write mismatched key");
+
+        let error = repair_root_ca_in_dir(
+            &dir,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("mismatched Root CA must fail closed");
+
+        assert!(error.to_string().contains("do not match"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rootCA.pem")).unwrap(),
+            cert_pem
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rootCA-key.pem")).unwrap(),
+            other_key_pem
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

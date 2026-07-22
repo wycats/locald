@@ -921,13 +921,24 @@ impl ProcessManager {
     /// Return the authoritative exact hostnames that require hosts-file mappings.
     #[must_use]
     pub fn hosts_domains(&self) -> Vec<String> {
-        self.domain_index.snapshot().hosts_domains()
+        self.hosts_domain_names()
+            .into_iter()
+            .map(|domain| domain.to_string())
+            .collect()
     }
 
     /// Return validated exact names for a privileged hosts-file writer.
     #[must_use]
     pub fn hosts_domain_names(&self) -> Vec<DomainName> {
-        self.domain_index.snapshot().hosts_domain_names()
+        let index = self.domain_index.snapshot();
+        #[cfg(target_os = "macos")]
+        {
+            index.macos_hosts_domain_names()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            index.hosts_domain_names()
+        }
     }
 
     fn build_domain_claims(
@@ -8345,12 +8356,20 @@ mod tests {
     }
 
     fn expected_hosts(service_domains: &[&str]) -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        let mut domains = service_domains
+            .iter()
+            .filter(|domain| **domain != "localhost" && !domain.ends_with(".localhost"))
+            .map(|domain| (*domain).to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(not(target_os = "macos"))]
         let mut domains = vec![
             "dev.docs.local".to_owned(),
             "dev.locald.local".to_owned(),
             "docs.local".to_owned(),
             "locald.local".to_owned(),
         ];
+        #[cfg(not(target_os = "macos"))]
         domains.extend(service_domains.iter().map(|domain| (*domain).to_owned()));
         domains.sort();
         domains.dedup();

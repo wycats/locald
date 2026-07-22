@@ -641,8 +641,6 @@ pub(crate) fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
     Ok(())
 }
 
-use std::fmt::Write;
-
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn update_hosts_file(domains: &[String]) -> Result<()> {
     let path = if cfg!(windows) {
@@ -653,48 +651,13 @@ pub(crate) fn update_hosts_file(domains: &[String]) -> Result<()> {
 
     let current_content = std::fs::read_to_string(&path).context("Failed to read hosts file")?;
 
-    let start_marker = "# BEGIN locald";
-    let end_marker = "# END locald";
-
-    let mut new_section = String::new();
-    new_section.push_str(start_marker);
-    new_section.push('\n');
-    for domain in domains {
-        let _ = writeln!(new_section, "127.0.0.1 {domain}");
-    }
-    new_section.push_str(end_marker);
-
-    let new_content = if let Some(start) = current_content.find(start_marker) {
-        if let Some(end_idx) = current_content[start..].find(end_marker) {
-            let end = start + end_idx;
-            // Replace existing section
-            let mut output = String::from(&current_content[..start]);
-            output.push_str(&new_section);
-            output.push_str(&current_content[end + end_marker.len()..]);
-            output
-        } else {
-            // Malformed block, append
-            let mut output = String::from(&current_content);
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
-            }
-            output.push_str(&new_section);
-            output.push('\n');
-            output
-        }
-    } else {
-        // Append if not found
-        let mut output = String::from(&current_content);
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&new_section);
-        output.push('\n');
-        output
-    };
-
+    let new_content = update_hosts_content(&current_content, domains);
     std::fs::write(&path, new_content).context("Failed to write hosts file")?;
     Ok(())
+}
+
+fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
+    locald_hosts::update_hosts_content(current_content, domains)
 }
 
 fn main() -> Result<()> {
@@ -923,5 +886,33 @@ polkit.addRule(function(action, subject) {
             check_port(args.port)?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_hosts_content;
+
+    #[test]
+    fn empty_host_sync_removes_the_managed_section() {
+        let current =
+            "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald\n";
+
+        let updated = update_hosts_content(current, &[]);
+
+        assert_eq!(updated, "127.0.0.1 localhost\n\n");
+        assert_eq!(update_hosts_content(&updated, &[]), updated);
+    }
+
+    #[test]
+    fn nonempty_host_sync_still_replaces_the_managed_section() {
+        let current =
+            "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald\n";
+
+        let updated = update_hosts_content(current, &["custom.example.test".to_owned()]);
+
+        assert!(!updated.contains("old.localhost"));
+        assert!(updated.contains("127.0.0.1 custom.example.test"));
+        assert_eq!(updated.matches("# BEGIN locald").count(), 1);
     }
 }
