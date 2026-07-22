@@ -56,6 +56,7 @@ impl FileOwner {
 
 trait Launchctl {
     fn bootout(&self, service: &str) -> Result<()>;
+    fn enable(&self, service: &str) -> Result<()>;
     fn bootstrap(&self, domain: &str, plist: &Path) -> Result<()>;
 }
 
@@ -87,6 +88,20 @@ impl Launchctl for SystemLaunchctl {
         if !output.status.success() {
             anyhow::bail!(
                 "launchctl bootstrap {domain} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn enable(&self, service: &str) -> Result<()> {
+        let output = std::process::Command::new("launchctl")
+            .args(["enable", service])
+            .output()
+            .context("failed to run launchctl enable for helper")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "launchctl enable {service} failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -182,6 +197,7 @@ fn install_with(
     atomic_install_file(&paths.plist, plist.as_bytes(), 0o644, owner)?;
 
     launchctl.bootout("system/com.locald.helper")?;
+    launchctl.enable("system/com.locald.helper")?;
     launchctl.bootstrap("system", &paths.plist)?;
     Ok(())
 }
@@ -340,6 +356,14 @@ mod tests {
                 .push(format!("bootstrap {domain} {}", plist.display()));
             Ok(())
         }
+
+        fn enable(&self, service: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("launchctl calls")
+                .push(format!("enable {service}"));
+            Ok(())
+        }
     }
 
     fn owner() -> FileOwner {
@@ -394,6 +418,7 @@ mod tests {
             *launchctl.calls.lock().expect("launchctl calls"),
             vec![
                 "bootout system/com.locald.helper".to_string(),
+                "enable system/com.locald.helper".to_string(),
                 format!("bootstrap system {}", paths.plist.display()),
             ]
         );
