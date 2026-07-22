@@ -412,9 +412,10 @@ mod macos {
 
     /// Resolve the locald binary path for running admin setup.
     ///
-    /// Prefers an executable pinned into the LaunchAgent, then `locald` on
-    /// `PATH`, and finally the legacy install location. A stale pinned path is
-    /// ignored so the repair flow can use a newly installed binary.
+    /// Prefers `locald` on `PATH`, then an executable pinned into the
+    /// LaunchAgent, and finally the legacy install location. This lets a
+    /// package upgrade repair an older running agent while retaining the
+    /// installed path for locald builds that are not on the agent's `PATH`.
     #[allow(clippy::disallowed_methods)]
     fn locald_path_for_admin_setup() -> String {
         let pinned = std::env::var(LOCALD_DAEMON_PATH_ENV).ok();
@@ -451,11 +452,15 @@ mod macos {
         pinned_is_executable: bool,
         discovered: Option<&str>,
     ) -> String {
-        pinned
+        discovered
             .map(str::trim)
             .filter(|path| !path.is_empty())
-            .filter(|_| pinned_is_executable)
-            .or_else(|| discovered.map(str::trim).filter(|path| !path.is_empty()))
+            .or_else(|| {
+                pinned
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .filter(|_| pinned_is_executable)
+            })
             .unwrap_or("/usr/local/bin/locald")
             .to_string()
     }
@@ -636,14 +641,14 @@ mod macos {
         }
 
         #[test]
-        fn admin_setup_prefers_the_pinned_daemon_path() {
+        fn admin_setup_prefers_a_discovered_current_install() {
             assert_eq!(
                 locald_path_for_admin_setup_from_sources(
                     Some("  /opt/locald/bin/locald  "),
                     true,
                     Some("/usr/local/bin/locald"),
                 ),
-                "/opt/locald/bin/locald"
+                "/usr/local/bin/locald"
             );
         }
 
@@ -656,6 +661,14 @@ mod macos {
                     Some("/opt/homebrew/bin/locald"),
                 ),
                 "/opt/homebrew/bin/locald"
+            );
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(
+                    Some("  /opt/locald/bin/locald  "),
+                    true,
+                    None,
+                ),
+                "/opt/locald/bin/locald"
             );
             assert_eq!(
                 locald_path_for_admin_setup_from_sources(Some("  "), false, None),
