@@ -558,6 +558,9 @@ fn validate_helper_authority(
 ) -> Result<()> {
     validate_authority_metadata(Path::new(AUTHORITY_PATH))?;
     if caller == ReportCaller::User {
+        // The root-only authority contents are reloaded, validated, and used to
+        // authenticate every helper request. The probe below therefore verifies
+        // the live file without making it readable by the configured user.
         return Ok(());
     }
     let authority = authority

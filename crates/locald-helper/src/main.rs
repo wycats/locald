@@ -22,8 +22,8 @@ mod macos {
     use futures::stream::StreamExt;
     use locald_helper_protocol::code_signing;
     use locald_helper_protocol::{
-        AUTHORITY_PATH, HelperAuthority, HelperCommand, HelperErrorCode, HelperStatus,
-        MACH_SERVICE, PROTOCOL_VERSION, is_supported_bind_port, load_authority,
+        AUTHORITY_PATH, AuthorityError, HelperAuthority, HelperCommand, HelperErrorCode,
+        HelperStatus, MACH_SERVICE, PROTOCOL_VERSION, is_supported_bind_port, load_authority,
     };
     use std::collections::HashMap;
     use std::ffi::CString;
@@ -34,7 +34,8 @@ mod macos {
     use xpc_connection::{Message, XpcClient, XpcListener};
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let authority = load_and_validate_authority()?;
+        let authority =
+            load_and_validate_authority().map_err(|(_, message)| anyhow::anyhow!(message))?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -42,13 +43,36 @@ mod macos {
         Ok(())
     }
 
-    fn load_and_validate_authority() -> Result<HelperAuthority> {
-        let authority = load_authority(Path::new(AUTHORITY_PATH))
-            .context("helper authority is unavailable; run `sudo locald admin setup`")?;
-        code_signing::validate_requirement(&authority.designated_requirement).context(
-            "helper authority contains an invalid code requirement; run `sudo locald admin setup`",
-        )?;
+    fn load_and_validate_authority()
+    -> std::result::Result<HelperAuthority, (HelperErrorCode, String)> {
+        let authority = load_authority(Path::new(AUTHORITY_PATH)).map_err(|error| {
+            let code = authority_error_code(&error);
+            let state = if code == HelperErrorCode::AuthorityUnavailable {
+                "unavailable"
+            } else {
+                "invalid"
+            };
+            (
+                code,
+                format!("helper authority is {state}: {error}; run `sudo locald admin setup`"),
+            )
+        })?;
+        code_signing::validate_requirement(&authority.designated_requirement).map_err(|error| {
+            (
+                HelperErrorCode::AuthorityInvalid,
+                format!(
+                    "helper authority contains an invalid code requirement: {error}; run `sudo locald admin setup`"
+                ),
+            )
+        })?;
         Ok(authority)
+    }
+
+    const fn authority_error_code(error: &AuthorityError) -> HelperErrorCode {
+        match error {
+            AuthorityError::Io(_) => HelperErrorCode::AuthorityUnavailable,
+            _ => HelperErrorCode::AuthorityInvalid,
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -65,10 +89,10 @@ mod macos {
     }
 
     #[allow(clippy::future_not_send)]
-    async fn handle_client(mut client: XpcClient, authority: Arc<HelperAuthority>) {
+    async fn handle_client(mut client: XpcClient, startup_authority: Arc<HelperAuthority>) {
         let token = client.audit_token();
         let caller_uid = audit_token_euid(&token);
-        if let Err(error) = authenticate_caller(&authority, &token) {
+        if let Err(error) = authenticate_caller(&startup_authority, &token) {
             client.send_message(error_response(
                 HelperErrorCode::AuthenticationFailed,
                 &format!("caller authentication failed: {error}"),
@@ -81,7 +105,18 @@ mod macos {
                 None | Some(Message::Error(_)) => break,
                 Some(Message::Dictionary(dict)) => {
                     let console_uid = console_owner_uid();
-                    let response = handle_command(&dict, &authority, caller_uid, &console_uid);
+                    let response = match load_and_validate_authority() {
+                        Ok(authority) => match authenticate_caller(&authority, &token) {
+                            Ok(()) => handle_command(&dict, &authority, caller_uid, &console_uid),
+                            Err(error) => CommandResponse::message(error_response(
+                                HelperErrorCode::AuthenticationFailed,
+                                &format!("caller authentication failed: {error}"),
+                            )),
+                        },
+                        Err((code, message)) => {
+                            CommandResponse::message(error_response(code, &message))
+                        }
+                    };
                     send_response(&client, response);
                 }
                 Some(_) => {
@@ -504,6 +539,19 @@ mod macos {
             let mut token = [0_u8; 32];
             token[4..8].copy_from_slice(&501_u32.to_ne_bytes());
             assert_eq!(audit_token_euid(&token), 501);
+        }
+
+        #[test]
+        fn authority_load_failures_use_stable_error_codes() {
+            let missing = AuthorityError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+            assert_eq!(
+                authority_error_code(&missing),
+                HelperErrorCode::AuthorityUnavailable
+            );
+            assert_eq!(
+                authority_error_code(&AuthorityError::WrongMode(0o644)),
+                HelperErrorCode::AuthorityInvalid
+            );
         }
 
         #[test]

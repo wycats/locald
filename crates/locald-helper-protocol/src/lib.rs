@@ -296,7 +296,7 @@ fn load_authority_for_owner(
 
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
@@ -604,6 +604,23 @@ mod tests {
         assert!(matches!(
             load_authority_for_owner(&link, metadata.uid(), metadata.gid()),
             Err(AuthorityError::Io(error)) if error.raw_os_error() == Some(libc::ELOOP)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_loader_rejects_a_fifo_without_blocking() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("temporary authority directory");
+        let path = directory.path().join("helper-authority.json");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("create authority FIFO");
+        let metadata = std::fs::metadata(&path).expect("FIFO metadata");
+
+        assert!(matches!(
+            load_authority_for_owner(&path, metadata.uid(), metadata.gid()),
+            Err(AuthorityError::NotRegularFile)
         ));
     }
 

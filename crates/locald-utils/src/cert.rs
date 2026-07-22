@@ -17,7 +17,7 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     os::fd::{AsFd, OwnedFd},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     sync::atomic::{AtomicU64, Ordering},
 };
 use tracing::{debug, error, info};
@@ -514,7 +514,10 @@ fn open_regular_file_if_present(directory: &OwnedFd, name: &str) -> Result<Optio
     let fd = match nix::fcntl::openat(
         directory,
         name,
-        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NONBLOCK
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     ) {
         Ok(fd) => fd,
@@ -830,19 +833,117 @@ pub fn is_ca_trusted() -> bool {
     is_ca_path_trusted(&certs_dir.join("rootCA.pem"))
 }
 
-/// Evaluate whether one CA certificate is trusted by macOS.
+/// Verify that the installed Root CA pair is trusted by macOS for HTTPS.
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
+    let Some(certs_dir) = ca_path.parent() else {
+        return false;
+    };
+    let Ok((probe_pem, ca_pem)) = ssl_trust_probe_pems(ca_path, &certs_dir.join("rootCA-key.pem"))
+    else {
+        return false;
+    };
+    let Ok(probe_file) = TemporarySecurityFile::new("ssl-trust-leaf", probe_pem.as_bytes()) else {
+        return false;
+    };
+    let Ok(ca_file) = TemporarySecurityFile::new("ssl-trust-root", &ca_pem) else {
+        return false;
+    };
+
     std::process::Command::new("/usr/bin/security")
         .args(["verify-cert", "-c"])
-        .arg(ca_path)
-        .args(["-p", "basic"])
+        .arg(&probe_file.path)
+        .arg("-c")
+        .arg(&ca_file.path)
+        .args(["-p", "ssl", "-n", "localhost", "-L", "-q"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+fn ssl_trust_probe_pems(ca_path: &Path, ca_key_path: &Path) -> Result<(String, Vec<u8>)> {
+    let ca_pem = read_regular_file_no_follow(ca_path, 1024 * 1024)?;
+    let ca_key_pem = String::from_utf8(read_regular_file_no_follow(ca_key_path, 1024 * 1024)?)
+        .context("rootCA-key.pem is not UTF-8 PEM data")?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem).context("Failed to parse rootCA-key.pem")?;
+    let issuer = CertifiedIssuer::self_signed(root_ca_params(), ca_key)
+        .context("Failed to construct Root CA issuer")?;
+    let leaf_key = KeyPair::generate()?;
+    let leaf =
+        CertificateParams::new(vec!["localhost".to_owned()])?.signed_by(&leaf_key, &issuer)?;
+    Ok((leaf.pem(), ca_pem))
+}
+
+#[cfg(target_os = "macos")]
+fn read_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open {} safely", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        anyhow::bail!("Path is not a regular file: {}", path.display());
+    }
+    if metadata.len() > maximum_bytes {
+        anyhow::bail!(
+            "File exceeds the {maximum_bytes}-byte safety limit: {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum_bytes {
+        anyhow::bail!(
+            "File exceeds the {maximum_bytes}-byte safety limit: {}",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+struct TemporarySecurityFile {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl TemporarySecurityFile {
+    #[allow(clippy::disallowed_methods)]
+    fn new(label: &str, bytes: &[u8]) -> Result<Self> {
+        let temporary = Self {
+            path: Path::new("/private/tmp").join(format!(
+                "locald-{label}-{}.pem",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary.path)
+            .with_context(|| format!("Failed to create {}", temporary.path.display()))?;
+        file.write_all(bytes)?;
+        Ok(temporary)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TemporarySecurityFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            debug!(%error, path = %self.path.display(), "failed to remove Security.framework input");
+        }
+    }
 }
 
 /// Returns the platform-appropriate data directory for locald.
@@ -1197,6 +1298,29 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_a_fifo_without_blocking() {
+        let certs = unique_temp_dir();
+        std::fs::create_dir_all(&certs).unwrap();
+        nix::unistd::mkfifo(
+            &certs.join("rootCA-key.pem"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        std::fs::write(certs.join("rootCA.pem"), b"certificate").unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("FIFO Root CA entry must fail closed without waiting for a writer");
+
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&certs);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn macos_permission_validation_requires_regular_ca_files() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1249,7 +1373,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     #[ignore = "requires a trusted locald CA installed by admin setup"]
-    fn macos_trust_evaluation_requires_only_the_certificate() {
+    fn macos_trust_evaluation_uses_an_ssl_leaf_signed_by_the_installed_ca() {
         let certs_dir = get_certs_dir().expect("resolve installed Root CA directory");
         assert!(is_ca_path_trusted(&certs_dir.join("rootCA.pem")));
 
@@ -1257,7 +1381,7 @@ mod tests {
         std::fs::create_dir_all(&isolated).unwrap();
         let copied_certificate = isolated.join("copied-root.pem");
         std::fs::copy(certs_dir.join("rootCA.pem"), &copied_certificate).unwrap();
-        assert!(is_ca_path_trusted(&copied_certificate));
+        assert!(!is_ca_path_trusted(&copied_certificate));
         assert!(!isolated.join("rootCA-key.pem").exists());
 
         let untrusted = isolated.join("untrusted-root.pem");
