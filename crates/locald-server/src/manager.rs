@@ -1702,9 +1702,10 @@ impl ProcessManager {
                         .with_context(|| {
                             format!("service `{name}` has an invalid readiness contract")
                         })?;
-                let state = match &service.runtime_state {
+                let (state, owned_process_id) = match &service.runtime_state {
                     ServiceRuntime::Controller(controller) => {
-                        controller.lock().await.read_state().await
+                        let controller = controller.lock().await;
+                        (controller.read_state().await, controller.owned_process_id())
                     }
                     ServiceRuntime::None => {
                         anyhow::bail!("service `{name}` has no runtime during readiness")
@@ -1730,7 +1731,7 @@ impl ProcessManager {
                 } else {
                     let controller_ready = match &requirement {
                         ReadinessRequirement::ProcessRunning => {
-                            state.status == ServiceState::Running
+                            state.status == ServiceState::Running && owned_process_id.is_some()
                         }
                         ReadinessRequirement::ControllerHealth => {
                             state.health_status == HealthStatus::Healthy
@@ -7718,6 +7719,7 @@ mod tests {
         id: String,
         state: RuntimeState,
         process_identity: Option<PersistedProcessIdentity>,
+        spawn_identity: Option<(u32, PersistedProcessIdentity)>,
         prepare_entered: Option<Arc<tokio::sync::Notify>>,
         release_prepare: Option<Arc<tokio::sync::Notify>>,
         start_entered: Option<Arc<tokio::sync::Notify>>,
@@ -7725,6 +7727,15 @@ mod tests {
         start_count: Option<Arc<AtomicUsize>>,
         fail_prepare: bool,
         stop_count: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedController {
+        fn materialize_spawn_identity(&mut self) {
+            if let Some((pid, identity)) = self.spawn_identity.take() {
+                self.state.pid = Some(pid);
+                self.process_identity = Some(identity);
+            }
+        }
     }
 
     #[async_trait]
@@ -7755,9 +7766,11 @@ mod tests {
                 if let Some(release) = &self.start_release {
                     release.notified().await;
                 }
+                self.materialize_spawn_identity();
                 self.state.status = ServiceState::Running;
                 return Ok(());
             }
+            self.materialize_spawn_identity();
             self.state.status = ServiceState::Running;
             self.state.health_status = HealthStatus::Healthy;
             Ok(())
@@ -7834,6 +7847,7 @@ mod tests {
                     health_status: HealthStatus::Unknown,
                 },
                 process_identity: Some(test_process_identity(1_234, 41, "/test/unready-worker")),
+                spawn_identity: None,
                 prepare_entered: None,
                 release_prepare: None,
                 start_entered: Some(self.entered.clone()),
@@ -7873,6 +7887,10 @@ mod tests {
                     health_status: HealthStatus::Unknown,
                 },
                 process_identity: None,
+                spawn_identity: Some((
+                    43,
+                    test_process_identity(1_235, 43, "/test/blocking-prepare-worker"),
+                )),
                 prepare_entered: Some(self.entered.clone()),
                 release_prepare: Some(self.release.clone()),
                 start_entered: None,
@@ -8112,6 +8130,7 @@ mod tests {
                     42,
                     "/test/retry-prepare-worker",
                 )),
+                spawn_identity: None,
                 prepare_entered: None,
                 release_prepare: None,
                 start_entered: None,
@@ -8149,6 +8168,10 @@ mod tests {
                     health_status: HealthStatus::Unknown,
                 },
                 process_identity: None,
+                spawn_identity: Some((
+                    44,
+                    test_process_identity(1_236, 44, "/test/counting-start-worker"),
+                )),
                 prepare_entered: None,
                 release_prepare: None,
                 start_entered: None,
@@ -15900,6 +15923,7 @@ command = "ignored"
                     42,
                     "/test/unhealthy-retry-worker",
                 )),
+                spawn_identity: None,
                 prepare_entered: None,
                 release_prepare: None,
                 start_entered: None,
@@ -20882,16 +20906,17 @@ command = "sleep 30"
         let dir = tempdir().expect("create worker readiness directory");
         let manager = readiness_test_manager(dir.path());
         let instance_id = test_instance_id();
-        let controller: Arc<Mutex<dyn ServiceController>> =
-            Arc::new(Mutex::new(TestController::new(
-                "readiness:worker",
-                RuntimeState {
-                    pid: Some(42),
-                    port: None,
-                    status: ServiceState::Running,
-                    health_status: HealthStatus::Unknown,
-                },
-            )));
+        let mut controller = TestController::new(
+            "readiness:worker",
+            RuntimeState {
+                pid: Some(42),
+                port: None,
+                status: ServiceState::Running,
+                health_status: HealthStatus::Unknown,
+            },
+        );
+        controller.owned_process_id = Some(42);
+        let controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(controller));
         let mut service = test_service(
             LocaldConfig::default(),
             ServiceConfig::Typed(TypedServiceConfig::Worker(
@@ -20919,6 +20944,57 @@ command = "sleep 30"
         assert_eq!(
             services["readiness:worker"].health_source,
             HealthSource::Explicit
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn portless_worker_requires_owned_process_identity() {
+        let dir = tempdir().expect("create worker readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "readiness:worker",
+                RuntimeState {
+                    pid: Some(42),
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Unknown,
+                },
+            )));
+        let mut service = test_service(
+            LocaldConfig::default(),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(
+                locald_core::config::WorkerServiceConfig::default(),
+            )),
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:worker".to_owned(), service);
+
+        let readiness = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .wait_for_health("readiness:worker", instance_id)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(SERVICE_READINESS_TIMEOUT).await;
+        let error = readiness
+            .await
+            .expect("worker readiness task joins")
+            .expect_err("unowned PID evidence cannot satisfy worker readiness");
+        assert!(format!("{error:#}").contains("owned process liveness"));
+        assert_eq!(
+            manager.services.lock().await["readiness:worker"].health_status,
+            HealthStatus::Unhealthy
         );
     }
 
