@@ -1639,49 +1639,72 @@ impl ProcessManager {
     }
 
     pub async fn handle_notify(&self, pid: u32) {
-        let updated = {
-            let mut services = self.services.lock().await;
-            let mut updated = None;
-            for (name, service) in services.iter_mut() {
-                if let ServiceRuntime::Controller(c) = &service.runtime_state {
-                    let state = c.lock().await.read_state().await;
-                    if state.pid == Some(pid) {
-                        let Ok(requirement) = ReadinessRequirement::for_service(
-                            &service.service_config,
-                            service.sticky_port,
-                        ) else {
-                            warn!(
-                                "Ignoring readiness notification for service {name} with an invalid readiness contract"
-                            );
-                            break;
-                        };
-                        if !requirement.accepts_notify() {
-                            info!(
-                                "Ignoring readiness notification for service {name}; its {} remains authoritative",
-                                requirement.description()
-                            );
-                            break;
-                        }
-                        if service.health_status != HealthStatus::Starting {
-                            info!(
-                                "Ignoring readiness notification for service {name}; readiness is already {}",
-                                service.health_status
-                            );
-                            break;
-                        }
-                        info!("Service {} is ready (via notify)", name);
-                        service.health_status = HealthStatus::Healthy;
-                        service.health_source = HealthSource::Notify;
-                        Self::advance_service_projection(service);
-                        updated = Some(name.clone());
-                        break;
-                    }
-                }
-            }
-            updated
+        let candidates = {
+            let services = self.services.lock().await;
+            services
+                .iter()
+                .filter_map(|(name, service)| match &service.runtime_state {
+                    ServiceRuntime::Controller(controller) => Some((
+                        name.clone(),
+                        service.instance_id,
+                        service.controller_generation,
+                        controller.clone(),
+                    )),
+                    ServiceRuntime::None => None,
+                })
+                .collect::<Vec<_>>()
         };
-        if let Some(name) = updated {
-            self.broadcast_service_update(&name).await;
+
+        for (name, instance_id, controller_generation, controller) in candidates {
+            let state = controller.lock().await.read_state().await;
+            if state.pid != Some(pid) {
+                continue;
+            }
+
+            let updated = {
+                let mut services = self.services.lock().await;
+                let Some(service) = services.get_mut(&name).filter(|service| {
+                    service.instance_id == instance_id
+                        && service.controller_generation == controller_generation
+                        && matches!(
+                            &service.runtime_state,
+                            ServiceRuntime::Controller(current) if Arc::ptr_eq(current, &controller)
+                        )
+                }) else {
+                    continue;
+                };
+                let Ok(requirement) =
+                    ReadinessRequirement::for_service(&service.service_config, service.sticky_port)
+                else {
+                    warn!(
+                        "Ignoring readiness notification for service {name} with an invalid readiness contract"
+                    );
+                    return;
+                };
+                if !requirement.accepts_notify() {
+                    info!(
+                        "Ignoring readiness notification for service {name}; its {} remains authoritative",
+                        requirement.description()
+                    );
+                    return;
+                }
+                if service.health_status != HealthStatus::Starting {
+                    info!(
+                        "Ignoring readiness notification for service {name}; readiness is already {}",
+                        service.health_status
+                    );
+                    return;
+                }
+                info!("Service {} is ready (via notify)", name);
+                service.health_status = HealthStatus::Healthy;
+                service.health_source = HealthSource::Notify;
+                Self::advance_service_projection(service);
+                true
+            };
+            if updated {
+                self.broadcast_service_update(&name).await;
+            }
+            return;
         }
     }
 
@@ -1892,9 +1915,11 @@ impl ProcessManager {
                             Self::advance_service_projection(service);
                         }
                         let readiness_changed = !ready
-                            && service.health_status != HealthStatus::Unhealthy;
+                            && (service.health_status != HealthStatus::Unhealthy
+                                || service.health_source != requirement.health_source());
                         if readiness_changed {
                             service.health_status = HealthStatus::Unhealthy;
+                            service.health_source = requirement.health_source();
                             Self::advance_service_projection(service);
                         }
                         (ready, last_status, last_source, readiness_changed)
@@ -1937,9 +1962,17 @@ impl ProcessManager {
                 service.instance_id == instance_id,
                 "service `{name}` changed project instances during readiness failure"
             );
-            let changed = service.health_status != HealthStatus::Unhealthy;
+            let requirement =
+                ReadinessRequirement::for_service(&service.service_config, service.sticky_port)
+                    .with_context(|| {
+                        format!("service `{name}` has an invalid readiness contract")
+                    })?;
+            let source = requirement.health_source();
+            let changed =
+                service.health_status != HealthStatus::Unhealthy || service.health_source != source;
             if changed {
                 service.health_status = HealthStatus::Unhealthy;
+                service.health_source = source;
                 Self::advance_service_projection(service);
             }
             changed
@@ -21247,6 +21280,17 @@ command = "sleep 30"
             manager.services.lock().await["readiness:worker"].health_status,
             HealthStatus::Unhealthy
         );
+        assert_eq!(
+            manager.services.lock().await["readiness:worker"].health_source,
+            HealthSource::Explicit,
+            "terminal worker readiness records its owned-process contract"
+        );
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load persisted worker readiness failure");
+        assert_eq!(persisted.services[0].health_source, HealthSource::Explicit);
     }
 
     #[tokio::test]
@@ -21288,6 +21332,72 @@ command = "sleep 30"
         assert_eq!(
             manager.services.lock().await["readiness:site"].health_status,
             HealthStatus::Unhealthy
+        );
+        assert_eq!(
+            manager.services.lock().await["readiness:site"].health_source,
+            HealthSource::Tcp,
+            "terminal combined readiness records its endpoint contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_releases_the_service_registry_while_reading_controller_state() {
+        let dir = tempdir().expect("create notify readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let pid = std::process::id();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingStatusController {
+                entered: entered.clone(),
+                release: release.clone(),
+                state: RuntimeState {
+                    pid: Some(pid),
+                    port: Some(41_239),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            }));
+        let mut service = test_service(
+            LocaldConfig::default(),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.sticky_port = Some(41_239);
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:web".to_owned(), service);
+
+        let notify = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.handle_notify(pid).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("notify begins reading controller state");
+        let services = tokio::time::timeout(Duration::from_secs(1), manager.services.lock())
+            .await
+            .expect("controller state read does not hold the service registry");
+        drop(services);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("notify publication reads the current controller");
+        release.notify_one();
+        notify.await.expect("notify task joins");
+
+        let services = manager.services.lock().await;
+        assert_eq!(
+            services["readiness:web"].health_status,
+            HealthStatus::Healthy
+        );
+        assert_eq!(
+            services["readiness:web"].health_source,
+            HealthSource::Notify
         );
     }
 

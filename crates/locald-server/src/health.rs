@@ -166,6 +166,17 @@ impl ReadinessRequirement {
         }
     }
 
+    pub(crate) const fn health_source(&self) -> HealthSource {
+        match self {
+            Self::ExplicitHttp { .. } => HealthSource::Http,
+            Self::ExplicitTcp { .. }
+            | Self::AssignedPortTcp { .. }
+            | Self::ControllerAndAssignedPortTcp { .. } => HealthSource::Tcp,
+            Self::ExplicitCommand { .. } => HealthSource::Command,
+            Self::ProcessRunning => HealthSource::Explicit,
+        }
+    }
+
     pub(crate) const fn accepts_notify(&self) -> bool {
         // Explicit configured readiness is authoritative. Notify is an
         // optimization only for the inferred assigned-port contract.
