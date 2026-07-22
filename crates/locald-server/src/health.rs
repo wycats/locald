@@ -176,12 +176,6 @@ impl ReadinessRequirement {
             Self::ProcessRunning => HealthSource::Explicit,
         }
     }
-
-    pub(crate) const fn accepts_notify(&self) -> bool {
-        // Explicit configured readiness is authoritative. Notify is an
-        // optimization only for the inferred assigned-port contract.
-        matches!(self, Self::AssignedPortTcp { .. })
-    }
 }
 
 impl HealthMonitor {

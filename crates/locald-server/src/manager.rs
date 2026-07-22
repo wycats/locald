@@ -1661,9 +1661,9 @@ impl ProcessManager {
                 continue;
             }
 
-            let updated = {
-                let mut services = self.services.lock().await;
-                let Some(service) = services.get_mut(&name).filter(|service| {
+            {
+                let services = self.services.lock().await;
+                let Some(service) = services.get(&name).filter(|service| {
                     service.instance_id == instance_id
                         && service.controller_generation == controller_generation
                         && matches!(
@@ -1681,28 +1681,10 @@ impl ProcessManager {
                     );
                     return;
                 };
-                if !requirement.accepts_notify() {
-                    info!(
-                        "Ignoring readiness notification for service {name}; its {} remains authoritative",
-                        requirement.description()
-                    );
-                    return;
-                }
-                if service.health_status != HealthStatus::Starting {
-                    info!(
-                        "Ignoring readiness notification for service {name}; readiness is already {}",
-                        service.health_status
-                    );
-                    return;
-                }
-                info!("Service {} is ready (via notify)", name);
-                service.health_status = HealthStatus::Healthy;
-                service.health_source = HealthSource::Notify;
-                Self::advance_service_projection(service);
-                true
-            };
-            if updated {
-                self.broadcast_service_update(&name).await;
+                info!(
+                    "Ignoring readiness notification for service {name}; its {} remains authoritative",
+                    requirement.description()
+                );
             }
             return;
         }
@@ -21384,25 +21366,18 @@ command = "sleep 30"
             .expect("controller state read does not hold the service registry");
         drop(services);
         release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
-            .await
-            .expect("notify publication reads the current controller");
-        release.notify_one();
         notify.await.expect("notify task joins");
 
         let services = manager.services.lock().await;
         assert_eq!(
             services["readiness:web"].health_status,
-            HealthStatus::Healthy
+            HealthStatus::Starting
         );
-        assert_eq!(
-            services["readiness:web"].health_source,
-            HealthSource::Notify
-        );
+        assert_eq!(services["readiness:web"].health_source, HealthSource::None);
     }
 
     #[tokio::test]
-    async fn notify_satisfies_only_inferred_readiness() {
+    async fn notify_cannot_bypass_authoritative_readiness() {
         let dir = tempdir().expect("create notify readiness directory");
         let manager = readiness_test_manager(dir.path());
         let pid = std::process::id();
@@ -21457,12 +21432,9 @@ command = "sleep 30"
         let services = manager.services.lock().await;
         assert_eq!(
             services["readiness:web"].health_status,
-            HealthStatus::Healthy
+            HealthStatus::Starting
         );
-        assert_eq!(
-            services["readiness:web"].health_source,
-            HealthSource::Notify
-        );
+        assert_eq!(services["readiness:web"].health_source, HealthSource::None);
         drop(services);
 
         manager
