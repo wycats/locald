@@ -412,11 +412,17 @@ mod macos {
 
     /// Resolve the locald binary path for running admin setup.
     ///
-    /// Prefers the executable pinned into the LaunchAgent, then `locald` on
-    /// `PATH`, and finally the legacy install location.
+    /// Prefers an executable pinned into the LaunchAgent, then `locald` on
+    /// `PATH`, and finally the legacy install location. A stale pinned path is
+    /// ignored so the repair flow can use a newly installed binary.
     #[allow(clippy::disallowed_methods)]
     fn locald_path_for_admin_setup() -> String {
         let pinned = std::env::var(LOCALD_DAEMON_PATH_ENV).ok();
+        let pinned_is_executable = pinned
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .is_some_and(is_executable_file);
         let discovered = if let Ok(output) =
             std::process::Command::new("which").arg("locald").output()
             && output.status.success()
@@ -426,16 +432,29 @@ mod macos {
         } else {
             None
         };
-        locald_path_for_admin_setup_from_sources(pinned.as_deref(), discovered.as_deref())
+        locald_path_for_admin_setup_from_sources(
+            pinned.as_deref(),
+            pinned_is_executable,
+            discovered.as_deref(),
+        )
+    }
+
+    fn is_executable_file(path: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
     }
 
     fn locald_path_for_admin_setup_from_sources(
         pinned: Option<&str>,
+        pinned_is_executable: bool,
         discovered: Option<&str>,
     ) -> String {
         pinned
             .map(str::trim)
             .filter(|path| !path.is_empty())
+            .filter(|_| pinned_is_executable)
             .or_else(|| discovered.map(str::trim).filter(|path| !path.is_empty()))
             .unwrap_or("/usr/local/bin/locald")
             .to_string()
@@ -621,6 +640,7 @@ mod macos {
             assert_eq!(
                 locald_path_for_admin_setup_from_sources(
                     Some("  /opt/locald/bin/locald  "),
+                    true,
                     Some("/usr/local/bin/locald"),
                 ),
                 "/opt/locald/bin/locald"
@@ -630,13 +650,36 @@ mod macos {
         #[test]
         fn admin_setup_falls_back_to_path_then_legacy_location() {
             assert_eq!(
-                locald_path_for_admin_setup_from_sources(None, Some("/opt/homebrew/bin/locald")),
+                locald_path_for_admin_setup_from_sources(
+                    None,
+                    false,
+                    Some("/opt/homebrew/bin/locald"),
+                ),
                 "/opt/homebrew/bin/locald"
             );
             assert_eq!(
-                locald_path_for_admin_setup_from_sources(Some("  "), None),
+                locald_path_for_admin_setup_from_sources(Some("  "), false, None),
                 "/usr/local/bin/locald"
             );
+        }
+
+        #[test]
+        fn admin_setup_ignores_a_stale_pinned_daemon_path() {
+            assert_eq!(
+                locald_path_for_admin_setup_from_sources(
+                    Some("/removed/locald"),
+                    false,
+                    Some("/opt/homebrew/bin/locald"),
+                ),
+                "/opt/homebrew/bin/locald"
+            );
+            assert!(!is_executable_file("/path/that/does/not/exist/locald"));
+            assert!(is_executable_file(
+                std::env::current_exe()
+                    .expect("current executable")
+                    .to_str()
+                    .expect("UTF-8 executable path")
+            ));
         }
 
         #[test]

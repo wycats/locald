@@ -190,13 +190,17 @@ fn install_with(
     ensure_parent(&paths.authority, owner)?;
     ensure_parent(&paths.helper, owner)?;
     ensure_parent(&paths.plist, owner)?;
+    // Stop any previously registered helper before replacing files on disk.
+    // If publication fails after this point, privileged binding remains
+    // unavailable until setup is rerun instead of leaving an older in-memory
+    // helper serving the Mach service.
+    launchctl.bootout("system/com.locald.helper")?;
     // Publish the fail-closed helper first. If setup is interrupted before the
     // authority follows, the new helper refuses to open its listener.
     atomic_install_file(&paths.helper, helper_bytes, 0o755, owner)?;
     atomic_install_file(&paths.authority, &authority_bytes, 0o600, owner)?;
     atomic_install_file(&paths.plist, plist.as_bytes(), 0o644, owner)?;
 
-    launchctl.bootout("system/com.locald.helper")?;
     launchctl.enable("system/com.locald.helper")?;
     launchctl.bootstrap("system", &paths.plist)?;
     Ok(())
@@ -366,6 +370,22 @@ mod tests {
         }
     }
 
+    struct FailingBootoutLaunchctl;
+
+    impl Launchctl for FailingBootoutLaunchctl {
+        fn bootout(&self, _service: &str) -> Result<()> {
+            anyhow::bail!("injected bootout failure")
+        }
+
+        fn enable(&self, _service: &str) -> Result<()> {
+            unreachable!("enable must not run after a bootout failure")
+        }
+
+        fn bootstrap(&self, _domain: &str, _plist: &Path) -> Result<()> {
+            unreachable!("bootstrap must not run after a bootout failure")
+        }
+    }
+
     fn owner() -> FileOwner {
         FileOwner {
             uid: nix::unistd::geteuid().as_raw(),
@@ -456,6 +476,37 @@ mod tests {
                     .to_string_lossy()
                     .contains(".tmp."))
         );
+    }
+
+    #[test]
+    fn bootout_failure_preserves_the_existing_installation() {
+        let root = tempfile::tempdir().expect("temporary install root");
+        let paths = InstallPaths::under(root.path());
+        let owner = owner();
+
+        ensure_parent(&paths.authority, owner).expect("authority parent");
+        ensure_parent(&paths.helper, owner).expect("helper parent");
+        ensure_parent(&paths.plist, owner).expect("plist parent");
+        std::fs::write(&paths.helper, b"helper-v1").expect("existing helper");
+        std::fs::write(&paths.authority, b"authority-v1").expect("existing authority");
+        std::fs::write(&paths.plist, b"plist-v1").expect("existing plist");
+
+        let error = install_with(
+            &paths,
+            owner,
+            b"helper-v2",
+            &authority("0.2.0"),
+            &FailingBootoutLaunchctl,
+        )
+        .expect_err("bootout failure must stop publication");
+
+        assert!(error.to_string().contains("injected bootout failure"));
+        assert_eq!(std::fs::read(&paths.helper).expect("helper"), b"helper-v1");
+        assert_eq!(
+            std::fs::read(&paths.authority).expect("authority"),
+            b"authority-v1"
+        );
+        assert_eq!(std::fs::read(&paths.plist).expect("plist"), b"plist-v1");
     }
 
     #[test]

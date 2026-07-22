@@ -957,6 +957,18 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
                     #[cfg(target_os = "macos")]
                     {
+                        // Resolve and validate the non-root console owner before
+                        // mutating trust, agent, or helper installation state.
+                        let sudo_uid = std::env::var("SUDO_UID").ok();
+                        let configured_uid = invoking_user_uid(sudo_uid.as_deref())?;
+                        let helper_authority =
+                            crate::macos_helper::authority_for_current_executable(configured_uid)
+                                .map_err(|error| {
+                                CliError::message(format!(
+                                    "Failed to authorize the privileged helper: {error}"
+                                ))
+                            })?;
+
                         cliclack::intro("locald admin setup (macOS)")?;
 
                         // Step 1: Generate and trust the Root CA certificate.
@@ -1007,21 +1019,10 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             const HELPER_BYTES: &[u8] =
                                 include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
 
-                            let sudo_uid = std::env::var("SUDO_UID").ok();
-                            let configured_uid = invoking_user_uid(sudo_uid.as_deref())?;
-                            let authority = crate::macos_helper::authority_for_current_executable(
-                                configured_uid,
-                            )
-                            .map_err(|error| {
-                                CliError::message(format!(
-                                    "Failed to authorize the privileged helper: {error}"
-                                ))
-                            })?;
-
                             let s = cliclack::spinner();
                             s.start("Installing privileged helper...");
 
-                            match crate::macos_helper::install(HELPER_BYTES, &authority) {
+                            match crate::macos_helper::install(HELPER_BYTES, &helper_authority) {
                                 Ok(()) => {
                                     s.stop("Privileged helper installed (binds ports 80/443)");
                                 }
