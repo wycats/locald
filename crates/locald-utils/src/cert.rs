@@ -335,12 +335,9 @@ fn regular_file_metadata_if_present(path: &Path) -> Result<Option<std::fs::Metad
 }
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::disallowed_methods)]
 fn validate_root_ca_pair(cert_path: &Path, key_path: &Path) -> Result<()> {
-    let mut cert =
-        File::open(cert_path).with_context(|| format!("Failed to read {}", cert_path.display()))?;
-    let mut key =
-        File::open(key_path).with_context(|| format!("Failed to read {}", key_path.display()))?;
+    let mut cert = open_regular_file_no_follow(cert_path, 1024 * 1024)?;
+    let mut key = open_regular_file_no_follow(key_path, 1024 * 1024)?;
     validate_root_ca_pair_files(&mut cert, &mut key)
 }
 
@@ -881,7 +878,23 @@ fn ssl_trust_probe_pems(ca_path: &Path, ca_key_path: &Path) -> Result<(String, V
 
 #[cfg(target_os = "macos")]
 fn read_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>> {
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = open_regular_file_no_follow(path, maximum_bytes)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum_bytes {
+        anyhow::bail!(
+            "File exceeds the {maximum_bytes}-byte safety limit: {}",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn open_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<File> {
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
@@ -896,17 +909,7 @@ fn read_regular_file_no_follow(path: &Path, maximum_bytes: u64) -> Result<Vec<u8
             path.display()
         );
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    std::io::Read::by_ref(&mut file)
-        .take(maximum_bytes + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > maximum_bytes {
-        anyhow::bail!(
-            "File exceeds the {maximum_bytes}-byte safety limit: {}",
-            path.display()
-        );
-    }
-    Ok(bytes)
+    Ok(file)
 }
 
 #[cfg(target_os = "macos")]
@@ -1314,6 +1317,25 @@ mod tests {
             nix::unistd::getgid().as_raw(),
         )
         .expect_err("FIFO Root CA entry must fail closed without waiting for a writer");
+
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&certs);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_root_ca_pair_validation_rejects_a_fifo_without_blocking() {
+        let certs = unique_temp_dir();
+        std::fs::create_dir_all(&certs).unwrap();
+        nix::unistd::mkfifo(
+            &certs.join("rootCA.pem"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        std::fs::write(certs.join("rootCA-key.pem"), b"private key").unwrap();
+
+        let error = validate_root_ca_pair(&certs.join("rootCA.pem"), &certs.join("rootCA-key.pem"))
+            .expect_err("FIFO Root CA entry must fail closed without waiting for a writer");
 
         assert!(error.to_string().contains("not a regular file"));
         let _ = std::fs::remove_dir_all(&certs);

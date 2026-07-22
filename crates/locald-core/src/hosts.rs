@@ -1,5 +1,4 @@
 #![allow(clippy::collapsible_if)]
-use std::fmt::Write;
 use std::io;
 use std::path::PathBuf;
 use tokio::fs;
@@ -43,52 +42,7 @@ impl HostsFileSection {
     }
 
     pub fn update_content(&self, current_content: &str, domains: &[String]) -> String {
-        let start_marker = "# BEGIN locald";
-        let end_marker = "# END locald";
-
-        if domains.is_empty() {
-            let Some(start) = current_content.find(start_marker) else {
-                return current_content.to_owned();
-            };
-            let Some(relative_end) = current_content[start..].find(end_marker) else {
-                return current_content.to_owned();
-            };
-            let end = start + relative_end + end_marker.len();
-            let mut output = String::from(&current_content[..start]);
-            output.push_str(&current_content[end..]);
-            while output.contains("\n\n\n") {
-                output = output.replace("\n\n\n", "\n\n");
-            }
-            return output;
-        }
-
-        let mut new_section = String::new();
-        new_section.push_str(start_marker);
-        new_section.push('\n');
-        for domain in domains {
-            let _ = writeln!(new_section, "127.0.0.1 {domain}");
-        }
-        new_section.push_str(end_marker);
-
-        if let Some(start) = current_content.find(start_marker) {
-            if let Some(end_idx) = current_content[start..].find(end_marker) {
-                let end = start + end_idx;
-                // Replace existing section
-                let mut output = String::from(&current_content[..start]);
-                output.push_str(&new_section);
-                output.push_str(&current_content[end + end_marker.len()..]);
-                return output;
-            }
-        }
-
-        // Append if not found
-        let mut output = String::from(current_content);
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&new_section);
-        output.push('\n');
-        output
+        locald_hosts::update_hosts_content(current_content, domains)
     }
 
     /// Rebuild locald's generated section after removing the named domains
