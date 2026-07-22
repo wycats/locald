@@ -99,7 +99,7 @@ impl SetupPlatform for SystemPlatform {
 
     fn restart_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()> {
         let service = format!("gui/{}/{AGENT_LABEL}", owner.uid);
-        let output = std::process::Command::new("launchctl")
+        let output = std::process::Command::new("/bin/launchctl")
             .args(["bootout", &service])
             .output()
             .context("failed to run launchctl bootout for menu bar agent")?;
@@ -110,7 +110,7 @@ impl SetupPlatform for SystemPlatform {
             }
         }
 
-        let status = std::process::Command::new("launchctl")
+        let status = std::process::Command::new("/bin/launchctl")
             .args(["enable", &service])
             .status()
             .context("failed to run launchctl enable for menu bar agent")?;
@@ -118,7 +118,7 @@ impl SetupPlatform for SystemPlatform {
             anyhow::bail!("launchctl enable {service} failed with status {status}");
         }
 
-        let status = std::process::Command::new("launchctl")
+        let status = std::process::Command::new("/bin/launchctl")
             .args(["bootstrap", &format!("gui/{}", owner.uid)])
             .arg(plist)
             .status()
@@ -231,7 +231,7 @@ pub fn run_setup() -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         use std::os::unix::process::CommandExt;
         let executable = std::env::current_exe().context("could not resolve locald executable")?;
-        let error = std::process::Command::new("sudo")
+        let error = std::process::Command::new("/usr/bin/sudo")
             .arg("--")
             .arg(executable)
             .args(["admin", "setup"])

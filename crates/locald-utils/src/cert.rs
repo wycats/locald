@@ -388,21 +388,58 @@ fn publish_new_root_ca_pair(
         }
     };
 
+    let mut key_published = false;
+    let mut cert_published = false;
     let result = (|| -> Result<()> {
         nix::fcntl::renameat(directory, key_temp.as_str(), directory, "rootCA-key.pem")
             .context("Failed to publish rootCA-key.pem")?;
+        key_published = true;
         nix::unistd::fsync(directory)?;
         nix::fcntl::renameat(directory, cert_temp.as_str(), directory, "rootCA.pem")
             .context("Failed to publish rootCA.pem")?;
+        cert_published = true;
         nix::unistd::fsync(directory)?;
         Ok(())
     })();
 
-    if result.is_err() {
+    if let Err(error) = result {
         remove_root_ca_temp(directory, &cert_temp);
         remove_root_ca_temp(directory, &key_temp);
+        let rollback = rollback_published_root_ca_pair(directory, key_published, cert_published);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(error.context(format!(
+                "also failed to roll back partially published Root CA material: {rollback:#}"
+            ))),
+        };
     }
-    result
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rollback_published_root_ca_pair(
+    directory: &OwnedFd,
+    key_published: bool,
+    cert_published: bool,
+) -> Result<()> {
+    if cert_published {
+        nix::unistd::unlinkat(
+            directory,
+            "rootCA.pem",
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .context("Failed to roll back rootCA.pem")?;
+    }
+    if key_published {
+        nix::unistd::unlinkat(
+            directory,
+            "rootCA-key.pem",
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .context("Failed to roll back rootCA-key.pem")?;
+    }
+    nix::unistd::fsync(directory).context("Failed to sync Root CA rollback")?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -963,6 +1000,45 @@ mod tests {
                 .mode()
                 & 0o7777,
             0o644
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_publication_rolls_back_a_key_when_certificate_publish_fails() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(dir.join("rootCA.pem"))
+            .expect("create conflicting certificate destination");
+        let directory = nix::fcntl::open(
+            &dir,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open Root CA directory");
+
+        publish_new_root_ca_pair(
+            &directory,
+            b"certificate",
+            b"private-key",
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("certificate publication must fail");
+
+        assert!(dir.join("rootCA.pem").is_dir());
+        assert!(!dir.join("rootCA-key.pem").exists());
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("read Root CA directory")
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp."))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
