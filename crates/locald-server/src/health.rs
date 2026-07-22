@@ -46,8 +46,10 @@ pub(crate) enum ReadinessRequirement {
     AssignedPortTcp {
         port: u16,
     },
+    ControllerAndAssignedPortTcp {
+        port: u16,
+    },
     ProcessRunning,
-    ControllerHealth,
 }
 
 impl ReadinessRequirement {
@@ -128,11 +130,15 @@ impl ReadinessRequirement {
                 || Ok(Self::ProcessRunning),
                 |port| Ok(Self::AssignedPortTcp { port }),
             ),
-            // Container endpoint publication is not yet authoritative. Keep
-            // the existing controller-owned process contract until the
-            // container runtime owns `container_port` mapping explicitly.
-            ServiceConfig::Typed(TypedServiceConfig::Container(_)) => Ok(Self::ControllerHealth),
-            ServiceConfig::Typed(TypedServiceConfig::Site(_)) => Ok(Self::ControllerHealth),
+            ServiceConfig::Typed(
+                TypedServiceConfig::Container(_) | TypedServiceConfig::Site(_),
+            ) => Ok(Self::ControllerAndAssignedPortTcp {
+                port: port.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "endpoint service has no assigned port for controller and TCP readiness"
+                    )
+                })?,
+            }),
             // Exec and legacy services are endpoint services: their common
             // config receives an assigned PORT even when `port` is omitted.
             // Commands that intentionally have no endpoint use `type = "worker"`.
@@ -153,8 +159,10 @@ impl ReadinessRequirement {
             Self::ExplicitTcp { .. } => "explicit TCP probe on the assigned endpoint".to_owned(),
             Self::ExplicitCommand { .. } => "explicit command probe".to_owned(),
             Self::AssignedPortTcp { .. } => "TCP probe on the assigned endpoint".to_owned(),
+            Self::ControllerAndAssignedPortTcp { .. } => {
+                "controller health and TCP probe on the assigned endpoint".to_owned()
+            }
             Self::ProcessRunning => "owned process liveness".to_owned(),
-            Self::ControllerHealth => "controller-reported readiness".to_owned(),
         }
     }
 
@@ -224,7 +232,7 @@ impl HealthMonitor {
                 port,
                 interval,
                 timeout,
-            } => self.spawn_tcp_monitor(name, controller, port, interval, timeout),
+            } => self.spawn_tcp_monitor(name, controller, port, interval, timeout, false),
             ReadinessRequirement::ExplicitCommand {
                 command,
                 interval,
@@ -236,8 +244,17 @@ impl HealthMonitor {
                 port,
                 Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
                 Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS),
+                false,
             ),
-            ReadinessRequirement::ProcessRunning | ReadinessRequirement::ControllerHealth => {}
+            ReadinessRequirement::ControllerAndAssignedPortTcp { port } => self.spawn_tcp_monitor(
+                name,
+                controller,
+                port,
+                Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
+                Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS),
+                true,
+            ),
+            ReadinessRequirement::ProcessRunning => {}
         }
     }
 
@@ -607,6 +624,7 @@ impl HealthMonitor {
         assigned_port: u16,
         interval: Duration,
         timeout: Duration,
+        require_controller_health: bool,
     ) {
         info!(
             "Starting TCP monitor for {} on port {}",
@@ -645,7 +663,30 @@ impl HealthMonitor {
                     name, assigned_port, result
                 );
 
-                if result {
+                let controller_ready = if result && require_controller_health {
+                    let runtime = {
+                        let services = monitor.services.lock().await;
+                        services
+                            .get(&name)
+                            .filter(|service| Self::matches_controller(service, controller))
+                            .and_then(|service| match &service.runtime_state {
+                                crate::manager::ServiceRuntime::Controller(controller) => {
+                                    Some(controller.clone())
+                                }
+                                crate::manager::ServiceRuntime::None => None,
+                            })
+                    };
+                    if let Some(runtime) = runtime {
+                        runtime.lock().await.read_state().await.health_status
+                            == HealthStatus::Healthy
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+
+                if result && controller_ready {
                     monitor
                         .update_health(&name, controller, HealthStatus::Healthy, HealthSource::Tcp)
                         .await;
@@ -685,7 +726,17 @@ mod tests {
     use std::collections::HashMap;
 
     #[derive(Debug)]
-    struct TestController;
+    struct TestController {
+        health_status: HealthStatus,
+    }
+
+    impl TestController {
+        const fn unknown() -> Self {
+            Self {
+                health_status: HealthStatus::Unknown,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl ServiceController for TestController {
@@ -710,7 +761,7 @@ mod tests {
                 pid: Some(std::process::id()),
                 port: None,
                 status: ServiceState::Running,
-                health_status: HealthStatus::Unknown,
+                health_status: self.health_status,
             }
         }
 
@@ -765,7 +816,9 @@ mod tests {
             config: LocaldConfig::default(),
             service_config,
             resolved_env: HashMap::new(),
-            runtime_state: ServiceRuntime::Controller(Arc::new(Mutex::new(TestController))),
+            runtime_state: ServiceRuntime::Controller(Arc::new(Mutex::new(
+                TestController::unknown(),
+            ))),
             sticky_port,
             path: std::path::PathBuf::from("/readiness-test"),
             health_status: HealthStatus::Starting,
@@ -836,7 +889,7 @@ mod tests {
                 Some(4123),
             )
             .expect("derive site readiness"),
-            ReadinessRequirement::ControllerHealth
+            ReadinessRequirement::ControllerAndAssignedPortTcp { port: 4123 }
         ));
         assert!(matches!(
             ReadinessRequirement::for_service(
@@ -846,8 +899,8 @@ mod tests {
                 })),
                 Some(4125),
             )
-            .expect("preserve controller readiness until container networking owns its endpoint"),
-            ReadinessRequirement::ControllerHealth
+            .expect("derive fail-closed container endpoint readiness"),
+            ReadinessRequirement::ControllerAndAssignedPortTcp { port: 4125 }
         ));
     }
 
@@ -948,6 +1001,68 @@ mod tests {
             services.lock().await["app:web"].health_source,
             HealthSource::Tcp
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_monitor_waits_for_controller_health() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("open assigned endpoint");
+        let assigned_port = listener
+            .local_addr()
+            .expect("assigned listener address")
+            .port();
+        let instance_id = instance_id("00000000-0000-4000-8000-000000000007");
+        let controller = Arc::new(Mutex::new(TestController::unknown()));
+        let runtime_controller: Arc<Mutex<dyn ServiceController>> = controller.clone();
+        let mut service = monitored_service(
+            instance_id,
+            ServiceConfig::Typed(TypedServiceConfig::Site(SiteServiceConfig::default())),
+            Some(assigned_port),
+        );
+        service.runtime_state = ServiceRuntime::Controller(runtime_controller);
+        let services = Arc::new(Mutex::new(HashMap::from([(
+            "app:site".to_owned(),
+            service,
+        )])));
+        let (event_sender, _) = tokio::sync::broadcast::channel(8);
+        let monitor = HealthMonitor::new(
+            services.clone(),
+            event_sender,
+            Arc::new(Mutex::new((None, None))),
+            SharedDomainIndex::default(),
+        );
+        monitor.spawn_check(
+            "app:site".to_owned(),
+            instance_id,
+            1,
+            ReadinessRequirement::ControllerAndAssignedPortTcp {
+                port: assigned_port,
+            },
+            Some(assigned_port),
+            None,
+            None,
+            None,
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            services.lock().await["app:site"].health_status,
+            HealthStatus::Starting,
+            "a bound endpoint cannot bypass controller health"
+        );
+        controller.lock().await.health_status = HealthStatus::Healthy;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if services.lock().await["app:site"].health_status == HealthStatus::Healthy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller and endpoint jointly become ready");
     }
 
     #[tokio::test]
@@ -1173,7 +1288,9 @@ mod tests {
                 config: LocaldConfig::default(),
                 service_config: ServiceConfig::Legacy(ExecServiceConfig::default()),
                 resolved_env: HashMap::new(),
-                runtime_state: ServiceRuntime::Controller(Arc::new(Mutex::new(TestController))),
+                runtime_state: ServiceRuntime::Controller(Arc::new(Mutex::new(
+                    TestController::unknown(),
+                ))),
                 sticky_port: None,
                 path: std::path::PathBuf::from("/second"),
                 health_status: HealthStatus::Unknown,
@@ -1250,7 +1367,8 @@ mod tests {
             instance_id,
             controller_generation: 1,
         };
-        let controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(TestController));
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::unknown()));
         let services = Arc::new(Mutex::new(HashMap::from([(
             "app:web".to_owned(),
             Service {

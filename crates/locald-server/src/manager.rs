@@ -1685,8 +1685,9 @@ impl ProcessManager {
         }
     }
 
-    fn controller_satisfies_readiness(
+    fn readiness_is_satisfied(
         requirement: &ReadinessRequirement,
+        projected_health: HealthStatus,
         runtime_status: ServiceState,
         controller_health: HealthStatus,
         owned_process_id: Option<u32>,
@@ -1695,12 +1696,24 @@ impl ProcessManager {
             ReadinessRequirement::ProcessRunning => {
                 runtime_status == ServiceState::Running && owned_process_id.is_some()
             }
-            ReadinessRequirement::ControllerHealth => controller_health == HealthStatus::Healthy,
+            ReadinessRequirement::ControllerAndAssignedPortTcp { .. } => {
+                projected_health == HealthStatus::Healthy
+                    && controller_health == HealthStatus::Healthy
+            }
             ReadinessRequirement::ExplicitHttp { .. }
             | ReadinessRequirement::ExplicitTcp { .. }
             | ReadinessRequirement::ExplicitCommand { .. }
-            | ReadinessRequirement::AssignedPortTcp { .. } => false,
+            | ReadinessRequirement::AssignedPortTcp { .. } => {
+                projected_health == HealthStatus::Healthy
+            }
         }
+    }
+
+    const fn readiness_requires_controller_health(requirement: &ReadinessRequirement) -> bool {
+        matches!(
+            requirement,
+            ReadinessRequirement::ControllerAndAssignedPortTcp { .. }
+        )
     }
 
     async fn wait_for_health(&self, name: &str, instance_id: ProjectInstanceId) -> Result<()> {
@@ -1769,9 +1782,7 @@ impl ProcessManager {
                         service.health_status,
                         service.health_source
                     )))
-                } else if service.health_status == HealthStatus::Healthy {
-                    Some(Ok(()))
-                } else if matches!(requirement, ReadinessRequirement::ControllerHealth)
+                } else if Self::readiness_requires_controller_health(&requirement)
                     && state.health_status == HealthStatus::Unhealthy
                 {
                     Some(Err(format!(
@@ -1779,16 +1790,19 @@ impl ProcessManager {
                         requirement.description()
                     )))
                 } else {
-                    let controller_ready = Self::controller_satisfies_readiness(
+                    let controller_ready = Self::readiness_is_satisfied(
                         &requirement,
+                        service.health_status,
                         state.status,
                         state.health_status,
                         owned_process_id,
                     );
                     if controller_ready {
-                        service.health_status = HealthStatus::Healthy;
-                        service.health_source = HealthSource::Explicit;
-                        Self::advance_service_projection(service);
+                        if service.health_status != HealthStatus::Healthy {
+                            service.health_status = HealthStatus::Healthy;
+                            service.health_source = HealthSource::Explicit;
+                            Self::advance_service_projection(service);
+                        }
                         Some(Ok(()))
                     } else {
                         None
@@ -1864,23 +1878,19 @@ impl ProcessManager {
                         );
                         let last_status = service.health_status;
                         let last_source = service.health_source;
-                        let ready = if state.status == ServiceState::Stopped {
-                            false
-                        } else if service.health_status == HealthStatus::Healthy {
-                            true
-                        } else if Self::controller_satisfies_readiness(
+                        let ready = state.status != ServiceState::Stopped
+                            && Self::readiness_is_satisfied(
                             &requirement,
+                            service.health_status,
                             state.status,
                             state.health_status,
                             owned_process_id,
-                        ) {
+                        );
+                        if ready && service.health_status != HealthStatus::Healthy {
                             service.health_status = HealthStatus::Healthy;
                             service.health_source = HealthSource::Explicit;
                             Self::advance_service_projection(service);
-                            true
-                        } else {
-                            false
-                        };
+                        }
                         let readiness_changed = !ready
                             && service.health_status != HealthStatus::Unhealthy;
                         if readiness_changed {
@@ -21045,6 +21055,7 @@ command = "sleep 30"
             ServiceRuntime::Controller(controller),
             dir.path().to_path_buf(),
         );
+        service.sticky_port = Some(41_236);
         service.health_status = HealthStatus::Starting;
         manager
             .services

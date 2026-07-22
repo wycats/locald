@@ -108,6 +108,7 @@ name = "test-proj"
 type = "container"
 image = "alpine:latest"
 command = "sleep 300"
+health_check = "true"
 "#;
     let project_path = ctx.create_project("test-proj", config).await?;
 
