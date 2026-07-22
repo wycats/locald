@@ -22,6 +22,7 @@ command = "sh -c 'sleep 2 && touch ready && sleep 300'"
 health_check = "test -f ready"
 
 [services.web]
+type = "worker"
 command = "echo WEB STARTED && sleep 300"
 depends_on = ["db"]
 "#;

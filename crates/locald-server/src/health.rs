@@ -133,6 +133,9 @@ impl ReadinessRequirement {
             // container runtime owns `container_port` mapping explicitly.
             ServiceConfig::Typed(TypedServiceConfig::Container(_)) => Ok(Self::ControllerHealth),
             ServiceConfig::Typed(TypedServiceConfig::Site(_)) => Ok(Self::ControllerHealth),
+            // Exec and legacy services are endpoint services: their common
+            // config receives an assigned PORT even when `port` is omitted.
+            // Commands that intentionally have no endpoint use `type = "worker"`.
             ServiceConfig::Typed(TypedServiceConfig::Exec(_) | TypedServiceConfig::Postgres(_))
             | ServiceConfig::Legacy(_) => Ok(Self::AssignedPortTcp {
                 port: port.ok_or_else(|| {

@@ -1662,15 +1662,18 @@ impl ProcessManager {
                             );
                             break;
                         }
-                        info!("Service {} is ready (via notify)", name);
-                        if service.health_status != HealthStatus::Healthy
-                            || service.health_source != HealthSource::Notify
-                        {
-                            service.health_status = HealthStatus::Healthy;
-                            service.health_source = HealthSource::Notify;
-                            Self::advance_service_projection(service);
-                            updated = Some(name.clone());
+                        if service.health_status != HealthStatus::Starting {
+                            info!(
+                                "Ignoring readiness notification for service {name}; readiness is already {}",
+                                service.health_status
+                            );
+                            break;
                         }
+                        info!("Service {} is ready (via notify)", name);
+                        service.health_status = HealthStatus::Healthy;
+                        service.health_source = HealthSource::Notify;
+                        Self::advance_service_projection(service);
+                        updated = Some(name.clone());
                         break;
                     }
                 }
@@ -1679,6 +1682,24 @@ impl ProcessManager {
         };
         if let Some(name) = updated {
             self.broadcast_service_update(&name).await;
+        }
+    }
+
+    fn controller_satisfies_readiness(
+        requirement: &ReadinessRequirement,
+        runtime_status: ServiceState,
+        controller_health: HealthStatus,
+        owned_process_id: Option<u32>,
+    ) -> bool {
+        match requirement {
+            ReadinessRequirement::ProcessRunning => {
+                runtime_status == ServiceState::Running && owned_process_id.is_some()
+            }
+            ReadinessRequirement::ControllerHealth => controller_health == HealthStatus::Healthy,
+            ReadinessRequirement::ExplicitHttp { .. }
+            | ReadinessRequirement::ExplicitTcp { .. }
+            | ReadinessRequirement::ExplicitCommand { .. }
+            | ReadinessRequirement::AssignedPortTcp { .. } => false,
         }
     }
 
@@ -1758,18 +1779,12 @@ impl ProcessManager {
                         requirement.description()
                     )))
                 } else {
-                    let controller_ready = match &requirement {
-                        ReadinessRequirement::ProcessRunning => {
-                            state.status == ServiceState::Running && owned_process_id.is_some()
-                        }
-                        ReadinessRequirement::ControllerHealth => {
-                            state.health_status == HealthStatus::Healthy
-                        }
-                        ReadinessRequirement::ExplicitHttp { .. }
-                        | ReadinessRequirement::ExplicitTcp { .. }
-                        | ReadinessRequirement::ExplicitCommand { .. }
-                        | ReadinessRequirement::AssignedPortTcp { .. } => false,
-                    };
+                    let controller_ready = Self::controller_satisfies_readiness(
+                        &requirement,
+                        state.status,
+                        state.health_status,
+                        owned_process_id,
+                    );
                     if controller_ready {
                         service.health_status = HealthStatus::Healthy;
                         service.health_source = HealthSource::Explicit;
@@ -1817,14 +1832,14 @@ impl ProcessManager {
                         };
                         (controller, service.controller_generation, requirement)
                     };
-                    let state = {
+                    let (state, owned_process_id) = {
                         let controller = controller.lock().await;
-                        controller.read_state().await
+                        (controller.read_state().await, controller.owned_process_id())
                     };
-                    let last_readiness = {
-                        let services = self.services.lock().await;
+                    let (ready, last_status, last_source, readiness_changed) = {
+                        let mut services = self.services.lock().await;
                         let service = services
-                            .get(name)
+                            .get_mut(name)
                             .with_context(|| format!("service `{name}` disappeared during readiness"))?;
                         anyhow::ensure!(
                             service.instance_id == instance_id,
@@ -1847,22 +1862,42 @@ impl ProcessManager {
                             current_requirement == requirement,
                             "service `{name}` changed its readiness contract during readiness"
                         );
-                        if service.health_status == HealthStatus::Healthy {
-                            None
-                        } else {
-                            Some((service.health_status, service.health_source))
-                        }
-                    };
-                    let Some((last_status, last_source)) = last_readiness else {
-                        self.broadcast_service_update(name).await;
-                        return Ok(());
-                    };
-                    let (runtime_status, controller_health) =
-                        (
+                        let last_status = service.health_status;
+                        let last_source = service.health_source;
+                        let ready = if state.status == ServiceState::Stopped {
+                            false
+                        } else if service.health_status == HealthStatus::Healthy {
+                            true
+                        } else if Self::controller_satisfies_readiness(
+                            &requirement,
                             state.status,
                             state.health_status,
-                        );
-                    self.mark_readiness_failed(name, instance_id).await?;
+                            owned_process_id,
+                        ) {
+                            service.health_status = HealthStatus::Healthy;
+                            service.health_source = HealthSource::Explicit;
+                            Self::advance_service_projection(service);
+                            true
+                        } else {
+                            false
+                        };
+                        let readiness_changed = !ready
+                            && service.health_status != HealthStatus::Unhealthy;
+                        if readiness_changed {
+                            service.health_status = HealthStatus::Unhealthy;
+                            Self::advance_service_projection(service);
+                        }
+                        (ready, last_status, last_source, readiness_changed)
+                    };
+                    if ready {
+                        self.broadcast_service_update(name).await;
+                        return Ok(());
+                    }
+                    let (runtime_status, controller_health) = (state.status, state.health_status);
+                    self.persist_state_checked().await?;
+                    if readiness_changed {
+                        self.broadcast_service_update(name).await;
+                    }
                     anyhow::bail!(
                         "service `{name}` timed out after {}s waiting for {}; last runtime was {} with controller health {}, and last readiness was {} ({})",
                         SERVICE_READINESS_TIMEOUT.as_secs(),
@@ -10220,7 +10255,7 @@ mod tests {
         );
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
             manager.reconcile_legacy_attachment_owners(),
         )
         .await
@@ -14360,7 +14395,7 @@ command = "unused-by-test-factory"
             let source = source.clone();
             async move { manager.project_attach(project_path, source).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
             loop {
                 let renewed_expiry = availability
                     .snapshot()
@@ -14456,7 +14491,7 @@ command = "unused-by-test-factory"
         assert!(!policy.is_finished());
         drop(publication_guard);
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
             stop.await
                 .expect("stop task joins")
                 .expect("journaled stop publishes");
@@ -21091,6 +21126,68 @@ command = "sleep 30"
     }
 
     #[tokio::test(start_paused = true)]
+    async fn exact_deadline_rechecks_controller_readiness() {
+        let dir = tempdir().expect("create worker readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let controller = Arc::new(Mutex::new(TestController::new(
+            "readiness:worker",
+            RuntimeState {
+                pid: Some(42),
+                port: None,
+                status: ServiceState::Running,
+                health_status: HealthStatus::Unknown,
+            },
+        )));
+        let runtime_controller: Arc<Mutex<dyn ServiceController>> = controller.clone();
+        let mut service = test_service(
+            LocaldConfig::default(),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(
+                locald_core::config::WorkerServiceConfig::default(),
+            )),
+            ServiceRuntime::Controller(runtime_controller),
+            dir.path().to_path_buf(),
+        );
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:worker".to_owned(), service);
+
+        let readiness = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .wait_for_health("readiness:worker", instance_id)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            SERVICE_READINESS_TIMEOUT
+                .checked_sub(Duration::from_millis(250))
+                .expect("readiness timeout exceeds the final interval"),
+        )
+        .await;
+        assert!(
+            !readiness.is_finished(),
+            "unowned process remains pending before the deadline"
+        );
+        controller.lock().await.owned_process_id = Some(42);
+
+        tokio::time::advance(Duration::from_millis(250)).await;
+        readiness
+            .await
+            .expect("readiness task joins")
+            .expect("final controller observation satisfies readiness");
+        assert_eq!(
+            manager.services.lock().await["readiness:worker"].health_status,
+            HealthStatus::Healthy
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn portless_worker_requires_owned_process_identity() {
         let dir = tempdir().expect("create worker readiness directory");
         let manager = readiness_test_manager(dir.path());
@@ -21244,6 +21341,21 @@ command = "sleep 30"
         assert_eq!(
             services["readiness:web"].health_source,
             HealthSource::Notify
+        );
+        drop(services);
+
+        manager
+            .services
+            .lock()
+            .await
+            .get_mut("readiness:web")
+            .expect("notify readiness service remains present")
+            .health_status = HealthStatus::Unhealthy;
+        manager.handle_notify(pid).await;
+        assert_eq!(
+            manager.services.lock().await["readiness:web"].health_status,
+            HealthStatus::Unhealthy,
+            "notify cannot revive terminal readiness"
         );
     }
 
