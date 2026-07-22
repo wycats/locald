@@ -5,9 +5,10 @@ const END_MARKER: &str = "# END locald";
 
 /// Replace locald's managed hosts-file section with the supplied domains.
 ///
-/// An empty domain set removes an existing managed section. Malformed sections
-/// without an end marker are left in place and a complete replacement is
-/// appended, matching locald's historical fail-safe behavior.
+/// An empty domain set removes an existing complete managed section and leaves
+/// an unclosed section unchanged. With a nonempty domain set, an unclosed
+/// section is retained and a complete replacement is appended, matching
+/// locald's historical fail-safe behavior.
 #[must_use]
 pub fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
     if domains.is_empty() {

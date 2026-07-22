@@ -26,6 +26,8 @@ type ServerNameAuthorizer = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 #[cfg(target_os = "macos")]
 static ROOT_CA_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "macos")]
+const ROOT_CA_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Paths to the locald Root CA certificate and key files.
 #[derive(Debug, Clone)]
@@ -336,8 +338,8 @@ fn regular_file_metadata_if_present(path: &Path) -> Result<Option<std::fs::Metad
 
 #[cfg(target_os = "macos")]
 fn validate_root_ca_pair(cert_path: &Path, key_path: &Path) -> Result<()> {
-    let mut cert = open_regular_file_no_follow(cert_path, 1024 * 1024)?;
-    let mut key = open_regular_file_no_follow(key_path, 1024 * 1024)?;
+    let mut cert = open_regular_file_no_follow(cert_path, ROOT_CA_MAX_BYTES)?;
+    let mut key = open_regular_file_no_follow(key_path, ROOT_CA_MAX_BYTES)?;
     validate_root_ca_pair_files(&mut cert, &mut key)
 }
 
@@ -525,6 +527,9 @@ fn open_regular_file_if_present(directory: &OwnedFd, name: &str) -> Result<Optio
     let kind = nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode);
     if !kind.contains(nix::sys::stat::SFlag::S_IFREG) {
         anyhow::bail!("Root CA path is not a regular file: {name}");
+    }
+    if metadata.st_size < 0 || metadata.st_size as u64 > ROOT_CA_MAX_BYTES {
+        anyhow::bail!("Root CA file {name} exceeds the maximum size of {ROOT_CA_MAX_BYTES} bytes");
     }
     Ok(Some(File::from(fd)))
 }
@@ -864,9 +869,10 @@ pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 fn ssl_trust_probe_pems(ca_path: &Path, ca_key_path: &Path) -> Result<(String, Vec<u8>)> {
-    let ca_pem = read_regular_file_no_follow(ca_path, 1024 * 1024)?;
-    let ca_key_pem = String::from_utf8(read_regular_file_no_follow(ca_key_path, 1024 * 1024)?)
-        .context("rootCA-key.pem is not UTF-8 PEM data")?;
+    let ca_pem = read_regular_file_no_follow(ca_path, ROOT_CA_MAX_BYTES)?;
+    let ca_key_pem =
+        String::from_utf8(read_regular_file_no_follow(ca_key_path, ROOT_CA_MAX_BYTES)?)
+            .context("rootCA-key.pem is not UTF-8 PEM data")?;
     let ca_key = KeyPair::from_pem(&ca_key_pem).context("Failed to parse rootCA-key.pem")?;
     let issuer = CertifiedIssuer::self_signed(root_ca_params(), ca_key)
         .context("Failed to construct Root CA issuer")?;
@@ -1319,6 +1325,28 @@ mod tests {
         .expect_err("FIFO Root CA entry must fail closed without waiting for a writer");
 
         assert!(error.to_string().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&certs);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_oversized_regular_files_before_reading() {
+        let certs = unique_temp_dir();
+        std::fs::create_dir_all(&certs).unwrap();
+        std::fs::File::create(certs.join("rootCA.pem"))
+            .unwrap()
+            .set_len(ROOT_CA_MAX_BYTES + 1)
+            .unwrap();
+        std::fs::write(certs.join("rootCA-key.pem"), b"private key").unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("oversized Root CA entries must fail before parsing");
+
+        assert!(error.to_string().contains("exceeds the maximum size"));
         let _ = std::fs::remove_dir_all(&certs);
     }
 
