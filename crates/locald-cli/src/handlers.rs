@@ -2202,15 +2202,19 @@ mod tests {
         sync_hosts_file(
             &hosts,
             &[
-                "app.localhost".parse().expect("valid project domain"),
-                "locald.local".parse().expect("valid platform domain"),
+                "custom.example.test"
+                    .parse()
+                    .expect("valid custom project domain"),
+                "docs.local"
+                    .parse()
+                    .expect("valid explicit legacy-spelling project domain"),
             ],
         )
         .expect("synchronize hosts fixture");
 
         let updated = std::fs::read_to_string(path).expect("read synchronized hosts fixture");
-        assert!(updated.contains("127.0.0.1 app.localhost"));
-        assert!(updated.contains("127.0.0.1 locald.local"));
+        assert!(updated.contains("127.0.0.1 custom.example.test"));
+        assert!(updated.contains("127.0.0.1 docs.local"));
         assert_eq!(updated.matches("# BEGIN locald").count(), 1);
     }
 }

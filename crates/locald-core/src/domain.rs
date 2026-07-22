@@ -377,6 +377,24 @@ impl DomainIndex {
             .collect()
     }
 
+    /// Return exact service-owned names that macOS must map explicitly.
+    ///
+    /// `.localhost` is resolved natively. Historical `.local` platform
+    /// fallbacks are intentionally omitted, while an identically named
+    /// project-service claim remains an active custom domain.
+    #[must_use]
+    pub fn macos_hosts_domain_names(&self) -> Vec<DomainName> {
+        self.claims
+            .iter()
+            .filter(|(domain, target)| {
+                matches!(target, DomainTarget::Service { .. })
+                    && domain.as_str() != "localhost"
+                    && !domain.as_str().ends_with(".localhost")
+            })
+            .map(|(domain, _)| domain.clone())
+            .collect()
+    }
+
     /// Return every exact hostname owned by one project instance.
     #[must_use]
     pub fn domains_for_instance(&self, instance_id: ProjectInstanceId) -> BTreeSet<String> {
@@ -763,6 +781,33 @@ mod tests {
                 "dev.locald.local",
                 "docs.local",
                 "locald.local",
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_hosts_projection_uses_ownership_not_legacy_spelling() {
+        let instance_id = instance(5);
+        let index = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    service_claim("app.localhost", instance_id, "app:web"),
+                    service_claim("docs.local", instance_id, "app:docs"),
+                    service_claim("custom.example.test", instance_id, "app:custom"),
+                ],
+            )
+            .expect("service claims");
+
+        assert_eq!(
+            index.macos_hosts_domain_names(),
+            [
+                "custom.example.test"
+                    .parse::<DomainName>()
+                    .expect("custom domain"),
+                "docs.local"
+                    .parse::<DomainName>()
+                    .expect("explicit legacy-spelling service domain"),
             ]
         );
     }

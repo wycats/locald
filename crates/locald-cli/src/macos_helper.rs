@@ -187,11 +187,12 @@ fn install_with(
     authority_bytes.push(b'\n');
     let plist = render_launch_daemon_plist();
 
-    ensure_parent(&paths.authority, owner)
+    ensure_parent(&paths.authority, owner, true)
         .context("could not prepare the helper-authority directory")?;
-    ensure_parent(&paths.helper, owner)
+    ensure_parent(&paths.helper, owner, false)
         .context("could not prepare the privileged-helper directory")?;
-    ensure_parent(&paths.plist, owner).context("could not prepare the LaunchDaemons directory")?;
+    ensure_parent(&paths.plist, owner, false)
+        .context("could not prepare the LaunchDaemons directory")?;
     // Stop any previously registered helper before replacing files on disk.
     // If publication fails after this point, privileged binding remains
     // unavailable until setup is rerun instead of leaving an older in-memory
@@ -248,7 +249,7 @@ fn remove_installed_file(path: &Path) -> Result<()> {
     }
 }
 
-fn ensure_parent(path: &Path, owner: FileOwner) -> Result<()> {
+fn ensure_parent(path: &Path, owner: FileOwner, repair_existing: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("installation path has no parent: {}", path.display()))?;
@@ -271,17 +272,23 @@ fn ensure_parent(path: &Path, owner: FileOwner) -> Result<()> {
             parent.display()
         );
     }
-    if created {
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("could not set permissions on {}", parent.display()))?;
-        nix::unistd::chown(
-            parent,
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)
+        .with_context(|| format!("could not open installation directory {}", parent.display()))?;
+    if created || repair_existing {
+        nix::unistd::fchown(
+            &directory,
             Some(nix::unistd::Uid::from_raw(owner.uid)),
             Some(nix::unistd::Gid::from_raw(owner.gid)),
         )
         .with_context(|| format!("could not set ownership on {}", parent.display()))?;
+        nix::sys::stat::fchmod(&directory, nix::sys::stat::Mode::from_bits_truncate(0o755))
+            .with_context(|| format!("could not set permissions on {}", parent.display()))?;
     }
-    let metadata = std::fs::symlink_metadata(parent)
+    let metadata = directory
+        .metadata()
         .with_context(|| format!("could not validate {}", parent.display()))?;
     let actual_mode = metadata.mode() & 0o7777;
     if metadata.uid() != owner.uid || metadata.gid() != owner.gid || actual_mode & 0o022 != 0 {
@@ -528,9 +535,9 @@ mod tests {
         let paths = InstallPaths::under(root.path());
         let owner = owner();
 
-        ensure_parent(&paths.authority, owner).expect("authority parent");
-        ensure_parent(&paths.helper, owner).expect("helper parent");
-        ensure_parent(&paths.plist, owner).expect("plist parent");
+        ensure_parent(&paths.authority, owner, true).expect("authority parent");
+        ensure_parent(&paths.helper, owner, false).expect("helper parent");
+        ensure_parent(&paths.plist, owner, false).expect("plist parent");
         std::fs::write(&paths.helper, b"helper-v1").expect("existing helper");
         std::fs::write(&paths.authority, b"authority-v1").expect("existing authority");
         std::fs::write(&paths.plist, b"plist-v1").expect("existing plist");
@@ -622,11 +629,29 @@ mod tests {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .expect("set protected parent mode");
 
-        ensure_parent(&paths.plist, owner()).expect("validate existing secure parent");
+        ensure_parent(&paths.plist, owner(), false).expect("validate existing secure parent");
 
         assert_eq!(
             std::fs::metadata(parent).expect("parent metadata").mode() & 0o7777,
             0o700
+        );
+    }
+
+    #[test]
+    fn existing_locald_install_directory_is_repaired_idempotently() {
+        let root = tempfile::tempdir().expect("temporary install root");
+        let paths = InstallPaths::under(root.path());
+        let parent = paths.authority.parent().expect("authority parent");
+        std::fs::create_dir_all(parent).expect("create locald install directory");
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777))
+            .expect("drift locald install directory mode");
+
+        ensure_parent(&paths.authority, owner(), true).expect("repair locald install directory");
+        ensure_parent(&paths.authority, owner(), true).expect("repeat repair");
+
+        assert_eq!(
+            std::fs::metadata(parent).expect("parent metadata").mode() & 0o7777,
+            0o755
         );
     }
 

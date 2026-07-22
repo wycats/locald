@@ -120,9 +120,6 @@ struct DefaultHostSyncer;
 #[async_trait::async_trait]
 impl HostSyncer for DefaultHostSyncer {
     async fn sync(&self, domains: Vec<String>) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        let domains = macos_hosts_domains(domains);
-
         // Try to read hosts file to see if we need to update
         let hosts = locald_core::HostsFileSection::new();
         let needs_update = match hosts.read().await {
@@ -173,19 +170,6 @@ impl HostSyncer for DefaultHostSyncer {
 
         Ok(())
     }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_hosts_domains(domains: Vec<String>) -> Vec<String> {
-    domains
-        .into_iter()
-        .filter(|domain| {
-            let canonical = domain.to_ascii_lowercase();
-            canonical != "localhost"
-                && !canonical.ends_with(".localhost")
-                && !locald_core::LEGACY_MACOS_HOST_ALIASES.contains(&canonical.as_str())
-        })
-        .collect()
 }
 
 struct SandboxHostSyncer;
@@ -937,13 +921,24 @@ impl ProcessManager {
     /// Return the authoritative exact hostnames that require hosts-file mappings.
     #[must_use]
     pub fn hosts_domains(&self) -> Vec<String> {
-        self.domain_index.snapshot().hosts_domains()
+        self.hosts_domain_names()
+            .into_iter()
+            .map(|domain| domain.to_string())
+            .collect()
     }
 
     /// Return validated exact names for a privileged hosts-file writer.
     #[must_use]
     pub fn hosts_domain_names(&self) -> Vec<DomainName> {
-        self.domain_index.snapshot().hosts_domain_names()
+        let index = self.domain_index.snapshot();
+        #[cfg(target_os = "macos")]
+        {
+            index.macos_hosts_domain_names()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            index.hosts_domain_names()
+        }
     }
 
     fn build_domain_claims(
@@ -8361,36 +8356,24 @@ mod tests {
     }
 
     fn expected_hosts(service_domains: &[&str]) -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        let mut domains = service_domains
+            .iter()
+            .filter(|domain| **domain != "localhost" && !domain.ends_with(".localhost"))
+            .map(|domain| (*domain).to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(not(target_os = "macos"))]
         let mut domains = vec![
             "dev.docs.local".to_owned(),
             "dev.locald.local".to_owned(),
             "docs.local".to_owned(),
             "locald.local".to_owned(),
         ];
+        #[cfg(not(target_os = "macos"))]
         domains.extend(service_domains.iter().map(|domain| (*domain).to_owned()));
         domains.sort();
         domains.dedup();
         domains
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_hosts_sync_keeps_only_non_native_project_domains() {
-        assert_eq!(
-            macos_hosts_domains(vec![
-                "app.localhost".to_owned(),
-                "Frame.App.Localhost".to_owned(),
-                "dev.docs.local".to_owned(),
-                "custom.example.test".to_owned(),
-                "locald.local".to_owned(),
-                "LOCALD.LOCAL".to_owned(),
-            ]),
-            ["custom.example.test"]
-        );
-        assert!(
-            macos_hosts_domains(vec!["app.localhost".to_owned(), "LOCALD.LOCAL".to_owned(),])
-                .is_empty()
-        );
     }
 
     fn test_instance_id() -> ProjectInstanceId {
