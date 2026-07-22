@@ -1,6 +1,6 @@
 use locald_core::config::{
     DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_TIMEOUT_SECS, HealthCheckConfig,
-    ProbeType, ServiceConfig,
+    ProbeType, ServiceConfig, TypedServiceConfig,
 };
 use locald_core::state::{HealthSource, HealthStatus};
 use locald_core::{ProjectInstanceId, SharedDomainIndex};
@@ -21,6 +21,143 @@ pub(crate) struct HealthMonitor {
 struct ControllerIdentity {
     instance_id: ProjectInstanceId,
     controller_generation: u64,
+}
+
+/// The single readiness contract that must be satisfied before a service is
+/// exposed as ready or a dependent service may start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReadinessRequirement {
+    ExplicitHttp {
+        port: u16,
+        path: String,
+        interval: Duration,
+        timeout: Duration,
+    },
+    ExplicitTcp {
+        port: u16,
+        interval: Duration,
+        timeout: Duration,
+    },
+    ExplicitCommand {
+        command: String,
+        interval: Duration,
+        timeout: Duration,
+    },
+    AssignedPortTcp {
+        port: u16,
+    },
+    ProcessRunning,
+    ControllerHealth,
+}
+
+impl ReadinessRequirement {
+    pub(crate) fn service_requires_port(config: &ServiceConfig) -> bool {
+        let explicit_network_probe = matches!(
+            config.health_check(),
+            Some(HealthCheckConfig::Probe(probe))
+                if matches!(probe.kind, ProbeType::Http | ProbeType::Tcp)
+        );
+        !matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+            || config.port().is_some()
+            || explicit_network_probe
+    }
+
+    pub(crate) fn for_service(config: &ServiceConfig, port: Option<u16>) -> anyhow::Result<Self> {
+        let default_interval = Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
+        let default_timeout = Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS);
+
+        if let Some(health_check) = config.health_check() {
+            return match health_check {
+                HealthCheckConfig::Command(command) => {
+                    anyhow::ensure!(
+                        !command.trim().is_empty(),
+                        "explicit command readiness check must not be empty"
+                    );
+                    Ok(Self::ExplicitCommand {
+                        command: command.clone(),
+                        interval: default_interval,
+                        timeout: default_timeout,
+                    })
+                }
+                HealthCheckConfig::Probe(probe) => {
+                    let interval = probe.interval_duration();
+                    let timeout = probe.timeout_duration();
+                    match probe.kind {
+                        ProbeType::Http => Ok(Self::ExplicitHttp {
+                            port: port.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "explicit HTTP readiness check requires an assigned service port"
+                                )
+                            })?,
+                            path: probe.path.clone().unwrap_or_else(|| "/".to_owned()),
+                            interval,
+                            timeout,
+                        }),
+                        ProbeType::Tcp => Ok(Self::ExplicitTcp {
+                            port: port.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "explicit TCP readiness check requires an assigned service port"
+                                )
+                            })?,
+                            interval,
+                            timeout,
+                        }),
+                        ProbeType::Command => {
+                            let command = probe.command.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "explicit command readiness probe requires `command`"
+                                )
+                            })?;
+                            anyhow::ensure!(
+                                !command.trim().is_empty(),
+                                "explicit command readiness probe must not be empty"
+                            );
+                            Ok(Self::ExplicitCommand {
+                                command: command.clone(),
+                                interval,
+                                timeout,
+                            })
+                        }
+                    }
+                }
+            };
+        }
+
+        match config {
+            ServiceConfig::Typed(TypedServiceConfig::Worker(_)) => port.map_or_else(
+                || Ok(Self::ProcessRunning),
+                |port| Ok(Self::AssignedPortTcp { port }),
+            ),
+            ServiceConfig::Typed(TypedServiceConfig::Site(_)) => Ok(Self::ControllerHealth),
+            ServiceConfig::Typed(
+                TypedServiceConfig::Exec(_)
+                | TypedServiceConfig::Postgres(_)
+                | TypedServiceConfig::Container(_),
+            )
+            | ServiceConfig::Legacy(_) => Ok(Self::AssignedPortTcp {
+                port: port.ok_or_else(|| {
+                    anyhow::anyhow!("portful service has no assigned port for TCP readiness")
+                })?,
+            }),
+        }
+    }
+
+    pub(crate) fn description(&self) -> String {
+        match self {
+            Self::ExplicitHttp { path, .. } => {
+                format!("explicit HTTP probe at `{path}` on the assigned endpoint")
+            }
+            Self::ExplicitTcp { .. } => "explicit TCP probe on the assigned endpoint".to_owned(),
+            Self::ExplicitCommand { .. } => "explicit command probe".to_owned(),
+            Self::AssignedPortTcp { .. } => "TCP probe on the assigned endpoint".to_owned(),
+            Self::ProcessRunning => "owned process liveness".to_owned(),
+            Self::ControllerHealth => "controller-reported readiness".to_owned(),
+        }
+    }
+
+    pub(crate) const fn accepts_notify(&self) -> bool {
+        matches!(self, Self::AssignedPortTcp { .. })
+    }
 }
 
 impl HealthMonitor {
@@ -56,7 +193,7 @@ impl HealthMonitor {
         name: String,
         instance_id: ProjectInstanceId,
         controller_generation: u64,
-        config: &ServiceConfig,
+        requirement: ReadinessRequirement,
         port: Option<u16>,
         pid: Option<u32>,
         _container_id: Option<String>,
@@ -66,67 +203,36 @@ impl HealthMonitor {
             instance_id,
             controller_generation,
         };
-        let default_interval = Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
-        let default_timeout = Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS);
-
         // Spawn port mismatch detector if we have a PID and an expected port
         if let (Some(pid), Some(expected_port)) = (pid, port) {
             self.spawn_port_mismatch_monitor(name.clone(), controller, pid, expected_port);
         }
 
-        if let Some(hc) = config.health_check() {
-            let (interval, timeout) = match hc {
-                HealthCheckConfig::Command(_) => (default_interval, default_timeout),
-                HealthCheckConfig::Probe(probe) => {
-                    (probe.interval_duration(), probe.timeout_duration())
-                }
-            };
-            match hc {
-                HealthCheckConfig::Command(cmd) => {
-                    self.spawn_command_monitor(
-                        name,
-                        controller,
-                        cmd.clone(),
-                        cwd,
-                        interval,
-                        timeout,
-                    );
-                }
-                HealthCheckConfig::Probe(probe) => match probe.kind {
-                    ProbeType::Http => {
-                        if let Some(p) = port {
-                            let path = probe.path.as_deref().unwrap_or("/");
-                            self.spawn_http_monitor(
-                                name,
-                                controller,
-                                p,
-                                path.to_string(),
-                                interval,
-                                timeout,
-                            );
-                        }
-                    }
-                    ProbeType::Tcp => {
-                        if let Some(p) = port {
-                            self.spawn_tcp_monitor(name, controller, p, interval, timeout);
-                        }
-                    }
-                    ProbeType::Command => {
-                        if let Some(cmd) = &probe.command {
-                            self.spawn_command_monitor(
-                                name,
-                                controller,
-                                cmd.clone(),
-                                cwd,
-                                interval,
-                                timeout,
-                            );
-                        }
-                    }
-                },
-            }
-        } else if let Some(p) = port {
-            self.spawn_tcp_monitor(name, controller, p, default_interval, default_timeout);
+        match requirement {
+            ReadinessRequirement::ExplicitHttp {
+                port,
+                path,
+                interval,
+                timeout,
+            } => self.spawn_http_monitor(name, controller, port, path, interval, timeout),
+            ReadinessRequirement::ExplicitTcp {
+                port,
+                interval,
+                timeout,
+            } => self.spawn_tcp_monitor(name, controller, port, interval, timeout),
+            ReadinessRequirement::ExplicitCommand {
+                command,
+                interval,
+                timeout,
+            } => self.spawn_command_monitor(name, controller, command, cwd, interval, timeout),
+            ReadinessRequirement::AssignedPortTcp { port } => self.spawn_tcp_monitor(
+                name,
+                controller,
+                port,
+                Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
+                Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS),
+            ),
+            ReadinessRequirement::ProcessRunning | ReadinessRequirement::ControllerHealth => {}
         }
     }
 
@@ -505,7 +611,7 @@ impl HealthMonitor {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             loop {
-                let pid = {
+                {
                     let services = monitor.services.lock().await;
                     if let Some(service) = services
                         .get(&name)
@@ -515,12 +621,6 @@ impl HealthMonitor {
                             info!("Service {} is already healthy, stopping monitor", name);
                             break;
                         }
-                        match &service.runtime_state {
-                            crate::manager::ServiceRuntime::Controller(c) => {
-                                c.lock().await.read_state().await.pid
-                            }
-                            crate::manager::ServiceRuntime::None => None,
-                        }
                     } else {
                         info!(
                             "Service {} not found in services map, stopping monitor",
@@ -528,7 +628,7 @@ impl HealthMonitor {
                         );
                         break;
                     }
-                };
+                }
 
                 info!("About to probe {} on {}", name, assigned_port);
                 let result =
@@ -544,24 +644,6 @@ impl HealthMonitor {
                         .update_health(&name, controller, HealthStatus::Healthy, HealthSource::Tcp)
                         .await;
                     break;
-                }
-
-                if let Some(pid) = pid {
-                    if let Ok(ports) = locald_utils::discovery::find_listening_ports(pid).await {
-                        if let Some(&found_port) = ports.first() {
-                            info!("Service {} discovered on port {}", name, found_port);
-                            // Port update removed as it requires Controller support
-                            monitor
-                                .update_health(
-                                    &name,
-                                    controller,
-                                    HealthStatus::Healthy,
-                                    HealthSource::Tcp,
-                                )
-                                .await;
-                            break;
-                        }
-                    }
                 }
 
                 tokio::time::sleep(interval).await;
@@ -587,7 +669,10 @@ mod tests {
     use crate::manager::{Service, ServiceRuntime};
     use anyhow::Result;
     use futures_util::{StreamExt, stream};
-    use locald_core::config::{ExecServiceConfig, LocaldConfig};
+    use locald_core::config::{
+        CommonServiceConfig, ExecServiceConfig, LocaldConfig, ProbeConfig, SiteServiceConfig,
+        WorkerServiceConfig,
+    };
     use locald_core::ipc::LogEntry;
     use locald_core::service::{RuntimeState, ServiceCommand, ServiceController};
     use locald_core::state::ServiceState;
@@ -616,7 +701,7 @@ mod tests {
 
         async fn read_state(&self) -> RuntimeState {
             RuntimeState {
-                pid: None,
+                pid: Some(std::process::id()),
                 port: None,
                 status: ServiceState::Running,
                 health_status: HealthStatus::Unknown,
@@ -650,6 +735,333 @@ mod tests {
 
     fn instance_id(value: &str) -> ProjectInstanceId {
         value.parse().expect("valid project instance ID")
+    }
+
+    fn legacy_config(health_check: Option<HealthCheckConfig>) -> ServiceConfig {
+        ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig {
+                health_check,
+                ..CommonServiceConfig::default()
+            },
+            ..ExecServiceConfig::default()
+        })
+    }
+
+    fn monitored_service(
+        instance_id: ProjectInstanceId,
+        service_config: ServiceConfig,
+        sticky_port: Option<u16>,
+    ) -> Service {
+        Service {
+            instance_id,
+            controller_generation: 1,
+            projection_generation: 1,
+            config: LocaldConfig::default(),
+            service_config,
+            resolved_env: HashMap::new(),
+            runtime_state: ServiceRuntime::Controller(Arc::new(Mutex::new(TestController))),
+            sticky_port,
+            path: std::path::PathBuf::from("/readiness-test"),
+            health_status: HealthStatus::Starting,
+            health_source: HealthSource::None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn readiness_requirement_prefers_explicit_configuration_and_infers_by_service_kind() {
+        let explicit_http = legacy_config(Some(HealthCheckConfig::Probe(ProbeConfig {
+            kind: ProbeType::Http,
+            path: Some("/ready".to_owned()),
+            interval: Some(2),
+            timeout: Some(3),
+            command: None,
+        })));
+        assert_eq!(
+            ReadinessRequirement::for_service(&explicit_http, Some(4123))
+                .expect("derive explicit HTTP readiness"),
+            ReadinessRequirement::ExplicitHttp {
+                port: 4123,
+                path: "/ready".to_owned(),
+                interval: Duration::from_secs(2),
+                timeout: Duration::from_secs(3),
+            }
+        );
+
+        let explicit_command = legacy_config(Some(HealthCheckConfig::Command("true".to_owned())));
+        assert!(matches!(
+            ReadinessRequirement::for_service(&explicit_command, Some(4123))
+                .expect("derive explicit command readiness"),
+            ReadinessRequirement::ExplicitCommand { .. }
+        ));
+        assert!(matches!(
+            ReadinessRequirement::for_service(&legacy_config(None), Some(4123))
+                .expect("derive assigned-port readiness"),
+            ReadinessRequirement::AssignedPortTcp { port: 4123 }
+        ));
+        let portless_worker =
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig::default()));
+        assert!(!ReadinessRequirement::service_requires_port(
+            &portless_worker
+        ));
+        assert!(matches!(
+            ReadinessRequirement::for_service(&portless_worker, None)
+                .expect("derive worker readiness"),
+            ReadinessRequirement::ProcessRunning
+        ));
+
+        let portful_worker =
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                common: CommonServiceConfig {
+                    port: Some(4124),
+                    ..CommonServiceConfig::default()
+                },
+                ..WorkerServiceConfig::default()
+            }));
+        assert!(ReadinessRequirement::service_requires_port(&portful_worker));
+        assert!(matches!(
+            ReadinessRequirement::for_service(&portful_worker, Some(4124))
+                .expect("derive portful worker readiness"),
+            ReadinessRequirement::AssignedPortTcp { port: 4124 }
+        ));
+        assert!(matches!(
+            ReadinessRequirement::for_service(
+                &ServiceConfig::Typed(TypedServiceConfig::Site(SiteServiceConfig::default())),
+                Some(4123),
+            )
+            .expect("derive site readiness"),
+            ReadinessRequirement::ControllerHealth
+        ));
+    }
+
+    #[test]
+    fn readiness_requirement_rejects_incomplete_explicit_probes() {
+        let missing_port = legacy_config(Some(HealthCheckConfig::Probe(ProbeConfig {
+            kind: ProbeType::Tcp,
+            path: None,
+            interval: None,
+            timeout: None,
+            command: None,
+        })));
+        assert!(
+            ReadinessRequirement::for_service(&missing_port, None)
+                .expect_err("TCP probe without assigned port must fail")
+                .to_string()
+                .contains("assigned service port")
+        );
+
+        let missing_command = legacy_config(Some(HealthCheckConfig::Probe(ProbeConfig {
+            kind: ProbeType::Command,
+            path: None,
+            interval: None,
+            timeout: None,
+            command: None,
+        })));
+        assert!(
+            ReadinessRequirement::for_service(&missing_command, Some(4123))
+                .expect_err("command probe without command must fail")
+                .to_string()
+                .contains("requires `command`")
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_monitor_requires_the_exact_assigned_port() {
+        let assigned_reservation = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve assigned port");
+        let assigned_port = assigned_reservation
+            .local_addr()
+            .expect("assigned listener address")
+            .port();
+        drop(assigned_reservation);
+        let _unrelated_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("open unrelated listener in the same process");
+
+        let instance_id = instance_id("00000000-0000-4000-8000-000000000003");
+        let services = Arc::new(Mutex::new(HashMap::from([(
+            "app:web".to_owned(),
+            monitored_service(instance_id, legacy_config(None), Some(assigned_port)),
+        )])));
+        let (event_sender, _) = tokio::sync::broadcast::channel(8);
+        let monitor = HealthMonitor::new(
+            services.clone(),
+            event_sender,
+            Arc::new(Mutex::new((None, None))),
+            SharedDomainIndex::default(),
+        );
+        monitor.spawn_check(
+            "app:web".to_owned(),
+            instance_id,
+            1,
+            ReadinessRequirement::ExplicitTcp {
+                port: assigned_port,
+                interval: Duration::from_millis(20),
+                timeout: Duration::from_millis(10),
+            },
+            Some(assigned_port),
+            Some(std::process::id()),
+            None,
+            None,
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_ne!(
+            services.lock().await["app:web"].health_status,
+            HealthStatus::Healthy,
+            "another listening port owned by the process must not satisfy readiness"
+        );
+
+        let _assigned_listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, assigned_port))
+                .await
+                .expect("listen on assigned port");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if services.lock().await["app:web"].health_status == HealthStatus::Healthy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("assigned TCP port becomes ready");
+        assert_eq!(
+            services.lock().await["app:web"].health_source,
+            HealthSource::Tcp
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_command_monitor_is_authoritative() {
+        let instance_id = instance_id("00000000-0000-4000-8000-000000000004");
+        let service_config = legacy_config(Some(HealthCheckConfig::Command("exit 0".to_owned())));
+        let services = Arc::new(Mutex::new(HashMap::from([(
+            "app:worker".to_owned(),
+            monitored_service(instance_id, service_config, None),
+        )])));
+        let (event_sender, _) = tokio::sync::broadcast::channel(8);
+        let monitor = HealthMonitor::new(
+            services.clone(),
+            event_sender,
+            Arc::new(Mutex::new((None, None))),
+            SharedDomainIndex::default(),
+        );
+        monitor.spawn_check(
+            "app:worker".to_owned(),
+            instance_id,
+            1,
+            ReadinessRequirement::ExplicitCommand {
+                command: "exit 0".to_owned(),
+                interval: Duration::from_millis(10),
+                timeout: Duration::from_secs(1),
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if services.lock().await["app:worker"].health_status == HealthStatus::Healthy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit command becomes ready");
+        assert_eq!(
+            services.lock().await["app:worker"].health_source,
+            HealthSource::Command
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_http_monitor_uses_the_configured_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP readiness fixture");
+        let port = listener.local_addr().expect("HTTP fixture address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept HTTP readiness probe");
+            let mut request = [0_u8; 1024];
+            let bytes = stream
+                .read(&mut request)
+                .await
+                .expect("read HTTP readiness request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            let status = if request.starts_with("GET /ready ") {
+                "200 OK"
+            } else {
+                "404 Not Found"
+            };
+            stream
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write HTTP readiness response");
+        });
+
+        let instance_id = instance_id("00000000-0000-4000-8000-000000000005");
+        let service_config = legacy_config(Some(HealthCheckConfig::Probe(ProbeConfig {
+            kind: ProbeType::Http,
+            path: Some("/ready".to_owned()),
+            interval: Some(1),
+            timeout: Some(1),
+            command: None,
+        })));
+        let services = Arc::new(Mutex::new(HashMap::from([(
+            "app:web".to_owned(),
+            monitored_service(instance_id, service_config, Some(port)),
+        )])));
+        let (event_sender, _) = tokio::sync::broadcast::channel(8);
+        let monitor = HealthMonitor::new(
+            services.clone(),
+            event_sender,
+            Arc::new(Mutex::new((None, None))),
+            SharedDomainIndex::default(),
+        );
+        monitor.spawn_check(
+            "app:web".to_owned(),
+            instance_id,
+            1,
+            ReadinessRequirement::ExplicitHttp {
+                port,
+                path: "/ready".to_owned(),
+                interval: Duration::from_millis(10),
+                timeout: Duration::from_secs(1),
+            },
+            Some(port),
+            None,
+            None,
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if services.lock().await["app:web"].health_status == HealthStatus::Healthy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit HTTP path becomes ready");
+        server.await.expect("HTTP readiness fixture joins");
+        assert_eq!(
+            services.lock().await["app:web"].health_source,
+            HealthSource::Http
+        );
     }
 
     #[tokio::test]

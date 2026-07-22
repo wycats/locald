@@ -1,7 +1,7 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::option_if_let_else)]
 use crate::config_loader::ConfigLoader;
-use crate::health::HealthMonitor;
+use crate::health::{HealthMonitor, ReadinessRequirement};
 use crate::lifecycle_migration::{
     availability_demand_for_attachment_source, manual_cli_session_demand,
     plan_project_lifecycle_migration,
@@ -51,6 +51,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
+const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 // This scope is entered only while holding a shared availability-transition
 // permit. It lets a transition admitted before shutdown finish its semantic
@@ -1637,68 +1639,200 @@ impl ProcessManager {
     }
 
     pub async fn handle_notify(&self, pid: u32) {
-        let mut services = self.services.lock().await;
-        for (name, service) in services.iter_mut() {
-            if let ServiceRuntime::Controller(c) = &service.runtime_state {
-                let state = c.lock().await.read_state().await;
-                if state.pid == Some(pid) {
-                    info!("Service {} is ready (via notify)", name);
-                    if service.health_status != HealthStatus::Healthy
-                        || service.health_source != HealthSource::Notify
-                    {
-                        service.health_status = HealthStatus::Healthy;
-                        service.health_source = HealthSource::Notify;
-                        Self::advance_service_projection(service);
+        let updated = {
+            let mut services = self.services.lock().await;
+            let mut updated = None;
+            for (name, service) in services.iter_mut() {
+                if let ServiceRuntime::Controller(c) = &service.runtime_state {
+                    let state = c.lock().await.read_state().await;
+                    if state.pid == Some(pid) {
+                        let Ok(requirement) = ReadinessRequirement::for_service(
+                            &service.service_config,
+                            service.sticky_port,
+                        ) else {
+                            warn!(
+                                "Ignoring readiness notification for service {name} with an invalid readiness contract"
+                            );
+                            break;
+                        };
+                        if !requirement.accepts_notify() {
+                            info!(
+                                "Ignoring readiness notification for service {name}; its {} remains authoritative",
+                                requirement.description()
+                            );
+                            break;
+                        }
+                        info!("Service {} is ready (via notify)", name);
+                        if service.health_status != HealthStatus::Healthy
+                            || service.health_source != HealthSource::Notify
+                        {
+                            service.health_status = HealthStatus::Healthy;
+                            service.health_source = HealthSource::Notify;
+                            Self::advance_service_projection(service);
+                            updated = Some(name.clone());
+                        }
+                        break;
                     }
-                    break;
                 }
             }
+            updated
+        };
+        if let Some(name) = updated {
+            self.broadcast_service_update(&name).await;
         }
     }
 
     async fn wait_for_health(&self, name: &str, instance_id: ProjectInstanceId) -> Result<()> {
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30); // TODO: Make configurable
+        let deadline = tokio::time::Instant::now() + SERVICE_READINESS_TIMEOUT;
 
         loop {
             self.availability_allows_inflight_transition(instance_id)
                 .await?;
-            if start.elapsed() > timeout {
-                anyhow::bail!("Service {name} timed out waiting for health check");
-            }
-
-            {
+            let observation = {
                 let mut services = self.services.lock().await;
-                if let Some(service) = services.get_mut(name) {
-                    match &service.runtime_state {
-                        ServiceRuntime::Controller(c) => {
-                            let state = c.lock().await.read_state().await;
-                            // info!("Controller state for {}: status={:?}, health={:?}", name, state.status, state.health_status);
-                            if state.status == locald_core::state::ServiceState::Stopped {
-                                anyhow::bail!("Service {name} stopped unexpectedly during startup");
-                            }
-                            if state.health_status == HealthStatus::Healthy {
-                                if service.health_status != HealthStatus::Healthy {
-                                    service.health_status = HealthStatus::Healthy;
-                                    Self::advance_service_projection(service);
-                                }
-                            }
-                        }
-                        ServiceRuntime::None => {
-                            anyhow::bail!("Service {name} is not running");
-                        }
+                let service = services
+                    .get_mut(name)
+                    .with_context(|| format!("service `{name}` disappeared during readiness"))?;
+                anyhow::ensure!(
+                    service.instance_id == instance_id,
+                    "service `{name}` changed project instances during readiness"
+                );
+                let requirement =
+                    ReadinessRequirement::for_service(&service.service_config, service.sticky_port)
+                        .with_context(|| {
+                            format!("service `{name}` has an invalid readiness contract")
+                        })?;
+                let state = match &service.runtime_state {
+                    ServiceRuntime::Controller(controller) => {
+                        controller.lock().await.read_state().await
                     }
+                    ServiceRuntime::None => {
+                        anyhow::bail!("service `{name}` has no runtime during readiness")
+                    }
+                };
 
-                    if service.health_status == HealthStatus::Healthy {
-                        return Ok(());
-                    }
+                if state.status == ServiceState::Stopped {
+                    Some(Err(format!(
+                        "runtime stopped before satisfying {}; last readiness was {} ({})",
+                        requirement.description(),
+                        service.health_status,
+                        service.health_source
+                    )))
+                } else if service.health_status == HealthStatus::Healthy {
+                    Some(Ok(()))
+                } else if matches!(requirement, ReadinessRequirement::ControllerHealth)
+                    && state.health_status == HealthStatus::Unhealthy
+                {
+                    Some(Err(format!(
+                        "controller reported unhealthy before satisfying {}",
+                        requirement.description()
+                    )))
                 } else {
-                    anyhow::bail!("Service {name} disappeared");
+                    let controller_ready = match &requirement {
+                        ReadinessRequirement::ProcessRunning => {
+                            state.status == ServiceState::Running
+                        }
+                        ReadinessRequirement::ControllerHealth => {
+                            state.health_status == HealthStatus::Healthy
+                        }
+                        ReadinessRequirement::ExplicitHttp { .. }
+                        | ReadinessRequirement::ExplicitTcp { .. }
+                        | ReadinessRequirement::ExplicitCommand { .. }
+                        | ReadinessRequirement::AssignedPortTcp { .. } => false,
+                    };
+                    if controller_ready {
+                        service.health_status = HealthStatus::Healthy;
+                        service.health_source = HealthSource::Explicit;
+                        Self::advance_service_projection(service);
+                        Some(Ok(()))
+                    } else {
+                        None
+                    }
                 }
+            };
+
+            match observation {
+                Some(Ok(())) => {
+                    self.broadcast_service_update(name).await;
+                    return Ok(());
+                }
+                Some(Err(reason)) => {
+                    self.mark_readiness_failed(name, instance_id).await?;
+                    anyhow::bail!("service `{name}` failed readiness: {reason}");
+                }
+                None => {}
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {
+                    let (requirement, last_status, last_source, runtime_status, controller_health) = {
+                        let services = self.services.lock().await;
+                        let service = services
+                            .get(name)
+                            .with_context(|| format!("service `{name}` disappeared during readiness"))?;
+                        let requirement = ReadinessRequirement::for_service(
+                            &service.service_config,
+                            service.sticky_port,
+                        )
+                        .with_context(|| format!("service `{name}` has an invalid readiness contract"))?;
+                        let state = match &service.runtime_state {
+                            ServiceRuntime::Controller(controller) => {
+                                controller.lock().await.read_state().await
+                            }
+                            ServiceRuntime::None => {
+                                anyhow::bail!("service `{name}` has no runtime at its readiness deadline")
+                            }
+                        };
+                        (
+                            requirement,
+                            service.health_status,
+                            service.health_source,
+                            state.status,
+                            state.health_status,
+                        )
+                    };
+                    self.mark_readiness_failed(name, instance_id).await?;
+                    anyhow::bail!(
+                        "service `{name}` timed out after {}s waiting for {}; last runtime was {} with controller health {}, and last readiness was {} ({})",
+                        SERVICE_READINESS_TIMEOUT.as_secs(),
+                        requirement.description(),
+                        runtime_status,
+                        controller_health,
+                        last_status,
+                        last_source
+                    );
+                }
+                () = tokio::time::sleep(SERVICE_READINESS_POLL_INTERVAL) => {}
+            }
         }
+    }
+
+    async fn mark_readiness_failed(
+        &self,
+        name: &str,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        let changed = {
+            let mut services = self.services.lock().await;
+            let service = services.get_mut(name).with_context(|| {
+                format!("service `{name}` disappeared during readiness failure")
+            })?;
+            anyhow::ensure!(
+                service.instance_id == instance_id,
+                "service `{name}` changed project instances during readiness failure"
+            );
+            let changed = service.health_status != HealthStatus::Unhealthy;
+            if changed {
+                service.health_status = HealthStatus::Unhealthy;
+                Self::advance_service_projection(service);
+            }
+            changed
+        };
+        self.persist_state_checked().await?;
+        if changed {
+            self.broadcast_service_update(name).await;
+        }
+        Ok(())
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -2493,10 +2627,7 @@ impl ProcessManager {
                 "service `{name}` changed after prepublication transition planning"
             );
 
-            let needs_port = !matches!(
-                service_config,
-                ServiceConfig::Typed(TypedServiceConfig::Worker(_))
-            );
+            let needs_port = ReadinessRequirement::service_requires_port(service_config);
 
             info!(
                 "Service {name}: needs_port={needs_port}, config type={:?}",
@@ -2537,6 +2668,8 @@ impl ProcessManager {
                 };
 
             info!("Starting service {name} on port {:?}", port);
+            let readiness = ReadinessRequirement::for_service(service_config, port)
+                .with_context(|| format!("service `{name}` has an invalid readiness contract"))?;
 
             if let Some(tx) = &event_tx {
                 let _ = tx
@@ -2590,7 +2723,7 @@ impl ProcessManager {
                                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                                 sticky_port: port,
                                 path: path.clone(),
-                                health_status: HealthStatus::Unknown,
+                                health_status: HealthStatus::Starting,
                                 health_source: HealthSource::None,
                                 warnings: Vec::new(),
                             },
@@ -2666,15 +2799,15 @@ impl ProcessManager {
 
                     let state = controller.lock().await.read_state().await;
 
-                    // Update service with final state (port might have changed if dynamic?)
+                    // Keep the allocator-selected endpoint authoritative for
+                    // readiness and sticky reuse.
                     {
                         let mut services = self.services.lock().await;
                         if let Some(service) = services
                             .get_mut(&name)
                             .filter(|service| service.instance_id == instance_id)
                         {
-                            service.sticky_port = state.port;
-                            service.health_status = state.health_status;
+                            service.sticky_port = port;
                         }
                     }
 
@@ -2708,8 +2841,8 @@ impl ProcessManager {
                         name.clone(),
                         instance_id,
                         controller_generation,
-                        service_config,
-                        state.port,
+                        readiness.clone(),
+                        port,
                         state.pid,
                         None,
                         Some(path.clone()),
@@ -8024,6 +8157,135 @@ mod tests {
                 fail_prepare: false,
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryingTcpReadinessFactory {
+        creates: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl ServiceFactory for RetryingTcpReadinessFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(
+                config,
+                ServiceConfig::Typed(TypedServiceConfig::Exec(_)) | ServiceConfig::Legacy(_)
+            )
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            let creation = self.creates.fetch_add(1, Ordering::SeqCst);
+            Arc::new(Mutex::new(RetryingTcpReadinessController {
+                id: name,
+                port: ctx.port.expect("portful readiness fixture receives a port"),
+                pid: 50 + u32::try_from(creation).expect("creation count fits in PID"),
+                bind_on_start: creation > 0,
+                running: false,
+                listener: None,
+                stops: self.stops.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryingTcpReadinessController {
+        id: String,
+        port: u16,
+        pid: u32,
+        bind_on_start: bool,
+        running: bool,
+        listener: Option<tokio::net::TcpListener>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ServiceController for RetryingTcpReadinessController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            self.running = true;
+            if self.bind_on_start {
+                self.listener = Some(
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.port))
+                        .await
+                        .with_context(|| format!("bind readiness fixture on {}", self.port))?,
+                );
+            }
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            self.listener = None;
+            self.running = false;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            RuntimeState {
+                pid: self.running.then_some(self.pid),
+                port: Some(self.port),
+                status: if self.running {
+                    ServiceState::Running
+                } else {
+                    ServiceState::Stopped
+                },
+                health_status: if self.running {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Unknown
+                },
+            }
+        }
+
+        fn owned_process_id(&self) -> Option<u32> {
+            self.running.then_some(self.pid)
+        }
+
+        fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+            self.running.then(|| {
+                test_process_identity(
+                    2_000 + u64::from(self.pid),
+                    i32::try_from(self.pid).expect("fixture PID fits i32"),
+                    "/test/readiness-controller",
+                )
+            })
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
         }
     }
 
@@ -20382,6 +20644,7 @@ command = "sleep 30"
 name = "attached"
 
 [services.web]
+type = "worker"
 command = "sleep 30"
 "#,
         )
@@ -20522,6 +20785,436 @@ command = "sleep 30"
             health_source: HealthSource::None,
             warnings: Vec::new(),
         }
+    }
+
+    fn readiness_test_manager(root: &Path) -> ProcessManager {
+        ProcessManager::new(
+            root.join("notify.sock"),
+            Arc::new(StateManager::with_path(root.join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                root.join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create readiness test manager")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn portful_controller_liveness_does_not_bypass_the_exact_readiness_deadline() {
+        let dir = tempdir().expect("create readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let assigned_port = 41_237;
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "readiness:web",
+                RuntimeState {
+                    pid: Some(42),
+                    port: Some(assigned_port),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let mut service = test_service(
+            test_config_with_domain("readiness", "readiness.localhost"),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.sticky_port = Some(assigned_port);
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:web".to_owned(), service);
+
+        let readiness = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.wait_for_health("readiness:web", instance_id).await }
+        });
+        tokio::task::yield_now().await;
+        {
+            let mut services = manager.services.lock().await;
+            let service = services
+                .get_mut("readiness:web")
+                .expect("readiness service remains present");
+            service.health_status = HealthStatus::Unhealthy;
+            service.health_source = HealthSource::Tcp;
+        }
+        tokio::time::advance(
+            SERVICE_READINESS_TIMEOUT
+                .checked_sub(Duration::from_millis(1))
+                .expect("readiness timeout exceeds one millisecond"),
+        )
+        .await;
+        assert!(
+            !readiness.is_finished(),
+            "a failed probe does not end readiness before the overall deadline"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = readiness
+            .await
+            .expect("readiness task joins")
+            .expect_err("assigned TCP port never became ready");
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out after 30s"));
+        assert!(message.contains("TCP probe on the assigned endpoint"));
+        assert!(message.contains("last runtime was running"));
+        assert!(!message.contains("41237"));
+        assert_eq!(
+            manager.services.lock().await["readiness:web"].health_status,
+            HealthStatus::Unhealthy
+        );
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load persisted readiness failure");
+        assert_eq!(persisted.services.len(), 1);
+        assert_eq!(persisted.services[0].health_status, HealthStatus::Unhealthy);
+    }
+
+    #[tokio::test]
+    async fn portless_worker_uses_owned_process_liveness() {
+        let dir = tempdir().expect("create worker readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "readiness:worker",
+                RuntimeState {
+                    pid: Some(42),
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Unknown,
+                },
+            )));
+        let mut service = test_service(
+            LocaldConfig::default(),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(
+                locald_core::config::WorkerServiceConfig::default(),
+            )),
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:worker".to_owned(), service);
+
+        manager
+            .wait_for_health("readiness:worker", instance_id)
+            .await
+            .expect("live worker becomes ready");
+        let services = manager.services.lock().await;
+        assert_eq!(
+            services["readiness:worker"].health_status,
+            HealthStatus::Healthy
+        );
+        assert_eq!(
+            services["readiness:worker"].health_source,
+            HealthSource::Explicit
+        );
+    }
+
+    #[tokio::test]
+    async fn site_controller_failure_is_an_immediate_readiness_failure() {
+        let dir = tempdir().expect("create site readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "readiness:site",
+                RuntimeState {
+                    pid: None,
+                    port: Some(41_238),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Unhealthy,
+                },
+            )));
+        let mut service = test_service(
+            LocaldConfig::default(),
+            ServiceConfig::Typed(TypedServiceConfig::Site(
+                locald_core::config::SiteServiceConfig::default(),
+            )),
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.sticky_port = Some(41_238);
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:site".to_owned(), service);
+
+        let error = manager
+            .wait_for_health("readiness:site", instance_id)
+            .await
+            .expect_err("failed site build must not become ready");
+        assert!(format!("{error:#}").contains("controller reported unhealthy"));
+        assert_eq!(
+            manager.services.lock().await["readiness:site"].health_status,
+            HealthStatus::Unhealthy
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_satisfies_only_inferred_readiness() {
+        let dir = tempdir().expect("create notify readiness directory");
+        let manager = readiness_test_manager(dir.path());
+        let pid = std::process::id();
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "readiness:web",
+                RuntimeState {
+                    pid: Some(pid),
+                    port: Some(41_239),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let explicit = ServiceConfig::Legacy(ExecServiceConfig {
+            common: locald_core::config::CommonServiceConfig {
+                health_check: Some(locald_core::config::HealthCheckConfig::Command(
+                    "true".to_owned(),
+                )),
+                ..locald_core::config::CommonServiceConfig::default()
+            },
+            ..ExecServiceConfig::default()
+        });
+        let mut service = test_service(
+            LocaldConfig::default(),
+            explicit,
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.sticky_port = Some(41_239);
+        service.health_status = HealthStatus::Starting;
+        manager
+            .services
+            .lock()
+            .await
+            .insert("readiness:web".to_owned(), service);
+
+        manager.handle_notify(pid).await;
+        assert_eq!(
+            manager.services.lock().await["readiness:web"].health_status,
+            HealthStatus::Starting,
+            "notify cannot override an explicit readiness check"
+        );
+
+        manager
+            .services
+            .lock()
+            .await
+            .get_mut("readiness:web")
+            .expect("notify readiness service")
+            .service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        manager.handle_notify(pid).await;
+        let services = manager.services.lock().await;
+        assert_eq!(
+            services["readiness:web"].health_status,
+            HealthStatus::Healthy
+        );
+        assert_eq!(
+            services["readiness:web"].health_source,
+            HealthSource::Notify
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_preserves_demand_and_retry_clears_the_convergence_error() {
+        let dir = tempdir().expect("create retry readiness directory");
+        let project_path = dir.path().join("retry-readiness-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "retry-readiness").await;
+        tokio::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "retry-readiness"
+domain = "retry-readiness.localhost"
+
+[services.db]
+command = "ignored by readiness fixture"
+
+[services.web]
+command = "ignored by readiness fixture"
+depends_on = ["db"]
+"#,
+        )
+        .await
+        .expect("write retry readiness config");
+        let creates = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: creates.clone(),
+                stops: stops.clone(),
+            }),
+        );
+
+        let first_ensure = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .project_ensure_availability(&project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if creates.load(Ordering::SeqCst) == 1
+                    && manager
+                        .services
+                        .lock()
+                        .await
+                        .get("retry-readiness:db")
+                        .is_some_and(|service| service.health_status == HealthStatus::Starting)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first ensure reaches its readiness wait");
+        assert!(
+            !first_ensure.is_finished(),
+            "first ensure remains blocked on readiness after creating its controller"
+        );
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_service_controller("retry-readiness:web")
+                .await
+                .is_none(),
+            "dependent service cannot start before its dependency is ready"
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::pause();
+        tokio::time::advance(SERVICE_READINESS_TIMEOUT).await;
+        let error = first_ensure
+            .await
+            .expect("first ensure task joins")
+            .expect_err("first controller never binds its assigned port");
+        assert!(format!("{error:#}").contains("timed out after 30s"));
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load readiness availability after timeout");
+        let failed = availability
+            .snapshot()
+            .await
+            .expect("read failed readiness state");
+        assert!(
+            availability
+                .desired_up()
+                .await
+                .expect("failed readiness remains desired up")
+        );
+        assert!(!failed.demands().is_empty());
+        assert!(
+            failed
+                .last_convergence_error()
+                .is_some_and(|message| message.contains("timed out after 30s"))
+        );
+        assert_eq!(
+            manager.services.lock().await["retry-readiness:db"].health_status,
+            HealthStatus::Unhealthy
+        );
+
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("retry binds the assigned port and becomes ready");
+        assert_eq!(creates.load(Ordering::SeqCst), 3);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("read successful readiness retry")
+                .last_convergence_error(),
+            None
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up retry readiness runtime");
+    }
+
+    #[tokio::test]
+    async fn invalid_readiness_contract_fails_before_controller_creation() {
+        let dir = tempdir().expect("create invalid readiness directory");
+        let project_path = dir.path().join("invalid-readiness-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "invalid-readiness").await;
+        tokio::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "invalid-readiness"
+domain = "invalid-readiness.localhost"
+
+[services.web]
+command = "ignored by readiness fixture"
+health_check = { type = "command" }
+"#,
+        )
+        .await
+        .expect("write invalid readiness config");
+        let creates = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: creates.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let error = manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect_err("incomplete command readiness must fail");
+        assert!(format!("{error:#}").contains("requires `command`"));
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        assert!(
+            manager
+                .get_service_controller("invalid-readiness:web")
+                .await
+                .is_none(),
+            "invalid readiness cannot create or start a controller"
+        );
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load invalid readiness availability");
+        assert!(
+            availability
+                .desired_up()
+                .await
+                .expect("invalid readiness preserves desired availability")
+        );
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("read invalid readiness convergence error")
+                .last_convergence_error()
+                .is_some_and(|message| message.contains("requires `command`"))
+        );
     }
 
     #[tokio::test]
