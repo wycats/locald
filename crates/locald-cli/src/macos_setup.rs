@@ -9,9 +9,10 @@ use locald_utils::privileged::{
     CgroupStrategyKind, CleanupMode, DoctorReport, EvidenceItem, FixAdvice, FixKey, Problem,
     Severity, Status, StrategyReport,
 };
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -85,7 +86,12 @@ impl SetupPlatform for SystemPlatform {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 anyhow::bail!("/etc/hosts is not a regular file");
             }
-            atomic_install_file(
+            let directory = open_existing_directory(
+                path.parent()
+                    .context("/etc/hosts has no parent directory")?,
+            )?;
+            atomic_install_file_at(
+                &directory,
                 path,
                 updated.as_bytes(),
                 metadata.mode() & 0o7777,
@@ -285,16 +291,23 @@ fn run_setup_with(
         .retire_stale_host_aliases()
         .context("could not retire locald's stale hosts-file aliases")?;
 
-    ensure_directory(
+    let agent_directory = ensure_directory(
         paths.agent.parent().context("agent path has no parent")?,
         owner.uid,
         owner.gid,
         0o700,
     )
     .context("could not repair the locald application-support directory")?;
-    atomic_install_file(&paths.agent, agent_bytes, 0o755, owner.uid, owner.gid)
-        .context("could not install the embedded menu bar agent")?;
-    ensure_directory(
+    atomic_install_file_at(
+        &agent_directory,
+        &paths.agent,
+        agent_bytes,
+        0o755,
+        owner.uid,
+        owner.gid,
+    )
+    .context("could not install the embedded menu bar agent")?;
+    let launch_agent_directory = ensure_directory(
         paths
             .launch_agent
             .parent()
@@ -305,7 +318,8 @@ fn run_setup_with(
     )
     .context("could not repair the user's LaunchAgents directory")?;
     let plist = render_launch_agent_plist(&paths.agent, &paths.daemon);
-    atomic_install_file(
+    atomic_install_file_at(
+        &launch_agent_directory,
         &paths.launch_agent,
         plist.as_bytes(),
         0o644,
@@ -803,7 +817,7 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn ensure_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+fn ensure_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<OwnedFd> {
     if !path.is_absolute() {
         anyhow::bail!(
             "installation directory must be absolute: {}",
@@ -870,34 +884,69 @@ fn ensure_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
         Some(nix::unistd::Uid::from_raw(uid)),
         Some(nix::unistd::Gid::from_raw(gid)),
     )?;
-    Ok(())
+    Ok(directory)
 }
 
-fn atomic_install_file(path: &Path, bytes: &[u8], mode: u32, uid: u32, gid: u32) -> Result<()> {
-    if let Ok(metadata) = std::fs::symlink_metadata(path)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        anyhow::bail!(
-            "installation path is not a regular file: {}",
-            path.display()
-        );
-    }
-    let parent = path.parent().context("installation path has no parent")?;
+fn open_existing_directory(path: &Path) -> Result<OwnedFd> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("could not canonicalize {}", path.display()))?;
+    nix::fcntl::open(
+        &canonical,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("could not open {} safely", path.display()))
+}
+
+fn atomic_install_file_at(
+    directory: &OwnedFd,
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     let name = path
         .file_name()
         .context("installation path has no file name")?;
+    match nix::sys::stat::fstatat(directory, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(metadata)
+            if !nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode)
+                .contains(nix::sys::stat::SFlag::S_IFREG) =>
+        {
+            anyhow::bail!(
+                "installation path is not a regular file: {}",
+                path.display()
+            );
+        }
+        Ok(_) | Err(nix::errno::Errno::ENOENT) => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not inspect {} safely", path.display()));
+        }
+    }
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
+    let temporary = format!(
         ".{}.tmp.{}.{}",
         name.to_string_lossy(),
         std::process::id(),
         sequence
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    );
+    let temporary_fd = nix::fcntl::openat(
+        directory,
+        temporary.as_str(),
+        nix::fcntl::OFlag::O_WRONLY
+            | nix::fcntl::OFlag::O_CREAT
+            | nix::fcntl::OFlag::O_EXCL
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .with_context(|| format!("could not create temporary file for {}", path.display()))?;
+    let mut file = File::from(temporary_fd);
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -907,12 +956,18 @@ fn atomic_install_file(path: &Path, bytes: &[u8], mode: u32, uid: u32, gid: u32)
             Some(nix::unistd::Gid::from_raw(gid)),
         )?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        nix::fcntl::renameat(directory, temporary.as_str(), directory, name)
+            .with_context(|| format!("could not publish {}", path.display()))?;
+        nix::unistd::fsync(directory)
+            .with_context(|| format!("could not synchronize {}", path.display()))?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = nix::unistd::unlinkat(
+            directory,
+            temporary.as_str(),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        );
     }
     result
 }
@@ -1049,6 +1104,42 @@ mod tests {
         .expect_err("symlinked installation ancestor must fail closed");
 
         assert!(!outside.path().join("Application Support").exists());
+    }
+
+    #[test]
+    fn atomic_install_remains_anchored_after_a_parent_path_swap() {
+        let root = tempfile::tempdir().expect("create installation root");
+        let outside = tempfile::tempdir().expect("create swapped target");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonical installation root");
+        let parent = root_path.join("Library/Application Support/locald");
+        let owner_uid = nix::unistd::getuid().as_raw();
+        let owner_gid = nix::unistd::getgid().as_raw();
+        let directory = ensure_directory(&parent, owner_uid, owner_gid, 0o700)
+            .expect("create and open installation directory");
+        let anchored = root_path.join("anchored-locald");
+        std::fs::rename(&parent, &anchored).expect("move opened installation directory");
+        std::os::unix::fs::symlink(outside.path(), &parent)
+            .expect("replace path with attacker-controlled symlink");
+        let apparent_target = parent.join("locald-agent");
+
+        atomic_install_file_at(
+            &directory,
+            &apparent_target,
+            b"agent",
+            0o755,
+            owner_uid,
+            owner_gid,
+        )
+        .expect("publish through anchored directory descriptor");
+
+        assert_eq!(
+            std::fs::read(anchored.join("locald-agent")).unwrap(),
+            b"agent"
+        );
+        assert!(!outside.path().join("locald-agent").exists());
     }
 
     #[test]
