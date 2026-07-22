@@ -1,7 +1,9 @@
 use crate::style;
 use anyhow::Result;
 use crossterm::style::Stylize;
-use locald_utils::privileged::{AcquireConfig, CleanupMode, DoctorReport, Severity, Status};
+#[cfg(not(target_os = "macos"))]
+use locald_utils::privileged::AcquireConfig;
+use locald_utils::privileged::{CleanupMode, DoctorReport, Severity, Status};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
@@ -42,9 +44,13 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         )
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     let (shim_bytes, expected_version): (Option<&[u8]>, Option<&str>) = (None, None);
 
+    #[cfg(target_os = "macos")]
+    let report = crate::macos_setup::collect_report(verbose)?;
+
+    #[cfg(not(target_os = "macos"))]
     let report = locald_utils::privileged::collect_report(AcquireConfig {
         verbose,
         expected_shim_version: expected_version,
@@ -57,83 +63,10 @@ pub fn run(json: bool, verbose: bool) -> Result<i32> {
         render_human(&report, verbose);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        const AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
-
-        let agent_path = locald_utils::agent::agent_path()?;
-        match locald_utils::agent::verify_integrity(&agent_path, AGENT_BYTES) {
-            Ok(true) => {
-                if !json {
-                    let _ = cliclack::log::success(format!(
-                        "Menu bar agent: OK ({})",
-                        agent_path.display()
-                    ));
-                }
-            }
-            Ok(false) => {
-                if !json {
-                    if agent_path.exists() {
-                        let _ = cliclack::log::warning(
-                            "Menu bar agent: outdated (run `locald admin setup` to update)",
-                        );
-                    } else {
-                        let _ = cliclack::log::warning(
-                            "Menu bar agent: not installed (run `locald admin setup`)",
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                if !json {
-                    let _ = cliclack::log::error(format!("Menu bar agent: error ({e})"));
-                }
-            }
-        }
-
-        if !json {
-            // Check if the privileged helper is installed and reachable.
-            let helper_path =
-                std::path::Path::new("/Library/PrivilegedHelperTools/com.locald.helper");
-            if helper_path.exists() {
-                let _ = cliclack::log::success(
-                    "Privileged helper: installed (ports 80/443 via FD passing)",
-                );
-            } else {
-                let _ = cliclack::log::warning(
-                    "Privileged helper: not installed (run `locald admin setup`)",
-                );
-            }
-
-            if locald_utils::cert::is_ca_trusted() {
-                let _ = cliclack::log::success("HTTPS trust: Root CA trusted by system");
-            } else {
-                let ca_exists = locald_utils::cert::get_certs_dir()
-                    .map(|dir| dir.join("rootCA.pem").exists())
-                    .unwrap_or(false);
-                if ca_exists {
-                    let _ = cliclack::log::warning(
-                        "HTTPS trust: Root CA exists but not trusted (run `locald admin setup`)",
-                    );
-                } else {
-                    let _ = cliclack::log::warning(
-                        "HTTPS trust: Root CA not generated (run `locald admin setup`)",
-                    );
-                }
-            }
-        }
-    }
-
     Ok(i32::from(report.has_critical_failures()))
 }
 
-fn render_command(cmd: &str) -> Cow<'_, str> {
-    let cmd = cmd.strip_prefix("sudo locald ").unwrap_or(cmd);
-
-    if let Some(rest) = cmd.strip_prefix("admin ") {
-        return Cow::Owned(format!("locald admin {rest}"));
-    }
-
+const fn render_command(cmd: &str) -> Cow<'_, str> {
     Cow::Borrowed(cmd)
 }
 

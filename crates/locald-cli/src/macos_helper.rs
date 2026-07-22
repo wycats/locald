@@ -187,22 +187,33 @@ fn install_with(
     authority_bytes.push(b'\n');
     let plist = render_launch_daemon_plist();
 
-    ensure_parent(&paths.authority, owner)?;
-    ensure_parent(&paths.helper, owner)?;
-    ensure_parent(&paths.plist, owner)?;
+    ensure_parent(&paths.authority, owner)
+        .context("could not prepare the helper-authority directory")?;
+    ensure_parent(&paths.helper, owner)
+        .context("could not prepare the privileged-helper directory")?;
+    ensure_parent(&paths.plist, owner).context("could not prepare the LaunchDaemons directory")?;
     // Stop any previously registered helper before replacing files on disk.
     // If publication fails after this point, privileged binding remains
     // unavailable until setup is rerun instead of leaving an older in-memory
     // helper serving the Mach service.
-    launchctl.bootout("system/com.locald.helper")?;
+    launchctl
+        .bootout("system/com.locald.helper")
+        .context("could not stop the installed privileged helper")?;
     // Publish the fail-closed helper first. If setup is interrupted before the
     // authority follows, the new helper refuses to open its listener.
-    atomic_install_file(&paths.helper, helper_bytes, 0o755, owner)?;
-    atomic_install_file(&paths.authority, &authority_bytes, 0o600, owner)?;
-    atomic_install_file(&paths.plist, plist.as_bytes(), 0o644, owner)?;
+    atomic_install_file(&paths.helper, helper_bytes, 0o755, owner)
+        .context("could not publish the privileged-helper binary")?;
+    atomic_install_file(&paths.authority, &authority_bytes, 0o600, owner)
+        .context("could not publish the helper authority")?;
+    atomic_install_file(&paths.plist, plist.as_bytes(), 0o644, owner)
+        .context("could not publish the helper LaunchDaemon plist")?;
 
-    launchctl.enable("system/com.locald.helper")?;
-    launchctl.bootstrap("system", &paths.plist)?;
+    launchctl
+        .enable("system/com.locald.helper")
+        .context("could not enable the privileged helper")?;
+    launchctl
+        .bootstrap("system", &paths.plist)
+        .context("could not bootstrap the privileged helper")?;
     Ok(())
 }
 
@@ -241,8 +252,17 @@ fn ensure_parent(path: &Path, owner: FileOwner) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("installation path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("could not create {}", parent.display()))?;
+    let created = match std::fs::symlink_metadata(parent) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+            true
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not inspect {}", parent.display()));
+        }
+    };
     let metadata = std::fs::symlink_metadata(parent)
         .with_context(|| format!("could not inspect {}", parent.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -251,12 +271,29 @@ fn ensure_parent(path: &Path, owner: FileOwner) -> Result<()> {
             parent.display()
         );
     }
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))?;
-    nix::unistd::chown(
-        parent,
-        Some(nix::unistd::Uid::from_raw(owner.uid)),
-        Some(nix::unistd::Gid::from_raw(owner.gid)),
-    )?;
+    if created {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("could not set permissions on {}", parent.display()))?;
+        nix::unistd::chown(
+            parent,
+            Some(nix::unistd::Uid::from_raw(owner.uid)),
+            Some(nix::unistd::Gid::from_raw(owner.gid)),
+        )
+        .with_context(|| format!("could not set ownership on {}", parent.display()))?;
+    }
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("could not validate {}", parent.display()))?;
+    let actual_mode = metadata.mode() & 0o7777;
+    if metadata.uid() != owner.uid || metadata.gid() != owner.gid || actual_mode & 0o022 != 0 {
+        anyhow::bail!(
+            "installation directory {} must be owned by {}:{} and not be group/other writable; found {}:{} with mode {actual_mode:04o}",
+            parent.display(),
+            owner.uid,
+            owner.gid,
+            metadata.uid(),
+            metadata.gid()
+        );
+    }
     Ok(())
 }
 
@@ -282,17 +319,24 @@ fn atomic_install_file(path: &Path, bytes: &[u8], mode: u32, owner: FileOwner) -
             .mode(0o600)
             .open(&temporary)
             .with_context(|| format!("could not create {}", temporary.display()))?;
-        file.write_all(bytes)?;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)
+            .with_context(|| format!("could not write {}", temporary.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("could not set permissions on {}", temporary.display()))?;
         nix::unistd::fchown(
             &file,
             Some(nix::unistd::Uid::from_raw(owner.uid)),
             Some(nix::unistd::Gid::from_raw(owner.gid)),
-        )?;
-        file.sync_all()?;
+        )
+        .with_context(|| format!("could not set ownership on {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not sync {}", temporary.display()))?;
         std::fs::rename(&temporary, path)
             .with_context(|| format!("could not publish {}", path.display()))?;
-        File::open(parent)?.sync_all()?;
+        File::open(parent)
+            .with_context(|| format!("could not open {} for synchronization", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("could not synchronize {}", parent.display()))?;
         Ok(())
     })();
 
@@ -302,7 +346,7 @@ fn atomic_install_file(path: &Path, bytes: &[u8], mode: u32, owner: FileOwner) -
     result
 }
 
-fn render_launch_daemon_plist() -> String {
+pub fn render_launch_daemon_plist() -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -500,7 +544,7 @@ mod tests {
         )
         .expect_err("bootout failure must stop publication");
 
-        assert!(error.to_string().contains("injected bootout failure"));
+        assert!(format!("{error:#}").contains("injected bootout failure"));
         assert_eq!(std::fs::read(&paths.helper).expect("helper"), b"helper-v1");
         assert_eq!(
             std::fs::read(&paths.authority).expect("authority"),
@@ -566,7 +610,24 @@ mod tests {
             &RecordingLaunchctl::default(),
         )
         .expect_err("symlinked authority directory must fail");
-        assert!(error.to_string().contains("not a real directory"));
+        assert!(format!("{error:#}").contains("not a real directory"));
+    }
+
+    #[test]
+    fn existing_secure_system_parent_is_validated_without_rewriting_its_mode() {
+        let root = tempfile::tempdir().expect("temporary install root");
+        let paths = InstallPaths::under(root.path());
+        let parent = paths.plist.parent().expect("LaunchDaemons parent");
+        std::fs::create_dir_all(parent).expect("create protected parent fixture");
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .expect("set protected parent mode");
+
+        ensure_parent(&paths.plist, owner()).expect("validate existing secure parent");
+
+        assert_eq!(
+            std::fs::metadata(parent).expect("parent metadata").mode() & 0o7777,
+            0o700
+        );
     }
 
     #[test]

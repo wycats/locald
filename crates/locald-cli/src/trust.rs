@@ -1,52 +1,62 @@
+#[cfg(not(target_os = "macos"))]
 use crate::style;
 use anyhow::{Context, Result};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::process::CommandExt;
 
 pub fn run() -> Result<()> {
-    // If we're not root and a privileged shim exists, delegate the entire operation to it.
-    #[cfg(unix)]
-    if !nix::unistd::geteuid().is_root() {
-        if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
-            if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
-                let err = std::process::Command::new(&shim_path)
-                    .arg("admin")
-                    .arg("trust")
-                    .exec();
-                anyhow::bail!("Failed to exec shim for trust install: {err}");
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_setup::run_setup()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // If we're not root and a privileged shim exists, delegate the entire operation to it.
+        #[cfg(unix)]
+        if !nix::unistd::geteuid().is_root() {
+            if let Ok(Some(shim_path)) = locald_utils::shim::find_privileged() {
+                if std::env::var("LOCALD_SHIM_ACTIVE").is_err() {
+                    let err = std::process::Command::new(&shim_path)
+                        .arg("admin")
+                        .arg("trust")
+                        .exec();
+                    anyhow::bail!("Failed to exec shim for trust install: {err}");
+                }
             }
         }
-    }
 
-    let ensure = locald_utils::cert::ensure_root_ca()?;
-    let ca_cert_path = ensure.paths.cert_path;
+        let ensure = locald_utils::cert::ensure_root_ca()?;
+        let ca_cert_path = ensure.paths.cert_path;
 
-    if ensure.created {
-        println!("Generating new Root CA...");
+        if ensure.created {
+            println!("Generating new Root CA...");
+            println!(
+                "{} Root CA generated at {}",
+                style::CHECK,
+                ca_cert_path.display()
+            );
+        } else {
+            println!("Root CA already exists at {}", ca_cert_path.display());
+        }
+
+        println!("Installing Root CA to system trust store...");
+        install_ca(&ca_cert_path)?;
+        println!("{} Root CA installed successfully.", style::CHECK);
         println!(
-            "{} Root CA generated at {}",
-            style::CHECK,
-            ca_cert_path.display()
+            "{} You may need to restart your browser to pick up trust changes.",
+            style::WARN
         );
-    } else {
-        println!("Root CA already exists at {}", ca_cert_path.display());
+
+        Ok(())
     }
-
-    println!("Installing Root CA to system trust store...");
-    install_ca(&ca_cert_path)?;
-    println!("{} Root CA installed successfully.", style::CHECK);
-    println!(
-        "{} You may need to restart your browser to pick up trust changes.",
-        style::WARN
-    );
-
-    Ok(())
 }
 
 /// Ensure a locald Root CA exists and install it into the system trust store.
 ///
 /// This function performs no user-facing printing so callers can control output.
+#[cfg(not(target_os = "macos"))]
 pub fn install_root_ca_into_trust_store() -> Result<()> {
     let ensure = locald_utils::cert::ensure_root_ca()?;
     install_ca(&ensure.paths.cert_path)?;
@@ -54,6 +64,7 @@ pub fn install_root_ca_into_trust_store() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn install_ca(cert_path: &std::path::Path) -> Result<()> {
     // On macOS, ca_injector is not supported — use the native security CLI directly.
     #[cfg(target_os = "macos")]
@@ -128,7 +139,7 @@ fn install_ca_linux_fallback(cert_path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
+pub fn install_ca_macos(cert_path: &std::path::Path) -> Result<()> {
     // Use the `security` CLI to add the cert as trusted. This is the most reliable
     // approach on macOS — the native SecTrustSettings API has issues with authorization
     // dialogs and session contexts that the CLI handles transparently.

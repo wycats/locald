@@ -399,6 +399,32 @@ fn is_already_running() -> bool {
     locald_utils::ipc::socket_path().is_ok_and(|path| UnixStream::connect(path).is_ok())
 }
 
+#[allow(clippy::similar_names)]
+fn validate_port_override_policy(
+    sandbox: bool,
+    has_http_override: bool,
+    has_https_override: bool,
+) -> Result<()> {
+    if !sandbox && (has_http_override || has_https_override) {
+        anyhow::bail!(
+            "LOCALD_HTTP_PORT and LOCALD_HTTPS_PORT are available only in explicit sandbox mode; standard mode always uses trusted HTTPS on ports 80 and 443"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_standard_preflight(ca_trusted: bool, helper_probe: Result<()>) -> Result<()> {
+    if !ca_trusted {
+        anyhow::bail!(
+            "locald's Root CA is missing or not trusted by macOS. Run `sudo locald admin setup` to repair the installation."
+        );
+    }
+    helper_probe.context(
+        "standard-mode privileged-helper preflight failed; run `sudo locald admin setup` to repair the installation",
+    )
+}
+
 async fn load_attachment_store_for_lifecycle_recovery(
     store: &mut locald_core::attachments::AttachmentStore,
     preflight: &lifecycle_transaction::LifecycleRecoveryPreflight,
@@ -523,6 +549,18 @@ async fn async_main(
             warn!("Failed to load global config: {e}. Using defaults.");
             locald_core::config::GlobalConfig::default()
         });
+
+    validate_port_override_policy(
+        config.server.is_sandbox(),
+        std::env::var_os("LOCALD_HTTP_PORT").is_some(),
+        std::env::var_os("LOCALD_HTTPS_PORT").is_some(),
+    )?;
+
+    #[cfg(target_os = "macos")]
+    if !config.server.is_sandbox() {
+        let helper_probe = helper_client::probe_helper().await;
+        validate_macos_standard_preflight(locald_utils::cert::is_ca_trusted(), helper_probe)?;
+    }
 
     // The notify socket must be sandbox-aware (tests and parallel sandboxes), otherwise
     // multiple daemon instances will contend for the same fixed path.
@@ -713,7 +751,9 @@ async fn async_main(
     ));
 
     // Bind HTTP
-    let listener_http = if let Ok(port_str) = std::env::var("LOCALD_HTTP_PORT") {
+    let listener_http = if config.server.is_sandbox()
+        && let Ok(port_str) = std::env::var("LOCALD_HTTP_PORT")
+    {
         let port = port_str.parse::<u16>().unwrap_or(8080);
         info!("Binding HTTP to configured port: {}", port);
         match proxy.bind_http(port).await {
@@ -772,39 +812,40 @@ async fn async_main(
     }
 
     // Bind HTTPS
-    let listener_https: Option<std::net::TcpListener> =
-        if let Ok(port_str) = std::env::var("LOCALD_HTTPS_PORT") {
-            let port = port_str.parse::<u16>().unwrap_or(8443);
-            info!("Binding HTTPS to configured port: {}", port);
-            match proxy.bind_https(port).await {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    error!("Failed to bind configured port {}: {}", port, e);
-                    None
-                }
+    let listener_https: Option<std::net::TcpListener> = if config.server.is_sandbox()
+        && let Ok(port_str) = std::env::var("LOCALD_HTTPS_PORT")
+    {
+        let port = port_str.parse::<u16>().unwrap_or(8443);
+        info!("Binding HTTPS to configured port: {}", port);
+        match proxy.bind_https(port).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!("Failed to bind configured port {}: {}", port, e);
+                None
             }
-        } else if config.server.is_sandbox() {
-            // Sandbox mode: use high ports, best-effort
-            match proxy.bind_https(8443).await {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    error!("Failed to bind port 8443: {e}. HTTPS disabled.");
-                    None
-                }
+        }
+    } else if config.server.is_sandbox() {
+        // Sandbox mode: use high ports, best-effort
+        match proxy.bind_https(8443).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!("Failed to bind port 8443: {e}. HTTPS disabled.");
+                None
             }
-        } else {
-            // Standard mode: bind privileged port 443.
-            match proxy.bind_https(443).await {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    error!(
-                        "Failed to bind port 443: {e}.\n\
+        }
+    } else {
+        // Standard mode: bind privileged port 443.
+        match proxy.bind_https(443).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!(
+                    "Failed to bind port 443: {e}.\n\
                      Run `sudo locald admin setup` to install the privileged helper."
-                    );
-                    return Err(e);
-                }
+                );
+                return Err(e);
             }
-        };
+        }
+    };
 
     // Set the advertised HTTPS port (always matches the bind port).
     if let Some(ref l) = listener_https {
@@ -930,6 +971,41 @@ async fn watch_for_upgrade(
             }
             info!("Deferring restart: {} active ephemeral tasks.", active);
         }
+    }
+}
+
+#[cfg(test)]
+mod privileged_startup_tests {
+    #[cfg(target_os = "macos")]
+    use super::validate_macos_standard_preflight;
+    use super::validate_port_override_policy;
+
+    #[test]
+    fn standard_mode_rejects_all_port_overrides() {
+        assert!(validate_port_override_policy(false, true, false).is_err());
+        assert!(validate_port_override_policy(false, false, true).is_err());
+        assert!(validate_port_override_policy(false, true, true).is_err());
+        validate_port_override_policy(false, false, false)
+            .expect("standard mode without overrides is valid");
+    }
+
+    #[test]
+    fn sandbox_mode_retains_ephemeral_port_overrides() {
+        validate_port_override_policy(true, true, true)
+            .expect("sandbox mode may configure both proxy ports");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn standard_mode_fails_closed_on_trust_or_helper_preflight() {
+        assert!(validate_macos_standard_preflight(false, Ok(())).is_err());
+        assert!(
+            validate_macos_standard_preflight(true, Err(anyhow::anyhow!("unauthorized")))
+                .unwrap_err()
+                .to_string()
+                .contains("sudo locald admin setup")
+        );
+        validate_macos_standard_preflight(true, Ok(())).expect("complete installation is ready");
     }
 }
 

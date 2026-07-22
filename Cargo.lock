@@ -3554,6 +3554,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",
@@ -3567,6 +3568,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

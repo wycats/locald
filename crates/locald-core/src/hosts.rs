@@ -37,6 +37,22 @@ impl HostsFileSection {
         let start_marker = "# BEGIN locald";
         let end_marker = "# END locald";
 
+        if domains.is_empty() {
+            let Some(start) = current_content.find(start_marker) else {
+                return current_content.to_owned();
+            };
+            let Some(relative_end) = current_content[start..].find(end_marker) else {
+                return current_content.to_owned();
+            };
+            let end = start + relative_end + end_marker.len();
+            let mut output = String::from(&current_content[..start]);
+            output.push_str(&current_content[end..]);
+            while output.contains("\n\n\n") {
+                output = output.replace("\n\n\n", "\n\n");
+            }
+            return output;
+        }
+
         let mut new_section = String::new();
         new_section.push_str(start_marker);
         new_section.push('\n');
@@ -101,5 +117,15 @@ mod tests {
         assert!(new_content.contains("127.0.0.1 new.local"));
         assert!(!new_content.contains("127.0.0.1 old.local"));
         assert_eq!(new_content.matches("# BEGIN locald").count(), 1);
+    }
+
+    #[test]
+    fn empty_domains_remove_an_existing_section_without_creating_one() {
+        let hosts = HostsFileSection::with_path(PathBuf::from("/tmp/hosts"));
+        let content = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.local\n# END locald\n";
+
+        let updated = hosts.update_content(content, &[]);
+        assert_eq!(updated, "127.0.0.1 localhost\n\n");
+        assert_eq!(hosts.update_content(&updated, &[]), updated);
     }
 }

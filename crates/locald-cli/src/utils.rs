@@ -306,9 +306,6 @@ fn show_container_unsupported_error() -> ! {
 pub fn verify_shim() {
     #[cfg(target_os = "macos")]
     {
-        use dialoguer::Confirm;
-        use std::io::IsTerminal;
-
         // Skip setup verification in sandbox mode (used for testing)
         if std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok() {
             return;
@@ -320,79 +317,36 @@ pub fn verify_shim() {
             return;
         }
 
-        let certs_dir = match locald_utils::cert::get_certs_dir() {
-            Ok(dir) => dir,
+        let report = match crate::macos_setup::collect_report(false) {
+            Ok(report) => report,
             Err(e) => {
                 eprintln!(
-                    "{} Failed to determine locald certs directory: {}",
+                    "{} Failed to inspect the locald installation: {}",
                     style::CROSS,
                     e
                 );
                 std::process::exit(1);
             }
         };
-
-        let ca_cert = certs_dir.join("rootCA.pem");
-        let ca_key = certs_dir.join("rootCA-key.pem");
-        if ca_cert.exists() && ca_key.exists() {
+        if !report.has_critical_failures() {
             return;
         }
 
-        if !std::io::stdin().is_terminal() {
-            eprintln!(
-                "{} locald needs initial setup. Run `sudo locald admin setup`.",
-                style::CROSS
-            );
-            std::process::exit(1);
-        }
-
-        let run_setup = Confirm::new()
-            .with_prompt("locald needs initial setup. Run it now?")
-            .default(true)
-            .interact()
-            .unwrap_or(false);
-
-        if !run_setup {
-            eprintln!(
-                "{} locald needs initial setup. Run `sudo locald admin setup`.",
-                style::CROSS
-            );
-            std::process::exit(1);
-        }
-
-        let exe_path = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to get executable path: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        let status = std::process::Command::new("sudo")
-            .arg("--")
-            .arg(&exe_path)
-            .arg("admin")
-            .arg("setup")
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                eprintln!();
-                eprintln!(
-                    "{} Setup complete! Continuing with your command...",
-                    style::CHECK
-                );
-                eprintln!();
-            }
-            Ok(s) => {
-                eprintln!("Setup failed with exit code: {:?}", s.code());
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Failed to run setup: {}", e);
-                std::process::exit(1);
-            }
-        }
+        let failed = report
+            .problems
+            .iter()
+            .filter(|problem| {
+                problem.status == locald_utils::privileged::Status::Fail
+                    && problem.severity == locald_utils::privileged::Severity::Critical
+            })
+            .map(|problem| problem.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "{} locald's privileged installation is not ready ({failed}). Run `sudo locald admin setup`.",
+            style::CROSS
+        );
+        std::process::exit(1);
     }
 
     #[cfg(target_os = "linux")]

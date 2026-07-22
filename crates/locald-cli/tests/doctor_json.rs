@@ -29,4 +29,22 @@ fn doctor_json_outputs_valid_json() {
     assert!(report.get("mode").is_some(), "missing mode");
     assert!(report.get("problems").is_some(), "missing problems");
     assert!(report.get("fixes").is_some(), "missing fixes");
+
+    #[cfg(target_os = "macos")]
+    {
+        let problems = report["problems"]
+            .as_array()
+            .expect("macOS doctor problems are an array");
+        let ids = problems
+            .iter()
+            .filter_map(|problem| problem["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(ids.contains("macos.console_user"));
+        assert!(ids.contains("macos.ca.trust"));
+        assert!(ids.contains("macos.agent.launch_agent"));
+        assert!(ids.contains("macos.helper.authority"));
+        assert!(ids.contains("macos.helper.probe"));
+        assert!(problems.iter().all(|problem| problem["status"] == "skip"));
+        assert_eq!(report["fixes"], serde_json::json!([]));
+    }
 }
