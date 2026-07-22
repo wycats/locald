@@ -686,7 +686,7 @@ fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
     }
     new_section.push_str(end_marker);
 
-    let new_content = if let Some(start) = current_content.find(start_marker) {
+    if let Some(start) = current_content.find(start_marker) {
         if let Some(end_idx) = current_content[start..].find(end_marker) {
             let end = start + end_idx;
             // Replace existing section
@@ -713,9 +713,7 @@ fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
         output.push_str(&new_section);
         output.push('\n');
         output
-    };
-
-    new_content
+    }
 }
 
 fn main() -> Result<()> {

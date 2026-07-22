@@ -128,17 +128,7 @@ pub fn repair_root_ca_in_dir(
     owner_uid: u32,
     owner_gid: u32,
 ) -> Result<EnsureRootCaResult> {
-    ensure_real_directory(certs_dir)?;
-
-    let directory = nix::fcntl::open(
-        certs_dir,
-        nix::fcntl::OFlag::O_RDONLY
-            | nix::fcntl::OFlag::O_DIRECTORY
-            | nix::fcntl::OFlag::O_NOFOLLOW
-            | nix::fcntl::OFlag::O_CLOEXEC,
-        nix::sys::stat::Mode::empty(),
-    )
-    .with_context(|| format!("Failed to open {} safely", certs_dir.display()))?;
+    let directory = open_or_create_real_directory(certs_dir)?;
 
     // Setup normally runs as root. Holding the directory under the effective
     // setup identity prevents the configured user from replacing entries while
@@ -269,33 +259,60 @@ pub fn validate_root_ca_permissions_in_dir(
 }
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::disallowed_methods)]
-fn ensure_real_directory(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            anyhow::bail!(
-                "Root CA directory is not a real directory: {}",
-                path.display()
-            )
-        }
-        Ok(_) => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
-        }
+fn open_or_create_real_directory(path: &Path) -> Result<OwnedFd> {
+    if !path.is_absolute() {
+        anyhow::bail!("Root CA directory must be absolute: {}", path.display());
     }
 
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("Failed to create {}", path.display()))?;
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to inspect {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!(
-            "Root CA directory is not a real directory: {}",
-            path.display()
-        );
+    let flags = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_DIRECTORY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    let mut directory = nix::fcntl::open("/", flags, nix::sys::stat::Mode::empty())
+        .context("Failed to open the filesystem root safely")?;
+    let mut current = PathBuf::from("/");
+
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            anyhow::bail!(
+                "Root CA directory has an unsupported component: {}",
+                path.display()
+            );
+        };
+        current.push(name);
+        let next = match nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+        {
+            Ok(next) => next,
+            Err(nix::errno::Errno::ENOENT) => {
+                nix::sys::stat::mkdirat(
+                    &directory,
+                    name,
+                    nix::sys::stat::Mode::from_bits_truncate(0o700),
+                )
+                .with_context(|| format!("Failed to create {} safely", current.display()))?;
+                nix::unistd::fsync(&directory)
+                    .with_context(|| format!("Failed to sync {}", current.display()))?;
+                nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+                    .with_context(|| format!("Failed to open {} safely", current.display()))?
+            }
+            Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+                anyhow::bail!(
+                    "Root CA directory is not a real directory: {}",
+                    current.display()
+                )
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to open {} safely", current.display()));
+            }
+        };
+        directory = next;
     }
-    Ok(())
+
+    Ok(directory)
 }
 
 #[cfg(target_os = "macos")]
@@ -887,7 +904,8 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir() -> PathBuf {
-        let base = std::env::temp_dir();
+        let configured = std::env::temp_dir();
+        let base = configured.canonicalize().unwrap_or(configured);
         base.join(format!("locald-utils-cert-test-{}", uuid::Uuid::new_v4()))
     }
 
@@ -1117,6 +1135,30 @@ mod tests {
 
         assert!(error.to_string().contains("not a real directory"));
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_repair_rejects_a_symlinked_ancestor_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir();
+        let target = root.join("target");
+        let redirect = root.join("redirect");
+        let certs = redirect.join("certs");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, &redirect).unwrap();
+
+        let error = repair_root_ca_in_dir(
+            &certs,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .expect_err("symlinked Root CA ancestor must fail closed");
+
+        assert!(error.to_string().contains("not a real directory"));
+        assert!(!target.join("certs").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
