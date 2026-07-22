@@ -94,6 +94,27 @@ impl HostsFileSection {
     /// Remove only the named domains from locald's generated section while
     /// preserving every other managed mapping.
     pub fn remove_domains_from_content(&self, current_content: &str, domains: &[&str]) -> String {
+        self.remove_matching_domains_from_content(current_content, |domain| {
+            domains.contains(&domain)
+        })
+    }
+
+    /// Remove host mappings that macOS resolves natively or that locald has
+    /// retired, while preserving explicit custom-domain mappings.
+    pub fn remove_native_macos_domains_from_content(&self, current_content: &str) -> String {
+        self.remove_matching_domains_from_content(current_content, |domain| {
+            let canonical = domain.to_ascii_lowercase();
+            canonical == "localhost"
+                || canonical.ends_with(".localhost")
+                || LEGACY_MACOS_HOST_ALIASES.contains(&canonical.as_str())
+        })
+    }
+
+    fn remove_matching_domains_from_content(
+        &self,
+        current_content: &str,
+        mut should_remove: impl FnMut(&str) -> bool,
+    ) -> String {
         let start_marker = "# BEGIN locald";
         let end_marker = "# END locald";
         let Some(start) = current_content.find(start_marker) else {
@@ -113,7 +134,7 @@ impl HostsFileSection {
                 continue;
             }
             for domain in fields {
-                if domains.contains(&domain) {
+                if should_remove(domain) {
                     removed = true;
                 } else {
                     retained.push(domain.to_owned());
@@ -192,6 +213,28 @@ mod tests {
         let content = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local\n# END locald\n";
 
         let updated = hosts.remove_domains_from_content(content, LEGACY_MACOS_HOST_ALIASES);
+        assert_eq!(updated, "127.0.0.1 localhost\n\n");
+    }
+
+    #[test]
+    fn removing_native_macos_domains_preserves_custom_mappings() {
+        let hosts = HostsFileSection::with_path(PathBuf::from("/tmp/hosts"));
+        let content = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local app.localhost frame.turn.v0.localhost custom.example.test\n# END locald\n";
+
+        let updated = hosts.remove_native_macos_domains_from_content(content);
+        assert!(!updated.contains("locald.local"));
+        assert!(!updated.contains("app.localhost"));
+        assert!(!updated.contains("frame.turn.v0.localhost"));
+        assert!(updated.contains("127.0.0.1 custom.example.test"));
+        assert!(updated.contains("# BEGIN locald"));
+    }
+
+    #[test]
+    fn removing_only_native_macos_domains_retires_the_generated_section() {
+        let hosts = HostsFileSection::with_path(PathBuf::from("/tmp/hosts"));
+        let content = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 app.localhost frame.turn.v0.localhost\n# END locald\n";
+
+        let updated = hosts.remove_native_macos_domains_from_content(content);
         assert_eq!(updated, "127.0.0.1 localhost\n\n");
     }
 }

@@ -61,7 +61,7 @@ enum ReportCaller {
 
 trait SetupPlatform {
     fn install_system_trust(&self, certificate: &Path) -> Result<()>;
-    fn retire_legacy_host_aliases(&self) -> Result<()>;
+    fn retire_stale_host_aliases(&self) -> Result<()>;
     fn restart_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()>;
     fn install_helper(&self, bytes: &[u8], authority: &HelperAuthority) -> Result<()>;
     fn probe_helper(&self) -> Result<()>;
@@ -74,11 +74,11 @@ impl SetupPlatform for SystemPlatform {
         crate::trust::install_ca_macos(certificate)
     }
 
-    fn retire_legacy_host_aliases(&self) -> Result<()> {
+    fn retire_stale_host_aliases(&self) -> Result<()> {
         let hosts = locald_core::HostsFileSection::new();
         let path = Path::new("/etc/hosts");
         let current = std::fs::read_to_string(path).context("could not read /etc/hosts")?;
-        let updated = retire_legacy_hosts_content(&hosts, &current);
+        let updated = retire_stale_hosts_content(&hosts, &current);
         if updated != current {
             let metadata = std::fs::symlink_metadata(path)
                 .context("could not inspect /etc/hosts before synchronization")?;
@@ -148,8 +148,8 @@ fn launchctl_service_absent(exit_code: Option<i32>, stderr: &str) -> bool {
         || stderr.contains("Could not find specified service")
 }
 
-fn retire_legacy_hosts_content(hosts: &locald_core::HostsFileSection, current: &str) -> String {
-    hosts.remove_domains_from_content(current, locald_core::LEGACY_MACOS_HOST_ALIASES)
+fn retire_stale_hosts_content(hosts: &locald_core::HostsFileSection, current: &str) -> String {
+    hosts.remove_native_macos_domains_from_content(current)
 }
 
 /// Resolve and cross-check the non-root console user that owns this setup.
@@ -282,8 +282,8 @@ fn run_setup_with(
         .install_system_trust(&ca.paths.cert_path)
         .context("could not install Root CA into system trust")?;
     platform
-        .retire_legacy_host_aliases()
-        .context("could not retire locald's legacy hosts-file aliases")?;
+        .retire_stale_host_aliases()
+        .context("could not retire locald's stale hosts-file aliases")?;
 
     ensure_directory(
         paths.agent.parent().context("agent path has no parent")?,
@@ -878,7 +878,7 @@ mod tests {
             Ok(())
         }
 
-        fn retire_legacy_host_aliases(&self) -> Result<()> {
+        fn retire_stale_host_aliases(&self) -> Result<()> {
             self.calls.lock().unwrap().push("hosts-cleanup");
             Ok(())
         }
@@ -1034,12 +1034,14 @@ mod tests {
     }
 
     #[test]
-    fn setup_retires_only_legacy_hosts_aliases() {
+    fn setup_retires_native_and_legacy_hosts_aliases() {
         let hosts = locald_core::HostsFileSection::with_path(PathBuf::from("/etc/hosts"));
-        let current = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local\n127.0.0.1 workbench.example.test\n# END locald\n";
+        let current = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local\n127.0.0.1 workbench.localhost\n127.0.0.1 frame.turn.v0.localhost\n127.0.0.1 workbench.example.test\n# END locald\n";
 
-        let updated = retire_legacy_hosts_content(&hosts, current);
+        let updated = retire_stale_hosts_content(&hosts, current);
         assert!(!updated.contains("locald.local"));
+        assert!(!updated.contains("workbench.localhost"));
+        assert!(!updated.contains("frame.turn.v0.localhost"));
         assert!(updated.contains("127.0.0.1 workbench.example.test"));
     }
 

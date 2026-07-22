@@ -653,8 +653,30 @@ pub(crate) fn update_hosts_file(domains: &[String]) -> Result<()> {
 
     let current_content = std::fs::read_to_string(&path).context("Failed to read hosts file")?;
 
+    let new_content = update_hosts_content(&current_content, domains);
+    std::fs::write(&path, new_content).context("Failed to write hosts file")?;
+    Ok(())
+}
+
+fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
     let start_marker = "# BEGIN locald";
     let end_marker = "# END locald";
+
+    if domains.is_empty() {
+        let Some(start) = current_content.find(start_marker) else {
+            return current_content.to_owned();
+        };
+        let Some(relative_end) = current_content[start..].find(end_marker) else {
+            return current_content.to_owned();
+        };
+        let end = start + relative_end + end_marker.len();
+        let mut output = String::from(&current_content[..start]);
+        output.push_str(&current_content[end..]);
+        while output.contains("\n\n\n") {
+            output = output.replace("\n\n\n", "\n\n");
+        }
+        return output;
+    }
 
     let mut new_section = String::new();
     new_section.push_str(start_marker);
@@ -693,8 +715,7 @@ pub(crate) fn update_hosts_file(domains: &[String]) -> Result<()> {
         output
     };
 
-    std::fs::write(&path, new_content).context("Failed to write hosts file")?;
-    Ok(())
+    new_content
 }
 
 fn main() -> Result<()> {
@@ -923,5 +944,33 @@ polkit.addRule(function(action, subject) {
             check_port(args.port)?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_hosts_content;
+
+    #[test]
+    fn empty_host_sync_removes_the_managed_section() {
+        let current =
+            "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald\n";
+
+        let updated = update_hosts_content(current, &[]);
+
+        assert_eq!(updated, "127.0.0.1 localhost\n\n");
+        assert_eq!(update_hosts_content(&updated, &[]), updated);
+    }
+
+    #[test]
+    fn nonempty_host_sync_still_replaces_the_managed_section() {
+        let current =
+            "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald\n";
+
+        let updated = update_hosts_content(current, &["custom.example.test".to_owned()]);
+
+        assert!(!updated.contains("old.localhost"));
+        assert!(updated.contains("127.0.0.1 custom.example.test"));
+        assert_eq!(updated.matches("# BEGIN locald").count(), 1);
     }
 }
