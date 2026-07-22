@@ -696,7 +696,7 @@ fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
             output
         } else {
             // Malformed block, append
-            let mut output = String::from(&current_content);
+            let mut output = String::from(current_content);
             if !output.is_empty() && !output.ends_with('\n') {
                 output.push('\n');
             }
@@ -706,7 +706,7 @@ fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
         }
     } else {
         // Append if not found
-        let mut output = String::from(&current_content);
+        let mut output = String::from(current_content);
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
