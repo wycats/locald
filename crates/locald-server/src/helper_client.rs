@@ -111,7 +111,7 @@ fn parse_response(command: HelperCommand, response: &Message) -> Result<Option<R
             .unwrap_or_else(|| HelperErrorCode::InternalError.as_str().to_string());
         let code = HelperErrorCode::parse(&raw_code).unwrap_or(HelperErrorCode::InternalError);
         let message = response_string(dict, "message").unwrap_or_else(|| "no detail".to_string());
-        return Err(helper_rejection(command, code, &message));
+        return Err(helper_rejection(command, code, &raw_code, &message));
     }
     if status != HelperStatus::Success.as_str() {
         return Err(setup_required(&format!(
@@ -135,11 +135,16 @@ fn helper_unavailable(error: &anyhow::Error) -> anyhow::Error {
     setup_required(&format!("privileged helper is unavailable: {error}"))
 }
 
-fn helper_rejection(command: HelperCommand, code: HelperErrorCode, message: &str) -> anyhow::Error {
+fn helper_rejection(
+    command: HelperCommand,
+    code: HelperErrorCode,
+    raw_code: &str,
+    message: &str,
+) -> anyhow::Error {
     let detail = format!(
         "helper rejected {} ({}): {message}",
         command.as_str(),
-        code.as_str()
+        raw_code
     );
     match code {
         HelperErrorCode::ProtocolMismatch
@@ -275,6 +280,19 @@ mod tests {
             .expect_err("authentication must fail");
         assert!(error.to_string().contains("authentication_failed"));
         assert!(error.to_string().contains("sudo locald admin setup"));
+    }
+
+    #[test]
+    fn unknown_error_code_is_preserved_for_diagnostics() {
+        let mut dict = response(HelperStatus::Error);
+        insert_string(&mut dict, "error_code", "future_policy_failure");
+        insert_string(&mut dict, "message", "future helper detail");
+
+        let error = parse_response(HelperCommand::Probe, &Message::Dictionary(dict))
+            .expect_err("unknown helper error code must fail");
+
+        assert!(error.to_string().contains("future_policy_failure"));
+        assert!(error.to_string().contains("future helper detail"));
     }
 
     #[test]
