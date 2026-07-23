@@ -5217,7 +5217,7 @@ impl ProcessManager {
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "locald's HTTPS proxy listener did not become ready within {}s; run `locald doctor` and retry",
+                "locald's HTTPS proxy listener did not become ready within {}s; inspect daemon logs and run `locald doctor`; repair standard mode with `sudo locald admin setup`, or provide valid local CA material in sandbox mode",
                 SERVICE_READINESS_TIMEOUT.as_secs()
             )
         })?
