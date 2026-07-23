@@ -5059,7 +5059,7 @@ impl ProcessManager {
         );
 
         let canonical = Self::normalize_ensure_project_root(&project_path)?;
-        self.wait_for_proxy_listeners().await?;
+        self.wait_for_https_proxy_listener().await?;
         self.run_admitted_availability_transition(|| async {
             self.ensure_accepting_lifecycle_requests()?;
             let (instance_id, pending_initial) =
@@ -5160,15 +5160,15 @@ impl ProcessManager {
             .with_context(|| format!("failed to normalize `{}`", root_locator.display()))
     }
 
-    async fn wait_for_proxy_listeners(&self) -> Result<()> {
+    async fn wait_for_https_proxy_listener(&self) -> Result<()> {
         tokio::time::timeout(SERVICE_READINESS_TIMEOUT, async {
             loop {
                 self.ensure_accepting_new_lifecycle_request()?;
                 let ports_changed = self.proxy_ports_changed.notified();
                 tokio::pin!(ports_changed);
                 let _ = ports_changed.as_mut().enable();
-                let (http, https) = *self.proxy_ports.lock().await;
-                if http.is_some() && https.is_some() {
+                let https = self.proxy_ports.lock().await.1;
+                if https.is_some() {
                     return Ok(());
                 }
                 ports_changed.await;
@@ -5177,7 +5177,7 @@ impl ProcessManager {
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "locald's HTTP and HTTPS proxy listeners did not become ready within {}s; run `locald doctor` and retry",
+                "locald's HTTPS proxy listener did not become ready within {}s; run `locald doctor` and retry",
                 SERVICE_READINESS_TIMEOUT.as_secs()
             )
         })?
@@ -5226,17 +5226,17 @@ impl ProcessManager {
                 "service `{}` did not remain ready while finalizing EnsureProject",
                 status.name
             );
-            let routed_url = status
-                .url
-                .as_ref()
-                .and(status.domain.as_ref())
-                .map(|domain| {
+            let routed_url = if status.url.is_some() {
+                status.domain.as_ref().map(|domain| {
                     if advertised_https_port == 443 {
                         format!("https://{domain}")
                     } else {
                         format!("https://{domain}:{advertised_https_port}")
                     }
-                });
+                })
+            } else {
+                None
+            };
             if let Some(url) = &routed_url {
                 urls.insert(url.clone());
             }
@@ -21815,15 +21815,7 @@ command = "unused-by-test-factory"
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut ensure)
                 .await
                 .is_err(),
-            "EnsureProject waits for proxy listeners"
-        );
-        assert!(manager.registry.lock().await.instances.is_empty());
-        manager.set_http_port(Some(80)).await;
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ensure)
-                .await
-                .is_err(),
-            "EnsureProject waits for both proxy listeners"
+            "EnsureProject waits for the HTTPS proxy listener"
         );
         assert!(manager.registry.lock().await.instances.is_empty());
         manager.set_https_port(Some(8443)).await;
