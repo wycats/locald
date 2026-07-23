@@ -24,7 +24,10 @@ use locald_core::attachments::{
     ProjectStatusInfo,
 };
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
-use locald_core::ipc::{BootEvent, Event, LogEntry, ServiceStatus};
+use locald_core::ipc::{
+    BootEvent, EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, Event, LogEntry,
+    ServiceStatus,
+};
 use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
 use locald_core::service::{ServiceContext, ServiceController, ServiceFactory};
@@ -34,10 +37,10 @@ use locald_core::state::{
 };
 use locald_core::{
     AvailabilityBatch, AvailabilityBatchOperation, AvailabilityError, AvailabilityStore,
-    CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DomainClaim, DomainName,
-    DomainTarget, EnsureDemandResult, ProjectAvailability, ProjectDiscovery, ProjectInstanceId,
-    SharedDomainIndex, SystemClock, availability_path, sanitize_project_name_for_dns,
-    sanitize_service_name_for_dns,
+    CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DemandKind, DomainClaim,
+    DomainName, DomainTarget, EnsureDemandResult, ProjectAvailability, ProjectDiscovery,
+    ProjectInstanceId, SharedDomainIndex, SystemClock, availability_path,
+    sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -47,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
@@ -502,6 +505,7 @@ pub struct ProcessManager {
     state_manager: Arc<StateManager>,
     runtime: Arc<Runtime>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
+    proxy_ports_changed: Arc<Notify>,
     watchers: Arc<Mutex<HashMap<PathBuf, RecommendedWatcher>>>,
     registry: Arc<Mutex<Registry>>,
     domain_index: SharedDomainIndex,
@@ -706,6 +710,7 @@ impl ProcessManager {
 
         let services = Arc::new(Mutex::new(HashMap::new()));
         let proxy_ports = Arc::new(Mutex::new((None, None)));
+        let proxy_ports_changed = Arc::new(Notify::new());
 
         let domain_index = {
             let registry_snapshot = registry
@@ -740,6 +745,7 @@ impl ProcessManager {
             state_manager,
             runtime,
             proxy_ports,
+            proxy_ports_changed,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             registry,
             domain_index,
@@ -904,10 +910,12 @@ impl ProcessManager {
 
     pub async fn set_http_port(&self, port: Option<u16>) {
         self.proxy_ports.lock().await.0 = port;
+        self.proxy_ports_changed.notify_waiters();
     }
 
     pub async fn set_https_port(&self, port: Option<u16>) {
         self.proxy_ports.lock().await.1 = port;
+        self.proxy_ports_changed.notify_waiters();
     }
 
     fn reap_dead_services(_name: &str, _service: &mut Service) {
@@ -2163,6 +2171,17 @@ impl ProcessManager {
     ) -> Result<(ProjectInstanceId, PendingInitialAvailabilityGuard)> {
         let (path, transition_lock) = self.transition_lock_for_path(&path).await;
         let _transition_guard = transition_lock.lock().await;
+        self.start_runtime_locked(path, event_tx, verbose, initial_identity)
+            .await
+    }
+
+    async fn start_runtime_locked(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        initial_identity: ConfigPhysicalIdentity,
+    ) -> Result<(ProjectInstanceId, PendingInitialAvailabilityGuard)> {
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
         self.forgotten_reload_paths.lock().await.remove(&path);
@@ -2184,6 +2203,39 @@ impl ProcessManager {
             .pending_initial
             .context("initial config publication did not retain availability ownership")?;
         Ok((outcome.instance_id, pending))
+    }
+
+    async fn resolve_or_register_ensure_project(
+        &self,
+        project_path: &Path,
+    ) -> Result<(ProjectInstanceId, Option<PendingInitialAvailabilityGuard>)> {
+        let (canonical, transition_lock) = self.transition_lock_for_path(project_path).await;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        match self.resolve_lifecycle_target(&canonical).await? {
+            LifecycleTargetResolution::Catalogued(target) => Ok((target.instance_id, None)),
+            LifecycleTargetResolution::UnregisteredPhysical { instance_id } => {
+                let (registered, pending) = self
+                    .start_runtime_locked(
+                        canonical,
+                        None,
+                        false,
+                        ConfigPhysicalIdentity::Git(instance_id),
+                    )
+                    .await?;
+                Ok((registered, Some(pending)))
+            }
+            LifecycleTargetResolution::UnresolvedLegacy => {
+                let (registered, pending) = self
+                    .start_runtime_locked(canonical, None, false, ConfigPhysicalIdentity::NonGit)
+                    .await?;
+                Ok((registered, Some(pending)))
+            }
+            LifecycleTargetResolution::Ambiguous => anyhow::bail!(
+                "project ensure cannot resolve `{}` because it matches multiple catalogued project instances",
+                project_path.display()
+            ),
+        }
     }
 
     async fn reload_config(&self, path: PathBuf) -> Result<()> {
@@ -4989,6 +5041,261 @@ impl ProcessManager {
         self.converge_managed_instance(instance_id, None, false, false)
             .await?;
         Ok(())
+    }
+
+    /// Acquire or renew one semantic demand and return only after the project
+    /// has converged to authoritative readiness.
+    pub async fn ensure_project(
+        &self,
+        project_path: PathBuf,
+        demand: DemandKey,
+    ) -> Result<EnsureProjectResult> {
+        demand
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid EnsureProject demand: {error}"))?;
+        anyhow::ensure!(
+            demand.kind() != DemandKind::LegacyProcessAttachment,
+            "EnsureProject does not accept legacy process-attachment demands"
+        );
+
+        let canonical = Self::normalize_ensure_project_root(project_path).await?;
+        self.wait_for_https_proxy_listener().await?;
+        self.run_admitted_availability_transition(|| async {
+            self.ensure_accepting_lifecycle_requests()?;
+            let (instance_id, pending_initial) =
+                self.resolve_or_register_ensure_project(&canonical).await?;
+
+            // Runtime convergence owns the outer per-instance lock and may
+            // briefly acquire lifecycle publication while it is held. Every
+            // publication-first lifecycle path releases publication before it
+            // waits here, preserving one-way nesting. Retain this guard through
+            // final status and authorization so a service stop cannot invalidate
+            // a Ready response before it is returned.
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
+            let target = self
+                .resolve_lifecycle_target(&canonical)
+                .await?
+                .into_catalogued()
+                .context("validated project registration did not produce a catalog instance")?;
+            anyhow::ensure!(
+                target.instance_id == instance_id,
+                "project identity changed during ensure: expected {instance_id}, discovered {}",
+                target.instance_id
+            );
+            let durability_error = if target.catalog_base == target.catalog_target {
+                let mut availability = self.load_availability(instance_id).await?;
+                let (_, durability_error) = Self::capture_availability_publication(
+                    availability.ensure_demand(demand).await,
+                )?;
+                durability_error
+            } else {
+                // Discovery reactivates a catalogued instance in the target
+                // image. Publish that reactivation and the new demand through
+                // one replayable transaction before runtime convergence.
+                let attachment_snapshot = self.attachments.lock().await.snapshot();
+                let batch = AvailabilityBatch::new(self.availability_now())
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand));
+                let transaction = self
+                    .prepare_project_lifecycle_transaction(
+                        target,
+                        &batch,
+                        attachment_snapshot.clone(),
+                        attachment_snapshot,
+                    )
+                    .await?;
+                self.create_and_apply_lifecycle_transaction_locked(&transaction)
+                    .await?;
+                None
+            };
+            anyhow::ensure!(
+                self.active_path_for_instance(instance_id).await.is_some(),
+                "project instance {instance_id} is no longer active"
+            );
+            drop(publication_guard);
+
+            self.clear_service_stop_suppressions(instance_id).await;
+            let convergence = self
+                .converge_managed_instance_locked(instance_id, None, false, true)
+                .await;
+            let decision = Self::surface_availability_durability(convergence, durability_error)?;
+            if !matches!(decision, ConvergenceDecision::EnsureUp) {
+                return Err(AvailabilityStartSuperseded {
+                    instance_id,
+                    decision,
+                }
+                .into());
+            }
+
+            self.sync_hosts()
+                .await
+                .context("failed to synchronize ensured project domain claims")?;
+            let result = self.ensure_project_result(instance_id).await?;
+            let _publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.availability_authorizes_start_locked(instance_id)
+                .await?;
+            drop(pending_initial);
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn normalize_ensure_project_root(project_path: PathBuf) -> Result<PathBuf> {
+        let display = project_path.display().to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::normalize_ensure_project_root_blocking(&project_path)
+        })
+        .await
+        .with_context(|| format!("project locator normalization task failed for `{display}`"))?
+    }
+
+    fn normalize_ensure_project_root_blocking(project_path: &Path) -> Result<PathBuf> {
+        let absolute = std::path::absolute(project_path)
+            .with_context(|| format!("failed to absolutize `{}`", project_path.display()))?;
+        let metadata = match std::fs::metadata(&absolute) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect project locator `{}`", absolute.display())
+                });
+            }
+        };
+        let is_config_locator = absolute
+            .file_name()
+            .is_some_and(|name| name == "locald.toml" || name == "Procfile");
+        let root_locator = match metadata {
+            Some(metadata) if metadata.is_file() => {
+                anyhow::ensure!(
+                    is_config_locator,
+                    "project locator `{}` is a file other than `locald.toml` or `Procfile`",
+                    absolute.display()
+                );
+                absolute.parent().with_context(|| {
+                    format!(
+                        "project configuration file `{}` has no parent directory",
+                        absolute.display()
+                    )
+                })?
+            }
+            Some(metadata) if metadata.is_dir() => absolute.as_path(),
+            Some(_) => {
+                anyhow::bail!(
+                    "project locator `{}` is neither a directory nor a regular supported project configuration file (`locald.toml` or `Procfile`)",
+                    absolute.display()
+                )
+            }
+            None if is_config_locator => absolute.parent().with_context(|| {
+                format!(
+                    "project configuration file `{}` has no parent directory",
+                    absolute.display()
+                )
+            })?,
+            None => absolute.as_path(),
+        };
+        locald_core::normalize_project_locator(root_locator)
+            .with_context(|| format!("failed to normalize `{}`", root_locator.display()))
+    }
+
+    async fn wait_for_https_proxy_listener(&self) -> Result<()> {
+        tokio::time::timeout(SERVICE_READINESS_TIMEOUT, async {
+            loop {
+                self.ensure_accepting_new_lifecycle_request()?;
+                let ports_changed = self.proxy_ports_changed.notified();
+                tokio::pin!(ports_changed);
+                let _ = ports_changed.as_mut().enable();
+                let https = self.proxy_ports.lock().await.1;
+                if https.is_some() {
+                    return Ok(());
+                }
+                ports_changed.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "locald's HTTPS proxy listener did not become ready within {}s; inspect daemon logs and run `locald doctor`; repair standard mode with `sudo locald admin setup`, or provide valid local CA material in sandbox mode",
+                SERVICE_READINESS_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    async fn ensure_project_result(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<EnsureProjectResult> {
+        let advertised_https_port = self
+            .proxy_ports
+            .lock()
+            .await
+            .1
+            .context("ensured project has no advertised HTTPS proxy listener")?;
+        let (project_path, project_name) = {
+            let registry = self.registry.lock().await;
+            let record = registry
+                .instances
+                .get(&instance_id)
+                .context("ensured project instance is no longer catalogued")?;
+            let project_path = record
+                .current_path
+                .clone()
+                .context("ensured project instance has no active path")?;
+            (project_path, record.display_name.clone())
+        };
+        let mut statuses = self
+            .list_with_instance_owners(Some(instance_id))
+            .await
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.name.cmp(&right.name));
+        anyhow::ensure!(
+            !statuses.is_empty(),
+            "project instance {instance_id} has no required services"
+        );
+
+        let mut urls = BTreeSet::new();
+        let mut services = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            anyhow::ensure!(
+                status.status == ServiceState::Running
+                    && status.health_status == HealthStatus::Healthy,
+                "service `{}` did not remain ready while finalizing EnsureProject",
+                status.name
+            );
+            let routed_url = if status.url.is_some() {
+                status.domain.as_ref().map(|domain| {
+                    if advertised_https_port == 443 {
+                        format!("https://{domain}")
+                    } else {
+                        format!("https://{domain}:{advertised_https_port}")
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(url) = &routed_url {
+                urls.insert(url.clone());
+            }
+            services.push(EnsuredServiceStatus {
+                name: status.name,
+                service_type: status.service_type,
+                status: status.status,
+                health_status: status.health_status,
+                url: routed_url,
+            });
+        }
+
+        Ok(EnsureProjectResult {
+            project_path,
+            project_name,
+            state: EnsureProjectState::Ready,
+            services,
+            urls: urls.into_iter().collect(),
+        })
     }
 
     /// Acquire or renew semantic availability and converge the project runtime.
@@ -8774,6 +9081,15 @@ mod tests {
         }
     }
 
+    struct RejectingHostSyncer;
+
+    #[async_trait]
+    impl HostSyncer for RejectingHostSyncer {
+        async fn sync(&self, _domains: Vec<String>) -> Result<()> {
+            anyhow::bail!("injected host synchronization failure")
+        }
+    }
+
     fn expected_hosts(service_domains: &[&str]) -> Vec<String> {
         #[cfg(target_os = "macos")]
         let mut domains = service_domains
@@ -8819,6 +9135,22 @@ mod tests {
             SharedAvailabilityClock::system(),
         )
         .await
+    }
+
+    fn unregistered_availability_manager(root: &Path) -> ProcessManager {
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            root.join("notify.sock"),
+            Arc::new(StateManager::with_path(root.join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(root.join("catalog.json")))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                root.join("attachments.json"),
+            ))),
+            None,
+            root.join("availability-data"),
+        )
+        .expect("create unregistered availability manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        manager
     }
 
     async fn availability_manager_with_clock(
@@ -21453,6 +21785,422 @@ command = "sleep 30"
             manager.services.lock().await["readiness:web"].health_status,
             HealthStatus::Unhealthy,
             "notify cannot revive terminal readiness"
+        );
+    }
+
+    #[test]
+    fn ensure_project_normalizes_a_procfile_locator_to_its_project_root() {
+        let dir = tempdir().expect("create Procfile locator directory");
+        let project_path = dir.path().join("procfile-project");
+        std::fs::create_dir(&project_path).expect("create Procfile-only project");
+        let procfile_path = project_path.join("Procfile");
+        std::fs::write(&procfile_path, "web: unused-by-test-factory\n")
+            .expect("write project Procfile");
+
+        let normalized = ProcessManager::normalize_ensure_project_root_blocking(&procfile_path)
+            .expect("normalize supported Procfile locator");
+
+        assert_eq!(
+            normalized,
+            std::fs::canonicalize(&project_path).expect("canonicalize Procfile project root")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_project_registers_then_returns_ready_semantic_urls() {
+        let dir = tempdir().expect("create EnsureProject directory");
+        let project_path = dir.path().join("ensure-project");
+        std::fs::create_dir(&project_path).expect("create EnsureProject project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "ensure-project"
+domain = "ensure-project.localhost"
+
+[services.web]
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write EnsureProject config");
+        let mut manager = unregistered_availability_manager(dir.path());
+        let creates = Arc::new(AtomicUsize::new(1));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: creates.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let unrelated_file = project_path.join("README.md");
+        std::fs::write(&unrelated_file, "not a locald project locator")
+            .expect("write unrelated file locator");
+        let unrelated_file_error = manager
+            .ensure_project(unrelated_file, DemandKey::manual_cli())
+            .await
+            .expect_err("unrelated file locator is rejected");
+        assert!(
+            format!("{unrelated_file_error:#}")
+                .contains("file other than `locald.toml` or `Procfile`")
+        );
+        assert!(manager.registry.lock().await.instances.is_empty());
+
+        let malformed_demand: DemandKey = serde_json::from_value(serde_json::json!({
+            "kind": "agent_conversation",
+            "owner": "not-a-canonical-digest"
+        }))
+        .expect("deserialize malformed demand fixture");
+        let malformed_error = manager
+            .ensure_project(project_path.clone(), malformed_demand)
+            .await
+            .expect_err("malformed demand is rejected before registration");
+        assert!(format!("{malformed_error:#}").contains("invalid EnsureProject demand"));
+        assert!(manager.registry.lock().await.instances.is_empty());
+
+        let legacy_error = manager
+            .ensure_project(
+                project_path.clone(),
+                DemandKey::legacy_process_attachment("untrusted-pid")
+                    .expect("construct compatibility demand"),
+            )
+            .await
+            .expect_err("semantic ensure rejects compatibility ownership");
+        assert!(
+            format!("{legacy_error:#}")
+                .contains("does not accept legacy process-attachment demands")
+        );
+        assert!(manager.registry.lock().await.instances.is_empty());
+
+        let mut ensure = tokio::spawn({
+            let manager = manager.clone();
+            let config_path = project_path.join("locald.toml");
+            async move {
+                manager
+                    .ensure_project(config_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ensure)
+                .await
+                .is_err(),
+            "EnsureProject waits for the HTTPS proxy listener"
+        );
+        assert!(manager.registry.lock().await.instances.is_empty());
+        manager.set_https_port(Some(8443)).await;
+
+        let result = ensure
+            .await
+            .expect("join first project registration")
+            .expect("ensure first project registration");
+        assert_eq!(result.state, EnsureProjectState::Ready);
+        assert_eq!(
+            result.project_path,
+            std::fs::canonicalize(&project_path).expect("canonical EnsureProject path")
+        );
+        assert_eq!(result.project_name.as_deref(), Some("ensure-project"));
+        assert_eq!(result.urls, vec!["https://ensure-project.localhost:8443"]);
+        assert_eq!(result.services.len(), 1);
+        assert_eq!(result.services[0].name, "ensure-project:web");
+        assert_eq!(result.services[0].status, ServiceState::Running);
+        assert_eq!(result.services[0].health_status, HealthStatus::Healthy);
+        assert_eq!(
+            result.services[0].url.as_deref(),
+            Some("https://ensure-project.localhost:8443")
+        );
+        assert_eq!(creates.load(Ordering::SeqCst), 2);
+
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve newly registered EnsureProject instance");
+        {
+            let mut registry = manager.registry.lock().await;
+            let record = registry
+                .instances
+                .get_mut(&instance_id)
+                .expect("registered EnsureProject instance");
+            record.current_path = None;
+            record.presence = CatalogPresence::Missing;
+            registry
+                .save()
+                .await
+                .expect("persist missing catalog state");
+        }
+        let reactivated = manager
+            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+            .await
+            .expect("EnsureProject republishes a reappeared catalog instance");
+        assert_eq!(reactivated.state, EnsureProjectState::Ready);
+        let registry = manager.registry.lock().await;
+        let reactivated_record = registry
+            .instances
+            .get(&instance_id)
+            .expect("reactivated EnsureProject instance remains catalogued");
+        assert_eq!(
+            reactivated_record.current_path.as_deref(),
+            Some(
+                std::fs::canonicalize(&project_path)
+                    .expect("canonical reactivated project")
+                    .as_path()
+            )
+        );
+        assert_eq!(reactivated_record.presence, CatalogPresence::Active);
+        drop(registry);
+
+        manager.set_https_port(Some(443)).await;
+        let standard_result = manager
+            .ensure_project_result(instance_id)
+            .await
+            .expect("project result uses standard-mode routed URL");
+        assert_eq!(
+            standard_result.urls,
+            vec!["https://ensure-project.localhost"]
+        );
+        assert_eq!(
+            standard_result.services[0].url.as_deref(),
+            Some("https://ensure-project.localhost")
+        );
+        let snapshot = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load EnsureProject availability")
+            .snapshot()
+            .await
+            .expect("read EnsureProject availability");
+        assert!(
+            snapshot
+                .demands()
+                .iter()
+                .any(|lease| lease.kind() == DemandKind::ManualCli)
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_project_requires_successful_domain_host_synchronization() {
+        let dir = tempdir().expect("create host-sync EnsureProject directory");
+        let project_path = dir.path().join("host-sync-ensure-project");
+        std::fs::create_dir(&project_path).expect("create host-sync project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "host-sync-ensure"
+domain = "host-sync-ensure.test"
+
+[services.web]
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write host-sync EnsureProject config");
+        let mut manager = unregistered_availability_manager(dir.path());
+        manager.set_host_syncer(Arc::new(RejectingHostSyncer));
+        manager.set_https_port(Some(443)).await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: Arc::new(AtomicUsize::new(1)),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let error = manager
+            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+            .await
+            .expect_err("host synchronization failure blocks Ready");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to synchronize ensured project domain claims"),
+            "unexpected EnsureProject error: {message}"
+        );
+        assert!(
+            message.contains("injected host synchronization failure"),
+            "unexpected EnsureProject error: {message}"
+        );
+
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("failed Ready result retains the registered project");
+        let snapshot = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load host-sync EnsureProject availability")
+            .snapshot()
+            .await
+            .expect("read host-sync EnsureProject availability");
+        assert!(
+            snapshot
+                .demands()
+                .iter()
+                .any(|lease| lease.kind() == DemandKind::ManualCli),
+            "host synchronization failure preserves the requested availability"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_project_calls_share_one_runtime_transition() {
+        let dir = tempdir().expect("create concurrent EnsureProject directory");
+        let project_path = dir.path().join("concurrent-ensure-project");
+        std::fs::create_dir(&project_path).expect("create concurrent EnsureProject project");
+        write_availability_worker_config(
+            &project_path,
+            "concurrent-ensure",
+            "concurrent-ensure.localhost",
+            &["web"],
+        );
+        let mut manager = unregistered_availability_manager(dir.path());
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        let publication_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_publication = Arc::new(tokio::sync::Notify::new());
+        manager.set_config_publication_hook(ConfigPublicationHook {
+            reached: publication_reached.clone(),
+            resume: resume_publication.clone(),
+        });
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .ensure_project(project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            publication_reached.notified(),
+        )
+        .await
+        .expect("first ensure reaches initial catalog publication");
+        let second = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .ensure_project(project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        resume_publication.notify_one();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("first ensure reaches service preparation");
+        assert!(!second.is_finished());
+        release_prepare.notify_one();
+
+        let (first, second) = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("concurrent ensures finish after readiness");
+        let first = first
+            .expect("join first ensure")
+            .expect("first ensure succeeds");
+        let second = second
+            .expect("join second ensure")
+            .expect("second ensure succeeds");
+        assert_eq!(first.state, EnsureProjectState::Ready);
+        assert_eq!(second.state, EnsureProjectState::Ready);
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.registry.lock().await.instances.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_project_surfaces_the_exact_readiness_timeout() {
+        let dir = tempdir().expect("create timed EnsureProject directory");
+        let project_path = dir.path().join("timed-ensure-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "timed-ensure").await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "timed-ensure"
+domain = "timed-ensure.localhost"
+
+[services.web]
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write timed EnsureProject config");
+        let creates = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: creates.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let ensure = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .ensure_project(project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if creates.load(Ordering::SeqCst) == 1
+                    && manager
+                        .services
+                        .lock()
+                        .await
+                        .get("timed-ensure:web")
+                        .is_some_and(|service| service.health_status == HealthStatus::Starting)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("EnsureProject reaches readiness polling");
+        tokio::time::pause();
+        tokio::time::advance(SERVICE_READINESS_TIMEOUT).await;
+        let error = ensure
+            .await
+            .expect("join timed EnsureProject")
+            .expect_err("unbound assigned endpoint times out");
+        assert!(format!("{error:#}").contains("timed out after 30s"));
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load timed EnsureProject availability");
+        assert!(
+            availability
+                .desired_up()
+                .await
+                .expect("timed EnsureProject remains desired up")
+        );
+        assert!(
+            availability
+                .snapshot()
+                .await
+                .expect("read timed EnsureProject failure")
+                .last_convergence_error()
+                .is_some_and(|message| message.contains("timed out after 30s"))
         );
     }
 

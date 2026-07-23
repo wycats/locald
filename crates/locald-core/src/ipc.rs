@@ -1,6 +1,7 @@
 use crate::attachments::{
     AttachmentSource, ManualCliSession, ProjectFilter, ProjectListEntry, ProjectStatusInfo,
 };
+use crate::availability::DemandKey;
 use crate::config::{ServiceConfig, TypedServiceConfig};
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
@@ -144,6 +145,47 @@ pub struct ServiceStatus {
     /// Any warnings associated with the service (e.g. port mismatch).
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// The terminal state returned by a successful project ensure operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnsureProjectState {
+    /// Every required service satisfied its authoritative readiness contract.
+    Ready,
+}
+
+/// Privacy-safe service status returned by a project ensure operation.
+///
+/// Internal service ports, PIDs, paths, and demand identities stay out of this
+/// projection. Standard mode returns the semantic routed HTTPS URL without an
+/// explicit port. Explicit sandbox mode includes its advertised HTTPS port so
+/// the returned URL remains reachable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnsuredServiceStatus {
+    pub name: String,
+    #[serde(default)]
+    pub service_type: ServiceType,
+    pub status: ServiceState,
+    #[serde(default)]
+    pub health_status: HealthStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Final status and routed HTTPS URLs returned after ensuring one project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnsureProjectResult {
+    pub project_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    pub state: EnsureProjectState,
+    #[serde(default)]
+    pub services: Vec<EnsuredServiceStatus>,
+    #[serde(default)]
+    pub urls: Vec<String>,
 }
 
 /// A log entry from a service.
@@ -374,6 +416,17 @@ pub enum IpcRequest {
         #[serde(default)]
         filter: Option<ProjectFilter>,
     },
+    /// Acquire or renew one semantic demand, converge the project, and wait
+    /// until every required service is ready.
+    ///
+    /// **Response:** `IpcResponse::ProjectEnsured(EnsureProjectResult)`
+    EnsureProject {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+        /// An ownerless semantic demand. Trusted editor and agent adapters
+        /// derive owner-bearing demands server-side from authenticated context.
+        demand: DemandKey,
+    },
     /// Force-start services for a project.
     ///
     /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
@@ -446,6 +499,8 @@ pub enum IpcResponse {
     ProjectStatus(ProjectStatusInfo),
     /// Response to ProjectList request.
     ProjectList(Vec<ProjectListEntry>),
+    /// Response to EnsureProject request.
+    ProjectEnsured(EnsureProjectResult),
 }
 
 /// Events broadcasted by the Server.
@@ -527,8 +582,13 @@ impl ServiceStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::IpcRequest;
+    use super::{
+        EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, IpcRequest, IpcResponse,
+        ServiceType,
+    };
     use crate::attachments::AttachmentSource;
+    use crate::availability::DemandKey;
+    use crate::state::{HealthStatus, ServiceState};
     use std::path::PathBuf;
 
     #[test]
@@ -556,5 +616,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn ensure_project_round_trips_ownerless_demand_and_sanitized_result() {
+        let request = IpcRequest::EnsureProject {
+            project_path: PathBuf::from("/project/locald.toml"),
+            demand: DemandKey::manual_cli(),
+        };
+        let encoded = serde_json::to_value(&request).expect("serialize ensure request");
+        let request: IpcRequest =
+            serde_json::from_value(encoded).expect("deserialize ensure request");
+        assert!(matches!(request, IpcRequest::EnsureProject { .. }));
+
+        let response = IpcResponse::ProjectEnsured(EnsureProjectResult {
+            project_path: PathBuf::from("/project"),
+            project_name: Some("project".to_owned()),
+            state: EnsureProjectState::Ready,
+            services: vec![EnsuredServiceStatus {
+                name: "project:web".to_owned(),
+                service_type: ServiceType::Exec,
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+                url: Some("https://project.localhost".to_owned()),
+            }],
+            urls: vec!["https://project.localhost".to_owned()],
+        });
+        let encoded = serde_json::to_value(&response).expect("serialize ensure response");
+        let rendered = encoded.to_string();
+        assert!(!rendered.contains("private-conversation"));
+        assert!(!rendered.contains("\"pid\""));
+        assert!(!rendered.contains("\"port\""));
+        let decoded: IpcResponse =
+            serde_json::from_value(encoded).expect("deserialize ensure response");
+        assert_eq!(decoded, response);
     }
 }
