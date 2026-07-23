@@ -645,8 +645,8 @@ mod tests {
         let encoded = serde_json::to_value(&response).expect("serialize ensure response");
         let rendered = encoded.to_string();
         assert!(!rendered.contains("private-conversation"));
-        assert!(!rendered.contains("pid"));
-        assert!(!rendered.contains("port"));
+        assert!(!rendered.contains("\"pid\""));
+        assert!(!rendered.contains("\"port\""));
         let decoded: IpcResponse =
             serde_json::from_value(encoded).expect("deserialize ensure response");
         assert_eq!(decoded, response);

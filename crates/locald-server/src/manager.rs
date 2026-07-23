@@ -5058,13 +5058,19 @@ impl ProcessManager {
             "EnsureProject does not accept legacy process-attachment demands"
         );
 
-        let canonical = Self::normalize_ensure_project_root(&project_path)?;
+        let canonical = Self::normalize_ensure_project_root(project_path).await?;
         self.wait_for_https_proxy_listener().await?;
         self.run_admitted_availability_transition(|| async {
             self.ensure_accepting_lifecycle_requests()?;
             let (instance_id, pending_initial) =
                 self.resolve_or_register_ensure_project(&canonical).await?;
 
+            // Runtime convergence owns the outer per-instance lock and may
+            // briefly acquire lifecycle publication while it is held. Every
+            // publication-first lifecycle path releases publication before it
+            // waits here, preserving one-way nesting. Retain this guard through
+            // final status and authorization so a service stop cannot invalidate
+            // a Ready response before it is returned.
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
             self.ensure_accepting_lifecycle_requests()?;
@@ -5112,7 +5118,16 @@ impl ProcessManager {
         .await
     }
 
-    fn normalize_ensure_project_root(project_path: &Path) -> Result<PathBuf> {
+    async fn normalize_ensure_project_root(project_path: PathBuf) -> Result<PathBuf> {
+        let display = project_path.display().to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::normalize_ensure_project_root_blocking(&project_path)
+        })
+        .await
+        .with_context(|| format!("project locator normalization task failed for `{display}`"))?
+    }
+
+    fn normalize_ensure_project_root_blocking(project_path: &Path) -> Result<PathBuf> {
         let absolute = std::path::absolute(project_path)
             .with_context(|| format!("failed to absolutize `{}`", project_path.display()))?;
         let metadata = match std::fs::metadata(&absolute) {
