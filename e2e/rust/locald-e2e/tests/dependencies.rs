@@ -37,6 +37,34 @@ depends_on = ["db"]
     let daemon_log = tokio::fs::read_to_string(ctx.root.path().join("daemon.out")).await?;
     println!("DAEMON LOG:\n{}", daemon_log);
 
+    let canonical_project_path = tokio::fs::canonicalize(&project_path).await?;
+    let project_path = canonical_project_path.to_string_lossy();
+    let project_path_field = format!("project_path: \"{project_path}\"");
+    let editor_id_field = format!("id: \"{}\"", ctx.sandbox);
+    let up_start_idx = daemon_log
+        .match_indices("Received request: Start")
+        .find_map(|(idx, _)| {
+            let line = daemon_log[idx..].lines().next()?;
+            (line.contains(&project_path_field) && line.contains("launch_path: Some("))
+                .then_some(idx)
+        })
+        .expect("explicit up should seed trusted launch context");
+    let editor_attach_idx = daemon_log
+        .match_indices("Received request: ProjectAttach")
+        .find_map(|(idx, _)| {
+            let line = daemon_log[idx..].lines().next()?;
+            (line.contains(&project_path_field)
+                && line.contains("source: Editor")
+                && line.contains("name: \"locald-e2e\"")
+                && line.contains(&editor_id_field))
+            .then_some(idx)
+        })
+        .expect("test editor owner should attach");
+    assert!(
+        up_start_idx < editor_attach_idx,
+        "explicit up must seed trusted launch context before editor attachment"
+    );
+
     let db_start_idx = daemon_log
         .find("Starting service dep-test:db")
         .expect("Should start db");
