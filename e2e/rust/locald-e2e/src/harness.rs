@@ -101,8 +101,9 @@ impl TestContext {
         Ok(output)
     }
 
-    /// Run the hidden test-harness `up` path while a PID-backed editor owner
-    /// keeps the project alive for the assertions that follow.
+    /// Run the hidden test-harness `up` path to establish trusted launch
+    /// context, then attach a PID-backed editor owner to keep the project alive
+    /// for the assertions that follow.
     pub async fn run_up_with_test_owner(
         &self,
         project_path: &std::path::Path,
@@ -112,7 +113,14 @@ impl TestContext {
             .context("Project path is not valid UTF-8")?;
         let editor_pid = std::process::id().to_string();
 
-        let output = self
+        let up_output = self
+            .run_cli(&["up", "--exit-after-register", project_path])
+            .await?;
+        if !up_output.status.success() {
+            return Ok(up_output);
+        }
+
+        let attach_output = self
             .run_cli(&[
                 "project",
                 "attach",
@@ -127,17 +135,16 @@ impl TestContext {
                 project_path,
             ])
             .await?;
-        if !output.status.success() {
+        if !attach_output.status.success() {
             let _ = self.dump_logs().await;
             anyhow::bail!(
                 "locald project attach failed (status: {}). stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
+                attach_output.status,
+                String::from_utf8_lossy(&attach_output.stderr)
             );
         }
 
-        self.run_cli(&["up", "--exit-after-register", project_path])
-            .await
+        Ok(up_output)
     }
 
     pub async fn create_project(&self, name: &str, config_content: &str) -> Result<PathBuf> {
