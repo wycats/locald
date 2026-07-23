@@ -125,6 +125,23 @@ fn validate_generic_ensure_demand(demand: &DemandKey) -> Result<()> {
     Ok(())
 }
 
+fn authenticate_ensure_launch_path(
+    stream: &UnixStream,
+    demand: &DemandKey,
+    launch_path: Option<String>,
+) -> Result<Option<String>> {
+    launch_path
+        .map(|path| {
+            authenticated_peer_pid(stream)?;
+            anyhow::ensure!(
+                demand.kind() == locald_core::DemandKind::ManualCli,
+                "trusted launch PATH is accepted only for an explicit Manual CLI ensure"
+            );
+            Ok(path)
+        })
+        .transpose()
+}
+
 async fn handle_connection(
     mut stream: UnixStream,
     manager: ProcessManager,
@@ -244,6 +261,7 @@ async fn handle_connection(
     if let IpcRequest::Start {
         project_path,
         verbose,
+        launch_path,
         manual_cli_session,
     } = request
     {
@@ -266,6 +284,15 @@ async fn handle_connection(
                 }
             }
         };
+        if launch_path.is_some() && manual_cli_session.is_none() && legacy_cli_peer_pid.is_none() {
+            let mut bytes = serde_json::to_vec(&IpcResponse::Error(
+                "trusted launch PATH requires kernel-authenticated local IPC peer credentials"
+                    .to_owned(),
+            ))?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+            return Ok(());
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let manager = manager.clone();
 
@@ -277,6 +304,7 @@ async fn handle_connection(
                     verbose,
                     manual_cli_session,
                     legacy_cli_peer_pid,
+                    launch_path,
                 )
                 .await
         });
@@ -422,11 +450,22 @@ async fn handle_connection(
         IpcRequest::EnsureProject {
             project_path,
             demand,
+            launch_path,
         } => match validate_generic_ensure_demand(&demand) {
-            Ok(()) => match manager.ensure_project(project_path, demand).await {
-                Ok(result) => IpcResponse::ProjectEnsured(result),
-                Err(error) => IpcResponse::Error(format!("{error:#}")),
-            },
+            Ok(()) => {
+                let authenticated_launch_path =
+                    authenticate_ensure_launch_path(&stream, &demand, launch_path);
+                match authenticated_launch_path {
+                    Ok(launch_path) => match manager
+                        .ensure_project_from_ipc(project_path, demand, launch_path)
+                        .await
+                    {
+                        Ok(result) => IpcResponse::ProjectEnsured(result),
+                        Err(error) => IpcResponse::Error(format!("{error:#}")),
+                    },
+                    Err(error) => IpcResponse::Error(format!("{error:#}")),
+                }
+            }
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectForceStart { project_path } => {
@@ -516,5 +555,29 @@ mod tests {
         assert!(error.to_string().contains("accepts only ownerless demands"));
         validate_generic_ensure_demand(&DemandKey::manual_cli())
             .expect("generic IPC accepts ownerless Manual CLI demand");
+    }
+
+    #[tokio::test]
+    async fn trusted_launch_path_requires_an_explicit_authenticated_cli_ensure() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let path = "/opt/homebrew/bin:/usr/bin".to_owned();
+
+        assert_eq!(
+            authenticate_ensure_launch_path(&server, &DemandKey::manual_cli(), Some(path.clone()),)
+                .expect("authenticate explicit CLI launch context"),
+            Some(path)
+        );
+
+        let error = authenticate_ensure_launch_path(
+            &server,
+            &DemandKey::stopped_page_resume(),
+            Some("/usr/bin".to_owned()),
+        )
+        .expect_err("non-CLI ensure must not replace trusted launch context");
+        assert!(
+            error
+                .to_string()
+                .contains("accepted only for an explicit Manual CLI ensure")
+        );
     }
 }

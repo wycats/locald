@@ -288,6 +288,13 @@ pub enum IpcRequest {
         /// Enable verbose output for build steps.
         #[serde(default)]
         verbose: bool,
+        /// The invoking CLI's trusted host-process search path.
+        ///
+        /// The daemon accepts this value only after authenticating the local
+        /// IPC peer. Older clients omit it and cannot establish launch
+        /// context for host-process services.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_path: Option<String>,
         /// Retry-stable log-following CLI session paired with this Start.
         ///
         /// Current following clients provide it so the daemon can journal the
@@ -426,6 +433,10 @@ pub enum IpcRequest {
         /// An ownerless semantic demand. Trusted editor and agent adapters
         /// derive owner-bearing demands server-side from authenticated context.
         demand: DemandKey,
+        /// Trusted host-process search path supplied by an explicit local CLI
+        /// ensure. The daemon authenticates the IPC peer before accepting it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_path: Option<String>,
     },
     /// Force-start services for a project.
     ///
@@ -623,6 +634,7 @@ mod tests {
         let request = IpcRequest::EnsureProject {
             project_path: PathBuf::from("/project/locald.toml"),
             demand: DemandKey::manual_cli(),
+            launch_path: Some("/opt/homebrew/bin:/usr/bin".to_owned()),
         };
         let encoded = serde_json::to_value(&request).expect("serialize ensure request");
         let request: IpcRequest =
@@ -650,5 +662,44 @@ mod tests {
         let decoded: IpcResponse =
             serde_json::from_value(encoded).expect("deserialize ensure response");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn legacy_start_and_ensure_requests_default_to_no_launch_context() {
+        let start: IpcRequest = serde_json::from_value(serde_json::json!({
+            "Start": {
+                "project_path": "/project",
+                "verbose": false
+            }
+        }))
+        .expect("deserialize legacy Start request");
+        assert!(matches!(
+            start,
+            IpcRequest::Start {
+                launch_path: None,
+                ..
+            }
+        ));
+
+        let mut encoded = serde_json::to_value(IpcRequest::EnsureProject {
+            project_path: PathBuf::from("/project"),
+            demand: DemandKey::manual_cli(),
+            launch_path: Some("/usr/bin".to_owned()),
+        })
+        .expect("serialize EnsureProject request");
+        encoded
+            .get_mut("EnsureProject")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("EnsureProject payload")
+            .remove("launch_path");
+        let ensure: IpcRequest =
+            serde_json::from_value(encoded).expect("deserialize legacy EnsureProject request");
+        assert!(matches!(
+            ensure,
+            IpcRequest::EnsureProject {
+                launch_path: None,
+                ..
+            }
+        ));
     }
 }

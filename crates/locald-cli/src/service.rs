@@ -46,6 +46,7 @@ fn start_project() -> Result<()> {
     crate::client::stream_boot_events(&locald_core::IpcRequest::Start {
         project_path: cwd,
         verbose: false,
+        launch_path: Some(crate::utils::trusted_launch_path()?),
         manual_cli_session: None,
     })?;
     println!("Project started successfully.");
