@@ -422,7 +422,8 @@ pub enum IpcRequest {
     EnsureProject {
         /// The path to the project root or configuration file.
         project_path: PathBuf,
-        /// A privacy-preserving semantic demand derived by the trusted caller.
+        /// An ownerless semantic demand. Trusted editor and agent adapters
+        /// derive owner-bearing demands server-side from authenticated context.
         demand: DemandKey,
     },
     /// Force-start services for a project.
@@ -617,14 +618,12 @@ mod tests {
     }
 
     #[test]
-    fn ensure_project_round_trips_opaque_demand_and_sanitized_result() {
+    fn ensure_project_round_trips_ownerless_demand_and_sanitized_result() {
         let request = IpcRequest::EnsureProject {
-            project_path: PathBuf::from("/project"),
-            demand: DemandKey::agent_conversation("private-conversation")
-                .expect("construct agent demand"),
+            project_path: PathBuf::from("/project/locald.toml"),
+            demand: DemandKey::manual_cli(),
         };
         let encoded = serde_json::to_value(&request).expect("serialize ensure request");
-        assert!(!encoded.to_string().contains("private-conversation"));
         let request: IpcRequest =
             serde_json::from_value(encoded).expect("deserialize ensure request");
         assert!(matches!(request, IpcRequest::EnsureProject { .. }));

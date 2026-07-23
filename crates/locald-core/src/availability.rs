@@ -277,6 +277,16 @@ impl DemandKey {
         self.kind
     }
 
+    /// Whether this demand carries a private owner identity digest.
+    ///
+    /// Generic IPC boundaries use this to reject caller-supplied ownership;
+    /// trusted host adapters derive owner-bearing demands from authenticated
+    /// editor, process, or conversation context instead.
+    #[must_use]
+    pub const fn has_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+
     /// Return the privacy-safe label for normal status projections.
     #[must_use]
     pub const fn safe_label(&self) -> &'static str {

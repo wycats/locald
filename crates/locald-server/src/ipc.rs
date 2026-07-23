@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use locald_core::attachments::{AttachmentSource, ManualCliSession};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::DaemonIdentity;
-use locald_core::{IpcRequest, IpcResponse};
+use locald_core::{DemandKey, IpcRequest, IpcResponse};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -112,6 +112,17 @@ fn authenticate_process_bound_attachment_source(
         | AttachmentSource::Runtime
         | AttachmentSource::Pin) => Ok(source),
     }
+}
+
+fn validate_generic_ensure_demand(demand: &DemandKey) -> Result<()> {
+    demand
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid EnsureProject demand: {error}"))?;
+    anyhow::ensure!(
+        !demand.has_owner(),
+        "generic EnsureProject IPC accepts only ownerless demands; owner-bearing demands must be derived by an authenticated host adapter"
+    );
+    Ok(())
 }
 
 async fn handle_connection(
@@ -411,8 +422,11 @@ async fn handle_connection(
         IpcRequest::EnsureProject {
             project_path,
             demand,
-        } => match manager.ensure_project(project_path, demand).await {
-            Ok(result) => IpcResponse::ProjectEnsured(result),
+        } => match validate_generic_ensure_demand(&demand) {
+            Ok(()) => match manager.ensure_project(project_path, demand).await {
+                Ok(result) => IpcResponse::ProjectEnsured(result),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectForceStart { project_path } => {
@@ -489,5 +503,18 @@ mod tests {
         .expect("authenticate CLI attachment source");
 
         assert_eq!(source, AttachmentSource::CLI { pid: peer_pid });
+    }
+
+    #[test]
+    fn generic_ensure_rejects_caller_supplied_owner_identity() {
+        let demand = DemandKey::manual_cli_session("caller-selected-session")
+            .expect("construct owner-bearing Manual CLI demand");
+
+        let error = validate_generic_ensure_demand(&demand)
+            .expect_err("generic IPC must reject caller-supplied demand owners");
+
+        assert!(error.to_string().contains("accepts only ownerless demands"));
+        validate_generic_ensure_demand(&DemandKey::manual_cli())
+            .expect("generic IPC accepts ownerless Manual CLI demand");
     }
 }

@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
@@ -505,6 +505,7 @@ pub struct ProcessManager {
     state_manager: Arc<StateManager>,
     runtime: Arc<Runtime>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
+    proxy_ports_changed: Arc<Notify>,
     watchers: Arc<Mutex<HashMap<PathBuf, RecommendedWatcher>>>,
     registry: Arc<Mutex<Registry>>,
     domain_index: SharedDomainIndex,
@@ -709,6 +710,7 @@ impl ProcessManager {
 
         let services = Arc::new(Mutex::new(HashMap::new()));
         let proxy_ports = Arc::new(Mutex::new((None, None)));
+        let proxy_ports_changed = Arc::new(Notify::new());
 
         let domain_index = {
             let registry_snapshot = registry
@@ -743,6 +745,7 @@ impl ProcessManager {
             state_manager,
             runtime,
             proxy_ports,
+            proxy_ports_changed,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             registry,
             domain_index,
@@ -907,10 +910,12 @@ impl ProcessManager {
 
     pub async fn set_http_port(&self, port: Option<u16>) {
         self.proxy_ports.lock().await.0 = port;
+        self.proxy_ports_changed.notify_waiters();
     }
 
     pub async fn set_https_port(&self, port: Option<u16>) {
         self.proxy_ports.lock().await.1 = port;
+        self.proxy_ports_changed.notify_waiters();
     }
 
     fn reap_dead_services(_name: &str, _service: &mut Service) {
@@ -5053,7 +5058,8 @@ impl ProcessManager {
             "EnsureProject does not accept legacy process-attachment demands"
         );
 
-        let canonical = Self::canonicalize_path(&project_path);
+        let canonical = Self::normalize_ensure_project_root(&project_path)?;
+        self.wait_for_proxy_listeners().await?;
         self.run_admitted_availability_transition(|| async {
             self.ensure_accepting_lifecycle_requests()?;
             let (instance_id, pending_initial) =
@@ -5104,6 +5110,59 @@ impl ProcessManager {
             Ok(result)
         })
         .await
+    }
+
+    fn normalize_ensure_project_root(project_path: &Path) -> Result<PathBuf> {
+        let absolute = std::path::absolute(project_path)
+            .with_context(|| format!("failed to absolutize `{}`", project_path.display()))?;
+        let metadata = match std::fs::metadata(&absolute) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect project locator `{}`", absolute.display())
+                });
+            }
+        };
+        let root_locator = if metadata.is_some_and(|metadata| metadata.is_file())
+            || absolute
+                .file_name()
+                .is_some_and(|name| name == "locald.toml")
+        {
+            absolute.parent().with_context(|| {
+                format!(
+                    "project configuration file `{}` has no parent directory",
+                    absolute.display()
+                )
+            })?
+        } else {
+            absolute.as_path()
+        };
+        locald_core::normalize_project_locator(root_locator)
+            .with_context(|| format!("failed to normalize `{}`", root_locator.display()))
+    }
+
+    async fn wait_for_proxy_listeners(&self) -> Result<()> {
+        tokio::time::timeout(SERVICE_READINESS_TIMEOUT, async {
+            loop {
+                self.ensure_accepting_new_lifecycle_request()?;
+                let ports_changed = self.proxy_ports_changed.notified();
+                tokio::pin!(ports_changed);
+                let _ = ports_changed.as_mut().enable();
+                let (http, https) = *self.proxy_ports.lock().await;
+                if http.is_some() && https.is_some() {
+                    return Ok(());
+                }
+                ports_changed.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "locald's HTTP and HTTPS proxy listeners did not become ready within {}s; run `locald doctor` and retry",
+                SERVICE_READINESS_TIMEOUT.as_secs()
+            )
+        })?
     }
 
     async fn ensure_project_result(
@@ -21698,9 +21757,35 @@ command = "unused-by-test-factory"
         );
         assert!(manager.registry.lock().await.instances.is_empty());
 
-        let result = manager
-            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+        let mut ensure = tokio::spawn({
+            let manager = manager.clone();
+            let config_path = project_path.join("locald.toml");
+            async move {
+                manager
+                    .ensure_project(config_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ensure)
+                .await
+                .is_err(),
+            "EnsureProject waits for proxy listeners"
+        );
+        assert!(manager.registry.lock().await.instances.is_empty());
+        manager.set_http_port(Some(80)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ensure)
+                .await
+                .is_err(),
+            "EnsureProject waits for both proxy listeners"
+        );
+        assert!(manager.registry.lock().await.instances.is_empty());
+        manager.set_https_port(Some(443)).await;
+
+        let result = ensure
             .await
+            .expect("join first project registration")
             .expect("ensure first project registration");
         assert_eq!(result.state, EnsureProjectState::Ready);
         assert_eq!(
@@ -21750,6 +21835,8 @@ command = "unused-by-test-factory"
             &["web"],
         );
         let mut manager = unregistered_availability_manager(dir.path());
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
         let publication_reached = Arc::new(tokio::sync::Notify::new());
         let resume_publication = Arc::new(tokio::sync::Notify::new());
         manager.set_config_publication_hook(ConfigPublicationHook {
@@ -21825,6 +21912,8 @@ command = "unused-by-test-factory"
         let project_path = dir.path().join("timed-ensure-project");
         let (mut manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "timed-ensure").await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
         std::fs::write(
             project_path.join("locald.toml"),
             r#"
