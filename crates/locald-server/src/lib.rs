@@ -766,6 +766,7 @@ async fn async_main(
             None
         }
     };
+    let https_enabled = cert_manager.is_some();
 
     // Run Proxy server
     let api_router = crate::api::router(manager.clone());
@@ -833,8 +834,12 @@ async fn async_main(
         });
     }
 
-    // Bind HTTPS
-    let listener_https: Option<std::net::TcpListener> = if let Some(port) = https_port_override {
+    // A bound socket is advertised only when TLS can actually serve it. In
+    // sandbox mode certificate initialization may be unavailable; leave HTTPS
+    // absent so readiness-aware callers receive a timeout instead of a dead URL.
+    let listener_https: Option<std::net::TcpListener> = if !https_enabled {
+        None
+    } else if let Some(port) = https_port_override {
         info!("Binding HTTPS to configured port: {}", port);
         match proxy.bind_https(port).await {
             Ok(l) => Some(l),

@@ -5086,13 +5086,35 @@ impl ProcessManager {
                 "project identity changed during ensure: expected {instance_id}, discovered {}",
                 target.instance_id
             );
+            let durability_error = if target.catalog_base == target.catalog_target {
+                let mut availability = self.load_availability(instance_id).await?;
+                let (_, durability_error) = Self::capture_availability_publication(
+                    availability.ensure_demand(demand).await,
+                )?;
+                durability_error
+            } else {
+                // Discovery reactivates a catalogued instance in the target
+                // image. Publish that reactivation and the new demand through
+                // one replayable transaction before runtime convergence.
+                let attachment_snapshot = self.attachments.lock().await.snapshot();
+                let batch = AvailabilityBatch::new(self.availability_now())
+                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand));
+                let transaction = self
+                    .prepare_project_lifecycle_transaction(
+                        target,
+                        &batch,
+                        attachment_snapshot.clone(),
+                        attachment_snapshot,
+                    )
+                    .await?;
+                self.create_and_apply_lifecycle_transaction_locked(&transaction)
+                    .await?;
+                None
+            };
             anyhow::ensure!(
                 self.active_path_for_instance(instance_id).await.is_some(),
                 "project instance {instance_id} is no longer active"
             );
-            let mut availability = self.load_availability(instance_id).await?;
-            let (_, durability_error) =
-                Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
             drop(publication_guard);
 
             self.clear_service_stop_suppressions(instance_id).await;
@@ -5108,6 +5130,9 @@ impl ProcessManager {
                 .into());
             }
 
+            self.sync_hosts()
+                .await
+                .context("failed to synchronize ensured project domain claims")?;
             let result = self.ensure_project_result(instance_id).await?;
             let _publication_guard = self.lifecycle_publication_lock.lock().await;
             self.availability_authorizes_start_locked(instance_id)
@@ -9053,6 +9078,15 @@ mod tests {
                 .expect("recording host sync mutex poisoned")
                 .push(domains);
             Ok(())
+        }
+    }
+
+    struct RejectingHostSyncer;
+
+    #[async_trait]
+    impl HostSyncer for RejectingHostSyncer {
+        async fn sync(&self, _domains: Vec<String>) -> Result<()> {
+            anyhow::bail!("injected host synchronization failure")
         }
     }
 
@@ -21860,6 +21894,40 @@ command = "unused-by-test-factory"
             .required_availability_instance_for_path(&project_path)
             .await
             .expect("resolve newly registered EnsureProject instance");
+        {
+            let mut registry = manager.registry.lock().await;
+            let record = registry
+                .instances
+                .get_mut(&instance_id)
+                .expect("registered EnsureProject instance");
+            record.current_path = None;
+            record.presence = CatalogPresence::Missing;
+            registry
+                .save()
+                .await
+                .expect("persist missing catalog state");
+        }
+        let reactivated = manager
+            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+            .await
+            .expect("EnsureProject republishes a reappeared catalog instance");
+        assert_eq!(reactivated.state, EnsureProjectState::Ready);
+        let registry = manager.registry.lock().await;
+        let reactivated_record = registry
+            .instances
+            .get(&instance_id)
+            .expect("reactivated EnsureProject instance remains catalogued");
+        assert_eq!(
+            reactivated_record.current_path.as_deref(),
+            Some(
+                std::fs::canonicalize(&project_path)
+                    .expect("canonical reactivated project")
+                    .as_path()
+            )
+        );
+        assert_eq!(reactivated_record.presence, CatalogPresence::Active);
+        drop(registry);
+
         manager.set_https_port(Some(443)).await;
         let standard_result = manager
             .ensure_project_result(instance_id)
@@ -21885,6 +21953,56 @@ command = "unused-by-test-factory"
                 .demands()
                 .iter()
                 .any(|lease| lease.kind() == DemandKind::ManualCli)
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_project_requires_successful_domain_host_synchronization() {
+        let dir = tempdir().expect("create host-sync EnsureProject directory");
+        let project_path = dir.path().join("host-sync-ensure-project");
+        std::fs::create_dir(&project_path).expect("create host-sync project");
+        write_availability_worker_config(
+            &project_path,
+            "host-sync-ensure",
+            "host-sync-ensure.test",
+            &["web"],
+        );
+        let mut manager = unregistered_availability_manager(dir.path());
+        manager.set_host_syncer(Arc::new(RejectingHostSyncer));
+        manager.set_https_port(Some(443)).await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: Arc::new(AtomicUsize::new(1)),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let error = manager
+            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+            .await
+            .expect_err("host synchronization failure blocks Ready");
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to synchronize ensured project domain claims"));
+        assert!(message.contains("injected host synchronization failure"));
+
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("failed Ready result retains the registered project");
+        let snapshot = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load host-sync EnsureProject availability")
+            .snapshot()
+            .await
+            .expect("read host-sync EnsureProject availability");
+        assert!(
+            snapshot
+                .demands()
+                .iter()
+                .any(|lease| lease.kind() == DemandKind::ManualCli),
+            "host synchronization failure preserves the requested availability"
         );
     }
 
