@@ -2560,6 +2560,7 @@ impl ProcessManager {
             .keys()
             .map(|service_name| format!("{}:{service_name}", config.project.name))
             .collect::<HashSet<_>>();
+        let service_stop_suppressions = self.service_stop_suppressions.lock().await.clone();
         #[cfg(test)]
         self.wait_at_config_publication_hook().await;
         let lifecycle_publication_guard = self.lifecycle_publication_lock.lock().await;
@@ -2590,6 +2591,15 @@ impl ProcessManager {
             let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
             if start_services {
                 for (service_name, service_config) in &config.services {
+                    let full_name = format!("{}:{service_name}", config.project.name);
+                    let remains_stopped = service_stop_suppressions
+                        .contains(&(instance_id, full_name.clone()))
+                        && !service_activation
+                            .as_ref()
+                            .is_some_and(|activated| activated.contains(&full_name));
+                    if remains_stopped {
+                        continue;
+                    }
                     let (effective_env, _) = Self::effective_service_env(
                         &config,
                         &dot_env_vars,
@@ -13820,9 +13830,6 @@ domain = "service-stop-reloaded.localhost"
 type = "worker"
 command = "updated-but-still-stopped"
 
-[services.web.env]
-PATH = "/usr/bin:/bin"
-
 [services.worker]
 type = "worker"
 command = "unused-by-test-factory"
@@ -13898,9 +13905,26 @@ PATH = "/usr/bin:/bin"
         ));
 
         manager
-            .start(project_path.clone(), None, false)
+            .start_service("service-stop:worker")
             .await
-            .expect("explicit project start clears service stop suppression");
+            .expect("selective sibling start ignores missing context for stopped web service");
+        let error = manager
+            .start_service("service-stop:web")
+            .await
+            .expect_err("resuming the stopped host service still requires launch context");
+        assert!(format!("{error:#}").contains("missing_launch_context"));
+
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                None,
+                false,
+                None,
+                Some(std::process::id()),
+                Some("/usr/bin:/bin".to_owned()),
+            )
+            .await
+            .expect("explicit CLI start supplies context and clears service stop suppression");
         assert!(
             manager
                 .get_service_controller("service-stop:web")

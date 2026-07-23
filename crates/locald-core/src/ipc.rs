@@ -8,6 +8,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Maximum encoded size of one daemon IPC request.
+pub const MAX_IPC_REQUEST_BYTES: usize = 64 * 1024;
+
 /// Represents the stream a log message came from.
 ///
 /// # Example

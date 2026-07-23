@@ -35,7 +35,7 @@ pub fn run(image: String, command: Vec<String>, interactive: bool, detached: boo
         }
     })?;
 
-    let request_bytes = serde_json::to_vec(&request)?;
+    let request_bytes = crate::client::serialize_request(&request)?;
     stream.write_all(&request_bytes)?;
 
     let reader = BufReader::new(stream);

@@ -1,14 +1,12 @@
 use crossterm::style::{Color, Stylize};
 use locald_core::{
     IpcRequest, IpcResponse,
-    ipc::{LogEntry, LogStream},
+    ipc::{LogEntry, LogStream, MAX_IPC_REQUEST_BYTES},
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
-#[cfg(target_os = "macos")]
-use crate::error::CliError;
-use crate::error::{CliResult, DaemonError};
+use crate::error::{CliError, CliResult, DaemonError};
 
 fn connect_to_daemon() -> Result<(UnixStream, String), DaemonError> {
     let socket_path = locald_utils::ipc::socket_path().map_err(DaemonError::from)?;
@@ -64,7 +62,7 @@ fn send_request_on_verified_stream(
 }
 
 fn send_request_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliResult<IpcResponse> {
-    let request_bytes = serde_json::to_vec(request)?;
+    let request_bytes = serialize_request(request)?;
     stream.write_all(&request_bytes)?;
 
     let mut response_bytes = Vec::new();
@@ -80,6 +78,17 @@ fn send_request_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliR
     Ok(response)
 }
 
+pub fn serialize_request(request: &IpcRequest) -> CliResult<Vec<u8>> {
+    let request_bytes = serde_json::to_vec(request)?;
+    if request_bytes.len() > MAX_IPC_REQUEST_BYTES {
+        return Err(CliError::message(format!(
+            "locald request is too large ({} bytes; maximum is {MAX_IPC_REQUEST_BYTES})",
+            request_bytes.len()
+        )));
+    }
+    Ok(request_bytes)
+}
+
 pub fn stream_logs(service: Option<String>, follow: bool) -> CliResult<()> {
     let (mut stream, _socket_display) = connect_to_daemon()?;
     let mode = if follow {
@@ -88,7 +97,7 @@ pub fn stream_logs(service: Option<String>, follow: bool) -> CliResult<()> {
         locald_core::ipc::LogMode::Snapshot
     };
     let request = IpcRequest::Logs { service, mode };
-    let request_bytes = serde_json::to_vec(&request)?;
+    let request_bytes = serialize_request(&request)?;
     stream.write_all(&request_bytes)?;
 
     let reader = BufReader::new(stream);
@@ -124,7 +133,11 @@ pub fn stream_logs(service: Option<String>, follow: bool) -> CliResult<()> {
 
 pub fn stream_boot_events(request: &IpcRequest) -> CliResult<()> {
     let (mut stream, _socket_display) = connect_to_daemon()?;
-    let request_bytes = serde_json::to_vec(request)?;
+    stream_boot_events_on_stream(&mut stream, request)
+}
+
+fn stream_boot_events_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliResult<()> {
+    let request_bytes = serialize_request(request)?;
     stream.write_all(&request_bytes)?;
 
     let mut renderer = crate::progress::ProgressRenderer::new();
@@ -150,14 +163,17 @@ pub fn stream_boot_events(request: &IpcRequest) -> CliResult<()> {
             }
         }
     }
-    Ok(())
+    Err(DaemonError::RequestFailed {
+        message: "daemon closed the connection before reporting the start result".to_owned(),
+    }
+    .into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::send_request_on_stream;
     #[cfg(target_os = "macos")]
     use super::send_request_on_verified_stream;
+    use super::{send_request_on_stream, serialize_request, stream_boot_events_on_stream};
     use locald_core::IpcRequest;
     use std::io::Read;
     #[cfg(target_os = "macos")]
@@ -180,6 +196,40 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("daemon closed the connection without a response")
+        );
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_writing() {
+        let request = IpcRequest::Start {
+            project_path: "/tmp/project".into(),
+            verbose: false,
+            launch_path: Some("x".repeat(locald_core::ipc::MAX_IPC_REQUEST_BYTES)),
+            manual_cli_session: None,
+        };
+
+        let error = serialize_request(&request).expect_err("oversized IPC request must fail");
+
+        assert!(error.to_string().contains("request is too large"));
+    }
+
+    #[test]
+    fn streamed_start_reports_eof_before_final_response() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server_thread = thread::spawn(move || {
+            let mut server = server;
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+        });
+
+        let error = stream_boot_events_on_stream(&mut client, &IpcRequest::Ping)
+            .expect_err("EOF before a final response must fail");
+        server_thread.join().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection before reporting the start result")
         );
     }
 
