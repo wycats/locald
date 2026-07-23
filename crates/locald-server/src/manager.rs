@@ -5166,12 +5166,12 @@ impl ProcessManager {
         };
         let is_config_locator = absolute
             .file_name()
-            .is_some_and(|name| name == "locald.toml");
+            .is_some_and(|name| name == "locald.toml" || name == "Procfile");
         let root_locator = match metadata {
             Some(metadata) if metadata.is_file() => {
                 anyhow::ensure!(
                     is_config_locator,
-                    "project locator `{}` is a file other than `locald.toml`",
+                    "project locator `{}` is a file other than `locald.toml` or `Procfile`",
                     absolute.display()
                 );
                 absolute.parent().with_context(|| {
@@ -5184,7 +5184,7 @@ impl ProcessManager {
             Some(metadata) if metadata.is_dir() => absolute.as_path(),
             Some(_) => {
                 anyhow::bail!(
-                    "project locator `{}` is neither a directory nor a regular `locald.toml` file",
+                    "project locator `{}` is neither a directory nor a regular supported project configuration file (`locald.toml` or `Procfile`)",
                     absolute.display()
                 )
             }
@@ -21788,6 +21788,24 @@ command = "sleep 30"
         );
     }
 
+    #[test]
+    fn ensure_project_normalizes_a_procfile_locator_to_its_project_root() {
+        let dir = tempdir().expect("create Procfile locator directory");
+        let project_path = dir.path().join("procfile-project");
+        std::fs::create_dir(&project_path).expect("create Procfile-only project");
+        let procfile_path = project_path.join("Procfile");
+        std::fs::write(&procfile_path, "web: unused-by-test-factory\n")
+            .expect("write project Procfile");
+
+        let normalized = ProcessManager::normalize_ensure_project_root_blocking(&procfile_path)
+            .expect("normalize supported Procfile locator");
+
+        assert_eq!(
+            normalized,
+            std::fs::canonicalize(&project_path).expect("canonicalize Procfile project root")
+        );
+    }
+
     #[tokio::test]
     async fn ensure_project_registers_then_returns_ready_semantic_urls() {
         let dir = tempdir().expect("create EnsureProject directory");
@@ -21822,7 +21840,10 @@ command = "unused-by-test-factory"
             .ensure_project(unrelated_file, DemandKey::manual_cli())
             .await
             .expect_err("unrelated file locator is rejected");
-        assert!(format!("{unrelated_file_error:#}").contains("file other than `locald.toml`"));
+        assert!(
+            format!("{unrelated_file_error:#}")
+                .contains("file other than `locald.toml` or `Procfile`")
+        );
         assert!(manager.registry.lock().await.instances.is_empty());
 
         let malformed_demand: DemandKey = serde_json::from_value(serde_json::json!({
