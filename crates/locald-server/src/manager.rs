@@ -5124,19 +5124,37 @@ impl ProcessManager {
                 });
             }
         };
-        let root_locator = if metadata.is_some_and(|metadata| metadata.is_file())
-            || absolute
-                .file_name()
-                .is_some_and(|name| name == "locald.toml")
-        {
-            absolute.parent().with_context(|| {
+        let is_config_locator = absolute
+            .file_name()
+            .is_some_and(|name| name == "locald.toml");
+        let root_locator = match metadata {
+            Some(metadata) if metadata.is_file() => {
+                anyhow::ensure!(
+                    is_config_locator,
+                    "project locator `{}` is a file other than `locald.toml`",
+                    absolute.display()
+                );
+                absolute.parent().with_context(|| {
+                    format!(
+                        "project configuration file `{}` has no parent directory",
+                        absolute.display()
+                    )
+                })?
+            }
+            Some(metadata) if metadata.is_dir() => absolute.as_path(),
+            Some(_) => {
+                anyhow::bail!(
+                    "project locator `{}` is neither a directory nor a regular `locald.toml` file",
+                    absolute.display()
+                )
+            }
+            None if is_config_locator => absolute.parent().with_context(|| {
                 format!(
                     "project configuration file `{}` has no parent directory",
                     absolute.display()
                 )
-            })?
-        } else {
-            absolute.as_path()
+            })?,
+            None => absolute.as_path(),
         };
         locald_core::normalize_project_locator(root_locator)
             .with_context(|| format!("failed to normalize `{}`", root_locator.display()))
@@ -21735,6 +21753,16 @@ command = "unused-by-test-factory"
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
         );
+
+        let unrelated_file = project_path.join("README.md");
+        std::fs::write(&unrelated_file, "not a locald project locator")
+            .expect("write unrelated file locator");
+        let unrelated_file_error = manager
+            .ensure_project(unrelated_file, DemandKey::manual_cli())
+            .await
+            .expect_err("unrelated file locator is rejected");
+        assert!(format!("{unrelated_file_error:#}").contains("file other than `locald.toml`"));
+        assert!(manager.registry.lock().await.instances.is_empty());
 
         let malformed_demand: DemandKey = serde_json::from_value(serde_json::json!({
             "kind": "agent_conversation",
