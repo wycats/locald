@@ -408,6 +408,13 @@ async fn handle_connection(
             Ok(entries) => IpcResponse::ProjectList(entries),
             Err(e) => IpcResponse::Error(e.to_string()),
         },
+        IpcRequest::EnsureProject {
+            project_path,
+            demand,
+        } => match manager.ensure_project(project_path, demand).await {
+            Ok(result) => IpcResponse::ProjectEnsured(result),
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
         IpcRequest::ProjectForceStart { project_path } => {
             match manager.project_force_start(project_path).await {
                 Ok(()) => IpcResponse::Ok,

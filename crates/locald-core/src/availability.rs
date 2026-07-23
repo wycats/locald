@@ -5,6 +5,7 @@
 //! both project configuration and process snapshots.
 
 use crate::ProjectInstanceId;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -125,7 +126,9 @@ impl Clock for SystemClock {
 }
 
 /// The semantic category of a renewable availability demand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DemandKind {
     ManualCli,
@@ -186,7 +189,9 @@ pub enum DemandKeyError {
 }
 
 /// A stable, privacy-preserving demand-owner digest.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 struct OpaqueDemandOwner(String);
 
@@ -218,7 +223,9 @@ impl OpaqueDemandOwner {
 /// Private editor, conversation, and compatibility identities are hashed
 /// before they enter durable state. Normal status surfaces expose only
 /// [`DemandKind`] and [`DemandKind::safe_label`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct DemandKey {
     kind: DemandKind,
@@ -283,7 +290,8 @@ impl DemandKey {
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    /// Validate a deserialized demand before using it as lifecycle authority.
+    pub fn validate(&self) -> Result<(), String> {
         if !self.kind.accepts_owner_state(self.owner.is_some()) {
             return Err(format!(
                 "{:?} demand has an invalid owner representation",
