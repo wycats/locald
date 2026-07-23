@@ -157,9 +157,10 @@ pub enum EnsureProjectState {
 
 /// Privacy-safe service status returned by a project ensure operation.
 ///
-/// Runtime implementation details such as ports, PIDs, paths, and demand
-/// identities stay out of this projection. The URL is the semantic routed URL
-/// for services that expose one.
+/// Internal service ports, PIDs, paths, and demand identities stay out of this
+/// projection. Standard mode returns the semantic routed HTTPS URL without an
+/// explicit port. Explicit sandbox mode includes its advertised HTTPS port so
+/// the returned URL remains reachable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EnsuredServiceStatus {
@@ -173,7 +174,7 @@ pub struct EnsuredServiceStatus {
     pub url: Option<String>,
 }
 
-/// Final status and semantic URLs returned after ensuring one project.
+/// Final status and routed HTTPS URLs returned after ensuring one project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EnsureProjectResult {

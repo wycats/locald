@@ -5187,6 +5187,12 @@ impl ProcessManager {
         &self,
         instance_id: ProjectInstanceId,
     ) -> Result<EnsureProjectResult> {
+        let advertised_https_port = self
+            .proxy_ports
+            .lock()
+            .await
+            .1
+            .context("ensured project has no advertised HTTPS proxy listener")?;
         let (project_path, project_name) = {
             let registry = self.registry.lock().await;
             let record = registry
@@ -5220,12 +5226,18 @@ impl ProcessManager {
                 "service `{}` did not remain ready while finalizing EnsureProject",
                 status.name
             );
-            let semantic_url = status
+            let routed_url = status
                 .url
                 .as_ref()
                 .and(status.domain.as_ref())
-                .map(|domain| format!("https://{domain}"));
-            if let Some(url) = &semantic_url {
+                .map(|domain| {
+                    if advertised_https_port == 443 {
+                        format!("https://{domain}")
+                    } else {
+                        format!("https://{domain}:{advertised_https_port}")
+                    }
+                });
+            if let Some(url) = &routed_url {
                 urls.insert(url.clone());
             }
             services.push(EnsuredServiceStatus {
@@ -5233,7 +5245,7 @@ impl ProcessManager {
                 service_type: status.service_type,
                 status: status.status,
                 health_status: status.health_status,
-                url: semantic_url,
+                url: routed_url,
             });
         }
 
@@ -21826,14 +21838,14 @@ command = "unused-by-test-factory"
             std::fs::canonicalize(&project_path).expect("canonical EnsureProject path")
         );
         assert_eq!(result.project_name.as_deref(), Some("ensure-project"));
-        assert_eq!(result.urls, vec!["https://ensure-project.localhost"]);
+        assert_eq!(result.urls, vec!["https://ensure-project.localhost:8443"]);
         assert_eq!(result.services.len(), 1);
         assert_eq!(result.services[0].name, "ensure-project:web");
         assert_eq!(result.services[0].status, ServiceState::Running);
         assert_eq!(result.services[0].health_status, HealthStatus::Healthy);
         assert_eq!(
             result.services[0].url.as_deref(),
-            Some("https://ensure-project.localhost")
+            Some("https://ensure-project.localhost:8443")
         );
         assert_eq!(creates.load(Ordering::SeqCst), 2);
 
@@ -21841,6 +21853,19 @@ command = "unused-by-test-factory"
             .required_availability_instance_for_path(&project_path)
             .await
             .expect("resolve newly registered EnsureProject instance");
+        manager.set_https_port(Some(443)).await;
+        let standard_result = manager
+            .ensure_project_result(instance_id)
+            .await
+            .expect("project result uses standard-mode routed URL");
+        assert_eq!(
+            standard_result.urls,
+            vec!["https://ensure-project.localhost"]
+        );
+        assert_eq!(
+            standard_result.services[0].url.as_deref(),
+            Some("https://ensure-project.localhost")
+        );
         let snapshot = manager
             .load_availability(instance_id)
             .await
