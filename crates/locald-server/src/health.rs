@@ -588,7 +588,7 @@ impl HealthMonitor {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             loop {
-                {
+                let env = {
                     let services = monitor.services.lock().await;
                     if let Some(service) = services
                         .get(&name)
@@ -597,13 +597,19 @@ impl HealthMonitor {
                         if service.health_status != HealthStatus::Starting {
                             break;
                         }
+                        service.resolved_env.clone()
                     } else {
                         break;
                     }
-                }
+                };
 
-                let success =
-                    locald_utils::probe::check_command(&command, cwd.as_deref(), timeout).await;
+                let success = locald_utils::probe::check_command_with_env(
+                    &command,
+                    cwd.as_deref(),
+                    &env,
+                    timeout,
+                )
+                .await;
 
                 if success {
                     monitor
@@ -1145,12 +1151,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_command_monitor_is_authoritative() {
+    async fn explicit_command_monitor_uses_the_resolved_service_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create command readiness fixture");
+        let probe = dir.path().join("service-ready");
+        std::fs::write(&probe, "#!/bin/sh\nexit 0\n").expect("write command readiness fixture");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))
+            .expect("make command readiness fixture executable");
+        let probe_env = HashMap::from([(
+            "PATH".to_owned(),
+            format!("{}:/usr/bin:/bin", dir.path().display()),
+        )]);
+        assert!(
+            locald_utils::probe::check_command_with_env(
+                "command -v service-ready >/dev/null",
+                None,
+                &probe_env,
+                Duration::from_secs(1),
+            )
+            .await,
+            "command readiness fixture resolves through its supplied PATH"
+        );
+
         let instance_id = instance_id("00000000-0000-4000-8000-000000000004");
-        let service_config = legacy_config(Some(HealthCheckConfig::Command("exit 0".to_owned())));
+        let service_config = legacy_config(Some(HealthCheckConfig::Command(
+            "command -v service-ready >/dev/null".to_owned(),
+        )));
+        let mut service = monitored_service(instance_id, service_config, None);
+        service.resolved_env = probe_env;
         let services = Arc::new(Mutex::new(HashMap::from([(
             "app:worker".to_owned(),
-            monitored_service(instance_id, service_config, None),
+            service,
         )])));
         let (event_sender, _) = tokio::sync::broadcast::channel(8);
         let monitor = HealthMonitor::new(
@@ -1164,7 +1196,7 @@ mod tests {
             instance_id,
             1,
             ReadinessRequirement::ExplicitCommand {
-                command: "exit 0".to_owned(),
+                command: "command -v service-ready >/dev/null".to_owned(),
                 interval: Duration::from_millis(10),
                 timeout: Duration::from_secs(1),
             },

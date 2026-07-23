@@ -1017,6 +1017,42 @@ mod tests {
         assert!(controller.pty_tx.is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_worker_resolves_commands_from_its_injected_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("create host PATH test directory");
+        let bin = dir.path().join("toolchain-bin");
+        std::fs::create_dir(&bin).expect("create injected PATH directory");
+        let tool = bin.join("agent-lab-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write injected PATH tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("make injected PATH tool executable");
+
+        let mut controller = ExecController::new(
+            "trusted-path:web".to_owned(),
+            ProcessRuntime::new(dir.path().join("notify.sock")),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
+                command: "agent-lab-tool".to_owned(),
+                ..Default::default()
+            })),
+            dir.path().to_path_buf(),
+            None,
+            std::collections::HashMap::from([(
+                "PATH".to_owned(),
+                format!("{}:/usr/bin:/bin", bin.display()),
+            )]),
+        );
+
+        controller
+            .start()
+            .await
+            .expect("resolve host command through injected PATH");
+        assert_eq!(controller.read_state().await.status, ServiceState::Running);
+        controller.stop().await.expect("stop injected PATH worker");
+    }
+
     #[tokio::test]
     async fn identity_capture_failure_stops_and_confirms_the_spawned_process_is_gone() {
         assert_identity_capture_failure_cleanup(

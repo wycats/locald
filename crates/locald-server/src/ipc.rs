@@ -4,7 +4,7 @@ use crate::manager::ProcessManager;
 use anyhow::{Context, Result};
 use locald_core::attachments::{AttachmentSource, ManualCliSession};
 use locald_core::config::LocaldConfig;
-use locald_core::ipc::DaemonIdentity;
+use locald_core::ipc::{DaemonIdentity, MAX_IPC_REQUEST_BYTES};
 use locald_core::{DemandKey, IpcRequest, IpcResponse};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,6 +125,54 @@ fn validate_generic_ensure_demand(demand: &DemandKey) -> Result<()> {
     Ok(())
 }
 
+fn authenticate_ensure_launch_path(
+    stream: &UnixStream,
+    demand: &DemandKey,
+    launch_path: Option<String>,
+) -> Result<Option<String>> {
+    launch_path
+        .map(|path| {
+            authenticated_peer_pid(stream)?;
+            anyhow::ensure!(
+                demand.kind() == locald_core::DemandKind::ManualCli,
+                "trusted launch PATH is accepted only for an explicit Manual CLI ensure"
+            );
+            Ok(path)
+        })
+        .transpose()
+}
+
+async fn read_request(stream: &mut UnixStream) -> Result<Option<IpcRequest>> {
+    let mut request_bytes = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        let remaining = MAX_IPC_REQUEST_BYTES + 1 - request_bytes.len();
+        let read_limit = remaining.min(chunk.len());
+        let bytes_read = stream.read(&mut chunk[..read_limit]).await?;
+        if bytes_read == 0 {
+            if request_bytes.is_empty() {
+                return Ok(None);
+            }
+            return serde_json::from_slice(&request_bytes)
+                .context("daemon IPC request ended before a complete JSON value")
+                .map(Some);
+        }
+
+        request_bytes.extend_from_slice(&chunk[..bytes_read]);
+        anyhow::ensure!(
+            request_bytes.len() <= MAX_IPC_REQUEST_BYTES,
+            "daemon IPC request exceeds the {MAX_IPC_REQUEST_BYTES}-byte limit"
+        );
+
+        match serde_json::from_slice(&request_bytes) {
+            Ok(request) => return Ok(Some(request)),
+            Err(error) if error.is_eof() => {}
+            Err(error) => return Err(error).context("invalid daemon IPC request"),
+        }
+    }
+}
+
 async fn handle_connection(
     mut stream: UnixStream,
     manager: ProcessManager,
@@ -132,14 +180,9 @@ async fn handle_connection(
     shutdown_tx: Sender<ShutdownReason>,
     version: String,
 ) -> Result<()> {
-    let mut buf = [0; 4096];
-    let n = stream.read(&mut buf).await?;
-
-    if n == 0 {
+    let Some(request) = read_request(&mut stream).await? else {
         return Ok(());
-    }
-
-    let request: IpcRequest = serde_json::from_slice(&buf[..n])?;
+    };
     tracing::debug!("Received request: {:?}", request);
 
     if let IpcRequest::RunContainer {
@@ -244,6 +287,7 @@ async fn handle_connection(
     if let IpcRequest::Start {
         project_path,
         verbose,
+        launch_path,
         manual_cli_session,
     } = request
     {
@@ -266,6 +310,15 @@ async fn handle_connection(
                 }
             }
         };
+        if launch_path.is_some() && manual_cli_session.is_none() && legacy_cli_peer_pid.is_none() {
+            let mut bytes = serde_json::to_vec(&IpcResponse::Error(
+                "trusted launch PATH requires kernel-authenticated local IPC peer credentials"
+                    .to_owned(),
+            ))?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+            return Ok(());
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let manager = manager.clone();
 
@@ -277,6 +330,7 @@ async fn handle_connection(
                     verbose,
                     manual_cli_session,
                     legacy_cli_peer_pid,
+                    launch_path,
                 )
                 .await
         });
@@ -422,11 +476,22 @@ async fn handle_connection(
         IpcRequest::EnsureProject {
             project_path,
             demand,
+            launch_path,
         } => match validate_generic_ensure_demand(&demand) {
-            Ok(()) => match manager.ensure_project(project_path, demand).await {
-                Ok(result) => IpcResponse::ProjectEnsured(result),
-                Err(error) => IpcResponse::Error(format!("{error:#}")),
-            },
+            Ok(()) => {
+                let authenticated_launch_path =
+                    authenticate_ensure_launch_path(&stream, &demand, launch_path);
+                match authenticated_launch_path {
+                    Ok(launch_path) => match manager
+                        .ensure_project_from_ipc(project_path, demand, launch_path)
+                        .await
+                    {
+                        Ok(result) => IpcResponse::ProjectEnsured(result),
+                        Err(error) => IpcResponse::Error(format!("{error:#}")),
+                    },
+                    Err(error) => IpcResponse::Error(format!("{error:#}")),
+                }
+            }
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectForceStart { project_path } => {
@@ -458,6 +523,7 @@ async fn handle_connection(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn different_pid(pid: u32) -> u32 {
         pid.wrapping_add(1)
@@ -516,5 +582,56 @@ mod tests {
         assert!(error.to_string().contains("accepts only ownerless demands"));
         validate_generic_ensure_demand(&DemandKey::manual_cli())
             .expect("generic IPC accepts ownerless Manual CLI demand");
+    }
+
+    #[tokio::test]
+    async fn trusted_launch_path_requires_an_explicit_authenticated_cli_ensure() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let path = "/opt/homebrew/bin:/usr/bin".to_owned();
+
+        assert_eq!(
+            authenticate_ensure_launch_path(&server, &DemandKey::manual_cli(), Some(path.clone()),)
+                .expect("authenticate explicit CLI launch context"),
+            Some(path)
+        );
+
+        let error = authenticate_ensure_launch_path(
+            &server,
+            &DemandKey::stopped_page_resume(),
+            Some("/usr/bin".to_owned()),
+        )
+        .expect_err("non-CLI ensure must not replace trusted launch context");
+        assert!(
+            error
+                .to_string()
+                .contains("accepted only for an explicit Manual CLI ensure")
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_reader_accepts_a_request_larger_than_one_read_buffer() {
+        let (mut client, mut server) = UnixStream::pair().expect("create connected IPC pair");
+        let request = IpcRequest::Start {
+            project_path: "/tmp/project".into(),
+            verbose: false,
+            launch_path: Some("x".repeat(8192)),
+            manual_cli_session: None,
+        };
+        let request_bytes = serde_json::to_vec(&request).expect("encode large request");
+        assert!(request_bytes.len() > 4096);
+
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(&request_bytes)
+                .await
+                .expect("write complete large request");
+        });
+        let decoded = read_request(&mut server)
+            .await
+            .expect("read large request")
+            .expect("request is present");
+        writer.await.expect("writer joins");
+
+        assert_eq!(decoded, request);
     }
 }

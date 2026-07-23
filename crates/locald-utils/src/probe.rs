@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::Path;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -40,8 +42,18 @@ pub async fn check_tcp(addr: &str, timeout: Duration) -> bool {
 
 /// Checks if a command executes successfully (exit code 0).
 pub async fn check_command(cmd: &str, cwd: Option<&Path>, timeout: Duration) -> bool {
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(cmd);
+    check_command_with_env(cmd, cwd, &HashMap::new(), timeout).await
+}
+
+/// Checks if a command executes successfully with the service environment.
+pub async fn check_command_with_env<S: BuildHasher + Sync>(
+    cmd: &str,
+    cwd: Option<&Path>,
+    env: &HashMap<String, String, S>,
+    timeout: Duration,
+) -> bool {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(cmd).envs(env);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }

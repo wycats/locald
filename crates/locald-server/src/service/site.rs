@@ -7,6 +7,7 @@ use locald_core::service::{
     RuntimeState, ServiceCommand, ServiceContext, ServiceController, ServiceFactory,
 };
 use locald_core::state::{HealthStatus, ServiceState};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -21,6 +22,7 @@ pub struct SiteService {
     config: SiteServiceConfig,
     project_root: PathBuf,
     port: Option<u16>,
+    env: HashMap<String, String>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     log_sender: broadcast::Sender<LogEntry>,
@@ -40,6 +42,7 @@ impl SiteService {
         config: SiteServiceConfig,
         project_root: PathBuf,
         port: Option<u16>,
+        env: HashMap<String, String>,
     ) -> Self {
         let (tx, _) = broadcast::channel(100);
         Self {
@@ -47,6 +50,7 @@ impl SiteService {
             config,
             project_root,
             port,
+            env,
             server_handle: None,
             watcher_handle: None,
             log_sender: tx,
@@ -82,6 +86,7 @@ impl SiteService {
         name: &str,
         config: &SiteServiceConfig,
         project_root: &PathBuf,
+        env: &HashMap<String, String>,
         log_sender: &broadcast::Sender<LogEntry>,
     ) -> Result<()> {
         if config.build.is_empty() {
@@ -101,7 +106,7 @@ impl SiteService {
         }
 
         let mut cmd = Command::new(parts[0]);
-        cmd.args(&parts[1..]).current_dir(project_root);
+        cmd.args(&parts[1..]).current_dir(project_root).envs(env);
 
         let output = cmd.output().await.context("Failed to run build command")?;
 
@@ -164,6 +169,7 @@ impl SiteService {
         let name = self.name.clone();
         let config = self.config.clone();
         let project_root = self.project_root.clone();
+        let env = self.env.clone();
         let log_sender = self.log_sender.clone();
 
         let handle = tokio::spawn(async move {
@@ -203,7 +209,14 @@ impl SiteService {
                         }
                     } => {
                         debounce_timer = None;
-                        let _ = Self::run_build_static(&name, &config, &project_root, &log_sender).await;
+                        let _ = Self::run_build_static(
+                            &name,
+                            &config,
+                            &project_root,
+                            &env,
+                            &log_sender,
+                        )
+                        .await;
                     }
                 }
             }
@@ -253,11 +266,13 @@ impl ServiceController for SiteService {
         let name = self.name.clone();
         let config = self.config.clone();
         let project_root = self.project_root.clone();
+        let env = self.env.clone();
         let log_sender = self.log_sender.clone();
         let shared = self.shared.clone();
 
         tokio::spawn(async move {
-            let result = Self::run_build_static(&name, &config, &project_root, &log_sender).await;
+            let result =
+                Self::run_build_static(&name, &config, &project_root, &env, &log_sender).await;
 
             let mut state = shared.lock().await;
             if result.is_ok() {
@@ -370,6 +385,45 @@ impl ServiceFactory for SiteFactory {
             site_config,
             ctx.project_root.clone(),
             ctx.port,
+            ctx.env.clone(),
         )))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn site_build_resolves_commands_from_service_context_path() {
+        let dir = tempdir().expect("create site PATH test directory");
+        let bin = dir.path().join("toolchain-bin");
+        std::fs::create_dir(&bin).expect("create injected PATH directory");
+        let tool = bin.join("site-build-tool");
+        std::fs::write(&tool, "#!/bin/sh\necho site-path-ok\n").expect("write site build tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("make site build tool executable");
+
+        let config = SiteServiceConfig {
+            build: "site-build-tool".to_owned(),
+            ..Default::default()
+        };
+        let (logs, mut receiver) = broadcast::channel(10);
+        SiteService::run_build_static(
+            "docs",
+            &config,
+            &dir.path().to_path_buf(),
+            &HashMap::from([("PATH".to_owned(), bin.display().to_string())]),
+            &logs,
+        )
+        .await
+        .expect("run site build through injected PATH");
+
+        let messages = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| message == "site-path-ok"));
     }
 }

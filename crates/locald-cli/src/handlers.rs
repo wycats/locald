@@ -110,6 +110,7 @@ fn prepare_up_start(
     let request = IpcRequest::Start {
         project_path: project_path.clone(),
         verbose,
+        launch_path: Some(utils::trusted_launch_path()?),
         manual_cli_session,
     };
     Ok((project_path, request))
@@ -2092,6 +2093,7 @@ mod tests {
             request,
             IpcRequest::Start {
                 manual_cli_session: Some(actual),
+                launch_path: Some(_),
                 ..
             } if actual == session
         ));
@@ -2107,6 +2109,7 @@ mod tests {
             request,
             IpcRequest::Start {
                 manual_cli_session: None,
+                launch_path: Some(_),
                 ..
             }
         ));

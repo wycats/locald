@@ -442,6 +442,14 @@ struct AvailabilityConvergenceOptions {
     defer_config_reload_during_cooldown: bool,
 }
 
+struct CataloguedStartRequest {
+    event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+    verbose: bool,
+    manual_cli_session: Option<ManualCliSession>,
+    legacy_cli_peer_pid: Option<u32>,
+    trusted_launch_path: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeRestorePlan;
 
@@ -564,6 +572,21 @@ impl ProcessManager {
             self.availability_clock.clone(),
         )
         .await
+    }
+
+    async fn trusted_launch_path_if_present(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<Option<String>> {
+        if !self.availability_record_exists(instance_id).await? {
+            return Ok(None);
+        }
+        let mut availability = self.load_availability(instance_id).await?;
+        Ok(availability
+            .snapshot()
+            .await?
+            .trusted_launch_path()
+            .map(ToOwned::to_owned))
     }
 
     fn availability_transition_key(&self) -> usize {
@@ -1000,8 +1023,15 @@ impl ProcessManager {
         config: &LocaldConfig,
         dot_env_vars: &HashMap<String, String>,
         service_config: &ServiceConfig,
+        trusted_launch_path: Option<&str>,
     ) -> (HashMap<String, String>, Option<String>) {
-        let mut combined_env = dot_env_vars.clone();
+        let mut combined_env = HashMap::new();
+        if Self::uses_host_launch_path(service_config)
+            && let Some(path) = trusted_launch_path
+        {
+            combined_env.insert("PATH".to_owned(), path.to_owned());
+        }
+        combined_env.extend(dot_env_vars.clone());
         combined_env.extend(service_config.env().clone());
 
         let injected_database = if combined_env.contains_key("DATABASE_URL") {
@@ -1024,6 +1054,31 @@ impl ProcessManager {
         }
 
         (combined_env, injected_database)
+    }
+
+    fn uses_host_launch_path(service_config: &ServiceConfig) -> bool {
+        match service_config {
+            ServiceConfig::Legacy(config)
+            | ServiceConfig::Typed(TypedServiceConfig::Exec(config)) => config.build.is_none(),
+            ServiceConfig::Typed(TypedServiceConfig::Worker(_)) => true,
+            ServiceConfig::Typed(TypedServiceConfig::Site(config)) => !config.build.is_empty(),
+            ServiceConfig::Typed(
+                TypedServiceConfig::Postgres(_) | TypedServiceConfig::Container(_),
+            ) => false,
+        }
+    }
+
+    fn ensure_host_launch_context(
+        project_name: &str,
+        service_name: &str,
+        service_config: &ServiceConfig,
+        effective_env: &HashMap<String, String>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !Self::uses_host_launch_path(service_config) || effective_env.contains_key("PATH"),
+            "missing_launch_context: project `{project_name}` requires a trusted PATH to launch host service `{service_name}`; run `locald up` once from an interactive shell"
+        );
+        Ok(())
     }
 
     fn configured_service_name<'a>(full_name: &'a str, config: &LocaldConfig) -> &'a str {
@@ -1083,6 +1138,7 @@ impl ProcessManager {
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
         dot_env_vars: &HashMap<String, String>,
+        trusted_launch_path: Option<&str>,
         sorted_services: &[String],
         desired_service_names: &HashSet<String>,
     ) -> Result<ConfigTransitionPlan> {
@@ -1110,8 +1166,12 @@ impl ProcessManager {
                 .depends_on()
                 .iter()
                 .any(|dependency| changed_services.contains(dependency));
-            let (combined_env, _) =
-                Self::effective_service_env(config, dot_env_vars, service_config);
+            let (combined_env, _) = Self::effective_service_env(
+                config,
+                dot_env_vars,
+                service_config,
+                trusted_launch_path,
+            );
             let manager = self.clone();
             let expected_instance = instance_id;
             let resolved_env =
@@ -2090,7 +2150,7 @@ impl ProcessManager {
         verbose: bool,
         manual_cli_session: Option<ManualCliSession>,
     ) -> Result<()> {
-        self.start_with_request_provenance(path, event_tx, verbose, manual_cli_session, None)
+        self.start_with_request_provenance(path, event_tx, verbose, manual_cli_session, None, None)
             .await
     }
 
@@ -2101,6 +2161,7 @@ impl ProcessManager {
         verbose: bool,
         manual_cli_session: Option<ManualCliSession>,
         legacy_cli_peer_pid: Option<u32>,
+        trusted_launch_path: Option<String>,
     ) -> Result<()> {
         self.start_with_request_provenance(
             path,
@@ -2108,6 +2169,7 @@ impl ProcessManager {
             verbose,
             manual_cli_session,
             legacy_cli_peer_pid,
+            trusted_launch_path,
         )
         .await
     }
@@ -2119,6 +2181,7 @@ impl ProcessManager {
         verbose: bool,
         manual_cli_session: Option<ManualCliSession>,
         legacy_cli_peer_pid: Option<u32>,
+        trusted_launch_path: Option<String>,
     ) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
         let path = Self::canonicalize_path(&path);
@@ -2128,10 +2191,13 @@ impl ProcessManager {
                     .start_catalogued_instance(
                         target.instance_id,
                         path,
-                        event_tx,
-                        verbose,
-                        manual_cli_session,
-                        legacy_cli_peer_pid,
+                        CataloguedStartRequest {
+                            event_tx,
+                            verbose,
+                            manual_cli_session,
+                            legacy_cli_peer_pid,
+                            trusted_launch_path,
+                        },
                     )
                     .await;
             }
@@ -2152,10 +2218,13 @@ impl ProcessManager {
             .start_catalogued_instance(
                 instance_id,
                 path,
-                event_tx,
-                verbose,
-                manual_cli_session,
-                legacy_cli_peer_pid,
+                CataloguedStartRequest {
+                    event_tx,
+                    verbose,
+                    manual_cli_session,
+                    legacy_cli_peer_pid,
+                    trusted_launch_path,
+                },
             )
             .await;
         drop(pending);
@@ -2480,7 +2549,7 @@ impl ProcessManager {
             .transpose()?;
         for (service_name, service_config) in &config.services {
             let (effective_env, _) =
-                Self::effective_service_env(&config, &dot_env_vars, service_config);
+                Self::effective_service_env(&config, &dot_env_vars, service_config, None);
             ConfigLoader::validate_env_references(&effective_env, &config, service_name)
                 .with_context(|| {
                     format!("service `{service_name}` contains an invalid environment reference")
@@ -2491,6 +2560,7 @@ impl ProcessManager {
             .keys()
             .map(|service_name| format!("{}:{service_name}", config.project.name))
             .collect::<HashSet<_>>();
+        let service_stop_suppressions = self.service_stop_suppressions.lock().await.clone();
         #[cfg(test)]
         self.wait_at_config_publication_hook().await;
         let lifecycle_publication_guard = self.lifecycle_publication_lock.lock().await;
@@ -2511,12 +2581,39 @@ impl ProcessManager {
             mut reusable_service_envs,
             stopped_service_projections,
             pending_initial,
+            trusted_launch_path,
         ) = {
             let mut registry = self.registry.lock().await;
             let catalog_base = registry.clone();
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
+            if start_services {
+                for (service_name, service_config) in &config.services {
+                    let full_name = format!("{}:{service_name}", config.project.name);
+                    let remains_stopped = service_stop_suppressions
+                        .contains(&(instance_id, full_name.clone()))
+                        && !service_activation
+                            .as_ref()
+                            .is_some_and(|activated| activated.contains(&full_name));
+                    if remains_stopped {
+                        continue;
+                    }
+                    let (effective_env, _) = Self::effective_service_env(
+                        &config,
+                        &dot_env_vars,
+                        service_config,
+                        trusted_launch_path.as_deref(),
+                    );
+                    Self::ensure_host_launch_context(
+                        &config.project.name,
+                        service_name,
+                        service_config,
+                        &effective_env,
+                    )?;
+                }
+            }
             if let Some(expectation) = expected_instance {
                 if expectation.requires_existing_catalog() {
                     let expected_instance = expectation
@@ -2567,6 +2664,7 @@ impl ProcessManager {
                     instance_id,
                     &config,
                     &dot_env_vars,
+                    trusted_launch_path.as_deref(),
                     &sorted_services,
                     &desired_service_names,
                 )
@@ -2645,6 +2743,7 @@ impl ProcessManager {
                 reusable_service_envs,
                 stopped_service_projections,
                 pending_initial,
+                trusted_launch_path,
             )
         };
 
@@ -2782,8 +2881,12 @@ impl ProcessManager {
                 }
             }
 
-            let (combined_env, injected_database) =
-                Self::effective_service_env(&config, &dot_env_vars, service_config);
+            let (combined_env, injected_database) = Self::effective_service_env(
+                &config,
+                &dot_env_vars,
+                service_config,
+                trusted_launch_path.as_deref(),
+            );
             if let Some(dependency) = injected_database {
                 info!(
                     "Auto-injected DATABASE_URL for {name} from Postgres dependency {dependency}"
@@ -5050,6 +5153,26 @@ impl ProcessManager {
         project_path: PathBuf,
         demand: DemandKey,
     ) -> Result<EnsureProjectResult> {
+        self.ensure_project_with_trusted_launch_path(project_path, demand, None)
+            .await
+    }
+
+    pub(crate) async fn ensure_project_from_ipc(
+        &self,
+        project_path: PathBuf,
+        demand: DemandKey,
+        trusted_launch_path: Option<String>,
+    ) -> Result<EnsureProjectResult> {
+        self.ensure_project_with_trusted_launch_path(project_path, demand, trusted_launch_path)
+            .await
+    }
+
+    async fn ensure_project_with_trusted_launch_path(
+        &self,
+        project_path: PathBuf,
+        demand: DemandKey,
+        trusted_launch_path: Option<String>,
+    ) -> Result<EnsureProjectResult> {
         demand
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid EnsureProject demand: {error}"))?;
@@ -5086,19 +5209,21 @@ impl ProcessManager {
                 "project identity changed during ensure: expected {instance_id}, discovered {}",
                 target.instance_id
             );
+            let mut batch = AvailabilityBatch::new(self.availability_now());
+            if let Some(path) = trusted_launch_path {
+                batch.push(AvailabilityBatchOperation::SetTrustedLaunchPath(Some(path)));
+            }
+            batch.push(AvailabilityBatchOperation::EnsureDemand(demand));
             let durability_error = if target.catalog_base == target.catalog_target {
                 let mut availability = self.load_availability(instance_id).await?;
-                let (_, durability_error) = Self::capture_availability_publication(
-                    availability.ensure_demand(demand).await,
-                )?;
+                let (_, durability_error) =
+                    Self::capture_availability_publication(availability.apply_batch(&batch).await)?;
                 durability_error
             } else {
                 // Discovery reactivates a catalogued instance in the target
                 // image. Publish that reactivation and the new demand through
                 // one replayable transaction before runtime convergence.
                 let attachment_snapshot = self.attachments.lock().await.snapshot();
-                let batch = AvailabilityBatch::new(self.availability_now())
-                    .with_operation(AvailabilityBatchOperation::EnsureDemand(demand));
                 let transaction = self
                     .prepare_project_lifecycle_transaction(
                         target,
@@ -7011,11 +7136,15 @@ impl ProcessManager {
         &self,
         instance_id: ProjectInstanceId,
         requested_path: PathBuf,
-        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
-        verbose: bool,
-        manual_cli_session: Option<ManualCliSession>,
-        legacy_cli_peer_pid: Option<u32>,
+        request: CataloguedStartRequest,
     ) -> Result<()> {
+        let CataloguedStartRequest {
+            event_tx,
+            verbose,
+            manual_cli_session,
+            legacy_cli_peer_pid,
+            trusted_launch_path,
+        } = request;
         let transition_guard = self.attachment_transition_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
         let coordinator = self.availability_coordinator(instance_id).await;
@@ -7123,6 +7252,9 @@ impl ProcessManager {
             None
         };
         let mut batch = AvailabilityBatch::new(effective_at);
+        if let Some(path) = trusted_launch_path {
+            batch.push(AvailabilityBatchOperation::SetTrustedLaunchPath(Some(path)));
+        }
         if let Some(session) = manual_cli_session {
             let source = session.attachment_source();
             let mut compatibility = attachment_target.project(&requested_path).attachments;
@@ -7619,41 +7751,31 @@ impl ProcessManager {
 
         // Load .env if exists
         let env_path = path.join(".env");
-        let mut combined_env = HashMap::new();
+        let mut dot_env_vars = HashMap::new();
         if env_path.exists() {
             if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
                 for (k, v) in iter.flatten() {
-                    combined_env.insert(k, v);
+                    dot_env_vars.insert(k, v);
                 }
             }
         }
 
-        for (k, v) in service_config.env() {
-            combined_env.insert(k.clone(), v.clone());
-        }
+        let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
+        let (mut combined_env, _) = Self::effective_service_env(
+            &config,
+            &dot_env_vars,
+            &service_config,
+            trusted_launch_path.as_deref(),
+        );
+        Self::ensure_host_launch_context(
+            &config.project.name,
+            Self::configured_service_name(name, &config),
+            &service_config,
+            &combined_env,
+        )?;
 
         if let Some(p) = port.or(sticky_port) {
             combined_env.insert("PORT".to_string(), p.to_string());
-        }
-
-        // Auto-inject DATABASE_URL for services that depend on Postgres
-        // (mirrors the logic in start_project)
-        if !combined_env.contains_key("DATABASE_URL") {
-            for dep in service_config.depends_on() {
-                if let Some(dep_config) = config.services.get(dep) {
-                    if matches!(
-                        dep_config,
-                        ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
-                    ) {
-                        // Use local service name - resolve_env adds the project prefix
-                        combined_env.insert(
-                            "DATABASE_URL".to_string(),
-                            format!("${{services.{}.url}}", dep),
-                        );
-                        break;
-                    }
-                }
-            }
         }
 
         let manager = self.clone();
@@ -9282,11 +9404,27 @@ mod tests {
         let mut config = format!("[project]\nname = \"{project_name}\"\ndomain = \"{domain}\"\n");
         for service_name in service_names {
             config.push_str(&format!(
-                "\n[services.{service_name}]\ntype = \"worker\"\ncommand = \"unused-by-test-factory\"\n"
+                "\n[services.{service_name}]\ntype = \"worker\"\ncommand = \"unused-by-test-factory\"\n\n[services.{service_name}.env]\nPATH = \"/usr/bin:/bin\"\n"
             ));
         }
         std::fs::write(project_path.join("locald.toml"), config)
             .expect("write availability worker config");
+    }
+
+    fn write_availability_worker_config_without_path(
+        project_path: &Path,
+        project_name: &str,
+        domain: &str,
+        service_names: &[&str],
+    ) {
+        let mut config = format!("[project]\nname = \"{project_name}\"\ndomain = \"{domain}\"\n");
+        for service_name in service_names {
+            config.push_str(&format!(
+                "\n[services.{service_name}]\ntype = \"worker\"\ncommand = \"unused-by-test-factory\"\n"
+            ));
+        }
+        std::fs::write(project_path.join("locald.toml"), config)
+            .expect("write availability worker config without PATH");
     }
 
     fn write_unready_availability_worker_config(
@@ -9298,7 +9436,7 @@ mod tests {
         let mut config = format!("[project]\nname = \"{project_name}\"\ndomain = \"{domain}\"\n");
         for service_name in service_names {
             config.push_str(&format!(
-                "\n[services.{service_name}]\ntype = \"worker\"\ncommand = \"unused-by-test-factory\"\nhealth_check = \"false\"\n"
+                "\n[services.{service_name}]\ntype = \"worker\"\ncommand = \"unused-by-test-factory\"\nhealth_check = \"false\"\n\n[services.{service_name}.env]\nPATH = \"/usr/bin:/bin\"\n"
             ));
         }
         std::fs::write(project_path.join("locald.toml"), config)
@@ -9589,6 +9727,7 @@ mod tests {
                 false,
                 None,
                 Some(peer_pid),
+                Some("/usr/bin:/bin".to_owned()),
             )
             .await
             .expect("matching legacy Start resumes and converges the process owner");
@@ -9676,6 +9815,7 @@ mod tests {
                 false,
                 None,
                 Some(different_peer_pid),
+                Some("/usr/bin:/bin".to_owned()),
             )
             .await
             .expect("mismatched legacy Start acquires independent Manual demand");
@@ -11840,6 +11980,9 @@ domain = "replacement.localhost"
 [services.web]
 type = "worker"
 command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write project config");
@@ -13550,6 +13693,9 @@ domain = "start-paused.localhost"
 [services.web]
 type = "worker"
 command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write paused project config");
@@ -13687,6 +13833,9 @@ command = "updated-but-still-stopped"
 [services.worker]
 type = "worker"
 command = "unused-by-test-factory"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
 "#;
         let reloaded_config: LocaldConfig =
             toml::from_str(reloaded_config_source).expect("parse reloaded stopped-service config");
@@ -13756,9 +13905,26 @@ command = "unused-by-test-factory"
         ));
 
         manager
-            .start(project_path.clone(), None, false)
+            .start_service("service-stop:worker")
             .await
-            .expect("explicit project start clears service stop suppression");
+            .expect("selective sibling start ignores missing context for stopped web service");
+        let error = manager
+            .start_service("service-stop:web")
+            .await
+            .expect_err("resuming the stopped host service still requires launch context");
+        assert!(format!("{error:#}").contains("missing_launch_context"));
+
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                None,
+                false,
+                None,
+                Some(std::process::id()),
+                Some("/usr/bin:/bin".to_owned()),
+            )
+            .await
+            .expect("explicit CLI start supplies context and clears service stop suppression");
         assert!(
             manager
                 .get_service_controller("service-stop:web")
@@ -14097,19 +14263,31 @@ domain = "dependency-service-start.localhost"
 type = "worker"
 command = "unused-by-test-factory"
 
+[services.db.env]
+PATH = "/usr/bin:/bin"
+
 [services.web]
 type = "worker"
 command = "unused-by-test-factory"
 depends_on = ["api"]
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 
 [services.api]
 type = "worker"
 command = "unused-by-test-factory"
 depends_on = ["db"]
 
+[services.api.env]
+PATH = "/usr/bin:/bin"
+
 [services.worker]
 type = "worker"
 command = "unused-by-test-factory"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write dependency service-start config");
@@ -15904,7 +16082,17 @@ command = "unused-by-test-factory"
             .await
             .expect("remove project before stale start");
         let error = manager
-            .start_catalogued_instance(instance_id, project_path, None, false, None, None)
+            .start_catalogued_instance(
+                instance_id,
+                project_path,
+                CataloguedStartRequest {
+                    event_tx: None,
+                    verbose: false,
+                    manual_cli_session: None,
+                    legacy_cli_peer_pid: None,
+                    trusted_launch_path: None,
+                },
+            )
             .await
             .expect_err("captured start cannot restore removed identity");
 
@@ -15935,6 +16123,9 @@ domain = "forgotten.localhost"
 [services.web]
 type = "worker"
 command = "ignored"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write forgotten project config");
@@ -17773,7 +17964,7 @@ command = "ignored"
         let project_path = dir.path().join("always-on-restore-project");
         let (manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "always-on-restore").await;
-        write_availability_worker_config(
+        write_availability_worker_config_without_path(
             &project_path,
             "always-on-restore",
             "always-on-restore.localhost",
@@ -17782,6 +17973,11 @@ command = "ignored"
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load Always On restore policy");
+        let trusted_path = "/Users/example/.proto/shims:/usr/bin";
+        availability
+            .replace_trusted_launch_path(trusted_path.to_owned())
+            .await
+            .expect("persist trusted launch context");
         availability
             .set_always_on(true)
             .await
@@ -17836,8 +18032,10 @@ command = "ignored"
                 .await
                 .get("always-on-restore:web")
                 .expect("restored Always On service")
-                .instance_id,
-            instance_id
+                .resolved_env
+                .get("PATH")
+                .map(String::as_str),
+            Some(trusted_path)
         );
         let snapshot = availability
             .snapshot()
@@ -17846,6 +18044,79 @@ command = "ignored"
         assert!(snapshot.always_on());
         assert!(!snapshot.is_paused());
         assert_eq!(snapshot.last_convergence_error(), None);
+    }
+
+    #[tokio::test]
+    async fn always_on_restore_without_launch_context_fails_with_stable_guidance() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("missing-launch-context-project");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "missing-launch-context").await;
+        write_availability_worker_config_without_path(
+            &project_path,
+            "missing-launch-context",
+            "missing-launch-context.localhost",
+            &["web"],
+        );
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load missing-context availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("persist Always On policy");
+        manager
+            .state_manager
+            .save(&ServerState::default())
+            .await
+            .expect("persist empty runtime snapshot");
+        drop(manager);
+
+        let catalog =
+            Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(dir.path()))
+                .await
+                .expect("reload missing-context catalog");
+        let mut fresh = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("fresh-notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+        )
+        .expect("create fresh missing-context manager");
+        fresh.set_host_syncer(Arc::new(NoopHostSyncer));
+        fresh.factories.insert(
+            0,
+            Arc::new(CountingStartFactory {
+                creates: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let restore_plan = fresh
+            .reconcile_stale_runtime_state()
+            .await
+            .expect("reconcile empty runtime snapshot");
+        fresh.restore_policy_owned_projects(restore_plan).await;
+
+        assert!(
+            fresh
+                .get_service_controller("missing-launch-context:web")
+                .await
+                .is_none()
+        );
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read missing launch-context failure");
+        let error = snapshot
+            .last_convergence_error()
+            .expect("record missing launch-context convergence error");
+        assert!(error.contains("missing_launch_context"));
+        assert!(error.contains("run `locald up` once"));
+        assert!(snapshot.always_on());
     }
 
     #[tokio::test]
@@ -18427,10 +18698,12 @@ command = "unused-by-test-factory"
             services: service_names
                 .iter()
                 .map(|name| {
-                    (
-                        (*name).to_owned(),
-                        ServiceConfig::Legacy(ExecServiceConfig::default()),
-                    )
+                    let mut config = ExecServiceConfig::default();
+                    config
+                        .common
+                        .env
+                        .insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+                    ((*name).to_owned(), ServiceConfig::Legacy(config))
                 })
                 .collect(),
             ..Default::default()
@@ -18547,8 +18820,12 @@ API_URL = "https://api.example"
         let dot_env_vars =
             HashMap::from([("API_URL".to_owned(), "${services.missing.url}".to_owned())]);
 
-        let (effective_env, injected_database) =
-            ProcessManager::effective_service_env(&config, &dot_env_vars, &config.services["web"]);
+        let (effective_env, injected_database) = ProcessManager::effective_service_env(
+            &config,
+            &dot_env_vars,
+            &config.services["web"],
+            None,
+        );
 
         assert_eq!(
             effective_env.get("API_URL").map(String::as_str),
@@ -18557,6 +18834,209 @@ API_URL = "https://api.example"
         assert!(injected_database.is_none());
         ConfigLoader::validate_env_references(&effective_env, &config, "web")
             .expect("shadowed project value is not active config");
+    }
+
+    #[test]
+    fn trusted_launch_path_is_a_host_only_lowest_precedence_default() {
+        let worker: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+type = "worker"
+command = "run-web"
+"#,
+        )
+        .expect("parse worker config");
+        let trusted = "/trusted/bin:/usr/bin";
+        let (inherited, _) = ProcessManager::effective_service_env(
+            &worker,
+            &HashMap::new(),
+            &worker.services["web"],
+            Some(trusted),
+        );
+        assert_eq!(inherited.get("PATH").map(String::as_str), Some(trusted));
+
+        let dot_env = HashMap::from([("PATH".to_owned(), "/project/dot-env".to_owned())]);
+        let (project_override, _) = ProcessManager::effective_service_env(
+            &worker,
+            &dot_env,
+            &worker.services["web"],
+            Some(trusted),
+        );
+        assert_eq!(
+            project_override.get("PATH").map(String::as_str),
+            Some("/project/dot-env")
+        );
+
+        let configured: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+type = "worker"
+command = "run-web"
+
+[services.web.env]
+PATH = "/project/service"
+"#,
+        )
+        .expect("parse configured worker");
+        let (service_override, _) = ProcessManager::effective_service_env(
+            &configured,
+            &dot_env,
+            &configured.services["web"],
+            Some(trusted),
+        );
+        assert_eq!(
+            service_override.get("PATH").map(String::as_str),
+            Some("/project/service")
+        );
+
+        let container: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.redis]
+type = "container"
+image = "redis:7"
+"#,
+        )
+        .expect("parse container config");
+        let (container_env, _) = ProcessManager::effective_service_env(
+            &container,
+            &HashMap::new(),
+            &container.services["redis"],
+            Some(trusted),
+        );
+        assert!(!container_env.contains_key("PATH"));
+    }
+
+    #[tokio::test]
+    async fn explicit_cli_start_persists_replaces_and_reuses_trusted_path_on_reload() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("trusted-path-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "trusted-path").await;
+        write_availability_worker_config_without_path(
+            &project_path,
+            "trusted-path",
+            "trusted-path.localhost",
+            &["web"],
+        );
+        let creates = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CountingStartFactory {
+                creates: creates.clone(),
+            }),
+        );
+
+        let first_path = "/Users/example/.proto/shims:/usr/bin".to_owned();
+        manager
+            .start_from_ipc(
+                project_path.clone(),
+                None,
+                false,
+                None,
+                Some(std::process::id()),
+                Some(first_path.clone()),
+            )
+            .await
+            .expect("start with trusted CLI PATH");
+        manager.watchers.lock().await.clear();
+
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load trusted launch context");
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("read trusted launch context")
+                .trusted_launch_path(),
+            Some(first_path.as_str())
+        );
+        assert_eq!(
+            manager
+                .services
+                .lock()
+                .await
+                .get("trusted-path:web")
+                .and_then(|service| service.resolved_env.get("PATH"))
+                .map(String::as_str),
+            Some(first_path.as_str())
+        );
+
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "trusted-path"
+domain = "trusted-path.localhost"
+
+[services.web]
+type = "worker"
+command = "changed-by-reload"
+
+[services.web.env]
+TOKEN = "reloaded"
+"#,
+        )
+        .expect("change worker config");
+        manager
+            .reload_config(project_path.clone())
+            .await
+            .expect("reload with persisted launch context");
+        {
+            let services = manager.services.lock().await;
+            let reloaded = services
+                .get("trusted-path:web")
+                .expect("reloaded trusted-path service");
+            assert_eq!(
+                reloaded.resolved_env.get("PATH").map(String::as_str),
+                Some(first_path.as_str())
+            );
+            assert_eq!(
+                reloaded.resolved_env.get("TOKEN").map(String::as_str),
+                Some("reloaded")
+            );
+        }
+
+        let replacement_path = "/Users/example/.cargo/bin:/usr/bin".to_owned();
+        manager
+            .start_from_ipc(
+                project_path,
+                None,
+                false,
+                None,
+                Some(std::process::id()),
+                Some(replacement_path.clone()),
+            )
+            .await
+            .expect("replace trusted CLI PATH");
+        assert_eq!(creates.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            availability
+                .snapshot()
+                .await
+                .expect("read replaced launch context")
+                .trusted_launch_path(),
+            Some(replacement_path.as_str())
+        );
+        assert_eq!(
+            manager
+                .services
+                .lock()
+                .await
+                .get("trusted-path:web")
+                .and_then(|service| service.resolved_env.get("PATH"))
+                .map(String::as_str),
+            Some(replacement_path.as_str())
+        );
     }
 
     #[test]
@@ -19220,6 +19700,9 @@ domain = "clean-start.localhost"
 [services.web]
 type = "worker"
 command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write clean/start config");
@@ -19997,6 +20480,9 @@ domain = "{domain}"
 [services.web]
 type = "worker"
 command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
                 ),
             )
@@ -20101,6 +20587,9 @@ domain = "first.localhost"
 [services.web]
 type = "worker"
 command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write initial config");
@@ -20198,6 +20687,9 @@ domain = "second.localhost"
 [services.web]
 type = "worker"
 command = "sleep 31"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write replacement config");
@@ -20211,6 +20703,9 @@ domain = "first.localhost"
 [services.web]
 type = "worker"
 command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("parse previous config");
@@ -20782,6 +21277,9 @@ domain = "{domain}"
 [services.web]
 type = "worker"
 command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 {}
 "#,
                 if include_api {
@@ -20789,6 +21287,9 @@ command = "sleep 30"
 [services.api]
 type = "worker"
 command = "sleep 30"
+
+[services.api.env]
+PATH = "/usr/bin:/bin"
 "#
                 } else {
                     ""
@@ -21149,6 +21650,9 @@ name = "attached"
 [services.web]
 type = "worker"
 command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .unwrap();
@@ -21820,6 +22324,9 @@ domain = "ensure-project.localhost"
 
 [services.web]
 command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write EnsureProject config");
@@ -21991,6 +22498,9 @@ domain = "host-sync-ensure.test"
 
 [services.web]
 command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write host-sync EnsureProject config");
@@ -22139,6 +22649,9 @@ domain = "timed-ensure.localhost"
 
 [services.web]
 command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write timed EnsureProject config");
@@ -22220,9 +22733,15 @@ domain = "retry-readiness.localhost"
 [services.db]
 command = "ignored by readiness fixture"
 
+[services.db.env]
+PATH = "/usr/bin:/bin"
+
 [services.web]
 command = "ignored by readiness fixture"
 depends_on = ["db"]
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .await
@@ -22347,6 +22866,9 @@ domain = "invalid-readiness.localhost"
 [services.web]
 command = "ignored by readiness fixture"
 health_check = { type = "command" }
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .await
@@ -22561,6 +23083,7 @@ command = "api"
                 test_instance_id(),
                 &next_config,
                 &dot_env_vars,
+                None,
                 &["db".to_owned(), "web".to_owned(), "api".to_owned()],
                 &desired_service_names,
             )
@@ -22636,6 +23159,7 @@ path = "docs"
                 test_instance_id(),
                 &config,
                 &HashMap::new(),
+                None,
                 &["db".to_owned(), "docs".to_owned()],
                 &desired_service_names,
             )
@@ -22777,6 +23301,7 @@ path = "docs"
                 second_instance,
                 &second_config,
                 &HashMap::new(),
+                None,
                 &["web".to_owned()],
                 &desired_names,
             )

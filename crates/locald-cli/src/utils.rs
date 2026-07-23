@@ -4,6 +4,18 @@ use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::IpcRequest;
 
+pub fn trusted_launch_path() -> CliResult<String> {
+    match std::env::var("PATH") {
+        Ok(path) => Ok(path),
+        Err(std::env::VarError::NotPresent) => Err(CliError::message(
+            "PATH is not set; run `locald up` from an interactive shell with a usable PATH",
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::message(
+            "PATH is not valid UTF-8; locald cannot persist it as trusted launch context",
+        )),
+    }
+}
+
 #[allow(unsafe_code)]
 pub fn setup_sandbox(name: &str) -> CliResult<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
