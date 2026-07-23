@@ -21961,12 +21961,18 @@ command = "unused-by-test-factory"
         let dir = tempdir().expect("create host-sync EnsureProject directory");
         let project_path = dir.path().join("host-sync-ensure-project");
         std::fs::create_dir(&project_path).expect("create host-sync project");
-        write_availability_worker_config(
-            &project_path,
-            "host-sync-ensure",
-            "host-sync-ensure.test",
-            &["web"],
-        );
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "host-sync-ensure"
+domain = "host-sync-ensure.test"
+
+[services.web]
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write host-sync EnsureProject config");
         let mut manager = unregistered_availability_manager(dir.path());
         manager.set_host_syncer(Arc::new(RejectingHostSyncer));
         manager.set_https_port(Some(443)).await;
@@ -21983,8 +21989,14 @@ command = "unused-by-test-factory"
             .await
             .expect_err("host synchronization failure blocks Ready");
         let message = format!("{error:#}");
-        assert!(message.contains("failed to synchronize ensured project domain claims"));
-        assert!(message.contains("injected host synchronization failure"));
+        assert!(
+            message.contains("failed to synchronize ensured project domain claims"),
+            "unexpected EnsureProject error: {message}"
+        );
+        assert!(
+            message.contains("injected host synchronization failure"),
+            "unexpected EnsureProject error: {message}"
+        );
 
         let (instance_id, _) = manager
             .required_availability_instance_for_path(&project_path)
