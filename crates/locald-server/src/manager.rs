@@ -5202,7 +5202,12 @@ impl ProcessManager {
                 "service `{}` did not remain ready while finalizing EnsureProject",
                 status.name
             );
-            if let Some(url) = &status.url {
+            let semantic_url = status
+                .url
+                .as_ref()
+                .and(status.domain.as_ref())
+                .map(|domain| format!("https://{domain}"));
+            if let Some(url) = &semantic_url {
                 urls.insert(url.clone());
             }
             services.push(EnsuredServiceStatus {
@@ -5210,7 +5215,7 @@ impl ProcessManager {
                 service_type: status.service_type,
                 status: status.status,
                 health_status: status.health_status,
-                url: status.url,
+                url: semantic_url,
             });
         }
 
@@ -21781,7 +21786,7 @@ command = "unused-by-test-factory"
             "EnsureProject waits for both proxy listeners"
         );
         assert!(manager.registry.lock().await.instances.is_empty());
-        manager.set_https_port(Some(443)).await;
+        manager.set_https_port(Some(8443)).await;
 
         let result = ensure
             .await
