@@ -474,8 +474,9 @@ impl AttachmentStoreSnapshot {
     /// Refresh one exact compatibility owner at a caller-selected time.
     ///
     /// Semantic editor heartbeats publish this timestamp in the same lifecycle
-    /// transaction as the availability lease renewal. PID-backed legacy
-    /// owners continue to use process reconciliation instead.
+    /// transaction as the availability lease renewal. A matching PID-backed
+    /// legacy editor owner is converted to the caller's pidless semantic
+    /// source so later process reconciliation cannot extend a missed heartbeat.
     pub fn refresh_attachment(
         &mut self,
         project_path: &Path,
@@ -492,6 +493,7 @@ impl AttachmentStoreSnapshot {
         else {
             return false;
         };
+        attachment.source.clone_from(source);
         attachment.created_at = refreshed_at;
         true
     }
@@ -2765,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_editor_heartbeat_refreshes_pidless_compatibility_evidence() {
+    fn semantic_editor_heartbeat_replaces_legacy_pid_with_pidless_compatibility_evidence() {
         let project = PathBuf::from("/projects/editor-refresh");
         let source = AttachmentSource::Editor {
             name: "vscode".to_owned(),
@@ -2779,7 +2781,11 @@ mod tests {
             &project,
             vec![Attachment {
                 project_path: project.clone(),
-                source: source.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_owned(),
+                    id: "window".to_owned(),
+                    pid: Some(42),
+                },
                 created_at: started_at,
             }],
             false,
@@ -2790,6 +2796,7 @@ mod tests {
             snapshot.project(&project).attachments[0].created_at,
             refreshed_at
         );
+        assert_eq!(snapshot.project(&project).attachments[0].source, source);
     }
 
     #[test]
