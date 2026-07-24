@@ -300,6 +300,16 @@
 		}
 	}
 
+	function projectActionTitle(project: ProjectListEntry): string {
+		if (projectCanPause(project.availability)) return 'Pause project';
+		if (projectCanResume(project.availability)) return 'Resume project';
+		if (project.availability?.state === 'missing') {
+			return 'Restore the worktree to resume this project';
+		}
+		if (!project.availability) return 'Project availability has not been reported';
+		return 'No lifecycle action is currently available';
+	}
+
 	function toggleGroupCollapse(group: string) {
 		if (collapsedGroups.includes(group)) {
 			collapsedGroups = collapsedGroups.filter((g) => g !== group);
@@ -533,11 +543,7 @@
 											: false)}
 									on:click|stopPropagation={() => toggleProject(project)}
 									title={project.entry
-										? projectCanPause(project.entry.availability)
-											? 'Pause project'
-											: projectCanResume(project.entry.availability)
-												? 'Resume project'
-												: 'Restore the worktree to resume this project'
+										? projectActionTitle(project.entry)
 										: isAllStopped
 											? 'Start group'
 											: 'Stop group'}

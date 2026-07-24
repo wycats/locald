@@ -253,10 +253,16 @@
 							{/if}
 							Resume
 						</button>
-					{:else}
+					{:else if project.availability?.state === 'missing'}
 						<span class="missing-guidance">Restore the worktree to resume this project.</span>
+					{:else}
+						<span class="missing-guidance">
+							{project.availability
+								? 'No lifecycle action is currently available.'
+								: 'Project availability has not been reported.'}
+						</span>
 					{/if}
-					{#if project.availability?.state !== 'missing'}
+					{#if project.availability && project.availability.state !== 'missing'}
 						<button
 							class="project-action secondary"
 							disabled={projectAction !== null}

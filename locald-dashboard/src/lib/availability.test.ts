@@ -74,5 +74,8 @@ describe('project availability presentation', () => {
 		expect(formatTransition({ secs_since_epoch: 1_000, nanos_since_epoch: 0 }, 940_000)).toBe(
 			'in 1m'
 		);
+		expect(formatTransition({ secs_since_epoch: 1_000, nanos_since_epoch: 0 }, 940_400)).toBe(
+			'in 60s'
+		);
 	});
 });

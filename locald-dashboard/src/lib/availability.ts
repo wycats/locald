@@ -65,10 +65,12 @@ export function formatTransition(
 ): string | null {
 	if (!timestamp) return null;
 	const transition = timestamp.secs_since_epoch * 1000 + timestamp.nanos_since_epoch / 1_000_000;
-	const remainingSeconds = Math.max(0, Math.round((transition - now) / 1000));
-	if (remainingSeconds < 60) return `in ${remainingSeconds}s`;
-	const remainingMinutes = Math.round(remainingSeconds / 60);
-	if (remainingMinutes < 60) return `in ${remainingMinutes}m`;
-	const remainingHours = Math.round(remainingMinutes / 60);
-	return `in ${remainingHours}h`;
+	const remainingMilliseconds = Math.max(0, transition - now);
+	if (remainingMilliseconds < 60_000) {
+		return `in ${Math.ceil(remainingMilliseconds / 1_000)}s`;
+	}
+	if (remainingMilliseconds < 3_600_000) {
+		return `in ${Math.ceil(remainingMilliseconds / 60_000)}m`;
+	}
+	return `in ${Math.ceil(remainingMilliseconds / 3_600_000)}h`;
 }
