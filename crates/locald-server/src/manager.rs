@@ -4589,6 +4589,8 @@ impl ProcessManager {
         project_path: PathBuf,
         editor: &EditorSession,
     ) -> Result<EnsureProjectResult> {
+        let project_path = Self::normalize_ensure_project_root(project_path).await?;
+        self.wait_for_https_proxy_listener().await?;
         self.project_attach_with_convergence(
             project_path,
             editor.attachment_source(),
@@ -4604,9 +4606,74 @@ impl ProcessManager {
         project_path: &Path,
         editor: &EditorSession,
     ) -> Result<bool> {
-        let demand = availability_demand_for_attachment_source(&editor.attachment_source())?
+        let project_path = Self::normalize_ensure_project_root(project_path.to_path_buf()).await?;
+        let source = editor.attachment_source();
+        let demand = availability_demand_for_attachment_source(&source)?
             .context("VS Code editor session did not produce an availability demand")?;
-        self.project_renew_availability(project_path, &demand).await
+        self.run_admitted_availability_transition(|| async {
+            self.ensure_accepting_lifecycle_requests()?;
+            let transition_guard = self.attachment_transition_lock.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            let initial_target = self
+                .resolve_lifecycle_target(&project_path)
+                .await?
+                .into_catalogued()
+                .context("VS Code editor project is not registered in the identity catalog")?;
+            let expected_instance = initial_target.instance_id;
+            let publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.ensure_lifecycle_publication_available()?;
+            let target = self
+                .resolve_lifecycle_target(&project_path)
+                .await?
+                .into_catalogued()
+                .context("VS Code editor project is not registered in the identity catalog")?;
+            anyhow::ensure!(
+                target.instance_id == expected_instance,
+                "project identity changed during editor heartbeat publication"
+            );
+
+            let effective_at = self.availability_now();
+            let mut availability = self.load_availability(expected_instance).await?;
+            let renews_live_owner = availability
+                .snapshot()
+                .await?
+                .live_demands_at(effective_at)
+                .any(|lease| lease.key() == &demand);
+            let attachment_base = self.attachments.lock().await.snapshot();
+            let mut attachment_target = attachment_base.clone();
+            if renews_live_owner {
+                let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
+                let mut refreshed = false;
+                for path in lifecycle_paths {
+                    if Self::attachment_path_is_owned_by_target(&attachment_base, &target, &path) {
+                        refreshed |=
+                            attachment_target.refresh_attachment(&path, &source, effective_at);
+                    }
+                }
+                anyhow::ensure!(
+                    refreshed,
+                    "live VS Code window demand has no matching compatibility owner"
+                );
+            }
+            let batch = AvailabilityBatch::new(effective_at)
+                .with_operation(AvailabilityBatchOperation::RenewDemand(demand));
+            let transaction = self
+                .prepare_project_lifecycle_transaction(
+                    target,
+                    &batch,
+                    attachment_base,
+                    attachment_target,
+                )
+                .await?;
+            self.create_and_apply_lifecycle_transaction_locked(&transaction)
+                .await?;
+            drop(publication_guard);
+            drop(transition_guard);
+            self.converge_managed_instance(expected_instance, None, false, false)
+                .await?;
+            Ok(renews_live_owner)
+        })
+        .await
     }
 
     pub(crate) async fn editor_release_project(
@@ -4614,6 +4681,7 @@ impl ProcessManager {
         project_path: PathBuf,
         editor: &EditorSession,
     ) -> Result<()> {
+        let project_path = Self::normalize_ensure_project_root(project_path).await?;
         self.project_detach(project_path, Some(editor.attachment_source()))
             .await
     }
@@ -11182,9 +11250,10 @@ mod tests {
         );
         let editor = EditorSession::new("window-a".to_owned(), std::process::id())
             .expect("construct editor session");
+        let config_path = project_path.join("locald.toml");
 
         let first = manager
-            .editor_ensure_project(project_path.clone(), &editor)
+            .editor_ensure_project(config_path.clone(), &editor)
             .await
             .expect("activate editor project");
         assert_eq!(first.state, EnsureProjectState::Ready);
@@ -11213,13 +11282,36 @@ mod tests {
             serde_json::to_string(&status.attachments).expect("serialize editor attachments");
         assert!(!rendered_attachments.contains("window-a"));
 
+        clock.advance(std::time::Duration::from_secs(30));
+        assert!(
+            manager
+                .editor_renew_project(&config_path, &editor)
+                .await
+                .expect("renew editor heartbeat through a config-file locator")
+        );
+        let renewed_attachment = manager
+            .attachments
+            .lock()
+            .await
+            .snapshot()
+            .project(&project_path)
+            .attachments
+            .into_iter()
+            .find(|attachment| attachment.source == editor.attachment_source())
+            .expect("semantic editor compatibility owner remains published");
+        assert_eq!(renewed_attachment.created_at, clock.time());
+        assert!(matches!(
+            renewed_attachment.source,
+            AttachmentSource::Editor { pid: None, .. }
+        ));
+
         manager
             .project_pause_availability(&project_path)
             .await
             .expect("pause editor project");
         assert!(
             manager
-                .editor_renew_project(&project_path, &editor)
+                .editor_renew_project(&config_path, &editor)
                 .await
                 .expect("passively renew paused editor")
         );
@@ -11234,7 +11326,7 @@ mod tests {
         assert!(!manager.project_runtime_exists(instance_id).await);
 
         let resumed = manager
-            .editor_ensure_project(project_path.clone(), &editor)
+            .editor_ensure_project(config_path.clone(), &editor)
             .await
             .expect("semantic refocus resumes editor project");
         assert_eq!(resumed.state, EnsureProjectState::Ready);
@@ -11250,7 +11342,7 @@ mod tests {
         assert_eq!(resumed_availability.demands().len(), 1);
 
         manager
-            .editor_release_project(project_path, &editor)
+            .editor_release_project(config_path, &editor)
             .await
             .expect("release editor project");
         let released = AvailabilityStore::load(&availability_data_dir, instance_id)
@@ -11261,6 +11353,49 @@ mod tests {
             .expect("read released editor availability");
         assert!(released.demands().is_empty());
         assert!(released.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn semantic_editor_ensure_waits_for_https_proxy_startup() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("editor-proxy-startup-project");
+        let (mut manager, _instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "editor-proxy-startup").await;
+        manager.set_http_port(Some(80)).await;
+        write_availability_worker_config(
+            &project_path,
+            "editor-proxy-startup",
+            "editor-proxy-startup.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let editor = EditorSession::new("window-proxy-startup".to_owned(), std::process::id())
+            .expect("construct editor session");
+        let mut ensure = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.editor_ensure_project(project_path, &editor).await }
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut ensure)
+                .await
+                .is_err(),
+            "editor ensure waits while HTTPS is not advertised"
+        );
+        manager.set_https_port(Some(443)).await;
+        let result = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, ensure)
+            .await
+            .expect("editor ensure finishes after HTTPS is advertised")
+            .expect("editor ensure task joins")
+            .expect("editor ensure succeeds");
+        assert_eq!(result.state, EnsureProjectState::Ready);
     }
 
     #[tokio::test]
@@ -11298,6 +11433,10 @@ mod tests {
             .expect("activate editor project");
 
         clock.advance(locald_core::VSCODE_DEMAND_TTL);
+        manager
+            .reconcile_legacy_attachment_project(project_path.clone())
+            .await
+            .expect("reconcile editor compatibility evidence at lease expiry");
         assert!(
             !manager
                 .editor_renew_project(&project_path, &editor)

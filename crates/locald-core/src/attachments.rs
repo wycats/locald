@@ -67,7 +67,7 @@ impl fmt::Debug for EditorSession {
         formatter
             .debug_struct("EditorSession")
             .field("window_id", &"<private>")
-            .field("host_pid", &self.host_pid)
+            .field("host_pid", &"<private>")
             .finish()
     }
 }
@@ -121,7 +121,11 @@ impl EditorSession {
         AttachmentSource::Editor {
             name: "vscode".to_owned(),
             id: self.window_id.clone(),
-            pid: Some(self.host_pid),
+            // The host PID authenticates each adapter request, but heartbeat
+            // renewal is the authority for semantic editor liveness. Keeping
+            // the PID out of durable compatibility state prevents the legacy
+            // process revalidator from extending a missed heartbeat.
+            pid: None,
         }
     }
 }
@@ -464,6 +468,31 @@ impl AttachmentStoreSnapshot {
                 self.instance_owners.remove(&project_path);
             }
         }
+        true
+    }
+
+    /// Refresh one exact compatibility owner at a caller-selected time.
+    ///
+    /// Semantic editor heartbeats publish this timestamp in the same lifecycle
+    /// transaction as the availability lease renewal. PID-backed legacy
+    /// owners continue to use process reconciliation instead.
+    pub fn refresh_attachment(
+        &mut self,
+        project_path: &Path,
+        source: &AttachmentSource,
+        refreshed_at: SystemTime,
+    ) -> bool {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        let Some(attachments) = self.attachments.get_mut(&project_path) else {
+            return false;
+        };
+        let Some(attachment) = attachments
+            .iter_mut()
+            .find(|attachment| AttachmentStore::matches_source(source, &attachment.source))
+        else {
+            return false;
+        };
+        attachment.created_at = refreshed_at;
         true
     }
 }
@@ -2708,7 +2737,7 @@ mod tests {
             AttachmentSource::Editor {
                 name: "vscode".to_owned(),
                 id: "window-session".to_owned(),
-                pid: Some(42),
+                pid: None,
             }
         );
 
@@ -2728,9 +2757,39 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize editor session");
 
         assert_eq!(decoded, session);
-        assert!(!format!("{session:?}").contains("private-window"));
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("private-window"));
+        assert!(!debug.contains("42"));
         assert!(!json.contains("owner"));
         assert!(!json.contains("demand"));
+    }
+
+    #[test]
+    fn semantic_editor_heartbeat_refreshes_pidless_compatibility_evidence() {
+        let project = PathBuf::from("/projects/editor-refresh");
+        let source = AttachmentSource::Editor {
+            name: "vscode".to_owned(),
+            id: "window".to_owned(),
+            pid: None,
+        };
+        let started_at = UNIX_EPOCH + Duration::from_secs(10);
+        let refreshed_at = UNIX_EPOCH + Duration::from_secs(40);
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.replace_project(
+            &project,
+            vec![Attachment {
+                project_path: project.clone(),
+                source: source.clone(),
+                created_at: started_at,
+            }],
+            false,
+        );
+
+        assert!(snapshot.refresh_attachment(&project, &source, refreshed_at));
+        assert_eq!(
+            snapshot.project(&project).attachments[0].created_at,
+            refreshed_at
+        );
     }
 
     #[test]
