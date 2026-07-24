@@ -14,6 +14,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::manager::{ProcessManager, ServiceNotFoundError};
+use locald_core::DemandKey;
 use locald_core::ipc::Event;
 
 pub fn router(pm: ProcessManager) -> Router {
@@ -22,6 +23,13 @@ pub fn router(pm: ProcessManager) -> Router {
         .route("/logs", get(handle_ws))
         .route("/events", get(handle_events))
         .route("/projects", get(handle_projects))
+        .route("/projects/resume", post(handle_project_resume))
+        .route(
+            "/projects/resume-domain",
+            post(handle_project_resume_domain),
+        )
+        .route("/projects/pause", post(handle_project_pause))
+        .route("/projects/always-on", post(handle_project_always_on))
         .route("/projects/remove", post(handle_project_remove))
         .route("/services/stop-all", post(handle_stop_all))
         .route("/services/restart-all", post(handle_restart_all))
@@ -261,6 +269,74 @@ async fn handle_projects(State(pm): State<Arc<ProcessManager>>) -> impl IntoResp
 #[derive(Deserialize)]
 struct RemoveProjectRequest {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectPathRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ResumeProjectDomainRequest {
+    domain: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectAlwaysOnRequest {
+    path: String,
+    enabled: bool,
+}
+
+async fn handle_project_resume(
+    State(pm): State<Arc<ProcessManager>>,
+    axum::Json(body): axum::Json<ProjectPathRequest>,
+) -> impl IntoResponse {
+    match pm
+        .ensure_project(
+            std::path::PathBuf::from(body.path),
+            DemandKey::stopped_page_resume(),
+        )
+        .await
+    {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
+}
+
+async fn handle_project_resume_domain(
+    State(pm): State<Arc<ProcessManager>>,
+    axum::Json(body): axum::Json<ResumeProjectDomainRequest>,
+) -> impl IntoResponse {
+    match pm.ensure_project_for_domain(&body.domain).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
+}
+
+async fn handle_project_pause(
+    State(pm): State<Arc<ProcessManager>>,
+    axum::Json(body): axum::Json<ProjectPathRequest>,
+) -> impl IntoResponse {
+    match pm
+        .project_pause_availability(std::path::Path::new(&body.path))
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
+}
+
+async fn handle_project_always_on(
+    State(pm): State<Arc<ProcessManager>>,
+    axum::Json(body): axum::Json<ProjectAlwaysOnRequest>,
+) -> impl IntoResponse {
+    match pm
+        .project_set_always_on(std::path::Path::new(&body.path), body.enabled)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
 }
 
 async fn handle_project_remove(

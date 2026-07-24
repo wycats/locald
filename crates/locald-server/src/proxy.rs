@@ -18,9 +18,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::assets;
-use locald_core::DomainName;
 use locald_core::resolver::{DomainResolution, ServiceResolver};
 use locald_core::state::ServiceState;
+use locald_core::{DomainName, ProjectAvailabilityStatus};
 use locald_utils::cert::CertManager;
 
 /// Manages the reverse proxy for routing requests to services.
@@ -273,7 +273,13 @@ async fn proxy_to_domain_resolution(
         status,
     } = resolution
     else {
-        return ownership_only_response(host);
+        let availability = state.resolver.project_availability_by_domain(host).await;
+        return unavailable_project_response(
+            host,
+            None,
+            "locald has preserved this project domain, but its service mapping is not currently loaded.",
+            availability.as_ref(),
+        );
     };
 
     if port.is_none() {
@@ -281,7 +287,13 @@ async fn proxy_to_domain_resolution(
             return loading_response(&service_name);
         }
 
-        return disabled_response(&service_name, host);
+        let availability = state.resolver.project_availability_by_domain(host).await;
+        return unavailable_project_response(
+            host,
+            Some(&service_name),
+            "The project is known to locald, but this service is not currently available.",
+            availability.as_ref(),
+        );
     }
 
     let port = port.unwrap_or_default();
@@ -476,16 +488,47 @@ fn error_response(status: StatusCode, message: impl std::fmt::Display) -> Respon
         .into_response()
 }
 
-fn disabled_response(service_name: &str, host: &str) -> Response {
-    let escaped_name = escape_html(service_name);
+fn unavailable_project_response(
+    host: &str,
+    service_name: Option<&str>,
+    fallback_message: &str,
+    availability: Option<&ProjectAvailabilityStatus>,
+) -> Response {
     let escaped_host = escape_html(host);
-    let service_name_js = format!("{service_name:?}");
+    let status_label = availability
+        .map(|availability| availability.state.to_string())
+        .unwrap_or_else(|| "Not Available".to_owned());
+    let message = availability
+        .and_then(|availability| availability.last_error.as_deref())
+        .or_else(|| {
+            availability.and_then(|availability| {
+                availability
+                    .reasons
+                    .first()
+                    .map(|reason| reason.message.as_str())
+            })
+        })
+        .unwrap_or(fallback_message);
+    let escaped_status = escape_html(&status_label);
+    let escaped_message = escape_html(message);
+    let always_on_hint = availability
+        .filter(|availability| availability.always_on)
+        .map_or_else(String::new, |_| {
+            r#"<p class="hint policy">Always On remains enabled for this project.</p>"#.to_owned()
+        });
+    let service_hint = service_name.map_or_else(String::new, |service_name| {
+        format!(
+            r#"<p class="hint">Service: <code>{}</code></p>"#,
+            escape_html(service_name)
+        )
+    });
+    let domain_js = format!("{host:?}");
     let mut html = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>__SERVICE_NAME__ is disabled</title>
+    <title>Local project is not available</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -553,34 +596,47 @@ fn disabled_response(service_name: &str, host: &str) -> Response {
 </head>
 <body>
     <div class="container">
-        <h1>__SERVICE_NAME__ is disabled</h1>
-        <p>The service exists in your configuration but is not running.</p>
+        <h1>Project is __STATUS__</h1>
+        <p>__MESSAGE__</p>
         <p class="hint">Domain: <code>__SERVICE_HOST__</code></p>
+        __SERVICE_HINT__
+        __ALWAYS_ON_HINT__
         <div class="actions">
-            <button class="btn" id="enable-btn">Enable &amp; open logs</button>
-            <a class="btn secondary" href="http://locald.localhost">Open dashboard</a>
+            <button class="btn" id="resume-btn">Resume project</button>
+            <a class="btn secondary" href="https://locald.localhost">Open dashboard</a>
         </div>
-        <p class="hint">You can also run <code>locald up</code> from the project directory.</p>
+        <p class="hint" id="resume-status">You can also run <code>locald up</code> from the project directory.</p>
     </div>
     <script>
-        const serviceName = __SERVICE_NAME_JS__;
-        const btn = document.getElementById('enable-btn');
-        const startUrl = '/api/services/' + encodeURIComponent(serviceName) + '/start';
-        const logsUrl = 'http://locald.localhost/?pin=' + encodeURIComponent(serviceName);
+        const domain = __DOMAIN_JS__;
+        const btn = document.getElementById('resume-btn');
+        const status = document.getElementById('resume-status');
 
         if (btn) {
             btn.addEventListener('click', async () => {
                 btn.disabled = true;
-                btn.textContent = 'Enabling...';
+                btn.textContent = 'Resuming...';
+                if (status) status.textContent = 'Starting the project and waiting for readiness...';
                 try {
-                    const res = await fetch(startUrl, { method: 'POST' });
-                    if (!res.ok) throw new Error('Failed to start service');
-                    window.location.href = logsUrl;
+                    const res = await fetch('/api/projects/resume-domain', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ domain })
+                    });
+                    if (!res.ok) {
+                        const detail = await res.text();
+                        throw new Error(detail || 'Failed to resume project');
+                    }
+                    window.location.reload();
                 } catch (err) {
                     console.error(err);
                     btn.disabled = false;
-                    btn.textContent = 'Enable & open logs';
-                    alert('Could not start the service. Try `locald up` or use the dashboard.');
+                    btn.textContent = 'Resume project';
+                    if (status) {
+                        status.textContent = err instanceof Error
+                            ? err.message
+                            : 'Could not resume the project. Try `locald up` or use the dashboard.';
+                    }
                 }
             });
         }
@@ -590,81 +646,16 @@ fn disabled_response(service_name: &str, host: &str) -> Response {
         .to_string();
 
     html = html
-        .replace("__SERVICE_NAME__", &escaped_name)
+        .replace("__STATUS__", &escaped_status)
+        .replace("__MESSAGE__", &escaped_message)
         .replace("__SERVICE_HOST__", &escaped_host)
-        .replace("__SERVICE_NAME_JS__", &service_name_js);
+        .replace("__SERVICE_HINT__", &service_hint)
+        .replace("__ALWAYS_ON_HINT__", &always_on_hint)
+        .replace("__DOMAIN_JS__", &domain_js);
 
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [("content-type", "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
-}
-
-fn ownership_only_response(host: &str) -> Response {
-    let escaped_host = escape_html(host);
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Local project is stopped</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #0b0b0f;
-            color: #e4e4e7;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-        }}
-        .container {{
-            background: #111827;
-            padding: 2rem;
-            border-radius: 12px;
-            border: 1px solid #1f2937;
-            max-width: 560px;
-            width: 90%;
-        }}
-        h1 {{ margin: 0 0 0.75rem; font-size: 1.5rem; }}
-        p {{ margin: 0 0 1rem; line-height: 1.5; color: #d4d4d8; }}
-        .hint {{ font-size: 0.9rem; color: #a1a1aa; }}
-        .btn {{
-            display: inline-block;
-            background-color: #1f2937;
-            color: #e4e4e7;
-            padding: 0.6rem 1.1rem;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-        }}
-        code {{
-            background: #0f172a;
-            padding: 0.15rem 0.35rem;
-            border-radius: 6px;
-            color: #93c5fd;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>This local project is stopped</h1>
-        <p>locald has preserved this project domain, but its service mapping is not currently loaded.</p>
-        <p class="hint">Domain: <code>{escaped_host}</code></p>
-        <p>Run <code>locald up</code> from the project directory to load its services.</p>
-        <a class="btn" href="http://locald.localhost">Open dashboard</a>
-    </div>
-</body>
-</html>"#
-    );
-
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
     )
         .into_response()

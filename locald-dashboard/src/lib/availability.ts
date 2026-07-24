@@ -1,0 +1,59 @@
+import type { ProjectAvailabilityStatus } from '$lib/api';
+
+export function availabilityLabel(
+	availability: ProjectAvailabilityStatus | null | undefined
+): string {
+	if (!availability) return 'Unknown';
+	return availability.state
+		.split('_')
+		.map((part) => part[0].toUpperCase() + part.slice(1))
+		.join(' ');
+}
+
+export function availabilityMessage(
+	availability: ProjectAvailabilityStatus | null | undefined
+): string {
+	if (!availability) return 'Availability has not been reported by the daemon.';
+	if (availability.last_error) return availability.last_error;
+	if (availability.reasons.length > 0) return availability.reasons[0].message;
+	if (availability.paused) return 'Paused until new meaningful activity resumes the project.';
+	if (availability.desired) return 'locald is keeping this project available.';
+	return 'No live demand or Always On policy currently requires this project.';
+}
+
+export function projectCanPause(
+	availability: ProjectAvailabilityStatus | null | undefined
+): boolean {
+	return (
+		availability?.desired === true &&
+		!availability.paused &&
+		(availability.state === 'ready' || availability.state === 'starting')
+	);
+}
+
+export function demandSummary(
+	availability: ProjectAvailabilityStatus | null | undefined
+): string | null {
+	if (!availability || availability.demands.length === 0) return null;
+	const counts = new Map<string, number>();
+	for (const demand of availability.demands) {
+		counts.set(demand.safe_label, (counts.get(demand.safe_label) ?? 0) + 1);
+	}
+	return [...counts.entries()]
+		.map(([label, count]) => (count === 1 ? label : `${count} ${label}`))
+		.join(' · ');
+}
+
+export function formatTransition(
+	timestamp: { secs_since_epoch: number; nanos_since_epoch: number } | null | undefined,
+	now = Date.now()
+): string | null {
+	if (!timestamp) return null;
+	const transition = timestamp.secs_since_epoch * 1000 + timestamp.nanos_since_epoch / 1_000_000;
+	const remainingSeconds = Math.max(0, Math.round((transition - now) / 1000));
+	if (remainingSeconds < 60) return `in ${remainingSeconds}s`;
+	const remainingMinutes = Math.round(remainingSeconds / 60);
+	if (remainingMinutes < 60) return `in ${remainingMinutes}m`;
+	const remainingHours = Math.round(remainingMinutes / 60);
+	return `in ${remainingHours}h`;
+}

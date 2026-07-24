@@ -61,8 +61,17 @@
 	onMount(() => {
 		services.refresh();
 		projectList.refresh();
-		const cleanup = connectEvents();
-		return cleanup;
+		const refreshProjects = () => {
+			void projectList.refresh();
+		};
+		const cleanupEvents = connectEvents(refreshProjects);
+		const refreshInterval = window.setInterval(refreshProjects, 30_000);
+		window.addEventListener('focus', refreshProjects);
+		return () => {
+			cleanupEvents();
+			window.clearInterval(refreshInterval);
+			window.removeEventListener('focus', refreshProjects);
+		};
 	});
 </script>
 

@@ -187,6 +187,15 @@ async fn test_disabled_service_page() {
 
     let content_type = response.headers().get("content-type").unwrap();
     assert_eq!(content_type, "text/html; charset=utf-8");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Resume project"));
+    assert!(body.contains("/api/projects/resume-domain"));
+    assert!(body.contains("disabled.localhost"));
+    assert!(body.contains("https://locald.localhost"));
+    assert!(!body.contains("/api/services/"));
 }
 
 #[derive(Debug)]
@@ -198,12 +207,31 @@ impl locald_core::resolver::ServiceResolver for OwnershipOnlyResolver {
         Some(DomainResolution::OwnershipOnly)
     }
 
+    async fn project_availability_by_domain(
+        &self,
+        _domain: &str,
+    ) -> Option<locald_core::ProjectAvailabilityStatus> {
+        Some(locald_core::ProjectAvailabilityStatus {
+            desired: false,
+            state: locald_core::ProjectLifecycleState::Paused,
+            always_on: true,
+            paused: true,
+            reasons: vec![locald_core::AvailabilityReason {
+                code: "paused".to_owned(),
+                message: "Paused until meaningful activity resumes the project.".to_owned(),
+            }],
+            demands: Vec::new(),
+            next_transition_at: None,
+            last_error: None,
+        })
+    }
+
     async fn set_http_port(&self, _port: Option<u16>) {}
     async fn set_https_port(&self, _port: Option<u16>) {}
 }
 
 #[tokio::test]
-async fn test_legacy_owned_domain_has_a_non_actionable_stopped_surface() {
+async fn test_legacy_owned_domain_has_a_project_resume_surface() {
     let proxy = ProxyManager::new(Arc::new(OwnershipOnlyResolver), Router::new(), None);
     let app = proxy.make_app();
 
@@ -221,10 +249,13 @@ async fn test_legacy_owned_domain_has_a_non_actionable_stopped_surface() {
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("locald has preserved this project domain"));
+        assert!(body.contains("Project is Paused"));
+        assert!(body.contains("Paused until meaningful activity resumes the project."));
+        assert!(body.contains("Always On remains enabled"));
         assert!(body.contains("locald up"));
+        assert!(body.contains("Resume project"));
+        assert!(body.contains("/api/projects/resume-domain"));
         assert!(!body.contains("/api/services/"));
-        assert!(!body.contains("Enable &amp; open logs"));
     }
 }
 
