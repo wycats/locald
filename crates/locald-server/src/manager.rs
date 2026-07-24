@@ -6434,10 +6434,31 @@ impl ProcessManager {
         }
     }
 
+    fn unresolved_project_availability_reason(
+        resolution: &LifecycleTargetResolution,
+    ) -> Option<(&'static str, &'static str)> {
+        match resolution {
+            LifecycleTargetResolution::Catalogued(_) => None,
+            LifecycleTargetResolution::UnresolvedLegacy => Some((
+                "unresolved_legacy_identity",
+                "This legacy project identity has not resolved; run `locald up` from its worktree to reconcile it.",
+            )),
+            LifecycleTargetResolution::UnregisteredPhysical { .. } => Some((
+                "unregistered",
+                "This project is not registered; run `locald up` to make it available.",
+            )),
+            LifecycleTargetResolution::Ambiguous => Some((
+                "ambiguous_identity",
+                "This project path is ambiguous; run `locald up` from the intended worktree.",
+            )),
+        }
+    }
+
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
         let canonical = Self::canonicalize_path(project_path);
         let resolution = self.resolve_lifecycle_projection(&canonical).await;
-        let (project_name, instance_id, presence, unresolved_reason) = match &resolution {
+        let unresolved_reason = Self::unresolved_project_availability_reason(&resolution);
+        let (project_name, instance_id, presence) = match &resolution {
             LifecycleTargetResolution::Catalogued(target) => (
                 target
                     .catalog_target
@@ -6450,7 +6471,6 @@ impl ProcessManager {
                     .instances
                     .get(&target.instance_id)
                     .map_or(CatalogPresence::Missing, |record| record.presence),
-                None,
             ),
             LifecycleTargetResolution::UnresolvedLegacy => {
                 let registry = self.registry.lock().await;
@@ -6461,33 +6481,10 @@ impl ProcessManager {
                         .and_then(|record| record.display_name.clone()),
                     None,
                     CatalogPresence::Missing,
-                    Some((
-                        "unresolved_legacy_identity",
-                        "This legacy project identity has not resolved; run `locald up` from its worktree to reconcile it."
-                            .to_owned(),
-                    )),
                 )
             }
-            LifecycleTargetResolution::UnregisteredPhysical { .. } => (
-                None,
-                None,
-                CatalogPresence::Missing,
-                Some((
-                    "unregistered",
-                    "This project is not registered; run `locald up` to make it available."
-                        .to_owned(),
-                )),
-            ),
-            LifecycleTargetResolution::Ambiguous => (
-                None,
-                None,
-                CatalogPresence::Missing,
-                Some((
-                    "ambiguous_identity",
-                    "This project path is ambiguous; run `locald up` from the intended worktree."
-                        .to_owned(),
-                )),
-            ),
+            LifecycleTargetResolution::UnregisteredPhysical { .. }
+            | LifecycleTargetResolution::Ambiguous => (None, None, CatalogPresence::Missing),
         };
 
         let attachments = {
@@ -6538,7 +6535,7 @@ impl ProcessManager {
                     ))
                 }),
             None => unresolved_reason.map(|(code, reason)| {
-                Self::inactive_project_availability(presence, code, reason)
+                Self::inactive_project_availability(presence, code, reason.to_owned())
             }),
         };
 
@@ -6593,6 +6590,7 @@ impl ProcessManager {
         for path in all_projects {
             let canonical = Self::canonicalize_path(&path);
             let resolution = self.resolve_lifecycle_projection(&canonical).await;
+            let unresolved_reason = Self::unresolved_project_availability_reason(&resolution);
             let (instance_id, project_name, pinned, presence, attachments_for) = match resolution {
                 LifecycleTargetResolution::Catalogued(target) => {
                     let record = target.catalog_target.instances.get(&target.instance_id);
@@ -6649,7 +6647,9 @@ impl ProcessManager {
                                 .to_owned(),
                         ))
                     }),
-                None => None,
+                None => unresolved_reason.map(|(code, reason)| {
+                    Self::inactive_project_availability(presence, code, reason.to_owned())
+                }),
             };
             let attachment_section = Self::compatibility_section_for_display(&attachments_for);
             let has_live_demand = availability
@@ -12989,6 +12989,17 @@ PATH = "/usr/bin:/bin"
         assert!(replacement_entry.attachments.is_empty());
         assert!(!replacement_entry.is_running);
         assert_eq!(replacement_entry.section, ProjectSection::Recent);
+        let listed_availability = replacement_entry
+            .availability
+            .as_ref()
+            .expect("unregistered project list entry still explains lifecycle state");
+        assert_eq!(listed_availability.state, ProjectLifecycleState::Missing);
+        assert!(
+            listed_availability
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "unregistered")
+        );
         for filter in [ProjectFilter::Active, ProjectFilter::Pinned] {
             assert!(
                 manager
