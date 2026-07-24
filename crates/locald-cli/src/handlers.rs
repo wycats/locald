@@ -30,6 +30,8 @@ use crate::{
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
 
+const LEGACY_AVAILABILITY_MESSAGE: &str = "Availability: unavailable (the running daemon does not provide semantic lifecycle status; run `sudo locald admin setup` to update it)";
+
 #[derive(Debug, Serialize)]
 struct JsonServiceAction {
     service: String,
@@ -138,6 +140,10 @@ const fn manual_follow_renewal_should_continue(response: &CliResult<IpcResponse>
     }
 }
 
+fn project_readiness_error(message: impl std::fmt::Display) -> CliError {
+    CliError::message(format!("Failed to make project ready: {message}"))
+}
+
 fn format_status_time(time: std::time::SystemTime) -> String {
     let time: chrono::DateTime<chrono::Local> = time.into();
     time.format("%Y-%m-%d %H:%M:%S %Z").to_string()
@@ -197,7 +203,7 @@ fn print_project_status(info: &ProjectStatusInfo) {
     if let Some(availability) = &info.availability {
         print_availability(availability);
     } else {
-        println!("Availability: legacy state");
+        println!("{LEGACY_AVAILABILITY_MESSAGE}");
     }
     let urls = info
         .service_details
@@ -638,8 +644,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         break result;
                     }
                     Ok(IpcResponse::Error(message)) => {
-                        cliclack::outro(format!("Failed to make project ready: {message}"))?;
-                        return Err(CliError::message(message));
+                        return Err(project_readiness_error(message));
                     }
                     Ok(response) => {
                         return Err(CliError::message(format!(
@@ -654,7 +659,6 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             attempts += 1;
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         } else {
-                            cliclack::outro(format!("Failed to make project ready: {error}"))?;
                             return Err(error);
                         }
                     }
@@ -2261,6 +2265,22 @@ name = "example"
         assert!(!manual_follow_renewal_should_continue(&Ok(
             IpcResponse::Error("demand rejected".to_owned())
         )));
+    }
+
+    #[test]
+    fn semantic_status_legacy_fallback_explains_the_upgrade_path() {
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("running daemon"));
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("semantic lifecycle status"));
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("sudo locald admin setup"));
+    }
+
+    #[test]
+    fn project_readiness_failure_is_rendered_once_by_the_error_handler() {
+        let error = project_readiness_error("readiness timed out");
+        assert_eq!(
+            error.to_string(),
+            "Failed to make project ready: readiness timed out"
+        );
     }
 
     #[test]
