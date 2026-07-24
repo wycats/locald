@@ -123,6 +123,14 @@ fn resolve_up_target(
     )
 }
 
+fn resolve_project_stop_target(current_dir: &std::path::Path) -> CliResult<std::path::PathBuf> {
+    nearest_project_root(current_dir).ok_or_else(|| {
+        CliError::message(
+            "No locald.toml found in current directory or its parents. Please specify a service name.",
+        )
+    })
+}
+
 fn resolve_service_name(name: &str) -> CliResult<String> {
     let current_dir = std::env::current_dir()?;
     let config_path = nearest_project_root(&current_dir)
@@ -732,18 +740,14 @@ pub fn run(cli: Cli) -> CliResult<()> {
         Commands::Stop { name, json } => {
             if name.is_none() {
                 let current_dir = std::env::current_dir()?;
-                let config_path = current_dir.join("locald.toml");
-                if !config_path.exists() {
-                    return Err(CliError::message(
-                        "No locald.toml found in current directory. Please specify a service name.",
-                    ));
-                }
+                let project_root = resolve_project_stop_target(&current_dir)?;
+                let config_path = project_root.join("locald.toml");
                 let json_actions = if *json {
                     Some(project_stop_json_actions(&config_path)?)
                 } else {
                     None
                 };
-                let project_path = resolve_project_locator(&current_dir)?;
+                let project_path = resolve_project_locator(&project_root)?;
                 utils::ensure_daemon_running()?;
                 match client::send_request(&IpcRequest::PauseProject {
                     project_path: project_path.clone(),
@@ -2268,6 +2272,25 @@ mod tests {
             explicit
         );
         assert_eq!(resolve_up_target(None, directory.path()), directory.path());
+    }
+
+    #[test]
+    fn ambient_project_stop_targets_the_nearest_project_root() {
+        let directory = tempfile::tempdir().expect("create ambient-stop directory");
+        let project_root = directory.path().join("project");
+        let nested = project_root.join("packages/app/src");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+        std::fs::write(
+            project_root.join("locald.toml"),
+            "[project]\nname = \"project\"\n",
+        )
+        .expect("write project config");
+
+        assert_eq!(
+            resolve_project_stop_target(&nested).expect("resolve nested project"),
+            project_root
+        );
+        assert!(resolve_project_stop_target(directory.path()).is_err());
     }
 
     #[test]
