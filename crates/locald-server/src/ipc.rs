@@ -2,12 +2,14 @@ use crate::ShutdownReason;
 use crate::container::ContainerManager;
 use crate::manager::{InstanceLogEntry, ProcessManager};
 use anyhow::{Context, Result};
-use locald_core::attachments::{AttachmentSource, ManualCliSession};
+use locald_core::attachments::{AttachmentSource, EditorSession, ManualCliSession};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::{DaemonIdentity, LogEntry, MAX_IPC_REQUEST_BYTES};
 use locald_core::{DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc::Sender};
@@ -85,6 +87,45 @@ fn authenticated_peer_pid(stream: &UnixStream) -> Result<u32> {
     let pid = u32::try_from(pid).context("kernel-authenticated IPC peer process ID was invalid")?;
     anyhow::ensure!(pid > 0, "kernel-authenticated IPC peer process ID was zero");
     Ok(pid)
+}
+
+fn process_descends_from(peer_pid: u32, host_pid: u32) -> bool {
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    let mut current = sysinfo::Pid::from_u32(peer_pid);
+    let host = sysinfo::Pid::from_u32(host_pid);
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        let Some(parent) = system.process(current).and_then(sysinfo::Process::parent) else {
+            return false;
+        };
+        if parent == host {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn validate_editor_session(stream: &UnixStream, editor: &EditorSession) -> Result<()> {
+    editor.validate()?;
+    let socket_owner_uid = stream
+        .peer_cred()
+        .context("failed to read kernel-authenticated editor IPC credentials")?
+        .uid();
+    let daemon_uid = nix::unistd::geteuid().as_raw();
+    anyhow::ensure!(
+        socket_owner_uid == daemon_uid,
+        "VS Code adapter UID {socket_owner_uid} does not match locald daemon UID {daemon_uid}"
+    );
+    let cli_process_id = authenticated_peer_pid(stream)?;
+    anyhow::ensure!(
+        process_descends_from(cli_process_id, editor.host_pid()),
+        "VS Code host PID {} is not an ancestor of kernel-authenticated IPC peer PID {cli_process_id}",
+        editor.host_pid()
+    );
+    Ok(())
 }
 
 fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -> Result<()> {
@@ -593,6 +634,40 @@ async fn handle_connection(
             Ok(entries) => IpcResponse::ProjectList(entries),
             Err(e) => IpcResponse::Error(e.to_string()),
         },
+        IpcRequest::EditorEnsureProject {
+            project_path,
+            editor,
+        } => match validate_editor_session(&stream, &editor) {
+            Ok(()) => match manager.editor_ensure_project(project_path, &editor).await {
+                Ok(result) => IpcResponse::ProjectEnsured(result),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::EditorRenewProject {
+            project_path,
+            editor,
+        } => match validate_editor_session(&stream, &editor) {
+            Ok(()) => match manager.editor_renew_project(&project_path, &editor).await {
+                Ok(true) => IpcResponse::Ok,
+                Ok(false) => IpcResponse::Error(
+                    "the VS Code window demand is no longer live; refocus the window or explicitly resume the project"
+                        .to_owned(),
+                ),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::EditorReleaseProject {
+            project_path,
+            editor,
+        } => match validate_editor_session(&stream, &editor) {
+            Ok(()) => match manager.editor_release_project(project_path, &editor).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
         IpcRequest::EnsureProject {
             project_path,
             demand,
@@ -719,6 +794,31 @@ mod tests {
         .expect("authenticate CLI attachment source");
 
         assert_eq!(source, AttachmentSource::CLI { pid: peer_pid });
+    }
+
+    #[tokio::test]
+    async fn editor_session_requires_the_live_ipc_peer_ancestor() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let peer_pid = authenticated_peer_pid(&server).expect("authenticate IPC peer PID");
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+        );
+        let parent_pid = system
+            .process(sysinfo::Pid::from_u32(peer_pid))
+            .and_then(sysinfo::Process::parent)
+            .map(sysinfo::Pid::as_u32)
+            .expect("test process has a live parent");
+        let editor = EditorSession::new("window-a".to_owned(), parent_pid)
+            .expect("construct editor session");
+
+        validate_editor_session(&server, &editor)
+            .expect("kernel-observed parent authenticates editor host");
+
+        let spoofed = EditorSession::new("window-a".to_owned(), peer_pid)
+            .expect("construct spoofed editor session");
+        let error = validate_editor_session(&server, &spoofed)
+            .expect_err("the IPC client cannot claim itself as the editor host");
+        assert!(error.to_string().contains("is not an ancestor"));
     }
 
     #[test]

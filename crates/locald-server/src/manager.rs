@@ -20,8 +20,8 @@ use directories::ProjectDirs;
 use futures_util::StreamExt;
 use locald_core::attachments::{
     Attachment, AttachmentCompatibilityEvidence, AttachmentSource, AttachmentStore,
-    AttachmentStoreSnapshot, ManualCliSession, ProjectFilter, ProjectListEntry, ProjectSection,
-    ProjectStatusInfo,
+    AttachmentStoreSnapshot, EditorSession, ManualCliSession, ProjectFilter, ProjectListEntry,
+    ProjectSection, ProjectStatusInfo,
 };
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{
@@ -486,6 +486,12 @@ struct CataloguedStartRequest {
     manual_cli_session: Option<ManualCliSession>,
     legacy_cli_peer_pid: Option<u32>,
     trusted_launch_path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachmentDemandActivity {
+    Compatibility,
+    SemanticEnsure,
 }
 
 #[derive(Debug, Default)]
@@ -4550,8 +4556,14 @@ impl ProcessManager {
         project_path: PathBuf,
         source: AttachmentSource,
     ) -> Result<()> {
-        self.project_attach_with_convergence(project_path, source, true)
-            .await
+        self.project_attach_with_convergence(
+            project_path,
+            source,
+            true,
+            AttachmentDemandActivity::Compatibility,
+        )
+        .await
+        .map(drop)
     }
 
     pub(crate) async fn project_attach_from_ipc(
@@ -4562,7 +4574,47 @@ impl ProcessManager {
     ) -> Result<()> {
         let converge_after_publication =
             standalone || !matches!(&source, AttachmentSource::CLI { .. });
-        self.project_attach_with_convergence(project_path, source, converge_after_publication)
+        self.project_attach_with_convergence(
+            project_path,
+            source,
+            converge_after_publication,
+            AttachmentDemandActivity::Compatibility,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub(crate) async fn editor_ensure_project(
+        &self,
+        project_path: PathBuf,
+        editor: &EditorSession,
+    ) -> Result<EnsureProjectResult> {
+        self.project_attach_with_convergence(
+            project_path,
+            editor.attachment_source(),
+            true,
+            AttachmentDemandActivity::SemanticEnsure,
+        )
+        .await?
+        .context("semantic editor ensure completed without a readiness result")
+    }
+
+    pub(crate) async fn editor_renew_project(
+        &self,
+        project_path: &Path,
+        editor: &EditorSession,
+    ) -> Result<bool> {
+        let demand = availability_demand_for_attachment_source(&editor.attachment_source())?
+            .context("VS Code editor session did not produce an availability demand")?;
+        self.project_renew_availability(project_path, &demand).await
+    }
+
+    pub(crate) async fn editor_release_project(
+        &self,
+        project_path: PathBuf,
+        editor: &EditorSession,
+    ) -> Result<()> {
+        self.project_detach(project_path, Some(editor.attachment_source()))
             .await
     }
 
@@ -4572,7 +4624,8 @@ impl ProcessManager {
         project_path: PathBuf,
         source: AttachmentSource,
         converge_after_publication: bool,
-    ) -> Result<()> {
+        activity: AttachmentDemandActivity,
+    ) -> Result<Option<EnsureProjectResult>> {
         anyhow::ensure!(
             !matches!(&source, AttachmentSource::Runtime),
             "Runtime attachment evidence is accepted only from persisted legacy state"
@@ -4582,7 +4635,8 @@ impl ProcessManager {
             "Manual CLI owners are published atomically by their paired Start request"
         );
         if matches!(&source, AttachmentSource::Pin) {
-            return self.registry_set_always_on(&project_path, true).await;
+            self.registry_set_always_on(&project_path, true).await?;
+            return Ok(None);
         }
         self.ensure_accepting_lifecycle_requests()?;
         let demand = availability_demand_for_attachment_source(&source)?
@@ -4671,13 +4725,15 @@ impl ProcessManager {
                 include_deferred,
             )?
             .contains(&demand);
+            let clears_compatibility_pause =
+                !renews_existing_owner || activity == AttachmentDemandActivity::SemanticEnsure;
             for path in &lifecycle_paths {
                 if Self::attachment_path_is_owned_by_target(&reaped, &target, path)
                     || (include_deferred
                         && Self::attachment_path_can_initialize_target(&reaped, &target, path))
                 {
                     candidate.detach(path, &source);
-                    if !renews_existing_owner {
+                    if clears_compatibility_pause {
                         candidate.clear_stopped(path);
                     }
                 }
@@ -4688,7 +4744,7 @@ impl ProcessManager {
                 created_at: effective_at,
             })?;
             candidate.set_instance_owner(&canonical, instance_id);
-            if !renews_existing_owner {
+            if clears_compatibility_pause {
                 candidate.clear_stopped(&canonical);
             }
             (base, candidate.snapshot(), renews_existing_owner)
@@ -4721,7 +4777,7 @@ impl ProcessManager {
             // the session-owned Manual demand is provenance-specific.
             batch.push(AvailabilityBatchOperation::ReleaseDemand(demand));
         }
-        if renews_existing_owner {
+        if renews_existing_owner && activity == AttachmentDemandActivity::Compatibility {
             // Legacy ProjectAttach is also used automatically after VS Code
             // rediscovers a daemon. Keep an established owner passive so that
             // recovery cannot cross a user pause. a.3.5 splits semantic editor
@@ -4765,7 +4821,30 @@ impl ProcessManager {
             if let AttachmentSource::CLI { pid } = source {
                 self.converge_legacy_cli_after_process_exit(instance_id, pid);
             }
-            return Ok(());
+            return Ok(None);
+        }
+        if activity == AttachmentDemandActivity::SemanticEnsure {
+            let coordinator = self.availability_coordinator(instance_id).await;
+            let _runtime_guard = coordinator.runtime.lock().await;
+            self.clear_service_stop_suppressions(instance_id).await;
+            let decision = self
+                .converge_managed_instance_locked(instance_id, None, false, true)
+                .await?;
+            if !matches!(decision, ConvergenceDecision::EnsureUp) {
+                return Err(AvailabilityStartSuperseded {
+                    instance_id,
+                    decision,
+                }
+                .into());
+            }
+            self.sync_hosts()
+                .await
+                .context("failed to synchronize editor project domain claims")?;
+            let result = self.ensure_project_result(instance_id).await?;
+            let _publication_guard = self.lifecycle_publication_lock.lock().await;
+            self.availability_authorizes_start_locked(instance_id)
+                .await?;
+            return Ok(Some(result));
         }
         if renews_existing_owner {
             self.converge_managed_instance(instance_id, None, false, false)
@@ -4777,7 +4856,7 @@ impl ProcessManager {
             self.converge_managed_instance_locked(instance_id, None, false, false)
                 .await?;
         }
-        Ok(())
+        Ok(None)
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -6156,11 +6235,26 @@ impl ProcessManager {
                 .attachments
                 .into_iter()
                 .map(|mut attachment| {
-                    if let AttachmentSource::ManualCLI(session) = attachment.source {
-                        // The retry-stable session UUID is daemon-owned lifecycle
-                        // provenance. Compatibility status keeps the safe owner
-                        // category and process label without publishing that ID.
-                        attachment.source = AttachmentSource::CLI { pid: session.pid() };
+                    match attachment.source {
+                        AttachmentSource::ManualCLI(session) => {
+                            // The retry-stable session UUID is daemon-owned lifecycle
+                            // provenance. Compatibility status keeps the safe owner
+                            // category and process label without publishing that ID.
+                            attachment.source = AttachmentSource::CLI { pid: session.pid() };
+                        }
+                        AttachmentSource::Editor { name, .. } => {
+                            // Window IDs and extension-host PIDs are private
+                            // adapter provenance. Availability status already
+                            // carries the safe owner category and lease.
+                            attachment.source = AttachmentSource::Editor {
+                                name,
+                                id: "<private>".to_owned(),
+                                pid: None,
+                            };
+                        }
+                        AttachmentSource::CLI { .. }
+                        | AttachmentSource::Runtime
+                        | AttachmentSource::Pin => {}
                     }
                     attachment
                 })
@@ -11057,6 +11151,221 @@ mod tests {
             .expect("read detached availability");
         assert!(detached.demands().is_empty());
         assert!(detached.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn semantic_editor_ensure_resumes_pause_and_waits_for_readiness() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("semantic-editor-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "semantic-editor",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        write_availability_worker_config(
+            &project_path,
+            "semantic-editor",
+            "semantic-editor.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let editor = EditorSession::new("window-a".to_owned(), std::process::id())
+            .expect("construct editor session");
+
+        let first = manager
+            .editor_ensure_project(project_path.clone(), &editor)
+            .await
+            .expect("activate editor project");
+        assert_eq!(first.state, EnsureProjectState::Ready);
+        assert!(first.urls.is_empty(), "portless workers have no routed URL");
+        assert_eq!(first.services.len(), 1);
+        assert_eq!(first.services[0].status, ServiceState::Running);
+        assert_eq!(first.services[0].health_status, HealthStatus::Healthy);
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect editor project");
+        assert!(matches!(
+            status.attachments.as_slice(),
+            [Attachment {
+                source:
+                    AttachmentSource::Editor {
+                        name,
+                        id,
+                        pid: None,
+                    },
+                ..
+            }] if name == "vscode" && id == "<private>"
+        ));
+        let rendered_attachments =
+            serde_json::to_string(&status.attachments).expect("serialize editor attachments");
+        assert!(!rendered_attachments.contains("window-a"));
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause editor project");
+        assert!(
+            manager
+                .editor_renew_project(&project_path, &editor)
+                .await
+                .expect("passively renew paused editor")
+        );
+        let paused = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load paused editor availability")
+            .snapshot()
+            .await
+            .expect("read paused editor availability");
+        assert!(paused.is_paused());
+        assert!(!manager.project_runtime_exists(instance_id).await);
+
+        let resumed = manager
+            .editor_ensure_project(project_path.clone(), &editor)
+            .await
+            .expect("semantic refocus resumes editor project");
+        assert_eq!(resumed.state, EnsureProjectState::Ready);
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        let resumed_availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load resumed editor availability")
+            .snapshot()
+            .await
+            .expect("read resumed editor availability");
+        assert!(!resumed_availability.is_paused());
+        assert_eq!(resumed_availability.demands().len(), 1);
+
+        manager
+            .editor_release_project(project_path, &editor)
+            .await
+            .expect("release editor project");
+        let released = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load released editor availability")
+            .snapshot()
+            .await
+            .expect("read released editor availability");
+        assert!(released.demands().is_empty());
+        assert!(released.shutdown_cooldown_until().is_some());
+    }
+
+    #[tokio::test]
+    async fn passive_editor_renewal_does_not_recreate_an_expired_owner() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("expired-editor-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "expired-editor",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        write_availability_worker_config(
+            &project_path,
+            "expired-editor",
+            "expired-editor.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let editor = EditorSession::new("window-expired".to_owned(), std::process::id())
+            .expect("construct editor session");
+        manager
+            .editor_ensure_project(project_path.clone(), &editor)
+            .await
+            .expect("activate editor project");
+
+        clock.advance(locald_core::VSCODE_DEMAND_TTL);
+        assert!(
+            !manager
+                .editor_renew_project(&project_path, &editor)
+                .await
+                .expect("reject expired editor heartbeat")
+        );
+        let expired = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load expired editor availability")
+            .snapshot()
+            .await
+            .expect("read expired editor availability");
+        assert!(expired.demands().is_empty());
+        assert_eq!(
+            expired.shutdown_cooldown_until(),
+            Some(clock.time() + locald_core::SHUTDOWN_COOLDOWN)
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_one_editor_owner_preserves_another() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("multiple-editor-project");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "multiple-editor").await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        write_availability_worker_config(
+            &project_path,
+            "multiple-editor",
+            "multiple-editor.localhost",
+            &["web"],
+        );
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let first = EditorSession::new("window-a".to_owned(), std::process::id())
+            .expect("construct first editor session");
+        let second = EditorSession::new("window-b".to_owned(), std::process::id())
+            .expect("construct second editor session");
+        manager
+            .editor_ensure_project(project_path.clone(), &first)
+            .await
+            .expect("activate first editor");
+        manager
+            .editor_ensure_project(project_path.clone(), &second)
+            .await
+            .expect("activate second editor");
+
+        manager
+            .editor_release_project(project_path, &first)
+            .await
+            .expect("release first editor");
+        let remaining = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load multiple editor availability")
+            .snapshot()
+            .await
+            .expect("read remaining editor availability");
+        assert_eq!(remaining.demands().len(), 1);
+        assert!(remaining.shutdown_cooldown_until().is_none());
+        assert!(manager.project_runtime_is_ready(instance_id).await);
     }
 
     #[tokio::test]

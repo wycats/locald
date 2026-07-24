@@ -1,7 +1,8 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
 use locald_core::attachments::{
-    AttachmentSource, ProjectFilter, ProjectListEntry, ProjectSection, ProjectStatusInfo,
+    AttachmentSource, EditorSession, ProjectFilter, ProjectListEntry, ProjectSection,
+    ProjectStatusInfo,
 };
 use locald_core::ipc::EnsureProjectResult;
 use locald_core::{DemandKey, IpcRequest, IpcResponse, LocaldConfig, ProjectAvailabilityStatus};
@@ -16,7 +17,8 @@ use crate::build;
 use crate::cli::TrayCommands;
 use crate::cli::{
     AddServiceType, AdminCommands, AiCommands, Cli, Commands, ConfigCommands, DebugCommands,
-    ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands, SurfaceCommands,
+    EditorCommands, ProjectCommands, RegistryCommands, ServerCommands, ServiceCommands,
+    SurfaceCommands,
 };
 #[cfg(feature = "experimental-plugins")]
 use crate::cli::{DistributionCommands, PluginCommands};
@@ -1692,6 +1694,110 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 .spawn();
         }
         Commands::Project { command } => match command {
+            ProjectCommands::Editor { command } => {
+                utils::ensure_daemon_running()?;
+                match command {
+                    EditorCommands::Ensure {
+                        path,
+                        window_id,
+                        host_pid,
+                        json,
+                    } => {
+                        let project_path = resolve_project_locator(path)?;
+                        let editor = EditorSession::new(window_id.clone(), *host_pid)
+                            .map_err(|error| CliError::message(format!("{error:#}")))?;
+                        match client::send_request(&IpcRequest::EditorEnsureProject {
+                            project_path,
+                            editor,
+                        }) {
+                            Ok(IpcResponse::ProjectEnsured(result)) => {
+                                if *json {
+                                    println!("{}", serde_json::to_string_pretty(&result)?);
+                                } else {
+                                    print_ensure_result(&result, false)?;
+                                }
+                            }
+                            Ok(IpcResponse::Error(message)) => {
+                                return Err(project_readiness_error(message));
+                            }
+                            Ok(response) => {
+                                return Err(CliError::message(format!(
+                                    "Unexpected response: {response:?}"
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    EditorCommands::Renew {
+                        path,
+                        window_id,
+                        host_pid,
+                        json,
+                    } => {
+                        let project_path = resolve_project_locator(path)?;
+                        let editor = EditorSession::new(window_id.clone(), *host_pid)
+                            .map_err(|error| CliError::message(format!("{error:#}")))?;
+                        match client::send_request(&IpcRequest::EditorRenewProject {
+                            project_path,
+                            editor,
+                        }) {
+                            Ok(IpcResponse::Ok) => {
+                                if *json {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&JsonProjectAction {
+                                            status: "renewed".to_owned(),
+                                        })?
+                                    );
+                                }
+                            }
+                            Ok(IpcResponse::Error(message)) => {
+                                return Err(CliError::message(message));
+                            }
+                            Ok(response) => {
+                                return Err(CliError::message(format!(
+                                    "Unexpected response: {response:?}"
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    EditorCommands::Release {
+                        path,
+                        window_id,
+                        host_pid,
+                        json,
+                    } => {
+                        let project_path = resolve_project_locator(path)?;
+                        let editor = EditorSession::new(window_id.clone(), *host_pid)
+                            .map_err(|error| CliError::message(format!("{error:#}")))?;
+                        match client::send_request(&IpcRequest::EditorReleaseProject {
+                            project_path,
+                            editor,
+                        }) {
+                            Ok(IpcResponse::Ok) => {
+                                if *json {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&JsonProjectAction {
+                                            status: "released".to_owned(),
+                                        })?
+                                    );
+                                }
+                            }
+                            Ok(IpcResponse::Error(message)) => {
+                                return Err(CliError::message(message));
+                            }
+                            Ok(response) => {
+                                return Err(CliError::message(format!(
+                                    "Unexpected response: {response:?}"
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
             ProjectCommands::Attach {
                 path,
                 source,
