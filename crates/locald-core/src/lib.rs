@@ -83,10 +83,11 @@ pub mod storage;
 pub use availability::{
     AGENT_ACTIVE_TTL, AGENT_DEMAND_TTL, AGENT_REVIEW_GRACE, AVAILABILITY_VERSION,
     AvailabilityBatch, AvailabilityBatchApplyResult, AvailabilityBatchDisposition,
-    AvailabilityBatchOperation, AvailabilityError, AvailabilityStateImage, AvailabilityStore,
-    Clock, ConvergenceDecision, DemandKey, DemandKeyError, DemandKind, DemandLease,
-    EnsureDemandEffect, EnsureDemandResult, LEGACY_PROCESS_DEMAND_TTL, MANUAL_DEMAND_TTL,
-    PreparedAvailabilityBatch, ProjectAvailability, RenewDemandResult, SHUTDOWN_COOLDOWN,
+    AvailabilityBatchOperation, AvailabilityDemandStatus, AvailabilityError, AvailabilityReason,
+    AvailabilityStateImage, AvailabilityStore, Clock, ConvergenceDecision, DemandKey,
+    DemandKeyError, DemandKind, DemandLease, EnsureDemandEffect, EnsureDemandResult,
+    LEGACY_PROCESS_DEMAND_TTL, MANUAL_DEMAND_TTL, PreparedAvailabilityBatch, ProjectAvailability,
+    ProjectAvailabilityStatus, ProjectLifecycleState, RenewDemandResult, SHUTDOWN_COOLDOWN,
     SystemClock, VSCODE_DEMAND_TTL, VSCODE_RENEWAL_INTERVAL, availability_path,
 };
 #[doc(inline)]

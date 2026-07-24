@@ -1,11 +1,12 @@
 use crate::ShutdownReason;
 use crate::container::ContainerManager;
-use crate::manager::ProcessManager;
+use crate::manager::{InstanceLogEntry, ProcessManager};
 use anyhow::{Context, Result};
 use locald_core::attachments::{AttachmentSource, ManualCliSession};
 use locald_core::config::LocaldConfig;
-use locald_core::ipc::{DaemonIdentity, MAX_IPC_REQUEST_BYTES};
-use locald_core::{DemandKey, IpcRequest, IpcResponse};
+use locald_core::ipc::{DaemonIdentity, LogEntry, MAX_IPC_REQUEST_BYTES};
+use locald_core::{DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -96,6 +97,55 @@ fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -
     Ok(())
 }
 
+fn project_logs_resolution_error(path: &Path, error: &anyhow::Error) -> String {
+    format!(
+        "project-scoped logs are unavailable for `{}`: {error:#}; run `locald up` from that project first, or run `locald logs` outside a locald project to inspect all daemon logs",
+        path.display()
+    )
+}
+
+enum LogSubscription {
+    Global(broadcast::Receiver<LogEntry>),
+    Project {
+        instance_id: ProjectInstanceId,
+        receiver: broadcast::Receiver<InstanceLogEntry>,
+    },
+}
+
+impl LogSubscription {
+    async fn recv(&mut self) -> Result<LogEntry, broadcast::error::RecvError> {
+        match self {
+            Self::Global(receiver) => receiver.recv().await,
+            Self::Project {
+                instance_id,
+                receiver,
+            } => loop {
+                match receiver.recv().await {
+                    Ok(scoped_entry) if scoped_entry.instance_id == *instance_id => {
+                        return Ok(scoped_entry.entry);
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+            },
+        }
+    }
+}
+
+fn subscribe_to_logs(
+    project_instance_id: Option<ProjectInstanceId>,
+    global_sender: &broadcast::Sender<LogEntry>,
+    instance_sender: &broadcast::Sender<InstanceLogEntry>,
+) -> LogSubscription {
+    project_instance_id.map_or_else(
+        || LogSubscription::Global(global_sender.subscribe()),
+        |instance_id| LogSubscription::Project {
+            instance_id,
+            receiver: instance_sender.subscribe(),
+        },
+    )
+}
+
 fn authenticate_process_bound_attachment_source(
     stream: &UnixStream,
     source: AttachmentSource,
@@ -173,6 +223,10 @@ async fn read_request(stream: &mut UnixStream) -> Result<Option<IpcRequest>> {
     }
 }
 
+// The compatibility dispatcher still owns the full legacy IPC enum while it
+// routes each request. Keep that known boundary explicit until the legacy
+// protocol is retired rather than spreading the match across public helpers.
+#[allow(clippy::large_futures, clippy::large_stack_frames)]
 async fn handle_connection(
     mut stream: UnixStream,
     manager: ProcessManager,
@@ -242,9 +296,31 @@ async fn handle_connection(
         return Ok(());
     }
 
-    if let IpcRequest::Logs { service, mode } = request {
-        let mut rx = manager.log_sender.subscribe();
-        let recent = manager.get_recent_logs();
+    if let IpcRequest::Logs {
+        service,
+        project_path,
+        mode,
+    } = request
+    {
+        let project_instance_id = match project_path {
+            Some(project_path) => match manager.project_instance_for_logs(&project_path).await {
+                Ok(instance_id) => Some(instance_id),
+                Err(error) => {
+                    let message = project_logs_resolution_error(&project_path, &error);
+                    let mut bytes = serde_json::to_vec(&IpcResponse::Error(message))?;
+                    bytes.push(b'\n');
+                    stream.write_all(&bytes).await?;
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        let mut subscription = subscribe_to_logs(
+            project_instance_id,
+            &manager.log_sender,
+            &manager.instance_log_sender,
+        );
+        let recent = manager.get_recent_logs_for_instance(project_instance_id);
 
         for entry in recent {
             if let Some(ref s) = service
@@ -263,7 +339,7 @@ async fn handle_connection(
         }
 
         loop {
-            match rx.recv().await {
+            match subscription.recv().await {
                 Ok(entry) => {
                     if let Some(ref s) = service
                         && &entry.service != s
@@ -281,6 +357,50 @@ async fn handle_connection(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+        return Ok(());
+    }
+
+    if let IpcRequest::EnsureProject {
+        project_path,
+        demand,
+        verbose: true,
+        launch_path,
+    } = &request
+    {
+        let authenticated_launch_path = validate_generic_ensure_demand(demand)
+            .and_then(|()| authenticate_ensure_launch_path(&stream, demand, launch_path.clone()));
+        let launch_path = match authenticated_launch_path {
+            Ok(launch_path) => launch_path,
+            Err(error) => {
+                let mut bytes = serde_json::to_vec(&IpcResponse::Error(format!("{error:#}")))?;
+                bytes.push(b'\n');
+                stream.write_all(&bytes).await?;
+                return Ok(());
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let manager = manager.clone();
+        let project_path = project_path.clone();
+        let demand = demand.clone();
+        let handle = tokio::spawn(async move {
+            manager
+                .ensure_project_from_ipc_with_events(project_path, demand, launch_path, tx)
+                .await
+        });
+
+        while let Some(event) = rx.recv().await {
+            let mut bytes = serde_json::to_vec(&event)?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+        }
+
+        let response = match handle.await? {
+            Ok(result) => IpcResponse::ProjectEnsured(result),
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        };
+        let mut bytes = serde_json::to_vec(&response)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
         return Ok(());
     }
 
@@ -476,6 +596,7 @@ async fn handle_connection(
         IpcRequest::EnsureProject {
             project_path,
             demand,
+            verbose: _,
             launch_path,
         } => match validate_generic_ensure_demand(&demand) {
             Ok(()) => {
@@ -492,6 +613,35 @@ async fn handle_connection(
                     Err(error) => IpcResponse::Error(format!("{error:#}")),
                 }
             }
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::RenewProjectDemand {
+            project_path,
+            demand,
+        } => match validate_generic_ensure_demand(&demand) {
+            Ok(()) => match manager
+                .project_renew_availability(&project_path, &demand)
+                .await
+            {
+                Ok(true) => IpcResponse::Ok,
+                Ok(false) => IpcResponse::Error(
+                    "the project demand is no longer live; run `locald up` again".to_owned(),
+                ),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::PauseProject { project_path } => {
+            match manager.project_pause_availability(&project_path).await {
+                Ok(_) => IpcResponse::Ok,
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            }
+        }
+        IpcRequest::SetAlwaysOn {
+            project_path,
+            enabled,
+        } => match manager.project_set_always_on(&project_path, enabled).await {
+            Ok(()) => IpcResponse::Ok,
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectForceStart { project_path } => {
@@ -582,6 +732,39 @@ mod tests {
         assert!(error.to_string().contains("accepts only ownerless demands"));
         validate_generic_ensure_demand(&DemandKey::manual_cli())
             .expect("generic IPC accepts ownerless Manual CLI demand");
+    }
+
+    #[test]
+    fn scoped_log_resolution_failure_explains_both_recovery_paths() {
+        let error = anyhow::anyhow!("project is not registered in the identity catalog");
+        let message = project_logs_resolution_error(Path::new("/tmp/example"), &error);
+
+        assert!(message.contains("project-scoped logs are unavailable for `/tmp/example`"));
+        assert!(message.contains("run `locald up` from that project first"));
+        assert!(message.contains("run `locald logs` outside a locald project"));
+        assert!(message.contains("not registered in the identity catalog"));
+    }
+
+    #[tokio::test]
+    async fn unscoped_logs_subscribe_to_the_global_daemon_stream() {
+        let (global_sender, _) = broadcast::channel(4);
+        let (instance_sender, _) = broadcast::channel(4);
+        let mut subscription = subscribe_to_logs(None, &global_sender, &instance_sender);
+        let entry = LogEntry {
+            timestamp: 0,
+            service: "locald".to_owned(),
+            stream: locald_core::ipc::LogStream::Stdout,
+            message: "daemon diagnostic".to_owned(),
+        };
+
+        global_sender
+            .send(entry.clone())
+            .expect("publish daemon log");
+
+        assert_eq!(
+            subscription.recv().await.expect("receive daemon log"),
+            entry
+        );
     }
 
     #[tokio::test]

@@ -24,13 +24,11 @@ command = "sleep 300"
     assert!(output.status.success());
 
     // 3. Check status
-    let output = ctx.run_cli(&["status"]).await?;
+    let project = project_path.to_string_lossy();
+    let output = ctx.run_cli(&["status", project.as_ref()]).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("myservice"));
-    assert!(stdout.contains("Running"));
-
-    // 4. Check logs
-    assert!(stdout.contains("Running"));
+    assert!(stdout.contains("Availability: Ready (desired up)"));
+    assert!(stdout.contains("test-proj:myservice: running"));
 
     // 4. Check logs
     // Give it a moment to flush logs
@@ -42,13 +40,15 @@ command = "sleep 300"
     // assert!(stdout.contains("SERVICE STARTED"));
 
     // 5. Stop service
-    let output = ctx.run_cli(&["stop", "test-proj:myservice"]).await?;
+    let output = ctx
+        .run_cli(&["service", "stop", "test-proj:myservice"])
+        .await?;
     assert!(output.status.success());
 
     // 6. Check status again
-    let output = ctx.run_cli(&["status"]).await?;
+    let output = ctx.run_cli(&["status", project.as_ref()]).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Stopped"));
+    assert!(stdout.contains("test-proj:myservice: stopped"));
 
     Ok(())
 }

@@ -265,6 +265,7 @@ pub enum LogMode {
 ///
 /// let req = IpcRequest::Logs {
 ///     service: Some("web".to_string()),
+///     project_path: None,
 ///     mode: LogMode::Follow,
 /// };
 /// ```
@@ -347,10 +348,14 @@ pub enum IpcRequest {
     Shutdown,
     /// Stream logs for a service.
     ///
-    /// **Response:** Stream of `Event::Log(LogEntry)`
+    /// **Response:** Newline-delimited JSON. Successful records are `LogEntry`
+    /// values; project-resolution failures are sent as `IpcResponse::Error`.
     Logs {
         /// Optional service name filter.
         service: Option<String>,
+        /// Optional project locator used to exclude unrelated project logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_path: Option<PathBuf>,
         /// The mode for log streaming (Follow or Snapshot).
         #[serde(default)]
         mode: LogMode,
@@ -436,10 +441,37 @@ pub enum IpcRequest {
         /// An ownerless semantic demand. Trusted editor and agent adapters
         /// derive owner-bearing demands server-side from authenticated context.
         demand: DemandKey,
+        /// Stream boot and build events before the final readiness response.
+        #[serde(default)]
+        verbose: bool,
         /// Trusted host-process search path supplied by an explicit local CLI
         /// ensure. The daemon authenticates the IPC peer before accepting it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_path: Option<String>,
+    },
+    /// Passively renew a live semantic demand without crossing a pause barrier.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    RenewProjectDemand {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+        /// An ownerless demand previously acquired through `EnsureProject`.
+        demand: DemandKey,
+    },
+    /// Pause a project through its current activity generation.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    PauseProject {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+    },
+    /// Enable or disable daemon-owned Always On policy.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    SetAlwaysOn {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+        enabled: bool,
     },
     /// Force-start services for a project.
     ///
@@ -598,7 +630,7 @@ impl ServiceStatus {
 mod tests {
     use super::{
         EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, IpcRequest, IpcResponse,
-        ServiceType,
+        LogMode, ServiceType,
     };
     use crate::attachments::AttachmentSource;
     use crate::availability::DemandKey;
@@ -637,12 +669,16 @@ mod tests {
         let request = IpcRequest::EnsureProject {
             project_path: PathBuf::from("/project/locald.toml"),
             demand: DemandKey::manual_cli(),
+            verbose: true,
             launch_path: Some("/opt/homebrew/bin:/usr/bin".to_owned()),
         };
         let encoded = serde_json::to_value(&request).expect("serialize ensure request");
         let request: IpcRequest =
             serde_json::from_value(encoded).expect("deserialize ensure request");
-        assert!(matches!(request, IpcRequest::EnsureProject { .. }));
+        assert!(matches!(
+            request,
+            IpcRequest::EnsureProject { verbose: true, .. }
+        ));
 
         let response = IpcResponse::ProjectEnsured(EnsureProjectResult {
             project_path: PathBuf::from("/project"),
@@ -687,22 +723,71 @@ mod tests {
         let mut encoded = serde_json::to_value(IpcRequest::EnsureProject {
             project_path: PathBuf::from("/project"),
             demand: DemandKey::manual_cli(),
+            verbose: true,
             launch_path: Some("/usr/bin".to_owned()),
         })
         .expect("serialize EnsureProject request");
-        encoded
+        let ensure_payload = encoded
             .get_mut("EnsureProject")
             .and_then(serde_json::Value::as_object_mut)
-            .expect("EnsureProject payload")
-            .remove("launch_path");
+            .expect("EnsureProject payload");
+        ensure_payload.remove("launch_path");
+        ensure_payload.remove("verbose");
         let ensure: IpcRequest =
             serde_json::from_value(encoded).expect("deserialize legacy EnsureProject request");
         assert!(matches!(
             ensure,
             IpcRequest::EnsureProject {
                 launch_path: None,
+                verbose: false,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn legacy_log_requests_default_to_unscoped_status() {
+        let request: IpcRequest = serde_json::from_value(serde_json::json!({
+            "Logs": {
+                "service": "example:web",
+                "mode": "snapshot"
+            }
+        }))
+        .expect("deserialize legacy Logs request");
+
+        assert_eq!(
+            request,
+            IpcRequest::Logs {
+                service: Some("example:web".to_owned()),
+                project_path: None,
+                mode: LogMode::Snapshot,
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_lifecycle_requests_round_trip() {
+        let project_path = PathBuf::from("/project");
+        let demand = DemandKey::manual_cli();
+        let requests = [
+            IpcRequest::RenewProjectDemand {
+                project_path: project_path.clone(),
+                demand,
+            },
+            IpcRequest::PauseProject {
+                project_path: project_path.clone(),
+            },
+            IpcRequest::SetAlwaysOn {
+                project_path,
+                enabled: true,
+            },
+        ];
+
+        for request in requests {
+            let encoded = serde_json::to_value(&request).expect("serialize lifecycle request");
+            let decoded: IpcRequest =
+                serde_json::from_value(encoded).expect("deserialize lifecycle request");
+            assert_eq!(decoded, request);
+        }
     }
 }

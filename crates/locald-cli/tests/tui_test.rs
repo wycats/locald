@@ -70,6 +70,11 @@ impl TestContext {
                 "XDG_RUNTIME_DIR",
                 home.join(".run").to_string_lossy().to_string(),
             ),
+            // `locald up` now waits for the sandbox HTTPS proxy before
+            // reporting readiness. Use ephemeral listeners so this test stays
+            // isolated from other integration-test daemons.
+            ("LOCALD_HTTP_PORT", "0".to_string()),
+            ("LOCALD_HTTPS_PORT", "0".to_string()),
         ];
 
         // Inherit PATH
@@ -165,19 +170,15 @@ fn test_tui_progress() {
     let mut cmd = StdCommand::new(&ctx.locald_bin);
     cmd.envs(ctx.env());
     cmd.arg("up");
-    cmd.arg("--exit-after-register");
     cmd.arg(&project_dir);
     cmd.arg(format!("--sandbox={}", ctx.sandbox));
 
     // Increase timeout for build
     let mut p = rexpect::session::spawn_command(cmd, Some(30000)).expect("failed to spawn rexpect");
 
-    // Expect TUI output. In test mode `locald up` exits after registration
-    // instead of staying attached to service logs.
-    p.exp_string("Loading configuration")
-        .expect("failed to find Loading configuration");
-    p.exp_string("Project registered")
-        .expect("failed to find Project registered");
+    // `locald up` exits after readiness instead of staying attached to service logs.
+    p.exp_string("is Ready")
+        .expect("failed to find readiness confirmation");
 
     // Wait for process to exit
     p.process.wait().expect("failed to wait");

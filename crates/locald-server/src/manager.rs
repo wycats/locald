@@ -36,11 +36,12 @@ use locald_core::state::{
     ServiceState,
 };
 use locald_core::{
-    AvailabilityBatch, AvailabilityBatchOperation, AvailabilityError, AvailabilityStore,
-    CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DemandKind, DomainClaim,
-    DomainName, DomainTarget, EnsureDemandResult, ProjectAvailability, ProjectDiscovery,
-    ProjectInstanceId, SharedDomainIndex, SystemClock, availability_path,
-    sanitize_project_name_for_dns, sanitize_service_name_for_dns,
+    AvailabilityBatch, AvailabilityBatchOperation, AvailabilityDemandStatus, AvailabilityError,
+    AvailabilityReason, AvailabilityStore, CatalogError, CatalogPresence, Clock,
+    ConvergenceDecision, DemandKey, DemandKind, DomainClaim, DomainName, DomainTarget,
+    EnsureDemandResult, ProjectAvailability, ProjectAvailabilityStatus, ProjectDiscovery,
+    ProjectInstanceId, ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock,
+    availability_path, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -56,6 +57,16 @@ use tracing::{error, info, warn};
 const LOG_BUFFER_SIZE: usize = 2000;
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+const fn demand_kind_code(kind: DemandKind) -> &'static str {
+    match kind {
+        DemandKind::ManualCli => "manual_cli",
+        DemandKind::VsCodeWindow => "vs_code_window",
+        DemandKind::AgentConversation => "agent_conversation",
+        DemandKind::LegacyProcessAttachment => "legacy_process_attachment",
+        DemandKind::StoppedPageResume => "stopped_page_resume",
+    }
+}
 
 // This scope is entered only while holding a shared availability-transition
 // permit. It lets a transition admitted before shutdown finish its semantic
@@ -94,6 +105,12 @@ impl LogBuffer {
 struct InstanceLogBuffer {
     instance_id: ProjectInstanceId,
     logs: LogBuffer,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InstanceLogEntry {
+    pub(crate) instance_id: ProjectInstanceId,
+    pub(crate) entry: LogEntry,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -508,6 +525,7 @@ pub(crate) enum RuntimeSnapshot {
 pub struct ProcessManager {
     services: Arc<Mutex<HashMap<String, Service>>>,
     pub log_sender: broadcast::Sender<LogEntry>,
+    pub(crate) instance_log_sender: broadcast::Sender<InstanceLogEntry>,
     pub event_sender: broadcast::Sender<Event>,
     log_buffers: Arc<StdMutex<HashMap<String, InstanceLogBuffer>>>,
     state_manager: Arc<StateManager>,
@@ -729,6 +747,7 @@ impl ProcessManager {
         } else {
             broadcast::channel(100)
         };
+        let (instance_log_tx, _) = broadcast::channel(100);
         let (event_tx, _) = broadcast::channel(100);
 
         let services = Arc::new(Mutex::new(HashMap::new()));
@@ -763,6 +782,7 @@ impl ProcessManager {
         Ok(Self {
             services,
             log_sender: tx,
+            instance_log_sender: instance_log_tx,
             event_sender: event_tx,
             log_buffers: Arc::new(StdMutex::new(HashMap::new())),
             state_manager,
@@ -869,34 +889,30 @@ impl ProcessManager {
         // Determine service type from config
         let service_type = service_config.map(ServiceType::from).unwrap_or_default();
 
-        // Compute the public URL (domain-based or localhost)
-        let url = if status == locald_core::state::ServiceState::Running && port.is_some() {
-            if let Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) = service_config {
-                None
+        // Owned routed domains remain meaningful while a service is stopped:
+        // the proxy still serves locald's stopped/paused surface there. Raw
+        // localhost URLs remain live-runtime diagnostics.
+        let url = if matches!(service_type, ServiceType::Postgres | ServiceType::Worker) {
+            None
+        } else if let Some(domain) = domain.as_ref() {
+            let (proxy_http, proxy_https) = proxy_ports;
+            if let Some(port) = proxy_https {
+                if port == 443 {
+                    Some(format!("https://{domain}"))
+                } else {
+                    Some(format!("https://{domain}:{port}"))
+                }
+            } else if let Some(port) = proxy_http {
+                if port == 80 {
+                    Some(format!("http://{domain}"))
+                } else {
+                    Some(format!("http://{domain}:{port}"))
+                }
             } else {
-                domain.as_ref().map_or_else(
-                    || port.map(|p| format!("http://localhost:{p}")),
-                    |d| {
-                        let (proxy_http, proxy_https) = proxy_ports;
-                        if let Some(p) = proxy_https {
-                            if p == 443 {
-                                Some(format!("https://{d}"))
-                            } else {
-                                Some(format!("https://{d}:{p}"))
-                            }
-                        } else if let Some(p) = proxy_http {
-                            if p == 80 {
-                                Some(format!("http://{d}"))
-                            } else {
-                                Some(format!("http://{d}:{p}"))
-                            }
-                        } else {
-                            // Default to HTTPS (implied port 443)
-                            Some(format!("https://{d}"))
-                        }
-                    },
-                )
+                Some(format!("https://{domain}"))
             }
+        } else if status == locald_core::state::ServiceState::Running {
+            port.map(|port| format!("http://localhost:{port}"))
         } else {
             None
         };
@@ -1404,20 +1420,44 @@ impl ProcessManager {
         }
 
         // Broadcast (ignore error if no receivers)
+        let _ = self.instance_log_sender.send(InstanceLogEntry {
+            instance_id,
+            entry: entry.clone(),
+        });
         let _ = self.log_sender.send(entry.clone());
         let _ = self.event_sender.send(Event::Log(entry));
     }
 
     #[must_use]
     pub fn get_recent_logs(&self) -> Vec<LogEntry> {
+        self.get_recent_logs_for_instance(None)
+    }
+
+    #[must_use]
+    pub fn get_recent_logs_for_instance(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+    ) -> Vec<LogEntry> {
         #[allow(clippy::expect_used)]
         let buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
         let mut all_logs = Vec::new();
         for buffer in buffers.values() {
+            if instance_id.is_some_and(|instance_id| buffer.instance_id != instance_id) {
+                continue;
+            }
             all_logs.extend(buffer.logs.get_all());
         }
         all_logs.sort_by_key(|e| e.timestamp);
         all_logs
+    }
+
+    pub async fn project_instance_for_logs(
+        &self,
+        project_path: &Path,
+    ) -> Result<ProjectInstanceId> {
+        self.required_availability_instance_for_path(project_path)
+            .await
+            .map(|(instance_id, _)| instance_id)
     }
 
     async fn persist_state_checked(&self) -> Result<()> {
@@ -5153,7 +5193,7 @@ impl ProcessManager {
         project_path: PathBuf,
         demand: DemandKey,
     ) -> Result<EnsureProjectResult> {
-        self.ensure_project_with_trusted_launch_path(project_path, demand, None)
+        self.ensure_project_with_trusted_launch_path(project_path, demand, None, None, false)
             .await
     }
 
@@ -5163,8 +5203,31 @@ impl ProcessManager {
         demand: DemandKey,
         trusted_launch_path: Option<String>,
     ) -> Result<EnsureProjectResult> {
-        self.ensure_project_with_trusted_launch_path(project_path, demand, trusted_launch_path)
-            .await
+        self.ensure_project_with_trusted_launch_path(
+            project_path,
+            demand,
+            trusted_launch_path,
+            None,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_project_from_ipc_with_events(
+        &self,
+        project_path: PathBuf,
+        demand: DemandKey,
+        trusted_launch_path: Option<String>,
+        event_tx: tokio::sync::mpsc::Sender<BootEvent>,
+    ) -> Result<EnsureProjectResult> {
+        self.ensure_project_with_trusted_launch_path(
+            project_path,
+            demand,
+            trusted_launch_path,
+            Some(event_tx),
+            true,
+        )
+        .await
     }
 
     async fn ensure_project_with_trusted_launch_path(
@@ -5172,6 +5235,8 @@ impl ProcessManager {
         project_path: PathBuf,
         demand: DemandKey,
         trusted_launch_path: Option<String>,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
     ) -> Result<EnsureProjectResult> {
         demand
             .validate()
@@ -5244,7 +5309,7 @@ impl ProcessManager {
 
             self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_managed_instance_locked(instance_id, None, false, true)
+                .converge_managed_instance_locked(instance_id, event_tx, verbose, true)
                 .await;
             let decision = Self::surface_availability_durability(convergence, durability_error)?;
             if !matches!(decision, ConvergenceDecision::EnsureUp) {
@@ -5459,8 +5524,12 @@ impl ProcessManager {
         .await
     }
 
-    /// Enable or disable durable Always On policy and converge the runtime.
-    pub async fn project_set_always_on(&self, project_path: &Path, enabled: bool) -> Result<bool> {
+    /// Passively renew a live demand without crossing a pause barrier.
+    pub async fn project_renew_availability(
+        &self,
+        project_path: &Path,
+        demand: &DemandKey,
+    ) -> Result<bool> {
         let (instance_id, _) = self
             .required_availability_instance_for_path(project_path)
             .await?;
@@ -5473,21 +5542,22 @@ impl ProcessManager {
                 "project instance {instance_id} is no longer active"
             );
             let mut availability = self.load_availability(instance_id).await?;
-            let (changed, durability_error) =
-                Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
+            let (result, durability_error) =
+                Self::capture_availability_publication(availability.renew_demand(demand).await)?;
             drop(publication_guard);
-            let convergence = if enabled {
-                let coordinator = self.availability_coordinator(instance_id).await;
-                let _runtime_guard = coordinator.runtime.lock().await;
-                self.clear_service_stop_suppressions(instance_id).await;
-                self.converge_managed_instance_locked(instance_id, None, false, false)
-                    .await
-            } else {
-                self.converge_managed_instance(instance_id, None, false, false)
-                    .await
-            };
+            let convergence = self
+                .converge_managed_instance(instance_id, None, false, false)
+                .await;
             Self::surface_availability_durability(convergence, durability_error)?;
-            Ok(changed.expect("successful availability publication returns its change result"))
+            Ok(matches!(result, Some(RenewDemandResult::Renewed(_))))
+        })
+        .await
+    }
+
+    /// Enable or disable durable Always On policy and converge the runtime.
+    pub async fn project_set_always_on(&self, project_path: &Path, enabled: bool) -> Result<()> {
+        self.run_admitted_availability_transition(|| async {
+            self.registry_set_always_on(project_path, enabled).await
         })
         .await
     }
@@ -5501,6 +5571,10 @@ impl ProcessManager {
             self.ensure_accepting_lifecycle_requests()?;
             let publication_guard = self.lifecycle_publication_lock.lock().await;
             self.ensure_lifecycle_publication_available()?;
+            anyhow::ensure!(
+                self.active_path_for_instance(instance_id).await.is_some(),
+                "project instance {instance_id} is no longer active"
+            );
             let mut availability = self.load_availability(instance_id).await?;
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.pause_project().await)?;
@@ -6185,10 +6259,240 @@ impl ProcessManager {
         Ok(())
     }
 
+    async fn project_availability_status(
+        &self,
+        instance_id: ProjectInstanceId,
+        presence: CatalogPresence,
+        services: &[ServiceStatus],
+    ) -> Result<Option<ProjectAvailabilityStatus>> {
+        if !self.availability_record_exists(instance_id).await? {
+            return Ok(None);
+        }
+
+        let now = self.availability_now();
+        let mut store = self.load_availability(instance_id).await?;
+        let availability = store.snapshot().await?;
+        let demands = availability
+            .live_demands_at(now)
+            .map(|demand| AvailabilityDemandStatus {
+                kind: demand.kind(),
+                safe_label: demand.safe_label().to_owned(),
+                expires_at: demand.expires_at(),
+            })
+            .collect::<Vec<_>>();
+        let suppressed = self
+            .service_stop_suppressions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(owner, name)| (*owner == instance_id).then_some(name.clone()))
+            .collect::<HashSet<_>>();
+        let unsuppressed = services
+            .iter()
+            .filter(|service| !suppressed.contains(&service.name))
+            .collect::<Vec<_>>();
+        let runtime_running = services
+            .iter()
+            .any(|service| service.status == ServiceState::Running);
+        let runtime_ready = suppressed.is_empty()
+            && !services.is_empty()
+            && services.iter().all(|service| {
+                service.status == ServiceState::Running
+                    && service.health_status == HealthStatus::Healthy
+            });
+        let runtime_starting = unsuppressed.iter().any(|service| {
+            service.status == ServiceState::Building
+                || service.health_status == HealthStatus::Starting
+        });
+        let desired = availability.desired_up_at(now);
+        let paused = availability.is_paused();
+        let last_error = availability.last_convergence_error().map(ToOwned::to_owned);
+        let state = if presence == CatalogPresence::Missing {
+            ProjectLifecycleState::Missing
+        } else if paused {
+            ProjectLifecycleState::Paused
+        } else if desired {
+            if runtime_ready {
+                ProjectLifecycleState::Ready
+            } else if last_error.is_some() {
+                ProjectLifecycleState::Failed
+            } else if !suppressed.is_empty() {
+                ProjectLifecycleState::Degraded
+            } else if runtime_starting || !runtime_running {
+                ProjectLifecycleState::Starting
+            } else {
+                ProjectLifecycleState::Degraded
+            }
+        } else if runtime_running {
+            if availability.shutdown_deferred_at(now) {
+                ProjectLifecycleState::CoolingDown
+            } else {
+                ProjectLifecycleState::Degraded
+            }
+        } else {
+            ProjectLifecycleState::Stopped
+        };
+
+        let mut reasons = Vec::new();
+        if presence == CatalogPresence::Missing {
+            reasons.push(AvailabilityReason {
+                code: "missing".to_owned(),
+                message: "The catalogued project worktree is missing.".to_owned(),
+            });
+        }
+        if paused {
+            reasons.push(AvailabilityReason {
+                code: "paused".to_owned(),
+                message:
+                    "The project is paused through its current activity; run `locald up` to resume."
+                        .to_owned(),
+            });
+        }
+        if availability.always_on() {
+            reasons.push(AvailabilityReason {
+                code: "always_on".to_owned(),
+                message: "Always On policy is enabled.".to_owned(),
+            });
+        }
+        for demand in &demands {
+            reasons.push(AvailabilityReason {
+                code: format!("demand_{}", demand_kind_code(demand.kind)),
+                message: if paused {
+                    format!(
+                        "{} demand remains live behind the pause.",
+                        demand.safe_label
+                    )
+                } else {
+                    format!("{} demand is active.", demand.safe_label)
+                },
+            });
+        }
+        if matches!(state, ProjectLifecycleState::CoolingDown) {
+            reasons.push(AvailabilityReason {
+                code: "cooling_down".to_owned(),
+                message: "The last demand ended; locald is preserving the runtime briefly."
+                    .to_owned(),
+            });
+        }
+        if matches!(state, ProjectLifecycleState::Degraded) && !desired {
+            reasons.push(AvailabilityReason {
+                code: "runtime_above_desired_state".to_owned(),
+                message: "The runtime is still up while locald converges it toward stopped."
+                    .to_owned(),
+            });
+        }
+        if !desired
+            && !paused
+            && !availability.always_on()
+            && demands.is_empty()
+            && presence == CatalogPresence::Active
+        {
+            reasons.push(AvailabilityReason {
+                code: "no_live_demand".to_owned(),
+                message:
+                    "No live demand currently requires this project; run `locald up` to resume."
+                        .to_owned(),
+            });
+        }
+        if last_error.is_some() {
+            reasons.push(AvailabilityReason {
+                code: "convergence_failed".to_owned(),
+                message:
+                    "The last convergence attempt failed; inspect logs and run `locald up` to retry."
+                        .to_owned(),
+            });
+        }
+        if !suppressed.is_empty() {
+            reasons.push(AvailabilityReason {
+                code: "service_override".to_owned(),
+                message: format!(
+                    "{} service-level stop override{} active.",
+                    suppressed.len(),
+                    if suppressed.len() == 1 {
+                        " is"
+                    } else {
+                        "s are"
+                    }
+                ),
+            });
+        }
+
+        let next_transition_at = if matches!(state, ProjectLifecycleState::CoolingDown) {
+            availability.shutdown_cooldown_until()
+        } else if desired
+            && !paused
+            && !availability.always_on()
+            && !demands.is_empty()
+            && demands.iter().all(|demand| demand.expires_at.is_some())
+        {
+            // The lifecycle changes only when the final live demand expires.
+            // Earlier owner expiries leave the project desired-up.
+            demands.iter().filter_map(|demand| demand.expires_at).max()
+        } else {
+            None
+        };
+
+        Ok(Some(ProjectAvailabilityStatus {
+            desired,
+            state,
+            always_on: availability.always_on(),
+            paused,
+            reasons,
+            demands,
+            next_transition_at,
+            last_error,
+        }))
+    }
+
+    fn inactive_project_availability(
+        presence: CatalogPresence,
+        reason_code: &str,
+        reason: String,
+    ) -> ProjectAvailabilityStatus {
+        ProjectAvailabilityStatus {
+            desired: false,
+            state: if presence == CatalogPresence::Missing {
+                ProjectLifecycleState::Missing
+            } else {
+                ProjectLifecycleState::Stopped
+            },
+            always_on: false,
+            paused: false,
+            reasons: vec![AvailabilityReason {
+                code: reason_code.to_owned(),
+                message: reason,
+            }],
+            demands: Vec::new(),
+            next_transition_at: None,
+            last_error: None,
+        }
+    }
+
+    fn unresolved_project_availability_reason(
+        resolution: &LifecycleTargetResolution,
+    ) -> Option<(&'static str, &'static str)> {
+        match resolution {
+            LifecycleTargetResolution::Catalogued(_) => None,
+            LifecycleTargetResolution::UnresolvedLegacy => Some((
+                "unresolved_legacy_identity",
+                "This legacy project identity has not resolved; run `locald up` from its worktree to reconcile it.",
+            )),
+            LifecycleTargetResolution::UnregisteredPhysical { .. } => Some((
+                "unregistered",
+                "This project is not registered; run `locald up` to make it available.",
+            )),
+            LifecycleTargetResolution::Ambiguous => Some((
+                "ambiguous_identity",
+                "This project path is ambiguous; run `locald up` from the intended worktree.",
+            )),
+        }
+    }
+
     pub async fn project_status(&self, project_path: &Path) -> Result<ProjectStatusInfo> {
         let canonical = Self::canonicalize_path(project_path);
         let resolution = self.resolve_lifecycle_projection(&canonical).await;
-        let (project_name, instance_id) = match &resolution {
+        let unresolved_reason = Self::unresolved_project_availability_reason(&resolution);
+        let (project_name, instance_id, presence) = match &resolution {
             LifecycleTargetResolution::Catalogued(target) => (
                 target
                     .catalog_target
@@ -6196,6 +6500,11 @@ impl ProcessManager {
                     .get(&target.instance_id)
                     .and_then(|record| record.display_name.clone()),
                 Some(target.instance_id),
+                target
+                    .catalog_target
+                    .instances
+                    .get(&target.instance_id)
+                    .map_or(CatalogPresence::Missing, |record| record.presence),
             ),
             LifecycleTargetResolution::UnresolvedLegacy => {
                 let registry = self.registry.lock().await;
@@ -6205,10 +6514,11 @@ impl ProcessManager {
                         .get(&canonical)
                         .and_then(|record| record.display_name.clone()),
                     None,
+                    CatalogPresence::Missing,
                 )
             }
             LifecycleTargetResolution::UnregisteredPhysical { .. }
-            | LifecycleTargetResolution::Ambiguous => (None, None),
+            | LifecycleTargetResolution::Ambiguous => (None, None, CatalogPresence::Missing),
         };
 
         let attachments = {
@@ -6246,6 +6556,22 @@ impl ProcessManager {
             services.push(status.name.clone());
             service_details.push(status);
         }
+        let availability = match instance_id {
+            Some(instance_id) => self
+                .project_availability_status(instance_id, presence, &service_details)
+                .await?
+                .or_else(|| {
+                    Some(Self::inactive_project_availability(
+                        presence,
+                        "no_availability_state",
+                        "No availability demand or policy has been recorded; run `locald up` to start the project."
+                            .to_owned(),
+                    ))
+                }),
+            None => unresolved_reason.map(|(code, reason)| {
+                Self::inactive_project_availability(presence, code, reason.to_owned())
+            }),
+        };
 
         Ok(ProjectStatusInfo {
             project_path: canonical,
@@ -6254,6 +6580,7 @@ impl ProcessManager {
             is_running,
             services,
             service_details,
+            availability,
         })
     }
 
@@ -6280,11 +6607,16 @@ impl ProcessManager {
 
         let statuses = self.list_with_instance_owners(None).await;
         let mut running_instances = HashSet::new();
+        let mut statuses_by_instance = HashMap::<ProjectInstanceId, Vec<ServiceStatus>>::new();
 
         for (instance_id, status) in statuses {
             if status.status == ServiceState::Running {
                 running_instances.insert(instance_id);
             }
+            statuses_by_instance
+                .entry(instance_id)
+                .or_default()
+                .push(status);
         }
 
         let mut entries = Vec::new();
@@ -6292,13 +6624,15 @@ impl ProcessManager {
         for path in all_projects {
             let canonical = Self::canonicalize_path(&path);
             let resolution = self.resolve_lifecycle_projection(&canonical).await;
-            let (instance_id, project_name, pinned, attachments_for) = match resolution {
+            let unresolved_reason = Self::unresolved_project_availability_reason(&resolution);
+            let (instance_id, project_name, pinned, presence, attachments_for) = match resolution {
                 LifecycleTargetResolution::Catalogued(target) => {
                     let record = target.catalog_target.instances.get(&target.instance_id);
                     (
                         Some(target.instance_id),
                         record.and_then(|record| record.display_name.clone()),
                         record.is_some_and(|record| record.pinned),
+                        record.map_or(CatalogPresence::Missing, |record| record.presence),
                         Self::compatibility_attachments_for_display(
                             &attachment_snapshot,
                             &canonical,
@@ -6315,6 +6649,7 @@ impl ProcessManager {
                         None,
                         record.and_then(|record| record.display_name.clone()),
                         record.is_some_and(|record| record.pinned),
+                        CatalogPresence::Missing,
                         Self::compatibility_attachments_for_display(
                             &attachment_snapshot,
                             &canonical,
@@ -6323,13 +6658,58 @@ impl ProcessManager {
                     )
                 }
                 LifecycleTargetResolution::UnregisteredPhysical { .. }
-                | LifecycleTargetResolution::Ambiguous => (None, None, false, Vec::new()),
+                | LifecycleTargetResolution::Ambiguous => {
+                    (None, None, false, CatalogPresence::Missing, Vec::new())
+                }
+            };
+            let service_details = match instance_id {
+                Some(instance_id) => statuses_by_instance
+                    .get(&instance_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let availability = match instance_id {
+                Some(instance_id) => self
+                    .project_availability_status(instance_id, presence, &service_details)
+                    .await?
+                    .or_else(|| {
+                        Some(Self::inactive_project_availability(
+                            presence,
+                            "no_availability_state",
+                            "No availability demand or policy has been recorded; run `locald up` to start the project."
+                                .to_owned(),
+                        ))
+                    }),
+                None => unresolved_reason.map(|(code, reason)| {
+                    Self::inactive_project_availability(presence, code, reason.to_owned())
+                }),
             };
             let attachment_section = Self::compatibility_section_for_display(&attachments_for);
-            let section = if attachment_section == ProjectSection::Active {
+            let has_live_demand = availability
+                .as_ref()
+                .is_some_and(|availability| !availability.demands.is_empty());
+            let runtime_is_active = availability.as_ref().is_some_and(|availability| {
+                matches!(
+                    availability.state,
+                    ProjectLifecycleState::Starting
+                        | ProjectLifecycleState::Ready
+                        | ProjectLifecycleState::Degraded
+                        | ProjectLifecycleState::Failed
+                        | ProjectLifecycleState::CoolingDown
+                )
+            });
+            let section = if has_live_demand || attachment_section == ProjectSection::Active {
                 ProjectSection::Active
-            } else if pinned || attachment_section == ProjectSection::AlwaysOn {
+            } else if availability
+                .as_ref()
+                .is_some_and(|availability| availability.always_on)
+                || pinned
+                || attachment_section == ProjectSection::AlwaysOn
+            {
                 ProjectSection::AlwaysOn
+            } else if runtime_is_active {
+                ProjectSection::Active
             } else {
                 ProjectSection::Recent
             };
@@ -6341,6 +6721,7 @@ impl ProcessManager {
                 attachments: attachments_for,
                 is_running,
                 section,
+                availability,
             };
 
             let include = match &filter {
@@ -12617,6 +12998,18 @@ PATH = "/usr/bin:/bin"
         assert!(!status.is_running);
         assert!(status.services.is_empty());
         assert!(status.service_details.is_empty());
+        let availability = status
+            .availability
+            .as_ref()
+            .expect("unregistered status still explains lifecycle state");
+        assert_eq!(availability.state, ProjectLifecycleState::Missing);
+        assert!(!availability.desired);
+        assert!(
+            availability
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "unregistered")
+        );
 
         let listed = manager
             .project_list(Some(ProjectFilter::All))
@@ -12630,6 +13023,17 @@ PATH = "/usr/bin:/bin"
         assert!(replacement_entry.attachments.is_empty());
         assert!(!replacement_entry.is_running);
         assert_eq!(replacement_entry.section, ProjectSection::Recent);
+        let listed_availability = replacement_entry
+            .availability
+            .as_ref()
+            .expect("unregistered project list entry still explains lifecycle state");
+        assert_eq!(listed_availability.state, ProjectLifecycleState::Missing);
+        assert!(
+            listed_availability
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "unregistered")
+        );
         for filter in [ProjectFilter::Active, ProjectFilter::Pinned] {
             assert!(
                 manager
@@ -13138,6 +13542,167 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn status_projects_semantic_availability_without_private_owner_identity() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("semantic-status-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "semantic-status",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "semantic-status",
+            "semantic-status.localhost",
+            &["web"],
+        );
+        let private_owner = "private-conversation-identity";
+        let demand = DemandKey::agent_conversation(private_owner).expect("construct agent demand");
+
+        let idle_status = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect project without availability state");
+        let idle_list_entry = manager
+            .project_list(Some(ProjectFilter::All))
+            .await
+            .expect("list project without availability state")
+            .into_iter()
+            .find(|entry| entry.project_path == idle_status.project_path)
+            .expect("idle project remains listed");
+        let idle_status_availability = idle_status
+            .availability
+            .expect("single-project status explains missing availability state");
+        let idle_list_availability = idle_list_entry
+            .availability
+            .expect("project list explains missing availability state");
+        assert_eq!(idle_list_availability, idle_status_availability);
+        assert!(
+            idle_list_availability
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "no_availability_state")
+        );
+
+        manager
+            .project_ensure_availability(&project_path, demand.clone())
+            .await
+            .expect("ensure semantic-status project");
+        let ready = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect ready project");
+        let ready_availability = ready.availability.as_ref().expect("availability status");
+        assert_eq!(ready_availability.state, ProjectLifecycleState::Ready);
+        assert!(ready_availability.desired);
+        assert!(!ready_availability.always_on);
+        assert!(!ready_availability.paused);
+        assert_eq!(ready_availability.demands.len(), 1);
+        assert_eq!(
+            ready_availability.demands[0].kind,
+            DemandKind::AgentConversation
+        );
+        assert_eq!(
+            ready_availability.demands[0].safe_label,
+            "Agent conversation"
+        );
+        assert_eq!(
+            ready_availability.next_transition_at,
+            Some(clock.time() + locald_core::AGENT_DEMAND_TTL)
+        );
+        assert!(
+            !serde_json::to_string(&ready_availability)
+                .expect("serialize availability status")
+                .contains(private_owner)
+        );
+        assert_eq!(
+            manager
+                .project_list(Some(ProjectFilter::Active))
+                .await
+                .expect("list active projects")
+                .into_iter()
+                .map(|entry| entry.project_path)
+                .collect::<Vec<_>>(),
+            vec![std::fs::canonicalize(&project_path).expect("canonical project path")]
+        );
+
+        manager
+            .stop("semantic-status:web")
+            .await
+            .expect("stop one service without changing project availability");
+        let degraded = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect service-level override");
+        assert_eq!(
+            degraded.service_details[0].service_type,
+            locald_core::ipc::ServiceType::Worker
+        );
+        // Portless workers never have routed URLs. Routable services preserve
+        // their semantic domains while stopped so the proxy can explain state.
+        assert_eq!(degraded.service_details[0].url, None);
+        let degraded_availability = degraded.availability.expect("degraded availability status");
+        assert_eq!(degraded_availability.state, ProjectLifecycleState::Degraded);
+        assert!(degraded_availability.desired);
+        assert!(
+            degraded_availability
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "service_override")
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause project");
+        assert!(
+            manager
+                .project_renew_availability(&project_path, &demand)
+                .await
+                .expect("passively renew paused owner")
+        );
+        let paused = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect paused project");
+        let paused_availability = paused.availability.expect("paused availability status");
+        assert_eq!(paused_availability.state, ProjectLifecycleState::Paused);
+        assert!(!paused_availability.desired);
+        assert!(paused_availability.paused);
+        assert_eq!(paused_availability.next_transition_at, None);
+        assert!(!paused.is_running);
+        assert_eq!(paused.service_details[0].url, None);
+
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("resume project with Always On");
+        let always_on = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect Always On project");
+        let always_on_availability = always_on
+            .availability
+            .expect("Always On availability status");
+        assert_eq!(always_on_availability.state, ProjectLifecycleState::Ready);
+        assert!(always_on_availability.desired);
+        assert!(always_on_availability.always_on);
+        assert!(!always_on_availability.paused);
+        assert_eq!(always_on_availability.next_transition_at, None);
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+    }
+
+    #[tokio::test]
     async fn fake_clock_expiring_one_owner_preserves_runtime_until_the_last_owner_expires() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("timed-owners-project");
@@ -13179,6 +13744,17 @@ PATH = "/usr/bin:/bin"
             )
             .await
             .expect("add agent owner");
+        let owned = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect multiple live owners")
+            .availability
+            .expect("multiple-owner availability");
+        assert_eq!(
+            owned.next_transition_at,
+            Some(clock.time() + locald_core::AGENT_DEMAND_TTL),
+            "only the final owner expiry changes lifecycle state"
+        );
 
         clock.advance(locald_core::VSCODE_DEMAND_TTL);
         assert_eq!(
@@ -13454,12 +14030,10 @@ PATH = "/usr/bin:/bin"
         assert!(paused.always_on());
         assert!(paused.is_paused());
 
-        assert!(
-            paused_reopen
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("semantic Always On activity resumes project")
-        );
+        paused_reopen
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("semantic Always On activity resumes project");
         assert!(paused_reopen.project_runtime_is_ready(instance_id).await);
         paused_reopen
             .project_pause_availability(&project_path)
@@ -13629,12 +14203,10 @@ PATH = "/usr/bin:/bin"
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load project availability");
-        assert!(
-            manager
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("enable Always On")
-        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("enable Always On");
         let first_controller = manager
             .get_service_controller("resume:web")
             .await
@@ -13652,12 +14224,10 @@ PATH = "/usr/bin:/bin"
             .expect("load paused generation")
             .activity_generation();
 
-        assert!(
-            manager
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("renew Always On")
-        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("renew Always On");
         let snapshot = availability
             .snapshot()
             .await
@@ -15079,6 +15649,11 @@ PATH = "/usr/bin:/bin"
             "direct-unpin-prepare.localhost",
             &["web"],
         );
+        {
+            let mut registry = manager.registry.lock().await;
+            assert!(registry.pin_project(&project_path));
+            registry.save().await.expect("persist seeded catalog pin");
+        }
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load direct unpin availability");
@@ -15158,6 +15733,16 @@ PATH = "/usr/bin:/bin"
                 .get_service_controller("direct-unpin-prepare:web")
                 .await
                 .is_none()
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .expect("directly unpinned project remains catalogued")
+                .pinned
         );
     }
 
@@ -15724,13 +16309,11 @@ PATH = "/usr/bin:/bin"
             .pause_project()
             .await
             .expect("cancel slow startup");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
-                .await
-                .expect("slow startup observes pause")
-                .expect("join slow startup")
-                .expect("converge slow startup after pause")
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
+            .await
+            .expect("slow startup observes pause")
+            .expect("join slow startup")
+            .expect("converge slow startup after pause");
     }
 
     #[tokio::test]
@@ -19401,6 +19984,28 @@ command = "api"
         // Verify no high port leaks into URLs
         assert!(!status.url.as_deref().unwrap_or("").contains("8443"));
         assert!(!status.url.as_deref().unwrap_or("").contains("8080"));
+
+        // Portless workers never advertise a routed domain, even when the
+        // project owns one and the runtime snapshot contains stale port data.
+        let worker_config = ServiceConfig::Typed(TypedServiceConfig::Worker(
+            locald_core::config::WorkerServiceConfig::default(),
+        ));
+        let status = ProcessManager::build_service_status(
+            "worker".to_owned(),
+            Some("worker.app.test".to_owned()),
+            path,
+            (Some(80), Some(443)),
+            health_status,
+            health_source,
+            running_snapshot(),
+            Some(&worker_config),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status.service_type, locald_core::ipc::ServiceType::Worker);
+        assert_eq!(status.url, None);
     }
 
     #[test]
@@ -22379,12 +22984,18 @@ PATH = "/usr/bin:/bin"
         );
         assert!(manager.registry.lock().await.instances.is_empty());
 
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
         let mut ensure = tokio::spawn({
             let manager = manager.clone();
             let config_path = project_path.join("locald.toml");
             async move {
                 manager
-                    .ensure_project(config_path, DemandKey::manual_cli())
+                    .ensure_project_from_ipc_with_events(
+                        config_path,
+                        DemandKey::manual_cli(),
+                        None,
+                        event_tx,
+                    )
                     .await
             }
         });
@@ -22415,6 +23026,10 @@ PATH = "/usr/bin:/bin"
         assert_eq!(
             result.services[0].url.as_deref(),
             Some("https://ensure-project.localhost:8443")
+        );
+        assert!(
+            event_rx.try_recv().is_ok(),
+            "verbose EnsureProject streams boot progress before readiness"
         );
         assert_eq!(creates.load(Ordering::SeqCst), 2);
 
@@ -23294,6 +23909,7 @@ path = "docs"
             .lock()
             .await
             .insert("app:web".to_owned(), first_service);
+        let mut instance_logs = manager.instance_log_sender.subscribe();
 
         let desired_names = HashSet::from(["app:web".to_owned()]);
         let error = manager
@@ -23326,6 +23942,15 @@ path = "docs"
             )
             .await;
         assert_eq!(manager.get_recent_logs().len(), 1);
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(first_instance))[0].message,
+            "first-instance history"
+        );
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(second_instance))
+                .is_empty()
+        );
         manager.services.lock().await.remove("app:web");
 
         install_test_claim_for_instance(&manager, first_instance, "first.app.localhost", "app:web");
@@ -23414,6 +24039,25 @@ path = "docs"
             )
             .await;
         assert_eq!(manager.get_recent_logs().len(), 1);
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(first_instance))
+                .is_empty()
+        );
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(second_instance))[0].message,
+            "current second-instance log"
+        );
+        let first_live_log = instance_logs
+            .try_recv()
+            .expect("first instance live log remains queued");
+        let second_live_log = instance_logs
+            .try_recv()
+            .expect("second instance live log remains queued");
+        assert_eq!(first_live_log.instance_id, first_instance);
+        assert_eq!(first_live_log.entry.message, "first-instance history");
+        assert_eq!(second_live_log.instance_id, second_instance);
+        assert_eq!(second_live_log.entry.message, "current second-instance log");
         manager
             .services
             .lock()

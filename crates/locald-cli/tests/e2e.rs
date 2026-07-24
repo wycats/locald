@@ -209,12 +209,7 @@ command = "python3 -m http.server $PORT"
     // fs::write(project_dir.join("runtime.txt"), "python-3.11.0").unwrap();
 
     // Run locald up
-    ctx.command()
-        .arg("up")
-        .arg("--exit-after-register")
-        .arg(&project_dir)
-        .assert()
-        .success();
+    ctx.command().arg("up").arg(&project_dir).assert().success();
 
     // Verify registry
     ctx.command()
@@ -229,7 +224,12 @@ command = "python3 -m http.server $PORT"
     thread::sleep(Duration::from_secs(1));
 
     // Debug: Print logs if status fails
-    let status = ctx.command().arg("status").output().unwrap();
+    let status = ctx
+        .command()
+        .arg("status")
+        .arg(&project_dir)
+        .output()
+        .unwrap();
     if !String::from_utf8_lossy(&status.stdout).contains("web") {
         println!("Status output: {}", String::from_utf8_lossy(&status.stdout));
 
@@ -246,10 +246,15 @@ command = "python3 -m http.server $PORT"
 
     ctx.command()
         .arg("status")
+        .arg(&project_dir)
         .assert()
         .success()
-        .stdout(predicates::str::contains("web"))
-        .stdout(predicates::str::contains("Running"));
+        .stdout(predicates::str::contains(
+            "Availability: Ready (desired up)",
+        ))
+        .stdout(predicates::str::contains(
+            "my-project:web: running (healthy)",
+        ));
 }
 
 #[test]

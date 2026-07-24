@@ -57,6 +57,8 @@ impl TestContext {
             .env("LOCALD_SOCKET", &self.socket_path)
             .env("LOCALD_SANDBOX_ACTIVE", "1")
             .env("LOCALD_SANDBOX_NAME", &self.sandbox)
+            .env("LOCALD_HTTP_PORT", "0")
+            .env("LOCALD_HTTPS_PORT", "0")
             // Isolate state for the daemon.
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
@@ -82,7 +84,15 @@ impl TestContext {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        anyhow::bail!("Timed out waiting for daemon socket")
+        let stdout = tokio::fs::read_to_string(self.root.path().join("daemon.out"))
+            .await
+            .unwrap_or_default();
+        let stderr = tokio::fs::read_to_string(self.root.path().join("daemon.err"))
+            .await
+            .unwrap_or_default();
+        anyhow::bail!(
+            "Timed out waiting for daemon socket\n\nDaemon stdout:\n{stdout}\n\nDaemon stderr:\n{stderr}"
+        )
     }
 
     pub async fn run_cli(&self, args: &[&str]) -> Result<std::process::Output> {
@@ -101,9 +111,8 @@ impl TestContext {
         Ok(output)
     }
 
-    /// Run the hidden test-harness `up` path to establish trusted launch
-    /// context, then attach a PID-backed editor owner to keep the project alive
-    /// for the assertions that follow.
+    /// Run quiet `up` to establish trusted launch context, then attach a
+    /// PID-backed editor owner for editor-lifecycle assertions that follow.
     pub async fn run_up_with_test_owner(
         &self,
         project_path: &std::path::Path,
@@ -113,9 +122,7 @@ impl TestContext {
             .context("Project path is not valid UTF-8")?;
         let editor_pid = std::process::id().to_string();
 
-        let up_output = self
-            .run_cli(&["up", "--exit-after-register", project_path])
-            .await?;
+        let up_output = self.run_cli(&["up", project_path]).await?;
         if !up_output.status.success() {
             return Ok(up_output);
         }

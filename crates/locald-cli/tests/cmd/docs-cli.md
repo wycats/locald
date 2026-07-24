@@ -32,7 +32,7 @@ Options:
 
 ```console
 $ locald up --help
-Start the daemon (if needed) and register the current project
+Ensure the current project is ready and print its URLs
 
 Usage: locald up [OPTIONS] [PATH]
 
@@ -42,6 +42,7 @@ Arguments:
 Options:
       --sandbox <SANDBOX>  Run in a sandbox environment
   -v, --verbose            Show verbose output
+      --follow             Follow this project's logs after it becomes ready
   -h, --help               Print help
 
 ```
@@ -50,13 +51,17 @@ Options:
 
 ```console
 $ locald status --help
-List running services
+Explain desired and actual project availability
 
-Usage: locald status [OPTIONS]
+Usage: locald status [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]  Project path (defaults to the current directory)
 
 Options:
-      --json               Machine-readable JSON output
+      --all                Show all known projects instead of the current project
       --sandbox <SANDBOX>  Run in a sandbox environment
+      --json               Machine-readable JSON output
   -h, --help               Print help
 
 ```

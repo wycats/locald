@@ -1,9 +1,12 @@
 use anyhow::Context;
 use crossterm::style::Stylize;
-use locald_core::attachments::{AttachmentSource, ManualCliSession, ProjectFilter, ProjectSection};
+use locald_core::attachments::{
+    AttachmentSource, ProjectFilter, ProjectListEntry, ProjectSection, ProjectStatusInfo,
+};
+use locald_core::ipc::EnsureProjectResult;
+use locald_core::{DemandKey, IpcRequest, IpcResponse, LocaldConfig, ProjectAvailabilityStatus};
 #[cfg(target_os = "macos")]
 use locald_core::{DomainName, HostsFileSection};
-use locald_core::{IpcRequest, IpcResponse, LocaldConfig};
 use serde::Serialize;
 use std::io::IsTerminal;
 
@@ -27,18 +30,7 @@ use crate::{
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
 
-#[derive(Serialize)]
-struct JsonServiceSummary {
-    name: String,
-    state: String,
-    port: Option<u16>,
-    url: Option<String>,
-}
-
-#[derive(Serialize)]
-struct JsonServiceList {
-    services: Vec<JsonServiceSummary>,
-}
+const LEGACY_AVAILABILITY_MESSAGE: &str = "Availability: unavailable (the running daemon does not provide semantic lifecycle status; run `sudo locald admin setup` to reinstall and restart locald)";
 
 #[derive(Debug, Serialize)]
 struct JsonServiceAction {
@@ -101,19 +93,233 @@ fn resolve_project_locator(path: &std::path::Path) -> CliResult<std::path::PathB
     })
 }
 
-fn prepare_up_start(
+const MANUAL_FOLLOW_RENEWAL_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
+
+fn prepare_up_ensure(
     project_locator: &std::path::Path,
     verbose: bool,
-    manual_cli_session: Option<ManualCliSession>,
 ) -> CliResult<(std::path::PathBuf, IpcRequest)> {
     let project_path = resolve_project_locator(project_locator)?;
-    let request = IpcRequest::Start {
+    let request = IpcRequest::EnsureProject {
         project_path: project_path.clone(),
+        demand: DemandKey::manual_cli(),
         verbose,
         launch_path: Some(utils::trusted_launch_path()?),
-        manual_cli_session,
     };
     Ok((project_path, request))
+}
+
+fn nearest_project_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.join("locald.toml").is_file())
+        .map(std::path::Path::to_path_buf)
+}
+
+fn resolve_ambient_project_target(
+    explicit_path: Option<&std::path::Path>,
+    current_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    explicit_path.map_or_else(
+        || nearest_project_root(current_dir).unwrap_or_else(|| current_dir.to_path_buf()),
+        std::path::Path::to_path_buf,
+    )
+}
+
+fn resolve_project_stop_target(current_dir: &std::path::Path) -> CliResult<std::path::PathBuf> {
+    nearest_project_root(current_dir).ok_or_else(|| {
+        CliError::message(
+            "No locald.toml found in current directory or its parents. Please specify a service name.",
+        )
+    })
+}
+
+fn resolve_service_name(name: &str) -> CliResult<String> {
+    let current_dir = std::env::current_dir()?;
+    let config_path = nearest_project_root(&current_dir)
+        .unwrap_or(current_dir)
+        .join("locald.toml");
+    Ok(resolve_service_name_from_config(name, &config_path))
+}
+
+fn resolve_service_name_from_config(name: &str, config_path: &std::path::Path) -> String {
+    if name.contains(':') {
+        return name.to_owned();
+    }
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| toml::from_str::<LocaldConfig>(&content).ok())
+        .map_or_else(
+            || name.to_owned(),
+            |config| format!("{}:{name}", config.project.name),
+        )
+}
+
+fn resolve_logs_context(
+    service: Option<&str>,
+    current_dir: &std::path::Path,
+) -> CliResult<(Option<String>, Option<std::path::PathBuf>)> {
+    let project_root = nearest_project_root(current_dir);
+    let config_path = project_root
+        .as_deref()
+        .unwrap_or(current_dir)
+        .join("locald.toml");
+    let service_name = service.map(|name| resolve_service_name_from_config(name, &config_path));
+    let project_path = if service.is_some_and(|name| name.contains(':')) {
+        None
+    } else {
+        project_root
+            .map(|root| resolve_project_locator(&root))
+            .transpose()?
+    };
+    Ok((service_name, project_path))
+}
+
+const fn daemon_startup_is_pending(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::Daemon(DaemonError::NotRunning { .. } | DaemonError::ConnectionRefused { .. })
+    )
+}
+
+fn semantic_request_may_be_unsupported(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::Daemon(DaemonError::RequestFailed { message })
+            if message.as_str() == "daemon closed the connection without a response"
+    )
+}
+
+fn send_project_pause<F>(project_path: &std::path::Path, mut send: F) -> CliResult<IpcResponse>
+where
+    F: FnMut(&IpcRequest) -> CliResult<IpcResponse>,
+{
+    let pause = IpcRequest::PauseProject {
+        project_path: project_path.to_path_buf(),
+    };
+    match send(&pause) {
+        Err(error) if semantic_request_may_be_unsupported(&error) => {
+            send(&IpcRequest::ProjectForceStop {
+                project_path: project_path.to_path_buf(),
+            })
+        }
+        response => response,
+    }
+}
+
+const fn manual_follow_renewal_should_continue(response: &CliResult<IpcResponse>) -> bool {
+    match response {
+        Ok(IpcResponse::Ok) => true,
+        Err(error) => daemon_startup_is_pending(error),
+        _ => false,
+    }
+}
+
+fn project_readiness_error(message: impl std::fmt::Display) -> CliError {
+    CliError::message(format!("Failed to make project ready: {message}"))
+}
+
+fn format_status_time(time: std::time::SystemTime) -> String {
+    let time: chrono::DateTime<chrono::Local> = time.into();
+    time.format("%Y-%m-%d %H:%M:%S %Z").to_string()
+}
+
+fn print_ensure_result(result: &EnsureProjectResult, verbose: bool) -> CliResult<()> {
+    let project = result
+        .project_name
+        .as_deref()
+        .unwrap_or_else(|| result.project_path.to_str().unwrap_or("project"));
+    cliclack::outro(format!("{project} is Ready"))?;
+    for url in &result.urls {
+        println!("  {url}");
+    }
+    if verbose {
+        for service in &result.services {
+            println!(
+                "  {}: {} ({})",
+                service.name, service.status, service.health_status
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_availability(availability: &ProjectAvailabilityStatus) {
+    let desired = if availability.desired { "up" } else { "down" };
+    println!("Availability: {} (desired {desired})", availability.state);
+    for reason in &availability.reasons {
+        println!("  - {}", reason.message);
+    }
+    if let Some(next_transition_at) = availability.next_transition_at {
+        println!(
+            "Next transition: {}",
+            format_status_time(next_transition_at)
+        );
+    }
+}
+
+fn is_semantic_status_url(url: &str) -> bool {
+    let Some((_, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or(remainder);
+    !matches!(authority, "localhost" | "127.0.0.1" | "[::1]")
+        && !authority.starts_with("localhost:")
+        && !authority.starts_with("127.0.0.1:")
+        && !authority.starts_with("[::1]:")
+}
+
+fn print_project_status(info: &ProjectStatusInfo) {
+    let project = info
+        .project_name
+        .as_deref()
+        .unwrap_or_else(|| info.project_path.to_str().unwrap_or("project"));
+    println!("{project}");
+    if let Some(availability) = &info.availability {
+        print_availability(availability);
+    } else {
+        println!("{LEGACY_AVAILABILITY_MESSAGE}");
+    }
+    let urls = info
+        .service_details
+        .iter()
+        .filter_map(|service| service.url.as_deref())
+        .filter(|url| is_semantic_status_url(url))
+        .collect::<std::collections::BTreeSet<_>>();
+    if !urls.is_empty() {
+        println!("URLs:");
+        for url in urls {
+            println!("  {url}");
+        }
+    }
+    if !info.service_details.is_empty() {
+        println!("Services:");
+        for service in &info.service_details {
+            println!(
+                "  {}: {} ({})",
+                service.name, service.status, service.health_status
+            );
+        }
+    }
+}
+
+fn print_project_list(entries: &[ProjectListEntry]) {
+    if entries.is_empty() {
+        println!("No projects found.");
+        return;
+    }
+    println!("{:<12} {:<14} NAME", "SECTION", "STATE");
+    for entry in entries {
+        let section = section_label(entry.section);
+        let state = entry
+            .availability
+            .as_ref()
+            .map_or_else(|| "Legacy".to_owned(), |status| status.state.to_string());
+        let name = entry
+            .project_name
+            .as_deref()
+            .unwrap_or_else(|| entry.project_path.to_str().unwrap_or("project"));
+        println!("{section:<12} {state:<14} {name}");
+    }
 }
 
 fn warn_if_daemon_identity_mismatch() {
@@ -249,22 +455,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             },
             ServiceCommands::Reset { name } => {
                 utils::ensure_daemon_running()?;
-                // Resolve full name if needed
-                let full_name = {
-                    let config_path = std::env::current_dir()?.join("locald.toml");
-                    if config_path.exists() {
-                        std::fs::read_to_string(&config_path).map_or_else(
-                            |_| name.clone(),
-                            |content| {
-                                toml::from_str::<LocaldConfig>(&content).map_or(name.clone(), |c| {
-                                    format!("{}:{}", c.project.name, name)
-                                })
-                            },
-                        )
-                    } else {
-                        name.clone()
-                    }
-                };
+                let full_name = resolve_service_name(name)?;
 
                 match client::send_request(&IpcRequest::Reset {
                     name: full_name.clone(),
@@ -280,6 +471,52 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(r) => return Err(CliError::message(format!("Unexpected response: {r:?}"))),
                     Err(e) => return Err(e),
+                }
+            }
+            ServiceCommands::Stop { name } => {
+                utils::ensure_daemon_running()?;
+                let full_name = resolve_service_name(name)?;
+                match client::send_request(&IpcRequest::Stop {
+                    name: full_name.clone(),
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        println!("{} Stopped service {}", style::CHECK, full_name.bold());
+                    }
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to stop {full_name}: {message}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ServiceCommands::Restart { name } => {
+                utils::ensure_daemon_running()?;
+                let full_name = resolve_service_name(name)?;
+                match client::send_request(&IpcRequest::Restart {
+                    name: full_name.clone(),
+                }) {
+                    Ok(IpcResponse::Ok) => {
+                        println!("{} Restarted service {}", style::CHECK, full_name.bold());
+                    }
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to restart {full_name}: {message}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         },
@@ -355,7 +592,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
         Commands::Up {
             path,
             verbose,
-            exit_after_register,
+            follow,
         } => {
             let config = global_config::load();
             let update_rx = if config.updates.auto_check {
@@ -454,11 +691,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             // Resolve path and check for config
-            let target_path = if let Some(p) = path {
-                p.clone()
-            } else {
-                std::env::current_dir()?
-            };
+            let current_dir = std::env::current_dir()?;
+            let target_path = resolve_ambient_project_target(path.as_deref(), &current_dir);
 
             let config_exists = target_path.join("locald.toml").exists();
 
@@ -472,80 +706,82 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let manual_cli_session =
-                (!*exit_after_register).then(|| ManualCliSession::new(std::process::id()));
-            let (abs_path, start_request) =
-                prepare_up_start(&target_path, *verbose, manual_cli_session)?;
+            let (_, ensure_request) = prepare_up_ensure(&target_path, *verbose)?;
 
-            // Start services with streaming output.
             let mut attempts = 0;
-            loop {
-                match client::stream_boot_events(&start_request) {
-                    Ok(()) => {
-                        cliclack::outro("Project registered")?;
-                        break;
+            let ensured = loop {
+                let response = if *verbose {
+                    client::stream_project_ensure(&ensure_request)
+                } else {
+                    client::send_request(&ensure_request)
+                };
+                match response {
+                    Ok(IpcResponse::ProjectEnsured(result)) => {
+                        break result;
                     }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("Connection refused")
-                            || err_str.contains("No such file or directory")
-                        {
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(project_readiness_error(message));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => {
+                        if daemon_startup_is_pending(&error) {
                             if attempts > 50 {
-                                return Err(e);
+                                return Err(error);
                             }
                             attempts += 1;
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         } else {
-                            cliclack::outro(format!("Failed to register project: {e}"))?;
-                            return Err(e);
+                            return Err(error);
                         }
                     }
                 }
-            }
+            };
 
+            print_ensure_result(&ensured, *verbose)?;
             report_update(&update_rx);
 
-            // Test harnesses use the hidden flag so `locald up` can assert that
-            // registration finished without staying attached to service logs.
-            if *exit_after_register {
+            if !*follow {
                 return Ok(());
             }
 
-            let detach_path = abs_path;
-            let detach_source = manual_cli_session
-                .context("log-following locald up did not create a Manual CLI session")?
-                .attachment_source();
-            let _ = ctrlc::set_handler(move || {
-                // Best-effort detach on Ctrl+C
-                let _ = client::send_request(&IpcRequest::ProjectDetach {
-                    project_path: detach_path.clone(),
-                    source: Some(detach_source.clone()),
-                });
-                std::process::exit(0);
+            let project_path = ensured.project_path;
+            let renewal_path = project_path.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(MANUAL_FOLLOW_RENEWAL_INTERVAL);
+                    let response = client::send_request(&IpcRequest::RenewProjectDemand {
+                        project_path: renewal_path.clone(),
+                        demand: DemandKey::manual_cli(),
+                    });
+                    if !manual_follow_renewal_should_continue(&response) {
+                        break;
+                    }
+                }
             });
 
-            println!("{} Streaming logs (Ctrl+C to stop)...", style::INFO);
-            client::stream_logs(None, true)?;
+            println!(
+                "{} Following project logs (Ctrl+C stops following; the project remains available)...",
+                style::INFO
+            );
+            client::stream_logs(None, Some(project_path), true)?;
         }
         Commands::Stop { name, json } => {
             if name.is_none() {
                 let current_dir = std::env::current_dir()?;
-                let config_path = current_dir.join("locald.toml");
-                if !config_path.exists() {
-                    return Err(CliError::message(
-                        "No locald.toml found in current directory. Please specify a service name.",
-                    ));
-                }
+                let project_root = resolve_project_stop_target(&current_dir)?;
+                let config_path = project_root.join("locald.toml");
                 let json_actions = if *json {
                     Some(project_stop_json_actions(&config_path)?)
                 } else {
                     None
                 };
-                let project_path = resolve_project_locator(&current_dir)?;
+                let project_path = resolve_project_locator(&project_root)?;
                 utils::ensure_daemon_running()?;
-                match client::send_request(&IpcRequest::ProjectForceStop {
-                    project_path: project_path.clone(),
-                }) {
+                match send_project_pause(&project_path, client::send_request) {
                     Ok(IpcResponse::Ok) => {
                         if let Some(json_actions) = json_actions {
                             println!("{}", serde_json::to_string_pretty(&json_actions)?);
@@ -571,7 +807,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
             let Some(name) = name else {
                 unreachable!("project stop returns before service-name resolution")
             };
-            let names = vec![name.clone()];
+            let names = vec![resolve_service_name(name)?];
 
             utils::ensure_daemon_running()?;
             let mut actions = Vec::new();
@@ -606,22 +842,60 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 println!("{json}");
             }
         }
-        Commands::Restart { name, json } => {
-            // Resolve full name if needed
-            let full_name = {
-                let config_path = std::env::current_dir()?.join("locald.toml");
-                if config_path.exists() {
-                    std::fs::read_to_string(&config_path).map_or_else(
-                        |_| name.clone(),
-                        |content| {
-                            toml::from_str::<LocaldConfig>(&content)
-                                .map_or(name.clone(), |c| format!("{}:{}", c.project.name, name))
-                        },
-                    )
-                } else {
-                    name.clone()
+        Commands::Pin { path } => {
+            utils::ensure_daemon_running()?;
+            let current_dir = std::env::current_dir()?;
+            let locator = resolve_ambient_project_target(path.as_deref(), &current_dir);
+            let project_path = resolve_project_locator(&locator)?;
+            match client::send_request(&IpcRequest::SetAlwaysOn {
+                project_path,
+                enabled: true,
+            }) {
+                Ok(IpcResponse::Ok) => {
+                    println!("{} Always On enabled.", style::CHECK);
                 }
-            };
+                Ok(IpcResponse::Error(message)) => {
+                    return Err(CliError::message(format!(
+                        "{} Failed to enable Always On: {message}",
+                        style::CROSS
+                    )));
+                }
+                Ok(response) => {
+                    return Err(CliError::message(format!(
+                        "Unexpected response: {response:?}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Commands::Unpin { path } => {
+            utils::ensure_daemon_running()?;
+            let current_dir = std::env::current_dir()?;
+            let locator = resolve_ambient_project_target(path.as_deref(), &current_dir);
+            let project_path = resolve_project_locator(&locator)?;
+            match client::send_request(&IpcRequest::SetAlwaysOn {
+                project_path,
+                enabled: false,
+            }) {
+                Ok(IpcResponse::Ok) => {
+                    println!("{} Always On disabled.", style::CHECK);
+                }
+                Ok(IpcResponse::Error(message)) => {
+                    return Err(CliError::message(format!(
+                        "{} Failed to disable Always On: {message}",
+                        style::CROSS
+                    )));
+                }
+                Ok(response) => {
+                    return Err(CliError::message(format!(
+                        "Unexpected response: {response:?}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Commands::Restart { name, json } => {
+            let full_name = resolve_service_name(name)?;
 
             match client::send_request(&IpcRequest::Restart {
                 name: full_name.clone(),
@@ -650,115 +924,68 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 Err(e) => return Err(e),
             }
         }
-        Commands::Status { json } => {
+        Commands::Status { path, all, json } => {
             utils::ensure_daemon_running()?;
             if !*json && std::io::stderr().is_terminal() {
                 warn_if_daemon_identity_mismatch();
             }
-            match client::send_request(&IpcRequest::Status) {
-                Ok(IpcResponse::Status(services)) => {
-                    if *json {
-                        let summaries = services
-                            .into_iter()
-                            .map(|service| JsonServiceSummary {
-                                name: service.name,
-                                state: match service.status {
-                                    locald_core::state::ServiceState::Running => {
-                                        "running".to_string()
-                                    }
-                                    locald_core::state::ServiceState::Stopped => {
-                                        "stopped".to_string()
-                                    }
-                                    locald_core::state::ServiceState::Building => {
-                                        "building".to_string()
-                                    }
-                                },
-                                port: service.port,
-                                url: service.url,
-                            })
-                            .collect();
-                        let json = serde_json::to_string_pretty(&JsonServiceList {
-                            services: summaries,
-                        })?;
-                        println!("{json}");
-                    } else if services.is_empty() {
-                        println!("No services running.");
-                    } else {
-                        // Print table
-                        println!(
-                            "{:<20} {:<10} {:<10} {:<30}",
-                            "NAME", "STATUS", "PORT", "URL"
-                        );
-                        for service in services {
-                            let port_str = service
-                                .port
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "-".to_string());
-                            let url = service.url.unwrap_or_else(|| "-".to_string());
-                            let status_style = match service.status {
-                                locald_core::state::ServiceState::Running => {
-                                    crossterm::style::Color::Green
-                                }
-                                locald_core::state::ServiceState::Stopped => {
-                                    crossterm::style::Color::Red
-                                }
-                                locald_core::state::ServiceState::Building => {
-                                    crossterm::style::Color::Blue
-                                }
-                            };
-                            println!(
-                                "{:<20} {:<10} {:<10} {:<30}",
-                                service.name,
-                                format!("{:?}", service.status).with(status_style),
-                                port_str,
-                                url
-                            );
-
-                            if !service.warnings.is_empty() {
-                                println!(
-                                    "  {} {}",
-                                    "WARNING:".yellow().bold(),
-                                    service.warnings.join(", ")
-                                );
-                            }
+            if *all {
+                match client::send_request(&IpcRequest::ProjectList { filter: None }) {
+                    Ok(IpcResponse::ProjectList(entries)) => {
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&entries)?);
+                        } else {
+                            print_project_list(&entries);
                         }
                     }
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(CliError::message(format!(
+                            "{} Failed to fetch project status: {message}",
+                            style::CROSS
+                        )));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+                return Ok(());
+            }
+
+            let current_dir = std::env::current_dir()?;
+            let locator = resolve_ambient_project_target(path.as_deref(), &current_dir);
+            let project_path = resolve_project_locator(&locator)?;
+            match client::send_request(&IpcRequest::ProjectStatus { project_path }) {
+                Ok(IpcResponse::ProjectStatus(info)) => {
+                    if *json {
+                        println!("{}", serde_json::to_string_pretty(&info)?);
+                    } else {
+                        print_project_status(&info);
+                    }
+                }
+                Ok(IpcResponse::Error(message)) => {
+                    return Err(CliError::message(format!(
+                        "{} Failed to fetch project status: {message}",
+                        style::CROSS
+                    )));
                 }
                 Ok(response) => {
                     return Err(CliError::message(format!(
                         "Unexpected response: {response:?}"
                     )));
                 }
-                Err(e) => return Err(e),
+                Err(error) => return Err(error),
             }
         }
         Commands::Logs { service, follow } => {
             utils::ensure_daemon_running()?;
-            let service_name = if let Some(name) = service {
-                if name.contains(':') {
-                    Some(name.clone())
-                } else {
-                    // Try to resolve project name
-                    let config_path = std::env::current_dir()?.join("locald.toml");
-                    if config_path.exists() {
-                        std::fs::read_to_string(&config_path).map_or_else(
-                            |_| Some(name.clone()),
-                            |content| {
-                                toml::from_str::<LocaldConfig>(&content)
-                                    .map_or(Some(name.clone()), |c| {
-                                        Some(format!("{}:{}", c.project.name, name))
-                                    })
-                            },
-                        )
-                    } else {
-                        Some(name.clone())
-                    }
-                }
-            } else {
-                None
-            };
+            let current_dir = std::env::current_dir()?;
+            let (service_name, project_path) =
+                resolve_logs_context(service.as_deref(), &current_dir)?;
 
-            client::stream_logs(service_name, *follow)?;
+            client::stream_logs(service_name, project_path, *follow)?;
         }
         Commands::Admin { command } => {
             match command {
@@ -2033,6 +2260,248 @@ mod tests {
     use super::*;
 
     #[test]
+    fn semantic_status_urls_exclude_direct_loopback_service_ports() {
+        assert!(!is_semantic_status_url("http://localhost:49152"));
+        assert!(!is_semantic_status_url("http://127.0.0.1:49152"));
+        assert!(!is_semantic_status_url("http://[::1]:49152"));
+        assert!(is_semantic_status_url("https://app.localhost"));
+        assert!(is_semantic_status_url("https://app.example.test:8443"));
+    }
+
+    #[test]
+    fn nearest_project_root_finds_the_closest_enclosing_config() {
+        let directory = tempfile::tempdir().expect("create project-root directory");
+        let outer = directory.path().join("outer");
+        let inner = outer.join("packages/inner");
+        let nested = inner.join("src/components");
+        std::fs::create_dir_all(&nested).expect("create nested project directories");
+        std::fs::write(outer.join("locald.toml"), "[project]\nname = \"outer\"\n")
+            .expect("write outer project config");
+
+        assert_eq!(nearest_project_root(&nested), Some(outer.clone()));
+
+        std::fs::write(inner.join("locald.toml"), "[project]\nname = \"inner\"\n")
+            .expect("write inner project config");
+        assert_eq!(nearest_project_root(&nested), Some(inner));
+        assert_eq!(nearest_project_root(directory.path()), None);
+    }
+
+    #[test]
+    fn ambient_lifecycle_commands_target_the_nearest_project_root() {
+        let directory = tempfile::tempdir().expect("create ambient lifecycle directory");
+        let project_root = directory.path().join("project");
+        let nested = project_root.join("packages/app/src");
+        let explicit = directory.path().join("explicit");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+        std::fs::write(
+            project_root.join("locald.toml"),
+            "[project]\nname = \"project\"\n",
+        )
+        .expect("write project config");
+
+        assert_eq!(resolve_ambient_project_target(None, &nested), project_root);
+        assert_eq!(
+            resolve_ambient_project_target(Some(explicit.as_path()), &nested),
+            explicit
+        );
+        assert_eq!(
+            resolve_ambient_project_target(None, directory.path()),
+            directory.path()
+        );
+    }
+
+    #[test]
+    fn ambient_project_stop_targets_the_nearest_project_root() {
+        let directory = tempfile::tempdir().expect("create ambient-stop directory");
+        let project_root = directory.path().join("project");
+        let nested = project_root.join("packages/app/src");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+        std::fs::write(
+            project_root.join("locald.toml"),
+            "[project]\nname = \"project\"\n",
+        )
+        .expect("write project config");
+
+        assert_eq!(
+            resolve_project_stop_target(&nested).expect("resolve nested project"),
+            project_root
+        );
+        assert!(resolve_project_stop_target(directory.path()).is_err());
+    }
+
+    #[test]
+    fn service_name_resolution_remains_best_effort() {
+        let directory = tempfile::tempdir().expect("create service config directory");
+        let config_path = directory.path().join("locald.toml");
+
+        assert_eq!(resolve_service_name_from_config("web", &config_path), "web");
+        std::fs::write(&config_path, "not valid toml = [").expect("write malformed service config");
+        assert_eq!(resolve_service_name_from_config("web", &config_path), "web");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "example"
+"#,
+        )
+        .expect("write valid service config");
+        assert_eq!(
+            resolve_service_name_from_config("web", &config_path),
+            "example:web"
+        );
+        assert_eq!(
+            resolve_service_name_from_config("other:web", &config_path),
+            "other:web"
+        );
+    }
+
+    #[test]
+    fn qualified_log_service_names_preserve_global_access() {
+        let directory = tempfile::tempdir().expect("create log-scope project");
+        let project_root = directory.path().join("example");
+        let nested = project_root.join("packages/app");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+        std::fs::write(
+            project_root.join("locald.toml"),
+            "[project]\nname = \"example\"\n",
+        )
+        .expect("write project config");
+        let expected_project_path =
+            resolve_project_locator(&project_root).expect("resolve expected project path");
+
+        let (qualified_service, qualified_scope) =
+            resolve_logs_context(Some("other:web"), &nested).expect("resolve qualified logs");
+        assert_eq!(qualified_service.as_deref(), Some("other:web"));
+        assert_eq!(qualified_scope, None);
+
+        let (local_service, local_scope) =
+            resolve_logs_context(Some("web"), &nested).expect("resolve project logs");
+        assert_eq!(local_service.as_deref(), Some("example:web"));
+        assert_eq!(
+            local_scope.as_deref(),
+            Some(expected_project_path.as_path())
+        );
+
+        let (all_services, ambient_scope) =
+            resolve_logs_context(None, &nested).expect("resolve ambient project logs");
+        assert_eq!(all_services, None);
+        assert_eq!(
+            ambient_scope.as_deref(),
+            Some(expected_project_path.as_path())
+        );
+    }
+
+    #[test]
+    fn daemon_startup_retry_recognizes_typed_socket_states() {
+        assert!(daemon_startup_is_pending(&CliError::Daemon(
+            DaemonError::NotRunning {
+                socket_path: "/tmp/missing.sock".to_owned(),
+            }
+        )));
+        assert!(daemon_startup_is_pending(&CliError::Daemon(
+            DaemonError::ConnectionRefused {
+                socket_path: "/tmp/refused.sock".to_owned(),
+            }
+        )));
+        assert!(!daemon_startup_is_pending(&CliError::Daemon(
+            DaemonError::PermissionDenied {
+                socket_path: "/tmp/forbidden.sock".to_owned(),
+            }
+        )));
+    }
+
+    #[test]
+    fn project_stop_falls_back_for_a_daemon_without_pause_project() {
+        let project_path = std::path::Path::new("/projects/example");
+        let mut requests = Vec::new();
+
+        let response = send_project_pause(project_path, |request| {
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                Err(CliError::Daemon(DaemonError::RequestFailed {
+                    message: "daemon closed the connection without a response".to_owned(),
+                }))
+            } else {
+                Ok(IpcResponse::Ok)
+            }
+        })
+        .expect("legacy project stop fallback");
+
+        assert_eq!(response, IpcResponse::Ok);
+        assert_eq!(
+            requests,
+            vec![
+                IpcRequest::PauseProject {
+                    project_path: project_path.to_path_buf(),
+                },
+                IpcRequest::ProjectForceStop {
+                    project_path: project_path.to_path_buf(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn project_stop_preserves_non_compatibility_failures() {
+        let project_path = std::path::Path::new("/projects/example");
+        let mut request_count = 0;
+
+        let error = send_project_pause(project_path, |_| {
+            request_count += 1;
+            Err(CliError::Daemon(DaemonError::PermissionDenied {
+                socket_path: "/tmp/locald.sock".to_owned(),
+            }))
+        })
+        .expect_err("permission failures must not use the legacy fallback");
+
+        assert_eq!(request_count, 1);
+        assert!(matches!(
+            error,
+            CliError::Daemon(DaemonError::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn manual_follow_renewal_survives_transient_daemon_unavailability() {
+        assert!(manual_follow_renewal_should_continue(&Ok(IpcResponse::Ok)));
+        assert!(manual_follow_renewal_should_continue(&Err(
+            CliError::Daemon(DaemonError::NotRunning {
+                socket_path: "/tmp/missing.sock".to_owned(),
+            })
+        )));
+        assert!(manual_follow_renewal_should_continue(&Err(
+            CliError::Daemon(DaemonError::ConnectionRefused {
+                socket_path: "/tmp/refused.sock".to_owned(),
+            })
+        )));
+        assert!(!manual_follow_renewal_should_continue(&Err(
+            CliError::Daemon(DaemonError::PermissionDenied {
+                socket_path: "/tmp/forbidden.sock".to_owned(),
+            })
+        )));
+        assert!(!manual_follow_renewal_should_continue(&Ok(
+            IpcResponse::Error("demand rejected".to_owned())
+        )));
+    }
+
+    #[test]
+    fn semantic_status_legacy_fallback_explains_the_upgrade_path() {
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("running daemon"));
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("semantic lifecycle status"));
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("sudo locald admin setup"));
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("reinstall and restart locald"));
+    }
+
+    #[test]
+    fn project_readiness_failure_is_rendered_once_by_the_error_handler() {
+        let error = project_readiness_error("readiness timed out");
+        assert_eq!(
+            error.to_string(),
+            "Failed to make project ready: readiness timed out"
+        );
+    }
+
+    #[test]
     fn locald_up_resolves_a_missing_project_locator() {
         let directory = tempfile::tempdir().expect("create locator directory");
         let locator = directory.path().join("missing").join("..").join("project");
@@ -2040,12 +2509,17 @@ mod tests {
             .expect("canonicalize locator directory")
             .join("project");
         let (resolved, request) =
-            prepare_up_start(&locator, false, None).expect("prepare missing project start");
+            prepare_up_ensure(&locator, false).expect("prepare missing project ensure");
 
         assert_eq!(resolved, expected);
         assert!(matches!(
             request,
-            IpcRequest::Start { project_path, .. } if project_path == expected
+            IpcRequest::EnsureProject {
+                project_path,
+                demand,
+                verbose: false,
+                launch_path: Some(_),
+            } if project_path == expected && demand == DemandKey::manual_cli()
         ));
     }
 
@@ -2058,13 +2532,18 @@ mod tests {
         std::fs::create_dir_all(&project).expect("create real project path");
         std::os::unix::fs::symlink(&real, &alias).expect("create locator symlink");
         let expected = std::fs::canonicalize(project).expect("canonicalize real project path");
-        let (resolved, request) = prepare_up_start(&alias.join("project"), false, None)
-            .expect("prepare project start through symlink spelling");
+        let (resolved, request) = prepare_up_ensure(&alias.join("project"), false)
+            .expect("prepare project ensure through symlink spelling");
 
         assert_eq!(resolved, expected);
         assert!(matches!(
             request,
-            IpcRequest::Start { project_path, .. } if project_path == expected
+            IpcRequest::EnsureProject {
+                project_path,
+                demand,
+                verbose: false,
+                launch_path: Some(_),
+            } if project_path == expected && demand == DemandKey::manual_cli()
         ));
     }
 
@@ -2083,35 +2562,19 @@ mod tests {
     }
 
     #[test]
-    fn normal_up_streams_a_start_paired_with_its_manual_cli_owner() {
-        let project = std::path::Path::new("/projects/example");
-        let session = ManualCliSession::new(std::process::id());
-
-        let (_, request) = prepare_up_start(project, false, Some(session))
-            .expect("prepare paired normal-up lifecycle request");
-        assert!(matches!(
-            request,
-            IpcRequest::Start {
-                manual_cli_session: Some(actual),
-                launch_path: Some(_),
-                ..
-            } if actual == session
-        ));
-    }
-
-    #[test]
-    fn exit_after_register_streams_start_without_a_manual_cli_owner() {
+    fn up_uses_an_ownerless_manual_demand_with_trusted_launch_context() {
         let project = std::path::Path::new("/projects/example");
 
-        let (_, request) = prepare_up_start(project, false, None)
-            .expect("prepare non-following lifecycle request");
+        let (_, request) =
+            prepare_up_ensure(project, true).expect("prepare manual availability ensure");
         assert!(matches!(
             request,
-            IpcRequest::Start {
-                manual_cli_session: None,
+            IpcRequest::EnsureProject {
+                demand,
+                verbose: true,
                 launch_path: Some(_),
                 ..
-            }
+            } if demand == DemandKey::manual_cli()
         ));
     }
 

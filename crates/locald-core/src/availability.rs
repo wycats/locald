@@ -138,6 +138,72 @@ pub enum DemandKind {
     StoppedPageResume,
 }
 
+/// Privacy-safe lifecycle state exposed by normal project status surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectLifecycleState {
+    Starting,
+    Ready,
+    Degraded,
+    Failed,
+    CoolingDown,
+    Paused,
+    Stopped,
+    Missing,
+}
+
+impl std::fmt::Display for ProjectLifecycleState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Starting => "Starting",
+            Self::Ready => "Ready",
+            Self::Degraded => "Degraded",
+            Self::Failed => "Failed",
+            Self::CoolingDown => "Cooling Down",
+            Self::Paused => "Paused",
+            Self::Stopped => "Stopped",
+            Self::Missing => "Missing",
+        };
+        formatter.write_str(label)
+    }
+}
+
+/// One stable, human-readable explanation for a project's lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AvailabilityReason {
+    pub code: String,
+    pub message: String,
+}
+
+/// One live demand without its private owner or generation metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AvailabilityDemandStatus {
+    pub kind: DemandKind,
+    pub safe_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<SystemTime>,
+}
+
+/// Authoritative desired availability combined with observed runtime state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAvailabilityStatus {
+    pub desired: bool,
+    pub state: ProjectLifecycleState,
+    pub always_on: bool,
+    pub paused: bool,
+    #[serde(default)]
+    pub reasons: Vec<AvailabilityReason>,
+    #[serde(default)]
+    pub demands: Vec<AvailabilityDemandStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_transition_at: Option<SystemTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 impl DemandKind {
     /// A privacy-safe label suitable for normal status projections.
     #[must_use]
