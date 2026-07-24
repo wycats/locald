@@ -123,6 +123,13 @@ fn resolve_service_name_from_config(name: &str, config_path: &std::path::Path) -
         )
 }
 
+const fn daemon_startup_is_pending(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::Daemon(DaemonError::NotRunning { .. } | DaemonError::ConnectionRefused { .. })
+    )
+}
+
 fn format_status_time(time: std::time::SystemTime) -> String {
     let time: chrono::DateTime<chrono::Local> = time.into();
     time.format("%Y-%m-%d %H:%M:%S %Z").to_string()
@@ -632,10 +639,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         )));
                     }
                     Err(error) => {
-                        let err_str = error.to_string();
-                        if err_str.contains("Connection refused")
-                            || err_str.contains("No such file or directory")
-                        {
+                        if daemon_startup_is_pending(&error) {
                             if attempts > 50 {
                                 return Err(error);
                             }
@@ -2207,6 +2211,25 @@ name = "example"
             resolve_service_name_from_config("other:web", &config_path),
             "other:web"
         );
+    }
+
+    #[test]
+    fn daemon_startup_retry_recognizes_typed_socket_states() {
+        assert!(daemon_startup_is_pending(&CliError::Daemon(
+            DaemonError::NotRunning {
+                socket_path: "/tmp/missing.sock".to_owned(),
+            }
+        )));
+        assert!(daemon_startup_is_pending(&CliError::Daemon(
+            DaemonError::ConnectionRefused {
+                socket_path: "/tmp/refused.sock".to_owned(),
+            }
+        )));
+        assert!(!daemon_startup_is_pending(&CliError::Daemon(
+            DaemonError::PermissionDenied {
+                socket_path: "/tmp/forbidden.sock".to_owned(),
+            }
+        )));
     }
 
     #[test]
