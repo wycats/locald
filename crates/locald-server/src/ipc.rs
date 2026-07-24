@@ -556,7 +556,7 @@ async fn handle_connection(
             project_path,
             enabled,
         } => match manager.project_set_always_on(&project_path, enabled).await {
-            Ok(_) => IpcResponse::Ok,
+            Ok(()) => IpcResponse::Ok,
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectForceStart { project_path } => {

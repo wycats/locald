@@ -5530,34 +5530,9 @@ impl ProcessManager {
     }
 
     /// Enable or disable durable Always On policy and converge the runtime.
-    pub async fn project_set_always_on(&self, project_path: &Path, enabled: bool) -> Result<bool> {
-        let (instance_id, _) = self
-            .required_availability_instance_for_path(project_path)
-            .await?;
+    pub async fn project_set_always_on(&self, project_path: &Path, enabled: bool) -> Result<()> {
         self.run_admitted_availability_transition(|| async {
-            self.ensure_accepting_lifecycle_requests()?;
-            let publication_guard = self.lifecycle_publication_lock.lock().await;
-            self.ensure_lifecycle_publication_available()?;
-            anyhow::ensure!(
-                self.active_path_for_instance(instance_id).await.is_some(),
-                "project instance {instance_id} is no longer active"
-            );
-            let mut availability = self.load_availability(instance_id).await?;
-            let (changed, durability_error) =
-                Self::capture_availability_publication(availability.set_always_on(enabled).await)?;
-            drop(publication_guard);
-            let convergence = if enabled {
-                let coordinator = self.availability_coordinator(instance_id).await;
-                let _runtime_guard = coordinator.runtime.lock().await;
-                self.clear_service_stop_suppressions(instance_id).await;
-                self.converge_managed_instance_locked(instance_id, None, false, false)
-                    .await
-            } else {
-                self.converge_managed_instance(instance_id, None, false, false)
-                    .await
-            };
-            Self::surface_availability_durability(convergence, durability_error)?;
-            Ok(changed.expect("successful availability publication returns its change result"))
+            self.registry_set_always_on(project_path, enabled).await
         })
         .await
     }
@@ -13662,12 +13637,10 @@ PATH = "/usr/bin:/bin"
         assert!(!paused.is_running);
         assert_eq!(paused.service_details[0].url, None);
 
-        assert!(
-            manager
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("resume project with Always On")
-        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("resume project with Always On");
         let always_on = manager
             .project_status(&project_path)
             .await
@@ -13999,12 +13972,10 @@ PATH = "/usr/bin:/bin"
         assert!(paused.always_on());
         assert!(paused.is_paused());
 
-        assert!(
-            paused_reopen
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("semantic Always On activity resumes project")
-        );
+        paused_reopen
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("semantic Always On activity resumes project");
         assert!(paused_reopen.project_runtime_is_ready(instance_id).await);
         paused_reopen
             .project_pause_availability(&project_path)
@@ -14174,12 +14145,10 @@ PATH = "/usr/bin:/bin"
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load project availability");
-        assert!(
-            manager
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("enable Always On")
-        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("enable Always On");
         let first_controller = manager
             .get_service_controller("resume:web")
             .await
@@ -14197,12 +14166,10 @@ PATH = "/usr/bin:/bin"
             .expect("load paused generation")
             .activity_generation();
 
-        assert!(
-            manager
-                .project_set_always_on(&project_path, true)
-                .await
-                .expect("renew Always On")
-        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("renew Always On");
         let snapshot = availability
             .snapshot()
             .await
@@ -15624,6 +15591,11 @@ PATH = "/usr/bin:/bin"
             "direct-unpin-prepare.localhost",
             &["web"],
         );
+        {
+            let mut registry = manager.registry.lock().await;
+            assert!(registry.pin_project(&project_path));
+            registry.save().await.expect("persist seeded catalog pin");
+        }
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load direct unpin availability");
@@ -15703,6 +15675,16 @@ PATH = "/usr/bin:/bin"
                 .get_service_controller("direct-unpin-prepare:web")
                 .await
                 .is_none()
+        );
+        assert!(
+            !manager
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .expect("directly unpinned project remains catalogued")
+                .pinned
         );
     }
 
@@ -16269,13 +16251,11 @@ PATH = "/usr/bin:/bin"
             .pause_project()
             .await
             .expect("cancel slow startup");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
-                .await
-                .expect("slow startup observes pause")
-                .expect("join slow startup")
-                .expect("converge slow startup after pause")
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_start)
+            .await
+            .expect("slow startup observes pause")
+            .expect("join slow startup")
+            .expect("converge slow startup after pause");
     }
 
     #[tokio::test]
