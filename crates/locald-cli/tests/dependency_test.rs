@@ -129,6 +129,7 @@ API_URL = "${services.api.url}"
     while Instant::now() < deadline {
         let output = Command::new(&locald_bin)
             .envs(env_vars.clone())
+            .current_dir(&project_dir)
             .arg(format!("--sandbox={}", sandbox))
             .arg("logs")
             .arg("dep-test:web")
