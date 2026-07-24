@@ -158,8 +158,9 @@ export async function getServiceInspect(name: string): Promise<ServiceInspectRes
 }
 
 let eventSource: EventSource | null = null;
+let lifecycleChangeCallback: (() => void) | undefined;
 
-function openEventSource(onLifecycleChange?: () => void) {
+function openEventSource() {
 	connection.setConnecting();
 	if (eventSource) {
 		eventSource.close();
@@ -175,7 +176,7 @@ function openEventSource(onLifecycleChange?: () => void) {
 			} else if (msg.type === 'ServiceUpdate') {
 				console.log('Received ServiceUpdate:', msg.data.name, msg.data.status);
 				services.updateService(msg.data);
-				onLifecycleChange?.();
+				lifecycleChangeCallback?.();
 			}
 		} catch (e) {
 			console.error('Failed to parse event', e);
@@ -200,7 +201,7 @@ function openEventSource(onLifecycleChange?: () => void) {
 		// Auto-reconnect with backoff. EventSource's native retry gives up
 		// when the server is down; we retry manually on a longer interval.
 		if (eventSource?.readyState === EventSource.CLOSED) {
-			scheduleReconnect(onLifecycleChange);
+			scheduleReconnect();
 		}
 	};
 }
@@ -209,12 +210,12 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelay = 2000;
 const MAX_RECONNECT_DELAY = 30000;
 
-function scheduleReconnect(onLifecycleChange?: () => void) {
+function scheduleReconnect() {
 	if (reconnectTimer) return;
 	reconnectTimer = setTimeout(() => {
 		reconnectTimer = null;
 		console.log(`Reconnecting SSE (after ${reconnectDelay}ms)...`);
-		openEventSource(onLifecycleChange);
+		openEventSource();
 		// Back off, but cap at 30s
 		reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
 	}, reconnectDelay);
@@ -229,10 +230,14 @@ function resetReconnectDelay() {
 }
 
 export function connectEvents(onLifecycleChange?: () => void) {
-	openEventSource(onLifecycleChange);
+	lifecycleChangeCallback = onLifecycleChange;
+	openEventSource();
 
 	return () => {
 		resetReconnectDelay();
+		if (lifecycleChangeCallback === onLifecycleChange) {
+			lifecycleChangeCallback = undefined;
+		}
 		if (eventSource) {
 			eventSource.close();
 			eventSource = null;
