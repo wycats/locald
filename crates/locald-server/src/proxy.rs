@@ -598,7 +598,7 @@ fn unavailable_project_response(
             String::new(),
         )
     };
-    let mut html = r#"<!DOCTYPE html>
+    let template = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -683,18 +683,21 @@ fn unavailable_project_response(
     </div>
     __RESUME_SCRIPT__
 </body>
-</html>"#
-        .to_string();
+</html>"#;
 
-    html = html
-        .replace("__STATUS__", &escaped_status)
-        .replace("__MESSAGE__", &escaped_message)
-        .replace("__SERVICE_HOST__", &escaped_host)
-        .replace("__SERVICE_HINT__", &service_hint)
-        .replace("__ALWAYS_ON_HINT__", &always_on_hint)
-        .replace("__RESUME_ACTION__", &resume_action)
-        .replace("__RESUME_STATUS__", &resume_status)
-        .replace("__RESUME_SCRIPT__", &resume_script);
+    let html = render_template_once(
+        template,
+        &[
+            ("__STATUS__", escaped_status.as_str()),
+            ("__MESSAGE__", escaped_message.as_str()),
+            ("__SERVICE_HOST__", escaped_host.as_str()),
+            ("__SERVICE_HINT__", service_hint.as_str()),
+            ("__ALWAYS_ON_HINT__", always_on_hint.as_str()),
+            ("__RESUME_ACTION__", resume_action.as_str()),
+            ("__RESUME_STATUS__", resume_status.as_str()),
+            ("__RESUME_SCRIPT__", resume_script.as_str()),
+        ],
+    );
 
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -702,6 +705,24 @@ fn unavailable_project_response(
         html,
     )
         .into_response()
+}
+
+fn render_template_once(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+
+    while let Some((index, token, value)) = replacements
+        .iter()
+        .filter_map(|(token, value)| remaining.find(token).map(|index| (index, *token, *value)))
+        .min_by_key(|(index, _, _)| *index)
+    {
+        rendered.push_str(&remaining[..index]);
+        rendered.push_str(value);
+        remaining = &remaining[index + token.len()..];
+    }
+
+    rendered.push_str(remaining);
+    rendered
 }
 
 fn inline_script_json_string(value: &str) -> String {
@@ -712,7 +733,7 @@ fn inline_script_json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod inline_script_tests {
-    use super::inline_script_json_string;
+    use super::{inline_script_json_string, render_template_once};
 
     #[test]
     fn inline_script_json_never_contains_an_html_end_tag() {
@@ -720,6 +741,22 @@ mod inline_script_tests {
 
         assert_eq!(encoded, r#""safe<\/script><script>alert(1)<\/script>""#);
         assert!(!encoded.contains("</script>"));
+    }
+
+    #[test]
+    fn template_rendering_does_not_reprocess_inserted_placeholder_text() {
+        let rendered = render_template_once(
+            "__MESSAGE__ __RESUME_SCRIPT__",
+            &[
+                ("__MESSAGE__", "__RESUME_SCRIPT__"),
+                ("__RESUME_SCRIPT__", "<script>safe()</script>"),
+            ],
+        );
+
+        assert_eq!(
+            rendered, "__RESUME_SCRIPT__ <script>safe()</script>",
+            "inserted values must never be treated as template source"
+        );
     }
 }
 
