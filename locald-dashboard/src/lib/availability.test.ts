@@ -51,6 +51,7 @@ describe('project availability presentation', () => {
 	it('only offers resume while the project still has a current worktree', () => {
 		expect(projectCanResume(status({ state: 'paused' }))).toBe(true);
 		expect(projectCanResume(status({ state: 'missing' }))).toBe(false);
+		expect(projectCanResume(undefined)).toBe(false);
 	});
 
 	it('summarizes privacy-safe demand labels without owner identifiers', () => {

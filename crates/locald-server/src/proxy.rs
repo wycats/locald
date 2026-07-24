@@ -522,7 +522,7 @@ fn unavailable_project_response(
             escape_html(service_name)
         )
     });
-    let domain_js = format!("{host:?}");
+    let domain_js = inline_script_json_string(host);
     let mut html = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -659,6 +659,25 @@ fn unavailable_project_response(
         html,
     )
         .into_response()
+}
+
+fn inline_script_json_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .expect("serializing a string as JSON cannot fail")
+        .replace("</", r"<\/")
+}
+
+#[cfg(test)]
+mod inline_script_tests {
+    use super::inline_script_json_string;
+
+    #[test]
+    fn inline_script_json_never_contains_an_html_end_tag() {
+        let encoded = inline_script_json_string("safe</script><script>alert(1)</script>");
+
+        assert_eq!(encoded, r#""safe<\/script><script>alert(1)<\/script>""#);
+        assert!(!encoded.contains("</script>"));
+    }
 }
 
 fn escape_html(input: &str) -> String {
