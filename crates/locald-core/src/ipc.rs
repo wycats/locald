@@ -348,7 +348,8 @@ pub enum IpcRequest {
     Shutdown,
     /// Stream logs for a service.
     ///
-    /// **Response:** Stream of `Event::Log(LogEntry)`
+    /// **Response:** Newline-delimited JSON. Successful records are `LogEntry`
+    /// values; project-resolution failures are sent as `IpcResponse::Error`.
     Logs {
         /// Optional service name filter.
         service: Option<String>,

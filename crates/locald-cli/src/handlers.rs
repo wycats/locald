@@ -30,7 +30,7 @@ use crate::{
 #[cfg(feature = "experimental-plugins")]
 use crate::{distribution, plugin};
 
-const LEGACY_AVAILABILITY_MESSAGE: &str = "Availability: unavailable (the running daemon does not provide semantic lifecycle status; run `sudo locald admin setup` to update it)";
+const LEGACY_AVAILABILITY_MESSAGE: &str = "Availability: unavailable (the running daemon does not provide semantic lifecycle status; run `sudo locald admin setup` to reinstall and restart locald)";
 
 #[derive(Debug, Serialize)]
 struct JsonServiceAction {
@@ -2272,6 +2272,7 @@ name = "example"
         assert!(LEGACY_AVAILABILITY_MESSAGE.contains("running daemon"));
         assert!(LEGACY_AVAILABILITY_MESSAGE.contains("semantic lifecycle status"));
         assert!(LEGACY_AVAILABILITY_MESSAGE.contains("sudo locald admin setup"));
+        assert!(LEGACY_AVAILABILITY_MESSAGE.contains("reinstall and restart locald"));
     }
 
     #[test]

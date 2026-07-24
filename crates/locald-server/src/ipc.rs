@@ -6,6 +6,7 @@ use locald_core::attachments::{AttachmentSource, ManualCliSession};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::{DaemonIdentity, MAX_IPC_REQUEST_BYTES};
 use locald_core::{DemandKey, IpcRequest, IpcResponse};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -94,6 +95,13 @@ fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -
         session.pid()
     );
     Ok(())
+}
+
+fn project_logs_resolution_error(path: &Path, error: &anyhow::Error) -> String {
+    format!(
+        "project-scoped logs are unavailable for `{}`: {error:#}; run `locald up` from that project first, or omit the project scope to inspect all daemon logs",
+        path.display()
+    )
 }
 
 fn authenticate_process_bound_attachment_source(
@@ -256,7 +264,8 @@ async fn handle_connection(
             Some(project_path) => match manager.project_instance_for_logs(&project_path).await {
                 Ok(instance_id) => Some(instance_id),
                 Err(error) => {
-                    let mut bytes = serde_json::to_vec(&IpcResponse::Error(format!("{error:#}")))?;
+                    let message = project_logs_resolution_error(&project_path, &error);
+                    let mut bytes = serde_json::to_vec(&IpcResponse::Error(message))?;
                     bytes.push(b'\n');
                     stream.write_all(&bytes).await?;
                     return Ok(());
@@ -638,6 +647,17 @@ mod tests {
         assert!(error.to_string().contains("accepts only ownerless demands"));
         validate_generic_ensure_demand(&DemandKey::manual_cli())
             .expect("generic IPC accepts ownerless Manual CLI demand");
+    }
+
+    #[test]
+    fn scoped_log_resolution_failure_explains_both_recovery_paths() {
+        let error = anyhow::anyhow!("project is not registered in the identity catalog");
+        let message = project_logs_resolution_error(Path::new("/tmp/example"), &error);
+
+        assert!(message.contains("project-scoped logs are unavailable for `/tmp/example`"));
+        assert!(message.contains("run `locald up` from that project first"));
+        assert!(message.contains("omit the project scope"));
+        assert!(message.contains("not registered in the identity catalog"));
     }
 
     #[tokio::test]
