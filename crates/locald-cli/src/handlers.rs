@@ -107,8 +107,17 @@ fn prepare_up_ensure(
     Ok((project_path, request))
 }
 
+fn nearest_project_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.join("locald.toml").is_file())
+        .map(std::path::Path::to_path_buf)
+}
+
 fn resolve_service_name(name: &str) -> CliResult<String> {
-    let config_path = std::env::current_dir()?.join("locald.toml");
+    let current_dir = std::env::current_dir()?;
+    let config_path = nearest_project_root(&current_dir)
+        .unwrap_or(current_dir)
+        .join("locald.toml");
     Ok(resolve_service_name_from_config(name, &config_path))
 }
 
@@ -909,10 +918,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
         Commands::Logs { service, follow } => {
             utils::ensure_daemon_running()?;
             let current_dir = std::env::current_dir()?;
-            let project_path = current_dir
-                .join("locald.toml")
-                .exists()
-                .then(|| resolve_project_locator(&current_dir))
+            let project_path = nearest_project_root(&current_dir)
+                .map(|project_root| resolve_project_locator(&project_root))
                 .transpose()?;
             let service_name = service.as_deref().map(resolve_service_name).transpose()?;
 
@@ -2197,6 +2204,24 @@ mod tests {
         assert!(!is_semantic_status_url("http://[::1]:49152"));
         assert!(is_semantic_status_url("https://app.localhost"));
         assert!(is_semantic_status_url("https://app.example.test:8443"));
+    }
+
+    #[test]
+    fn nearest_project_root_finds_the_closest_enclosing_config() {
+        let directory = tempfile::tempdir().expect("create project-root directory");
+        let outer = directory.path().join("outer");
+        let inner = outer.join("packages/inner");
+        let nested = inner.join("src/components");
+        std::fs::create_dir_all(&nested).expect("create nested project directories");
+        std::fs::write(outer.join("locald.toml"), "[project]\nname = \"outer\"\n")
+            .expect("write outer project config");
+
+        assert_eq!(nearest_project_root(&nested), Some(outer.clone()));
+
+        std::fs::write(inner.join("locald.toml"), "[project]\nname = \"inner\"\n")
+            .expect("write inner project config");
+        assert_eq!(nearest_project_root(&nested), Some(inner));
+        assert_eq!(nearest_project_root(directory.path()), None);
     }
 
     #[test]
