@@ -224,7 +224,12 @@ command = "python3 -m http.server $PORT"
     thread::sleep(Duration::from_secs(1));
 
     // Debug: Print logs if status fails
-    let status = ctx.command().arg("status").output().unwrap();
+    let status = ctx
+        .command()
+        .arg("status")
+        .arg(&project_dir)
+        .output()
+        .unwrap();
     if !String::from_utf8_lossy(&status.stdout).contains("web") {
         println!("Status output: {}", String::from_utf8_lossy(&status.stdout));
 
@@ -241,6 +246,7 @@ command = "python3 -m http.server $PORT"
 
     ctx.command()
         .arg("status")
+        .arg(&project_dir)
         .assert()
         .success()
         .stdout(predicates::str::contains("web"))
