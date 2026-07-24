@@ -214,7 +214,13 @@ impl locald_core::resolver::ServiceResolver for OwnershipOnlyResolver {
         _domain: &str,
     ) -> Option<locald_core::ProjectAvailabilityStatus> {
         Some(locald_core::ProjectAvailabilityStatus {
-            desired: false,
+            desired: matches!(
+                self.state,
+                locald_core::ProjectLifecycleState::Starting
+                    | locald_core::ProjectLifecycleState::Ready
+                    | locald_core::ProjectLifecycleState::Degraded
+                    | locald_core::ProjectLifecycleState::Failed
+            ),
             state: self.state,
             always_on: true,
             paused: self.state == locald_core::ProjectLifecycleState::Paused,
@@ -308,6 +314,41 @@ async fn test_missing_owned_domain_explains_how_to_restore_the_worktree() {
     assert!(!body.contains("Resume project"));
     assert!(!body.contains("resume-btn"));
     assert!(!body.contains("/api/projects/resume-domain"));
+}
+
+#[tokio::test]
+async fn test_available_owned_domain_directs_user_to_service_diagnostics() {
+    for state in [
+        locald_core::ProjectLifecycleState::Starting,
+        locald_core::ProjectLifecycleState::Ready,
+    ] {
+        let proxy = ProxyManager::new(
+            Arc::new(OwnershipOnlyResolver { state }),
+            Router::new(),
+            None,
+        );
+        let app = proxy.make_app();
+
+        let req = Request::builder()
+            .uri("/")
+            .header("Host", "worker.localhost")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(&format!("Project is {state}")));
+        assert!(body.contains("service status and logs") || body.contains("status and logs"));
+        assert!(body.contains("Open dashboard"));
+        assert!(!body.contains("Resume project"));
+        assert!(!body.contains("resume-btn"));
+        assert!(!body.contains("/api/projects/resume-domain"));
+    }
 }
 
 #[tokio::test]

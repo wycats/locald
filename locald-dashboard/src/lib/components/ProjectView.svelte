@@ -256,20 +256,22 @@
 					{:else}
 						<span class="missing-guidance">Restore the worktree to resume this project.</span>
 					{/if}
-					<button
-						class="project-action secondary"
-						disabled={projectAction !== null}
-						onclick={() => handleProjectAction('always-on')}
-					>
-						{#if projectAction === 'always-on'}
-							<Spinner size={14} />
-						{:else if project.availability?.always_on}
-							<PinOff size={14} />
-						{:else}
-							<Pin size={14} />
-						{/if}
-						{project.availability?.always_on ? 'Use automatic lifecycle' : 'Keep Always On'}
-					</button>
+					{#if project.availability?.state !== 'missing'}
+						<button
+							class="project-action secondary"
+							disabled={projectAction !== null}
+							onclick={() => handleProjectAction('always-on')}
+						>
+							{#if projectAction === 'always-on'}
+								<Spinner size={14} />
+							{:else if project.availability?.always_on}
+								<PinOff size={14} />
+							{:else}
+								<Pin size={14} />
+							{/if}
+							{project.availability?.always_on ? 'Use automatic lifecycle' : 'Keep Always On'}
+						</button>
+					{/if}
 				</div>
 			</div>
 		{/if}

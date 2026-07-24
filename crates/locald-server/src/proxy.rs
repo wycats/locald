@@ -522,17 +522,18 @@ fn unavailable_project_response(
             escape_html(service_name)
         )
     });
-    let missing = availability
-        .is_some_and(|availability| availability.state == ProjectLifecycleState::Missing);
-    let (resume_action, resume_status, resume_script) = if missing {
-        (
-            r#"<a class="btn secondary" href="https://locald.localhost">Open dashboard</a>"#
-                .to_owned(),
-            r#"<p class="hint">Restore the project worktree, then run <code>locald up</code> from that directory.</p>"#
-                .to_owned(),
-            String::new(),
+    let lifecycle_state = availability.map(|availability| availability.state);
+    let can_resume = matches!(
+        lifecycle_state,
+        None | Some(
+            ProjectLifecycleState::Paused
+                | ProjectLifecycleState::Stopped
+                | ProjectLifecycleState::Failed
+                | ProjectLifecycleState::Degraded
+                | ProjectLifecycleState::CoolingDown
         )
-    } else {
+    );
+    let (resume_action, resume_status, resume_script) = if can_resume {
         let domain_js = inline_script_json_string(host);
         (
             r#"<button class="btn" id="resume-btn">Resume project</button>
@@ -576,6 +577,25 @@ fn unavailable_project_response(
         }}
     </script>"
             ),
+        )
+    } else {
+        let guidance = match lifecycle_state {
+            Some(ProjectLifecycleState::Missing) => {
+                "Restore the project worktree, then run <code>locald up</code> from that directory."
+            }
+            Some(ProjectLifecycleState::Starting) => {
+                "This project is already starting. Open the dashboard to inspect its service status and logs."
+            }
+            Some(ProjectLifecycleState::Ready) => {
+                "This project is available, but this service does not currently expose a reachable web endpoint. Open the dashboard to inspect its status and logs."
+            }
+            _ => unreachable!("every non-resumable lifecycle state has guidance"),
+        };
+        (
+            r#"<a class="btn secondary" href="https://locald.localhost">Open dashboard</a>"#
+                .to_owned(),
+            format!(r#"<p class="hint">{guidance}</p>"#),
+            String::new(),
         )
     };
     let mut html = r#"<!DOCTYPE html>
