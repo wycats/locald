@@ -70,6 +70,11 @@ impl TestContext {
                 "XDG_RUNTIME_DIR",
                 home.join(".run").to_string_lossy().to_string(),
             ),
+            // `locald up` now waits for the sandbox HTTPS proxy before
+            // reporting readiness. Use ephemeral listeners so this test stays
+            // isolated from other integration-test daemons.
+            ("LOCALD_HTTP_PORT", "0".to_string()),
+            ("LOCALD_HTTPS_PORT", "0".to_string()),
         ];
 
         // Inherit PATH
