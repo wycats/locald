@@ -32,7 +32,7 @@ Options:
 
 ```console
 $ locald up --help
-Start the daemon (if needed) and register the current project
+Ensure the current project is ready and print its URLs
 
 Usage: locald up [OPTIONS] [PATH]
 
@@ -42,6 +42,7 @@ Arguments:
 Options:
       --sandbox <SANDBOX>  Run in a sandbox environment
   -v, --verbose            Show verbose output
+      --follow             Follow this project's logs after it becomes ready
   -h, --help               Print help
 
 ```

@@ -101,9 +101,8 @@ impl TestContext {
         Ok(output)
     }
 
-    /// Run the hidden test-harness `up` path to establish trusted launch
-    /// context, then attach a PID-backed editor owner to keep the project alive
-    /// for the assertions that follow.
+    /// Run quiet `up` to establish trusted launch context, then attach a
+    /// PID-backed editor owner for editor-lifecycle assertions that follow.
     pub async fn run_up_with_test_owner(
         &self,
         project_path: &std::path::Path,
@@ -113,9 +112,7 @@ impl TestContext {
             .context("Project path is not valid UTF-8")?;
         let editor_pid = std::process::id().to_string();
 
-        let up_output = self
-            .run_cli(&["up", "--exit-after-register", project_path])
-            .await?;
+        let up_output = self.run_cli(&["up", project_path]).await?;
         if !up_output.status.success() {
             return Ok(up_output);
         }

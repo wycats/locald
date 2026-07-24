@@ -165,14 +165,13 @@ fn test_tui_progress() {
     let mut cmd = StdCommand::new(&ctx.locald_bin);
     cmd.envs(ctx.env());
     cmd.arg("up");
-    cmd.arg("--exit-after-register");
     cmd.arg(&project_dir);
     cmd.arg(format!("--sandbox={}", ctx.sandbox));
 
     // Increase timeout for build
     let mut p = rexpect::session::spawn_command(cmd, Some(30000)).expect("failed to spawn rexpect");
 
-    // Expect TUI output. In test mode `locald up` exits after registration
+    // Expect TUI output. `locald up` exits after readiness.
     // instead of staying attached to service logs.
     p.exp_string("Loading configuration")
         .expect("failed to find Loading configuration");

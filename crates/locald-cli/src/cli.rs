@@ -164,16 +164,16 @@ pub enum Commands {
         #[arg(long)]
         version: Option<String>,
     },
-    /// Start the daemon (if needed) and register the current project
+    /// Ensure the current project is ready and print its URLs
     Up {
         /// Path to the service directory (defaults to current directory if locald.toml exists)
         path: Option<std::path::PathBuf>,
         /// Show verbose output
         #[arg(long, short)]
         verbose: bool,
-        /// Exit after project registration instead of attaching to service logs
-        #[arg(long, hide = true)]
-        exit_after_register: bool,
+        /// Follow this project's logs after it becomes ready
+        #[arg(long)]
+        follow: bool,
     },
     /// Open the dashboard in the default browser
     Dashboard,
@@ -197,6 +197,16 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Keep a project available even without an active demand
+    Pin {
+        /// Path to the project (defaults to the current directory)
+        path: Option<std::path::PathBuf>,
+    },
+    /// Return a project to automatic demand-based availability
+    Unpin {
+        /// Path to the project (defaults to the current directory)
+        path: Option<std::path::PathBuf>,
+    },
     /// Restart a running service
     Restart {
         /// Name of the service to restart
@@ -206,8 +216,13 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// List running services
+    /// Explain desired and actual project availability
     Status {
+        /// Project path (defaults to the current directory)
+        path: Option<std::path::PathBuf>,
+        /// Show all known projects instead of the current project
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -555,6 +570,16 @@ pub enum ServiceCommands {
     },
     /// Reset a service (stop, wipe data, restart)
     Reset {
+        /// Name of the service
+        name: String,
+    },
+    /// Stop one service without changing project availability
+    Stop {
+        /// Name of the service
+        name: String,
+    },
+    /// Restart one service
+    Restart {
         /// Name of the service
         name: String,
     },

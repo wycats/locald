@@ -173,6 +173,10 @@ async fn read_request(stream: &mut UnixStream) -> Result<Option<IpcRequest>> {
     }
 }
 
+// The compatibility dispatcher still owns the full legacy IPC enum while it
+// routes each request. Keep that known boundary explicit until the legacy
+// protocol is retired rather than spreading the match across public helpers.
+#[allow(clippy::large_futures, clippy::large_stack_frames)]
 async fn handle_connection(
     mut stream: UnixStream,
     manager: ProcessManager,
@@ -242,9 +246,26 @@ async fn handle_connection(
         return Ok(());
     }
 
-    if let IpcRequest::Logs { service, mode } = request {
+    if let IpcRequest::Logs {
+        service,
+        project_path,
+        mode,
+    } = request
+    {
+        let project_instance_id = match project_path {
+            Some(project_path) => match manager.project_instance_for_logs(&project_path).await {
+                Ok(instance_id) => Some(instance_id),
+                Err(error) => {
+                    let mut bytes = serde_json::to_vec(&IpcResponse::Error(format!("{error:#}")))?;
+                    bytes.push(b'\n');
+                    stream.write_all(&bytes).await?;
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
         let mut rx = manager.log_sender.subscribe();
-        let recent = manager.get_recent_logs();
+        let recent = manager.get_recent_logs_for_instance(project_instance_id);
 
         for entry in recent {
             if let Some(ref s) = service
@@ -265,6 +286,11 @@ async fn handle_connection(
         loop {
             match rx.recv().await {
                 Ok(entry) => {
+                    if project_instance_id.is_some_and(|instance_id| {
+                        !manager.log_entry_belongs_to_instance(&entry, instance_id)
+                    }) {
+                        continue;
+                    }
                     if let Some(ref s) = service
                         && &entry.service != s
                         && entry.service != format!("{}:build", s)
@@ -492,6 +518,35 @@ async fn handle_connection(
                     Err(error) => IpcResponse::Error(format!("{error:#}")),
                 }
             }
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::RenewProjectDemand {
+            project_path,
+            demand,
+        } => match validate_generic_ensure_demand(&demand) {
+            Ok(()) => match manager
+                .project_renew_availability(&project_path, &demand)
+                .await
+            {
+                Ok(true) => IpcResponse::Ok,
+                Ok(false) => IpcResponse::Error(
+                    "the project demand is no longer live; run `locald up` again".to_owned(),
+                ),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::PauseProject { project_path } => {
+            match manager.project_pause_availability(&project_path).await {
+                Ok(_) => IpcResponse::Ok,
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            }
+        }
+        IpcRequest::SetAlwaysOn {
+            project_path,
+            enabled,
+        } => match manager.project_set_always_on(&project_path, enabled).await {
+            Ok(_) => IpcResponse::Ok,
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::ProjectForceStart { project_path } => {

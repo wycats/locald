@@ -89,14 +89,22 @@ pub fn serialize_request(request: &IpcRequest) -> CliResult<Vec<u8>> {
     Ok(request_bytes)
 }
 
-pub fn stream_logs(service: Option<String>, follow: bool) -> CliResult<()> {
+pub fn stream_logs(
+    service: Option<String>,
+    project_path: Option<std::path::PathBuf>,
+    follow: bool,
+) -> CliResult<()> {
     let (mut stream, _socket_display) = connect_to_daemon()?;
     let mode = if follow {
         locald_core::ipc::LogMode::Follow
     } else {
         locald_core::ipc::LogMode::Snapshot
     };
-    let request = IpcRequest::Logs { service, mode };
+    let request = IpcRequest::Logs {
+        service,
+        project_path,
+        mode,
+    };
     let request_bytes = serialize_request(&request)?;
     stream.write_all(&request_bytes)?;
 
@@ -126,6 +134,8 @@ pub fn stream_logs(service: Option<String>, follow: bool) -> CliResult<()> {
                 stream_style,
                 entry.message
             );
+        } else if let Ok(IpcResponse::Error(message)) = serde_json::from_str(&line) {
+            return Err(DaemonError::RequestFailed { message }.into());
         }
     }
     Ok(())

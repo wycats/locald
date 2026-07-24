@@ -805,6 +805,13 @@
             "subcommands": []
           },
           {
+            "name": "pin",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
             "name": "ping",
             "aliases": [],
             "hidden": false,
@@ -1002,6 +1009,20 @@
                 "hidden": false,
                 "args": [],
                 "subcommands": []
+              },
+              {
+                "name": "restart",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "stop",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
               }
             ]
           },
@@ -1064,6 +1085,13 @@
           },
           {
             "name": "try",
+            "aliases": [],
+            "hidden": false,
+            "args": [],
+            "subcommands": []
+          },
+          {
+            "name": "unpin",
             "aliases": [],
             "hidden": false,
             "args": [],
@@ -1218,6 +1246,38 @@
             "global": true,
             "hidden": false,
             "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
+        "name": "pin",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
           }
         ],
         "subcommands": []
@@ -2421,11 +2481,89 @@
                 "hidden": false,
                 "args": [],
                 "subcommands": []
+              },
+              {
+                "name": "restart",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
+              },
+              {
+                "name": "stop",
+                "aliases": [],
+                "hidden": false,
+                "args": [],
+                "subcommands": []
               }
             ]
           },
           {
             "name": "reset",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "restart",
+            "aliases": [],
+            "hidden": false,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "stop",
             "aliases": [],
             "hidden": false,
             "args": [
@@ -2464,6 +2602,14 @@
         "hidden": false,
         "args": [
           {
+            "long": "all",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "help",
             "short": "h",
             "aliases": [],
@@ -2486,6 +2632,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
           }
         ],
         "subcommands": []
@@ -2751,16 +2905,48 @@
         "subcommands": []
       },
       {
+        "name": "unpin",
+        "aliases": [],
+        "hidden": false,
+        "args": [
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": null,
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": true
+          }
+        ],
+        "subcommands": []
+      },
+      {
         "name": "up",
         "aliases": [],
         "hidden": false,
         "args": [
           {
-            "long": "exit-after-register",
+            "long": "follow",
             "short": null,
             "aliases": [],
             "global": false,
-            "hidden": true,
+            "hidden": false,
             "positional": false
           },
           {

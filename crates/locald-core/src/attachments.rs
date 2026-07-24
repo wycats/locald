@@ -103,6 +103,9 @@ pub struct ProjectStatusInfo {
     /// Full service details (ports, URLs, health, etc.)
     #[serde(default)]
     pub service_details: Vec<crate::ipc::ServiceStatus>,
+    /// Daemon-owned desired availability and observed project lifecycle state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<crate::availability::ProjectAvailabilityStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -113,6 +116,9 @@ pub struct ProjectListEntry {
     pub attachments: Vec<Attachment>,
     pub is_running: bool,
     pub section: ProjectSection,
+    /// Daemon-owned desired availability and observed project lifecycle state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<crate::availability::ProjectAvailabilityStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

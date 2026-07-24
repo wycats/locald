@@ -18,12 +18,14 @@ Commands:
   trust         Install the locald Root CA into the system trust store
   server        Server management commands
   selfupgrade   Self-upgrade locald to a newer version
-  up            Start the daemon (if needed) and register the current project
+  up            Ensure the current project is ready and print its URLs
   dashboard     Open the dashboard in the default browser
   doctor        Diagnose host readiness for running locald
   stop          Pause the current project. With a name, stop only that service
+  pin           Keep a project available even without an active demand
+  unpin         Return a project to automatic demand-based availability
   restart       Restart a running service
-  status        List running services
+  status        Explain desired and actual project availability
   logs          Stream logs from services
   admin         Administrative commands
   tray          Manage the menu bar agent
