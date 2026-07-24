@@ -24,15 +24,20 @@ port = 9090
     assert!(output.status.success());
 
     // 3. Check status
-    let output = ctx.run_cli(&["status"]).await?;
+    let project = project_path.to_string_lossy();
+    let output = ctx.run_cli(&["status", project.as_ref()]).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !stdout.contains("9090") {
+    if !stdout.contains("port-test:web: running") {
         ctx.dump_logs().await?;
     }
 
-    assert!(stdout.contains("9090"));
-    assert!(stdout.contains("Running"));
+    assert!(stdout.contains("Availability: Ready (desired up)"));
+    assert!(stdout.contains("port-test:web: running"));
+    assert!(
+        !stdout.contains("9090"),
+        "normal semantic status must not expose internal service ports"
+    );
 
     // 4. Verify port is open
     // We can try to connect to localhost:9090

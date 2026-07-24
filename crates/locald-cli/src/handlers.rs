@@ -598,7 +598,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let (abs_path, ensure_request) = prepare_up_ensure(&target_path)?;
+            let (_, ensure_request) = prepare_up_ensure(&target_path)?;
 
             let mut attempts = 0;
             let ensured = loop {
@@ -640,7 +640,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let renewal_path = abs_path.clone();
+            let project_path = ensured.project_path;
+            let renewal_path = project_path.clone();
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(MANUAL_FOLLOW_RENEWAL_INTERVAL);
@@ -658,7 +659,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 "{} Following project logs (Ctrl+C stops following; the project remains available)...",
                 style::INFO
             );
-            client::stream_logs(None, Some(abs_path), true)?;
+            client::stream_logs(None, Some(project_path), true)?;
         }
         Commands::Stop { name, json } => {
             if name.is_none() {

@@ -42,7 +42,7 @@ depends_on = ["db"]
     let project_path_field = format!("project_path: \"{project_path}\"");
     let editor_id_field = format!("id: \"{}\"", ctx.sandbox);
     let up_start_idx = daemon_log
-        .match_indices("Received request: Start")
+        .match_indices("Received request: EnsureProject")
         .find_map(|(idx, _)| {
             let line = daemon_log[idx..].lines().next()?;
             (line.contains(&project_path_field) && line.contains("launch_path: Some("))

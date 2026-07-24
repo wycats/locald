@@ -107,6 +107,12 @@ struct InstanceLogBuffer {
     logs: LogBuffer,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct InstanceLogEntry {
+    pub(crate) instance_id: ProjectInstanceId,
+    pub(crate) entry: LogEntry,
+}
+
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("Service not found")]
 pub struct ServiceNotFoundError;
@@ -519,6 +525,7 @@ pub(crate) enum RuntimeSnapshot {
 pub struct ProcessManager {
     services: Arc<Mutex<HashMap<String, Service>>>,
     pub log_sender: broadcast::Sender<LogEntry>,
+    pub(crate) instance_log_sender: broadcast::Sender<InstanceLogEntry>,
     pub event_sender: broadcast::Sender<Event>,
     log_buffers: Arc<StdMutex<HashMap<String, InstanceLogBuffer>>>,
     state_manager: Arc<StateManager>,
@@ -740,6 +747,7 @@ impl ProcessManager {
         } else {
             broadcast::channel(100)
         };
+        let (instance_log_tx, _) = broadcast::channel(100);
         let (event_tx, _) = broadcast::channel(100);
 
         let services = Arc::new(Mutex::new(HashMap::new()));
@@ -774,6 +782,7 @@ impl ProcessManager {
         Ok(Self {
             services,
             log_sender: tx,
+            instance_log_sender: instance_log_tx,
             event_sender: event_tx,
             log_buffers: Arc::new(StdMutex::new(HashMap::new())),
             state_manager,
@@ -883,31 +892,30 @@ impl ProcessManager {
         // Owned routed domains remain meaningful while a service is stopped:
         // the proxy still serves locald's stopped/paused surface there. Raw
         // localhost URLs remain live-runtime diagnostics.
-        let url =
-            if let Some(ServiceConfig::Typed(TypedServiceConfig::Postgres(_))) = service_config {
-                None
-            } else if let Some(domain) = domain.as_ref() {
-                let (proxy_http, proxy_https) = proxy_ports;
-                if let Some(port) = proxy_https {
-                    if port == 443 {
-                        Some(format!("https://{domain}"))
-                    } else {
-                        Some(format!("https://{domain}:{port}"))
-                    }
-                } else if let Some(port) = proxy_http {
-                    if port == 80 {
-                        Some(format!("http://{domain}"))
-                    } else {
-                        Some(format!("http://{domain}:{port}"))
-                    }
-                } else {
+        let url = if matches!(service_type, ServiceType::Postgres | ServiceType::Worker) {
+            None
+        } else if let Some(domain) = domain.as_ref() {
+            let (proxy_http, proxy_https) = proxy_ports;
+            if let Some(port) = proxy_https {
+                if port == 443 {
                     Some(format!("https://{domain}"))
+                } else {
+                    Some(format!("https://{domain}:{port}"))
                 }
-            } else if status == locald_core::state::ServiceState::Running {
-                port.map(|port| format!("http://localhost:{port}"))
+            } else if let Some(port) = proxy_http {
+                if port == 80 {
+                    Some(format!("http://{domain}"))
+                } else {
+                    Some(format!("http://{domain}:{port}"))
+                }
             } else {
-                None
-            };
+                Some(format!("https://{domain}"))
+            }
+        } else if status == locald_core::state::ServiceState::Running {
+            port.map(|port| format!("http://localhost:{port}"))
+        } else {
+            None
+        };
 
         // Compute the connection URL (raw connection string)
         let connection_url = if status == locald_core::state::ServiceState::Running {
@@ -1412,6 +1420,10 @@ impl ProcessManager {
         }
 
         // Broadcast (ignore error if no receivers)
+        let _ = self.instance_log_sender.send(InstanceLogEntry {
+            instance_id,
+            entry: entry.clone(),
+        });
         let _ = self.log_sender.send(entry.clone());
         let _ = self.event_sender.send(Event::Log(entry));
     }
@@ -1437,19 +1449,6 @@ impl ProcessManager {
         }
         all_logs.sort_by_key(|e| e.timestamp);
         all_logs
-    }
-
-    #[must_use]
-    pub fn log_entry_belongs_to_instance(
-        &self,
-        entry: &LogEntry,
-        instance_id: ProjectInstanceId,
-    ) -> bool {
-        #[allow(clippy::expect_used)]
-        let buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
-        buffers
-            .get(&entry.service)
-            .is_some_and(|buffer| buffer.instance_id == instance_id)
     }
 
     pub async fn project_instance_for_logs(
@@ -13593,10 +13592,7 @@ PATH = "/usr/bin:/bin"
             .project_status(&project_path)
             .await
             .expect("inspect service-level override");
-        assert_eq!(
-            degraded.service_details[0].url.as_deref(),
-            Some("https://semantic-status.localhost")
-        );
+        assert_eq!(degraded.service_details[0].url, None);
         let degraded_availability = degraded.availability.expect("degraded availability status");
         assert_eq!(degraded_availability.state, ProjectLifecycleState::Degraded);
         assert!(degraded_availability.desired);
@@ -13626,10 +13622,7 @@ PATH = "/usr/bin:/bin"
         assert!(!paused_availability.desired);
         assert!(paused_availability.paused);
         assert!(!paused.is_running);
-        assert_eq!(
-            paused.service_details[0].url.as_deref(),
-            Some("https://semantic-status.localhost")
-        );
+        assert_eq!(paused.service_details[0].url, None);
 
         assert!(
             manager
@@ -19915,6 +19908,28 @@ command = "api"
         // Verify no high port leaks into URLs
         assert!(!status.url.as_deref().unwrap_or("").contains("8443"));
         assert!(!status.url.as_deref().unwrap_or("").contains("8080"));
+
+        // Portless workers never advertise a routed domain, even when the
+        // project owns one and the runtime snapshot contains stale port data.
+        let worker_config = ServiceConfig::Typed(TypedServiceConfig::Worker(
+            locald_core::config::WorkerServiceConfig::default(),
+        ));
+        let status = ProcessManager::build_service_status(
+            "worker".to_owned(),
+            Some("worker.app.test".to_owned()),
+            path,
+            (Some(80), Some(443)),
+            health_status,
+            health_source,
+            running_snapshot(),
+            Some(&worker_config),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status.service_type, locald_core::ipc::ServiceType::Worker);
+        assert_eq!(status.url, None);
     }
 
     #[test]
@@ -23808,6 +23823,7 @@ path = "docs"
             .lock()
             .await
             .insert("app:web".to_owned(), first_service);
+        let mut instance_logs = manager.instance_log_sender.subscribe();
 
         let desired_names = HashSet::from(["app:web".to_owned()]);
         let error = manager
@@ -23946,6 +23962,16 @@ path = "docs"
             manager.get_recent_logs_for_instance(Some(second_instance))[0].message,
             "current second-instance log"
         );
+        let first_live_log = instance_logs
+            .try_recv()
+            .expect("first instance live log remains queued");
+        let second_live_log = instance_logs
+            .try_recv()
+            .expect("second instance live log remains queued");
+        assert_eq!(first_live_log.instance_id, first_instance);
+        assert_eq!(first_live_log.entry.message, "first-instance history");
+        assert_eq!(second_live_log.instance_id, second_instance);
+        assert_eq!(second_live_log.entry.message, "current second-instance log");
         manager
             .services
             .lock()

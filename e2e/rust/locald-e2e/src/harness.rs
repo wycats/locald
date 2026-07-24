@@ -57,6 +57,8 @@ impl TestContext {
             .env("LOCALD_SOCKET", &self.socket_path)
             .env("LOCALD_SANDBOX_ACTIVE", "1")
             .env("LOCALD_SANDBOX_NAME", &self.sandbox)
+            .env("LOCALD_HTTP_PORT", "0")
+            .env("LOCALD_HTTPS_PORT", "0")
             // Isolate state for the daemon.
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
@@ -82,7 +84,15 @@ impl TestContext {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        anyhow::bail!("Timed out waiting for daemon socket")
+        let stdout = tokio::fs::read_to_string(self.root.path().join("daemon.out"))
+            .await
+            .unwrap_or_default();
+        let stderr = tokio::fs::read_to_string(self.root.path().join("daemon.err"))
+            .await
+            .unwrap_or_default();
+        anyhow::bail!(
+            "Timed out waiting for daemon socket\n\nDaemon stdout:\n{stdout}\n\nDaemon stderr:\n{stderr}"
+        )
     }
 
     pub async fn run_cli(&self, args: &[&str]) -> Result<std::process::Output> {

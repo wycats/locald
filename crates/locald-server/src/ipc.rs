@@ -264,7 +264,7 @@ async fn handle_connection(
             },
             None => None,
         };
-        let mut rx = manager.log_sender.subscribe();
+        let mut rx = manager.instance_log_sender.subscribe();
         let recent = manager.get_recent_logs_for_instance(project_instance_id);
 
         for entry in recent {
@@ -285,12 +285,13 @@ async fn handle_connection(
 
         loop {
             match rx.recv().await {
-                Ok(entry) => {
-                    if project_instance_id.is_some_and(|instance_id| {
-                        !manager.log_entry_belongs_to_instance(&entry, instance_id)
-                    }) {
+                Ok(scoped_entry) => {
+                    if project_instance_id
+                        .is_some_and(|instance_id| scoped_entry.instance_id != instance_id)
+                    {
                         continue;
                     }
+                    let entry = scoped_entry.entry;
                     if let Some(ref s) = service
                         && &entry.service != s
                         && entry.service != format!("{}:build", s)

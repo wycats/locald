@@ -26,43 +26,22 @@ command = "while true; do sleep 1; done"
     assert!(output.status.success());
 
     // 3. Check status
-    let output = ctx.run_cli(&["status"]).await?;
+    let project = project_path.to_string_lossy();
+    let output = ctx.run_cli(&["status", project.as_ref()]).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     println!("Status output:\n{}", stdout);
 
-    // Parse output to verify URLs
-    // Expected format:
-    // NAME                 STATUS     PORT       URL
-    // url-test:web         Running    12345      http(s)://url-test.localhost[:PORT]
-    // url-test:worker      Running    -          -
-
-    let lines: Vec<&str> = stdout.lines().collect();
-
-    let web_line = lines
-        .iter()
-        .find(|l| l.contains("url-test:web"))
-        .expect("Web service not found");
-    let worker_line = lines
-        .iter()
-        .find(|l| l.contains("url-test:worker"))
-        .expect("Worker service not found");
-
-    // Web service should have a URL. In CI, HTTPS may be disabled if `locald trust`
-    // hasn't been run, so accept either scheme.
+    // The routable web service has one semantic HTTPS URL. The portless
+    // worker remains visible as a service without advertising a route.
     assert!(
-        web_line.contains("https://") || web_line.contains("http://"),
+        stdout.contains("https://url-test.localhost"),
         "Web service should have a URL"
     );
-
-    // Worker service should NOT have a URL (should be "-")
+    assert!(stdout.contains("url-test:worker: running"));
     assert!(
-        !worker_line.contains("https://") && !worker_line.contains("http://"),
+        !stdout.contains("worker.url-test.localhost"),
         "Worker service should not have a URL"
-    );
-    assert!(
-        worker_line.contains("-"),
-        "Worker service should show '-' for URL"
     );
 
     Ok(())
