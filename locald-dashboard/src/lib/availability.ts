@@ -60,7 +60,7 @@ export function demandSummary(
 }
 
 export function formatTransition(
-	timestamp: { secs_since_epoch: number; nanos_since_epoch: number } | null | undefined,
+	timestamp: ProjectAvailabilityStatus['next_transition_at'] | null,
 	now = Date.now()
 ): string | null {
 	if (!timestamp) return null;
