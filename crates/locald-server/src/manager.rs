@@ -38,7 +38,7 @@ use locald_core::state::{
 use locald_core::{
     AvailabilityBatch, AvailabilityBatchOperation, AvailabilityDemandStatus, AvailabilityError,
     AvailabilityReason, AvailabilityStore, CatalogError, CatalogPresence, Clock,
-    ConvergenceDecision, DemandKey, DemandKind, DomainClaim, DomainName, DomainTarget,
+    ConvergenceDecision, DemandKey, DemandKind, DomainClaim, DomainIndex, DomainName, DomainTarget,
     EnsureDemandResult, ProjectAvailability, ProjectAvailabilityStatus, ProjectDiscovery,
     ProjectInstanceId, ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock,
     availability_path, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
@@ -57,6 +57,27 @@ use tracing::{error, info, warn};
 const LOG_BUFFER_SIZE: usize = 2000;
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn domain_target_remains_compatible(
+    index: &DomainIndex,
+    domain: &DomainName,
+    expected: &DomainTarget,
+) -> bool {
+    let current = index.resolve(domain.as_str());
+    match (expected, current) {
+        (
+            DomainTarget::Service {
+                project_instance_id: expected_instance,
+                service_name: None,
+            },
+            Some(DomainTarget::Service {
+                project_instance_id: current_instance,
+                ..
+            }),
+        ) => expected_instance == current_instance,
+        _ => current == Some(expected),
+    }
+}
 
 const fn demand_kind_code(kind: DemandKind) -> &'static str {
     match kind {
@@ -3974,6 +3995,54 @@ impl ProcessManager {
         }
     }
 
+    pub async fn project_availability_by_domain(
+        &self,
+        domain: &str,
+    ) -> Option<ProjectAvailabilityStatus> {
+        let (instance_id, presence) = {
+            let index = self.domain_index.snapshot();
+            let instance_id = match index.resolve(domain) {
+                Some(DomainTarget::Service {
+                    project_instance_id,
+                    ..
+                }) => *project_instance_id,
+                Some(DomainTarget::Platform { .. }) | None => return None,
+            };
+            let presence = self
+                .registry
+                .lock()
+                .await
+                .instances
+                .get(&instance_id)
+                .map_or(CatalogPresence::Missing, |record| record.presence);
+            (instance_id, presence)
+        };
+        let service_details = self
+            .list_with_instance_owners(Some(instance_id))
+            .await
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect::<Vec<_>>();
+        match self
+            .project_availability_status(instance_id, presence, &service_details)
+            .await
+        {
+            Ok(Some(status)) => Some(status),
+            Ok(None) => Some(Self::inactive_project_availability(
+                presence,
+                "no_availability_state",
+                "No availability demand or policy has been recorded; resume the project to start it."
+                    .to_owned(),
+            )),
+            Err(error) => {
+                warn!(
+                    "failed to construct availability status for domain `{domain}` and instance {instance_id}: {error:#}"
+                );
+                None
+            }
+        }
+    }
+
     pub async fn registry_list(&self) -> Result<Vec<locald_core::registry::ProjectEntry>> {
         let projects = self.registry.lock().await.project_entries();
         let mut resolved = Vec::with_capacity(projects.len());
@@ -5197,6 +5266,55 @@ impl ProcessManager {
             .await
     }
 
+    /// Resume the active project that owns one exact domain and wait for readiness.
+    ///
+    /// Domain-backed surfaces use this instead of exposing a filesystem path or
+    /// starting one service outside the authoritative project lifecycle.
+    pub async fn ensure_project_for_domain(&self, domain: &str) -> Result<EnsureProjectResult> {
+        let domain = domain
+            .parse::<DomainName>()
+            .with_context(|| format!("invalid locald project domain `{domain}`"))?;
+        let initial_target = {
+            let index = self.domain_index.snapshot();
+            match index.resolve(domain.as_str()) {
+                Some(target @ DomainTarget::Service { .. }) => target.clone(),
+                Some(DomainTarget::Platform { .. }) | None => {
+                    anyhow::bail!("domain `{domain}` is not owned by a locald project")
+                }
+            }
+        };
+        let DomainTarget::Service {
+            project_instance_id: instance_id,
+            ..
+        } = &initial_target
+        else {
+            unreachable!("the initial target was checked as a project service");
+        };
+        let instance_id = *instance_id;
+        let project_path = self
+            .active_path_for_instance(instance_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "domain `{domain}` belongs to project instance {instance_id}, but that project is not available at a current path"
+                )
+            })?;
+
+        let result = self
+            .ensure_project(project_path, DemandKey::explicit_resume())
+            .await?;
+
+        let still_owned = {
+            let index = self.domain_index.snapshot();
+            domain_target_remains_compatible(&index, &domain, &initial_target)
+        };
+        anyhow::ensure!(
+            still_owned,
+            "domain `{domain}` changed targets while its project was resuming"
+        );
+        Ok(result)
+    }
+
     pub(crate) async fn ensure_project_from_ipc(
         &self,
         project_path: PathBuf,
@@ -6343,28 +6461,27 @@ impl ProcessManager {
         if paused {
             reasons.push(AvailabilityReason {
                 code: "paused".to_owned(),
-                message:
-                    "The project is paused through its current activity; run `locald up` to resume."
-                        .to_owned(),
+                message: "The project is paused through its current activity; resume it to start a new activity generation.".to_owned(),
             });
         }
-        if availability.always_on() {
+        if last_error.is_some() {
             reasons.push(AvailabilityReason {
-                code: "always_on".to_owned(),
-                message: "Always On policy is enabled.".to_owned(),
+                code: "convergence_failed".to_owned(),
+                message: "The last convergence attempt failed; inspect logs, then resume the project to retry.".to_owned(),
             });
         }
-        for demand in &demands {
+        if !suppressed.is_empty() {
             reasons.push(AvailabilityReason {
-                code: format!("demand_{}", demand_kind_code(demand.kind)),
-                message: if paused {
-                    format!(
-                        "{} demand remains live behind the pause.",
-                        demand.safe_label
-                    )
-                } else {
-                    format!("{} demand is active.", demand.safe_label)
-                },
+                code: "service_override".to_owned(),
+                message: format!(
+                    "{} service-level stop override{} active.",
+                    suppressed.len(),
+                    if suppressed.len() == 1 {
+                        " is"
+                    } else {
+                        "s are"
+                    }
+                ),
             });
         }
         if matches!(state, ProjectLifecycleState::CoolingDown) {
@@ -6390,30 +6507,27 @@ impl ProcessManager {
             reasons.push(AvailabilityReason {
                 code: "no_live_demand".to_owned(),
                 message:
-                    "No live demand currently requires this project; run `locald up` to resume."
+                    "No live demand currently requires this project; resume it when you need it."
                         .to_owned(),
             });
         }
-        if last_error.is_some() {
+        if availability.always_on() {
             reasons.push(AvailabilityReason {
-                code: "convergence_failed".to_owned(),
-                message:
-                    "The last convergence attempt failed; inspect logs and run `locald up` to retry."
-                        .to_owned(),
+                code: "always_on".to_owned(),
+                message: "Always On policy is enabled.".to_owned(),
             });
         }
-        if !suppressed.is_empty() {
+        for demand in &demands {
             reasons.push(AvailabilityReason {
-                code: "service_override".to_owned(),
-                message: format!(
-                    "{} service-level stop override{} active.",
-                    suppressed.len(),
-                    if suppressed.len() == 1 {
-                        " is"
-                    } else {
-                        "s are"
-                    }
-                ),
+                code: format!("demand_{}", demand_kind_code(demand.kind)),
+                message: if paused {
+                    format!(
+                        "{} demand remains live behind the pause.",
+                        demand.safe_label
+                    )
+                } else {
+                    format!("{} demand is active.", demand.safe_label)
+                },
             });
         }
 
@@ -8359,6 +8473,12 @@ impl ServiceResolver for ProcessManager {
         domain: &str,
     ) -> Option<locald_core::resolver::DomainResolution> {
         self.resolve_service_by_domain(domain).await
+    }
+    async fn project_availability_by_domain(
+        &self,
+        domain: &str,
+    ) -> Option<ProjectAvailabilityStatus> {
+        self.project_availability_by_domain(domain).await
     }
     async fn set_http_port(&self, port: Option<u16>) {
         self.set_http_port(port).await;
@@ -19385,6 +19505,56 @@ command = "unused-by-test-factory"
     }
 
     #[test]
+    fn domain_resume_target_check_includes_the_service_name() {
+        let instance_id = test_instance_id();
+        let domain: DomainName = "resume.localhost".parse().expect("valid test domain");
+        let initial_target = DomainTarget::Service {
+            project_instance_id: instance_id,
+            service_name: Some("resume:web".to_owned()),
+        };
+        let replacement = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [DomainClaim::service(
+                    domain.clone(),
+                    instance_id,
+                    "resume:replacement".to_owned(),
+                )],
+            )
+            .expect("install replacement target");
+
+        assert!(
+            !domain_target_remains_compatible(&replacement, &domain, &initial_target),
+            "a service reassignment within the same project is a changed target"
+        );
+    }
+
+    #[test]
+    fn domain_resume_target_check_allows_legacy_claim_concretization() {
+        let instance_id = test_instance_id();
+        let domain: DomainName = "resume.localhost".parse().expect("valid test domain");
+        let initial_target = DomainTarget::Service {
+            project_instance_id: instance_id,
+            service_name: None,
+        };
+        let replacement = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [DomainClaim::service(
+                    domain.clone(),
+                    instance_id,
+                    "resume:web".to_owned(),
+                )],
+            )
+            .expect("install concrete target");
+
+        assert!(
+            domain_target_remains_compatible(&replacement, &domain, &initial_target),
+            "a legacy ownership-only claim may become a concrete service in the same project"
+        );
+    }
+
+    #[test]
     fn effective_service_env_applies_overrides_before_reference_validation() {
         let config: LocaldConfig = toml::from_str(
             r#"
@@ -23037,6 +23207,49 @@ PATH = "/usr/bin:/bin"
             .required_availability_instance_for_path(&project_path)
             .await
             .expect("resolve newly registered EnsureProject instance");
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause ensured project");
+        let stopped_domain_status = manager
+            .project_availability_by_domain("ensure-project.localhost")
+            .await
+            .expect("resolve stopped-domain availability");
+        assert_eq!(stopped_domain_status.state, ProjectLifecycleState::Paused);
+        assert!(stopped_domain_status.paused);
+        let platform_error = manager
+            .ensure_project_for_domain("locald.localhost")
+            .await
+            .expect_err("platform domains cannot acquire project availability");
+        assert!(
+            format!("{platform_error:#}").contains("is not owned by a locald project"),
+            "unexpected platform-domain error: {platform_error:#}"
+        );
+        let resumed_from_domain = manager
+            .ensure_project_for_domain("ENSURE-PROJECT.LOCALHOST.")
+            .await
+            .expect("resume the exact project owner from its stopped domain");
+        assert_eq!(resumed_from_domain.state, EnsureProjectState::Ready);
+        assert_eq!(
+            resumed_from_domain.urls,
+            vec!["https://ensure-project.localhost:8443"]
+        );
+        let resumed_snapshot = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load domain-resumed availability")
+            .snapshot()
+            .await
+            .expect("read domain-resumed availability");
+        assert!(!resumed_snapshot.is_paused());
+        assert!(
+            resumed_snapshot
+                .demands()
+                .iter()
+                .any(|lease| lease.kind() == DemandKind::StoppedPageResume),
+            "domain Resume records the explicit stopped-page demand"
+        );
+
         {
             let mut registry = manager.registry.lock().await;
             let record = registry

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::availability::ProjectAvailabilityStatus;
 use crate::state::ServiceState;
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,17 @@ pub trait ServiceResolver: Send + Sync + std::fmt::Debug {
     /// can serve the corresponding platform surface; unclaimed domains also
     /// return `None`.
     async fn resolve_service_by_domain(&self, domain: &str) -> Option<DomainResolution>;
+
+    /// Return the authoritative project lifecycle status for one owned domain.
+    ///
+    /// The proxy requests this only while rendering an unavailable project
+    /// surface, keeping healthy request routing independent of availability IO.
+    async fn project_availability_by_domain(
+        &self,
+        _domain: &str,
+    ) -> Option<ProjectAvailabilityStatus> {
+        None
+    }
 
     /// Update the port the HTTP proxy is bound to.
     ///

@@ -59,6 +59,44 @@ export interface ProjectListEntry {
 	}>;
 	is_running: boolean;
 	section: 'Active' | 'AlwaysOn' | 'Recent';
+	availability?: ProjectAvailabilityStatus;
+}
+
+export type DemandKind =
+	| 'manual_cli'
+	| 'vs_code_window'
+	| 'agent_conversation'
+	| 'legacy_process_attachment'
+	| 'stopped_page_resume';
+
+export type ProjectLifecycleState =
+	| 'starting'
+	| 'ready'
+	| 'degraded'
+	| 'failed'
+	| 'cooling_down'
+	| 'paused'
+	| 'stopped'
+	| 'missing';
+
+export interface SystemTimestamp {
+	secs_since_epoch: number;
+	nanos_since_epoch: number;
+}
+
+export interface ProjectAvailabilityStatus {
+	desired: boolean;
+	state: ProjectLifecycleState;
+	always_on: boolean;
+	paused: boolean;
+	reasons: Array<{ code: string; message: string }>;
+	demands: Array<{
+		kind: DemandKind;
+		safe_label: string;
+		expires_at?: SystemTimestamp;
+	}>;
+	next_transition_at?: SystemTimestamp;
+	last_error?: string;
 }
 
 export async function getProjects(): Promise<ProjectListEntry[]> {
@@ -80,6 +118,34 @@ export async function removeProject(path: string): Promise<void> {
 	}
 }
 
+async function postProjectAction(
+	endpoint: string,
+	body: Record<string, string | boolean>
+): Promise<Response> {
+	const res = await fetch(`/api/projects/${endpoint}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+	if (!res.ok) {
+		const detail = await res.text();
+		throw new Error(detail || `Project ${endpoint} failed`);
+	}
+	return res;
+}
+
+export async function resumeProject(path: string): Promise<void> {
+	await postProjectAction('resume', { path });
+}
+
+export async function pauseProject(path: string): Promise<void> {
+	await postProjectAction('pause', { path });
+}
+
+export async function setProjectAlwaysOn(path: string, enabled: boolean): Promise<void> {
+	await postProjectAction('always-on', { path, enabled });
+}
+
 import { services } from '$lib/stores/services';
 import { logs } from '$lib/stores/logs';
 
@@ -92,6 +158,7 @@ export async function getServiceInspect(name: string): Promise<ServiceInspectRes
 }
 
 let eventSource: EventSource | null = null;
+let lifecycleChangeCallback: (() => void) | undefined;
 
 function openEventSource() {
 	connection.setConnecting();
@@ -109,6 +176,7 @@ function openEventSource() {
 			} else if (msg.type === 'ServiceUpdate') {
 				console.log('Received ServiceUpdate:', msg.data.name, msg.data.status);
 				services.updateService(msg.data);
+				lifecycleChangeCallback?.();
 			}
 		} catch (e) {
 			console.error('Failed to parse event', e);
@@ -161,11 +229,15 @@ function resetReconnectDelay() {
 	}
 }
 
-export function connectEvents() {
+export function connectEvents(onLifecycleChange?: () => void) {
+	lifecycleChangeCallback = onLifecycleChange;
 	openEventSource();
 
 	return () => {
 		resetReconnectDelay();
+		if (lifecycleChangeCallback === onLifecycleChange) {
+			lifecycleChangeCallback = undefined;
+		}
 		if (eventSource) {
 			eventSource.close();
 			eventSource = null;

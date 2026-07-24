@@ -213,7 +213,7 @@ impl DemandKind {
             Self::VsCodeWindow => "VS Code window",
             Self::AgentConversation => "Agent conversation",
             Self::LegacyProcessAttachment => "Legacy process attachment",
-            Self::StoppedPageResume => "Stopped-page resume",
+            Self::StoppedPageResume => "Explicit resume",
         }
     }
 
@@ -328,13 +328,19 @@ impl DemandKey {
         Self::owned(DemandKind::LegacyProcessAttachment, private_identity)
     }
 
-    /// The singleton demand created by an explicit stopped-page Resume action.
+    /// The singleton demand created by an explicit dashboard or stopped-page Resume action.
     #[must_use]
-    pub const fn stopped_page_resume() -> Self {
+    pub const fn explicit_resume() -> Self {
         Self {
             kind: DemandKind::StoppedPageResume,
             owner: None,
         }
+    }
+
+    /// The persisted compatibility name for an explicit Resume demand.
+    #[must_use]
+    pub const fn stopped_page_resume() -> Self {
+        Self::explicit_resume()
     }
 
     /// Return the privacy-safe demand category.
@@ -2188,6 +2194,15 @@ mod tests {
             serde_json::from_str::<DemandKey>(&serialized_manual)
                 .expect("deserialize owned Manual CLI demand"),
             manual_session
+        );
+        let explicit_resume = DemandKey::explicit_resume();
+        assert_eq!(explicit_resume.safe_label(), "Explicit resume");
+        assert_eq!(
+            serde_json::to_value(&explicit_resume).expect("serialize explicit Resume demand"),
+            serde_json::json!({
+                "kind": "stopped_page_resume",
+                "owner": null
+            })
         );
         assert_eq!(AGENT_DEMAND_TTL, AGENT_ACTIVE_TTL + AGENT_REVIEW_GRACE);
     }

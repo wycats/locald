@@ -8,9 +8,33 @@
 		stopServiceWithFeedback,
 		restartServiceWithFeedback
 	} from '$lib/actions/service';
+	import {
+		pauseProjectWithFeedback,
+		resumeProjectWithFeedback,
+		setProjectAlwaysOnWithFeedback
+	} from '$lib/actions/project';
+	import {
+		availabilityLabel,
+		availabilityMessage,
+		demandSummary,
+		formatTransition,
+		projectCanPause,
+		projectCanResume
+	} from '$lib/availability';
 	import type { ProjectListEntry } from '$lib/api';
 	import type { ServiceStatus } from '$lib/types';
-	import { RotateCw, Square, Play, ExternalLink, Folder, Users, Layers, X } from 'lucide-svelte';
+	import {
+		RotateCw,
+		Square,
+		Play,
+		ExternalLink,
+		Folder,
+		Layers,
+		X,
+		Pause,
+		Pin,
+		PinOff
+	} from 'lucide-svelte';
 	import Spinner from './Spinner.svelte';
 	import Terminal from './Terminal.svelte';
 
@@ -34,8 +58,13 @@
 	);
 
 	let projectServices = $derived($services.filter((s: ServiceStatus) => s.path === projectPath));
+	let projectAction = $state<'resume' | 'pause' | 'always-on' | null>(null);
 
 	let displayName = $derived(project?.project_name || projectPath.split('/').pop() || 'Unknown');
+	let availabilityState = $derived(availabilityLabel(project?.availability));
+	let availabilityExplanation = $derived(availabilityMessage(project?.availability));
+	let liveDemands = $derived(demandSummary(project?.availability));
+	let nextTransition = $derived(formatTransition(project?.availability?.next_transition_at));
 
 	let sectionLabel = $derived.by(() => {
 		if (!project) return '';
@@ -53,17 +82,13 @@
 		if (!project) return '';
 		switch (project.section) {
 			case 'Active':
-				return 'Attached/open now; services may be stopped';
+				return 'Demanded or currently available';
 			case 'AlwaysOn':
 				return 'Kept available';
 			case 'Recent':
 				return 'Known project';
 		}
 	});
-
-	let editorCount = $derived(project?.attachments.filter((a) => a.source.Editor).length ?? 0);
-
-	let cliCount = $derived(project?.attachments.filter((a) => a.source.CLI).length ?? 0);
 
 	let deckCount = $derived(
 		projectServices.filter((s: ServiceStatus) => monitored.includes(s.name)).length
@@ -122,6 +147,20 @@
 		if (action === 'restart') await restartServiceWithFeedback(serviceName);
 	}
 
+	async function handleProjectAction(action: 'resume' | 'pause' | 'always-on') {
+		if (!project || projectAction) return;
+		projectAction = action;
+		try {
+			if (action === 'resume') await resumeProjectWithFeedback(project);
+			if (action === 'pause') await pauseProjectWithFeedback(project);
+			if (action === 'always-on') {
+				await setProjectAlwaysOnWithFeedback(project, !project.availability?.always_on);
+			}
+		} finally {
+			projectAction = null;
+		}
+	}
+
 	function displayUrl(service: ServiceStatus): string {
 		if (service.domain) return service.domain;
 		if (!service.url) return '';
@@ -156,15 +195,6 @@
 				{#if sectionSubtitle}
 					<span class="meta-item section-subtitle">{sectionSubtitle}</span>
 				{/if}
-				{#if editorCount > 0}
-					<span class="meta-item">
-						<Users size={12} />
-						{editorCount} editor{editorCount > 1 ? 's' : ''}
-					</span>
-				{/if}
-				{#if cliCount > 0}
-					<span class="meta-item">{cliCount} CLI</span>
-				{/if}
 				{#if deckCount > 0}
 					<span class="meta-item deck">
 						<Layers size={12} />
@@ -177,6 +207,80 @@
 			<Folder size={12} />
 			<span>{projectPath}</span>
 		</div>
+		{#if project}
+			<div class="availability-panel" data-state={project.availability?.state ?? 'unknown'}>
+				<div class="availability-copy">
+					<div class="availability-heading">
+						<span class="availability-state">{availabilityState}</span>
+						{#if project.availability?.always_on}
+							<span class="always-on-chip">Always On</span>
+						{/if}
+					</div>
+					<p>{availabilityExplanation}</p>
+					<div class="availability-details">
+						{#if liveDemands}
+							<span>Demand: {liveDemands}</span>
+						{/if}
+						{#if nextTransition}
+							<span>Next transition {nextTransition}</span>
+						{/if}
+					</div>
+				</div>
+				<div class="availability-actions">
+					{#if projectCanPause(project.availability)}
+						<button
+							class="project-action secondary"
+							disabled={projectAction !== null}
+							onclick={() => handleProjectAction('pause')}
+						>
+							{#if projectAction === 'pause'}
+								<Spinner size={14} />
+							{:else}
+								<Pause size={14} />
+							{/if}
+							Pause
+						</button>
+					{:else if projectCanResume(project.availability)}
+						<button
+							class="project-action primary"
+							disabled={projectAction !== null}
+							onclick={() => handleProjectAction('resume')}
+						>
+							{#if projectAction === 'resume'}
+								<Spinner size={14} />
+							{:else}
+								<Play size={14} />
+							{/if}
+							Resume
+						</button>
+					{:else if project.availability?.state === 'missing'}
+						<span class="missing-guidance">Restore the worktree to resume this project.</span>
+					{:else}
+						<span class="missing-guidance">
+							{project.availability
+								? 'No lifecycle action is currently available.'
+								: 'Project availability has not been reported.'}
+						</span>
+					{/if}
+					{#if project.availability && project.availability.state !== 'missing'}
+						<button
+							class="project-action secondary"
+							disabled={projectAction !== null}
+							onclick={() => handleProjectAction('always-on')}
+						>
+							{#if projectAction === 'always-on'}
+								<Spinner size={14} />
+							{:else if project.availability?.always_on}
+								<PinOff size={14} />
+							{:else}
+								<Pin size={14} />
+							{/if}
+							{project.availability?.always_on ? 'Use automatic lifecycle' : 'Keep Always On'}
+						</button>
+					{/if}
+				</div>
+			</div>
+		{/if}
 	</div>
 
 	{#if projectServices.length === 0}
@@ -411,6 +515,102 @@
 	.empty-state .hint {
 		font-size: 0.85rem;
 		color: #52525b;
+	}
+
+	.availability-panel {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 20px;
+		margin-top: 16px;
+		padding: 14px 16px;
+		border: 1px solid #27272a;
+		border-radius: 10px;
+		background: #111113;
+	}
+	.availability-panel[data-state='failed'],
+	.availability-panel[data-state='degraded'] {
+		border-color: rgba(239, 68, 68, 0.45);
+	}
+	.availability-panel[data-state='paused'],
+	.availability-panel[data-state='stopped'],
+	.availability-panel[data-state='cooling_down'] {
+		border-color: rgba(245, 158, 11, 0.35);
+	}
+	.availability-copy {
+		min-width: 0;
+	}
+	.availability-heading,
+	.availability-details,
+	.availability-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+	.availability-state {
+		font-size: 0.85rem;
+		font-weight: 700;
+		color: #e4e4e7;
+	}
+	.always-on-chip {
+		padding: 2px 6px;
+		border-radius: 999px;
+		background: rgba(59, 130, 246, 0.15);
+		color: #93c5fd;
+		font-size: 0.65rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+	.availability-copy p {
+		margin: 5px 0 0;
+		color: #a1a1aa;
+		font-size: 0.8rem;
+		line-height: 1.4;
+	}
+	.availability-details {
+		margin-top: 7px;
+		color: #71717a;
+		font-size: 0.7rem;
+	}
+	.availability-actions {
+		justify-content: flex-end;
+		flex-shrink: 0;
+	}
+	.project-action {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		border: 1px solid #3f3f46;
+		border-radius: 7px;
+		padding: 7px 10px;
+		font: inherit;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.project-action.primary {
+		background: #2563eb;
+		border-color: #2563eb;
+		color: white;
+	}
+	.project-action.secondary {
+		background: #18181b;
+		color: #d4d4d8;
+	}
+	.project-action:hover:not(:disabled) {
+		filter: brightness(1.12);
+	}
+	.project-action:disabled {
+		opacity: 0.55;
+		cursor: wait;
+	}
+	.missing-guidance {
+		max-width: 15rem;
+		color: #a1a1aa;
+		font-size: 11px;
+		line-height: 1.4;
 	}
 
 	.empty-state code {

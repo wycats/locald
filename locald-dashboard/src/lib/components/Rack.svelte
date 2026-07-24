@@ -16,6 +16,13 @@
 		restartServiceWithFeedback,
 		resetServiceWithFeedback
 	} from '$lib/actions/service';
+	import { pauseProjectWithFeedback, resumeProjectWithFeedback } from '$lib/actions/project';
+	import {
+		availabilityLabel,
+		demandSummary,
+		projectCanPause,
+		projectCanResume
+	} from '$lib/availability';
 	import {
 		Activity,
 		Layers,
@@ -41,6 +48,7 @@
 	let collapsedGroups: string[] = [];
 	let activeMenu: string | null = null;
 	let keyboardFocus: string | null = null;
+	let pendingProjects: string[] = [];
 	let contextMenu: { x: number; y: number; project: ProjectListEntry } | null = null;
 
 	type ProjectSection = ProjectListEntry['section'];
@@ -49,7 +57,7 @@
 	const SECTION_COPY: Record<ProjectSection, { label: string; subtitle: string }> = {
 		Active: {
 			label: 'Active',
-			subtitle: 'Attached/open now; services may be stopped'
+			subtitle: 'Demanded or currently available'
 		},
 		AlwaysOn: {
 			label: 'Always On',
@@ -267,6 +275,41 @@
 		);
 	}
 
+	async function toggleProject(project: ProjectGroup) {
+		if (!project.entry) {
+			await toggleGroup(project.services);
+			return;
+		}
+		const path = project.entry.project_path;
+		if (pendingProjects.includes(path)) return;
+		if (
+			!projectCanPause(project.entry.availability) &&
+			!projectCanResume(project.entry.availability)
+		) {
+			return;
+		}
+		pendingProjects = [...pendingProjects, path];
+		try {
+			if (projectCanPause(project.entry.availability)) {
+				await pauseProjectWithFeedback(project.entry);
+			} else {
+				await resumeProjectWithFeedback(project.entry);
+			}
+		} finally {
+			pendingProjects = pendingProjects.filter((candidate) => candidate !== path);
+		}
+	}
+
+	function projectActionTitle(project: ProjectListEntry): string {
+		if (projectCanPause(project.availability)) return 'Pause project';
+		if (projectCanResume(project.availability)) return 'Resume project';
+		if (project.availability?.state === 'missing') {
+			return 'Restore the worktree to resume this project';
+		}
+		if (!project.availability) return 'Project availability has not been reported';
+		return 'No lifecycle action is currently available';
+	}
+
 	function toggleGroupCollapse(group: string) {
 		if (collapsedGroups.includes(group)) {
 			collapsedGroups = collapsedGroups.filter((g) => g !== group);
@@ -358,20 +401,6 @@
 		if (count === 0) return null;
 		return `${count} in Deck`;
 	}
-
-	function attachmentSummary(entry: ProjectListEntry | null): string | null {
-		if (!entry) return null;
-
-		const editors = entry.attachments.filter((a) => a.source.Editor).length;
-		const cli = entry.attachments.filter((a) => a.source.CLI).length;
-		const parts: string[] = [];
-
-		if (editors > 0) parts.push(`${editors} editor${editors === 1 ? '' : 's'}`);
-		if (cli > 0) parts.push(`${cli} CLI`);
-
-		if (parts.length === 0) return null;
-		return `${parts.join(' · ')} attached`;
-	}
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -449,11 +478,18 @@
 						project.services.length === 0 || project.services.every((s) => s.status === 'stopped')}
 					{@const projectLifecycle = lifecycleSummary(project.services)}
 					{@const projectDeck = deckSummary(project.services)}
-					{@const projectAttachments = attachmentSummary(project.entry)}
+					{@const projectDemands = demandSummary(project.entry?.availability)}
+					{@const projectAvailability = project.entry?.availability
+						? availabilityLabel(project.entry.availability)
+						: null}
+					{@const projectPending =
+						project.entry != null && pendingProjects.includes(project.entry.project_path)}
 					<!-- svelte-ignore a11y-no-static-element-interactions -->
 					<div
 						class="rack-group-header"
-						class:disabled={isAllStopped}
+						class:disabled={project.entry?.availability
+							? !project.entry.availability.desired
+							: isAllStopped}
 						class:selected={project.path != null && selectedProject === project.path}
 						on:contextmenu={(e) => project.entry && handleProjectContextMenu(e, project.entry)}
 					>
@@ -469,36 +505,63 @@
 								<span>{project.name}</span>
 							</button>
 							<div class="group-meta" aria-label="Project state">
-								<span>{projectLifecycle}</span>
+								<span>{projectAvailability ?? projectLifecycle}</span>
+								{#if projectAvailability}
+									<span class="group-cue">{projectLifecycle}</span>
+								{/if}
 								{#if projectDeck}
 									<span class="group-cue deck">{projectDeck}</span>
 								{/if}
-								{#if project.section === 'Active' && projectAttachments}
-									<span class="group-cue">{projectAttachments}</span>
+								{#if projectDemands}
+									<span class="group-cue">{projectDemands}</span>
 								{/if}
 							</div>
 						</div>
-						{#if project.services.length > 0}
+						{#if project.entry || project.services.length > 0}
 							{@const serviceNames = project.services.map((s) => s.name)}
 							{@const allMonitored =
 								serviceNames.length > 0 && serviceNames.every((n) => monitored.includes(n))}
 							{@const someMonitored = serviceNames.some((n) => monitored.includes(n))}
 							<div class="group-actions">
-								<button
-									class="group-btn monitor-group-btn"
-									class:active={allMonitored}
-									class:partial={someMonitored && !allMonitored}
-									on:click|stopPropagation={() => toggleMonitorGroup(project.services)}
-									title={allMonitored ? 'Remove all from Deck' : 'Add all to Deck'}
-								>
-									<Layers size={12} />
-								</button>
+								{#if project.services.length > 0}
+									<button
+										class="group-btn monitor-group-btn"
+										class:active={allMonitored}
+										class:partial={someMonitored && !allMonitored}
+										on:click|stopPropagation={() => toggleMonitorGroup(project.services)}
+										title={allMonitored ? 'Remove all from Deck' : 'Add all to Deck'}
+									>
+										<Layers size={12} />
+									</button>
+								{/if}
 								<button
 									class="group-btn"
-									on:click|stopPropagation={() => toggleGroup(project.services)}
-									title={isAllStopped ? 'Start Group' : 'Stop Group'}
+									disabled={projectPending ||
+										(project.entry
+											? !projectCanPause(project.entry.availability) &&
+												!projectCanResume(project.entry.availability)
+											: false)}
+									on:click|stopPropagation={() => toggleProject(project)}
+									title={project.entry
+										? projectActionTitle(project.entry)
+										: isAllStopped
+											? 'Start group'
+											: 'Stop group'}
 								>
-									<Power size={12} color={isAllStopped ? '#52525b' : '#ef4444'} />
+									{#if projectPending}
+										<Spinner size={12} />
+									{:else}
+										<Power
+											size={12}
+											color={project.entry
+												? projectCanPause(project.entry.availability)
+													? '#ef4444'
+													: '#52525b'
+												: isAllStopped
+													? '#52525b'
+													: '#ef4444'}
+										/>
+									{/if}
 								</button>
 							</div>
 						{/if}
