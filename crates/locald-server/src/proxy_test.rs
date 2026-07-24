@@ -199,7 +199,9 @@ async fn test_disabled_service_page() {
 }
 
 #[derive(Debug)]
-struct OwnershipOnlyResolver;
+struct OwnershipOnlyResolver {
+    state: locald_core::ProjectLifecycleState,
+}
 
 #[async_trait::async_trait]
 impl locald_core::resolver::ServiceResolver for OwnershipOnlyResolver {
@@ -213,13 +215,24 @@ impl locald_core::resolver::ServiceResolver for OwnershipOnlyResolver {
     ) -> Option<locald_core::ProjectAvailabilityStatus> {
         Some(locald_core::ProjectAvailabilityStatus {
             desired: false,
-            state: locald_core::ProjectLifecycleState::Paused,
+            state: self.state,
             always_on: true,
-            paused: true,
-            reasons: vec![locald_core::AvailabilityReason {
-                code: "paused".to_owned(),
-                message: "Paused until meaningful activity resumes the project.".to_owned(),
-            }],
+            paused: self.state == locald_core::ProjectLifecycleState::Paused,
+            reasons: match self.state {
+                locald_core::ProjectLifecycleState::Paused => {
+                    vec![locald_core::AvailabilityReason {
+                        code: "paused".to_owned(),
+                        message: "Paused until meaningful activity resumes the project.".to_owned(),
+                    }]
+                }
+                locald_core::ProjectLifecycleState::Missing => {
+                    vec![locald_core::AvailabilityReason {
+                        code: "missing".to_owned(),
+                        message: "The project worktree is missing.".to_owned(),
+                    }]
+                }
+                _ => Vec::new(),
+            },
             demands: Vec::new(),
             next_transition_at: None,
             last_error: None,
@@ -232,7 +245,13 @@ impl locald_core::resolver::ServiceResolver for OwnershipOnlyResolver {
 
 #[tokio::test]
 async fn test_legacy_owned_domain_has_a_project_resume_surface() {
-    let proxy = ProxyManager::new(Arc::new(OwnershipOnlyResolver), Router::new(), None);
+    let proxy = ProxyManager::new(
+        Arc::new(OwnershipOnlyResolver {
+            state: locald_core::ProjectLifecycleState::Paused,
+        }),
+        Router::new(),
+        None,
+    );
     let app = proxy.make_app();
 
     for host in ["legacy.localhost", "docs.localhost"] {
@@ -257,6 +276,38 @@ async fn test_legacy_owned_domain_has_a_project_resume_surface() {
         assert!(body.contains("/api/projects/resume-domain"));
         assert!(!body.contains("/api/services/"));
     }
+}
+
+#[tokio::test]
+async fn test_missing_owned_domain_explains_how_to_restore_the_worktree() {
+    let proxy = ProxyManager::new(
+        Arc::new(OwnershipOnlyResolver {
+            state: locald_core::ProjectLifecycleState::Missing,
+        }),
+        Router::new(),
+        None,
+    );
+    let app = proxy.make_app();
+
+    let req = Request::builder()
+        .uri("/")
+        .header("Host", "missing.localhost")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Project is Missing"));
+    assert!(body.contains("Restore the project worktree"));
+    assert!(body.contains("locald up"));
+    assert!(!body.contains("Resume project"));
+    assert!(!body.contains("resume-btn"));
+    assert!(!body.contains("/api/projects/resume-domain"));
 }
 
 #[tokio::test]

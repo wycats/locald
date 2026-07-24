@@ -20,7 +20,7 @@ use tracing::{error, info};
 use crate::assets;
 use locald_core::resolver::{DomainResolution, ServiceResolver};
 use locald_core::state::ServiceState;
-use locald_core::{DomainName, ProjectAvailabilityStatus};
+use locald_core::{DomainName, ProjectAvailabilityStatus, ProjectLifecycleState};
 use locald_utils::cert::CertManager;
 
 /// Manages the reverse proxy for routing requests to services.
@@ -522,7 +522,62 @@ fn unavailable_project_response(
             escape_html(service_name)
         )
     });
-    let domain_js = inline_script_json_string(host);
+    let missing = availability
+        .is_some_and(|availability| availability.state == ProjectLifecycleState::Missing);
+    let (resume_action, resume_status, resume_script) = if missing {
+        (
+            r#"<a class="btn secondary" href="https://locald.localhost">Open dashboard</a>"#
+                .to_owned(),
+            r#"<p class="hint">Restore the project worktree, then run <code>locald up</code> from that directory.</p>"#
+                .to_owned(),
+            String::new(),
+        )
+    } else {
+        let domain_js = inline_script_json_string(host);
+        (
+            r#"<button class="btn" id="resume-btn">Resume project</button>
+            <a class="btn secondary" href="https://locald.localhost">Open dashboard</a>"#
+                .to_owned(),
+            r#"<p class="hint" id="resume-status">You can also run <code>locald up</code> from the project directory.</p>"#
+                .to_owned(),
+            format!(
+                r"<script>
+        const domain = {domain_js};
+        const btn = document.getElementById('resume-btn');
+        const status = document.getElementById('resume-status');
+
+        if (btn) {{
+            btn.addEventListener('click', async () => {{
+                btn.disabled = true;
+                btn.textContent = 'Resuming...';
+                if (status) status.textContent = 'Starting the project and waiting for readiness...';
+                try {{
+                    const res = await fetch('/api/projects/resume-domain', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ domain }})
+                    }});
+                    if (!res.ok) {{
+                        const detail = await res.text();
+                        throw new Error(detail || 'Failed to resume project');
+                    }}
+                    window.location.reload();
+                }} catch (err) {{
+                    console.error(err);
+                    btn.disabled = false;
+                    btn.textContent = 'Resume project';
+                    if (status) {{
+                        status.textContent = err instanceof Error
+                            ? err.message
+                            : 'Could not resume the project. Try `locald up` or use the dashboard.';
+                    }}
+                }}
+            }});
+        }}
+    </script>"
+            ),
+        )
+    };
     let mut html = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -602,45 +657,11 @@ fn unavailable_project_response(
         __SERVICE_HINT__
         __ALWAYS_ON_HINT__
         <div class="actions">
-            <button class="btn" id="resume-btn">Resume project</button>
-            <a class="btn secondary" href="https://locald.localhost">Open dashboard</a>
+            __RESUME_ACTION__
         </div>
-        <p class="hint" id="resume-status">You can also run <code>locald up</code> from the project directory.</p>
+        __RESUME_STATUS__
     </div>
-    <script>
-        const domain = __DOMAIN_JS__;
-        const btn = document.getElementById('resume-btn');
-        const status = document.getElementById('resume-status');
-
-        if (btn) {
-            btn.addEventListener('click', async () => {
-                btn.disabled = true;
-                btn.textContent = 'Resuming...';
-                if (status) status.textContent = 'Starting the project and waiting for readiness...';
-                try {
-                    const res = await fetch('/api/projects/resume-domain', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ domain })
-                    });
-                    if (!res.ok) {
-                        const detail = await res.text();
-                        throw new Error(detail || 'Failed to resume project');
-                    }
-                    window.location.reload();
-                } catch (err) {
-                    console.error(err);
-                    btn.disabled = false;
-                    btn.textContent = 'Resume project';
-                    if (status) {
-                        status.textContent = err instanceof Error
-                            ? err.message
-                            : 'Could not resume the project. Try `locald up` or use the dashboard.';
-                    }
-                }
-            });
-        }
-    </script>
+    __RESUME_SCRIPT__
 </body>
 </html>"#
         .to_string();
@@ -651,7 +672,9 @@ fn unavailable_project_response(
         .replace("__SERVICE_HOST__", &escaped_host)
         .replace("__SERVICE_HINT__", &service_hint)
         .replace("__ALWAYS_ON_HINT__", &always_on_hint)
-        .replace("__DOMAIN_JS__", &domain_js);
+        .replace("__RESUME_ACTION__", &resume_action)
+        .replace("__RESUME_STATUS__", &resume_status)
+        .replace("__RESUME_SCRIPT__", &resume_script);
 
     (
         StatusCode::SERVICE_UNAVAILABLE,

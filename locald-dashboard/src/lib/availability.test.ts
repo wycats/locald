@@ -48,9 +48,14 @@ describe('project availability presentation', () => {
 		expect(projectCanPause(status({ state: 'ready' }))).toBe(true);
 	});
 
-	it('only offers resume while the project still has a current worktree', () => {
-		expect(projectCanResume(status({ state: 'paused' }))).toBe(true);
+	it('offers resume only when convergence can make a current project more available', () => {
+		for (const state of ['paused', 'stopped', 'failed', 'degraded', 'cooling_down'] as const) {
+			expect(projectCanResume(status({ state }))).toBe(true);
+		}
+		expect(projectCanResume(status({ state: 'starting' }))).toBe(false);
+		expect(projectCanResume(status({ state: 'ready' }))).toBe(false);
 		expect(projectCanResume(status({ state: 'missing' }))).toBe(false);
+		expect(projectCanResume(null)).toBe(false);
 		expect(projectCanResume(undefined)).toBe(false);
 	});
 

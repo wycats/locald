@@ -34,7 +34,16 @@ export function projectCanPause(
 export function projectCanResume(
 	availability: ProjectAvailabilityStatus | null | undefined
 ): boolean {
-	return availability !== null && availability !== undefined && availability.state !== 'missing';
+	switch (availability?.state) {
+		case 'paused':
+		case 'stopped':
+		case 'failed':
+		case 'degraded':
+		case 'cooling_down':
+			return true;
+		default:
+			return false;
+	}
 }
 
 export function demandSummary(

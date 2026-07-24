@@ -58,12 +58,25 @@ const LOG_BUFFER_SIZE: usize = 2000;
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-fn domain_target_unchanged(
+fn domain_target_remains_compatible(
     index: &DomainIndex,
     domain: &DomainName,
     expected: &DomainTarget,
 ) -> bool {
-    index.resolve(domain.as_str()) == Some(expected)
+    let current = index.resolve(domain.as_str());
+    match (expected, current) {
+        (
+            DomainTarget::Service {
+                project_instance_id: expected_instance,
+                service_name: None,
+            },
+            Some(DomainTarget::Service {
+                project_instance_id: current_instance,
+                ..
+            }),
+        ) => expected_instance == current_instance,
+        _ => current == Some(expected),
+    }
 }
 
 const fn demand_kind_code(kind: DemandKind) -> &'static str {
@@ -5293,7 +5306,7 @@ impl ProcessManager {
 
         let still_owned = {
             let index = self.domain_index.snapshot();
-            domain_target_unchanged(&index, &domain, &initial_target)
+            domain_target_remains_compatible(&index, &domain, &initial_target)
         };
         anyhow::ensure!(
             still_owned,
@@ -19511,8 +19524,33 @@ command = "unused-by-test-factory"
             .expect("install replacement target");
 
         assert!(
-            !domain_target_unchanged(&replacement, &domain, &initial_target),
+            !domain_target_remains_compatible(&replacement, &domain, &initial_target),
             "a service reassignment within the same project is a changed target"
+        );
+    }
+
+    #[test]
+    fn domain_resume_target_check_allows_legacy_claim_concretization() {
+        let instance_id = test_instance_id();
+        let domain: DomainName = "resume.localhost".parse().expect("valid test domain");
+        let initial_target = DomainTarget::Service {
+            project_instance_id: instance_id,
+            service_name: None,
+        };
+        let replacement = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [DomainClaim::service(
+                    domain.clone(),
+                    instance_id,
+                    "resume:web".to_owned(),
+                )],
+            )
+            .expect("install concrete target");
+
+        assert!(
+            domain_target_remains_compatible(&replacement, &domain, &initial_target),
+            "a legacy ownership-only claim may become a concrete service in the same project"
         );
     }
 
