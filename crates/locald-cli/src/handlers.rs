@@ -158,6 +158,17 @@ fn print_availability(availability: &ProjectAvailabilityStatus) {
     }
 }
 
+fn is_semantic_status_url(url: &str) -> bool {
+    let Some((_, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or(remainder);
+    !matches!(authority, "localhost" | "127.0.0.1" | "[::1]")
+        && !authority.starts_with("localhost:")
+        && !authority.starts_with("127.0.0.1:")
+        && !authority.starts_with("[::1]:")
+}
+
 fn print_project_status(info: &ProjectStatusInfo) {
     let project = info
         .project_name
@@ -173,6 +184,7 @@ fn print_project_status(info: &ProjectStatusInfo) {
         .service_details
         .iter()
         .filter_map(|service| service.url.as_deref())
+        .filter(|url| is_semantic_status_url(url))
         .collect::<std::collections::BTreeSet<_>>();
     if !urls.is_empty() {
         println!("URLs:");
@@ -2157,6 +2169,15 @@ fn sync_hosts_file(hosts: &HostsFileSection, domains: &[DomainName]) -> CliResul
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_status_urls_exclude_direct_loopback_service_ports() {
+        assert!(!is_semantic_status_url("http://localhost:49152"));
+        assert!(!is_semantic_status_url("http://127.0.0.1:49152"));
+        assert!(!is_semantic_status_url("http://[::1]:49152"));
+        assert!(is_semantic_status_url("https://app.localhost"));
+        assert!(is_semantic_status_url("https://app.example.test:8443"));
+    }
 
     #[test]
     fn locald_up_resolves_a_missing_project_locator() {
