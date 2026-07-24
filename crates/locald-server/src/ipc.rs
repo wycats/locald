@@ -99,7 +99,7 @@ fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -
 
 fn project_logs_resolution_error(path: &Path, error: &anyhow::Error) -> String {
     format!(
-        "project-scoped logs are unavailable for `{}`: {error:#}; run `locald up` from that project first, or omit the project scope to inspect all daemon logs",
+        "project-scoped logs are unavailable for `{}`: {error:#}; run `locald up` from that project first, or run `locald logs` outside a locald project to inspect all daemon logs",
         path.display()
     )
 }
@@ -696,7 +696,7 @@ mod tests {
 
         assert!(message.contains("project-scoped logs are unavailable for `/tmp/example`"));
         assert!(message.contains("run `locald up` from that project first"));
-        assert!(message.contains("omit the project scope"));
+        assert!(message.contains("run `locald logs` outside a locald project"));
         assert!(message.contains("not registered in the identity catalog"));
     }
 
