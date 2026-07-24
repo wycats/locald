@@ -294,7 +294,7 @@ async fn handle_project_resume(
     match pm
         .ensure_project(
             std::path::PathBuf::from(body.path),
-            DemandKey::stopped_page_resume(),
+            DemandKey::explicit_resume(),
         )
         .await
     {

@@ -60,10 +60,15 @@
 
 	onMount(() => {
 		services.refresh();
-		projectList.refresh();
+		let refreshProjectsInFlight: Promise<void> | null = null;
 		const refreshProjects = () => {
-			void projectList.refresh();
+			if (refreshProjectsInFlight) return refreshProjectsInFlight;
+			refreshProjectsInFlight = projectList.refresh().finally(() => {
+				refreshProjectsInFlight = null;
+			});
+			return refreshProjectsInFlight;
 		};
+		void refreshProjects();
 		const cleanupEvents = connectEvents(refreshProjects);
 		const refreshInterval = window.setInterval(refreshProjects, 30_000);
 		window.addEventListener('focus', refreshProjects);

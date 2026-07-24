@@ -458,7 +458,7 @@
 					{@const projectLifecycle = lifecycleSummary(project.services)}
 					{@const projectDeck = deckSummary(project.services)}
 					{@const projectDemands = demandSummary(project.entry?.availability)}
-					{@const projectAvailability = project.entry
+					{@const projectAvailability = project.entry?.availability
 						? availabilityLabel(project.entry.availability)
 						: null}
 					{@const projectPending =
@@ -466,7 +466,9 @@
 					<!-- svelte-ignore a11y-no-static-element-interactions -->
 					<div
 						class="rack-group-header"
-						class:disabled={project.entry ? !project.entry.availability?.desired : isAllStopped}
+						class:disabled={project.entry?.availability
+							? !project.entry.availability.desired
+							: isAllStopped}
 						class:selected={project.path != null && selectedProject === project.path}
 						on:contextmenu={(e) => project.entry && handleProjectContextMenu(e, project.entry)}
 					>

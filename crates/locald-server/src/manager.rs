@@ -5275,7 +5275,7 @@ impl ProcessManager {
             })?;
 
         let result = self
-            .ensure_project(project_path, DemandKey::stopped_page_resume())
+            .ensure_project(project_path, DemandKey::explicit_resume())
             .await?;
 
         let still_owned = {
