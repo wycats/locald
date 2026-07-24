@@ -181,6 +181,31 @@ const fn daemon_startup_is_pending(error: &CliError) -> bool {
     )
 }
 
+fn semantic_request_may_be_unsupported(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::Daemon(DaemonError::RequestFailed { message })
+            if message.as_str() == "daemon closed the connection without a response"
+    )
+}
+
+fn send_project_pause<F>(project_path: &std::path::Path, mut send: F) -> CliResult<IpcResponse>
+where
+    F: FnMut(&IpcRequest) -> CliResult<IpcResponse>,
+{
+    let pause = IpcRequest::PauseProject {
+        project_path: project_path.to_path_buf(),
+    };
+    match send(&pause) {
+        Err(error) if semantic_request_may_be_unsupported(&error) => {
+            send(&IpcRequest::ProjectForceStop {
+                project_path: project_path.to_path_buf(),
+            })
+        }
+        response => response,
+    }
+}
+
 const fn manual_follow_renewal_should_continue(response: &CliResult<IpcResponse>) -> bool {
     match response {
         Ok(IpcResponse::Ok) => true,
@@ -756,9 +781,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 };
                 let project_path = resolve_project_locator(&project_root)?;
                 utils::ensure_daemon_running()?;
-                match client::send_request(&IpcRequest::PauseProject {
-                    project_path: project_path.clone(),
-                }) {
+                match send_project_pause(&project_path, client::send_request) {
                     Ok(IpcResponse::Ok) => {
                         if let Some(json_actions) = json_actions {
                             println!("{}", serde_json::to_string_pretty(&json_actions)?);
@@ -2385,6 +2408,57 @@ name = "example"
                 socket_path: "/tmp/forbidden.sock".to_owned(),
             }
         )));
+    }
+
+    #[test]
+    fn project_stop_falls_back_for_a_daemon_without_pause_project() {
+        let project_path = std::path::Path::new("/projects/example");
+        let mut requests = Vec::new();
+
+        let response = send_project_pause(project_path, |request| {
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                Err(CliError::Daemon(DaemonError::RequestFailed {
+                    message: "daemon closed the connection without a response".to_owned(),
+                }))
+            } else {
+                Ok(IpcResponse::Ok)
+            }
+        })
+        .expect("legacy project stop fallback");
+
+        assert_eq!(response, IpcResponse::Ok);
+        assert_eq!(
+            requests,
+            vec![
+                IpcRequest::PauseProject {
+                    project_path: project_path.to_path_buf(),
+                },
+                IpcRequest::ProjectForceStop {
+                    project_path: project_path.to_path_buf(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn project_stop_preserves_non_compatibility_failures() {
+        let project_path = std::path::Path::new("/projects/example");
+        let mut request_count = 0;
+
+        let error = send_project_pause(project_path, |_| {
+            request_count += 1;
+            Err(CliError::Daemon(DaemonError::PermissionDenied {
+                socket_path: "/tmp/locald.sock".to_owned(),
+            }))
+        })
+        .expect_err("permission failures must not use the legacy fallback");
+
+        assert_eq!(request_count, 1);
+        assert!(matches!(
+            error,
+            CliError::Daemon(DaemonError::PermissionDenied { .. })
+        ));
     }
 
     #[test]
