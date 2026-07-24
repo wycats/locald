@@ -249,8 +249,12 @@ command = "python3 -m http.server $PORT"
         .arg(&project_dir)
         .assert()
         .success()
-        .stdout(predicates::str::contains("web"))
-        .stdout(predicates::str::contains("Running"));
+        .stdout(predicates::str::contains(
+            "Availability: Ready (desired up)",
+        ))
+        .stdout(predicates::str::contains(
+            "my-project:web: running (healthy)",
+        ));
 }
 
 #[test]
