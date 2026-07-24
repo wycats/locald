@@ -107,13 +107,20 @@ fn prepare_up_ensure(
 
 fn resolve_service_name(name: &str) -> CliResult<String> {
     let config_path = std::env::current_dir()?.join("locald.toml");
-    if !name.contains(':') && config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let config: LocaldConfig = toml::from_str(&content)?;
-        Ok(format!("{}:{name}", config.project.name))
-    } else {
-        Ok(name.to_owned())
+    Ok(resolve_service_name_from_config(name, &config_path))
+}
+
+fn resolve_service_name_from_config(name: &str, config_path: &std::path::Path) -> String {
+    if name.contains(':') {
+        return name.to_owned();
     }
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| toml::from_str::<LocaldConfig>(&content).ok())
+        .map_or_else(
+            || name.to_owned(),
+            |config| format!("{}:{name}", config.project.name),
+        )
 }
 
 fn format_status_time(time: std::time::SystemTime) -> String {
@@ -2174,6 +2181,32 @@ mod tests {
         assert!(!is_semantic_status_url("http://[::1]:49152"));
         assert!(is_semantic_status_url("https://app.localhost"));
         assert!(is_semantic_status_url("https://app.example.test:8443"));
+    }
+
+    #[test]
+    fn service_name_resolution_remains_best_effort() {
+        let directory = tempfile::tempdir().expect("create service config directory");
+        let config_path = directory.path().join("locald.toml");
+
+        assert_eq!(resolve_service_name_from_config("web", &config_path), "web");
+        std::fs::write(&config_path, "not valid toml = [").expect("write malformed service config");
+        assert_eq!(resolve_service_name_from_config("web", &config_path), "web");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "example"
+"#,
+        )
+        .expect("write valid service config");
+        assert_eq!(
+            resolve_service_name_from_config("web", &config_path),
+            "example:web"
+        );
+        assert_eq!(
+            resolve_service_name_from_config("other:web", &config_path),
+            "other:web"
+        );
     }
 
     #[test]
