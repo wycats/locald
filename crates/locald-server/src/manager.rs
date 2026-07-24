@@ -13592,6 +13592,12 @@ PATH = "/usr/bin:/bin"
             .project_status(&project_path)
             .await
             .expect("inspect service-level override");
+        assert_eq!(
+            degraded.service_details[0].service_type,
+            locald_core::ipc::ServiceType::Worker
+        );
+        // Portless workers never have routed URLs. Routable services preserve
+        // their semantic domains while stopped so the proxy can explain state.
         assert_eq!(degraded.service_details[0].url, None);
         let degraded_availability = degraded.availability.expect("degraded availability status");
         assert_eq!(degraded_availability.state, ProjectLifecycleState::Degraded);

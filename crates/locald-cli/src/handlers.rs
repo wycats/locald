@@ -153,9 +153,6 @@ fn print_availability(availability: &ProjectAvailabilityStatus) {
             format_status_time(next_transition_at)
         );
     }
-    if let Some(error) = &availability.last_error {
-        println!("Last error: {error}");
-    }
 }
 
 fn is_semantic_status_url(url: &str) -> bool {
