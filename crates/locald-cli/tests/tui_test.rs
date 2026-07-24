@@ -171,12 +171,9 @@ fn test_tui_progress() {
     // Increase timeout for build
     let mut p = rexpect::session::spawn_command(cmd, Some(30000)).expect("failed to spawn rexpect");
 
-    // Expect TUI output. `locald up` exits after readiness.
-    // instead of staying attached to service logs.
-    p.exp_string("Loading configuration")
-        .expect("failed to find Loading configuration");
-    p.exp_string("Project registered")
-        .expect("failed to find Project registered");
+    // `locald up` exits after readiness instead of staying attached to service logs.
+    p.exp_string("is Ready")
+        .expect("failed to find readiness confirmation");
 
     // Wait for process to exit
     p.process.wait().expect("failed to wait");
