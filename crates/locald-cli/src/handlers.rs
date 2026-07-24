@@ -134,6 +134,26 @@ fn resolve_service_name_from_config(name: &str, config_path: &std::path::Path) -
         )
 }
 
+fn resolve_logs_context(
+    service: Option<&str>,
+    current_dir: &std::path::Path,
+) -> CliResult<(Option<String>, Option<std::path::PathBuf>)> {
+    let project_root = nearest_project_root(current_dir);
+    let config_path = project_root
+        .as_deref()
+        .unwrap_or(current_dir)
+        .join("locald.toml");
+    let service_name = service.map(|name| resolve_service_name_from_config(name, &config_path));
+    let project_path = if service.is_some_and(|name| name.contains(':')) {
+        None
+    } else {
+        project_root
+            .map(|root| resolve_project_locator(&root))
+            .transpose()?
+    };
+    Ok((service_name, project_path))
+}
+
 const fn daemon_startup_is_pending(error: &CliError) -> bool {
     matches!(
         error,
@@ -918,10 +938,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
         Commands::Logs { service, follow } => {
             utils::ensure_daemon_running()?;
             let current_dir = std::env::current_dir()?;
-            let project_path = nearest_project_root(&current_dir)
-                .map(|project_root| resolve_project_locator(&project_root))
-                .transpose()?;
-            let service_name = service.as_deref().map(resolve_service_name).transpose()?;
+            let (service_name, project_path) =
+                resolve_logs_context(service.as_deref(), &current_dir)?;
 
             client::stream_logs(service_name, project_path, *follow)?;
         }
@@ -2247,6 +2265,42 @@ name = "example"
         assert_eq!(
             resolve_service_name_from_config("other:web", &config_path),
             "other:web"
+        );
+    }
+
+    #[test]
+    fn qualified_log_service_names_preserve_global_access() {
+        let directory = tempfile::tempdir().expect("create log-scope project");
+        let project_root = directory.path().join("example");
+        let nested = project_root.join("packages/app");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+        std::fs::write(
+            project_root.join("locald.toml"),
+            "[project]\nname = \"example\"\n",
+        )
+        .expect("write project config");
+        let expected_project_path =
+            resolve_project_locator(&project_root).expect("resolve expected project path");
+
+        let (qualified_service, qualified_scope) =
+            resolve_logs_context(Some("other:web"), &nested).expect("resolve qualified logs");
+        assert_eq!(qualified_service.as_deref(), Some("other:web"));
+        assert_eq!(qualified_scope, None);
+
+        let (local_service, local_scope) =
+            resolve_logs_context(Some("web"), &nested).expect("resolve project logs");
+        assert_eq!(local_service.as_deref(), Some("example:web"));
+        assert_eq!(
+            local_scope.as_deref(),
+            Some(expected_project_path.as_path())
+        );
+
+        let (all_services, ambient_scope) =
+            resolve_logs_context(None, &nested).expect("resolve ambient project logs");
+        assert_eq!(all_services, None);
+        assert_eq!(
+            ambient_scope.as_deref(),
+            Some(expected_project_path.as_path())
         );
     }
 

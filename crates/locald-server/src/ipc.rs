@@ -1,11 +1,11 @@
 use crate::ShutdownReason;
 use crate::container::ContainerManager;
-use crate::manager::ProcessManager;
+use crate::manager::{InstanceLogEntry, ProcessManager};
 use anyhow::{Context, Result};
 use locald_core::attachments::{AttachmentSource, ManualCliSession};
 use locald_core::config::LocaldConfig;
-use locald_core::ipc::{DaemonIdentity, MAX_IPC_REQUEST_BYTES};
-use locald_core::{DemandKey, IpcRequest, IpcResponse};
+use locald_core::ipc::{DaemonIdentity, LogEntry, MAX_IPC_REQUEST_BYTES};
+use locald_core::{DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,6 +101,48 @@ fn project_logs_resolution_error(path: &Path, error: &anyhow::Error) -> String {
     format!(
         "project-scoped logs are unavailable for `{}`: {error:#}; run `locald up` from that project first, or omit the project scope to inspect all daemon logs",
         path.display()
+    )
+}
+
+enum LogSubscription {
+    Global(broadcast::Receiver<LogEntry>),
+    Project {
+        instance_id: ProjectInstanceId,
+        receiver: broadcast::Receiver<InstanceLogEntry>,
+    },
+}
+
+impl LogSubscription {
+    async fn recv(&mut self) -> Result<LogEntry, broadcast::error::RecvError> {
+        match self {
+            Self::Global(receiver) => receiver.recv().await,
+            Self::Project {
+                instance_id,
+                receiver,
+            } => loop {
+                match receiver.recv().await {
+                    Ok(scoped_entry) if scoped_entry.instance_id == *instance_id => {
+                        return Ok(scoped_entry.entry);
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+            },
+        }
+    }
+}
+
+fn subscribe_to_logs(
+    project_instance_id: Option<ProjectInstanceId>,
+    global_sender: &broadcast::Sender<LogEntry>,
+    instance_sender: &broadcast::Sender<InstanceLogEntry>,
+) -> LogSubscription {
+    project_instance_id.map_or_else(
+        || LogSubscription::Global(global_sender.subscribe()),
+        |instance_id| LogSubscription::Project {
+            instance_id,
+            receiver: instance_sender.subscribe(),
+        },
     )
 }
 
@@ -273,7 +315,11 @@ async fn handle_connection(
             },
             None => None,
         };
-        let mut rx = manager.instance_log_sender.subscribe();
+        let mut subscription = subscribe_to_logs(
+            project_instance_id,
+            &manager.log_sender,
+            &manager.instance_log_sender,
+        );
         let recent = manager.get_recent_logs_for_instance(project_instance_id);
 
         for entry in recent {
@@ -293,14 +339,8 @@ async fn handle_connection(
         }
 
         loop {
-            match rx.recv().await {
-                Ok(scoped_entry) => {
-                    if project_instance_id
-                        .is_some_and(|instance_id| scoped_entry.instance_id != instance_id)
-                    {
-                        continue;
-                    }
-                    let entry = scoped_entry.entry;
+            match subscription.recv().await {
+                Ok(entry) => {
                     if let Some(ref s) = service
                         && &entry.service != s
                         && entry.service != format!("{}:build", s)
@@ -658,6 +698,28 @@ mod tests {
         assert!(message.contains("run `locald up` from that project first"));
         assert!(message.contains("omit the project scope"));
         assert!(message.contains("not registered in the identity catalog"));
+    }
+
+    #[tokio::test]
+    async fn unscoped_logs_subscribe_to_the_global_daemon_stream() {
+        let (global_sender, _) = broadcast::channel(4);
+        let (instance_sender, _) = broadcast::channel(4);
+        let mut subscription = subscribe_to_logs(None, &global_sender, &instance_sender);
+        let entry = LogEntry {
+            timestamp: 0,
+            service: "locald".to_owned(),
+            stream: locald_core::ipc::LogStream::Stdout,
+            message: "daemon diagnostic".to_owned(),
+        };
+
+        global_sender
+            .send(entry.clone())
+            .expect("publish daemon log");
+
+        assert_eq!(
+            subscription.recv().await.expect("receive daemon log"),
+            entry
+        );
     }
 
     #[tokio::test]
