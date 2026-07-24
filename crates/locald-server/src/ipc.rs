@@ -360,6 +360,50 @@ async fn handle_connection(
         return Ok(());
     }
 
+    if let IpcRequest::EnsureProject {
+        project_path,
+        demand,
+        verbose: true,
+        launch_path,
+    } = &request
+    {
+        let authenticated_launch_path = validate_generic_ensure_demand(demand)
+            .and_then(|()| authenticate_ensure_launch_path(&stream, demand, launch_path.clone()));
+        let launch_path = match authenticated_launch_path {
+            Ok(launch_path) => launch_path,
+            Err(error) => {
+                let mut bytes = serde_json::to_vec(&IpcResponse::Error(format!("{error:#}")))?;
+                bytes.push(b'\n');
+                stream.write_all(&bytes).await?;
+                return Ok(());
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let manager = manager.clone();
+        let project_path = project_path.clone();
+        let demand = demand.clone();
+        let handle = tokio::spawn(async move {
+            manager
+                .ensure_project_from_ipc_with_events(project_path, demand, launch_path, tx)
+                .await
+        });
+
+        while let Some(event) = rx.recv().await {
+            let mut bytes = serde_json::to_vec(&event)?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+        }
+
+        let response = match handle.await? {
+            Ok(result) => IpcResponse::ProjectEnsured(result),
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        };
+        let mut bytes = serde_json::to_vec(&response)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        return Ok(());
+    }
+
     if let IpcRequest::Start {
         project_path,
         verbose,
@@ -552,6 +596,7 @@ async fn handle_connection(
         IpcRequest::EnsureProject {
             project_path,
             demand,
+            verbose: _,
             launch_path,
         } => match validate_generic_ensure_demand(&demand) {
             Ok(()) => {

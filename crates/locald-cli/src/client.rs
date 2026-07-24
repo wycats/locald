@@ -147,6 +147,25 @@ pub fn stream_boot_events(request: &IpcRequest) -> CliResult<()> {
 }
 
 fn stream_boot_events_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliResult<()> {
+    match stream_boot_events_response_on_stream(stream, request)? {
+        IpcResponse::Ok => Ok(()),
+        IpcResponse::Error(message) => Err(DaemonError::RequestFailed { message }.into()),
+        response => Err(DaemonError::RequestFailed {
+            message: format!("unexpected streamed start response: {response:?}"),
+        }
+        .into()),
+    }
+}
+
+pub fn stream_project_ensure(request: &IpcRequest) -> CliResult<IpcResponse> {
+    let (mut stream, _socket_display) = connect_to_daemon()?;
+    stream_boot_events_response_on_stream(&mut stream, request)
+}
+
+fn stream_boot_events_response_on_stream(
+    stream: &mut UnixStream,
+    request: &IpcRequest,
+) -> CliResult<IpcResponse> {
     let request_bytes = serialize_request(request)?;
     stream.write_all(&request_bytes)?;
 
@@ -163,14 +182,7 @@ fn stream_boot_events_on_stream(stream: &mut UnixStream, request: &IpcRequest) -
         if let Ok(event) = serde_json::from_str::<locald_core::ipc::BootEvent>(&line) {
             renderer.handle_event(event);
         } else if let Ok(response) = serde_json::from_str::<IpcResponse>(&line) {
-            // It might be the final response (Ok or Error)
-            match response {
-                IpcResponse::Ok => return Ok(()),
-                IpcResponse::Error(msg) => {
-                    return Err(DaemonError::RequestFailed { message: msg }.into());
-                }
-                _ => {} // Ignore other responses?
-            }
+            return Ok(response);
         }
     }
     Err(DaemonError::RequestFailed {
@@ -183,11 +195,15 @@ fn stream_boot_events_on_stream(stream: &mut UnixStream, request: &IpcRequest) -
 mod tests {
     #[cfg(target_os = "macos")]
     use super::send_request_on_verified_stream;
-    use super::{send_request_on_stream, serialize_request, stream_boot_events_on_stream};
-    use locald_core::IpcRequest;
-    use std::io::Read;
-    #[cfg(target_os = "macos")]
-    use std::io::Write;
+    use super::{
+        send_request_on_stream, serialize_request, stream_boot_events_on_stream,
+        stream_boot_events_response_on_stream,
+    };
+    use locald_core::{
+        IpcRequest, IpcResponse,
+        ipc::{BootEvent, EnsureProjectResult, EnsureProjectState},
+    };
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::thread;
 
@@ -241,6 +257,41 @@ mod tests {
                 .to_string()
                 .contains("closed the connection before reporting the start result")
         );
+    }
+
+    #[test]
+    fn streamed_ensure_preserves_boot_events_and_final_readiness_response() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let final_response = IpcResponse::ProjectEnsured(EnsureProjectResult {
+            project_path: "/tmp/project".into(),
+            project_name: Some("project".to_owned()),
+            state: EnsureProjectState::Ready,
+            services: Vec::new(),
+            urls: vec!["https://project.localhost".to_owned()],
+        });
+        let expected = final_response.clone();
+        let server_thread = thread::spawn(move || {
+            let mut server = server;
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+            for payload in [
+                serde_json::to_vec(&BootEvent::StepProgress {
+                    id: "project".to_owned(),
+                    message: "waiting for readiness".to_owned(),
+                })
+                .unwrap(),
+                serde_json::to_vec(&final_response).unwrap(),
+            ] {
+                server.write_all(&payload).unwrap();
+                server.write_all(b"\n").unwrap();
+            }
+        });
+
+        let response =
+            stream_boot_events_response_on_stream(&mut client, &IpcRequest::Ping).unwrap();
+        server_thread.join().unwrap();
+
+        assert_eq!(response, expected);
     }
 
     #[cfg(target_os = "macos")]

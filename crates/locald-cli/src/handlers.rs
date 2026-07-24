@@ -97,11 +97,13 @@ const MANUAL_FOLLOW_RENEWAL_INTERVAL: std::time::Duration = std::time::Duration:
 
 fn prepare_up_ensure(
     project_locator: &std::path::Path,
+    verbose: bool,
 ) -> CliResult<(std::path::PathBuf, IpcRequest)> {
     let project_path = resolve_project_locator(project_locator)?;
     let request = IpcRequest::EnsureProject {
         project_path: project_path.clone(),
         demand: DemandKey::manual_cli(),
+        verbose,
         launch_path: Some(utils::trusted_launch_path()?),
     };
     Ok((project_path, request))
@@ -113,7 +115,7 @@ fn nearest_project_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
-fn resolve_up_target(
+fn resolve_ambient_project_target(
     explicit_path: Option<&std::path::Path>,
     current_dir: &std::path::Path,
 ) -> std::path::PathBuf {
@@ -665,7 +667,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
 
             // Resolve path and check for config
             let current_dir = std::env::current_dir()?;
-            let target_path = resolve_up_target(path.as_deref(), &current_dir);
+            let target_path = resolve_ambient_project_target(path.as_deref(), &current_dir);
 
             let config_exists = target_path.join("locald.toml").exists();
 
@@ -679,11 +681,16 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let (_, ensure_request) = prepare_up_ensure(&target_path)?;
+            let (_, ensure_request) = prepare_up_ensure(&target_path, *verbose)?;
 
             let mut attempts = 0;
             let ensured = loop {
-                match client::send_request(&ensure_request) {
+                let response = if *verbose {
+                    client::stream_project_ensure(&ensure_request)
+                } else {
+                    client::send_request(&ensure_request)
+                };
+                match response {
                     Ok(IpcResponse::ProjectEnsured(result)) => {
                         break result;
                     }
@@ -814,7 +821,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
         }
         Commands::Pin { path } => {
             utils::ensure_daemon_running()?;
-            let locator = path.clone().unwrap_or(std::env::current_dir()?);
+            let current_dir = std::env::current_dir()?;
+            let locator = resolve_ambient_project_target(path.as_deref(), &current_dir);
             let project_path = resolve_project_locator(&locator)?;
             match client::send_request(&IpcRequest::SetAlwaysOn {
                 project_path,
@@ -839,7 +847,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
         }
         Commands::Unpin { path } => {
             utils::ensure_daemon_running()?;
-            let locator = path.clone().unwrap_or(std::env::current_dir()?);
+            let current_dir = std::env::current_dir()?;
+            let locator = resolve_ambient_project_target(path.as_deref(), &current_dir);
             let project_path = resolve_project_locator(&locator)?;
             match client::send_request(&IpcRequest::SetAlwaysOn {
                 project_path,
@@ -922,7 +931,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 return Ok(());
             }
 
-            let locator = path.clone().unwrap_or(std::env::current_dir()?);
+            let current_dir = std::env::current_dir()?;
+            let locator = resolve_ambient_project_target(path.as_deref(), &current_dir);
             let project_path = resolve_project_locator(&locator)?;
             match client::send_request(&IpcRequest::ProjectStatus { project_path }) {
                 Ok(IpcResponse::ProjectStatus(info)) => {
@@ -2254,8 +2264,8 @@ mod tests {
     }
 
     #[test]
-    fn ambient_up_targets_the_nearest_project_root() {
-        let directory = tempfile::tempdir().expect("create ambient-up directory");
+    fn ambient_lifecycle_commands_target_the_nearest_project_root() {
+        let directory = tempfile::tempdir().expect("create ambient lifecycle directory");
         let project_root = directory.path().join("project");
         let nested = project_root.join("packages/app/src");
         let explicit = directory.path().join("explicit");
@@ -2266,12 +2276,15 @@ mod tests {
         )
         .expect("write project config");
 
-        assert_eq!(resolve_up_target(None, &nested), project_root);
+        assert_eq!(resolve_ambient_project_target(None, &nested), project_root);
         assert_eq!(
-            resolve_up_target(Some(explicit.as_path()), &nested),
+            resolve_ambient_project_target(Some(explicit.as_path()), &nested),
             explicit
         );
-        assert_eq!(resolve_up_target(None, directory.path()), directory.path());
+        assert_eq!(
+            resolve_ambient_project_target(None, directory.path()),
+            directory.path()
+        );
     }
 
     #[test]
@@ -2422,7 +2435,7 @@ name = "example"
             .expect("canonicalize locator directory")
             .join("project");
         let (resolved, request) =
-            prepare_up_ensure(&locator).expect("prepare missing project ensure");
+            prepare_up_ensure(&locator, false).expect("prepare missing project ensure");
 
         assert_eq!(resolved, expected);
         assert!(matches!(
@@ -2430,6 +2443,7 @@ name = "example"
             IpcRequest::EnsureProject {
                 project_path,
                 demand,
+                verbose: false,
                 launch_path: Some(_),
             } if project_path == expected && demand == DemandKey::manual_cli()
         ));
@@ -2444,7 +2458,7 @@ name = "example"
         std::fs::create_dir_all(&project).expect("create real project path");
         std::os::unix::fs::symlink(&real, &alias).expect("create locator symlink");
         let expected = std::fs::canonicalize(project).expect("canonicalize real project path");
-        let (resolved, request) = prepare_up_ensure(&alias.join("project"))
+        let (resolved, request) = prepare_up_ensure(&alias.join("project"), false)
             .expect("prepare project ensure through symlink spelling");
 
         assert_eq!(resolved, expected);
@@ -2453,6 +2467,7 @@ name = "example"
             IpcRequest::EnsureProject {
                 project_path,
                 demand,
+                verbose: false,
                 launch_path: Some(_),
             } if project_path == expected && demand == DemandKey::manual_cli()
         ));
@@ -2476,11 +2491,13 @@ name = "example"
     fn up_uses_an_ownerless_manual_demand_with_trusted_launch_context() {
         let project = std::path::Path::new("/projects/example");
 
-        let (_, request) = prepare_up_ensure(project).expect("prepare manual availability ensure");
+        let (_, request) =
+            prepare_up_ensure(project, true).expect("prepare manual availability ensure");
         assert!(matches!(
             request,
             IpcRequest::EnsureProject {
                 demand,
+                verbose: true,
                 launch_path: Some(_),
                 ..
             } if demand == DemandKey::manual_cli()

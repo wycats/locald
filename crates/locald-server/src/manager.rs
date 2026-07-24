@@ -5193,7 +5193,7 @@ impl ProcessManager {
         project_path: PathBuf,
         demand: DemandKey,
     ) -> Result<EnsureProjectResult> {
-        self.ensure_project_with_trusted_launch_path(project_path, demand, None)
+        self.ensure_project_with_trusted_launch_path(project_path, demand, None, None, false)
             .await
     }
 
@@ -5203,8 +5203,31 @@ impl ProcessManager {
         demand: DemandKey,
         trusted_launch_path: Option<String>,
     ) -> Result<EnsureProjectResult> {
-        self.ensure_project_with_trusted_launch_path(project_path, demand, trusted_launch_path)
-            .await
+        self.ensure_project_with_trusted_launch_path(
+            project_path,
+            demand,
+            trusted_launch_path,
+            None,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_project_from_ipc_with_events(
+        &self,
+        project_path: PathBuf,
+        demand: DemandKey,
+        trusted_launch_path: Option<String>,
+        event_tx: tokio::sync::mpsc::Sender<BootEvent>,
+    ) -> Result<EnsureProjectResult> {
+        self.ensure_project_with_trusted_launch_path(
+            project_path,
+            demand,
+            trusted_launch_path,
+            Some(event_tx),
+            true,
+        )
+        .await
     }
 
     async fn ensure_project_with_trusted_launch_path(
@@ -5212,6 +5235,8 @@ impl ProcessManager {
         project_path: PathBuf,
         demand: DemandKey,
         trusted_launch_path: Option<String>,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
     ) -> Result<EnsureProjectResult> {
         demand
             .validate()
@@ -5284,7 +5309,7 @@ impl ProcessManager {
 
             self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_managed_instance_locked(instance_id, None, false, true)
+                .converge_managed_instance_locked(instance_id, event_tx, verbose, true)
                 .await;
             let decision = Self::surface_availability_durability(convergence, durability_error)?;
             if !matches!(decision, ConvergenceDecision::EnsureUp) {
@@ -6392,11 +6417,20 @@ impl ProcessManager {
             });
         }
 
-        let next_transition_at = demands
-            .iter()
-            .filter_map(|demand| demand.expires_at)
-            .chain(availability.shutdown_cooldown_until())
-            .min();
+        let next_transition_at = if matches!(state, ProjectLifecycleState::CoolingDown) {
+            availability.shutdown_cooldown_until()
+        } else if desired
+            && !paused
+            && !availability.always_on()
+            && !demands.is_empty()
+            && demands.iter().all(|demand| demand.expires_at.is_some())
+        {
+            // The lifecycle changes only when the final live demand expires.
+            // Earlier owner expiries leave the project desired-up.
+            demands.iter().filter_map(|demand| demand.expires_at).max()
+        } else {
+            None
+        };
 
         Ok(Some(ProjectAvailabilityStatus {
             desired,
@@ -13645,6 +13679,7 @@ PATH = "/usr/bin:/bin"
         assert_eq!(paused_availability.state, ProjectLifecycleState::Paused);
         assert!(!paused_availability.desired);
         assert!(paused_availability.paused);
+        assert_eq!(paused_availability.next_transition_at, None);
         assert!(!paused.is_running);
         assert_eq!(paused.service_details[0].url, None);
 
@@ -13663,6 +13698,7 @@ PATH = "/usr/bin:/bin"
         assert!(always_on_availability.desired);
         assert!(always_on_availability.always_on);
         assert!(!always_on_availability.paused);
+        assert_eq!(always_on_availability.next_transition_at, None);
         assert!(manager.project_runtime_is_ready(instance_id).await);
     }
 
@@ -13708,6 +13744,17 @@ PATH = "/usr/bin:/bin"
             )
             .await
             .expect("add agent owner");
+        let owned = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect multiple live owners")
+            .availability
+            .expect("multiple-owner availability");
+        assert_eq!(
+            owned.next_transition_at,
+            Some(clock.time() + locald_core::AGENT_DEMAND_TTL),
+            "only the final owner expiry changes lifecycle state"
+        );
 
         clock.advance(locald_core::VSCODE_DEMAND_TTL);
         assert_eq!(
@@ -22937,12 +22984,18 @@ PATH = "/usr/bin:/bin"
         );
         assert!(manager.registry.lock().await.instances.is_empty());
 
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
         let mut ensure = tokio::spawn({
             let manager = manager.clone();
             let config_path = project_path.join("locald.toml");
             async move {
                 manager
-                    .ensure_project(config_path, DemandKey::manual_cli())
+                    .ensure_project_from_ipc_with_events(
+                        config_path,
+                        DemandKey::manual_cli(),
+                        None,
+                        event_tx,
+                    )
                     .await
             }
         });
@@ -22973,6 +23026,10 @@ PATH = "/usr/bin:/bin"
         assert_eq!(
             result.services[0].url.as_deref(),
             Some("https://ensure-project.localhost:8443")
+        );
+        assert!(
+            event_rx.try_recv().is_ok(),
+            "verbose EnsureProject streams boot progress before readiness"
         );
         assert_eq!(creates.load(Ordering::SeqCst), 2);
 

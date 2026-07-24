@@ -441,6 +441,9 @@ pub enum IpcRequest {
         /// An ownerless semantic demand. Trusted editor and agent adapters
         /// derive owner-bearing demands server-side from authenticated context.
         demand: DemandKey,
+        /// Stream boot and build events before the final readiness response.
+        #[serde(default)]
+        verbose: bool,
         /// Trusted host-process search path supplied by an explicit local CLI
         /// ensure. The daemon authenticates the IPC peer before accepting it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,12 +669,16 @@ mod tests {
         let request = IpcRequest::EnsureProject {
             project_path: PathBuf::from("/project/locald.toml"),
             demand: DemandKey::manual_cli(),
+            verbose: true,
             launch_path: Some("/opt/homebrew/bin:/usr/bin".to_owned()),
         };
         let encoded = serde_json::to_value(&request).expect("serialize ensure request");
         let request: IpcRequest =
             serde_json::from_value(encoded).expect("deserialize ensure request");
-        assert!(matches!(request, IpcRequest::EnsureProject { .. }));
+        assert!(matches!(
+            request,
+            IpcRequest::EnsureProject { verbose: true, .. }
+        ));
 
         let response = IpcResponse::ProjectEnsured(EnsureProjectResult {
             project_path: PathBuf::from("/project"),
@@ -716,20 +723,23 @@ mod tests {
         let mut encoded = serde_json::to_value(IpcRequest::EnsureProject {
             project_path: PathBuf::from("/project"),
             demand: DemandKey::manual_cli(),
+            verbose: true,
             launch_path: Some("/usr/bin".to_owned()),
         })
         .expect("serialize EnsureProject request");
-        encoded
+        let ensure_payload = encoded
             .get_mut("EnsureProject")
             .and_then(serde_json::Value::as_object_mut)
-            .expect("EnsureProject payload")
-            .remove("launch_path");
+            .expect("EnsureProject payload");
+        ensure_payload.remove("launch_path");
+        ensure_payload.remove("verbose");
         let ensure: IpcRequest =
             serde_json::from_value(encoded).expect("deserialize legacy EnsureProject request");
         assert!(matches!(
             ensure,
             IpcRequest::EnsureProject {
                 launch_path: None,
+                verbose: false,
                 ..
             }
         ));
