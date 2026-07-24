@@ -130,6 +130,14 @@ const fn daemon_startup_is_pending(error: &CliError) -> bool {
     )
 }
 
+const fn manual_follow_renewal_should_continue(response: &CliResult<IpcResponse>) -> bool {
+    match response {
+        Ok(IpcResponse::Ok) => true,
+        Err(error) => daemon_startup_is_pending(error),
+        _ => false,
+    }
+}
+
 fn format_status_time(time: std::time::SystemTime) -> String {
     let time: chrono::DateTime<chrono::Local> = time.into();
     time.format("%Y-%m-%d %H:%M:%S %Z").to_string()
@@ -669,7 +677,7 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         project_path: renewal_path.clone(),
                         demand: DemandKey::manual_cli(),
                     });
-                    if !matches!(response, Ok(IpcResponse::Ok)) {
+                    if !manual_follow_renewal_should_continue(&response) {
                         break;
                     }
                 }
@@ -2229,6 +2237,29 @@ name = "example"
             DaemonError::PermissionDenied {
                 socket_path: "/tmp/forbidden.sock".to_owned(),
             }
+        )));
+    }
+
+    #[test]
+    fn manual_follow_renewal_survives_transient_daemon_unavailability() {
+        assert!(manual_follow_renewal_should_continue(&Ok(IpcResponse::Ok)));
+        assert!(manual_follow_renewal_should_continue(&Err(
+            CliError::Daemon(DaemonError::NotRunning {
+                socket_path: "/tmp/missing.sock".to_owned(),
+            })
+        )));
+        assert!(manual_follow_renewal_should_continue(&Err(
+            CliError::Daemon(DaemonError::ConnectionRefused {
+                socket_path: "/tmp/refused.sock".to_owned(),
+            })
+        )));
+        assert!(!manual_follow_renewal_should_continue(&Err(
+            CliError::Daemon(DaemonError::PermissionDenied {
+                socket_path: "/tmp/forbidden.sock".to_owned(),
+            })
+        )));
+        assert!(!manual_follow_renewal_should_continue(&Ok(
+            IpcResponse::Error("demand rejected".to_owned())
         )));
     }
 

@@ -6663,10 +6663,17 @@ impl ProcessManager {
                 None => Vec::new(),
             };
             let availability = match instance_id {
-                Some(instance_id) => {
-                    self.project_availability_status(instance_id, presence, &service_details)
-                        .await?
-                }
+                Some(instance_id) => self
+                    .project_availability_status(instance_id, presence, &service_details)
+                    .await?
+                    .or_else(|| {
+                        Some(Self::inactive_project_availability(
+                            presence,
+                            "no_availability_state",
+                            "No availability demand or policy has been recorded; run `locald up` to start the project."
+                                .to_owned(),
+                        ))
+                    }),
                 None => None,
             };
             let attachment_section = Self::compatibility_section_for_display(&attachments_for);
@@ -13541,6 +13548,31 @@ PATH = "/usr/bin:/bin"
         );
         let private_owner = "private-conversation-identity";
         let demand = DemandKey::agent_conversation(private_owner).expect("construct agent demand");
+
+        let idle_status = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect project without availability state");
+        let idle_list_entry = manager
+            .project_list(Some(ProjectFilter::All))
+            .await
+            .expect("list project without availability state")
+            .into_iter()
+            .find(|entry| entry.project_path == idle_status.project_path)
+            .expect("idle project remains listed");
+        let idle_status_availability = idle_status
+            .availability
+            .expect("single-project status explains missing availability state");
+        let idle_list_availability = idle_list_entry
+            .availability
+            .expect("project list explains missing availability state");
+        assert_eq!(idle_list_availability, idle_status_availability);
+        assert!(
+            idle_list_availability
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "no_availability_state")
+        );
 
         manager
             .project_ensure_availability(&project_path, demand.clone())
