@@ -38,7 +38,7 @@ use locald_core::state::{
 use locald_core::{
     AvailabilityBatch, AvailabilityBatchOperation, AvailabilityDemandStatus, AvailabilityError,
     AvailabilityReason, AvailabilityStore, CatalogError, CatalogPresence, Clock,
-    ConvergenceDecision, DemandKey, DemandKind, DomainClaim, DomainName, DomainTarget,
+    ConvergenceDecision, DemandKey, DemandKind, DomainClaim, DomainIndex, DomainName, DomainTarget,
     EnsureDemandResult, ProjectAvailability, ProjectAvailabilityStatus, ProjectDiscovery,
     ProjectInstanceId, ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock,
     availability_path, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
@@ -57,6 +57,14 @@ use tracing::{error, info, warn};
 const LOG_BUFFER_SIZE: usize = 2000;
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn domain_target_unchanged(
+    index: &DomainIndex,
+    domain: &DomainName,
+    expected: &DomainTarget,
+) -> bool {
+    index.resolve(domain.as_str()) == Some(expected)
+}
 
 const fn demand_kind_code(kind: DemandKind) -> &'static str {
     match kind {
@@ -5253,18 +5261,23 @@ impl ProcessManager {
         let domain = domain
             .parse::<DomainName>()
             .with_context(|| format!("invalid locald project domain `{domain}`"))?;
-        let instance_id = {
+        let initial_target = {
             let index = self.domain_index.snapshot();
             match index.resolve(domain.as_str()) {
-                Some(DomainTarget::Service {
-                    project_instance_id,
-                    ..
-                }) => *project_instance_id,
+                Some(target @ DomainTarget::Service { .. }) => target.clone(),
                 Some(DomainTarget::Platform { .. }) | None => {
                     anyhow::bail!("domain `{domain}` is not owned by a locald project")
                 }
             }
         };
+        let DomainTarget::Service {
+            project_instance_id: instance_id,
+            ..
+        } = &initial_target
+        else {
+            unreachable!("the initial target was checked as a project service");
+        };
+        let instance_id = *instance_id;
         let project_path = self
             .active_path_for_instance(instance_id)
             .await
@@ -5280,17 +5293,11 @@ impl ProcessManager {
 
         let still_owned = {
             let index = self.domain_index.snapshot();
-            matches!(
-                index.resolve(domain.as_str()),
-                Some(DomainTarget::Service {
-                    project_instance_id,
-                    ..
-                }) if *project_instance_id == instance_id
-            )
+            domain_target_unchanged(&index, &domain, &initial_target)
         };
         anyhow::ensure!(
             still_owned,
-            "domain `{domain}` changed ownership while its project was resuming"
+            "domain `{domain}` changed targets while its project was resuming"
         );
         Ok(result)
     }
@@ -19482,6 +19489,31 @@ command = "unused-by-test-factory"
             )
             .expect("install legacy test claim");
         manager.domain_index.store(replacement);
+    }
+
+    #[test]
+    fn domain_resume_target_check_includes_the_service_name() {
+        let instance_id = test_instance_id();
+        let domain: DomainName = "resume.localhost".parse().expect("valid test domain");
+        let initial_target = DomainTarget::Service {
+            project_instance_id: instance_id,
+            service_name: Some("resume:web".to_owned()),
+        };
+        let replacement = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [DomainClaim::service(
+                    domain.clone(),
+                    instance_id,
+                    "resume:replacement".to_owned(),
+                )],
+            )
+            .expect("install replacement target");
+
+        assert!(
+            !domain_target_unchanged(&replacement, &domain, &initial_target),
+            "a service reassignment within the same project is a changed target"
+        );
     }
 
     #[test]

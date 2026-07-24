@@ -4,7 +4,8 @@ import {
 	availabilityMessage,
 	demandSummary,
 	formatTransition,
-	projectCanPause
+	projectCanPause,
+	projectCanResume
 } from './availability';
 import type { ProjectAvailabilityStatus } from './api';
 
@@ -45,6 +46,11 @@ describe('project availability presentation', () => {
 	it('offers convergence rather than pause for a degraded desired project', () => {
 		expect(projectCanPause(status({ state: 'degraded' }))).toBe(false);
 		expect(projectCanPause(status({ state: 'ready' }))).toBe(true);
+	});
+
+	it('only offers resume while the project still has a current worktree', () => {
+		expect(projectCanResume(status({ state: 'paused' }))).toBe(true);
+		expect(projectCanResume(status({ state: 'missing' }))).toBe(false);
 	});
 
 	it('summarizes privacy-safe demand labels without owner identifiers', () => {

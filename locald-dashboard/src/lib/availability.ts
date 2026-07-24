@@ -31,6 +31,12 @@ export function projectCanPause(
 	);
 }
 
+export function projectCanResume(
+	availability: ProjectAvailabilityStatus | null | undefined
+): boolean {
+	return availability?.state !== 'missing';
+}
+
 export function demandSummary(
 	availability: ProjectAvailabilityStatus | null | undefined
 ): string | null {

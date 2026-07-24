@@ -18,7 +18,8 @@
 		availabilityMessage,
 		demandSummary,
 		formatTransition,
-		projectCanPause
+		projectCanPause,
+		projectCanResume
 	} from '$lib/availability';
 	import type { ProjectListEntry } from '$lib/api';
 	import type { ServiceStatus } from '$lib/types';
@@ -239,7 +240,7 @@
 							{/if}
 							Pause
 						</button>
-					{:else}
+					{:else if projectCanResume(project.availability)}
 						<button
 							class="project-action primary"
 							disabled={projectAction !== null}
@@ -252,6 +253,8 @@
 							{/if}
 							Resume
 						</button>
+					{:else}
+						<span class="missing-guidance">Restore the worktree to resume this project.</span>
 					{/if}
 					<button
 						class="project-action secondary"
@@ -594,6 +597,12 @@
 	.project-action:disabled {
 		opacity: 0.55;
 		cursor: wait;
+	}
+	.missing-guidance {
+		max-width: 15rem;
+		color: #a1a1aa;
+		font-size: 11px;
+		line-height: 1.4;
 	}
 
 	.empty-state code {

@@ -12,6 +12,7 @@ use hyper::StatusCode;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::manager::{ProcessManager, ServiceNotFoundError};
 use locald_core::DemandKey;
@@ -308,8 +309,19 @@ async fn handle_project_resume_domain(
     axum::Json(body): axum::Json<ResumeProjectDomainRequest>,
 ) -> impl IntoResponse {
     match pm.ensure_project_for_domain(&body.domain).await {
-        Ok(result) => axum::Json(result).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            warn!(
+                domain = %body.domain,
+                error = %format!("{error:#}"),
+                "Failed to resume project from its owned domain"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not resume the project for this domain. Run `locald up` from the project directory or use the dashboard.",
+            )
+                .into_response()
+        }
     }
 }
 

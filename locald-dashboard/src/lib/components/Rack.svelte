@@ -17,7 +17,12 @@
 		resetServiceWithFeedback
 	} from '$lib/actions/service';
 	import { pauseProjectWithFeedback, resumeProjectWithFeedback } from '$lib/actions/project';
-	import { availabilityLabel, demandSummary, projectCanPause } from '$lib/availability';
+	import {
+		availabilityLabel,
+		demandSummary,
+		projectCanPause,
+		projectCanResume
+	} from '$lib/availability';
 	import {
 		Activity,
 		Layers,
@@ -277,6 +282,12 @@
 		}
 		const path = project.entry.project_path;
 		if (pendingProjects.includes(path)) return;
+		if (
+			!projectCanPause(project.entry.availability) &&
+			!projectCanResume(project.entry.availability)
+		) {
+			return;
+		}
 		pendingProjects = [...pendingProjects, path];
 		try {
 			if (projectCanPause(project.entry.availability)) {
@@ -515,12 +526,18 @@
 								{/if}
 								<button
 									class="group-btn"
-									disabled={projectPending}
+									disabled={projectPending ||
+										(project.entry
+											? !projectCanPause(project.entry.availability) &&
+												!projectCanResume(project.entry.availability)
+											: false)}
 									on:click|stopPropagation={() => toggleProject(project)}
 									title={project.entry
 										? projectCanPause(project.entry.availability)
 											? 'Pause project'
-											: 'Resume project'
+											: projectCanResume(project.entry.availability)
+												? 'Resume project'
+												: 'Restore the worktree to resume this project'
 										: isAllStopped
 											? 'Start group'
 											: 'Stop group'}
