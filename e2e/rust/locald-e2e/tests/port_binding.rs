@@ -34,10 +34,16 @@ port = 9090
 
     assert!(stdout.contains("Availability: Ready (desired up)"));
     assert!(stdout.contains("port-test:web: running"));
-    assert!(
-        !stdout.contains("9090"),
-        "normal semantic status must not expose internal service ports"
-    );
+    for direct_url in [
+        "http://localhost:9090",
+        "http://127.0.0.1:9090",
+        "http://[::1]:9090",
+    ] {
+        assert!(
+            !stdout.contains(direct_url),
+            "normal semantic status must not expose the direct service URL {direct_url}"
+        );
+    }
 
     // 4. Verify port is open
     // We can try to connect to localhost:9090

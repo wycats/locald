@@ -113,6 +113,16 @@ fn nearest_project_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
+fn resolve_up_target(
+    explicit_path: Option<&std::path::Path>,
+    current_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    explicit_path.map_or_else(
+        || nearest_project_root(current_dir).unwrap_or_else(|| current_dir.to_path_buf()),
+        std::path::Path::to_path_buf,
+    )
+}
+
 fn resolve_service_name(name: &str) -> CliResult<String> {
     let current_dir = std::env::current_dir()?;
     let config_path = nearest_project_root(&current_dir)
@@ -646,11 +656,8 @@ pub fn run(cli: Cli) -> CliResult<()> {
             }
 
             // Resolve path and check for config
-            let target_path = if let Some(p) = path {
-                p.clone()
-            } else {
-                std::env::current_dir()?
-            };
+            let current_dir = std::env::current_dir()?;
+            let target_path = resolve_up_target(path.as_deref(), &current_dir);
 
             let config_exists = target_path.join("locald.toml").exists();
 
@@ -2240,6 +2247,27 @@ mod tests {
             .expect("write inner project config");
         assert_eq!(nearest_project_root(&nested), Some(inner));
         assert_eq!(nearest_project_root(directory.path()), None);
+    }
+
+    #[test]
+    fn ambient_up_targets_the_nearest_project_root() {
+        let directory = tempfile::tempdir().expect("create ambient-up directory");
+        let project_root = directory.path().join("project");
+        let nested = project_root.join("packages/app/src");
+        let explicit = directory.path().join("explicit");
+        std::fs::create_dir_all(&nested).expect("create nested project directory");
+        std::fs::write(
+            project_root.join("locald.toml"),
+            "[project]\nname = \"project\"\n",
+        )
+        .expect("write project config");
+
+        assert_eq!(resolve_up_target(None, &nested), project_root);
+        assert_eq!(
+            resolve_up_target(Some(explicit.as_path()), &nested),
+            explicit
+        );
+        assert_eq!(resolve_up_target(None, directory.path()), directory.path());
     }
 
     #[test]
