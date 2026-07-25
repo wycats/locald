@@ -3,20 +3,15 @@ import {
   AmbiguousProjectError,
   selectProjectPath,
 } from "./project-selection.js";
+import { findProjectConfigPaths } from "./project-discovery.js";
 
 export { AmbiguousProjectError, selectProjectPath };
-
-const LOCALD_CONFIG_GLOB = "**/locald.toml";
-const LOCALD_CONFIG_EXCLUDE =
-  "**/{.git,node_modules,target,dist,build,.next}/**";
 
 export async function resolveCurrentProjectPath(): Promise<
   string | undefined
 > {
-  const configs = await vscode.workspace.findFiles(
-    LOCALD_CONFIG_GLOB,
-    LOCALD_CONFIG_EXCLUDE,
-    100,
+  const configPaths = await findProjectConfigPaths((include, exclude) =>
+    vscode.workspace.findFiles(include, exclude),
   );
   const activeDocument = vscode.window.activeTextEditor?.document;
   const activeFilePath =
@@ -24,7 +19,7 @@ export async function resolveCurrentProjectPath(): Promise<
       ? activeDocument.uri.fsPath
       : undefined;
   return selectProjectPath(
-    configs.map((config) => config.fsPath),
+    configPaths,
     activeFilePath,
   );
 }

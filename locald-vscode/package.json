@@ -44,6 +44,21 @@
     ],
     "languageModelTools": [
       {
+        "name": "locald_ensure",
+        "toolReferenceName": "localdEnsure",
+        "tags": [
+          "locald"
+        ],
+        "displayName": "Ensure locald Ready",
+        "modelDescription": "Ensure the current locald project is running and ready, then return semantic service URLs",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(run-all)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
         "name": "locald_services",
         "toolReferenceName": "localdServices",
         "tags": [

@@ -42,8 +42,20 @@ function registerTools(context, controller, resolveProject) {
         extension_js_1.log.warn("vscode.lm.registerTool not available — tools disabled");
         return;
     }
-    extension_js_1.log.info("Registering 4 locald language-model tools");
-    context.subscriptions.push(vscode.lm.registerTool("locald_services", {
+    extension_js_1.log.info("Registering 5 locald language-model tools");
+    context.subscriptions.push(vscode.lm.registerTool("locald_ensure", {
+        async invoke(_options, _token) {
+            const result = await controller.ensureCurrent("language-model readiness request");
+            if (!result) {
+                throw new Error("no locald project is selected");
+            }
+            return textResult(JSON.stringify({
+                state: result.state,
+                services: result.services,
+                urls: result.urls,
+            }, null, 2));
+        },
+    }), vscode.lm.registerTool("locald_services", {
         async invoke(_options, _token) {
             const projectPath = await resolveRequiredProject(resolveProject);
             const info = await (0, plumbing_js_1.status)(projectPath);

@@ -39,14 +39,13 @@ const vscode = __importStar(require("vscode"));
 const project_selection_js_1 = require("./project-selection.js");
 Object.defineProperty(exports, "AmbiguousProjectError", { enumerable: true, get: function () { return project_selection_js_1.AmbiguousProjectError; } });
 Object.defineProperty(exports, "selectProjectPath", { enumerable: true, get: function () { return project_selection_js_1.selectProjectPath; } });
-const LOCALD_CONFIG_GLOB = "**/locald.toml";
-const LOCALD_CONFIG_EXCLUDE = "**/{.git,node_modules,target,dist,build,.next}/**";
+const project_discovery_js_1 = require("./project-discovery.js");
 async function resolveCurrentProjectPath() {
-    const configs = await vscode.workspace.findFiles(LOCALD_CONFIG_GLOB, LOCALD_CONFIG_EXCLUDE, 100);
+    const configPaths = await (0, project_discovery_js_1.findProjectConfigPaths)((include, exclude) => vscode.workspace.findFiles(include, exclude));
     const activeDocument = vscode.window.activeTextEditor?.document;
     const activeFilePath = activeDocument?.uri.scheme === "file"
         ? activeDocument.uri.fsPath
         : undefined;
-    return (0, project_selection_js_1.selectProjectPath)(configs.map((config) => config.fsPath), activeFilePath);
+    return (0, project_selection_js_1.selectProjectPath)(configPaths, activeFilePath);
 }
 //# sourceMappingURL=workspace-project.js.map

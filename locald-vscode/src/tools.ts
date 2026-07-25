@@ -14,9 +14,33 @@ export function registerTools(
     log.warn("vscode.lm.registerTool not available — tools disabled");
     return;
   }
-  log.info("Registering 4 locald language-model tools");
+  log.info("Registering 5 locald language-model tools");
 
   context.subscriptions.push(
+    vscode.lm.registerTool("locald_ensure", {
+      async invoke(
+        _options: vscode.LanguageModelToolInvocationOptions<void>,
+        _token: vscode.CancellationToken,
+      ): Promise<vscode.LanguageModelToolResult> {
+        const result = await controller.ensureCurrent(
+          "language-model readiness request",
+        );
+        if (!result) {
+          throw new Error("no locald project is selected");
+        }
+        return textResult(
+          JSON.stringify(
+            {
+              state: result.state,
+              services: result.services,
+              urls: result.urls,
+            },
+            null,
+            2,
+          ),
+        );
+      },
+    } satisfies vscode.LanguageModelTool<void>),
     vscode.lm.registerTool("locald_services", {
       async invoke(
         _options: vscode.LanguageModelToolInvocationOptions<void>,

@@ -11,6 +11,7 @@ class EditorAvailabilityController {
     renewalIntervalMs;
     scheduleRenewal;
     currentPath;
+    operationRenewalPath;
     cancelHeartbeat;
     pending = Promise.resolve();
     disposed = false;
@@ -45,21 +46,26 @@ class EditorAvailabilityController {
             if (!initial) {
                 return undefined;
             }
-            return operation(initial, (nextReason) => this.ensureProjectWithinQueue(initial.project_path, nextReason));
+            this.operationRenewalPath = initial.project_path;
+            try {
+                return await operation(initial, (nextReason) => this.ensureProjectWithinQueue(initial.project_path, nextReason));
+            }
+            finally {
+                this.operationRenewalPath = undefined;
+            }
         });
     }
     async renewCurrent() {
+        const operationPath = this.operationRenewalPath;
+        if (!this.disposed && operationPath) {
+            await this.renewProject(operationPath);
+            return;
+        }
         await this.enqueue(async () => {
             if (this.disposed || !this.currentPath) {
                 return;
             }
-            const projectPath = this.currentPath;
-            try {
-                await this.client.renew(projectPath, this.windowId, this.hostPid);
-            }
-            catch (error) {
-                this.log.warn(`Failed to renew editor demand for ${projectPath}; the next semantic activity will ensure it again: ${formatError(error)}`);
-            }
+            await this.renewProject(this.currentPath);
         });
     }
     async releaseCurrent() {
@@ -97,19 +103,14 @@ class EditorAvailabilityController {
             return undefined;
         }
         const previousPath = this.currentPath;
+        const result = await this.ensureProjectWithinQueue(nextPath, reason);
         this.currentPath = nextPath;
-        let result;
-        try {
-            result = await this.ensureProjectWithinQueue(nextPath, reason);
-        }
-        finally {
-            if (previousPath && previousPath !== nextPath) {
-                try {
-                    await this.client.release(previousPath, this.windowId, this.hostPid);
-                }
-                catch (error) {
-                    this.log.warn(`Failed to release previous editor demand for ${previousPath}; it will expire automatically: ${formatError(error)}`);
-                }
+        if (previousPath && previousPath !== nextPath) {
+            try {
+                await this.client.release(previousPath, this.windowId, this.hostPid);
+            }
+            catch (error) {
+                this.log.warn(`Failed to release previous editor demand for ${previousPath}; it will expire automatically: ${formatError(error)}`);
             }
         }
         return result;
@@ -118,6 +119,14 @@ class EditorAvailabilityController {
         const result = await this.client.ensure(projectPath, this.windowId, this.hostPid);
         this.log.info(`Editor availability ready for ${projectPath} after ${reason}`);
         return result;
+    }
+    async renewProject(projectPath) {
+        try {
+            await this.client.renew(projectPath, this.windowId, this.hostPid);
+        }
+        catch (error) {
+            this.log.warn(`Failed to renew editor demand for ${projectPath}; the next semantic activity will ensure it again: ${formatError(error)}`);
+        }
     }
     ensureNotDisposed() {
         if (this.disposed) {

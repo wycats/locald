@@ -145,7 +145,41 @@ test("restart work keeps its original project target until readiness returns", a
   ]);
 });
 
-test("failed readiness remains the current demand and releases the old project", async () => {
+test("heartbeat renews the fixed target during long restart work", async () => {
+  const fixture = setup("/work/one");
+  await fixture.controller.activate();
+  let finishRestart: (() => void) | undefined;
+  let restartStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    restartStarted = resolve;
+  });
+  const restartGate = new Promise<void>((resolve) => {
+    finishRestart = resolve;
+  });
+
+  const restart = fixture.controller.withCurrentProject(
+    "prepare restart",
+    async (initial) => {
+      restartStarted?.();
+      await restartGate;
+      return initial;
+    },
+  );
+  await started;
+
+  await fixture.controller.renewCurrent();
+
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/one:window-a:42",
+    "ensure:/work/one:window-a:42",
+    "renew:/work/one:window-a:42",
+  ]);
+
+  finishRestart?.();
+  await restart;
+});
+
+test("failed project switch preserves the old demand", async () => {
   const fixture = setup("/work/one");
   await fixture.controller.activate();
   fixture.projectPath = "/work/two";
@@ -159,11 +193,10 @@ test("failed readiness remains the current demand and releases the old project",
     /readiness failed/,
   );
 
-  assert.equal(fixture.controller.projectPath, "/work/two");
+  assert.equal(fixture.controller.projectPath, "/work/one");
   assert.deepEqual(fixture.calls, [
     "ensure:/work/one:window-a:42",
     "ensure:/work/two:window-a:42",
-    "release:/work/one:window-a:42",
   ]);
 });
 
