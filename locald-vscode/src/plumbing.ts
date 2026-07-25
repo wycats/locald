@@ -152,9 +152,7 @@ function run(args: string[], options: RunOptions = {}): Promise<string> {
       (error, stdout, stderr) => {
         if (error) {
           reject(
-            new Error(
-              `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`,
-            ),
+            new Error(formatCommandFailure(binary, args, stderr || error.message)),
           );
         } else {
           resolve(stdout);
@@ -162,6 +160,23 @@ function run(args: string[], options: RunOptions = {}): Promise<string> {
       },
     );
   });
+}
+
+export function formatCommandFailure(
+  binary: LocaldBinaryIdentity,
+  args: string[],
+  detail: string,
+): string {
+  const commandFailure =
+    detail.trim() || "locald command exited without diagnostic output";
+  const editorProtocolMismatch =
+    args[0] === "project" &&
+    args[1] === "editor" &&
+    /unrecognized subcommand ['"]?editor['"]?/i.test(commandFailure);
+  const remediation = editorProtocolMismatch
+    ? "\nInstall the current locald CLI, run `sudo locald admin setup`, then reload this VS Code window."
+    : "";
+  return `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${commandFailure}${remediation}`;
 }
 
 export async function ensureEditorProject(

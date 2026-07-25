@@ -6552,14 +6552,21 @@ impl ProcessManager {
         let now = self.availability_now();
         let mut store = self.load_availability(instance_id).await?;
         let availability = store.snapshot().await?;
-        let demands = availability
+        let pause_through_generation = availability.pause_through_generation();
+        let live_demands = availability
             .live_demands_at(now)
-            .map(|demand| AvailabilityDemandStatus {
-                kind: demand.kind(),
-                safe_label: demand.safe_label().to_owned(),
-                expires_at: demand.expires_at(),
+            .map(|demand| {
+                (
+                    AvailabilityDemandStatus {
+                        kind: demand.kind(),
+                        safe_label: demand.safe_label().to_owned(),
+                        expires_at: demand.expires_at(),
+                    },
+                    pause_through_generation.is_none_or(|pause| demand.generation() > pause),
+                )
             })
             .collect::<Vec<_>>();
+        let has_effective_demand = live_demands.iter().any(|(_, effective)| *effective);
         let suppressed = self
             .service_stop_suppressions
             .lock()
@@ -6663,7 +6670,7 @@ impl ProcessManager {
         if !desired
             && !paused
             && !availability.always_on()
-            && demands.is_empty()
+            && !has_effective_demand
             && presence == CatalogPresence::Active
         {
             reasons.push(AvailabilityReason {
@@ -6679,16 +6686,16 @@ impl ProcessManager {
                 message: "Always On policy is enabled.".to_owned(),
             });
         }
-        for demand in &demands {
+        for (demand, effective) in &live_demands {
             reasons.push(AvailabilityReason {
                 code: format!("demand_{}", demand_kind_code(demand.kind)),
-                message: if paused {
+                message: if *effective {
+                    format!("{} demand is active.", demand.safe_label)
+                } else {
                     format!(
-                        "{} demand remains live behind the pause.",
+                        "{} demand remains live behind the last pause.",
                         demand.safe_label
                     )
-                } else {
-                    format!("{} demand is active.", demand.safe_label)
                 },
             });
         }
@@ -6698,15 +6705,23 @@ impl ProcessManager {
         } else if desired
             && !paused
             && !availability.always_on()
-            && !demands.is_empty()
-            && demands.iter().all(|demand| demand.expires_at.is_some())
+            && has_effective_demand
+            && live_demands
+                .iter()
+                .filter(|(_, effective)| *effective)
+                .all(|(demand, _)| demand.expires_at.is_some())
         {
             // The lifecycle changes only when the final live demand expires.
             // Earlier owner expiries leave the project desired-up.
-            demands.iter().filter_map(|demand| demand.expires_at).max()
+            live_demands
+                .iter()
+                .filter(|(_, effective)| *effective)
+                .filter_map(|(demand, _)| demand.expires_at)
+                .max()
         } else {
             None
         };
+        let demands = live_demands.into_iter().map(|(demand, _)| demand).collect();
 
         Ok(Some(ProjectAvailabilityStatus {
             desired,
@@ -14114,7 +14129,7 @@ PATH = "/usr/bin:/bin"
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("semantic-status-project");
         let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
-        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+        let (mut manager, instance_id, availability_data_dir) = availability_manager_with_clock(
             dir.path(),
             &project_path,
             "semantic-status",
@@ -14251,6 +14266,58 @@ PATH = "/usr/bin:/bin"
         assert!(!paused.is_running);
         assert_eq!(paused.service_details[0].url, None);
 
+        let editor_demand =
+            DemandKey::vs_code_window("active-window").expect("construct editor demand");
+        manager
+            .project_ensure_availability(&project_path, editor_demand.clone())
+            .await
+            .expect("resume project through a new editor generation");
+        let resumed = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect editor-resumed project")
+            .availability
+            .expect("editor-resumed availability status");
+        assert_eq!(resumed.state, ProjectLifecycleState::Ready);
+        assert!(resumed.desired);
+        assert!(!resumed.paused);
+        assert_eq!(
+            resumed.next_transition_at,
+            Some(clock.time() + locald_core::VSCODE_DEMAND_TTL),
+            "the effective editor owner, not the older suppressed owner, controls the next transition"
+        );
+        assert!(resumed.reasons.iter().any(|reason| {
+            reason.code == "demand_agent_conversation"
+                && reason.message == "Agent conversation demand remains live behind the last pause."
+        }));
+        assert!(resumed.reasons.iter().any(|reason| {
+            reason.code == "demand_vs_code_window"
+                && reason.message == "VS Code window demand is active."
+        }));
+
+        let mut availability = AvailabilityStore::load_with_clock(
+            &availability_data_dir,
+            instance_id,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await
+        .expect("reload semantic-status availability");
+        assert!(
+            availability
+                .release_demand(&editor_demand)
+                .await
+                .expect("release editor demand")
+        );
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("enter cooldown after the effective owner releases"),
+            Some(ConvergenceDecision::PreserveRuntimeUntil {
+                deadline: clock.time() + locald_core::SHUTDOWN_COOLDOWN,
+            })
+        );
+
         manager
             .project_set_always_on(&project_path, true)
             .await
@@ -14267,7 +14334,117 @@ PATH = "/usr/bin:/bin"
         assert!(always_on_availability.always_on);
         assert!(!always_on_availability.paused);
         assert_eq!(always_on_availability.next_transition_at, None);
+        assert!(
+            always_on_availability.reasons.iter().any(|reason| {
+                reason.code == "demand_agent_conversation"
+                    && reason.message
+                        == "Agent conversation demand remains live behind the last pause."
+            }),
+            "resuming through Always On must not describe an older suppressed owner as active"
+        );
         assert!(manager.project_runtime_is_ready(instance_id).await);
+
+        manager
+            .project_set_always_on(&project_path, false)
+            .await
+            .expect("disable Always On");
+        clock.advance(locald_core::SHUTDOWN_COOLDOWN);
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("finish shutdown after Always On is disabled"),
+            Some(ConvergenceDecision::EnsureDown)
+        );
+        let stopped = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect stopped project with an older live demand")
+            .availability
+            .expect("stopped availability status");
+        assert_eq!(stopped.state, ProjectLifecycleState::Stopped);
+        assert!(!stopped.desired);
+        assert!(!stopped.paused);
+        assert!(
+            stopped
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "no_live_demand")
+        );
+        assert!(stopped.reasons.iter().any(|reason| {
+            reason.code == "demand_agent_conversation"
+                && reason.message == "Agent conversation demand remains live behind the last pause."
+        }));
+    }
+
+    #[tokio::test]
+    async fn status_next_transition_ignores_live_demands_behind_the_last_pause() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("mixed-generation-status-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, _instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "mixed-generation-status",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "mixed-generation-status",
+            "mixed-generation-status.localhost",
+            &["web"],
+        );
+
+        let older_agent =
+            DemandKey::agent_conversation("older-owner").expect("construct agent demand");
+        manager
+            .project_ensure_availability(&project_path, older_agent.clone())
+            .await
+            .expect("start project through the older owner");
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("pause the older generation");
+        assert!(
+            manager
+                .project_renew_availability(&project_path, &older_agent)
+                .await
+                .expect("passively renew the suppressed owner")
+        );
+
+        let active_editor =
+            DemandKey::vs_code_window("active-window").expect("construct editor demand");
+        manager
+            .project_ensure_availability(&project_path, active_editor)
+            .await
+            .expect("resume through a new editor generation");
+
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("inspect mixed-generation project")
+            .availability
+            .expect("mixed-generation availability");
+        assert_eq!(
+            status.next_transition_at,
+            Some(clock.time() + locald_core::VSCODE_DEMAND_TTL)
+        );
+        assert!(status.reasons.iter().any(|reason| {
+            reason.code == "demand_agent_conversation"
+                && reason.message == "Agent conversation demand remains live behind the last pause."
+        }));
+        assert!(status.reasons.iter().any(|reason| {
+            reason.code == "demand_vs_code_window"
+                && reason.message == "VS Code window demand is active."
+        }));
     }
 
     #[tokio::test]
@@ -17802,6 +17979,24 @@ PATH = "/usr/bin:/bin"
                 .expect("reload repaired availability")
                 .last_convergence_error(),
             None
+        );
+
+        assert_eq!(
+            manager
+                .converge_project_availability(&project_path)
+                .await
+                .expect("keep the repaired runtime stable"),
+            Some(ConvergenceDecision::EnsureUp)
+        );
+        let stable = manager
+            .get_service_controller("unhealthy-retry:web")
+            .await
+            .expect("repaired controller remains running");
+        assert!(Arc::ptr_eq(&replacement, &stable));
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "a later convergence sweep must preserve the repaired runtime"
         );
 
         manager

@@ -5,6 +5,7 @@ exports.getBinaryIdentity = getBinaryIdentity;
 exports.formatBinaryIdentity = formatBinaryIdentity;
 exports.findBinary = findBinary;
 exports.resolveBinaryIdentityFrom = resolveBinaryIdentityFrom;
+exports.formatCommandFailure = formatCommandFailure;
 exports.ensureEditorProject = ensureEditorProject;
 exports.renewEditorProject = renewEditorProject;
 exports.releaseEditorProject = releaseEditorProject;
@@ -75,13 +76,23 @@ function run(args, options = {}) {
             timeout: options.timeout ?? DEFAULT_COMMAND_TIMEOUT_MS,
         }, (error, stdout, stderr) => {
             if (error) {
-                reject(new Error(`${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`));
+                reject(new Error(formatCommandFailure(binary, args, stderr || error.message)));
             }
             else {
                 resolve(stdout);
             }
         });
     });
+}
+function formatCommandFailure(binary, args, detail) {
+    const commandFailure = detail.trim() || "locald command exited without diagnostic output";
+    const editorProtocolMismatch = args[0] === "project" &&
+        args[1] === "editor" &&
+        /unrecognized subcommand ['"]?editor['"]?/i.test(commandFailure);
+    const remediation = editorProtocolMismatch
+        ? "\nInstall the current locald CLI, run `sudo locald admin setup`, then reload this VS Code window."
+        : "";
+    return `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${commandFailure}${remediation}`;
 }
 async function ensureEditorProject(projectPath, windowId, hostPid) {
     const output = await run([

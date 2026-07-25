@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  formatCommandFailure,
   logCommandArgs,
   parseJsonOutput,
   resolveBinaryIdentityFrom,
@@ -55,6 +56,19 @@ test("parseJsonOutput accepts machine-clean JSON and legacy startup prefixes", (
     ),
     { ready: true },
   );
+});
+
+test("old locald editor protocols receive actionable upgrade guidance", () => {
+  const message = formatCommandFailure(
+    { path: "/Users/test/.local/bin/locald", source: "local install" },
+    ["project", "editor", "ensure", "/work/project", "--json"],
+    "error: unrecognized subcommand 'editor'",
+  );
+
+  assert.match(message, /unrecognized subcommand 'editor'/);
+  assert.match(message, /Install the current locald CLI/);
+  assert.match(message, /sudo locald admin setup/);
+  assert.match(message, /reload this VS Code window/);
 });
 
 test("StreamingLineTail bounds chunked output before returning recent lines", () => {
