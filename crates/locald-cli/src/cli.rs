@@ -510,6 +510,12 @@ pub enum RegistryCommands {
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
+    /// Machine-facing VS Code lifecycle adapter.
+    #[command(hide = true)]
+    Editor {
+        #[command(subcommand)]
+        command: EditorCommands,
+    },
     /// Register an attachment (editor, CLI, or pin).
     Attach {
         path: std::path::PathBuf,
@@ -558,6 +564,40 @@ pub enum ProjectCommands {
         /// Filter: active, pinned, recent, all.
         #[arg(long)]
         filter: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EditorCommands {
+    /// Semantically activate or refocus a VS Code project and wait for readiness.
+    Ensure {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        window_id: String,
+        #[arg(long)]
+        host_pid: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Passively renew an existing live VS Code window demand.
+    Renew {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        window_id: String,
+        #[arg(long)]
+        host_pid: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release one VS Code window demand.
+    Release {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        window_id: String,
+        #[arg(long)]
+        host_pid: u32,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -720,6 +760,44 @@ mod tests {
                 assert_eq!(command, vec!["echo".to_string(), "hi".to_string()]);
             }
             _ => panic!("expected Commands::Exec"),
+        }
+    }
+
+    #[test]
+    fn parse_hidden_editor_ensure_captures_window_provenance() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "project",
+            "editor",
+            "ensure",
+            "/project",
+            "--window-id",
+            "window-a",
+            "--host-pid",
+            "42",
+            "--json",
+        ])
+        .expect("parse editor ensure");
+
+        match cli.command {
+            Commands::Project {
+                command:
+                    ProjectCommands::Editor {
+                        command:
+                            EditorCommands::Ensure {
+                                path,
+                                window_id,
+                                host_pid,
+                                json,
+                            },
+                    },
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("/project"));
+                assert_eq!(window_id, "window-a");
+                assert_eq!(host_pid, 42);
+                assert!(json);
+            }
+            _ => panic!("expected editor ensure command"),
         }
     }
 }

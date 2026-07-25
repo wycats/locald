@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use uuid::Uuid;
 use crate::{MANUAL_DEMAND_TTL, ProjectInstanceId, VSCODE_DEMAND_TTL};
 
 const LEGACY_EDITOR_MIGRATION_TTL: Duration = Duration::from_mins(30);
+const MAX_EDITOR_WINDOW_ID_BYTES: usize = 256;
 
 /// Retry-stable identity for one log-following `locald up` session.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -45,6 +47,86 @@ impl ManualCliSession {
     #[must_use]
     pub const fn attachment_source(self) -> AttachmentSource {
         AttachmentSource::ManualCLI(self)
+    }
+}
+
+/// One trusted host-editor session presented to the daemon adapter.
+///
+/// The daemon validates the host process against the kernel-authenticated IPC
+/// peer before deriving the private availability owner. Normal status surfaces
+/// expose only the safe `VS Code window` demand category.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSession {
+    window_id: String,
+    host_pid: u32,
+}
+
+impl fmt::Debug for EditorSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EditorSession")
+            .field("window_id", &"<private>")
+            .field("host_pid", &"<private>")
+            .finish()
+    }
+}
+
+impl EditorSession {
+    pub fn new(window_id: String, host_pid: u32) -> Result<Self> {
+        let session = Self {
+            window_id,
+            host_pid,
+        };
+        session.validate()?;
+        Ok(session)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.window_id.is_empty(),
+            "VS Code window identity must not be empty"
+        );
+        anyhow::ensure!(
+            self.window_id.len() <= MAX_EDITOR_WINDOW_ID_BYTES,
+            "VS Code window identity exceeds {MAX_EDITOR_WINDOW_ID_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            self.window_id.trim() == self.window_id,
+            "VS Code window identity must not have surrounding whitespace"
+        );
+        anyhow::ensure!(
+            !self.window_id.chars().any(char::is_control),
+            "VS Code window identity must not contain control characters"
+        );
+        anyhow::ensure!(
+            self.host_pid > 0,
+            "VS Code host process ID must be positive"
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
+    #[must_use]
+    pub const fn host_pid(&self) -> u32 {
+        self.host_pid
+    }
+
+    #[must_use]
+    pub fn attachment_source(&self) -> AttachmentSource {
+        AttachmentSource::Editor {
+            name: "vscode".to_owned(),
+            id: self.window_id.clone(),
+            // The host PID authenticates each adapter request, but heartbeat
+            // renewal is the authority for semantic editor liveness. Keeping
+            // the PID out of durable compatibility state prevents the legacy
+            // process revalidator from extending a missed heartbeat.
+            pid: None,
+        }
     }
 }
 
@@ -386,6 +468,33 @@ impl AttachmentStoreSnapshot {
                 self.instance_owners.remove(&project_path);
             }
         }
+        true
+    }
+
+    /// Refresh one exact compatibility owner at a caller-selected time.
+    ///
+    /// Semantic editor heartbeats publish this timestamp in the same lifecycle
+    /// transaction as the availability lease renewal. A matching PID-backed
+    /// legacy editor owner is converted to the caller's pidless semantic
+    /// source so later process reconciliation cannot extend a missed heartbeat.
+    pub fn refresh_attachment(
+        &mut self,
+        project_path: &Path,
+        source: &AttachmentSource,
+        refreshed_at: SystemTime,
+    ) -> bool {
+        let project_path = AttachmentStore::canonicalize_path(project_path);
+        let Some(attachments) = self.attachments.get_mut(&project_path) else {
+            return false;
+        };
+        let Some(attachment) = attachments
+            .iter_mut()
+            .find(|attachment| AttachmentStore::matches_source(source, &attachment.source))
+        else {
+            return false;
+        };
+        attachment.source.clone_from(source);
+        attachment.created_at = refreshed_at;
         true
     }
 }
@@ -2617,6 +2726,77 @@ mod tests {
         let decoded: Attachment = serde_json::from_str(&json).unwrap();
 
         assert_eq!(decoded, attachment);
+    }
+
+    #[test]
+    fn editor_session_validates_private_window_provenance() {
+        let session =
+            EditorSession::new("window-session".to_owned(), 42).expect("valid editor session");
+        assert_eq!(session.window_id(), "window-session");
+        assert_eq!(session.host_pid(), 42);
+        assert_eq!(
+            session.attachment_source(),
+            AttachmentSource::Editor {
+                name: "vscode".to_owned(),
+                id: "window-session".to_owned(),
+                pid: None,
+            }
+        );
+
+        assert!(EditorSession::new(String::new(), 42).is_err());
+        assert!(EditorSession::new(" window".to_owned(), 42).is_err());
+        assert!(EditorSession::new("window\nid".to_owned(), 42).is_err());
+        assert!(EditorSession::new("x".repeat(MAX_EDITOR_WINDOW_ID_BYTES + 1), 42).is_err());
+        assert!(EditorSession::new("window".to_owned(), 0).is_err());
+    }
+
+    #[test]
+    fn editor_session_round_trips_without_exposing_a_demand_key() {
+        let session =
+            EditorSession::new("private-window".to_owned(), 42).expect("valid editor session");
+        let json = serde_json::to_string(&session).expect("serialize editor session");
+        let decoded: EditorSession =
+            serde_json::from_str(&json).expect("deserialize editor session");
+
+        assert_eq!(decoded, session);
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("private-window"));
+        assert!(!debug.contains("42"));
+        assert!(!json.contains("owner"));
+        assert!(!json.contains("demand"));
+    }
+
+    #[test]
+    fn semantic_editor_heartbeat_replaces_legacy_pid_with_pidless_compatibility_evidence() {
+        let project = PathBuf::from("/projects/editor-refresh");
+        let source = AttachmentSource::Editor {
+            name: "vscode".to_owned(),
+            id: "window".to_owned(),
+            pid: None,
+        };
+        let started_at = UNIX_EPOCH + Duration::from_secs(10);
+        let refreshed_at = UNIX_EPOCH + Duration::from_secs(40);
+        let mut snapshot = AttachmentStoreSnapshot::default();
+        snapshot.replace_project(
+            &project,
+            vec![Attachment {
+                project_path: project.clone(),
+                source: AttachmentSource::Editor {
+                    name: "vscode".to_owned(),
+                    id: "window".to_owned(),
+                    pid: Some(42),
+                },
+                created_at: started_at,
+            }],
+            false,
+        );
+
+        assert!(snapshot.refresh_attachment(&project, &source, refreshed_at));
+        assert_eq!(
+            snapshot.project(&project).attachments[0].created_at,
+            refreshed_at
+        );
+        assert_eq!(snapshot.project(&project).attachments[0].source, source);
     }
 
     #[test]

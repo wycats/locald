@@ -1,5 +1,6 @@
 use crate::attachments::{
-    AttachmentSource, ManualCliSession, ProjectFilter, ProjectListEntry, ProjectStatusInfo,
+    AttachmentSource, EditorSession, ManualCliSession, ProjectFilter, ProjectListEntry,
+    ProjectStatusInfo,
 };
 use crate::availability::DemandKey;
 use crate::config::{ServiceConfig, TypedServiceConfig};
@@ -431,6 +432,36 @@ pub enum IpcRequest {
         #[serde(default)]
         filter: Option<ProjectFilter>,
     },
+    /// Semantically activate or refocus one authenticated VS Code window,
+    /// converge its project, and wait for readiness.
+    ///
+    /// **Response:** `IpcResponse::ProjectEnsured(EnsureProjectResult)`
+    EditorEnsureProject {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+        /// Private editor provenance validated against the IPC peer.
+        editor: EditorSession,
+    },
+    /// Passively renew one live VS Code window demand.
+    ///
+    /// This never creates an owner or crosses a project pause.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    EditorRenewProject {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+        /// Private editor provenance validated against the IPC peer.
+        editor: EditorSession,
+    },
+    /// Release one authenticated VS Code window demand.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    EditorReleaseProject {
+        /// The path to the project root or configuration file.
+        project_path: PathBuf,
+        /// Private editor provenance validated against the IPC peer.
+        editor: EditorSession,
+    },
     /// Acquire or renew one semantic demand, converge the project, and wait
     /// until every required service is ready.
     ///
@@ -632,7 +663,7 @@ mod tests {
         EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, IpcRequest, IpcResponse,
         LogMode, ServiceType,
     };
-    use crate::attachments::AttachmentSource;
+    use crate::attachments::{AttachmentSource, EditorSession};
     use crate::availability::DemandKey;
     use crate::state::{HealthStatus, ServiceState};
     use std::path::PathBuf;
@@ -701,6 +732,42 @@ mod tests {
         let decoded: IpcResponse =
             serde_json::from_value(encoded).expect("deserialize ensure response");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn editor_lifecycle_requests_round_trip_private_host_provenance() {
+        let project_path = PathBuf::from("/project");
+        let editor =
+            EditorSession::new("window-a".to_owned(), 42).expect("construct editor session");
+        let requests = [
+            IpcRequest::EditorEnsureProject {
+                project_path: project_path.clone(),
+                editor: editor.clone(),
+            },
+            IpcRequest::EditorRenewProject {
+                project_path: project_path.clone(),
+                editor: editor.clone(),
+            },
+            IpcRequest::EditorReleaseProject {
+                project_path,
+                editor,
+            },
+        ];
+
+        for request in requests {
+            assert!(
+                !format!("{request:?}").contains("window-a"),
+                "daemon request logging must redact the private window identity"
+            );
+            let encoded = serde_json::to_value(&request).expect("serialize editor request");
+            let rendered = encoded.to_string();
+            assert!(rendered.contains("window-a"));
+            assert!(!rendered.contains("\"demand\""));
+            assert!(!rendered.contains("\"owner\""));
+            let decoded: IpcRequest =
+                serde_json::from_value(encoded).expect("deserialize editor request");
+            assert_eq!(decoded, request);
+        }
     }
 
     #[test]

@@ -2,12 +2,14 @@ use crate::ShutdownReason;
 use crate::container::ContainerManager;
 use crate::manager::{InstanceLogEntry, ProcessManager};
 use anyhow::{Context, Result};
-use locald_core::attachments::{AttachmentSource, ManualCliSession};
+use locald_core::attachments::{AttachmentSource, EditorSession, ManualCliSession};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::{DaemonIdentity, LogEntry, MAX_IPC_REQUEST_BYTES};
 use locald_core::{DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Arc;
+use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc::Sender};
@@ -85,6 +87,134 @@ fn authenticated_peer_pid(stream: &UnixStream) -> Result<u32> {
     let pid = u32::try_from(pid).context("kernel-authenticated IPC peer process ID was invalid")?;
     anyhow::ensure!(pid > 0, "kernel-authenticated IPC peer process ID was zero");
     Ok(pid)
+}
+
+fn command_has_arg(command: &[OsString], expected: &str) -> bool {
+    command.iter().any(|argument| argument == expected)
+}
+
+fn is_supported_vscode_extension_host(
+    name: &OsStr,
+    executable: Option<&Path>,
+    command: &[OsString],
+) -> bool {
+    if !command_has_arg(command, "--type=utility")
+        || !command_has_arg(command, "--utility-sub-type=node.mojom.NodeService")
+        || !command_has_arg(command, "--service-sandbox-type=none")
+    {
+        return false;
+    }
+
+    let Some(executable) = executable else {
+        return false;
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        const HOSTS: [(&str, &str); 3] = [
+            (
+                "Code Helper (Plugin)",
+                "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)",
+            ),
+            (
+                "Code - Insiders Helper (Plugin)",
+                "/Applications/Visual Studio Code - Insiders.app/Contents/Frameworks/Code - Insiders Helper (Plugin).app/Contents/MacOS/Code - Insiders Helper (Plugin)",
+            ),
+            (
+                "VSCodium Helper (Plugin)",
+                "/Applications/VSCodium.app/Contents/Frameworks/VSCodium Helper (Plugin).app/Contents/MacOS/VSCodium Helper (Plugin)",
+            ),
+        ];
+        HOSTS.iter().any(|(expected_name, expected_path)| {
+            name == *expected_name && executable == Path::new(expected_path)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        const HOSTS: [(&str, &str); 5] = [
+            ("code", "/usr/share/code/code"),
+            ("code", "/usr/lib/code/code"),
+            ("code-insiders", "/usr/share/code-insiders/code-insiders"),
+            ("codium", "/usr/share/codium/codium"),
+            ("code", "/opt/visual-studio-code/code"),
+        ];
+        HOSTS.iter().any(|(expected_name, expected_path)| {
+            name == *expected_name && executable == Path::new(expected_path)
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (name, executable);
+        false
+    }
+}
+
+fn validate_editor_process_chain(peer_pid: u32, host_pid: u32, expected_uid: u32) -> Result<()> {
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(
+            ProcessRefreshKind::nothing()
+                .with_user(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_exe(UpdateKind::OnlyIfNotSet),
+        ),
+    );
+    let peer = sysinfo::Pid::from_u32(peer_pid);
+    let host = sysinfo::Pid::from_u32(host_pid);
+    let peer_process = system
+        .process(peer)
+        .context("kernel-authenticated editor IPC peer process was no longer live")?;
+    anyhow::ensure!(
+        peer_process.parent() == Some(host),
+        "VS Code host PID {host_pid} is not the direct parent of kernel-authenticated IPC peer PID {peer_pid}"
+    );
+    let host_process = system
+        .process(host)
+        .context("declared VS Code host process was no longer live")?;
+    let declared_owner = host_process
+        .user_id()
+        .context("declared VS Code host process owner was unavailable")?;
+    anyhow::ensure!(
+        declared_owner.to_string() == expected_uid.to_string(),
+        "VS Code host PID {host_pid} does not belong to locald daemon UID {expected_uid}"
+    );
+    anyhow::ensure!(
+        is_supported_vscode_extension_host(
+            host_process.name(),
+            host_process.exe(),
+            host_process.cmd()
+        ),
+        "VS Code host PID {host_pid} is not a supported VS Code extension-host process"
+    );
+    Ok(())
+}
+
+fn validate_editor_session_with<ValidateProcess>(
+    stream: &UnixStream,
+    editor: &EditorSession,
+    validate_process: ValidateProcess,
+) -> Result<()>
+where
+    ValidateProcess: FnOnce(u32, u32, u32) -> Result<()>,
+{
+    editor.validate()?;
+    let socket_owner_uid = stream
+        .peer_cred()
+        .context("failed to read kernel-authenticated editor IPC credentials")?
+        .uid();
+    let daemon_uid = nix::unistd::geteuid().as_raw();
+    anyhow::ensure!(
+        socket_owner_uid == daemon_uid,
+        "VS Code adapter UID {socket_owner_uid} does not match locald daemon UID {daemon_uid}"
+    );
+    let cli_process_id = authenticated_peer_pid(stream)?;
+    validate_process(cli_process_id, editor.host_pid(), daemon_uid)?;
+    Ok(())
+}
+
+fn validate_editor_session(stream: &UnixStream, editor: &EditorSession) -> Result<()> {
+    validate_editor_session_with(stream, editor, validate_editor_process_chain)
 }
 
 fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -> Result<()> {
@@ -593,6 +723,40 @@ async fn handle_connection(
             Ok(entries) => IpcResponse::ProjectList(entries),
             Err(e) => IpcResponse::Error(e.to_string()),
         },
+        IpcRequest::EditorEnsureProject {
+            project_path,
+            editor,
+        } => match validate_editor_session(&stream, &editor) {
+            Ok(()) => match manager.editor_ensure_project(project_path, &editor).await {
+                Ok(result) => IpcResponse::ProjectEnsured(result),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::EditorRenewProject {
+            project_path,
+            editor,
+        } => match validate_editor_session(&stream, &editor) {
+            Ok(()) => match manager.editor_renew_project(&project_path, &editor).await {
+                Ok(true) => IpcResponse::Ok,
+                Ok(false) => IpcResponse::Error(
+                    "the VS Code window demand is no longer live; refocus the window or explicitly resume the project"
+                        .to_owned(),
+                ),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
+        IpcRequest::EditorReleaseProject {
+            project_path,
+            editor,
+        } => match validate_editor_session(&stream, &editor) {
+            Ok(()) => match manager.editor_release_project(project_path, &editor).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            },
+            Err(error) => IpcResponse::Error(format!("{error:#}")),
+        },
         IpcRequest::EnsureProject {
             project_path,
             demand,
@@ -719,6 +883,91 @@ mod tests {
         .expect("authenticate CLI attachment source");
 
         assert_eq!(source, AttachmentSource::CLI { pid: peer_pid });
+    }
+
+    #[tokio::test]
+    async fn editor_session_authenticates_the_requested_host_against_the_live_ipc_peer() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let peer_pid = authenticated_peer_pid(&server).expect("authenticate IPC peer PID");
+        let host_pid = different_pid(peer_pid);
+        let editor =
+            EditorSession::new("window-a".to_owned(), host_pid).expect("construct editor session");
+
+        validate_editor_session_with(&server, &editor, |observed_peer, observed_host, uid| {
+            assert_eq!(observed_peer, peer_pid);
+            assert_eq!(observed_host, host_pid);
+            assert_eq!(uid, nix::unistd::geteuid().as_raw());
+            Ok(())
+        })
+        .expect("kernel-authenticated peer and requested host reach process validation");
+    }
+
+    #[test]
+    fn editor_process_chain_rejects_a_universal_ancestor() {
+        let error =
+            validate_editor_process_chain(std::process::id(), 1, nix::unistd::geteuid().as_raw())
+                .expect_err("PID 1 must not authenticate as a VS Code extension host");
+
+        assert!(error.to_string().contains("is not the direct parent"));
+    }
+
+    #[test]
+    fn editor_process_chain_rejects_an_unrelated_direct_parent() {
+        let peer_pid = std::process::id();
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+        );
+        let parent_pid = system
+            .process(sysinfo::Pid::from_u32(peer_pid))
+            .and_then(sysinfo::Process::parent)
+            .map(sysinfo::Pid::as_u32)
+            .expect("test process has a live direct parent");
+
+        let error =
+            validate_editor_process_chain(peer_pid, parent_pid, nix::unistd::geteuid().as_raw())
+                .expect_err("an unrelated same-user parent must not authenticate as VS Code");
+
+        assert!(
+            error
+                .to_string()
+                .contains("is not a supported VS Code extension-host process")
+        );
+    }
+
+    #[test]
+    fn vscode_extension_host_requires_supported_install_and_extension_host_flags() {
+        let command = [
+            "--type=utility",
+            "--utility-sub-type=node.mojom.NodeService",
+            "--service-sandbox-type=none",
+        ]
+        .map(OsString::from);
+
+        #[cfg(target_os = "macos")]
+        let (name, path) = (
+            OsStr::new("Code Helper (Plugin)"),
+            Path::new(
+                "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)",
+            ),
+        );
+        #[cfg(target_os = "linux")]
+        let (name, path) = (OsStr::new("code"), Path::new("/usr/share/code/code"));
+
+        assert!(is_supported_vscode_extension_host(
+            name,
+            Some(path),
+            &command
+        ));
+        assert!(!is_supported_vscode_extension_host(
+            name,
+            Some(Path::new("/tmp/code")),
+            &command
+        ));
+        assert!(!is_supported_vscode_extension_host(
+            name,
+            Some(path),
+            &command[..2]
+        ));
     }
 
     #[test]
