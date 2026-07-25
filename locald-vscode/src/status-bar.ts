@@ -13,6 +13,7 @@ export class StatusBar implements vscode.Disposable {
   private webItem: vscode.StatusBarItem;
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly getProjectPath: () => string | undefined;
+  private readonly recoverEditorDemand: (paused: boolean) => void;
   private log: vscode.LogOutputChannel;
   private webServices: ServiceStatus[] = [];
   private wasUnreachable = false;
@@ -21,9 +22,11 @@ export class StatusBar implements vscode.Disposable {
   constructor(
     getProjectPath: () => string | undefined,
     log: vscode.LogOutputChannel,
+    recoverEditorDemand: (paused: boolean) => void,
   ) {
     this.getProjectPath = getProjectPath;
     this.log = log;
+    this.recoverEditorDemand = recoverEditorDemand;
 
     // Dashboard item (left)
     this.dashboardItem = vscode.window.createStatusBarItem(
@@ -70,6 +73,7 @@ export class StatusBar implements vscode.Disposable {
           `locald daemon reachable again after ${this.consecutiveFailures} failed status poll${this.consecutiveFailures === 1 ? "" : "s"}`,
         );
         this.wasUnreachable = false;
+        this.recoverEditorDemand(info.availability?.paused === true);
       }
       this.consecutiveFailures = 0;
       this.updateDashboard(info);

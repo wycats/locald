@@ -38,6 +38,7 @@ export declare class EditorAvailabilityController {
     get projectPath(): string | undefined;
     activate(): Promise<EnsureProjectResult | undefined>;
     ensureCurrent(reason: string): Promise<EnsureProjectResult | undefined>;
+    recoverAfterDaemonReconnect(paused: boolean): Promise<EnsureProjectResult | undefined>;
     withCurrentProject<T>(reason: string, operation: CurrentProjectOperation<T>): Promise<T | undefined>;
     renewCurrent(): Promise<void>;
     releaseCurrent(): Promise<void>;

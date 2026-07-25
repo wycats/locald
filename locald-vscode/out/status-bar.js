@@ -42,13 +42,15 @@ class StatusBar {
     webItem;
     timer;
     getProjectPath;
+    recoverEditorDemand;
     log;
     webServices = [];
     wasUnreachable = false;
     consecutiveFailures = 0;
-    constructor(getProjectPath, log) {
+    constructor(getProjectPath, log, recoverEditorDemand) {
         this.getProjectPath = getProjectPath;
         this.log = log;
+        this.recoverEditorDemand = recoverEditorDemand;
         // Dashboard item (left)
         this.dashboardItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 51);
         this.dashboardItem.command = "locald.openDashboard";
@@ -81,6 +83,7 @@ class StatusBar {
             if (this.wasUnreachable) {
                 this.log.info(`locald daemon reachable again after ${this.consecutiveFailures} failed status poll${this.consecutiveFailures === 1 ? "" : "s"}`);
                 this.wasUnreachable = false;
+                this.recoverEditorDemand(info.availability?.paused === true);
             }
             this.consecutiveFailures = 0;
             this.updateDashboard(info);

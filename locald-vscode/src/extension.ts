@@ -36,7 +36,19 @@ export async function activate(
     log,
   });
 
-  statusBar = new StatusBar(() => editorController?.projectPath, log);
+  statusBar = new StatusBar(
+    () => editorController?.projectPath,
+    log,
+    (paused) => {
+      void editorController
+        ?.recoverAfterDaemonReconnect(paused)
+        .catch((error: unknown) => {
+          log.warn(
+            `Editor demand recovery after daemon reconnect failed: ${formatError(error)}`,
+          );
+        });
+    },
+  );
   context.subscriptions.push(statusBar);
   statusBar.start();
 

@@ -118,6 +118,48 @@ test("changing projects ensures the new project before releasing the old one", a
   ]);
 });
 
+test("canonical project paths prevent alias switches from releasing the live demand", async () => {
+  const fixture = setup("/work/project-alias");
+  fixture.client.ensure = async (path, windowId, hostPid) => {
+    fixture.calls.push(`ensure:${path}:${windowId}:${hostPid}`);
+    return ready("/work/project");
+  };
+
+  await fixture.controller.activate();
+  fixture.projectPath = "/work/other-project-alias";
+  await fixture.controller.ensureCurrent("workspace folder change");
+
+  assert.equal(fixture.controller.projectPath, "/work/project");
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/project-alias:window-a:42",
+    "ensure:/work/other-project-alias:window-a:42",
+  ]);
+});
+
+test("daemon recovery semantically restores an expired editor demand", async () => {
+  const fixture = setup();
+  await fixture.controller.activate();
+
+  await fixture.controller.recoverAfterDaemonReconnect(false);
+
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/project:window-a:42",
+    "ensure:/work/project:window-a:42",
+  ]);
+});
+
+test("daemon recovery preserves an explicit project pause", async () => {
+  const fixture = setup();
+  await fixture.controller.activate();
+
+  const result = await fixture.controller.recoverAfterDaemonReconnect(true);
+
+  assert.equal(result, undefined);
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/project:window-a:42",
+  ]);
+});
+
 test("restart work keeps its original project target until readiness returns", async () => {
   const fixture = setup("/work/one");
   await fixture.controller.activate();

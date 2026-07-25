@@ -60,7 +60,13 @@ async function activate(context) {
         },
         log: exports.log,
     });
-    statusBar = new status_bar_js_1.StatusBar(() => editorController?.projectPath, exports.log);
+    statusBar = new status_bar_js_1.StatusBar(() => editorController?.projectPath, exports.log, (paused) => {
+        void editorController
+            ?.recoverAfterDaemonReconnect(paused)
+            .catch((error) => {
+            exports.log.warn(`Editor demand recovery after daemon reconnect failed: ${formatError(error)}`);
+        });
+    });
     context.subscriptions.push(statusBar);
     statusBar.start();
     (0, tools_js_1.registerTools)(context, editorController, workspace_project_js_1.resolveCurrentProjectPath);

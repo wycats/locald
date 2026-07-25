@@ -41,6 +41,13 @@ class EditorAvailabilityController {
     async ensureCurrent(reason) {
         return this.enqueue(() => this.ensureCurrentWithinQueue(reason));
     }
+    async recoverAfterDaemonReconnect(paused) {
+        if (paused) {
+            this.log.info("locald daemon recovered while the current project is paused; preserving the pause");
+            return undefined;
+        }
+        return this.ensureCurrent("daemon recovery");
+    }
     async withCurrentProject(reason, operation) {
         return this.enqueue(async () => {
             const initial = await this.ensureCurrentWithinQueue(reason);
@@ -119,8 +126,10 @@ class EditorAvailabilityController {
         const previousPath = this.currentPath;
         this.uncertainRenewalPaths.add(nextPath);
         const result = await this.ensureProjectWithinQueue(nextPath, reason);
+        const confirmedPath = result.project_path;
         this.uncertainRenewalPaths.delete(nextPath);
-        this.currentPath = nextPath;
+        this.uncertainRenewalPaths.delete(confirmedPath);
+        this.currentPath = confirmedPath;
         for (const uncertainPath of [...this.uncertainRenewalPaths]) {
             if (uncertainPath === previousPath) {
                 continue;
@@ -134,7 +143,7 @@ class EditorAvailabilityController {
                 this.log.warn(`Failed to release uncertain editor demand for ${uncertainPath}; renewal will preserve it for cleanup retry: ${formatError(error)}`);
             }
         }
-        if (previousPath && previousPath !== nextPath) {
+        if (previousPath && previousPath !== confirmedPath) {
             this.uncertainRenewalPaths.delete(previousPath);
             try {
                 await this.client.release(previousPath, this.windowId, this.hostPid);

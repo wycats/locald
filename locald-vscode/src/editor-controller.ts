@@ -87,6 +87,18 @@ export class EditorAvailabilityController {
     return this.enqueue(() => this.ensureCurrentWithinQueue(reason));
   }
 
+  async recoverAfterDaemonReconnect(
+    paused: boolean,
+  ): Promise<EnsureProjectResult | undefined> {
+    if (paused) {
+      this.log.info(
+        "locald daemon recovered while the current project is paused; preserving the pause",
+      );
+      return undefined;
+    }
+    return this.ensureCurrent("daemon recovery");
+  }
+
   async withCurrentProject<T>(
     reason: string,
     operation: CurrentProjectOperation<T>,
@@ -188,8 +200,10 @@ export class EditorAvailabilityController {
     const previousPath = this.currentPath;
     this.uncertainRenewalPaths.add(nextPath);
     const result = await this.ensureProjectWithinQueue(nextPath, reason);
+    const confirmedPath = result.project_path;
     this.uncertainRenewalPaths.delete(nextPath);
-    this.currentPath = nextPath;
+    this.uncertainRenewalPaths.delete(confirmedPath);
+    this.currentPath = confirmedPath;
     for (const uncertainPath of [...this.uncertainRenewalPaths]) {
       if (uncertainPath === previousPath) {
         continue;
@@ -210,7 +224,7 @@ export class EditorAvailabilityController {
         );
       }
     }
-    if (previousPath && previousPath !== nextPath) {
+    if (previousPath && previousPath !== confirmedPath) {
       this.uncertainRenewalPaths.delete(previousPath);
       try {
         await this.client.release(
