@@ -71,6 +71,19 @@ test("old locald editor protocols receive actionable upgrade guidance", () => {
   assert.match(message, /reload this VS Code window/);
 });
 
+test("old configured locald binaries explain how to repair the override", () => {
+  const message = formatCommandFailure(
+    { path: "/custom/old-locald", source: "LOCALD_BINARY" },
+    ["project", "editor", "ensure", "/work/project", "--json"],
+    "error: unrecognized subcommand 'editor'",
+  );
+
+  assert.match(message, /Update or remove the `LOCALD_BINARY` override/);
+  assert.match(message, /\/custom\/old-locald/);
+  assert.match(message, /replace that binary with the current locald CLI/);
+  assert.match(message, /sudo locald admin setup/);
+});
+
 test("StreamingLineTail bounds chunked output before returning recent lines", () => {
   const tail = new StreamingLineTail(2, 100);
   tail.push("one\ntwo");

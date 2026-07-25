@@ -6721,7 +6721,10 @@ impl ProcessManager {
         } else {
             None
         };
-        let demands = live_demands.into_iter().map(|(demand, _)| demand).collect();
+        let demands = live_demands
+            .into_iter()
+            .filter_map(|(demand, effective)| effective.then_some(demand))
+            .collect();
 
         Ok(Some(ProjectAvailabilityStatus {
             desired,
@@ -14262,6 +14265,10 @@ PATH = "/usr/bin:/bin"
         assert_eq!(paused_availability.state, ProjectLifecycleState::Paused);
         assert!(!paused_availability.desired);
         assert!(paused_availability.paused);
+        assert!(
+            paused_availability.demands.is_empty(),
+            "a pre-pause lease remains durable but is not an effective owner"
+        );
         assert_eq!(paused_availability.next_transition_at, None);
         assert!(!paused.is_running);
         assert_eq!(paused.service_details[0].url, None);
@@ -14281,6 +14288,8 @@ PATH = "/usr/bin:/bin"
         assert_eq!(resumed.state, ProjectLifecycleState::Ready);
         assert!(resumed.desired);
         assert!(!resumed.paused);
+        assert_eq!(resumed.demands.len(), 1);
+        assert_eq!(resumed.demands[0].kind, DemandKind::VsCodeWindow);
         assert_eq!(
             resumed.next_transition_at,
             Some(clock.time() + locald_core::VSCODE_DEMAND_TTL),
@@ -14333,6 +14342,10 @@ PATH = "/usr/bin:/bin"
         assert!(always_on_availability.desired);
         assert!(always_on_availability.always_on);
         assert!(!always_on_availability.paused);
+        assert!(
+            always_on_availability.demands.is_empty(),
+            "Always On is the effective policy; the older lease remains suppressed"
+        );
         assert_eq!(always_on_availability.next_transition_at, None);
         assert!(
             always_on_availability.reasons.iter().any(|reason| {
@@ -14365,6 +14378,10 @@ PATH = "/usr/bin:/bin"
         assert_eq!(stopped.state, ProjectLifecycleState::Stopped);
         assert!(!stopped.desired);
         assert!(!stopped.paused);
+        assert!(
+            stopped.demands.is_empty(),
+            "suppressed leases are retained internally, not projected as active owners"
+        );
         assert!(
             stopped
                 .reasons
@@ -14437,6 +14454,8 @@ PATH = "/usr/bin:/bin"
             status.next_transition_at,
             Some(clock.time() + locald_core::VSCODE_DEMAND_TTL)
         );
+        assert_eq!(status.demands.len(), 1);
+        assert_eq!(status.demands[0].kind, DemandKind::VsCodeWindow);
         assert!(status.reasons.iter().any(|reason| {
             reason.code == "demand_agent_conversation"
                 && reason.message == "Agent conversation demand remains live behind the last pause."

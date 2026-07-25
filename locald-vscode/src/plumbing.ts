@@ -173,9 +173,14 @@ export function formatCommandFailure(
     args[0] === "project" &&
     args[1] === "editor" &&
     /unrecognized subcommand ['"]?editor['"]?/i.test(commandFailure);
-  const remediation = editorProtocolMismatch
-    ? "\nInstall the current locald CLI, run `sudo locald admin setup`, then reload this VS Code window."
-    : "";
+  let remediation = "";
+  if (editorProtocolMismatch) {
+    const updateCli =
+      binary.source === "LOCALD_BINARY"
+        ? `Update or remove the \`LOCALD_BINARY\` override that selects ${binary.path}, or replace that binary with the current locald CLI.`
+        : "Install the current locald CLI.";
+    remediation = `\n${updateCli} Then run \`sudo locald admin setup\` and reload this VS Code window.`;
+  }
   return `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${commandFailure}${remediation}`;
 }
 
