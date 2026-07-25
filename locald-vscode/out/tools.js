@@ -37,55 +37,82 @@ exports.registerTools = registerTools;
 const vscode = __importStar(require("vscode"));
 const plumbing_js_1 = require("./plumbing.js");
 const extension_js_1 = require("./extension.js");
-function registerTools(context, projectPath) {
+function registerTools(context, controller, resolveProject) {
     if (!vscode.lm || typeof vscode.lm.registerTool !== "function") {
         extension_js_1.log.warn("vscode.lm.registerTool not available — tools disabled");
         return;
     }
-    extension_js_1.log.info("Registering 4 Copilot tools");
+    extension_js_1.log.info("Registering 4 locald language-model tools");
     context.subscriptions.push(vscode.lm.registerTool("locald_services", {
         async invoke(_options, _token) {
+            const projectPath = await resolveRequiredProject(resolveProject);
             const info = await (0, plumbing_js_1.status)(projectPath);
-            const text = JSON.stringify(info.service_details, null, 2);
-            return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart(text),
-            ]);
+            const services = info.service_details.map((service) => ({
+                name: service.name,
+                status: service.status,
+                health_status: service.health_status,
+                url: service.url,
+                domain: service.domain,
+                service_type: service.service_type,
+            }));
+            return textResult(JSON.stringify(services, null, 2));
         },
-    }));
-    context.subscriptions.push(vscode.lm.registerTool("locald_restart", {
+    }), vscode.lm.registerTool("locald_restart", {
         async invoke(options, _token) {
-            void options.input?.service;
-            await (0, plumbing_js_1.startProject)(projectPath);
-            return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart("Services restarted."),
-            ]);
+            const initial = await controller.ensureCurrent("language-model restart request");
+            if (!initial) {
+                throw new Error("no locald project is selected");
+            }
+            const services = options.input?.service
+                ? initial.services.filter((candidate) => candidate.name === options.input?.service ||
+                    candidate.name.endsWith(`:${options.input?.service}`))
+                : initial.services;
+            if (services.length === 0) {
+                throw new Error(`service ${options.input?.service ?? "(unknown)"} was not found`);
+            }
+            for (const service of services) {
+                await (0, plumbing_js_1.restartService)(initial.project_path, service.name);
+            }
+            const result = await controller.ensureCurrent("wait for restarted services");
+            if (!result) {
+                throw new Error("locald project was removed during restart");
+            }
+            return textResult(`Services restarted and ready.${result.urls.length > 0 ? ` ${result.urls.join(" ")}` : ""}`);
         },
-    }));
-    context.subscriptions.push(vscode.lm.registerTool("locald_logs", {
+    }), vscode.lm.registerTool("locald_logs", {
         async invoke(options, _token) {
-            void options.input?.service;
-            const output = await (0, plumbing_js_1.getLogs)(options.input?.lines ?? 200);
-            return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart(output),
-            ]);
+            const projectPath = await resolveRequiredProject(resolveProject);
+            const output = await (0, plumbing_js_1.getLogs)(projectPath, options.input?.lines ?? 200, options.input?.service);
+            return textResult(output);
         },
-    }));
-    context.subscriptions.push(vscode.lm.registerTool("locald_open", {
+    }), vscode.lm.registerTool("locald_open", {
         async invoke(options, _token) {
-            const info = await (0, plumbing_js_1.status)(projectPath);
+            const result = await controller.ensureCurrent("language-model browser request");
+            if (!result) {
+                throw new Error("no locald project is selected");
+            }
             const service = options.input?.service
-                ? info.service_details.find((s) => s.name === options.input?.service)
-                : info.service_details.find((s) => s.url);
+                ? result.services.find((candidate) => candidate.name === options.input?.service ||
+                    candidate.name.endsWith(`:${options.input?.service}`))
+                : result.services.find((candidate) => candidate.url);
             if (!service?.url) {
-                return new vscode.LanguageModelToolResult([
-                    new vscode.LanguageModelTextPart("No service URL available."),
-                ]);
+                return textResult("No service URL available.");
             }
             await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse(service.url));
-            return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart(`Opened ${service.url} in Simple Browser.`),
-            ]);
+            return textResult(`Opened ${service.url} in Simple Browser.`);
         },
     }));
+}
+async function resolveRequiredProject(resolveProject) {
+    const projectPath = await resolveProject();
+    if (!projectPath) {
+        throw new Error("no locald.toml found in the current workspace");
+    }
+    return projectPath;
+}
+function textResult(text) {
+    return new vscode.LanguageModelToolResult([
+        new vscode.LanguageModelTextPart(text),
+    ]);
 }
 //# sourceMappingURL=tools.js.map

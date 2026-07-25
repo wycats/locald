@@ -37,7 +37,7 @@
     ],
     "chatInstructions": [
       {
-        "path": "copilot-instructions.md",
+        "path": "locald-instructions.md",
         "when": "locald:projectDetected"
       }
     ],
@@ -49,7 +49,7 @@
           "locald"
         ],
         "displayName": "locald Services",
-        "modelDescription": "List all locald-managed services for the current project, including name, status, port, URL, domain, and health",
+        "modelDescription": "List all locald-managed services for the current project, including name, status, semantic URL, domain, and health",
         "canBeReferencedInPrompt": true,
         "icon": "$(server)",
         "inputSchema": {
@@ -64,7 +64,7 @@
           "locald"
         ],
         "displayName": "locald Restart",
-        "modelDescription": "Restart locald services for the current project",
+        "modelDescription": "Restart locald services for the current project and wait for readiness",
         "canBeReferencedInPrompt": true,
         "icon": "$(debug-restart)",
         "inputSchema": {
@@ -125,6 +125,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test .test-out/test/*.test.js",
     "watch": "tsc --watch",
     "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --skip-license -o locald-vscode.vsix",
     "install-ext": "npm run package && code --install-extension locald-vscode.vsix --force",

@@ -3,6 +3,7 @@ target/
 .DS_Store
 node_modules/
 dist/
+.test-out/
 .env
 .tmp
 locald-docs/node_modules/

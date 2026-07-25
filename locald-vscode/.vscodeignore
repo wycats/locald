@@ -1,4 +1,7 @@
-src/
-tsconfig.json
-node_modules/
-.vscode/
+.test-out/**
+node_modules/**
+src/**
+test/**
+*.vsix
+package-lock.json
+tsconfig*.json

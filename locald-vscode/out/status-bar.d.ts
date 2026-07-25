@@ -4,13 +4,12 @@ export declare class StatusBar implements vscode.Disposable {
     private dashboardItem;
     private webItem;
     private timer;
-    private projectPath;
-    private windowId;
+    private readonly getProjectPath;
     private log;
     private webServices;
     private wasUnreachable;
     private consecutiveFailures;
-    constructor(projectPath: string, windowId: string, log: vscode.LogOutputChannel);
+    constructor(getProjectPath: () => string | undefined, log: vscode.LogOutputChannel);
     start(): void;
     getWebServices(): ServiceStatus[];
     private refresh;

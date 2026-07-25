@@ -37,128 +37,165 @@ exports.log = void 0;
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const editor_controller_js_1 = require("./editor-controller.js");
 const plumbing_js_1 = require("./plumbing.js");
 const status_bar_js_1 = require("./status-bar.js");
 const tools_js_1 = require("./tools.js");
+const workspace_project_js_1 = require("./workspace-project.js");
 let statusBar;
-let projectPath;
-let projectName;
-let windowId;
-let dashboardPanel;
+let editorController;
 exports.log = vscode.window.createOutputChannel("locald", { log: true });
 async function activate(context) {
     context.subscriptions.push(exports.log);
     exports.log.info("Extension activating...");
     exports.log.info(`Using locald binary ${(0, plumbing_js_1.formatBinaryIdentity)()}`);
-    const files = await vscode.workspace.findFiles("locald.toml", null, 1);
-    if (files.length === 0) {
-        exports.log.info("No locald.toml found, deactivating");
-        return;
-    }
-    exports.log.info("Found locald.toml, proceeding with activation");
-    const tomlUri = files[0];
-    projectPath = vscode.workspace.getWorkspaceFolder(tomlUri)?.uri.fsPath;
-    if (!projectPath) {
-        projectPath = tomlUri.fsPath.replace(/\/locald\.toml$/, "");
-    }
-    windowId = vscode.env.sessionId;
-    // Attach to the project
-    try {
-        await (0, plumbing_js_1.attach)(projectPath, windowId);
-    }
-    catch (e) {
-        vscode.window.showWarningMessage(`locald: failed to attach — ${e instanceof Error ? e.message : e}`);
-    }
-    // Get project name for deep linking
-    try {
-        const info = await (0, plumbing_js_1.status)(projectPath);
-        projectName = info.project_name ?? projectPath.split("/").pop();
-    }
-    catch {
-        projectName = projectPath.split("/").pop();
-    }
-    // Set context key for chatInstructions
-    await vscode.commands.executeCommand("setContext", "locald:projectDetected", true);
-    // Status bar
-    statusBar = new status_bar_js_1.StatusBar(projectPath, windowId, exports.log);
+    editorController = new editor_controller_js_1.EditorAvailabilityController({
+        windowId: vscode.env.sessionId,
+        hostPid: process.pid,
+        resolveProject: workspace_project_js_1.resolveCurrentProjectPath,
+        client: {
+            ensure: plumbing_js_1.ensureEditorProject,
+            renew: plumbing_js_1.renewEditorProject,
+            release: plumbing_js_1.releaseEditorProject,
+        },
+        log: exports.log,
+    });
+    statusBar = new status_bar_js_1.StatusBar(() => editorController?.projectPath, exports.log);
     context.subscriptions.push(statusBar);
     statusBar.start();
-    // Register Copilot tools
-    (0, tools_js_1.registerTools)(context, projectPath);
-    // Commands
-    function openInBrowser(url, reuseFilter) {
-        vscode.commands.executeCommand("workbench.action.browser.open", {
+    (0, tools_js_1.registerTools)(context, editorController, workspace_project_js_1.resolveCurrentProjectPath);
+    registerCommands(context, editorController);
+    registerSemanticActivity(context, editorController);
+    try {
+        const result = await editorController.activate();
+        await vscode.commands.executeCommand("setContext", "locald:projectDetected", result !== undefined);
+        if (!result) {
+            exports.log.info("No locald.toml found in the current workspace");
+        }
+    }
+    catch (error) {
+        await vscode.commands.executeCommand("setContext", "locald:projectDetected", editorController.projectPath !== undefined);
+        vscode.window.showWarningMessage(`locald: project activation failed — ${formatError(error)}`);
+    }
+}
+async function deactivate() {
+    const controller = editorController;
+    editorController = undefined;
+    if (!controller) {
+        return;
+    }
+    try {
+        await controller.releaseCurrent();
+    }
+    catch {
+        // Best effort. The daemon also expires and reaps stale window ownership.
+    }
+    finally {
+        controller.dispose();
+    }
+}
+function registerSemanticActivity(context, controller) {
+    const ensureAfterActivity = (reason) => {
+        void controller
+            .ensureCurrent(reason)
+            .then((result) => vscode.commands.executeCommand("setContext", "locald:projectDetected", result !== undefined))
+            .catch((error) => {
+            exports.log.warn(`Editor activity could not ensure locald: ${formatError(error)}`);
+        });
+    };
+    context.subscriptions.push(vscode.window.onDidChangeWindowState((state) => {
+        if (state.focused) {
+            ensureAfterActivity("window refocus");
+        }
+    }), vscode.window.onDidChangeActiveTextEditor(() => {
+        if (vscode.window.state.focused) {
+            ensureAfterActivity("active editor change");
+        }
+    }), vscode.workspace.onDidChangeWorkspaceFolders(() => {
+        if (vscode.window.state.focused) {
+            ensureAfterActivity("workspace folder change");
+        }
+    }));
+}
+function registerCommands(context, controller) {
+    const openInBrowser = (url, reuseFilter) => {
+        void vscode.commands.executeCommand("workbench.action.browser.open", {
             url,
             reuseUrlFilter: reuseFilter,
         });
-    }
-    context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", () => {
-        const url = projectName
-            ? `https://dashboard.dotlocal.localhost/?project=${encodeURIComponent(projectName)}`
-            : "https://dashboard.dotlocal.localhost";
-        openInBrowser(url, "https://dashboard.dotlocal.localhost/**");
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand("locald.openWebService", async () => {
-        const webServices = statusBar.getWebServices();
-        if (webServices.length === 0)
-            return;
-        if (webServices.length === 1) {
-            const svc = webServices[0];
-            if (svc.url && svc.domain) {
-                openInBrowser(svc.url, `https://${svc.domain}/**`);
-            }
-            return;
-        }
-        // Multiple web services — show picker
-        const items = webServices.map((svc) => ({
-            label: svc.name.split(":").pop() ?? svc.name,
-            description: svc.domain ?? undefined,
-            detail: svc.url ?? undefined,
-        }));
-        const picked = await vscode.window.showQuickPick(items, {
-            placeHolder: "Open web service",
-        });
-        if (picked?.detail && picked?.description) {
-            openInBrowser(picked.detail, `https://${picked.description}/**`);
-        }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand("locald.restartServices", async () => {
+    };
+    context.subscriptions.push(vscode.commands.registerCommand("locald.openDashboard", async () => {
         try {
-            await (0, plumbing_js_1.startProject)(projectPath);
+            const projectPath = await resolveRequiredProjectPath();
+            const info = await (0, plumbing_js_1.status)(projectPath);
+            const url = info.project_name
+                ? `https://locald.localhost/?project=${encodeURIComponent(info.project_name)}`
+                : "https://locald.localhost";
+            openInBrowser(url, "https://locald.localhost/**");
+        }
+        catch (error) {
+            vscode.window.showErrorMessage(`locald: dashboard unavailable — ${formatError(error)}`);
+        }
+    }), vscode.commands.registerCommand("locald.openWebService", async () => {
+        try {
+            const result = await controller.ensureCurrent("open web service");
+            const webServices = result?.services.filter((service) => service.url) ?? [];
+            if (webServices.length === 0) {
+                vscode.window.showInformationMessage("locald: this project has no web service URL");
+                return;
+            }
+            if (webServices.length === 1) {
+                const service = webServices[0];
+                if (service.url) {
+                    openInBrowser(service.url, `${service.url}/**`);
+                }
+                return;
+            }
+            const picked = await vscode.window.showQuickPick(webServices.map((service) => ({
+                label: service.name.split(":").pop() ?? service.name,
+                description: service.url,
+            })), { placeHolder: "Open web service" });
+            if (picked?.description) {
+                openInBrowser(picked.description, `${picked.description}/**`);
+            }
+        }
+        catch (error) {
+            vscode.window.showErrorMessage(`locald: web service unavailable — ${formatError(error)}`);
+        }
+    }), vscode.commands.registerCommand("locald.restartServices", async () => {
+        try {
+            const initial = await controller.ensureCurrent("prepare services for restart");
+            if (!initial) {
+                throw new Error("no locald project is selected");
+            }
+            for (const service of initial.services) {
+                await (0, plumbing_js_1.restartService)(initial.project_path, service.name);
+            }
+            await controller.ensureCurrent("wait for restarted services");
             vscode.window.showInformationMessage("locald: services restarted");
         }
-        catch (e) {
-            vscode.window.showErrorMessage(`locald: restart failed — ${e instanceof Error ? e.message : e}`);
+        catch (error) {
+            vscode.window.showErrorMessage(`locald: restart failed — ${formatError(error)}`);
         }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand("locald.stopServices", async () => {
+    }), vscode.commands.registerCommand("locald.stopServices", async () => {
         try {
-            if (projectPath && windowId) {
-                await (0, plumbing_js_1.detach)(projectPath, windowId);
-            }
-            vscode.window.showInformationMessage("locald: services stopped");
+            const projectPath = await resolveRequiredProjectPath();
+            await (0, plumbing_js_1.stopProject)(projectPath);
+            vscode.window.showInformationMessage("locald: project paused");
         }
-        catch (e) {
-            vscode.window.showErrorMessage(`locald: stop failed — ${e instanceof Error ? e.message : e}`);
+        catch (error) {
+            vscode.window.showErrorMessage(`locald: pause failed — ${formatError(error)}`);
         }
     }));
 }
-async function deactivate() {
-    if (projectPath && windowId) {
-        try {
-            await (0, plumbing_js_1.detach)(projectPath, windowId);
-        }
-        catch {
-            // Best-effort detach on shutdown
-        }
+async function resolveRequiredProjectPath() {
+    const projectPath = await (0, workspace_project_js_1.resolveCurrentProjectPath)();
+    if (!projectPath) {
+        throw new Error("no locald.toml found in the current workspace");
     }
+    return projectPath;
 }
-function getDashboardHtml(url) {
-    return `<!DOCTYPE html>
-<html style="height:100%;width:100%;margin:0;padding:0;">
-<body style="height:100%;width:100%;margin:0;padding:0;overflow:hidden;">
-<iframe src="${url}" style="width:100%;height:100%;border:none;"></iframe>
-</body>
-</html>`;
+function formatError(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 //# sourceMappingURL=extension.js.map

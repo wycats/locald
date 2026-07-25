@@ -14,8 +14,36 @@ export interface ProjectStatusInfo {
     service_details: ServiceStatus[];
     attachments: unknown[];
     is_running: boolean;
+    availability?: {
+        desired: boolean;
+        state: string;
+        always_on: boolean;
+        paused: boolean;
+        reasons: unknown[];
+        demands: Array<{
+            kind: string;
+            safe_label: string;
+            expires_at?: unknown;
+        }>;
+        next_transition_at?: unknown;
+        last_error?: string;
+    };
 }
-export type LocaldBinarySource = "LOCALD_BINARY" | "cargo" | "PATH";
+export interface EnsuredServiceStatus {
+    name: string;
+    service_type: string;
+    status: string;
+    health_status: string;
+    url?: string;
+}
+export interface EnsureProjectResult {
+    project_path: string;
+    project_name?: string;
+    state: "ready";
+    services: EnsuredServiceStatus[];
+    urls: string[];
+}
+export type LocaldBinarySource = "LOCALD_BINARY" | "local install" | "cargo fallback" | "PATH";
 export interface LocaldBinaryIdentity {
     path: string;
     source: LocaldBinarySource;
@@ -23,9 +51,18 @@ export interface LocaldBinaryIdentity {
 export declare function getBinaryIdentity(): LocaldBinaryIdentity;
 export declare function formatBinaryIdentity(identity?: LocaldBinaryIdentity): string;
 export declare function findBinary(): string;
-export declare function attach(projectPath: string, windowId: string): Promise<void>;
-export declare function detach(projectPath: string, windowId: string): Promise<void>;
+export declare function resolveBinaryIdentityFrom(options: {
+    configuredPath?: string;
+    homeDirectory: string;
+    path?: string;
+    exists(path: string): boolean;
+}): LocaldBinaryIdentity;
+export declare function ensureEditorProject(projectPath: string, windowId: string, hostPid: number): Promise<EnsureProjectResult>;
+export declare function renewEditorProject(projectPath: string, windowId: string, hostPid: number): Promise<void>;
+export declare function releaseEditorProject(projectPath: string, windowId: string, hostPid: number): Promise<void>;
 export declare function status(projectPath: string): Promise<ProjectStatusInfo>;
 export declare function listProjects(): Promise<ProjectStatusInfo[]>;
-export declare function startProject(projectPath: string): Promise<void>;
-export declare function getLogs(lines?: number): Promise<string>;
+export declare function stopProject(projectPath: string): Promise<void>;
+export declare function restartService(projectPath: string, serviceName: string): Promise<void>;
+export declare function getLogs(projectPath: string, lines?: number, service?: string): Promise<string>;
+export declare function tailLines(output: string, lines: number): string;

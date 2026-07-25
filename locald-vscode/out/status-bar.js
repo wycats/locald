@@ -41,15 +41,13 @@ class StatusBar {
     dashboardItem;
     webItem;
     timer;
-    projectPath;
-    windowId;
+    getProjectPath;
     log;
     webServices = [];
     wasUnreachable = false;
     consecutiveFailures = 0;
-    constructor(projectPath, windowId, log) {
-        this.projectPath = projectPath;
-        this.windowId = windowId;
+    constructor(getProjectPath, log) {
+        this.getProjectPath = getProjectPath;
         this.log = log;
         // Dashboard item (left)
         this.dashboardItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 51);
@@ -69,14 +67,20 @@ class StatusBar {
         return this.webServices;
     }
     async refresh() {
+        const projectPath = this.getProjectPath();
+        if (!projectPath) {
+            this.dashboardItem.text = "$(server) locald";
+            this.dashboardItem.tooltip =
+                "locald — focus a file inside a locald project";
+            this.webServices = [];
+            this.webItem.hide();
+            return;
+        }
         try {
-            const info = await (0, plumbing_js_1.status)(this.projectPath);
+            const info = await (0, plumbing_js_1.status)(projectPath);
             if (this.wasUnreachable) {
                 this.log.info(`locald daemon reachable again after ${this.consecutiveFailures} failed status poll${this.consecutiveFailures === 1 ? "" : "s"}`);
                 this.wasUnreachable = false;
-                (0, plumbing_js_1.attach)(this.projectPath, this.windowId).catch((error) => {
-                    this.log.warn(`Failed to re-attach editor after daemon recovery: ${formatError(error)}`);
-                });
             }
             this.consecutiveFailures = 0;
             this.updateDashboard(info);
@@ -145,8 +149,16 @@ class StatusBar {
         this.webItem.show();
     }
     buildTooltip(name, services, info) {
-        const lines = [`${name} — editor attached`];
-        lines.push("Services stop when this window closes.");
+        const lines = [`${name} — managed for this VS Code window`];
+        if (info.availability?.paused) {
+            lines.push("Paused until the next explicit activity.");
+        }
+        else if (info.availability?.always_on) {
+            lines.push("Always On is enabled.");
+        }
+        else {
+            lines.push("Idle services stop after this window demand expires.");
+        }
         lines.push("");
         for (const s of services) {
             const icon = s.status === "running" ? "●" : "○";

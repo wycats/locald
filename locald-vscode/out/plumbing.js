@@ -3,16 +3,22 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getBinaryIdentity = getBinaryIdentity;
 exports.formatBinaryIdentity = formatBinaryIdentity;
 exports.findBinary = findBinary;
-exports.attach = attach;
-exports.detach = detach;
+exports.resolveBinaryIdentityFrom = resolveBinaryIdentityFrom;
+exports.ensureEditorProject = ensureEditorProject;
+exports.renewEditorProject = renewEditorProject;
+exports.releaseEditorProject = releaseEditorProject;
 exports.status = status;
 exports.listProjects = listProjects;
-exports.startProject = startProject;
+exports.stopProject = stopProject;
+exports.restartService = restartService;
 exports.getLogs = getLogs;
+exports.tailLines = tailLines;
 const node_child_process_1 = require("node:child_process");
 const node_fs_1 = require("node:fs");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
+const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
+const ENSURE_COMMAND_TIMEOUT_MS = 45_000;
 let cachedBinaryIdentity;
 function getBinaryIdentity() {
     cachedBinaryIdentity ??= resolveBinaryIdentity();
@@ -25,20 +31,44 @@ function findBinary() {
     return getBinaryIdentity().path;
 }
 function resolveBinaryIdentity() {
-    const configuredPath = process.env.LOCALD_BINARY?.trim();
+    return resolveBinaryIdentityFrom({
+        configuredPath: process.env.LOCALD_BINARY,
+        homeDirectory: (0, node_os_1.homedir)(),
+        path: process.env.PATH,
+        exists: node_fs_1.existsSync,
+    });
+}
+function resolveBinaryIdentityFrom(options) {
+    const configuredPath = options.configuredPath?.trim();
     if (configuredPath) {
         return { path: configuredPath, source: "LOCALD_BINARY" };
     }
-    const cargoPath = (0, node_path_1.join)((0, node_os_1.homedir)(), ".cargo", "bin", "locald");
-    if ((0, node_fs_1.existsSync)(cargoPath)) {
-        return { path: cargoPath, source: "cargo" };
+    const localInstallPath = (0, node_path_1.join)(options.homeDirectory, ".local", "bin", "locald");
+    if (options.exists(localInstallPath)) {
+        return { path: localInstallPath, source: "local install" };
+    }
+    for (const directory of options.path?.split(node_path_1.delimiter) ?? []) {
+        if (!directory) {
+            continue;
+        }
+        const candidate = (0, node_path_1.join)(directory, "locald");
+        if (options.exists(candidate)) {
+            return { path: candidate, source: "PATH" };
+        }
+    }
+    const cargoPath = (0, node_path_1.join)(options.homeDirectory, ".cargo", "bin", "locald");
+    if (options.exists(cargoPath)) {
+        return { path: cargoPath, source: "cargo fallback" };
     }
     return { path: "locald", source: "PATH" };
 }
-function run(args) {
+function run(args, options = {}) {
     return new Promise((resolve, reject) => {
         const binary = getBinaryIdentity();
-        (0, node_child_process_1.execFile)(binary.path, args, { timeout: 10_000 }, (error, stdout, stderr) => {
+        (0, node_child_process_1.execFile)(binary.path, args, {
+            cwd: options.cwd,
+            timeout: options.timeout ?? DEFAULT_COMMAND_TIMEOUT_MS,
+        }, (error, stdout, stderr) => {
             if (error) {
                 reject(new Error(`${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${stderr || error.message}`));
             }
@@ -48,31 +78,44 @@ function run(args) {
         });
     });
 }
-async function attach(projectPath, windowId) {
+async function ensureEditorProject(projectPath, windowId, hostPid) {
+    const output = await run([
+        "project",
+        "editor",
+        "ensure",
+        projectPath,
+        "--window-id",
+        windowId,
+        "--host-pid",
+        String(hostPid),
+        "--json",
+    ], { timeout: ENSURE_COMMAND_TIMEOUT_MS });
+    return JSON.parse(output);
+}
+async function renewEditorProject(projectPath, windowId, hostPid) {
     await run([
         "project",
-        "attach",
-        projectPath,
-        "--source",
         "editor",
-        "--editor-name",
-        "vscode",
-        "--editor-id",
+        "renew",
+        projectPath,
+        "--window-id",
         windowId,
-        "--editor-pid",
-        String(process.pid),
+        "--host-pid",
+        String(hostPid),
         "--json",
     ]);
 }
-async function detach(projectPath, windowId) {
+async function releaseEditorProject(projectPath, windowId, hostPid) {
     await run([
         "project",
-        "detach",
-        projectPath,
-        "--source",
         "editor",
-        "--editor-id",
+        "release",
+        projectPath,
+        "--window-id",
         windowId,
+        "--host-pid",
+        String(hostPid),
+        "--json",
     ]);
 }
 async function status(projectPath) {
@@ -83,11 +126,21 @@ async function listProjects() {
     const output = await run(["project", "list", "--json"]);
     return JSON.parse(output);
 }
-async function startProject(projectPath) {
-    await run(["project", "start", projectPath]);
+async function stopProject(projectPath) {
+    await run(["stop", "--json"], { cwd: projectPath });
 }
-async function getLogs(lines = 100) {
-    const output = await run(["logs", "--no-follow", "--lines", String(lines)]);
-    return output;
+async function restartService(projectPath, serviceName) {
+    await run(["restart", serviceName, "--json"], { cwd: projectPath });
+}
+async function getLogs(projectPath, lines = 100, service) {
+    const args = service ? ["logs", service] : ["logs"];
+    const output = await run(args, { cwd: projectPath });
+    return tailLines(output, lines);
+}
+function tailLines(output, lines) {
+    const limit = Number.isFinite(lines) ? Math.max(1, Math.floor(lines)) : 100;
+    const hasTrailingNewline = output.endsWith("\n");
+    const body = hasTrailingNewline ? output.slice(0, -1) : output;
+    return `${body.split("\n").slice(-limit).join("\n")}${hasTrailingNewline ? "\n" : ""}`;
 }
 //# sourceMappingURL=plumbing.js.map
