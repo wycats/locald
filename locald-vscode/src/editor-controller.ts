@@ -30,6 +30,10 @@ export type RenewalScheduler = (
   renew: () => void,
   intervalMs: number,
 ) => () => void;
+export type CurrentProjectOperation<T> = (
+  initial: EnsureProjectResult,
+  ensureTarget: (reason: string) => Promise<EnsureProjectResult>,
+) => Promise<T>;
 
 export class EditorAvailabilityController {
   private readonly windowId: string;
@@ -78,43 +82,21 @@ export class EditorAvailabilityController {
   }
 
   async ensureCurrent(reason: string): Promise<EnsureProjectResult | undefined> {
+    return this.enqueue(() => this.ensureCurrentWithinQueue(reason));
+  }
+
+  async withCurrentProject<T>(
+    reason: string,
+    operation: CurrentProjectOperation<T>,
+  ): Promise<T | undefined> {
     return this.enqueue(async () => {
-      this.ensureNotDisposed();
-      const nextPath = await this.resolveProject();
-      if (!nextPath) {
-        await this.releaseCurrentWithinQueue();
+      const initial = await this.ensureCurrentWithinQueue(reason);
+      if (!initial) {
         return undefined;
       }
-
-      const previousPath = this.currentPath;
-      this.currentPath = nextPath;
-      let result: EnsureProjectResult;
-      try {
-        result = await this.client.ensure(
-          nextPath,
-          this.windowId,
-          this.hostPid,
-        );
-        this.log.info(
-          `Editor availability ready for ${nextPath} after ${reason}`,
-        );
-      } finally {
-        if (previousPath && previousPath !== nextPath) {
-          try {
-            await this.client.release(
-              previousPath,
-              this.windowId,
-              this.hostPid,
-            );
-          } catch (error) {
-            this.log.warn(
-              `Failed to release previous editor demand for ${previousPath}; it will expire automatically: ${formatError(error)}`,
-            );
-          }
-        }
-      }
-
-      return result;
+      return operation(initial, (nextReason) =>
+        this.ensureProjectWithinQueue(initial.project_path, nextReason),
+      );
     });
   }
 
@@ -163,6 +145,55 @@ export class EditorAvailabilityController {
     }
     await this.client.release(projectPath, this.windowId, this.hostPid);
     this.log.info(`Released editor availability for ${projectPath}`);
+  }
+
+  private async ensureCurrentWithinQueue(
+    reason: string,
+  ): Promise<EnsureProjectResult | undefined> {
+    this.ensureNotDisposed();
+    const nextPath = await this.resolveProject();
+    if (!nextPath) {
+      await this.releaseCurrentWithinQueue();
+      return undefined;
+    }
+
+    const previousPath = this.currentPath;
+    this.currentPath = nextPath;
+    let result: EnsureProjectResult;
+    try {
+      result = await this.ensureProjectWithinQueue(nextPath, reason);
+    } finally {
+      if (previousPath && previousPath !== nextPath) {
+        try {
+          await this.client.release(
+            previousPath,
+            this.windowId,
+            this.hostPid,
+          );
+        } catch (error) {
+          this.log.warn(
+            `Failed to release previous editor demand for ${previousPath}; it will expire automatically: ${formatError(error)}`,
+          );
+        }
+      }
+    }
+
+    return result;
+  }
+
+  private async ensureProjectWithinQueue(
+    projectPath: string,
+    reason: string,
+  ): Promise<EnsureProjectResult> {
+    const result = await this.client.ensure(
+      projectPath,
+      this.windowId,
+      this.hostPid,
+    );
+    this.log.info(
+      `Editor availability ready for ${projectPath} after ${reason}`,
+    );
+    return result;
   }
 
   private ensureNotDisposed(): void {

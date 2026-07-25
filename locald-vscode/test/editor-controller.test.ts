@@ -118,6 +118,33 @@ test("changing projects ensures the new project before releasing the old one", a
   ]);
 });
 
+test("restart work keeps its original project target until readiness returns", async () => {
+  const fixture = setup("/work/one");
+  await fixture.controller.activate();
+  let queuedSwitch: Promise<EnsureProjectResult | undefined> | undefined;
+
+  const result = await fixture.controller.withCurrentProject(
+    "prepare restart",
+    async (initial, ensureTarget) => {
+      assert.equal(initial.project_path, "/work/one");
+      fixture.projectPath = "/work/two";
+      queuedSwitch = fixture.controller.ensureCurrent("active editor change");
+      return ensureTarget("wait for restart");
+    },
+  );
+  await queuedSwitch;
+
+  assert.equal(result?.project_path, "/work/one");
+  assert.equal(fixture.controller.projectPath, "/work/two");
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/one:window-a:42",
+    "ensure:/work/one:window-a:42",
+    "ensure:/work/one:window-a:42",
+    "ensure:/work/two:window-a:42",
+    "release:/work/one:window-a:42",
+  ]);
+});
+
 test("failed readiness remains the current demand and releases the old project", async () => {
   const fixture = setup("/work/one");
   await fixture.controller.activate();

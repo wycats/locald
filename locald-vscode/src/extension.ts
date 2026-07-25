@@ -188,16 +188,18 @@ function registerCommands(
     }),
     vscode.commands.registerCommand("locald.restartServices", async () => {
       try {
-        const initial = await controller.ensureCurrent(
+        const restarted = await controller.withCurrentProject(
           "prepare services for restart",
+          async (initial, ensureTarget) => {
+            for (const service of initial.services) {
+              await restartService(initial.project_path, service.name);
+            }
+            return ensureTarget("wait for restarted services");
+          },
         );
-        if (!initial) {
+        if (!restarted) {
           throw new Error("no locald project is selected");
         }
-        for (const service of initial.services) {
-          await restartService(initial.project_path, service.name);
-        }
-        await controller.ensureCurrent("wait for restarted services");
         vscode.window.showInformationMessage("locald: services restarted");
       } catch (error) {
         vscode.window.showErrorMessage(

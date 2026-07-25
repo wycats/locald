@@ -163,11 +163,14 @@ jobs:
         working-directory: locald-vscode
         run: |
           npm ci
+          rm -rf out
           npm test
 
       - name: Verify generated extension output
         if: ${{ steps.gate.outputs.run == 'true' }}
-        run: git diff --exit-code -- locald-vscode/out
+        run: |
+          git diff --exit-code -- locald-vscode/out
+          test -z "$(git status --porcelain --untracked-files=all -- locald-vscode/out)"
 
   web-build:
     name: Web Build (Dashboard + Docs)

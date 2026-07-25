@@ -65,4 +65,13 @@ export declare function listProjects(): Promise<ProjectStatusInfo[]>;
 export declare function stopProject(projectPath: string): Promise<void>;
 export declare function restartService(projectPath: string, serviceName: string): Promise<void>;
 export declare function getLogs(projectPath: string, lines?: number, service?: string): Promise<string>;
+export declare function parseJsonOutput<T>(output: string): T;
 export declare function tailLines(output: string, lines: number): string;
+export declare class StreamingLineTail {
+    private output;
+    private readonly lines;
+    private readonly maxCharacters;
+    constructor(lines: number, maxCharacters?: number);
+    push(chunk: string): void;
+    value(): string;
+}

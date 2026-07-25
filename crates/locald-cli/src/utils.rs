@@ -95,6 +95,16 @@ pub fn spawn_daemon() -> CliResult<()> {
     Ok(())
 }
 
+fn write_daemon_starting(
+    mut output: impl std::io::Write,
+    sandbox_active: bool,
+) -> std::io::Result<()> {
+    if !sandbox_active {
+        writeln!(output, "Starting locald server...")?;
+    }
+    Ok(())
+}
+
 pub fn ensure_daemon_running() -> CliResult<()> {
     let sandbox_active = std::env::var("LOCALD_SANDBOX_ACTIVE").is_ok();
     // Try to ping first
@@ -111,9 +121,7 @@ pub fn ensure_daemon_running() -> CliResult<()> {
         }
     }
 
-    if !sandbox_active {
-        println!("Starting locald server...");
-    }
+    write_daemon_starting(std::io::stderr().lock(), sandbox_active)?;
     spawn_daemon()?;
 
     // Wait for it to be ready
@@ -426,6 +434,20 @@ pub fn verify_shim() {
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    #[test]
+    fn daemon_startup_message_is_machine_output_safe() {
+        let mut standard_stderr = Vec::new();
+        write_daemon_starting(&mut standard_stderr, false).expect("write standard startup message");
+        assert_eq!(
+            String::from_utf8(standard_stderr).expect("startup message is UTF-8"),
+            "Starting locald server...\n"
+        );
+
+        let mut sandbox_stderr = Vec::new();
+        write_daemon_starting(&mut sandbox_stderr, true).expect("write sandbox startup message");
+        assert!(sandbox_stderr.is_empty());
+    }
 
     // The following tests document the container detection behavior for locald.
 

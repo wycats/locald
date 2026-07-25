@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  parseJsonOutput,
   resolveBinaryIdentityFrom,
+  StreamingLineTail,
   tailLines,
 } from "../src/plumbing.js";
 
@@ -14,6 +16,33 @@ test("tailLines keeps the requested final complete lines", () => {
 test("tailLines normalizes invalid limits to a safe snapshot", () => {
   assert.equal(tailLines("one\ntwo\n", 0), "two\n");
   assert.equal(tailLines("one\ntwo\n", Number.NaN), "one\ntwo\n");
+});
+
+test("parseJsonOutput accepts machine-clean JSON and legacy startup prefixes", () => {
+  assert.deepEqual(parseJsonOutput<{ ready: boolean }>('{"ready":true}\n'), {
+    ready: true,
+  });
+  assert.deepEqual(
+    parseJsonOutput<{ ready: boolean }>(
+      'Starting locald server...\n{\n  "ready": true\n}\n',
+    ),
+    { ready: true },
+  );
+});
+
+test("StreamingLineTail bounds chunked output before returning recent lines", () => {
+  const tail = new StreamingLineTail(2, 100);
+  tail.push("one\ntwo");
+  tail.push("\nthree\n");
+
+  assert.equal(tail.value(), "two\nthree\n");
+});
+
+test("StreamingLineTail bounds a single oversized line while streaming", () => {
+  const tail = new StreamingLineTail(2, 8);
+  tail.push("0123456789");
+
+  assert.equal(tail.value(), "23456789");
 });
 
 test("binary selection prefers explicit and installed product paths", () => {

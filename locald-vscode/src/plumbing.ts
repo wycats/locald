@@ -1,10 +1,11 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
-const ENSURE_COMMAND_TIMEOUT_MS = 45_000;
+const LIFECYCLE_COMMAND_TIMEOUT_MS = 0;
+const MAX_CAPTURED_LOG_CHARACTERS = 1_000_000;
 
 export interface ServiceStatus {
   name: string;
@@ -180,9 +181,9 @@ export async function ensureEditorProject(
       String(hostPid),
       "--json",
     ],
-    { timeout: ENSURE_COMMAND_TIMEOUT_MS },
+    { timeout: LIFECYCLE_COMMAND_TIMEOUT_MS },
   );
-  return JSON.parse(output) as EnsureProjectResult;
+  return parseJsonOutput<EnsureProjectResult>(output);
 }
 
 export async function renewEditorProject(
@@ -223,12 +224,12 @@ export async function releaseEditorProject(
 
 export async function status(projectPath: string): Promise<ProjectStatusInfo> {
   const output = await run(["project", "status", projectPath, "--json"]);
-  return JSON.parse(output) as ProjectStatusInfo;
+  return parseJsonOutput<ProjectStatusInfo>(output);
 }
 
 export async function listProjects(): Promise<ProjectStatusInfo[]> {
   const output = await run(["project", "list", "--json"]);
-  return JSON.parse(output) as ProjectStatusInfo[];
+  return parseJsonOutput<ProjectStatusInfo[]>(output);
 }
 
 export async function stopProject(projectPath: string): Promise<void> {
@@ -239,7 +240,10 @@ export async function restartService(
   projectPath: string,
   serviceName: string,
 ): Promise<void> {
-  await run(["restart", serviceName, "--json"], { cwd: projectPath });
+  await run(["restart", serviceName, "--json"], {
+    cwd: projectPath,
+    timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
+  });
 }
 
 export async function getLogs(
@@ -248,8 +252,28 @@ export async function getLogs(
   service?: string,
 ): Promise<string> {
   const args = service ? ["logs", service] : ["logs"];
-  const output = await run(args, { cwd: projectPath });
-  return tailLines(output, lines);
+  return runTail(args, lines, { cwd: projectPath });
+}
+
+export function parseJsonOutput<T>(output: string): T {
+  const trimmed = output.trim();
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch (initialError) {
+    const firstObject = trimmed.indexOf("{");
+    const firstArray = trimmed.indexOf("[");
+    const candidates = [firstObject, firstArray]
+      .filter((offset) => offset >= 0)
+      .sort((left, right) => left - right);
+    for (const offset of candidates) {
+      try {
+        return JSON.parse(trimmed.slice(offset)) as T;
+      } catch {
+        // Try the next possible JSON payload start.
+      }
+    }
+    throw initialError;
+  }
 }
 
 export function tailLines(output: string, lines: number): string {
@@ -257,4 +281,88 @@ export function tailLines(output: string, lines: number): string {
   const hasTrailingNewline = output.endsWith("\n");
   const body = hasTrailingNewline ? output.slice(0, -1) : output;
   return `${body.split("\n").slice(-limit).join("\n")}${hasTrailingNewline ? "\n" : ""}`;
+}
+
+export class StreamingLineTail {
+  private output = "";
+  private readonly lines: number;
+  private readonly maxCharacters: number;
+
+  constructor(
+    lines: number,
+    maxCharacters: number = MAX_CAPTURED_LOG_CHARACTERS,
+  ) {
+    this.lines = Number.isFinite(lines)
+      ? Math.max(1, Math.floor(lines))
+      : 100;
+    this.maxCharacters = Math.max(1, Math.floor(maxCharacters));
+  }
+
+  push(chunk: string): void {
+    this.output = tailLines(this.output + chunk, this.lines);
+    if (this.output.length > this.maxCharacters) {
+      this.output = this.output.slice(-this.maxCharacters);
+    }
+  }
+
+  value(): string {
+    return this.output;
+  }
+}
+
+function runTail(
+  args: string[],
+  lines: number,
+  options: RunOptions = {},
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const binary = getBinaryIdentity();
+    const child = spawn(binary.path, args, {
+      cwd: options.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout = new StreamingLineTail(lines);
+    const stderr = new StreamingLineTail(100);
+    const timeout = options.timeout ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const timer =
+      timeout > 0
+        ? setTimeout(() => {
+            child.kill();
+          }, timeout)
+        : undefined;
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => stdout.push(chunk));
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => stderr.push(chunk));
+    child.on("error", (error) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      reject(
+        new Error(
+          `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${error.message}`,
+        ),
+      );
+    });
+    child.on("close", (code, signal) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (code === 0) {
+        resolve(stdout.value());
+        return;
+      }
+      const detail =
+        stderr.value() ||
+        (signal
+          ? `terminated by ${signal}`
+          : `exited with status ${code ?? "unknown"}`);
+      reject(
+        new Error(
+          `${formatBinaryIdentity(binary)} ${args.join(" ")} failed: ${detail}`,
+        ),
+      );
+    });
+  });
 }

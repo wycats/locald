@@ -11,6 +11,7 @@ export interface ControllerLog {
 }
 export type ProjectResolver = () => Promise<string | undefined>;
 export type RenewalScheduler = (renew: () => void, intervalMs: number) => () => void;
+export type CurrentProjectOperation<T> = (initial: EnsureProjectResult, ensureTarget: (reason: string) => Promise<EnsureProjectResult>) => Promise<T>;
 export declare class EditorAvailabilityController {
     private readonly windowId;
     private readonly hostPid;
@@ -35,11 +36,14 @@ export declare class EditorAvailabilityController {
     get projectPath(): string | undefined;
     activate(): Promise<EnsureProjectResult | undefined>;
     ensureCurrent(reason: string): Promise<EnsureProjectResult | undefined>;
+    withCurrentProject<T>(reason: string, operation: CurrentProjectOperation<T>): Promise<T | undefined>;
     renewCurrent(): Promise<void>;
     releaseCurrent(): Promise<void>;
     dispose(): void;
     private startHeartbeat;
     private releaseCurrentWithinQueue;
+    private ensureCurrentWithinQueue;
+    private ensureProjectWithinQueue;
     private ensureNotDisposed;
     private enqueue;
 }

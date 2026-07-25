@@ -42,32 +42,29 @@ export function registerTools(
         }>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
-        const initial = await controller.ensureCurrent(
+        const result = await controller.withCurrentProject(
           "language-model restart request",
-        );
-        if (!initial) {
-          throw new Error("no locald project is selected");
-        }
-        const services = options.input?.service
-          ? initial.services.filter(
-              (candidate) =>
-                candidate.name === options.input?.service ||
-                candidate.name.endsWith(`:${options.input?.service}`),
-            )
-          : initial.services;
-        if (services.length === 0) {
-          throw new Error(
-            `service ${options.input?.service ?? "(unknown)"} was not found`,
-          );
-        }
-        for (const service of services) {
-          await restartService(initial.project_path, service.name);
-        }
-        const result = await controller.ensureCurrent(
-          "wait for restarted services",
+          async (initial, ensureTarget) => {
+            const services = options.input?.service
+              ? initial.services.filter(
+                  (candidate) =>
+                    candidate.name === options.input?.service ||
+                    candidate.name.endsWith(`:${options.input?.service}`),
+                )
+              : initial.services;
+            if (services.length === 0) {
+              throw new Error(
+                `service ${options.input?.service ?? "(unknown)"} was not found`,
+              );
+            }
+            for (const service of services) {
+              await restartService(initial.project_path, service.name);
+            }
+            return ensureTarget("wait for language-model service restart");
+          },
         );
         if (!result) {
-          throw new Error("locald project was removed during restart");
+          throw new Error("no locald project is selected");
         }
         return textResult(
           `Services restarted and ready.${result.urls.length > 0 ? ` ${result.urls.join(" ")}` : ""}`,
