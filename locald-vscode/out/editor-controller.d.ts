@@ -22,6 +22,7 @@ export declare class EditorAvailabilityController {
     private readonly scheduleRenewal;
     private currentPath;
     private operationRenewalPath;
+    private readonly uncertainRenewalPaths;
     private cancelHeartbeat;
     private pending;
     private disposed;
@@ -44,6 +45,7 @@ export declare class EditorAvailabilityController {
     private startHeartbeat;
     private releaseCurrentWithinQueue;
     private ensureCurrentWithinQueue;
+    private directRenewalPaths;
     private ensureProjectWithinQueue;
     private renewProject;
     private ensureNotDisposed;

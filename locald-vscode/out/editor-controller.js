@@ -12,6 +12,7 @@ class EditorAvailabilityController {
     scheduleRenewal;
     currentPath;
     operationRenewalPath;
+    uncertainRenewalPaths = new Set();
     cancelHeartbeat;
     pending = Promise.resolve();
     disposed = false;
@@ -56,9 +57,9 @@ class EditorAvailabilityController {
         });
     }
     async renewCurrent() {
-        const operationPath = this.operationRenewalPath;
-        if (!this.disposed && operationPath) {
-            await this.renewProject(operationPath);
+        const directPaths = this.directRenewalPaths();
+        if (!this.disposed && directPaths.length > 0) {
+            await Promise.all(directPaths.map((projectPath) => this.renewProject(projectPath)));
             return;
         }
         await this.enqueue(async () => {
@@ -87,13 +88,26 @@ class EditorAvailabilityController {
         }, this.renewalIntervalMs);
     }
     async releaseCurrentWithinQueue() {
-        const projectPath = this.currentPath;
-        this.currentPath = undefined;
-        if (!projectPath) {
-            return;
+        const projectPaths = new Set(this.uncertainRenewalPaths);
+        if (this.currentPath) {
+            projectPaths.add(this.currentPath);
         }
-        await this.client.release(projectPath, this.windowId, this.hostPid);
-        this.log.info(`Released editor availability for ${projectPath}`);
+        this.currentPath = undefined;
+        this.uncertainRenewalPaths.clear();
+        let firstError;
+        for (const projectPath of projectPaths) {
+            try {
+                await this.client.release(projectPath, this.windowId, this.hostPid);
+                this.log.info(`Released editor availability for ${projectPath}`);
+            }
+            catch (error) {
+                firstError ??= error;
+                this.log.warn(`Failed to release editor demand for ${projectPath}; it will expire automatically: ${formatError(error)}`);
+            }
+        }
+        if (firstError) {
+            throw firstError;
+        }
     }
     async ensureCurrentWithinQueue(reason) {
         this.ensureNotDisposed();
@@ -103,7 +117,9 @@ class EditorAvailabilityController {
             return undefined;
         }
         const previousPath = this.currentPath;
+        this.uncertainRenewalPaths.add(nextPath);
         const result = await this.ensureProjectWithinQueue(nextPath, reason);
+        this.uncertainRenewalPaths.clear();
         this.currentPath = nextPath;
         if (previousPath && previousPath !== nextPath) {
             try {
@@ -114,6 +130,16 @@ class EditorAvailabilityController {
             }
         }
         return result;
+    }
+    directRenewalPaths() {
+        const projectPaths = new Set(this.uncertainRenewalPaths);
+        if (this.operationRenewalPath) {
+            projectPaths.add(this.operationRenewalPath);
+        }
+        if (projectPaths.size > 0 && this.currentPath) {
+            projectPaths.add(this.currentPath);
+        }
+        return [...projectPaths];
     }
     async ensureProjectWithinQueue(projectPath, reason) {
         const result = await this.client.ensure(projectPath, this.windowId, this.hostPid);

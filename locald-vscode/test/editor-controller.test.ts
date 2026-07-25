@@ -179,7 +179,7 @@ test("heartbeat renews the fixed target during long restart work", async () => {
   await restart;
 });
 
-test("failed project switch preserves the old demand", async () => {
+test("failed project switch renews both confirmed and possibly-published demands", async () => {
   const fixture = setup("/work/one");
   await fixture.controller.activate();
   fixture.projectPath = "/work/two";
@@ -192,11 +192,33 @@ test("failed project switch preserves the old demand", async () => {
     fixture.controller.ensureCurrent("active editor change"),
     /readiness failed/,
   );
+  await fixture.controller.renewCurrent();
 
   assert.equal(fixture.controller.projectPath, "/work/one");
   assert.deepEqual(fixture.calls, [
     "ensure:/work/one:window-a:42",
     "ensure:/work/two:window-a:42",
+    "renew:/work/two:window-a:42",
+    "renew:/work/one:window-a:42",
+  ]);
+});
+
+test("failed initial readiness keeps a possibly-published demand renewable", async () => {
+  const fixture = setup("/work/one");
+  fixture.client.ensure = async (path, windowId, hostPid) => {
+    fixture.calls.push(`ensure:${path}:${windowId}:${hostPid}`);
+    throw new Error("readiness failed");
+  };
+
+  await assert.rejects(fixture.controller.activate(), /readiness failed/);
+  await fixture.controller.renewCurrent();
+  await fixture.controller.releaseCurrent();
+
+  assert.equal(fixture.controller.projectPath, undefined);
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/one:window-a:42",
+    "renew:/work/one:window-a:42",
+    "release:/work/one:window-a:42",
   ]);
 });
 

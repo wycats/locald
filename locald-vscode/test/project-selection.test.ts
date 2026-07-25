@@ -32,6 +32,16 @@ test("uses the active file to disambiguate a multi-root window", () => {
   );
 });
 
+test("accepts child paths whose names begin with two dots", () => {
+  assert.equal(
+    selectProjectPath(
+      ["/work/one/locald.toml", "/work/two/locald.toml"],
+      "/work/one/..generated/file.ts",
+    ),
+    "/work/one",
+  );
+});
+
 test("fails clearly when several projects are ambiguous", () => {
   assert.throws(
     () =>

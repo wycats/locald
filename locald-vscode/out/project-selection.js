@@ -30,6 +30,9 @@ function selectProjectPath(configPaths, activeFilePath) {
 }
 function isPathWithin(root, candidate) {
     const path = (0, node_path_1.relative)(root, candidate);
-    return path === "" || (!path.startsWith("..") && !path.startsWith("/"));
+    return (path === "" ||
+        (path !== ".." &&
+            !path.startsWith(`..${node_path_1.sep}`) &&
+            !(0, node_path_1.isAbsolute)(path)));
 }
 //# sourceMappingURL=project-selection.js.map

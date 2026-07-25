@@ -1,4 +1,4 @@
-import { dirname, relative } from "node:path";
+import { dirname, isAbsolute, relative, sep } from "node:path";
 
 export class AmbiguousProjectError extends Error {
   constructor(projectPaths: string[]) {
@@ -36,5 +36,10 @@ export function selectProjectPath(
 
 function isPathWithin(root: string, candidate: string): boolean {
   const path = relative(root, candidate);
-  return path === "" || (!path.startsWith("..") && !path.startsWith("/"));
+  return (
+    path === "" ||
+    (path !== ".." &&
+      !path.startsWith(`..${sep}`) &&
+      !isAbsolute(path))
+  );
 }
