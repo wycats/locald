@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": false,
+    "outDir": ".test-out",
+    "rootDir": ".",
+    "sourceMap": false
+  },
+  "include": [
+    "src/editor-controller.ts",
+    "src/plumbing.ts",
+    "src/project-selection.ts",
+    "test/**/*.ts"
+  ],
+  "exclude": ["node_modules", "out", ".test-out"]
+}

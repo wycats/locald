@@ -1,33 +1,69 @@
 import * as vscode from "vscode";
-import { status, startProject, getLogs } from "./plumbing.js";
+import type { EditorAvailabilityController } from "./editor-controller.js";
+import {
+  getLogs,
+  restartService,
+  status,
+  stopProject,
+} from "./plumbing.js";
 import { log } from "./extension.js";
+
+type ProjectResolver = () => Promise<string | undefined>;
 
 export function registerTools(
   context: vscode.ExtensionContext,
-  projectPath: string,
+  controller: EditorAvailabilityController,
+  resolveProject: ProjectResolver,
 ): void {
   if (!vscode.lm || typeof vscode.lm.registerTool !== "function") {
     log.warn("vscode.lm.registerTool not available — tools disabled");
     return;
   }
-  log.info("Registering 4 Copilot tools");
+  log.info("Registering 5 locald language-model tools");
 
   context.subscriptions.push(
+    vscode.lm.registerTool("locald_ensure", {
+      async invoke(
+        _options: vscode.LanguageModelToolInvocationOptions<void>,
+        _token: vscode.CancellationToken,
+      ): Promise<vscode.LanguageModelToolResult> {
+        const result = await controller.ensureCurrent(
+          "language-model readiness request",
+        );
+        if (!result) {
+          throw new Error("no locald project is selected");
+        }
+        return textResult(
+          JSON.stringify(
+            {
+              state: result.state,
+              services: result.services,
+              urls: result.urls,
+            },
+            null,
+            2,
+          ),
+        );
+      },
+    } satisfies vscode.LanguageModelTool<void>),
     vscode.lm.registerTool("locald_services", {
       async invoke(
         _options: vscode.LanguageModelToolInvocationOptions<void>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
+        const projectPath = await resolveRequiredProject(resolveProject);
         const info = await status(projectPath);
-        const text = JSON.stringify(info.service_details, null, 2);
-        return new vscode.LanguageModelToolResult([
-          new vscode.LanguageModelTextPart(text),
-        ]);
+        const services = info.service_details.map((service) => ({
+          name: service.name,
+          status: service.status,
+          health_status: service.health_status,
+          url: service.url,
+          domain: service.domain,
+          service_type: service.service_type,
+        }));
+        return textResult(JSON.stringify(services, null, 2));
       },
     } satisfies vscode.LanguageModelTool<void>),
-  );
-
-  context.subscriptions.push(
     vscode.lm.registerTool("locald_restart", {
       async invoke(
         options: vscode.LanguageModelToolInvocationOptions<{
@@ -35,16 +71,35 @@ export function registerTools(
         }>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
-        void options.input?.service;
-        await startProject(projectPath);
-        return new vscode.LanguageModelToolResult([
-          new vscode.LanguageModelTextPart("Services restarted."),
-        ]);
+        const result = await controller.withCurrentProject(
+          "language-model restart request",
+          async (initial, ensureTarget) => {
+            if (options.input?.service) {
+              const service = initial.services.find(
+                (candidate) =>
+                  candidate.name === options.input?.service ||
+                  candidate.name.endsWith(`:${options.input?.service}`),
+              );
+              if (!service) {
+                throw new Error(
+                  `service ${options.input.service} was not found`,
+                );
+              }
+              await restartService(initial.project_path, service.name);
+            } else {
+              await stopProject(initial.project_path);
+            }
+            return ensureTarget("wait for language-model service restart");
+          },
+        );
+        if (!result) {
+          throw new Error("no locald project is selected");
+        }
+        return textResult(
+          `Services restarted and ready.${result.urls.length > 0 ? ` ${result.urls.join(" ")}` : ""}`,
+        );
       },
     } satisfies vscode.LanguageModelTool<{ service?: string }>),
-  );
-
-  context.subscriptions.push(
     vscode.lm.registerTool("locald_logs", {
       async invoke(
         options: vscode.LanguageModelToolInvocationOptions<{
@@ -53,19 +108,18 @@ export function registerTools(
         }>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
-        void options.input?.service;
-        const output = await getLogs(options.input?.lines ?? 200);
-        return new vscode.LanguageModelToolResult([
-          new vscode.LanguageModelTextPart(output),
-        ]);
+        const projectPath = await resolveRequiredProject(resolveProject);
+        const output = await getLogs(
+          projectPath,
+          options.input?.lines ?? 200,
+          options.input?.service,
+        );
+        return textResult(output);
       },
     } satisfies vscode.LanguageModelTool<{
       service?: string;
       lines?: number;
     }>),
-  );
-
-  context.subscriptions.push(
     vscode.lm.registerTool("locald_open", {
       async invoke(
         options: vscode.LanguageModelToolInvocationOptions<{
@@ -73,25 +127,44 @@ export function registerTools(
         }>,
         _token: vscode.CancellationToken,
       ): Promise<vscode.LanguageModelToolResult> {
-        const info = await status(projectPath);
+        const result = await controller.ensureCurrent(
+          "language-model browser request",
+        );
+        if (!result) {
+          throw new Error("no locald project is selected");
+        }
         const service = options.input?.service
-          ? info.service_details.find((s) => s.name === options.input?.service)
-          : info.service_details.find((s) => s.url);
+          ? result.services.find(
+              (candidate) =>
+                candidate.name === options.input?.service ||
+                candidate.name.endsWith(`:${options.input?.service}`),
+            )
+          : result.services.find((candidate) => candidate.url);
         if (!service?.url) {
-          return new vscode.LanguageModelToolResult([
-            new vscode.LanguageModelTextPart("No service URL available."),
-          ]);
+          return textResult("No service URL available.");
         }
         await vscode.commands.executeCommand(
           "simpleBrowser.show",
           vscode.Uri.parse(service.url),
         );
-        return new vscode.LanguageModelToolResult([
-          new vscode.LanguageModelTextPart(
-            `Opened ${service.url} in Simple Browser.`,
-          ),
-        ]);
+        return textResult(`Opened ${service.url} in Simple Browser.`);
       },
     } satisfies vscode.LanguageModelTool<{ service?: string }>),
   );
+}
+
+async function resolveRequiredProject(
+  resolveProject: ProjectResolver,
+): Promise<string> {
+  const projectPath = await resolveProject();
+  if (!projectPath) {
+    throw new Error("no locald.toml found in the current workspace");
+  }
+  return projectPath;
+}
+
+function textResult(text: string): vscode.LanguageModelToolResult {
+  return new vscode.LanguageModelToolResult([
+    new vscode.LanguageModelTextPart(text),
+  ]);
 }

@@ -46,6 +46,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      vscode: ${{ steps.filter.outputs.vscode }}
       only_macos: ${{ steps.only-macos.outputs.only_macos }}
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +80,9 @@ jobs:
             web:
               - 'locald-dashboard/**'
               - 'locald-docs/**'
+              - '.github/workflows/**'
+            vscode:
+              - 'locald-vscode/**'
               - '.github/workflows/**'
 
   mainline-health:
@@ -129,6 +133,44 @@ jobs:
 
       - name: Fail if Rust src changed without test deltas
         run: ./scripts/untested-change-tripwire.sh
+
+  vscode-extension:
+    name: VS Code Extension
+    if: ${{ github.event_name != 'schedule' && needs.changes.outputs.only_macos != 'true' }}
+    needs: [changes]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate
+        id: gate
+        run: echo "run=${{ needs.changes.outputs.vscode }}" >> "$GITHUB_OUTPUT"
+
+      - name: No extension changes
+        if: ${{ steps.gate.outputs.run != 'true' }}
+        run: echo "No VS Code extension changes; skipping extension build."
+
+      - name: Setup Node.js
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+          cache: npm
+          cache-dependency-path: locald-vscode/package-lock.json
+
+      - name: Build and test extension
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        working-directory: locald-vscode
+        run: |
+          npm ci
+          rm -rf out
+          npm test
+
+      - name: Verify generated extension output
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          git diff --exit-code -- locald-vscode/out
+          test -z "$(git status --porcelain --untracked-files=all -- locald-vscode/out)"
 
   web-build:
     name: Web Build (Dashboard + Docs)

@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import {
-  attach,
   formatBinaryIdentity,
   status,
   type ProjectStatusInfo,
@@ -13,21 +12,21 @@ export class StatusBar implements vscode.Disposable {
   private dashboardItem: vscode.StatusBarItem;
   private webItem: vscode.StatusBarItem;
   private timer: ReturnType<typeof setInterval> | undefined;
-  private projectPath: string;
-  private windowId: string;
+  private readonly getProjectPath: () => string | undefined;
+  private readonly recoverEditorDemand: (paused: boolean) => void;
   private log: vscode.LogOutputChannel;
   private webServices: ServiceStatus[] = [];
   private wasUnreachable = false;
   private consecutiveFailures = 0;
 
   constructor(
-    projectPath: string,
-    windowId: string,
+    getProjectPath: () => string | undefined,
     log: vscode.LogOutputChannel,
+    recoverEditorDemand: (paused: boolean) => void,
   ) {
-    this.projectPath = projectPath;
-    this.windowId = windowId;
+    this.getProjectPath = getProjectPath;
     this.log = log;
+    this.recoverEditorDemand = recoverEditorDemand;
 
     // Dashboard item (left)
     this.dashboardItem = vscode.window.createStatusBarItem(
@@ -57,18 +56,24 @@ export class StatusBar implements vscode.Disposable {
   }
 
   private async refresh(): Promise<void> {
+    const projectPath = this.getProjectPath();
+    if (!projectPath) {
+      this.dashboardItem.text = "$(server) locald";
+      this.dashboardItem.tooltip =
+        "locald — focus a file inside a locald project";
+      this.webServices = [];
+      this.webItem.hide();
+      return;
+    }
+
     try {
-      const info = await status(this.projectPath);
+      const info = await status(projectPath);
       if (this.wasUnreachable) {
         this.log.info(
           `locald daemon reachable again after ${this.consecutiveFailures} failed status poll${this.consecutiveFailures === 1 ? "" : "s"}`,
         );
         this.wasUnreachable = false;
-        attach(this.projectPath, this.windowId).catch((error: unknown) => {
-          this.log.warn(
-            `Failed to re-attach editor after daemon recovery: ${formatError(error)}`,
-          );
-        });
+        this.recoverEditorDemand(info.availability?.paused === true);
       }
       this.consecutiveFailures = 0;
       this.updateDashboard(info);
@@ -148,8 +153,14 @@ export class StatusBar implements vscode.Disposable {
     services: ServiceStatus[],
     info: ProjectStatusInfo,
   ): string {
-    const lines: string[] = [`${name} — editor attached`];
-    lines.push("Services stop when this window closes.");
+    const lines: string[] = [`${name} — managed for this VS Code window`];
+    if (info.availability?.paused) {
+      lines.push("Paused until the next explicit activity.");
+    } else if (info.availability?.always_on) {
+      lines.push("Always On is enabled.");
+    } else {
+      lines.push("Idle services stop after this window demand expires.");
+    }
     lines.push("");
     for (const s of services) {
       const icon = s.status === "running" ? "●" : "○";
