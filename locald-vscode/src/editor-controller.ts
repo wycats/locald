@@ -188,9 +188,30 @@ export class EditorAvailabilityController {
     const previousPath = this.currentPath;
     this.uncertainRenewalPaths.add(nextPath);
     const result = await this.ensureProjectWithinQueue(nextPath, reason);
-    this.uncertainRenewalPaths.clear();
+    this.uncertainRenewalPaths.delete(nextPath);
     this.currentPath = nextPath;
+    for (const uncertainPath of [...this.uncertainRenewalPaths]) {
+      if (uncertainPath === previousPath) {
+        continue;
+      }
+      try {
+        await this.client.release(
+          uncertainPath,
+          this.windowId,
+          this.hostPid,
+        );
+        this.uncertainRenewalPaths.delete(uncertainPath);
+        this.log.info(
+          `Released uncertain editor availability for ${uncertainPath}`,
+        );
+      } catch (error) {
+        this.log.warn(
+          `Failed to release uncertain editor demand for ${uncertainPath}; renewal will preserve it for cleanup retry: ${formatError(error)}`,
+        );
+      }
+    }
     if (previousPath && previousPath !== nextPath) {
+      this.uncertainRenewalPaths.delete(previousPath);
       try {
         await this.client.release(
           previousPath,

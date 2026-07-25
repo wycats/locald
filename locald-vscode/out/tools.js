@@ -72,15 +72,16 @@ function registerTools(context, controller, resolveProject) {
     }), vscode.lm.registerTool("locald_restart", {
         async invoke(options, _token) {
             const result = await controller.withCurrentProject("language-model restart request", async (initial, ensureTarget) => {
-                const services = options.input?.service
-                    ? initial.services.filter((candidate) => candidate.name === options.input?.service ||
-                        candidate.name.endsWith(`:${options.input?.service}`))
-                    : initial.services;
-                if (services.length === 0) {
-                    throw new Error(`service ${options.input?.service ?? "(unknown)"} was not found`);
-                }
-                for (const service of services) {
+                if (options.input?.service) {
+                    const service = initial.services.find((candidate) => candidate.name === options.input?.service ||
+                        candidate.name.endsWith(`:${options.input?.service}`));
+                    if (!service) {
+                        throw new Error(`service ${options.input.service} was not found`);
+                    }
                     await (0, plumbing_js_1.restartService)(initial.project_path, service.name);
+                }
+                else {
+                    await (0, plumbing_js_1.stopProject)(initial.project_path);
                 }
                 return ensureTarget("wait for language-model service restart");
             });

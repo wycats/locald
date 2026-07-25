@@ -4,7 +4,6 @@ import {
   ensureEditorProject,
   formatBinaryIdentity,
   releaseEditorProject,
-  restartService,
   renewEditorProject,
   status,
   stopProject,
@@ -191,9 +190,7 @@ function registerCommands(
         const restarted = await controller.withCurrentProject(
           "prepare services for restart",
           async (initial, ensureTarget) => {
-            for (const service of initial.services) {
-              await restartService(initial.project_path, service.name);
-            }
+            await stopProject(initial.project_path);
             return ensureTarget("wait for restarted services");
           },
         );

@@ -233,17 +233,24 @@ export async function listProjects(): Promise<ProjectStatusInfo[]> {
 }
 
 export async function stopProject(projectPath: string): Promise<void> {
-  await run(["stop", "--json"], { cwd: projectPath });
+  await run(["stop", "--json"], {
+    cwd: projectPath,
+    timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
+  });
 }
 
 export async function restartService(
   projectPath: string,
   serviceName: string,
 ): Promise<void> {
-  await run(["restart", serviceName, "--json"], {
+  await run(restartCommandArgs(serviceName), {
     cwd: projectPath,
     timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
   });
+}
+
+export function restartCommandArgs(serviceName: string): string[] {
+  return ["restart", "--json", "--", serviceName];
 }
 
 export async function getLogs(
@@ -251,8 +258,12 @@ export async function getLogs(
   lines: number = 100,
   service?: string,
 ): Promise<string> {
-  const args = service ? ["logs", service] : ["logs"];
+  const args = logCommandArgs(service);
   return runTail(args, lines, { cwd: projectPath });
+}
+
+export function logCommandArgs(service?: string): string[] {
+  return service ? ["logs", "--", service] : ["logs"];
 }
 
 export function parseJsonOutput<T>(output: string): T {

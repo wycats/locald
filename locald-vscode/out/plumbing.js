@@ -12,7 +12,9 @@ exports.status = status;
 exports.listProjects = listProjects;
 exports.stopProject = stopProject;
 exports.restartService = restartService;
+exports.restartCommandArgs = restartCommandArgs;
 exports.getLogs = getLogs;
+exports.logCommandArgs = logCommandArgs;
 exports.parseJsonOutput = parseJsonOutput;
 exports.tailLines = tailLines;
 const node_child_process_1 = require("node:child_process");
@@ -130,17 +132,26 @@ async function listProjects() {
     return parseJsonOutput(output);
 }
 async function stopProject(projectPath) {
-    await run(["stop", "--json"], { cwd: projectPath });
-}
-async function restartService(projectPath, serviceName) {
-    await run(["restart", serviceName, "--json"], {
+    await run(["stop", "--json"], {
         cwd: projectPath,
         timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
     });
 }
+async function restartService(projectPath, serviceName) {
+    await run(restartCommandArgs(serviceName), {
+        cwd: projectPath,
+        timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
+    });
+}
+function restartCommandArgs(serviceName) {
+    return ["restart", "--json", "--", serviceName];
+}
 async function getLogs(projectPath, lines = 100, service) {
-    const args = service ? ["logs", service] : ["logs"];
+    const args = logCommandArgs(service);
     return runTail(args, lines, { cwd: projectPath });
+}
+function logCommandArgs(service) {
+    return service ? ["logs", "--", service] : ["logs"];
 }
 function parseJsonOutput(output) {
     const trimmed = output.trim();

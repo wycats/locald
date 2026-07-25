@@ -165,9 +165,7 @@ function registerCommands(context, controller) {
     }), vscode.commands.registerCommand("locald.restartServices", async () => {
         try {
             const restarted = await controller.withCurrentProject("prepare services for restart", async (initial, ensureTarget) => {
-                for (const service of initial.services) {
-                    await (0, plumbing_js_1.restartService)(initial.project_path, service.name);
-                }
+                await (0, plumbing_js_1.stopProject)(initial.project_path);
                 return ensureTarget("wait for restarted services");
             });
             if (!restarted) {

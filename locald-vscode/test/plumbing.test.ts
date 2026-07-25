@@ -1,11 +1,38 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  logCommandArgs,
   parseJsonOutput,
   resolveBinaryIdentityFrom,
+  restartCommandArgs,
   StreamingLineTail,
   tailLines,
 } from "../src/plumbing.js";
+
+test("log service names are separated from CLI options", () => {
+  assert.deepEqual(logCommandArgs(), ["logs"]);
+  assert.deepEqual(logCommandArgs("web"), ["logs", "--", "web"]);
+  assert.deepEqual(logCommandArgs("--follow"), [
+    "logs",
+    "--",
+    "--follow",
+  ]);
+});
+
+test("restart service names are separated from CLI options", () => {
+  assert.deepEqual(restartCommandArgs("web"), [
+    "restart",
+    "--json",
+    "--",
+    "web",
+  ]);
+  assert.deepEqual(restartCommandArgs("--help"), [
+    "restart",
+    "--json",
+    "--",
+    "--help",
+  ]);
+});
 
 test("tailLines keeps the requested final complete lines", () => {
   assert.equal(tailLines("one\ntwo\nthree\n", 2), "two\nthree\n");

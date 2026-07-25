@@ -1,6 +1,11 @@
 import * as vscode from "vscode";
 import type { EditorAvailabilityController } from "./editor-controller.js";
-import { getLogs, restartService, status } from "./plumbing.js";
+import {
+  getLogs,
+  restartService,
+  status,
+  stopProject,
+} from "./plumbing.js";
 import { log } from "./extension.js";
 
 type ProjectResolver = () => Promise<string | undefined>;
@@ -69,20 +74,20 @@ export function registerTools(
         const result = await controller.withCurrentProject(
           "language-model restart request",
           async (initial, ensureTarget) => {
-            const services = options.input?.service
-              ? initial.services.filter(
-                  (candidate) =>
-                    candidate.name === options.input?.service ||
-                    candidate.name.endsWith(`:${options.input?.service}`),
-                )
-              : initial.services;
-            if (services.length === 0) {
-              throw new Error(
-                `service ${options.input?.service ?? "(unknown)"} was not found`,
+            if (options.input?.service) {
+              const service = initial.services.find(
+                (candidate) =>
+                  candidate.name === options.input?.service ||
+                  candidate.name.endsWith(`:${options.input?.service}`),
               );
-            }
-            for (const service of services) {
+              if (!service) {
+                throw new Error(
+                  `service ${options.input.service} was not found`,
+                );
+              }
               await restartService(initial.project_path, service.name);
+            } else {
+              await stopProject(initial.project_path);
             }
             return ensureTarget("wait for language-model service restart");
           },

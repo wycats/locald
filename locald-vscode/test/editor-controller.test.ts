@@ -222,6 +222,37 @@ test("failed initial readiness keeps a possibly-published demand renewable", asy
   ]);
 });
 
+test("successful selection releases earlier uncertain demands", async () => {
+  const fixture = setup("/work/one");
+  await fixture.controller.activate();
+  fixture.projectPath = "/work/two";
+  fixture.client.ensure = async (path, windowId, hostPid) => {
+    fixture.calls.push(`ensure:${path}:${windowId}:${hostPid}`);
+    if (path === "/work/two") {
+      throw new Error("readiness failed");
+    }
+    return ready(path);
+  };
+  await assert.rejects(
+    fixture.controller.ensureCurrent("active editor change"),
+    /readiness failed/,
+  );
+
+  fixture.projectPath = "/work/three";
+  await fixture.controller.ensureCurrent("active editor change");
+  await fixture.controller.renewCurrent();
+
+  assert.equal(fixture.controller.projectPath, "/work/three");
+  assert.deepEqual(fixture.calls, [
+    "ensure:/work/one:window-a:42",
+    "ensure:/work/two:window-a:42",
+    "ensure:/work/three:window-a:42",
+    "release:/work/two:window-a:42",
+    "release:/work/one:window-a:42",
+    "renew:/work/three:window-a:42",
+  ]);
+});
+
 test("leaving the last locald workspace releases the window demand", async () => {
   const fixture = setup();
   await fixture.controller.activate();
