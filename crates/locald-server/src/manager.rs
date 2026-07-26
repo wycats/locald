@@ -294,6 +294,9 @@ pub(crate) struct Service {
     pub resolved_env: HashMap<String, String>,
     pub runtime_state: ServiceRuntime,
     pub sticky_port: Option<u16>,
+    /// Keeps an allocator-selected endpoint reserved while its controller is
+    /// still building or otherwise waiting to prove readiness.
+    pub pending_port_guard: Option<crate::port_allocator::PortGuard>,
     pub path: PathBuf,
     pub health_status: HealthStatus,
     pub health_source: HealthSource,
@@ -2073,6 +2076,7 @@ impl ProcessManager {
                         owned_process_id,
                     );
                     if controller_ready {
+                        service.pending_port_guard = None;
                         if service.health_status != HealthStatus::Healthy {
                             service.health_status = HealthStatus::Healthy;
                             service.health_source = HealthSource::Explicit;
@@ -2179,10 +2183,13 @@ impl ProcessManager {
                             && (!Self::readiness_requires_controller_health(&requirement)
                                 || state.health_status != HealthStatus::Unhealthy)
                             && has_durable_process_ownership;
-                        if ready && service.health_status != HealthStatus::Healthy {
-                            service.health_status = HealthStatus::Healthy;
-                            service.health_source = HealthSource::Explicit;
-                            Self::advance_service_projection(service);
+                        if ready {
+                            service.pending_port_guard = None;
+                            if service.health_status != HealthStatus::Healthy {
+                                service.health_status = HealthStatus::Healthy;
+                                service.health_source = HealthSource::Explicit;
+                                Self::advance_service_projection(service);
+                            }
                         }
                         let readiness_changed = !ready
                             && !retryable_runtime
@@ -3277,6 +3284,7 @@ impl ProcessManager {
                                 resolved_env: resolved_env.clone(),
                                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                                 sticky_port: port,
+                                pending_port_guard: port_guard.take(),
                                 path: path.clone(),
                                 health_status: HealthStatus::Starting,
                                 health_source: HealthSource::None,
@@ -3586,9 +3594,18 @@ impl ProcessManager {
                         "service `{name}` changed controller during lifecycle transition"
                     );
                     service.runtime_state = ServiceRuntime::None;
+                    service.pending_port_guard = None;
                 }
             }
-            ServiceRuntime::None => {}
+            ServiceRuntime::None => {
+                let mut services = self.services.lock().await;
+                if let Some(service) = services
+                    .get_mut(name)
+                    .filter(|service| service.instance_id == instance_id)
+                {
+                    service.pending_port_guard = None;
+                }
+            }
         }
 
         // Clear health and broadcast after stop
@@ -4128,6 +4145,7 @@ impl ProcessManager {
             for (name, service) in services.iter_mut() {
                 let runtime_state =
                     std::mem::replace(&mut service.runtime_state, ServiceRuntime::None);
+                service.pending_port_guard = None;
 
                 match runtime_state {
                     ServiceRuntime::Controller(c) => {
@@ -21783,6 +21801,7 @@ PATH = "/usr/bin:/bin"
             resolved_env: HashMap::new(),
             runtime_state: ServiceRuntime::None,
             sticky_port: None,
+            pending_port_guard: None,
             path,
             health_status: HealthStatus::Healthy,
             health_source: HealthSource::None,
@@ -21857,6 +21876,7 @@ PATH = "/usr/bin:/bin"
                 resolved_env: HashMap::new(),
                 runtime_state: ServiceRuntime::None,
                 sticky_port: None,
+                pending_port_guard: None,
                 path: canonical,
                 health_status: HealthStatus::Healthy,
                 health_source: HealthSource::None,
@@ -21938,6 +21958,7 @@ PATH = "/usr/bin:/bin"
                 resolved_env: HashMap::new(),
                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                 sticky_port: None,
+                pending_port_guard: None,
                 path: canonical.clone(),
                 health_status: HealthStatus::Healthy,
                 health_source: HealthSource::None,
@@ -22063,6 +22084,7 @@ PATH = "/usr/bin:/bin"
                 resolved_env: HashMap::new(),
                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                 sticky_port: None,
+                pending_port_guard: None,
                 path: canonical.clone(),
                 health_status: HealthStatus::Healthy,
                 health_source: HealthSource::None,
@@ -23634,6 +23656,7 @@ PATH = "/usr/bin:/bin"
             resolved_env: HashMap::new(),
             runtime_state,
             sticky_port: None,
+            pending_port_guard: None,
             path,
             health_status: HealthStatus::Healthy,
             health_source: HealthSource::None,
@@ -24616,10 +24639,34 @@ PATH = "/usr/bin:/bin"
             HealthStatus::Starting,
             "the slow owned runtime remains eligible to finish"
         );
+        let slow_port = {
+            let services = manager.services.lock().await;
+            let service = &services["background-slow:web"];
+            assert!(
+                service.pending_port_guard.is_some(),
+                "the unbound cold build retains its allocator reservation"
+            );
+            service
+                .sticky_port
+                .expect("the cold build retains its assigned endpoint")
+        };
+        assert!(
+            manager
+                .port_allocator
+                .try_allocate_specific(slow_port)
+                .is_none(),
+            "the retained cold build's unbound port cannot be reallocated"
+        );
         assert_eq!(
             manager.services.lock().await["background-later:web"].health_status,
             HealthStatus::Healthy,
             "the later project converges in the same sweep"
+        );
+        assert!(
+            manager.services.lock().await["background-later:web"]
+                .pending_port_guard
+                .is_none(),
+            "a ready service releases its allocator reservation"
         );
         let slow_snapshot = AvailabilityStore::load(&availability_data_dir, *slow_instance)
             .await
@@ -24667,6 +24714,25 @@ PATH = "/usr/bin:/bin"
             "the sweep visits later projects while a prior coordinator is busy"
         );
         drop(slow_foreground_guard);
+
+        let mut slow_availability = AvailabilityStore::load(&availability_data_dir, *slow_instance)
+            .await
+            .expect("reload slow availability before cleanup");
+        slow_availability
+            .pause_project()
+            .await
+            .expect("pause retained cold build");
+        manager
+            .converge_managed_instance(*slow_instance, None, false, false)
+            .await
+            .expect("stop retained cold build");
+        assert!(
+            manager
+                .port_allocator
+                .try_allocate_specific(slow_port)
+                .is_some(),
+            "stopping the retained runtime releases its allocator reservation"
+        );
     }
 
     #[tokio::test]

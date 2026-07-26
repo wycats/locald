@@ -387,6 +387,9 @@ impl HealthMonitor {
                     );
                     service.health_status = status;
                     service.health_source = source;
+                    if status == HealthStatus::Healthy {
+                        service.pending_port_guard = None;
+                    }
                     let projection_generation =
                         crate::manager::ProcessManager::advance_service_projection(service);
 
@@ -871,6 +874,7 @@ mod tests {
                 TestController::unknown(),
             ))),
             sticky_port,
+            pending_port_guard: None,
             path: std::path::PathBuf::from("/readiness-test"),
             health_status: HealthStatus::Starting,
             health_source: HealthSource::None,
@@ -1376,6 +1380,7 @@ mod tests {
                     TestController::unknown(),
                 ))),
                 sticky_port: None,
+                pending_port_guard: None,
                 path: std::path::PathBuf::from("/second"),
                 health_status: HealthStatus::Unknown,
                 health_source: HealthSource::None,
@@ -1464,6 +1469,7 @@ mod tests {
                 resolved_env: HashMap::new(),
                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                 sticky_port: None,
+                pending_port_guard: None,
                 path: std::path::PathBuf::from("/app"),
                 health_status: HealthStatus::Unknown,
                 health_source: HealthSource::None,
