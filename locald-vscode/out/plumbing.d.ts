@@ -57,6 +57,7 @@ export declare function resolveBinaryIdentityFrom(options: {
     path?: string;
     exists(path: string): boolean;
 }): LocaldBinaryIdentity;
+export declare function formatCommandFailure(binary: LocaldBinaryIdentity, args: string[], detail: string): string;
 export declare function ensureEditorProject(projectPath: string, windowId: string, hostPid: number): Promise<EnsureProjectResult>;
 export declare function renewEditorProject(projectPath: string, windowId: string, hostPid: number): Promise<void>;
 export declare function releaseEditorProject(projectPath: string, windowId: string, hostPid: number): Promise<void>;

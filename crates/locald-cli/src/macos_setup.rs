@@ -1216,7 +1216,25 @@ mod tests {
         let report = sandbox_report();
         assert!(!report.has_critical_failures());
         assert!(report.fixes.is_empty());
-        assert_eq!(report.problems.len(), 10);
+        assert_eq!(
+            report
+                .problems
+                .iter()
+                .map(|problem| problem.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "macos.console_user",
+                "macos.ca.material",
+                "macos.ca.permissions",
+                "macos.ca.trust",
+                "macos.agent.binary",
+                "macos.agent.launch_agent",
+                "macos.helper.binary",
+                "macos.helper.plist",
+                "macos.helper.authority",
+                "macos.helper.probe",
+            ]
+        );
         assert!(
             report
                 .problems
