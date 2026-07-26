@@ -1312,12 +1312,13 @@ impl ProcessManager {
                         service.resolved_env.clone(),
                         controller,
                         service.health_status,
+                        service.sticky_port,
                     )
                 })
             };
 
             let (has_controller, is_up_to_date, is_stopped_projection) = match service_snapshot {
-                Some((loaded_instance, loaded_path, _, _, Some(_), _))
+                Some((loaded_instance, loaded_path, _, _, Some(_), _, _))
                     if loaded_instance != instance_id =>
                 {
                     anyhow::bail!(
@@ -1325,43 +1326,74 @@ impl ProcessManager {
                         loaded_path.display()
                     );
                 }
-                Some((_, _, current_config, current_env, Some(controller), health_status)) => {
+                Some((
+                    _,
+                    loaded_path,
+                    current_config,
+                    current_env,
+                    Some(controller),
+                    health_status,
+                    sticky_port,
+                )) => {
                     let controller = controller.lock().await;
-                    let runtime_status = controller.read_state().await.status;
-                    let runtime_is_reusable = match (runtime_status, health_status, service_config)
-                    {
-                        (ServiceState::Running, HealthStatus::Healthy, _) => true,
-                        (
-                            ServiceState::Running,
-                            HealthStatus::Starting,
-                            ServiceConfig::Typed(TypedServiceConfig::Site(_)),
-                        ) => false,
-                        (ServiceState::Running, HealthStatus::Starting, _) => true,
-                        (
-                            ServiceState::Building,
-                            HealthStatus::Starting,
-                            ServiceConfig::Typed(TypedServiceConfig::Site(_)),
-                        ) => true,
-                        _ => false,
-                    };
+                    let runtime_state = controller.read_state().await;
+                    let owned_process_id = controller.owned_process_id();
+                    let has_process_identity = controller.process_identity().is_some();
+                    drop(controller);
                     let has_durable_process_ownership =
                         !Self::requires_durable_process_ownership(service_config)
-                            || (controller.owned_process_id().is_some()
-                                && controller.process_identity().is_some());
+                            || (owned_process_id.is_some() && has_process_identity);
                     let environment_matches = resolved_env
                         .as_ref()
                         .is_some_and(|resolved_env| current_env == *resolved_env);
+                    let static_configuration_matches = !dependency_will_change
+                        && has_durable_process_ownership
+                        && current_config == *service_config
+                        && environment_matches;
+                    let runtime_is_reusable =
+                        match (runtime_state.status, health_status, service_config) {
+                            (ServiceState::Running, HealthStatus::Healthy, _) => true,
+                            (
+                                ServiceState::Running,
+                                HealthStatus::Starting,
+                                ServiceConfig::Typed(TypedServiceConfig::Site(_)),
+                            ) if static_configuration_matches => {
+                                let requirement = ReadinessRequirement::for_service(
+                                    service_config,
+                                    sticky_port,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "service `{full_name}` has an invalid readiness contract"
+                                    )
+                                })?;
+                                let probe_succeeded = requirement
+                                    .probe_once(Some(&loaded_path), &current_env)
+                                    .await;
+                                probe_succeeded
+                                    && Self::readiness_is_satisfied(
+                                        &requirement,
+                                        HealthStatus::Healthy,
+                                        runtime_state.status,
+                                        runtime_state.health_status,
+                                        owned_process_id,
+                                    )
+                            }
+                            (ServiceState::Running, HealthStatus::Starting, _) => true,
+                            (
+                                ServiceState::Building,
+                                HealthStatus::Starting,
+                                ServiceConfig::Typed(TypedServiceConfig::Site(_)),
+                            ) => true,
+                            _ => false,
+                        };
                     (
                         true,
-                        !dependency_will_change
-                            && runtime_is_reusable
-                            && has_durable_process_ownership
-                            && current_config == *service_config
-                            && environment_matches,
+                        static_configuration_matches && runtime_is_reusable,
                         false,
                     )
                 }
-                Some((_, _, _, _, None, _)) => (false, false, true),
+                Some((_, _, _, _, None, _, _)) => (false, false, true),
                 None => (false, false, false),
             };
 
@@ -1960,6 +1992,9 @@ impl ProcessManager {
         self.notify_readiness_wait_hook(readiness_timeout);
 
         loop {
+            if self.is_shutting_down() {
+                return Err(DaemonShuttingDown.into());
+            }
             self.availability_allows_inflight_transition(instance_id)
                 .await?;
             let (controller, controller_generation, requirement) = {
@@ -7834,15 +7869,15 @@ impl ProcessManager {
             AvailabilityManagementState::LegacyUnmanaged => return Ok(()),
         }
         let mut availability = self.load_availability(instance_id).await?;
-        let snapshot = availability.snapshot().await?;
-        if snapshot.is_paused() {
+        let decision = availability.sweep_and_decide().await?;
+        if matches!(decision, ConvergenceDecision::EnsureUp) {
+            Ok(())
+        } else {
             Err(AvailabilityStartSuperseded {
                 instance_id,
-                decision: ConvergenceDecision::EnsureDown,
+                decision,
             }
             .into())
-        } else {
-            Ok(())
         }
     }
 
@@ -16348,6 +16383,128 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn last_owner_release_cancels_inflight_readiness_and_enters_cooldown() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("release-readiness-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "release-readiness").await;
+        write_unready_availability_worker_config(
+            &project_path,
+            "release-readiness",
+            "release-readiness.localhost",
+            &["web"],
+        );
+        let source = AttachmentSource::Editor {
+            name: "Code".to_owned(),
+            id: "window-a".to_owned(),
+            pid: None,
+        };
+        let demand = availability_demand_for_attachment_source(&source)
+            .expect("derive editor demand")
+            .expect("editor has an availability demand");
+        {
+            let mut attachments = manager.attachments.lock().await;
+            attachments
+                .attach(Attachment {
+                    project_path: project_path.clone(),
+                    source: source.clone(),
+                    created_at: SystemTime::now(),
+                })
+                .expect("seed editor attachment");
+            attachments.set_instance_owner(&project_path, instance_id);
+            attachments.save().await.expect("persist editor attachment");
+        }
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load release-readiness availability");
+        availability
+            .ensure_demand(demand)
+            .await
+            .expect("seed editor demand");
+
+        let readiness_entered = Arc::new(tokio::sync::Notify::new());
+        manager.set_readiness_wait_hook(readiness_entered.clone());
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(UnreadyStartFactory {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: None,
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_entered.notified())
+            .await
+            .expect("startup reaches its readiness wait");
+
+        let detach = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            let source = source.clone();
+            async move { manager.project_detach(project_path, Some(source)).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if availability
+                    .snapshot()
+                    .await
+                    .expect("observe released availability")
+                    .demands()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last owner release publishes while readiness is pending");
+
+        let (convergence_result, detach_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(convergence, detach)
+            })
+            .await
+            .expect("owner release cancels the stale readiness wait");
+        assert!(matches!(
+            convergence_result
+                .expect("startup convergence task joins")
+                .expect("released startup converges to current availability"),
+            ConvergenceDecision::PreserveRuntimeUntil { .. }
+        ));
+        detach_result
+            .expect("detach task joins")
+            .expect("detach converges the released owner");
+
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read release cooldown");
+        assert!(snapshot.demands().is_empty());
+        assert!(snapshot.shutdown_cooldown_until().is_some());
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            0,
+            "the existing runtime remains available only for the normal cooldown"
+        );
+        assert!(
+            manager
+                .get_service_controller("release-readiness:web")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_force_stop_publishes_pause_during_in_flight_start() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("force-stop-race-project");
@@ -18568,7 +18725,7 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
-    async fn shutdown_drains_an_admitted_ensure_across_post_gate_checks() {
+    async fn shutdown_cancels_an_admitted_ensure_readiness_wait() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("shutdown-admitted-ensure-project");
         let (mut manager, instance_id, availability_data_dir) =
@@ -18579,12 +18736,13 @@ PATH = "/usr/bin:/bin"
             "shutdown-admitted-ensure.localhost",
             &["web"],
         );
-        let start_entered = Arc::new(tokio::sync::Notify::new());
+        let readiness_entered = Arc::new(tokio::sync::Notify::new());
+        manager.set_readiness_wait_hook(readiness_entered.clone());
         let stop_count = Arc::new(AtomicUsize::new(0));
         manager.factories.insert(
             0,
             Arc::new(UnreadyStartFactory {
-                entered: start_entered.clone(),
+                entered: Arc::new(tokio::sync::Notify::new()),
                 release: None,
                 stop_count: stop_count.clone(),
             }),
@@ -18599,7 +18757,7 @@ PATH = "/usr/bin:/bin"
                     .await
             }
         });
-        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, start_entered.notified())
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_entered.notified())
             .await
             .expect("admitted ensure reaches its readiness wait");
 
@@ -18616,26 +18774,19 @@ PATH = "/usr/bin:/bin"
         .expect("shutdown publishes its lifecycle gate");
         assert!(!shutdown_task.is_finished());
 
-        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
-            .await
-            .expect("load admitted ensure availability");
-        availability
-            .pause_project()
-            .await
-            .expect("supersede the admitted ensure after shutdown begins");
-
         let (ensure_result, shutdown_result) =
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 tokio::join!(ensure_task, shutdown_task)
             })
             .await
-            .expect("admitted ensure drains before shutdown teardown");
-        ensure_result
+            .expect("shutdown cancels the readiness wait before teardown");
+        let ensure_error = ensure_result
             .expect("join admitted ensure")
-            .expect("admitted ensure crosses post-shutdown convergence checks");
+            .expect_err("admitted ensure is cancelled by shutdown");
+        assert!(ensure_error.downcast_ref::<DaemonShuttingDown>().is_some());
         shutdown_result
             .expect("join shutdown")
-            .expect("finish shutdown after admitted ensure");
+            .expect("finish shutdown after cancelling admitted ensure");
 
         assert_eq!(stop_count.load(Ordering::SeqCst), 1);
         assert!(
@@ -18644,12 +18795,19 @@ PATH = "/usr/bin:/bin"
                 .await
                 .is_none()
         );
+        let snapshot = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("reload admitted ensure availability")
+            .snapshot()
+            .await
+            .expect("read admitted ensure availability");
+        assert!(!snapshot.is_paused());
         assert!(
-            availability
-                .snapshot()
-                .await
-                .expect("reload admitted ensure availability")
-                .is_paused()
+            snapshot
+                .demands()
+                .iter()
+                .any(|lease| lease.kind() == DemandKind::ManualCli),
+            "shutdown stops runtime without rewriting the requested availability"
         );
     }
 
@@ -24888,7 +25046,11 @@ PATH = "/usr/bin:/bin"
             .project_ensure_availability(&project_path, DemandKey::manual_cli())
             .await
             .expect_err("incomplete command readiness must fail");
-        assert!(format!("{error:#}").contains("requires `command`"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("requires `command`"),
+            "unexpected invalid readiness error: {message}"
+        );
         assert_eq!(creates.load(Ordering::SeqCst), 0);
         assert!(
             manager
@@ -25129,16 +25291,39 @@ path = "docs"
 [services.broken]
 type = "site"
 path = "broken"
+
+[services.ready]
+type = "site"
+path = "ready"
 "#,
         )
         .expect("parse managed service config");
+        let ready_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ready site endpoint");
+        let ready_port = ready_listener
+            .local_addr()
+            .expect("read ready site endpoint")
+            .port();
+        let broken_port = {
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve broken site port");
+            listener
+                .local_addr()
+                .expect("read broken site endpoint")
+                .port()
+        };
         {
             let mut services = manager.services.lock().await;
-            for name in ["db", "docs", "broken"] {
+            for name in ["db", "docs", "broken", "ready"] {
                 let (runtime_status, health_status) = match name {
                     "docs" => (ServiceState::Building, HealthStatus::Starting),
-                    "broken" => (ServiceState::Running, HealthStatus::Starting),
+                    "broken" | "ready" => (ServiceState::Running, HealthStatus::Starting),
                     _ => (ServiceState::Running, HealthStatus::Healthy),
+                };
+                let controller_health = if matches!(name, "broken" | "ready") {
+                    HealthStatus::Healthy
+                } else {
+                    health_status
                 };
                 let controller: Arc<Mutex<dyn ServiceController>> =
                     Arc::new(Mutex::new(TestController::new(
@@ -25147,7 +25332,7 @@ path = "broken"
                             pid: None,
                             port: None,
                             status: runtime_status,
-                            health_status,
+                            health_status: controller_health,
                         },
                     )));
                 let mut service = test_service(
@@ -25157,6 +25342,11 @@ path = "broken"
                     project_path.clone(),
                 );
                 service.health_status = health_status;
+                service.sticky_port = match name {
+                    "broken" => Some(broken_port),
+                    "ready" => Some(ready_port),
+                    _ => None,
+                };
                 services.insert(format!("managed-reload:{name}"), service);
             }
         }
@@ -25164,6 +25354,7 @@ path = "broken"
             "managed-reload:db".to_owned(),
             "managed-reload:docs".to_owned(),
             "managed-reload:broken".to_owned(),
+            "managed-reload:ready".to_owned(),
         ]);
 
         let plan = manager
@@ -25172,7 +25363,12 @@ path = "broken"
                 &config,
                 &HashMap::new(),
                 None,
-                &["db".to_owned(), "docs".to_owned(), "broken".to_owned()],
+                &[
+                    "db".to_owned(),
+                    "docs".to_owned(),
+                    "broken".to_owned(),
+                    "ready".to_owned(),
+                ],
                 &desired_service_names,
             )
             .await
@@ -25182,14 +25378,20 @@ path = "broken"
         assert_eq!(
             plan.restart_service_names,
             ["managed-reload:broken"],
-            "a completed site with no ready listener must be replaced"
+            "only a completed site without its ready listener must be replaced"
         );
-        assert_eq!(plan.reusable_service_envs.len(), 2);
+        assert_eq!(plan.reusable_service_envs.len(), 3);
         assert!(plan.reusable_service_envs.contains_key("managed-reload:db"));
         assert!(
             plan.reusable_service_envs
                 .contains_key("managed-reload:docs")
         );
+        assert!(
+            plan.reusable_service_envs
+                .contains_key("managed-reload:ready"),
+            "a site that completed after the prior readiness deadline remains reusable"
+        );
+        drop(ready_listener);
     }
 
     #[tokio::test]
