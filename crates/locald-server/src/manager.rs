@@ -1328,18 +1328,22 @@ impl ProcessManager {
                 Some((_, _, current_config, current_env, Some(controller), health_status)) => {
                     let controller = controller.lock().await;
                     let runtime_status = controller.read_state().await.status;
-                    let runtime_is_reusable = matches!(
-                        (runtime_status, health_status, service_config),
+                    let runtime_is_reusable = match (runtime_status, health_status, service_config)
+                    {
+                        (ServiceState::Running, HealthStatus::Healthy, _) => true,
                         (
                             ServiceState::Running,
-                            HealthStatus::Healthy | HealthStatus::Starting,
-                            _
-                        ) | (
+                            HealthStatus::Starting,
+                            ServiceConfig::Typed(TypedServiceConfig::Site(_)),
+                        ) => false,
+                        (ServiceState::Running, HealthStatus::Starting, _) => true,
+                        (
                             ServiceState::Building,
                             HealthStatus::Starting,
-                            ServiceConfig::Typed(TypedServiceConfig::Site(_))
-                        )
-                    );
+                            ServiceConfig::Typed(TypedServiceConfig::Site(_)),
+                        ) => true,
+                        _ => false,
+                    };
                     let has_durable_process_ownership =
                         !Self::requires_durable_process_ownership(service_config)
                             || (controller.owned_process_id().is_some()
@@ -7609,8 +7613,8 @@ impl ProcessManager {
             }
             match self.availability_is_managed(instance_id).await {
                 Ok(true) => {
-                    if let Err(error) = self
-                        .converge_managed_instance_with_readiness_timeout(
+                    if let Some(Err(error)) = self
+                        .try_converge_managed_instance_with_readiness_timeout(
                             instance_id,
                             None,
                             false,
@@ -8256,6 +8260,31 @@ impl ProcessManager {
             SERVICE_READINESS_TIMEOUT,
         )
         .await
+    }
+
+    async fn try_converge_managed_instance_with_readiness_timeout(
+        &self,
+        instance_id: ProjectInstanceId,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        apply_config_when_up: bool,
+        service_readiness_timeout: std::time::Duration,
+    ) -> Option<Result<ConvergenceDecision>> {
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let Ok(runtime_guard) = coordinator.runtime.clone().try_lock_owned() else {
+            return None;
+        };
+        let result = self
+            .converge_managed_instance_locked(
+                instance_id,
+                event_tx,
+                verbose,
+                apply_config_when_up,
+                service_readiness_timeout,
+            )
+            .await;
+        drop(runtime_guard);
+        Some(result)
     }
 
     async fn converge_managed_instance_with_readiness_timeout(
@@ -24366,14 +24395,19 @@ PATH = "/usr/bin:/bin"
                 "background catalog identity resolves before convergence"
             );
         }
-
         let sweep = tokio::spawn({
             let manager = manager.clone();
             async move { manager.converge_all_project_availability().await }
         });
-        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_observed.notified())
-            .await
-            .expect("the first background project enters its readiness wait");
+        let readiness_observed =
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_observed.notified())
+                .await;
+        assert!(
+            readiness_observed.is_ok(),
+            "the first background project enters its readiness wait; creates={}, sweep_finished={}",
+            creates.load(Ordering::SeqCst),
+            sweep.is_finished()
+        );
         assert_eq!(
             *manager
                 .readiness_wait_timeout
@@ -24447,6 +24481,34 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("read later convergence result");
         assert_eq!(later_snapshot.last_convergence_error(), None);
+
+        let slow_coordinator = manager.availability_coordinator(*slow_instance).await;
+        let slow_foreground_guard = slow_coordinator.runtime.lock().await;
+        let mut later_availability =
+            AvailabilityStore::load(&availability_data_dir, *later_instance)
+                .await
+                .expect("reload later availability before pause");
+        later_availability
+            .pause_project()
+            .await
+            .expect("pause later project behind busy coordinator");
+
+        let busy_sweep = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.converge_all_project_availability().await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, busy_sweep)
+            .await
+            .expect("background sweep skips the foreground-owned coordinator")
+            .expect("busy-coordinator sweep joins");
+        assert!(
+            manager
+                .get_service_controller("background-later:web")
+                .await
+                .is_none(),
+            "the sweep visits later projects while a prior coordinator is busy"
+        );
+        drop(slow_foreground_guard);
     }
 
     #[tokio::test]
@@ -25063,16 +25125,20 @@ type = "postgres"
 [services.docs]
 type = "site"
 path = "docs"
+
+[services.broken]
+type = "site"
+path = "broken"
 "#,
         )
         .expect("parse managed service config");
         {
             let mut services = manager.services.lock().await;
-            for name in ["db", "docs"] {
-                let (runtime_status, health_status) = if name == "docs" {
-                    (ServiceState::Building, HealthStatus::Starting)
-                } else {
-                    (ServiceState::Running, HealthStatus::Healthy)
+            for name in ["db", "docs", "broken"] {
+                let (runtime_status, health_status) = match name {
+                    "docs" => (ServiceState::Building, HealthStatus::Starting),
+                    "broken" => (ServiceState::Running, HealthStatus::Starting),
+                    _ => (ServiceState::Running, HealthStatus::Healthy),
                 };
                 let controller: Arc<Mutex<dyn ServiceController>> =
                     Arc::new(Mutex::new(TestController::new(
@@ -25097,6 +25163,7 @@ path = "docs"
         let desired_service_names = HashSet::from([
             "managed-reload:db".to_owned(),
             "managed-reload:docs".to_owned(),
+            "managed-reload:broken".to_owned(),
         ]);
 
         let plan = manager
@@ -25105,14 +25172,18 @@ path = "docs"
                 &config,
                 &HashMap::new(),
                 None,
-                &["db".to_owned(), "docs".to_owned()],
+                &["db".to_owned(), "docs".to_owned(), "broken".to_owned()],
                 &desired_service_names,
             )
             .await
             .expect("build managed-service reuse plan");
 
         assert!(plan.removed_service_names.is_empty());
-        assert!(plan.restart_service_names.is_empty());
+        assert_eq!(
+            plan.restart_service_names,
+            ["managed-reload:broken"],
+            "a completed site with no ready listener must be replaced"
+        );
         assert_eq!(plan.reusable_service_envs.len(), 2);
         assert!(plan.reusable_service_envs.contains_key("managed-reload:db"));
         assert!(
