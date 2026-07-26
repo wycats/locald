@@ -55,7 +55,11 @@ use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
-const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Service commands commonly perform a cold application build before binding
+// their endpoint. Keep that work bounded without treating a normal build like
+// the much shorter daemon-proxy startup check.
+const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+const PROXY_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn domain_target_remains_compatible(
@@ -1271,7 +1275,10 @@ impl ProcessManager {
                         true,
                         !dependency_will_change
                             && is_running
-                            && health_status == HealthStatus::Healthy
+                            && matches!(
+                                health_status,
+                                HealthStatus::Healthy | HealthStatus::Starting
+                            )
                             && has_durable_process_ownership
                             && current_config == *service_config
                             && environment_matches,
@@ -1990,11 +1997,21 @@ impl ProcessManager {
                         };
                         (controller, service.controller_generation, requirement)
                     };
-                    let (state, owned_process_id) = {
+                    let (state, owned_process_id, has_process_identity) = {
                         let controller = controller.lock().await;
-                        (controller.read_state().await, controller.owned_process_id())
+                        (
+                            controller.read_state().await,
+                            controller.owned_process_id(),
+                            controller.process_identity().is_some(),
+                        )
                     };
-                    let (ready, last_status, last_source, readiness_changed) = {
+                    let (
+                        ready,
+                        retryable_runtime,
+                        last_status,
+                        last_source,
+                        readiness_changed,
+                    ) = {
                         let mut services = self.services.lock().await;
                         let service = services
                             .get_mut(name)
@@ -2020,6 +2037,9 @@ impl ProcessManager {
                             current_requirement == requirement,
                             "service `{name}` changed its readiness contract during readiness"
                         );
+                        let has_durable_process_ownership =
+                            !Self::requires_durable_process_ownership(&service.service_config)
+                                || (owned_process_id.is_some() && has_process_identity);
                         let last_status = service.health_status;
                         let last_source = service.health_source;
                         let ready = state.status != ServiceState::Stopped
@@ -2030,12 +2050,18 @@ impl ProcessManager {
                             state.health_status,
                             owned_process_id,
                         );
+                        let retryable_runtime = !ready
+                            && state.status != ServiceState::Stopped
+                            && (!Self::readiness_requires_controller_health(&requirement)
+                                || state.health_status != HealthStatus::Unhealthy)
+                            && has_durable_process_ownership;
                         if ready && service.health_status != HealthStatus::Healthy {
                             service.health_status = HealthStatus::Healthy;
                             service.health_source = HealthSource::Explicit;
                             Self::advance_service_projection(service);
                         }
                         let readiness_changed = !ready
+                            && !retryable_runtime
                             && (service.health_status != HealthStatus::Unhealthy
                                 || service.health_source != requirement.health_source());
                         if readiness_changed {
@@ -2043,7 +2069,13 @@ impl ProcessManager {
                             service.health_source = requirement.health_source();
                             Self::advance_service_projection(service);
                         }
-                        (ready, last_status, last_source, readiness_changed)
+                        (
+                            ready,
+                            retryable_runtime,
+                            last_status,
+                            last_source,
+                            readiness_changed,
+                        )
                     };
                     if ready {
                         self.broadcast_service_update(name).await;
@@ -2055,13 +2087,18 @@ impl ProcessManager {
                         self.broadcast_service_update(name).await;
                     }
                     anyhow::bail!(
-                        "service `{name}` timed out after {}s waiting for {}; last runtime was {} with controller health {}, and last readiness was {} ({})",
+                        "service `{name}` timed out after {}s waiting for {}; last runtime was {} with controller health {}, last readiness was {} ({}), and the owned runtime {}",
                         SERVICE_READINESS_TIMEOUT.as_secs(),
                         requirement.description(),
                         runtime_status,
                         controller_health,
                         last_status,
-                        last_source
+                        last_source,
+                        if retryable_runtime {
+                            "remains in progress"
+                        } else {
+                            "requires replacement"
+                        }
                     );
                 }
                 () = tokio::time::sleep(SERVICE_READINESS_POLL_INTERVAL) => {}
@@ -2921,21 +2958,31 @@ impl ProcessManager {
             // service's display configuration using the authoritative
             // prepublication reuse decision.
             if reusable_service_envs.remove(&name).is_some() {
-                let reused = self
-                    .services
-                    .lock()
-                    .await
-                    .get(&name)
-                    .is_some_and(|service| service.instance_id == instance_id);
-                if reused {
-                    info!("Service {name} is already running and up to date");
+                let reused_health = self.services.lock().await.get(&name).and_then(|service| {
+                    (service.instance_id == instance_id).then_some(service.health_status)
+                });
+                if let Some(health_status) = reused_health {
+                    info!("Service {name} already has a matching owned runtime");
                     if let Some(tx) = &event_tx {
                         let _ = tx
                             .send(BootEvent::StepStarted {
                                 id: name.clone(),
-                                description: format!("Service {name} up to date"),
+                                description: format!("Waiting for service {name}"),
                             })
                             .await;
+                    }
+                    match health_status {
+                        HealthStatus::Healthy => {}
+                        HealthStatus::Starting => {
+                            self.wait_for_health(&name, instance_id).await?;
+                        }
+                        status @ (HealthStatus::Unknown | HealthStatus::Unhealthy) => {
+                            anyhow::bail!(
+                                "service `{name}` became {status} while reusing its owned runtime"
+                            );
+                        }
+                    }
+                    if let Some(tx) = &event_tx {
                         let _ = tx
                             .send(BootEvent::StepFinished {
                                 id: name.clone(),
@@ -5656,7 +5703,7 @@ impl ProcessManager {
     }
 
     async fn wait_for_https_proxy_listener(&self) -> Result<()> {
-        tokio::time::timeout(SERVICE_READINESS_TIMEOUT, async {
+        tokio::time::timeout(PROXY_READINESS_TIMEOUT, async {
             loop {
                 self.ensure_accepting_new_lifecycle_request()?;
                 let ports_changed = self.proxy_ports_changed.notified();
@@ -5673,7 +5720,7 @@ impl ProcessManager {
         .map_err(|_| {
             anyhow::anyhow!(
                 "locald's HTTPS proxy listener did not become ready within {}s; inspect daemon logs and run `locald doctor`; repair standard mode with `sudo locald admin setup`, or provide valid local CA material in sandbox mode",
-                SERVICE_READINESS_TIMEOUT.as_secs()
+                PROXY_READINESS_TIMEOUT.as_secs()
             )
         })?
     }
@@ -23304,7 +23351,7 @@ PATH = "/usr/bin:/bin"
             .expect("readiness task joins")
             .expect_err("assigned TCP port never became ready");
         let message = format!("{error:#}");
-        assert!(message.contains("timed out after 30s"));
+        assert!(message.contains("timed out after 300s"));
         assert!(message.contains("TCP probe on the assigned endpoint"));
         assert!(message.contains("last runtime was running"));
         assert!(!message.contains("41237"));
@@ -24181,12 +24228,23 @@ PATH = "/usr/bin:/bin"
         .await
         .expect("EnsureProject reaches readiness polling");
         tokio::time::pause();
-        tokio::time::advance(SERVICE_READINESS_TIMEOUT).await;
+        let former_deadline = Duration::from_secs(30);
+        tokio::time::advance(former_deadline).await;
+        assert!(
+            !ensure.is_finished(),
+            "a normal cold build may continue beyond the former 30-second deadline"
+        );
+        tokio::time::advance(
+            SERVICE_READINESS_TIMEOUT
+                .checked_sub(former_deadline)
+                .expect("service readiness exceeds the former deadline"),
+        )
+        .await;
         let error = ensure
             .await
             .expect("join timed EnsureProject")
             .expect_err("unbound assigned endpoint times out");
-        assert!(format!("{error:#}").contains("timed out after 30s"));
+        assert!(format!("{error:#}").contains("timed out after 300s"));
 
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
@@ -24203,7 +24261,12 @@ PATH = "/usr/bin:/bin"
                 .await
                 .expect("read timed EnsureProject failure")
                 .last_convergence_error()
-                .is_some_and(|message| message.contains("timed out after 30s"))
+                .is_some_and(|message| message.contains("timed out after 300s"))
+        );
+        assert_eq!(
+            manager.services.lock().await["timed-ensure:web"].health_status,
+            HealthStatus::Starting,
+            "a live owned runtime remains eligible to finish after the caller's deadline"
         );
     }
 
@@ -24292,7 +24355,7 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("first ensure task joins")
             .expect_err("first controller never binds its assigned port");
-        assert!(format!("{error:#}").contains("timed out after 30s"));
+        assert!(format!("{error:#}").contains("timed out after 300s"));
 
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
@@ -24311,19 +24374,43 @@ PATH = "/usr/bin:/bin"
         assert!(
             failed
                 .last_convergence_error()
-                .is_some_and(|message| message.contains("timed out after 30s"))
+                .is_some_and(|message| message.contains("timed out after 300s"))
         );
         assert_eq!(
             manager.services.lock().await["retry-readiness:db"].health_status,
-            HealthStatus::Unhealthy
+            HealthStatus::Starting
         );
 
-        manager
-            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+        let assigned_port = manager.services.lock().await["retry-readiness:db"]
+            .sticky_port
+            .expect("timed-out endpoint retains its assigned port");
+        let listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, assigned_port))
+                .await
+                .expect("make the original owned runtime endpoint ready");
+        let retry = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.converge_project_availability(&project_path).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(SERVICE_READINESS_POLL_INTERVAL).await;
+        retry
             .await
-            .expect("retry binds the assigned port and becomes ready");
-        assert_eq!(creates.load(Ordering::SeqCst), 3);
-        assert_eq!(stops.load(Ordering::SeqCst), 1);
+            .expect("retry readiness task joins")
+            .expect("automatic retry waits for the original runtime and becomes ready")
+            .expect("project remains availability-managed");
+        drop(listener);
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            2,
+            "retry preserves the first controller and only creates its dependent"
+        );
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "retry does not erase progress by stopping the original controller"
+        );
         assert!(manager.project_runtime_is_ready(instance_id).await);
         assert_eq!(
             availability
