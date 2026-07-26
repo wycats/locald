@@ -59,6 +59,11 @@ const LOG_BUFFER_SIZE: usize = 2000;
 // their endpoint. Keep that work bounded without treating a normal build like
 // the much shorter daemon-proxy startup check.
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+// The periodic sweep visits every managed project serially. Preserve its
+// shorter budget so one cold or stuck project cannot defer convergence for all
+// later project instances for the full foreground readiness window.
+const BACKGROUND_SERVICE_READINESS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 const PROXY_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -447,6 +452,33 @@ struct ConfigApplyOutcome {
     pending_initial: Option<PendingInitialAvailabilityGuard>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ConfigApplyOptions<'a> {
+    start_services: bool,
+    service_activation: Option<&'a str>,
+    service_readiness_timeout: std::time::Duration,
+}
+
+impl<'a> ConfigApplyOptions<'a> {
+    const fn foreground(start_services: bool, service_activation: Option<&'a str>) -> Self {
+        Self {
+            start_services,
+            service_activation,
+            service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
+        }
+    }
+
+    const fn start_all_with_readiness_timeout(
+        service_readiness_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            start_services: true,
+            service_activation: None,
+            service_readiness_timeout,
+        }
+    }
+}
+
 impl Drop for PendingInitialAvailabilityGuard {
     fn drop(&mut self) {
         self.pending
@@ -482,6 +514,7 @@ struct AvailabilityConvergenceOptions {
     verbose: bool,
     apply_config_when_up: bool,
     defer_config_reload_during_cooldown: bool,
+    service_readiness_timeout: std::time::Duration,
 }
 
 struct CataloguedStartRequest {
@@ -594,6 +627,10 @@ pub struct ProcessManager {
     shutting_down: Arc<AtomicBool>,
     #[cfg(test)]
     config_publication_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
+    readiness_wait_hook: Arc<StdMutex<Option<Arc<Notify>>>>,
+    #[cfg(test)]
+    readiness_wait_timeout: Arc<StdMutex<Option<std::time::Duration>>>,
 }
 
 impl ProcessManager {
@@ -848,6 +885,10 @@ impl ProcessManager {
             shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             config_publication_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            readiness_wait_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            readiness_wait_timeout: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -874,6 +915,30 @@ impl ProcessManager {
         if let Some(hook) = hook {
             hook.reached.notify_one();
             hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_readiness_wait_hook(&self, hook: Arc<Notify>) {
+        *self
+            .readiness_wait_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn notify_readiness_wait_hook(&self, readiness_timeout: std::time::Duration) {
+        *self
+            .readiness_wait_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(readiness_timeout);
+        if let Some(hook) = self
+            .readiness_wait_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hook.notify_one();
         }
     }
 
@@ -1262,8 +1327,19 @@ impl ProcessManager {
                 }
                 Some((_, _, current_config, current_env, Some(controller), health_status)) => {
                     let controller = controller.lock().await;
-                    let is_running = controller.read_state().await.status
-                        == locald_core::state::ServiceState::Running;
+                    let runtime_status = controller.read_state().await.status;
+                    let runtime_is_reusable = matches!(
+                        (runtime_status, health_status, service_config),
+                        (
+                            ServiceState::Running,
+                            HealthStatus::Healthy | HealthStatus::Starting,
+                            _
+                        ) | (
+                            ServiceState::Building,
+                            HealthStatus::Starting,
+                            ServiceConfig::Typed(TypedServiceConfig::Site(_))
+                        )
+                    );
                     let has_durable_process_ownership =
                         !Self::requires_durable_process_ownership(service_config)
                             || (controller.owned_process_id().is_some()
@@ -1274,11 +1350,7 @@ impl ProcessManager {
                     (
                         true,
                         !dependency_will_change
-                            && is_running
-                            && matches!(
-                                health_status,
-                                HealthStatus::Healthy | HealthStatus::Starting
-                            )
+                            && runtime_is_reusable
                             && has_durable_process_ownership
                             && current_config == *service_config
                             && environment_matches,
@@ -1867,8 +1939,21 @@ impl ProcessManager {
         )
     }
 
+    #[cfg(test)]
     async fn wait_for_health(&self, name: &str, instance_id: ProjectInstanceId) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + SERVICE_READINESS_TIMEOUT;
+        self.wait_for_health_with_timeout(name, instance_id, SERVICE_READINESS_TIMEOUT)
+            .await
+    }
+
+    async fn wait_for_health_with_timeout(
+        &self,
+        name: &str,
+        instance_id: ProjectInstanceId,
+        readiness_timeout: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + readiness_timeout;
+        #[cfg(test)]
+        self.notify_readiness_wait_hook(readiness_timeout);
 
         loop {
             self.availability_allows_inflight_transition(instance_id)
@@ -2088,7 +2173,7 @@ impl ProcessManager {
                     }
                     anyhow::bail!(
                         "service `{name}` timed out after {}s waiting for {}; last runtime was {} with controller health {}, last readiness was {} ({}), and the owned runtime {}",
-                        SERVICE_READINESS_TIMEOUT.as_secs(),
+                        readiness_timeout.as_secs(),
                         requirement.description(),
                         runtime_status,
                         controller_health,
@@ -2368,8 +2453,7 @@ impl ProcessManager {
                 event_tx,
                 verbose,
                 Some(ConfigIdentityExpectation::Initial(initial_identity)),
-                false,
-                None,
+                ConfigApplyOptions::foreground(false, None),
             )
             .await?;
         let pending = outcome
@@ -2556,6 +2640,26 @@ impl ProcessManager {
         expected_instance: Option<ProjectInstanceId>,
         reject_forgotten: bool,
     ) -> Result<()> {
+        self.apply_config_for_instance_with_readiness_timeout(
+            path,
+            event_tx,
+            verbose,
+            expected_instance,
+            reject_forgotten,
+            SERVICE_READINESS_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn apply_config_for_instance_with_readiness_timeout(
+        &self,
+        path: PathBuf,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        expected_instance: Option<ProjectInstanceId>,
+        reject_forgotten: bool,
+        service_readiness_timeout: std::time::Duration,
+    ) -> Result<()> {
         let (path, transition_lock) = self.transition_lock_for_path(&path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
@@ -2567,8 +2671,7 @@ impl ProcessManager {
             event_tx,
             verbose,
             expected_instance.map(ConfigIdentityExpectation::Existing),
-            true,
-            None,
+            ConfigApplyOptions::start_all_with_readiness_timeout(service_readiness_timeout),
         )
         .await
         .map(|_| ())
@@ -2580,9 +2683,13 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
         expected_instance: Option<ConfigIdentityExpectation>,
-        start_services: bool,
-        service_activation: Option<&str>,
+        options: ConfigApplyOptions<'_>,
     ) -> Result<ConfigApplyOutcome> {
+        let ConfigApplyOptions {
+            start_services,
+            service_activation,
+            service_readiness_timeout,
+        } = options;
         self.ensure_accepting_lifecycle_requests()?;
         let discovery_before_config = Registry::discover(path.clone()).await?;
         let physical_identity_before_config =
@@ -2974,7 +3081,12 @@ impl ProcessManager {
                     match health_status {
                         HealthStatus::Healthy => {}
                         HealthStatus::Starting => {
-                            self.wait_for_health(&name, instance_id).await?;
+                            self.wait_for_health_with_timeout(
+                                &name,
+                                instance_id,
+                                service_readiness_timeout,
+                            )
+                            .await?;
                         }
                         status @ (HealthStatus::Unknown | HealthStatus::Unhealthy) => {
                             anyhow::bail!(
@@ -3263,7 +3375,10 @@ impl ProcessManager {
 
             // Wait for health before starting next service (which might depend on this one)
             info!("Waiting for service {} to be ready...", name);
-            if let Err(e) = self.wait_for_health(&name, instance_id).await {
+            if let Err(e) = self
+                .wait_for_health_with_timeout(&name, instance_id, service_readiness_timeout)
+                .await
+            {
                 error!("Dependency failed: {}", e);
                 return Err(e);
             }
@@ -3355,8 +3470,7 @@ impl ProcessManager {
                     None,
                     false,
                     Some(ConfigIdentityExpectation::Existing(instance_id)),
-                    true,
-                    Some(name),
+                    ConfigApplyOptions::foreground(true, Some(name)),
                 )
                 .await
                 .map(|_| ());
@@ -3702,8 +3816,7 @@ impl ProcessManager {
                     None,
                     false,
                     Some(ConfigIdentityExpectation::Existing(instance_id)),
-                    true,
-                    None,
+                    ConfigApplyOptions::foreground(true, None),
                 )
                 .await
                 .map(|_| ());
@@ -3735,8 +3848,7 @@ impl ProcessManager {
             None,
             false,
             Some(ConfigIdentityExpectation::Existing(instance_id)),
-            true,
-            None,
+            ConfigApplyOptions::foreground(true, None),
         )
         .await
         .map(|_| ())
@@ -3849,8 +3961,7 @@ impl ProcessManager {
             None,
             false,
             Some(ConfigIdentityExpectation::Existing(instance_id)),
-            true,
-            None,
+            ConfigApplyOptions::foreground(true, None),
         )
         .await?;
 
@@ -4943,7 +5054,13 @@ impl ProcessManager {
             let _runtime_guard = coordinator.runtime.lock().await;
             self.clear_service_stop_suppressions(instance_id).await;
             let decision = self
-                .converge_managed_instance_locked(instance_id, None, false, true)
+                .converge_managed_instance_locked(
+                    instance_id,
+                    None,
+                    false,
+                    true,
+                    SERVICE_READINESS_TIMEOUT,
+                )
                 .await?;
             if !matches!(decision, ConvergenceDecision::EnsureUp) {
                 return Err(AvailabilityStartSuperseded {
@@ -4968,8 +5085,14 @@ impl ProcessManager {
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
             self.clear_service_stop_suppressions(instance_id).await;
-            self.converge_managed_instance_locked(instance_id, None, false, false)
-                .await?;
+            self.converge_managed_instance_locked(
+                instance_id,
+                None,
+                false,
+                false,
+                SERVICE_READINESS_TIMEOUT,
+            )
+            .await?;
         }
         Ok(None)
     }
@@ -5621,7 +5744,13 @@ impl ProcessManager {
 
             self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_managed_instance_locked(instance_id, event_tx, verbose, true)
+                .converge_managed_instance_locked(
+                    instance_id,
+                    event_tx,
+                    verbose,
+                    true,
+                    SERVICE_READINESS_TIMEOUT,
+                )
                 .await;
             let decision = Self::surface_availability_durability(convergence, durability_error)?;
             if !matches!(decision, ConvergenceDecision::EnsureUp) {
@@ -5828,7 +5957,13 @@ impl ProcessManager {
             let _runtime_guard = coordinator.runtime.lock().await;
             self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_managed_instance_locked(instance_id, None, false, false)
+                .converge_managed_instance_locked(
+                    instance_id,
+                    None,
+                    false,
+                    false,
+                    SERVICE_READINESS_TIMEOUT,
+                )
                 .await;
             Self::surface_availability_durability(convergence, durability_error)?;
             Ok(result.expect("successful availability publication returns its demand result"))
@@ -7235,8 +7370,14 @@ impl ProcessManager {
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
             self.clear_service_stop_suppressions(instance_id).await;
-            self.converge_managed_instance_locked(instance_id, None, false, false)
-                .await?;
+            self.converge_managed_instance_locked(
+                instance_id,
+                None,
+                false,
+                false,
+                SERVICE_READINESS_TIMEOUT,
+            )
+            .await?;
         } else {
             self.converge_managed_instance(instance_id, None, false, false)
                 .await?;
@@ -7469,7 +7610,13 @@ impl ProcessManager {
             match self.availability_is_managed(instance_id).await {
                 Ok(true) => {
                     if let Err(error) = self
-                        .converge_managed_instance(instance_id, None, false, false)
+                        .converge_managed_instance_with_readiness_timeout(
+                            instance_id,
+                            None,
+                            false,
+                            false,
+                            BACKGROUND_SERVICE_READINESS_TIMEOUT,
+                        )
                         .await
                     {
                         warn!("Failed to converge availability for {instance_id}: {error:#}");
@@ -8056,6 +8203,7 @@ impl ProcessManager {
                         verbose: false,
                         apply_config_when_up: true,
                         defer_config_reload_during_cooldown: true,
+                        service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
                     },
                 )
                 .await?;
@@ -8082,6 +8230,7 @@ impl ProcessManager {
                         verbose: false,
                         apply_config_when_up: true,
                         defer_config_reload_during_cooldown: true,
+                        service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
                     },
                 )
                 .await?;
@@ -8099,10 +8248,34 @@ impl ProcessManager {
         verbose: bool,
         apply_config_when_up: bool,
     ) -> Result<ConvergenceDecision> {
+        self.converge_managed_instance_with_readiness_timeout(
+            instance_id,
+            event_tx,
+            verbose,
+            apply_config_when_up,
+            SERVICE_READINESS_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn converge_managed_instance_with_readiness_timeout(
+        &self,
+        instance_id: ProjectInstanceId,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        apply_config_when_up: bool,
+        service_readiness_timeout: std::time::Duration,
+    ) -> Result<ConvergenceDecision> {
         let coordinator = self.availability_coordinator(instance_id).await;
         let _runtime_guard = coordinator.runtime.lock().await;
-        self.converge_managed_instance_locked(instance_id, event_tx, verbose, apply_config_when_up)
-            .await
+        self.converge_managed_instance_locked(
+            instance_id,
+            event_tx,
+            verbose,
+            apply_config_when_up,
+            service_readiness_timeout,
+        )
+        .await
     }
 
     async fn converge_managed_instance_locked(
@@ -8111,6 +8284,7 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
         apply_config_when_up: bool,
+        service_readiness_timeout: std::time::Duration,
     ) -> Result<ConvergenceDecision> {
         self.ensure_accepting_lifecycle_requests()?;
         self.watch_active_instance(instance_id).await;
@@ -8123,6 +8297,7 @@ impl ProcessManager {
                     verbose,
                     apply_config_when_up,
                     defer_config_reload_during_cooldown: false,
+                    service_readiness_timeout,
                 },
             )
             .await?;
@@ -8219,12 +8394,13 @@ impl ProcessManager {
                         || !self.project_runtime_is_ready(instance_id).await;
                     if should_apply {
                         let action = async {
-                            self.apply_config_for_instance(
+                            self.apply_config_for_instance_with_readiness_timeout(
                                 project_path,
                                 event_tx.clone(),
                                 options.verbose,
                                 Some(instance_id),
                                 false,
+                                options.service_readiness_timeout,
                             )
                             .await?;
                             anyhow::ensure!(
@@ -24087,6 +24263,193 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn background_convergence_bounds_readiness_before_visiting_later_projects() {
+        let dir = tempdir().expect("create background convergence directory");
+        let first_path = dir.path().join("first-project");
+        let second_path = dir.path().join("second-project");
+        std::fs::create_dir_all(&first_path).expect("create first project");
+        std::fs::create_dir_all(&second_path).expect("create second project");
+
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        for path in [&first_path, &second_path] {
+            let discovery = Registry::discover(
+                std::fs::canonicalize(path).expect("canonical background project"),
+            )
+            .await
+            .expect("discover background project");
+            catalog
+                .register_project(discovery, None)
+                .expect("register background project");
+        }
+        catalog.save().await.expect("save background catalog");
+        let ordered_instances = catalog
+            .instances
+            .iter()
+            .map(|(instance_id, record)| {
+                (
+                    *instance_id,
+                    record
+                        .current_path
+                        .clone()
+                        .expect("background project remains present"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (slow_instance, slow_path) = &ordered_instances[0];
+        let (later_instance, later_path) = &ordered_instances[1];
+
+        for (path, name) in [
+            (slow_path, "background-slow"),
+            (later_path, "background-later"),
+        ] {
+            std::fs::write(
+                path.join("locald.toml"),
+                format!(
+                    r#"
+[project]
+name = "{name}"
+domain = "{name}.localhost"
+
+[services.web]
+command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#
+                ),
+            )
+            .expect("write background project config");
+        }
+
+        let availability_data_dir = dir.path().join("availability-data");
+        for instance_id in [*slow_instance, *later_instance] {
+            let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+                .await
+                .expect("load background availability");
+            availability
+                .ensure_demand(DemandKey::manual_cli())
+                .await
+                .expect("demand background project");
+        }
+
+        let mut manager = ProcessManager::new_with_availability_data_dir(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir.clone(),
+        )
+        .expect("create background convergence manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let readiness_observed = Arc::new(tokio::sync::Notify::new());
+        manager.set_readiness_wait_hook(readiness_observed.clone());
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: creates.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        for (instance_id, path) in &ordered_instances {
+            assert!(
+                manager
+                    .availability_is_managed(*instance_id)
+                    .await
+                    .expect("classify background availability")
+            );
+            assert!(
+                manager.path_matches_instance(path, *instance_id).await,
+                "background catalog identity resolves before convergence"
+            );
+        }
+
+        let sweep = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.converge_all_project_availability().await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_observed.notified())
+            .await
+            .expect("the first background project enters its readiness wait");
+        assert_eq!(
+            *manager
+                .readiness_wait_timeout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(BACKGROUND_SERVICE_READINESS_TIMEOUT)
+        );
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.services.lock().await["background-slow:web"].health_status,
+            HealthStatus::Starting
+        );
+        tokio::time::pause();
+
+        tokio::time::advance(
+            BACKGROUND_SERVICE_READINESS_TIMEOUT
+                .checked_sub(Duration::from_millis(1))
+                .expect("background readiness exceeds one millisecond"),
+        )
+        .await;
+        assert!(!sweep.is_finished());
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            1,
+            "later projects wait only for the bounded background deadline"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::resume();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if creates.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the sweep visits the later project at the background deadline");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, sweep)
+            .await
+            .expect("the sweep completes after visiting the later project")
+            .expect("background convergence task joins");
+
+        assert_eq!(creates.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            manager.services.lock().await["background-slow:web"].health_status,
+            HealthStatus::Starting,
+            "the slow owned runtime remains eligible to finish"
+        );
+        assert_eq!(
+            manager.services.lock().await["background-later:web"].health_status,
+            HealthStatus::Healthy,
+            "the later project converges in the same sweep"
+        );
+        let slow_snapshot = AvailabilityStore::load(&availability_data_dir, *slow_instance)
+            .await
+            .expect("reload slow availability")
+            .snapshot()
+            .await
+            .expect("read slow convergence result");
+        assert!(
+            slow_snapshot
+                .last_convergence_error()
+                .is_some_and(|message| message.contains("timed out after 30s"))
+        );
+        let later_snapshot = AvailabilityStore::load(&availability_data_dir, *later_instance)
+            .await
+            .expect("reload later availability")
+            .snapshot()
+            .await
+            .expect("read later convergence result");
+        assert_eq!(later_snapshot.last_convergence_error(), None);
+    }
+
+    #[tokio::test]
     async fn concurrent_ensure_project_calls_share_one_runtime_transition() {
         let dir = tempdir().expect("create concurrent EnsureProject directory");
         let project_path = dir.path().join("concurrent-ensure-project");
@@ -24676,7 +25039,7 @@ command = "api"
     }
 
     #[tokio::test]
-    async fn prepublication_plan_reuses_non_process_services_without_process_identity() {
+    async fn prepublication_plan_reuses_building_site_without_process_identity() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("managed-reload-project");
         let manager = ProcessManager::new(
@@ -24703,27 +25066,32 @@ path = "docs"
 "#,
         )
         .expect("parse managed service config");
-        let running_state = RuntimeState {
-            pid: None,
-            port: None,
-            status: ServiceState::Running,
-            health_status: HealthStatus::Healthy,
-        };
         {
             let mut services = manager.services.lock().await;
             for name in ["db", "docs"] {
-                let controller: Arc<Mutex<dyn ServiceController>> = Arc::new(Mutex::new(
-                    TestController::new(format!("managed-reload:{name}"), running_state.clone()),
-                ));
-                services.insert(
-                    format!("managed-reload:{name}"),
-                    test_service(
-                        config.clone(),
-                        config.services[name].clone(),
-                        ServiceRuntime::Controller(controller),
-                        project_path.clone(),
-                    ),
+                let (runtime_status, health_status) = if name == "docs" {
+                    (ServiceState::Building, HealthStatus::Starting)
+                } else {
+                    (ServiceState::Running, HealthStatus::Healthy)
+                };
+                let controller: Arc<Mutex<dyn ServiceController>> =
+                    Arc::new(Mutex::new(TestController::new(
+                        format!("managed-reload:{name}"),
+                        RuntimeState {
+                            pid: None,
+                            port: None,
+                            status: runtime_status,
+                            health_status,
+                        },
+                    )));
+                let mut service = test_service(
+                    config.clone(),
+                    config.services[name].clone(),
+                    ServiceRuntime::Controller(controller),
+                    project_path.clone(),
                 );
+                service.health_status = health_status;
+                services.insert(format!("managed-reload:{name}"), service);
             }
         }
         let desired_service_names = HashSet::from([
