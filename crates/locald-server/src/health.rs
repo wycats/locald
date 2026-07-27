@@ -4,6 +4,8 @@ use locald_core::config::{
 };
 use locald_core::state::{HealthSource, HealthStatus};
 use locald_core::{ProjectInstanceId, SharedDomainIndex};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -174,6 +176,57 @@ impl ReadinessRequirement {
             | Self::ControllerAndAssignedPortTcp { .. } => HealthSource::Tcp,
             Self::ExplicitCommand { .. } => HealthSource::Command,
             Self::ProcessRunning => HealthSource::Explicit,
+        }
+    }
+
+    /// Evaluate the configured endpoint or command side of readiness once.
+    ///
+    /// Controller state and process ownership remain manager-owned evidence.
+    /// This probe is used when a preserved controller may have completed after
+    /// the foreground readiness deadline but before the health monitor
+    /// published its projection.
+    pub(crate) async fn probe_once(
+        &self,
+        cwd: Option<&Path>,
+        env: &HashMap<String, String>,
+        budget: Duration,
+    ) -> bool {
+        match self {
+            Self::ExplicitHttp {
+                port,
+                path,
+                timeout,
+                ..
+            } => {
+                locald_utils::probe::check_http(
+                    &format!("http://127.0.0.1:{port}{path}"),
+                    (*timeout).min(budget),
+                )
+                .await
+            }
+            Self::ExplicitTcp { port, timeout, .. } => {
+                locald_utils::probe::check_tcp(&format!("127.0.0.1:{port}"), (*timeout).min(budget))
+                    .await
+            }
+            Self::ExplicitCommand {
+                command, timeout, ..
+            } => {
+                locald_utils::probe::check_command_with_env(
+                    command,
+                    cwd,
+                    env,
+                    (*timeout).min(budget),
+                )
+                .await
+            }
+            Self::AssignedPortTcp { port } | Self::ControllerAndAssignedPortTcp { port } => {
+                locald_utils::probe::check_tcp(
+                    &format!("127.0.0.1:{port}"),
+                    Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS).min(budget),
+                )
+                .await
+            }
+            Self::ProcessRunning => true,
         }
     }
 }
@@ -347,6 +400,9 @@ impl HealthMonitor {
                     );
                     service.health_status = status;
                     service.health_source = source;
+                    if status == HealthStatus::Healthy {
+                        service.pending_port_guard = None;
+                    }
                     let projection_generation =
                         crate::manager::ProcessManager::advance_service_projection(service);
 
@@ -831,6 +887,7 @@ mod tests {
                 TestController::unknown(),
             ))),
             sticky_port,
+            pending_port_guard: None,
             path: std::path::PathBuf::from("/readiness-test"),
             health_status: HealthStatus::Starting,
             health_source: HealthSource::None,
@@ -913,6 +970,26 @@ mod tests {
             .expect("derive fail-closed container endpoint readiness"),
             ReadinessRequirement::ControllerAndAssignedPortTcp { port: 4125 }
         ));
+    }
+
+    #[tokio::test]
+    async fn one_shot_readiness_command_probe_respects_the_callers_budget() {
+        let requirement = ReadinessRequirement::ExplicitCommand {
+            command: "sleep 60".to_owned(),
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+        };
+        let started = std::time::Instant::now();
+
+        assert!(
+            !requirement
+                .probe_once(None, &HashMap::new(), Duration::from_millis(20))
+                .await
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a catch-up probe must remain inside the caller's convergence budget"
+        );
     }
 
     #[test]
@@ -1336,6 +1413,7 @@ mod tests {
                     TestController::unknown(),
                 ))),
                 sticky_port: None,
+                pending_port_guard: None,
                 path: std::path::PathBuf::from("/second"),
                 health_status: HealthStatus::Unknown,
                 health_source: HealthSource::None,
@@ -1424,6 +1502,7 @@ mod tests {
                 resolved_env: HashMap::new(),
                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                 sticky_port: None,
+                pending_port_guard: None,
                 path: std::path::PathBuf::from("/app"),
                 health_status: HealthStatus::Unknown,
                 health_source: HealthSource::None,
