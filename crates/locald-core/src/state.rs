@@ -13,6 +13,7 @@
 //! assert_eq!(HealthStatus::Unknown.to_string(), "unknown");
 //! ```
 use crate::config::LocaldConfig;
+use crate::service::ServiceKey;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -135,6 +136,8 @@ pub struct PersistedProcessIdentity {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PersistedServiceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_key: Option<ServiceKey>,
     pub name: String,
     pub config: LocaldConfig,
     pub path: PathBuf,
@@ -161,6 +164,7 @@ mod tests {
 
     fn service_state(process_identity: Option<PersistedProcessIdentity>) -> PersistedServiceState {
         PersistedServiceState {
+            service_key: None,
             name: "example:web".to_owned(),
             config: LocaldConfig::default(),
             path: PathBuf::from("/tmp/example"),
@@ -186,6 +190,22 @@ mod tests {
             serde_json::from_value(value).expect("deserialize legacy service state");
         assert!(decoded.process_identity.is_none());
         assert_eq!(decoded.pid, Some(42));
+    }
+
+    #[test]
+    fn service_key_round_trip_preserves_instance_namespace() {
+        let instance = "00000000-0000-4000-8000-000000000001"
+            .parse()
+            .expect("valid project instance ID");
+        let key = ServiceKey::new(instance, "web");
+        let mut state = service_state(None);
+        state.service_key = Some(key.clone());
+
+        let encoded = serde_json::to_vec(&state).expect("serialize keyed service state");
+        let decoded: PersistedServiceState =
+            serde_json::from_slice(&encoded).expect("deserialize keyed service state");
+
+        assert_eq!(decoded.service_key, Some(key));
     }
 
     #[test]

@@ -5,12 +5,93 @@
 //! `prepare` -> `start` -> `stop`, where `prepare` handles heavyweight setup
 //! (downloads, builds) and `start` is fast and idempotent.
 use crate::config::ServiceConfig;
+use crate::identity::ProjectInstanceId;
 use crate::ipc::{LogEntry, ServiceMetrics};
 use crate::state::{HealthStatus, PersistedProcessIdentity, ServiceState};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
+
+/// The configured name of one service within a locald project.
+///
+/// Service names are meaningful only inside their owning project instance.
+/// Runtime registries therefore use [`ServiceKey`] instead of a display name
+/// such as `project:web`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ServiceName(String);
+
+impl ServiceName {
+    /// Construct a service name from its exact configured value.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Return the exact configured value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ServiceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl From<&str> for ServiceName {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl From<String> for ServiceName {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+/// The stable runtime identity of one service in one physical project
+/// instance.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ServiceKey {
+    instance: ProjectInstanceId,
+    name: ServiceName,
+}
+
+impl ServiceKey {
+    /// Construct an instance-scoped service key.
+    #[must_use]
+    pub fn new(instance: ProjectInstanceId, name: impl Into<ServiceName>) -> Self {
+        Self {
+            instance,
+            name: name.into(),
+        }
+    }
+
+    /// Return the owning physical project instance.
+    #[must_use]
+    pub const fn instance(&self) -> ProjectInstanceId {
+        self.instance
+    }
+
+    /// Return the configured service name.
+    #[must_use]
+    pub const fn name(&self) -> &ServiceName {
+        &self.name
+    }
+
+    /// Render the existing human-facing `project:service` label.
+    #[must_use]
+    pub fn display_name(&self, project_name: &str) -> String {
+        format!("{project_name}:{}", self.name)
+    }
+}
 
 /// The dynamic runtime state of a service.
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +197,7 @@ use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct ServiceContext {
+    pub key: ServiceKey,
     pub project_root: PathBuf,
     pub port: Option<u16>,
     pub env: HashMap<String, String>,

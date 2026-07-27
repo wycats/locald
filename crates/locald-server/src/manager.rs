@@ -30,7 +30,9 @@ use locald_core::ipc::{
 };
 use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
-use locald_core::service::{ServiceContext, ServiceController, ServiceFactory};
+use locald_core::service::{
+    ServiceContext, ServiceController, ServiceFactory, ServiceKey, ServiceName,
+};
 use locald_core::state::{
     HealthSource, HealthStatus, PersistedProcessIdentity, PersistedServiceState, ServerState,
     ServiceState,
@@ -315,16 +317,17 @@ impl Service {}
 
 #[derive(Debug)]
 struct ConfigTransitionPlan {
-    removed_service_names: Vec<String>,
-    restart_service_names: Vec<String>,
-    reusable_service_envs: HashMap<String, HashMap<String, String>>,
-    stopped_service_projections: HashMap<String, (ServiceConfig, Option<HashMap<String, String>>)>,
+    removed_service_names: Vec<ServiceKey>,
+    restart_service_names: Vec<ServiceKey>,
+    reusable_service_envs: HashMap<ServiceKey, HashMap<String, String>>,
+    stopped_service_projections:
+        HashMap<ServiceKey, (ServiceConfig, Option<HashMap<String, String>>)>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PrepublicationStopOptions<'a> {
     sorted_services: &'a [String],
-    desired_service_names: &'a HashSet<String>,
+    desired_service_names: &'a HashSet<ServiceKey>,
     readiness_probe_budget: std::time::Duration,
 }
 
@@ -605,11 +608,11 @@ pub(crate) enum RuntimeSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct ProcessManager {
-    services: Arc<Mutex<HashMap<String, Service>>>,
+    services: Arc<Mutex<HashMap<ServiceKey, Service>>>,
     pub log_sender: broadcast::Sender<LogEntry>,
     pub(crate) instance_log_sender: broadcast::Sender<InstanceLogEntry>,
     pub event_sender: broadcast::Sender<Event>,
-    log_buffers: Arc<StdMutex<HashMap<String, InstanceLogBuffer>>>,
+    log_buffers: Arc<StdMutex<HashMap<ServiceKey, InstanceLogBuffer>>>,
     state_manager: Arc<StateManager>,
     runtime: Arc<Runtime>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
@@ -635,7 +638,7 @@ pub struct ProcessManager {
     // A named service stop is a daemon-memory, one-off runtime override. It
     // survives automatic availability convergence without rewriting project
     // availability, and explicit lifecycle actions or daemon restart clear it.
-    service_stop_suppressions: Arc<Mutex<HashSet<(ProjectInstanceId, String)>>>,
+    service_stop_suppressions: Arc<Mutex<HashSet<ServiceKey>>>,
     availability_data_dir: PathBuf,
     availability_clock: SharedAvailabilityClock,
     lifecycle_journal: LifecycleJournal,
@@ -760,7 +763,8 @@ impl ProcessManager {
         name: &str,
     ) -> Option<Arc<tokio::sync::Mutex<dyn ServiceController>>> {
         let services = self.services.lock().await;
-        if let Some(service) = services.get(name) {
+        let key = Self::unique_service_key(&services, name).ok().flatten()?;
+        if let Some(service) = services.get(&key) {
             if let ServiceRuntime::Controller(c) = &service.runtime_state {
                 return Some(c.clone());
             }
@@ -1218,10 +1222,59 @@ impl ProcessManager {
             .unwrap_or(full_name)
     }
 
+    fn service_key(
+        instance_id: ProjectInstanceId,
+        configured_name: impl Into<ServiceName>,
+    ) -> ServiceKey {
+        ServiceKey::new(instance_id, configured_name)
+    }
+
+    fn service_display_name(key: &ServiceKey, service: &Service) -> String {
+        key.display_name(&service.config.project.name)
+    }
+
+    fn service_key_for_instance(
+        services: &HashMap<ServiceKey, Service>,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Option<ServiceKey> {
+        let legacy_configured_name = name
+            .split_once(':')
+            .map(|(_, configured_name)| configured_name);
+        services.iter().find_map(|(key, service)| {
+            (key.instance() == instance_id
+                && (key.name().as_str() == name
+                    || Self::service_display_name(key, service) == name
+                    || legacy_configured_name == Some(key.name().as_str())))
+            .then(|| key.clone())
+        })
+    }
+
+    fn unique_service_key(
+        services: &HashMap<ServiceKey, Service>,
+        name: &str,
+    ) -> Result<Option<ServiceKey>> {
+        let mut matches = services
+            .iter()
+            .filter(|(key, service)| Self::service_display_name(key, service) == name)
+            .map(|(key, _)| key.clone());
+        let first = matches.next();
+        if let Some(second) = matches.next() {
+            let first = first.as_ref().expect("second match requires first match");
+            anyhow::bail!(
+                "service `{name}` is ambiguous across project instances {} and {}",
+                first.instance(),
+                second.instance()
+            );
+        }
+        Ok(first)
+    }
+
     fn service_activation_closure(
+        instance_id: ProjectInstanceId,
         config: &LocaldConfig,
         selected_service: &str,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<HashSet<ServiceKey>> {
         let selected = Self::configured_service_name(selected_service, config);
         anyhow::ensure!(
             config.services.contains_key(selected),
@@ -1242,7 +1295,7 @@ impl ProcessManager {
 
         Ok(local_names
             .into_iter()
-            .map(|name| format!("{}:{name}", config.project.name))
+            .map(|name| Self::service_key(instance_id, name))
             .collect())
     }
 
@@ -1280,9 +1333,8 @@ impl ProcessManager {
             let services = self.services.lock().await;
             services
                 .iter()
-                .filter(|(name, service)| {
-                    service.instance_id == instance_id
-                        && !desired_service_names.contains(name.as_str())
+                .filter(|(key, _)| {
+                    key.instance() == instance_id && !desired_service_names.contains(*key)
                 })
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>()
@@ -1319,10 +1371,11 @@ impl ProcessManager {
                 })
                 .await
                 .ok();
-            let full_name = format!("{}:{service_name}", config.project.name);
+            let key = Self::service_key(instance_id, service_name.clone());
+            let full_name = key.display_name(&config.project.name);
             let service_snapshot = {
                 let services = self.services.lock().await;
-                services.get(&full_name).map(|service| {
+                services.get(&key).map(|service| {
                     let controller = match &service.runtime_state {
                         ServiceRuntime::Controller(controller) => Some(controller.clone()),
                         ServiceRuntime::None => None,
@@ -1427,19 +1480,17 @@ impl ProcessManager {
             };
 
             if is_stopped_projection {
-                stopped_service_projections.insert(
-                    full_name.clone(),
-                    (service_config.clone(), resolved_env.clone()),
-                );
+                stopped_service_projections
+                    .insert(key.clone(), (service_config.clone(), resolved_env.clone()));
             }
 
             if !is_up_to_date {
                 changed_services.insert(service_name.clone());
                 if has_controller {
-                    restart_service_names.push(full_name);
+                    restart_service_names.push(key);
                 }
             } else if let Some(resolved_env) = resolved_env {
-                reusable_service_envs.insert(full_name, resolved_env);
+                reusable_service_envs.insert(key, resolved_env);
             }
         }
 
@@ -1463,7 +1514,7 @@ impl ProcessManager {
     #[allow(clippy::significant_drop_tightening)]
     async fn get_service_status(
         &self,
-        name: &str,
+        key: &ServiceKey,
     ) -> Option<(ServiceStatus, ServiceProjectionToken)> {
         let proxy_ports = { *self.proxy_ports.lock().await };
         let (
@@ -1477,11 +1528,13 @@ impl ProcessManager {
             constellation,
             warnings,
             projection,
+            display_name,
         ) = {
             let mut services = self.services.lock().await;
-            let service = services.get_mut(name)?;
+            let service = services.get_mut(key)?;
+            let display_name = Self::service_display_name(key, service);
             // We reap here to ensure status is up to date for single service query too
-            Self::reap_dead_services(name, service);
+            Self::reap_dead_services(&display_name, service);
 
             let snapshot = match &service.runtime_state {
                 ServiceRuntime::Controller(c) => RuntimeSnapshot::Controller(c.clone()),
@@ -1493,7 +1546,7 @@ impl ProcessManager {
             };
 
             (
-                self.domain_for_service(service.instance_id, name),
+                self.domain_for_service(service.instance_id, &display_name),
                 Some(service.path.clone()),
                 service.health_status,
                 service.health_source,
@@ -1508,12 +1561,13 @@ impl ProcessManager {
                     projection_generation: service.projection_generation,
                     has_controller: matches!(service.runtime_state, ServiceRuntime::Controller(_)),
                 },
+                display_name,
             )
         };
 
         Some((
             Self::build_service_status(
-                name.to_string(),
+                display_name,
                 domain,
                 path,
                 proxy_ports,
@@ -1530,11 +1584,11 @@ impl ProcessManager {
         ))
     }
 
-    async fn broadcast_service_update(&self, name: &str) {
-        if let Some((status, projection)) = self.get_service_status(name).await {
+    async fn broadcast_service_update(&self, key: &ServiceKey) {
+        if let Some((status, projection)) = self.get_service_status(key).await {
             let services = self.services.lock().await;
             if services
-                .get(name)
+                .get(key)
                 .is_some_and(|service| projection.matches(service))
             {
                 let _ = self.event_sender.send(Event::ServiceUpdate(status));
@@ -1542,26 +1596,18 @@ impl ProcessManager {
         }
     }
 
-    fn clear_foreign_log_buffer(&self, name: &str, instance_id: ProjectInstanceId) {
+    fn clear_log_buffer(&self, key: &ServiceKey) {
         #[allow(clippy::expect_used)]
         self.log_buffers
             .lock()
             .expect("log buffer mutex poisoned")
-            .retain(|service_name, buffer| {
-                service_name != name || buffer.instance_id == instance_id
-            });
+            .remove(key);
     }
 
-    async fn broadcast_log(
-        &self,
-        instance_id: ProjectInstanceId,
-        controller_generation: u64,
-        entry: LogEntry,
-    ) {
+    async fn broadcast_log(&self, key: ServiceKey, controller_generation: u64, entry: LogEntry) {
         let services = self.services.lock().await;
-        let is_current_controller = services.get(&entry.service).is_some_and(|service| {
-            service.instance_id == instance_id
-                && service.controller_generation == controller_generation
+        let is_current_controller = services.get(&key).is_some_and(|service| {
+            service.controller_generation == controller_generation
                 && matches!(service.runtime_state, ServiceRuntime::Controller(_))
         });
         if !is_current_controller {
@@ -1574,17 +1620,9 @@ impl ProcessManager {
             #[allow(clippy::expect_used)]
             let mut buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
             let buffer = buffers
-                .entry(entry.service.clone())
-                .and_modify(|buffer| {
-                    if buffer.instance_id != instance_id {
-                        *buffer = InstanceLogBuffer {
-                            instance_id,
-                            logs: LogBuffer::new(LOG_BUFFER_SIZE),
-                        };
-                    }
-                })
+                .entry(key.clone())
                 .or_insert_with(|| InstanceLogBuffer {
-                    instance_id,
+                    instance_id: key.instance(),
                     logs: LogBuffer::new(LOG_BUFFER_SIZE),
                 });
             buffer.logs.push(entry.clone());
@@ -1592,7 +1630,7 @@ impl ProcessManager {
 
         // Broadcast (ignore error if no receivers)
         let _ = self.instance_log_sender.send(InstanceLogEntry {
-            instance_id,
+            instance_id: key.instance(),
             entry: entry.clone(),
         });
         let _ = self.log_sender.send(entry.clone());
@@ -1636,9 +1674,10 @@ impl ProcessManager {
         let mut services_data = Vec::new();
         {
             let services = self.services.lock().await;
-            for (name, service) in services.iter() {
+            for (key, service) in services.iter() {
                 services_data.push((
-                    name.clone(),
+                    key.clone(),
+                    Self::service_display_name(key, service),
                     service.instance_id,
                     service.config.clone(),
                     service.path.clone(),
@@ -1650,7 +1689,7 @@ impl ProcessManager {
         }
 
         let mut service_states = Vec::new();
-        for (name, instance_id, config, path, health_status, health_source, runtime) in
+        for (service_key, name, instance_id, config, path, health_status, health_source, runtime) in
             services_data
         {
             let (pid, process_identity, port, status, container_id) = match runtime {
@@ -1684,6 +1723,7 @@ impl ProcessManager {
             service_states.push((
                 instance_id,
                 PersistedServiceState {
+                    service_key: Some(service_key),
                     name,
                     config,
                     path,
@@ -1934,7 +1974,7 @@ impl ProcessManager {
                 .collect::<Vec<_>>()
         };
 
-        for (name, instance_id, controller_generation, controller) in candidates {
+        for (key, instance_id, controller_generation, controller) in candidates {
             let state = controller.lock().await.read_state().await;
             if state.pid != Some(pid) {
                 continue;
@@ -1942,7 +1982,7 @@ impl ProcessManager {
 
             {
                 let services = self.services.lock().await;
-                let Some(service) = services.get(&name).filter(|service| {
+                let Some(service) = services.get(&key).filter(|service| {
                     service.instance_id == instance_id
                         && service.controller_generation == controller_generation
                         && matches!(
@@ -1955,6 +1995,7 @@ impl ProcessManager {
                 let Ok(requirement) =
                     ReadinessRequirement::for_service(&service.service_config, service.sticky_port)
                 else {
+                    let name = Self::service_display_name(&key, service);
                     warn!(
                         "Ignoring readiness notification for service {name} with an invalid readiness contract"
                     );
@@ -1964,6 +2005,7 @@ impl ProcessManager {
                 // cannot replace the service's authoritative readiness
                 // contract. Endpoint services prove their assigned endpoint;
                 // portless workers prove owned-process liveness.
+                let name = Self::service_display_name(&key, service);
                 info!(
                     "Ignoring readiness notification for service {name}; its {} remains authoritative",
                     requirement.description()
@@ -2014,6 +2056,13 @@ impl ProcessManager {
         controller: &Arc<tokio::sync::Mutex<dyn ServiceController>>,
         requirement: &ReadinessRequirement,
     ) -> bool {
+        let key = {
+            let services = self.services.lock().await;
+            Self::service_key_for_instance(&services, instance_id, name)
+        };
+        let Some(key) = key else {
+            return false;
+        };
         let (runtime_state, owned_process_id) = {
             let controller = controller.lock().await;
             (controller.read_state().await, controller.owned_process_id())
@@ -2031,7 +2080,7 @@ impl ProcessManager {
         let (accepted, changed) = {
             let mut services = self.services.lock().await;
             services
-                .get_mut(name)
+                .get_mut(&key)
                 .filter(|service| {
                     service.instance_id == instance_id
                         && matches!(
@@ -2054,7 +2103,7 @@ impl ProcessManager {
                 })
         };
         if changed {
-            self.broadcast_service_update(name).await;
+            self.broadcast_service_update(&key).await;
         }
         accepted
     }
@@ -2078,6 +2127,11 @@ impl ProcessManager {
         instance_id: ProjectInstanceId,
         readiness_timeout: std::time::Duration,
     ) -> Result<()> {
+        let key = {
+            let services = self.services.lock().await;
+            Self::service_key_for_instance(&services, instance_id, name)
+        }
+        .with_context(|| format!("service `{name}` disappeared during readiness"))?;
         let deadline = tokio::time::Instant::now() + readiness_timeout;
         #[cfg(test)]
         self.notify_readiness_wait_hook(readiness_timeout);
@@ -2091,7 +2145,7 @@ impl ProcessManager {
             let (controller, controller_generation, requirement) = {
                 let services = self.services.lock().await;
                 let service = services
-                    .get(name)
+                    .get(&key)
                     .with_context(|| format!("service `{name}` disappeared during readiness"))?;
                 anyhow::ensure!(
                     service.instance_id == instance_id,
@@ -2117,7 +2171,7 @@ impl ProcessManager {
             let observation = {
                 let mut services = self.services.lock().await;
                 let service = services
-                    .get_mut(name)
+                    .get_mut(&key)
                     .with_context(|| format!("service `{name}` disappeared during readiness"))?;
                 anyhow::ensure!(
                     service.instance_id == instance_id,
@@ -2179,7 +2233,7 @@ impl ProcessManager {
 
             match observation {
                 Some(Ok(())) => {
-                    self.broadcast_service_update(name).await;
+                    self.broadcast_service_update(&key).await;
                     return Ok(());
                 }
                 Some(Err(reason)) => {
@@ -2194,7 +2248,7 @@ impl ProcessManager {
                     let (controller, controller_generation, requirement) = {
                         let services = self.services.lock().await;
                         let service = services
-                            .get(name)
+                            .get(&key)
                             .with_context(|| format!("service `{name}` disappeared during readiness"))?;
                         anyhow::ensure!(
                             service.instance_id == instance_id,
@@ -2230,7 +2284,7 @@ impl ProcessManager {
                     ) = {
                         let mut services = self.services.lock().await;
                         let service = services
-                            .get_mut(name)
+                            .get_mut(&key)
                             .with_context(|| format!("service `{name}` disappeared during readiness"))?;
                         anyhow::ensure!(
                             service.instance_id == instance_id,
@@ -2297,13 +2351,13 @@ impl ProcessManager {
                         )
                     };
                     if ready {
-                        self.broadcast_service_update(name).await;
+                        self.broadcast_service_update(&key).await;
                         return Ok(());
                     }
                     let (runtime_status, controller_health) = (state.status, state.health_status);
                     self.persist_state_checked().await?;
                     if readiness_changed {
-                        self.broadcast_service_update(name).await;
+                        self.broadcast_service_update(&key).await;
                     }
                     anyhow::bail!(
                         "service `{name}` timed out after {}s waiting for {}; last runtime was {} with controller health {}, last readiness was {} ({}), and the owned runtime {}",
@@ -2330,9 +2384,14 @@ impl ProcessManager {
         name: &str,
         instance_id: ProjectInstanceId,
     ) -> Result<()> {
+        let key = {
+            let services = self.services.lock().await;
+            Self::service_key_for_instance(&services, instance_id, name)
+        }
+        .with_context(|| format!("service `{name}` disappeared during readiness failure"))?;
         let changed = {
             let mut services = self.services.lock().await;
-            let service = services.get_mut(name).with_context(|| {
+            let service = services.get_mut(&key).with_context(|| {
                 format!("service `{name}` disappeared during readiness failure")
             })?;
             anyhow::ensure!(
@@ -2356,7 +2415,7 @@ impl ProcessManager {
         };
         self.persist_state_checked().await?;
         if changed {
-            self.broadcast_service_update(name).await;
+            self.broadcast_service_update(&key).await;
         }
         Ok(())
     }
@@ -2373,8 +2432,20 @@ impl ProcessManager {
         // Let's get everything we need in one go.
         let (service_config, port_result) = {
             let services = self.services.lock().await;
+            let key = if let Some(key) =
+                Self::service_key_for_instance(&services, expected_instance, name)
+            {
+                key
+            } else if let Some(key) = Self::unique_service_key(&services, name)? {
+                anyhow::bail!(
+                    "service `{name}` belongs to project instance {}, not requesting instance {expected_instance}",
+                    key.instance()
+                );
+            } else {
+                anyhow::bail!("Service {name} not found");
+            };
             let service = services
-                .get(name)
+                .get(&key)
                 .ok_or_else(|| anyhow::anyhow!("Service {name} not found"))?;
             anyhow::ensure!(
                 service.instance_id == expected_instance,
@@ -2889,9 +2960,6 @@ impl ProcessManager {
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
-        let service_activation = service_activation
-            .map(|selected| Self::service_activation_closure(&config, selected))
-            .transpose()?;
         for (service_name, service_config) in &config.services {
             let (effective_env, _) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config, None);
@@ -2900,11 +2968,6 @@ impl ProcessManager {
                     format!("service `{service_name}` contains an invalid environment reference")
                 })?;
         }
-        let desired_service_names = config
-            .services
-            .keys()
-            .map(|service_name| format!("{}:{service_name}", config.project.name))
-            .collect::<HashSet<_>>();
         let service_stop_suppressions = self.service_stop_suppressions.lock().await.clone();
         #[cfg(test)]
         self.wait_at_config_publication_hook().await;
@@ -2927,21 +2990,29 @@ impl ProcessManager {
             stopped_service_projections,
             pending_initial,
             trusted_launch_path,
+            service_activation,
         ) = {
             let mut registry = self.registry.lock().await;
             let catalog_base = registry.clone();
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            let service_activation = service_activation
+                .map(|selected| Self::service_activation_closure(instance_id, &config, selected))
+                .transpose()?;
+            let desired_service_names = config
+                .services
+                .keys()
+                .map(|service_name| Self::service_key(instance_id, service_name.clone()))
+                .collect::<HashSet<_>>();
             let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
             if start_services {
                 for (service_name, service_config) in &config.services {
-                    let full_name = format!("{}:{service_name}", config.project.name);
-                    let remains_stopped = service_stop_suppressions
-                        .contains(&(instance_id, full_name.clone()))
+                    let key = Self::service_key(instance_id, service_name.clone());
+                    let remains_stopped = service_stop_suppressions.contains(&key)
                         && !service_activation
                             .as_ref()
-                            .is_some_and(|activated| activated.contains(&full_name));
+                            .is_some_and(|activated| activated.contains(&key));
                     if remains_stopped {
                         continue;
                     }
@@ -3021,13 +3092,19 @@ impl ProcessManager {
                 self.availability_authorizes_start_locked(instance_id)
                     .await?;
             }
-            for name in &removed_service_names {
-                info!("Service {name} removed from config, stopping before domain publication...");
-                self.stop_service_instance_locked(name, instance_id).await?;
+            for key in &removed_service_names {
+                info!(
+                    "Service {} removed from config, stopping before domain publication...",
+                    key.display_name(&config.project.name)
+                );
+                self.stop_service_instance_locked(key).await?;
             }
-            for name in &restart_service_names {
-                info!("Service {name} changed, stopping before domain publication...");
-                self.stop_service_instance_locked(name, instance_id).await?;
+            for key in &restart_service_names {
+                info!(
+                    "Service {} changed, stopping before domain publication...",
+                    key.display_name(&config.project.name)
+                );
+                self.stop_service_instance_locked(key).await?;
             }
 
             let (commit_result, published_domain_index) = if initial_registration {
@@ -3092,6 +3169,7 @@ impl ProcessManager {
                 stopped_service_projections,
                 pending_initial,
                 trusted_launch_path,
+                service_activation,
             )
         };
 
@@ -3103,22 +3181,19 @@ impl ProcessManager {
             let mut published_stopped_service_names = Vec::new();
             {
                 let mut services = self.services.lock().await;
-                for (name, resolved_env) in &reusable_service_envs {
-                    if let Some(service) = services
-                        .get_mut(name)
-                        .filter(|service| service.instance_id == instance_id)
-                    {
+                for (key, resolved_env) in &reusable_service_envs {
+                    if let Some(service) = services.get_mut(key) {
                         service.config = config.clone();
                         service.path.clone_from(&path);
                         service.resolved_env.clone_from(resolved_env);
                         Self::advance_service_projection(service);
                     }
                 }
-                for (name, (service_config, resolved_env)) in &stopped_service_projections {
-                    if let Some(service) = services.get_mut(name).filter(|service| {
-                        service.instance_id == instance_id
-                            && matches!(&service.runtime_state, ServiceRuntime::None)
-                    }) {
+                for (key, (service_config, resolved_env)) in &stopped_service_projections {
+                    if let Some(service) = services
+                        .get_mut(key)
+                        .filter(|service| matches!(&service.runtime_state, ServiceRuntime::None))
+                    {
                         service.config = config.clone();
                         service.service_config.clone_from(service_config);
                         service.path.clone_from(&path);
@@ -3127,22 +3202,19 @@ impl ProcessManager {
                         service.health_source = HealthSource::None;
                         service.warnings.clear();
                         Self::advance_service_projection(service);
-                        published_stopped_service_names.push(name.clone());
+                        published_stopped_service_names.push(key.clone());
                     }
                 }
-                for name in &removed_service_names {
-                    services.remove(name);
+                for key in &removed_service_names {
+                    services.remove(key);
                 }
                 self.domain_index.store(published_domain_index);
             }
-            for name in &published_stopped_service_names {
-                self.broadcast_service_update(name).await;
+            for key in &published_stopped_service_names {
+                self.broadcast_service_update(key).await;
             }
             if !removed_service_names.is_empty() {
-                let removed_service_names = removed_service_names
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>();
+                let removed_service_names = removed_service_names.iter().cloned().collect();
                 self.clear_service_stop_suppressions_for(instance_id, &removed_service_names)
                     .await;
             }
@@ -3183,17 +3255,13 @@ impl ProcessManager {
             self.availability_allows_inflight_transition(instance_id)
                 .await?;
             let service_config = &config.services[&service_name];
+            let key = Self::service_key(instance_id, service_name.clone());
             info!(
                 "Service {}:{} config: {:?}",
                 config.project.name, service_name, service_config
             );
-            let name = format!("{}:{}", config.project.name, service_name);
-            if self
-                .service_stop_suppressions
-                .lock()
-                .await
-                .contains(&(instance_id, name.clone()))
-            {
+            let name = key.display_name(&config.project.name);
+            if self.service_stop_suppressions.lock().await.contains(&key) {
                 info!("Service {name} remains stopped until an explicit lifecycle action");
                 continue;
             }
@@ -3201,10 +3269,13 @@ impl ProcessManager {
             // A domain-only reload updates the shared claim snapshot and the
             // service's display configuration using the authoritative
             // prepublication reuse decision.
-            if reusable_service_envs.remove(&name).is_some() {
-                let reused_health = self.services.lock().await.get(&name).and_then(|service| {
-                    (service.instance_id == instance_id).then_some(service.health_status)
-                });
+            if reusable_service_envs.remove(&key).is_some() {
+                let reused_health = self
+                    .services
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|service| service.health_status);
                 if let Some(health_status) = reused_health {
                     info!("Service {name} already has a matching owned runtime");
                     if let Some(tx) = &event_tx {
@@ -3239,7 +3310,7 @@ impl ProcessManager {
                             })
                             .await;
                     }
-                    self.broadcast_service_update(&name).await;
+                    self.broadcast_service_update(&key).await;
                     continue;
                 }
             }
@@ -3271,7 +3342,7 @@ impl ProcessManager {
 
             let has_controller = {
                 let services = self.services.lock().await;
-                services.get(&name).is_some_and(|service| {
+                services.get(&key).is_some_and(|service| {
                     matches!(&service.runtime_state, ServiceRuntime::Controller(_))
                 })
             };
@@ -3302,7 +3373,7 @@ impl ProcessManager {
                     // Check for sticky port
                     let sticky = {
                         let services = self.services.lock().await;
-                        services.get(&name).and_then(|s| s.sticky_port)
+                        services.get(&key).and_then(|s| s.sticky_port)
                     };
 
                     if let Some(p) = sticky {
@@ -3341,6 +3412,7 @@ impl ProcessManager {
                 if factory.can_handle(service_config) {
                     info!("Using factory for service {}", name);
                     let ctx = ServiceContext {
+                        key: key.clone(),
                         project_root: path.clone(),
                         port,
                         env: resolved_env.clone(),
@@ -3366,9 +3438,9 @@ impl ProcessManager {
                     // Insert into map immediately so status is visible
                     {
                         let mut services = self.services.lock().await;
-                        self.clear_foreign_log_buffer(&name, instance_id);
+                        self.clear_log_buffer(&key);
                         services.insert(
-                            name.clone(),
+                            key.clone(),
                             Service {
                                 instance_id,
                                 controller_generation,
@@ -3386,23 +3458,24 @@ impl ProcessManager {
                             },
                         );
                     }
+                    let log_key = key.clone();
                     tokio::spawn(async move {
                         let mut logs = controller_logs;
                         while let Some(entry) = logs.next().await {
                             manager
-                                .broadcast_log(instance_id, controller_generation, entry)
+                                .broadcast_log(log_key.clone(), controller_generation, entry)
                                 .await;
                         }
                     });
 
-                    self.broadcast_service_update(&name).await;
+                    self.broadcast_service_update(&key).await;
 
                     {
                         let mut c = controller.lock().await;
                         c.prepare().await.context("Failed to prepare service")?;
                         // Broadcast update after prepare (state might be Building)
                     }
-                    self.broadcast_service_update(&name).await;
+                    self.broadcast_service_update(&key).await;
 
                     let start_authorization = async {
                         self.availability_authorizes_start(instance_id).await?;
@@ -3414,7 +3487,7 @@ impl ProcessManager {
                     }
                     .await;
                     if let Err(superseded) = start_authorization {
-                        let cleanup = self.stop_service_instance_locked(&name, instance_id).await;
+                        let cleanup = self.stop_service_instance_locked(&key).await;
                         if let Err(cleanup_error) = cleanup {
                             return Err(superseded.context(format!(
                                 "failed to stop service `{name}` after availability superseded its prepared start: {cleanup_error:#}"
@@ -3429,11 +3502,10 @@ impl ProcessManager {
                     };
                     if let Err(start_error) = start_result {
                         if let Err(persistence_error) = self.persist_state_checked().await {
-                            let rollback_result = self
-                                .stop_service_instance_runtime_locked(&name, instance_id)
-                                .await;
+                            let rollback_result =
+                                self.stop_service_instance_runtime_locked(&key).await;
                             let retry_persistence_result = self.persist_state_checked().await;
-                            self.broadcast_service_update(&name).await;
+                            self.broadcast_service_update(&key).await;
 
                             let recovery = match (rollback_result, retry_persistence_result) {
                                 (Ok(()), Ok(())) => format!(
@@ -3460,10 +3532,7 @@ impl ProcessManager {
                     // readiness and sticky reuse.
                     {
                         let mut services = self.services.lock().await;
-                        if let Some(service) = services
-                            .get_mut(&name)
-                            .filter(|service| service.instance_id == instance_id)
-                        {
+                        if let Some(service) = services.get_mut(&key) {
                             service.sticky_port = port;
                         }
                     }
@@ -3474,11 +3543,9 @@ impl ProcessManager {
                     // fails, synchronously stop this controller so locald never
                     // leaves behind a child that the next daemon cannot own.
                     if let Err(persistence_error) = self.persist_state_checked().await {
-                        let rollback_result = self
-                            .stop_service_instance_runtime_locked(&name, instance_id)
-                            .await;
+                        let rollback_result = self.stop_service_instance_runtime_locked(&key).await;
                         self.persist_state().await;
-                        self.broadcast_service_update(&name).await;
+                        self.broadcast_service_update(&key).await;
 
                         if let Err(rollback_error) = rollback_result {
                             anyhow::bail!(
@@ -3492,11 +3559,11 @@ impl ProcessManager {
                         });
                     }
 
-                    self.broadcast_service_update(&name).await;
+                    self.broadcast_service_update(&key).await;
 
                     self.health_monitor.spawn_check(
+                        key.clone(),
                         name.clone(),
-                        instance_id,
                         controller_generation,
                         readiness.clone(),
                         port,
@@ -3555,25 +3622,23 @@ impl ProcessManager {
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
         loop {
-            let Some(instance_id) = self.service_instance_id(name).await else {
+            let Some(key) = self.resolve_unique_service_key(name).await? else {
                 return Ok(());
             };
+            let instance_id = key.instance();
             let coordinator = self.availability_coordinator(instance_id).await;
             let _availability_guard = coordinator.runtime.lock().await;
             let Some((path, _transition_guard, _runtime_projection_guard)) =
-                self.lock_service_runtime_transition(name).await
+                self.lock_service_runtime_transition(&key).await
             else {
                 return Ok(());
             };
-            if self.service_instance_id(name).await != Some(instance_id) {
+            if self.get_service_path_by_key(&key).await.is_none() {
                 continue;
             }
             self.ensure_accepting_lifecycle_requests()?;
-            self.stop_service_locked(name, &path).await?;
-            self.service_stop_suppressions
-                .lock()
-                .await
-                .insert((instance_id, name.to_owned()));
+            self.stop_service_locked(&key, &path).await?;
+            self.service_stop_suppressions.lock().await.insert(key);
             return Ok(());
         }
     }
@@ -3587,17 +3652,18 @@ impl ProcessManager {
 
     async fn start_service_admitted(&self, name: &str) -> Result<()> {
         loop {
-            let Some(instance_id) = self.service_instance_id(name).await else {
+            let Some(key) = self.resolve_unique_service_key(name).await? else {
                 return Err(ServiceNotFoundError.into());
             };
+            let instance_id = key.instance();
             let coordinator = self.availability_coordinator(instance_id).await;
             let _availability_guard = coordinator.runtime.lock().await;
             let Some((path, _transition_guard, _runtime_projection_guard)) =
-                self.lock_service_runtime_transition(name).await
+                self.lock_service_runtime_transition(&key).await
             else {
                 return Err(ServiceNotFoundError.into());
             };
-            if self.service_instance_id(name).await != Some(instance_id) {
+            if self.get_service_path_by_key(&key).await.is_none() {
                 continue;
             }
             self.ensure_accepting_lifecycle_requests()?;
@@ -3619,48 +3685,38 @@ impl ProcessManager {
         }
     }
 
-    async fn stop_service_locked(&self, name: &str, project_path: &Path) -> Result<()> {
-        let instance_id = {
+    async fn stop_service_locked(&self, key: &ServiceKey, project_path: &Path) -> Result<()> {
+        {
             let services = self.services.lock().await;
-            if let Some(service) = services.get(name) {
+            if let Some(service) = services.get(key) {
+                let name = Self::service_display_name(key, service);
                 anyhow::ensure!(
                     Self::canonicalize_path(&service.path) == project_path,
                     "service `{name}` changed project during lifecycle transition"
                 );
-                service.instance_id
             } else {
                 return Ok(());
             }
-        };
+        }
 
-        self.stop_service_instance_locked(name, instance_id).await
+        self.stop_service_instance_locked(key).await
     }
 
-    async fn stop_service_instance_locked(
-        &self,
-        name: &str,
-        instance_id: ProjectInstanceId,
-    ) -> Result<()> {
-        self.stop_service_instance_runtime_locked(name, instance_id)
-            .await?;
+    async fn stop_service_instance_locked(&self, key: &ServiceKey) -> Result<()> {
+        self.stop_service_instance_runtime_locked(key).await?;
         self.persist_state().await;
-        self.broadcast_service_update(name).await;
+        self.broadcast_service_update(key).await;
         Ok(())
     }
 
-    async fn stop_service_instance_runtime_locked(
-        &self,
-        name: &str,
-        instance_id: ProjectInstanceId,
-    ) -> Result<()> {
-        let runtime_state = {
+    async fn stop_service_instance_runtime_locked(&self, key: &ServiceKey) -> Result<()> {
+        let (runtime_state, name) = {
             let services = self.services.lock().await;
-            if let Some(service) = services.get(name) {
-                anyhow::ensure!(
-                    service.instance_id == instance_id,
-                    "service `{name}` changed project instance during lifecycle transition"
-                );
-                service.runtime_state.clone()
+            if let Some(service) = services.get(key) {
+                (
+                    service.runtime_state.clone(),
+                    Self::service_display_name(key, service),
+                )
             } else {
                 return Ok(());
             }
@@ -3674,11 +3730,7 @@ impl ProcessManager {
                     return Err(e).with_context(|| format!("failed to stop service `{name}`"));
                 }
                 let mut services = self.services.lock().await;
-                if let Some(service) = services.get_mut(name) {
-                    anyhow::ensure!(
-                        service.instance_id == instance_id,
-                        "service `{name}` changed project instance during lifecycle transition"
-                    );
+                if let Some(service) = services.get_mut(key) {
                     let same_controller = matches!(
                         &service.runtime_state,
                         ServiceRuntime::Controller(current) if Arc::ptr_eq(current, &c)
@@ -3693,10 +3745,7 @@ impl ProcessManager {
             }
             ServiceRuntime::None => {
                 let mut services = self.services.lock().await;
-                if let Some(service) = services
-                    .get_mut(name)
-                    .filter(|service| service.instance_id == instance_id)
-                {
+                if let Some(service) = services.get_mut(key) {
                     service.pending_port_guard = None;
                 }
             }
@@ -3705,10 +3754,7 @@ impl ProcessManager {
         // Clear health and broadcast after stop
         {
             let mut services = self.services.lock().await;
-            if let Some(service) = services
-                .get_mut(name)
-                .filter(|service| service.instance_id == instance_id)
-            {
+            if let Some(service) = services.get_mut(key) {
                 // Note: We do NOT clear sticky_port here, so we can reuse it on restart.
                 service.health_status = HealthStatus::Unknown;
                 Self::advance_service_projection(service);
@@ -3805,17 +3851,17 @@ impl ProcessManager {
     }
 
     async fn stop_project_locked(&self, project_path: &Path) -> Result<()> {
-        let service_names: Vec<String> = {
+        let service_keys: Vec<ServiceKey> = {
             let services = self.services.lock().await;
             services
                 .iter()
                 .filter(|(_, service)| Self::canonicalize_path(&service.path) == project_path)
-                .map(|(name, _)| name.clone())
+                .map(|(key, _)| key.clone())
                 .collect()
         };
 
-        for name in service_names {
-            self.stop_service_locked(&name, project_path).await?;
+        for key in service_keys {
+            self.stop_service_locked(&key, project_path).await?;
         }
         Ok(())
     }
@@ -3907,58 +3953,56 @@ impl ProcessManager {
     }
 
     async fn stop_project_instance_locked(&self, instance_id: ProjectInstanceId) -> Result<()> {
-        let service_names: Vec<String> = {
+        let service_keys: Vec<ServiceKey> = {
             let services = self.services.lock().await;
             services
                 .iter()
                 .filter(|(_, service)| service.instance_id == instance_id)
-                .map(|(name, _)| name.clone())
+                .map(|(key, _)| key.clone())
                 .collect()
         };
-        if service_names.is_empty() {
+        if service_keys.is_empty() {
             return Ok(());
         }
 
-        let mut stopped_service_names: Vec<String> = Vec::new();
-        for name in service_names {
-            if let Err(error) = self
-                .stop_service_instance_runtime_locked(&name, instance_id)
-                .await
-            {
+        let mut stopped_service_keys = Vec::new();
+        for key in service_keys {
+            if let Err(error) = self.stop_service_instance_runtime_locked(&key).await {
                 self.persist_state().await;
-                for stopped_name in stopped_service_names {
-                    self.broadcast_service_update(&stopped_name).await;
+                for stopped_key in stopped_service_keys {
+                    self.broadcast_service_update(&stopped_key).await;
                 }
                 return Err(error);
             }
-            stopped_service_names.push(name);
+            stopped_service_keys.push(key);
         }
         self.persist_state().await;
-        for name in stopped_service_names {
-            self.broadcast_service_update(&name).await;
+        for key in stopped_service_keys {
+            self.broadcast_service_update(&key).await;
         }
         Ok(())
     }
 
     pub async fn restart(&self, name: &str) -> Result<()> {
         loop {
-            let Some(instance_id) = self.service_instance_id(name).await else {
+            let Some(key) = self.resolve_unique_service_key(name).await? else {
                 return Err(ServiceNotFoundError.into());
             };
+            let instance_id = key.instance();
             let coordinator = self.availability_coordinator(instance_id).await;
             let _availability_guard = coordinator.runtime.lock().await;
             let Some((path, _transition_guard, _runtime_projection_guard)) =
-                self.lock_service_runtime_transition(name).await
+                self.lock_service_runtime_transition(&key).await
             else {
                 return Err(ServiceNotFoundError.into());
             };
-            if self.service_instance_id(name).await != Some(instance_id) {
+            if self.get_service_path_by_key(&key).await.is_none() {
                 continue;
             }
             self.ensure_accepting_lifecycle_requests()?;
             self.availability_authorizes_start(instance_id).await?;
-            self.stop_service_locked(name, &path).await?;
-            self.clear_service_stop_suppression(instance_id, name).await;
+            self.stop_service_locked(&key, &path).await?;
+            self.clear_service_stop_suppression(&key).await;
             self.watch_config(path.clone()).await;
             return self
                 .apply_config_locked(
@@ -4041,31 +4085,32 @@ impl ProcessManager {
     pub async fn reset(&self, name: &str) -> Result<()> {
         info!("Resetting service {}", name);
 
-        let Some(instance_id) = self.service_instance_id(name).await else {
+        let Some(key) = self.resolve_unique_service_key(name).await? else {
             anyhow::bail!("Service {name} not found");
         };
+        let instance_id = key.instance();
         let coordinator = self.availability_coordinator(instance_id).await;
         let _availability_guard = coordinator.runtime.lock().await;
         let Some((path, _transition_guard, _runtime_projection_guard)) =
-            self.lock_service_runtime_transition(name).await
+            self.lock_service_runtime_transition(&key).await
         else {
             anyhow::bail!("Service {name} not found");
         };
         anyhow::ensure!(
-            self.service_instance_id(name).await == Some(instance_id),
+            self.get_service_path_by_key(&key).await.is_some(),
             "service `{name}` changed project instance during reset"
         );
         self.ensure_accepting_lifecycle_requests()?;
         self.availability_authorizes_start(instance_id).await?;
 
         // 1. Stop the service
-        self.stop_service_locked(name, &path).await?;
-        self.clear_service_stop_suppression(instance_id, name).await;
+        self.stop_service_locked(&key, &path).await?;
+        self.clear_service_stop_suppression(&key).await;
 
         // Clear sticky port on reset
         {
             let mut services = self.services.lock().await;
-            if let Some(service) = services.get_mut(name) {
+            if let Some(service) = services.get_mut(&key) {
                 service.sticky_port = None;
             }
         }
@@ -4073,7 +4118,7 @@ impl ProcessManager {
         // 2. Wipe data (if applicable)
         let data_dir = {
             let services = self.services.lock().await;
-            services.get(name).and_then(|service| {
+            services.get(&key).and_then(|service| {
                 if matches!(
                     &service.service_config,
                     ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
@@ -4137,12 +4182,13 @@ impl ProcessManager {
             let mut services = self.services.lock().await;
 
             // First pass: Reap dead processes
-            for (name, service) in services.iter_mut() {
-                Self::reap_dead_services(name, service);
+            for (key, service) in services.iter_mut() {
+                let name = Self::service_display_name(key, service);
+                Self::reap_dead_services(&name, service);
             }
 
             // Second pass: Collect snapshots
-            for (name, service) in services.iter() {
+            for (key, service) in services.iter() {
                 if instance_filter.is_some_and(|instance_id| service.instance_id != instance_id) {
                     continue;
                 }
@@ -4157,8 +4203,11 @@ impl ProcessManager {
 
                 snapshots.push((
                     service.instance_id,
-                    name.clone(),
-                    self.domain_for_service(service.instance_id, name),
+                    Self::service_display_name(key, service),
+                    self.domain_for_service(
+                        service.instance_id,
+                        &Self::service_display_name(key, service),
+                    ),
                     Some(service.path.clone()),
                     service.health_status,
                     service.health_source,
@@ -4236,14 +4285,14 @@ impl ProcessManager {
 
         {
             let mut services = self.services.lock().await;
-            for (name, service) in services.iter_mut() {
+            for (key, service) in services.iter_mut() {
                 let runtime_state =
                     std::mem::replace(&mut service.runtime_state, ServiceRuntime::None);
                 service.pending_port_guard = None;
 
                 match runtime_state {
                     ServiceRuntime::Controller(c) => {
-                        controllers_to_stop.push((name.clone(), c));
+                        controllers_to_stop.push((Self::service_display_name(key, service), c));
                     }
                     ServiceRuntime::None => {}
                 }
@@ -4284,10 +4333,13 @@ impl ProcessManager {
         };
         let runtime = {
             let services = self.services.lock().await;
-            services
-                .get(&service_name)
-                .filter(|service| service.instance_id == claimed_instance_id)
-                .map(|service| service.runtime_state.clone())
+            Self::service_key_for_instance(&services, claimed_instance_id, &service_name).and_then(
+                |key| {
+                    services
+                        .get(&key)
+                        .map(|service| service.runtime_state.clone())
+                },
+            )
         };
         match runtime {
             None => Some(locald_core::resolver::DomainResolution::OwnershipOnly),
@@ -7023,13 +7075,25 @@ impl ProcessManager {
             })
             .collect::<Vec<_>>();
         let has_effective_demand = live_demands.iter().any(|(_, effective)| *effective);
-        let suppressed = self
+        let suppressed_keys = self
             .service_stop_suppressions
             .lock()
             .await
             .iter()
-            .filter_map(|(owner, name)| (*owner == instance_id).then_some(name.clone()))
-            .collect::<HashSet<_>>();
+            .filter(|key| key.instance() == instance_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let suppressed = {
+            let loaded_services = self.services.lock().await;
+            suppressed_keys
+                .iter()
+                .filter_map(|key| {
+                    loaded_services
+                        .get(key)
+                        .map(|service| Self::service_display_name(key, service))
+                })
+                .collect::<HashSet<_>>()
+        };
         let unsuppressed = services
             .iter()
             .filter(|service| !suppressed.contains(&service.name))
@@ -7820,7 +7884,7 @@ impl ProcessManager {
         self.service_stop_suppressions
             .lock()
             .await
-            .retain(|(owner, _)| !removed_set.contains(owner));
+            .retain(|key| !removed_set.contains(&key.instance()));
         self.persist_state().await;
         drop(publication_guard);
         drop(runtime_projection_guard);
@@ -8184,7 +8248,8 @@ impl ProcessManager {
             .lock()
             .await
             .iter()
-            .filter_map(|(owner, name)| (*owner == instance_id).then_some(name.clone()))
+            .filter(|key| key.instance() == instance_id)
+            .cloned()
             .collect::<HashSet<_>>();
         let runtimes = {
             let services = self.services.lock().await;
@@ -8223,29 +8288,26 @@ impl ProcessManager {
         true
     }
 
-    async fn clear_service_stop_suppression(&self, instance_id: ProjectInstanceId, name: &str) {
-        self.service_stop_suppressions
-            .lock()
-            .await
-            .remove(&(instance_id, name.to_owned()));
+    async fn clear_service_stop_suppression(&self, key: &ServiceKey) {
+        self.service_stop_suppressions.lock().await.remove(key);
     }
 
     async fn clear_service_stop_suppressions_for(
         &self,
-        instance_id: ProjectInstanceId,
-        service_names: &HashSet<String>,
+        _instance_id: ProjectInstanceId,
+        service_keys: &HashSet<ServiceKey>,
     ) {
         self.service_stop_suppressions
             .lock()
             .await
-            .retain(|(owner, name)| *owner != instance_id || !service_names.contains(name));
+            .retain(|key| !service_keys.contains(key));
     }
 
     async fn clear_service_stop_suppressions(&self, instance_id: ProjectInstanceId) {
         self.service_stop_suppressions
             .lock()
             .await
-            .retain(|(owner, _)| *owner != instance_id);
+            .retain(|key| key.instance() != instance_id);
     }
 
     async fn stop_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
@@ -8931,14 +8993,14 @@ impl ProcessManager {
 
     async fn lock_service_runtime_transition(
         &self,
-        name: &str,
+        key: &ServiceKey,
     ) -> Option<(PathBuf, OwnedMutexGuard<()>, OwnedMutexGuard<()>)> {
         loop {
-            let path = self.get_service_path(name).await?;
+            let path = self.get_service_path_by_key(key).await?;
             let (canonical, transition_lock) = self.transition_lock_for_path(&path).await;
             let transition_guard = transition_lock.lock_owned().await;
             let runtime_projection_guard = self.runtime_projection_lock.clone().lock_owned().await;
-            match self.get_service_path(name).await {
+            match self.get_service_path_by_key(key).await {
                 Some(current_path) if Self::canonicalize_path(&current_path) == canonical => {
                     return Some((canonical, transition_guard, runtime_projection_guard));
                 }
@@ -8953,17 +9015,27 @@ impl ProcessManager {
 
     pub async fn get_service_path(&self, name: &str) -> Option<PathBuf> {
         let services = self.services.lock().await;
-        services.get(name).map(|s| s.path.clone())
+        let key = Self::unique_service_key(&services, name).ok().flatten()?;
+        services.get(&key).map(|s| s.path.clone())
     }
 
-    async fn service_instance_id(&self, name: &str) -> Option<ProjectInstanceId> {
+    async fn resolve_unique_service_key(&self, name: &str) -> Result<Option<ServiceKey>> {
         let services = self.services.lock().await;
-        services.get(name).map(|service| service.instance_id)
+        Self::unique_service_key(&services, name)
+    }
+
+    async fn get_service_path_by_key(&self, key: &ServiceKey) -> Option<PathBuf> {
+        let services = self.services.lock().await;
+        services.get(key).map(|service| service.path.clone())
     }
 
     pub async fn get_service_env(&self, name: &str) -> Result<HashMap<String, String>> {
+        let key = self
+            .resolve_unique_service_key(name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Service {name} not found"))?;
         let Some((_path, _transition_guard, _runtime_projection_guard)) =
-            self.lock_service_runtime_transition(name).await
+            self.lock_service_runtime_transition(&key).await
         else {
             anyhow::bail!("Service {name} not found");
         };
@@ -8971,7 +9043,7 @@ impl ProcessManager {
         let (instance_id, config, service_config, path, port_result, sticky_port) = {
             let services = self.services.lock().await;
             let service = services
-                .get(name)
+                .get(&key)
                 .ok_or_else(|| anyhow::anyhow!("Service {name} not found"))?;
 
             let port_result = match &service.runtime_state {
@@ -9050,11 +9122,15 @@ impl ProcessManager {
     /// Returns an error if the service is not found.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn inspect(&self, name: &str) -> Result<serde_json::Value> {
+        let key = self
+            .resolve_unique_service_key(name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Service not found"))?;
         let proxy_ports = { *self.proxy_ports.lock().await };
         let (service_config, path, health_status, health_source, runtime_info, domain, warnings) = {
             let services = self.services.lock().await;
             let service = services
-                .get(name)
+                .get(&key)
                 .ok_or_else(|| anyhow::anyhow!("Service not found"))?;
 
             let short_name = Self::configured_service_name(name, &service.config);
@@ -10496,6 +10572,83 @@ mod tests {
             .expect("valid alternate project instance ID")
     }
 
+    fn test_service_key(instance_id: ProjectInstanceId, display_name: &str) -> ServiceKey {
+        ServiceKey::new(
+            instance_id,
+            display_name
+                .split_once(':')
+                .map_or(display_name, |(_, configured_name)| configured_name),
+        )
+    }
+
+    fn insert_test_service(
+        services: &mut HashMap<ServiceKey, Service>,
+        display_name: impl AsRef<str>,
+        service: Service,
+    ) {
+        services.insert(
+            test_service_key(service.instance_id, display_name.as_ref()),
+            service,
+        );
+    }
+
+    fn get_test_service<'a>(
+        services: &'a HashMap<ServiceKey, Service>,
+        display_name: &str,
+    ) -> Option<&'a Service> {
+        let configured_name = display_name.rsplit(':').next().unwrap_or(display_name);
+        ProcessManager::unique_service_key(services, display_name)
+            .ok()
+            .flatten()
+            .and_then(|key| services.get(&key))
+            .or_else(|| {
+                let mut matches = services
+                    .iter()
+                    .filter(|(key, _)| key.name().as_str() == configured_name)
+                    .map(|(_, service)| service);
+                let first = matches.next()?;
+                matches.next().is_none().then_some(first)
+            })
+    }
+
+    fn get_test_service_mut<'a>(
+        services: &'a mut HashMap<ServiceKey, Service>,
+        display_name: &str,
+    ) -> Option<&'a mut Service> {
+        let configured_name = display_name.rsplit(':').next().unwrap_or(display_name);
+        let key = ProcessManager::unique_service_key(services, display_name)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                let mut matches = services
+                    .keys()
+                    .filter(|key| key.name().as_str() == configured_name);
+                let first = matches.next()?.clone();
+                matches.next().is_none().then_some(first)
+            })?;
+        services.get_mut(&key)
+    }
+
+    trait TestServiceMapExt {
+        fn insert_display(&mut self, display_name: impl AsRef<str>, service: Service);
+        fn get_display(&self, display_name: &str) -> Option<&Service>;
+        fn get_display_mut(&mut self, display_name: &str) -> Option<&mut Service>;
+    }
+
+    impl TestServiceMapExt for HashMap<ServiceKey, Service> {
+        fn insert_display(&mut self, display_name: impl AsRef<str>, service: Service) {
+            insert_test_service(self, display_name, service);
+        }
+
+        fn get_display(&self, display_name: &str) -> Option<&Service> {
+            get_test_service(self, display_name)
+        }
+
+        fn get_display_mut(&mut self, display_name: &str) -> Option<&mut Service> {
+            get_test_service_mut(self, display_name)
+        }
+    }
+
     async fn availability_manager(
         root: &Path,
         project_path: &Path,
@@ -10817,8 +10970,9 @@ mod tests {
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: Arc::clone(&host_calls),
         }));
-        manager.services.lock().await.insert(
-            "historical:web".to_owned(),
+        insert_test_service(
+            &mut *manager.services.lock().await,
+            "historical:web",
             availability_test_service(historical_instance, "historical", &canonical, false),
         );
         manager
@@ -11174,7 +11328,7 @@ mod tests {
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "fieldless-cli-attach:web".to_owned()))
+                .contains(&test_service_key(instance_id, "fieldless-cli-attach:web"))
         );
 
         manager
@@ -11193,7 +11347,7 @@ mod tests {
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "fieldless-cli-attach:web".to_owned())),
+                .contains(&test_service_key(instance_id, "fieldless-cli-attach:web")),
             "new field-less owner resumes automatic service management at publication"
         );
 
@@ -15217,6 +15371,7 @@ PATH = "/usr/bin:/bin"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "expired-demand-restore:web".to_owned(),
                     config: test_config_with_domain(
                         "expired-demand-restore",
@@ -15431,7 +15586,8 @@ PATH = "/usr/bin:/bin"
             .set_always_on(true)
             .await
             .expect("enable Always On");
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "paused:web".to_owned(),
             availability_test_service(instance_id, "paused", &project_path, false),
         );
@@ -15463,7 +15619,8 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("enable Always On");
         let canonical = std::fs::canonicalize(&project_path).expect("canonical retry path");
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "retry:web".to_owned(),
             availability_test_service(instance_id, "retry", &project_path, true),
         );
@@ -15498,7 +15655,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .get_mut("retry:web")
+            .get_mut(&test_service_key(instance_id, "retry:web"))
             .expect("retry service remains registered")
             .runtime_state = ServiceRuntime::Controller(replacement);
 
@@ -15762,12 +15919,11 @@ PATH = "/usr/bin:/bin"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "service-stop:web".to_owned()))
+                .contains(&test_service_key(instance_id, "service-stop:web"))
         );
         {
             let services = manager.services.lock().await;
-            let stopped = services
-                .get("service-stop:web")
+            let stopped = get_test_service(&services, "service-stop:web")
                 .expect("stopped service projection remains available");
             assert!(matches!(&stopped.runtime_state, ServiceRuntime::None));
             assert_eq!(stopped.config, reloaded_config);
@@ -15840,15 +15996,14 @@ PATH = "/usr/bin:/bin"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "service-stop:web".to_owned()))
+                .contains(&test_service_key(instance_id, "service-stop:web"))
         );
 
         let stop_entered = Arc::new(tokio::sync::Notify::new());
         let release_stop = Arc::new(tokio::sync::Notify::new());
         {
             let mut services = manager.services.lock().await;
-            let service = services
-                .get_mut("service-stop:web")
+            let service = get_test_service_mut(&mut services, "service-stop:web")
                 .expect("replace running web controller");
             service.runtime_state = ServiceRuntime::Controller(Arc::new(Mutex::new(
                 BlockingSuccessfulStopController {
@@ -15908,7 +16063,7 @@ PATH = "/usr/bin:/bin"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "service-stop:web".to_owned()))
+                .contains(&test_service_key(instance_id, "service-stop:web"))
         );
 
         manager
@@ -15962,17 +16117,20 @@ PATH = "/usr/bin:/bin"
             .expect("publish stopped service removal");
         {
             let suppressions = manager.service_stop_suppressions.lock().await;
-            assert!(!suppressions.contains(&(instance_id, "removed-service-stop:web".to_owned())));
             assert!(
-                suppressions.contains(&(instance_id, "removed-service-stop:worker".to_owned()))
+                !suppressions.contains(&test_service_key(instance_id, "removed-service-stop:web"))
             );
+            assert!(suppressions.contains(&test_service_key(
+                instance_id,
+                "removed-service-stop:worker"
+            )));
         }
         assert!(
             manager
                 .services
                 .lock()
                 .await
-                .get("removed-service-stop:web")
+                .get(&test_service_key(instance_id, "removed-service-stop:web"))
                 .is_none()
         );
 
@@ -16063,8 +16221,14 @@ PATH = "/usr/bin:/bin"
             "starting web must preserve worker's independent stop override"
         );
         let suppressions = manager.service_stop_suppressions.lock().await;
-        assert!(!suppressions.contains(&(instance_id, "selective-service-start:web".to_owned())));
-        assert!(suppressions.contains(&(instance_id, "selective-service-start:worker".to_owned())));
+        assert!(!suppressions.contains(&test_service_key(
+            instance_id,
+            "selective-service-start:web"
+        )));
+        assert!(suppressions.contains(&test_service_key(
+            instance_id,
+            "selective-service-start:worker"
+        )));
         drop(suppressions);
 
         manager
@@ -16251,12 +16415,22 @@ PATH = "/usr/bin:/bin"
             "an unrelated stopped service remains suppressed"
         );
         let suppressions = manager.service_stop_suppressions.lock().await;
-        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:db".to_owned())));
-        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:api".to_owned())));
-        assert!(!suppressions.contains(&(instance_id, "dependency-service-start:web".to_owned())));
-        assert!(
-            suppressions.contains(&(instance_id, "dependency-service-start:worker".to_owned()))
-        );
+        assert!(!suppressions.contains(&test_service_key(
+            instance_id,
+            "dependency-service-start:db"
+        )));
+        assert!(!suppressions.contains(&test_service_key(
+            instance_id,
+            "dependency-service-start:api"
+        )));
+        assert!(!suppressions.contains(&test_service_key(
+            instance_id,
+            "dependency-service-start:web"
+        )));
+        assert!(suppressions.contains(&test_service_key(
+            instance_id,
+            "dependency-service-start:worker"
+        )));
         drop(suppressions);
 
         manager
@@ -16354,7 +16528,10 @@ PATH = "/usr/bin:/bin"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "pause-service-start-race:web".to_owned()))
+                .contains(&test_service_key(
+                    instance_id,
+                    "pause-service-start-race:web"
+                ))
         );
     }
 
@@ -16407,7 +16584,10 @@ PATH = "/usr/bin:/bin"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "attachment-service-stop:web".to_owned()))
+                .contains(&test_service_key(
+                    instance_id,
+                    "attachment-service-stop:web"
+                ))
         );
 
         manager
@@ -16436,7 +16616,10 @@ PATH = "/usr/bin:/bin"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "attachment-service-stop:web".to_owned()))
+                .contains(&test_service_key(
+                    instance_id,
+                    "attachment-service-stop:web"
+                ))
         );
 
         manager
@@ -16581,7 +16764,7 @@ PATH = "/usr/bin:/bin"
                 .lock()
                 .await
                 .iter()
-                .any(|(owner, _)| *owner == instance_id)
+                .any(|key| key.instance() == instance_id)
         );
 
         manager
@@ -17724,7 +17907,8 @@ PATH = "/usr/bin:/bin"
         let mut second_availability = AvailabilityStore::load(&availability_data_dir, second_id)
             .await
             .expect("load second availability");
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "pause-now:web".to_owned(),
             availability_test_service(first_id, "pause-now", &first_path, false),
         );
@@ -17801,9 +17985,9 @@ PATH = "/usr/bin:/bin"
         };
         {
             let mut services = manager.services.lock().await;
-            services.insert("batched-stop:web".to_owned(), web);
-            services.insert("batched-stop:api".to_owned(), api);
-            services.insert("unrelated:web".to_owned(), unrelated);
+            insert_test_service(&mut services, "batched-stop:web", web);
+            insert_test_service(&mut services, "batched-stop:api", api);
+            insert_test_service(&mut services, "unrelated:web", unrelated);
         }
 
         let unrelated_guard = unrelated_controller.lock().await;
@@ -17819,7 +18003,7 @@ PATH = "/usr/bin:/bin"
                     ["batched-stop:web", "batched-stop:api"]
                         .into_iter()
                         .all(|name| {
-                            services.get(name).is_some_and(|service| {
+                            get_test_service(&services, name).is_some_and(|service| {
                                 matches!(service.runtime_state, ServiceRuntime::None)
                             })
                         })
@@ -17855,7 +18039,8 @@ PATH = "/usr/bin:/bin"
             .set_always_on(true)
             .await
             .expect("enable moved Always On");
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "moved:web".to_owned(),
             availability_test_service(instance_id, "moved", &old_path, false),
         );
@@ -17905,7 +18090,8 @@ PATH = "/usr/bin:/bin"
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }),
         );
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "move-reload:web".to_owned(),
             availability_test_service(instance_id, "move-reload", &old_path, false),
         );
@@ -17938,9 +18124,8 @@ PATH = "/usr/bin:/bin"
             .expect("reload moved project with a restart-required change");
 
         let services = manager.services.lock().await;
-        let service = services
-            .get("move-reload:web")
-            .expect("restarted moved service");
+        let service =
+            get_test_service(&services, "move-reload:web").expect("restarted moved service");
         assert_eq!(service.instance_id, instance_id);
         assert_eq!(service.path, canonical_new);
         assert!(matches!(
@@ -17956,7 +18141,8 @@ PATH = "/usr/bin:/bin"
         let new_path = dir.path().join("remove-new-location");
         let (manager, instance_id, _availability_data_dir) =
             availability_manager(dir.path(), &old_path, "remove-moved").await;
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "remove-moved:web".to_owned(),
             availability_test_service(instance_id, "remove-moved", &old_path, false),
         );
@@ -18021,7 +18207,8 @@ PATH = "/usr/bin:/bin"
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }),
         );
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "moved-owner:web".to_owned(),
             availability_test_service(moved_id, "moved-owner", &reused_path, false),
         );
@@ -18269,7 +18456,8 @@ PATH = "/usr/bin:/bin"
                 .legacy_paths
                 .insert(project_path.clone(), replacement_id);
         }
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "replacement:web".to_owned(),
             availability_test_service(replacement_id, "replacement", &project_path, false),
         );
@@ -18422,7 +18610,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("reload-authority:web".to_owned(), service);
+            .insert_display("reload-authority:web".to_owned(), service);
 
         let reload_task = tokio::spawn({
             let manager = manager.clone();
@@ -18508,7 +18696,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("stopped-cooldown-reload:web".to_owned(), service);
+            .insert_display("stopped-cooldown-reload:web".to_owned(), service);
 
         manager
             .reload_config(project_path.clone())
@@ -18653,7 +18841,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("unhealthy-retry:web".to_owned(), service);
+            .insert_display("unhealthy-retry:web".to_owned(), service);
 
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
@@ -18737,6 +18925,7 @@ PATH = "/usr/bin:/bin"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "restore-paused:web".to_owned(),
                     config: test_config_with_domain("restore-paused", "restore-paused.localhost"),
                     path: project_path.clone(),
@@ -18949,7 +19138,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("shutdown-convergence:web".to_owned(), service);
+            .insert_display("shutdown-convergence:web".to_owned(), service);
         manager.persist_state().await;
 
         let pause_task = tokio::spawn({
@@ -19653,7 +19842,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("process-identity:web".to_owned(), service);
+            .insert_display("process-identity:web".to_owned(), service);
 
         manager.persist_state().await;
         let running = manager
@@ -19741,7 +19930,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("leaderless-group:web".to_owned(), service);
+            .insert_display("leaderless-group:web".to_owned(), service);
 
         manager
             .persist_state_checked()
@@ -19987,6 +20176,7 @@ PATH = "/usr/bin:/bin"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "legacy-restore:web".to_owned(),
                     config: test_config_with_domain("legacy-restore", "legacy-restore.localhost"),
                     path: project_path,
@@ -20088,7 +20278,7 @@ PATH = "/usr/bin:/bin"
                 .services
                 .lock()
                 .await
-                .get("always-on-restore:web")
+                .get_display("always-on-restore:web")
                 .expect("restored Always On service")
                 .resolved_env
                 .get("PATH")
@@ -20200,6 +20390,7 @@ PATH = "/usr/bin:/bin"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "legacy-service-stop:web".to_owned(),
                     config: test_config_with_domain(
                         "legacy-service-stop",
@@ -20247,6 +20438,7 @@ PATH = "/usr/bin:/bin"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "legacy-stop:web".to_owned(),
                     config: test_config_with_domain("legacy-stop", "legacy-stop.localhost"),
                     path: project_path.clone(),
@@ -20342,6 +20534,7 @@ PATH = "/usr/bin:/bin"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "legacy-moved:web".to_owned(),
                     config: test_config_with_domain("legacy-moved", "legacy-moved.localhost"),
                     path: canonical_old,
@@ -20439,6 +20632,7 @@ command = "unused-by-test-factory"
         state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "legacy-recreated:web".to_owned(),
                     config: test_config_with_domain(
                         "legacy-recreated",
@@ -20499,6 +20693,7 @@ command = "unused-by-test-factory"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "unconfirmed-cleanup:web".to_owned(),
                     config: test_config_with_domain(
                         "unconfirmed-cleanup",
@@ -20551,6 +20746,7 @@ command = "unused-by-test-factory"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "unverified-live:web".to_owned(),
                     config: test_config_with_domain("unverified-live", "unverified-live.localhost"),
                     path: project_path,
@@ -20611,6 +20807,7 @@ command = "unused-by-test-factory"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "confirmed-cleanup:web".to_owned(),
                     config: test_config_with_domain(
                         "confirmed-cleanup",
@@ -20684,6 +20881,7 @@ command = "unused-by-test-factory"
             .state_manager
             .save(&ServerState {
                 services: vec![PersistedServiceState {
+                    service_key: None,
                     name: "removed-restore:web".to_owned(),
                     config: test_config_with_domain("removed-restore", "removed-restore.localhost"),
                     path: project_path.clone(),
@@ -21073,7 +21271,7 @@ image = "redis:7"
                 .services
                 .lock()
                 .await
-                .get("trusted-path:web")
+                .get_display("trusted-path:web")
                 .and_then(|service| service.resolved_env.get("PATH"))
                 .map(String::as_str),
             Some(first_path.as_str())
@@ -21102,7 +21300,7 @@ TOKEN = "reloaded"
         {
             let services = manager.services.lock().await;
             let reloaded = services
-                .get("trusted-path:web")
+                .get_display("trusted-path:web")
                 .expect("reloaded trusted-path service");
             assert_eq!(
                 reloaded.resolved_env.get("PATH").map(String::as_str),
@@ -21140,7 +21338,7 @@ TOKEN = "reloaded"
                 .services
                 .lock()
                 .await
-                .get("trusted-path:web")
+                .get_display("trusted-path:web")
                 .and_then(|service| service.resolved_env.get("PATH"))
                 .map(String::as_str),
             Some(replacement_path.as_str())
@@ -21165,6 +21363,45 @@ TOKEN = "reloaded"
         assert_eq!(
             ProcessManager::configured_service_name("another:web", &config),
             "another:web"
+        );
+    }
+
+    #[test]
+    fn instance_lookup_preserves_colons_in_configured_service_names() {
+        let instance_id = test_instance_id();
+        let config = LocaldConfig {
+            project: ProjectConfig {
+                name: "team:app".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let key = ServiceKey::new(instance_id, "worker:blue");
+        let services = HashMap::from([(
+            key.clone(),
+            test_service(
+                config,
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::None,
+                PathBuf::from("/team-app"),
+            ),
+        )]);
+
+        assert_eq!(
+            ProcessManager::service_key_for_instance(&services, instance_id, "worker:blue"),
+            Some(key.clone())
+        );
+        assert_eq!(
+            ProcessManager::service_key_for_instance(
+                &services,
+                instance_id,
+                "team:app:worker:blue"
+            ),
+            Some(key.clone())
+        );
+        assert_eq!(
+            ProcessManager::service_key_for_instance(&services, instance_id, "legacy:worker:blue"),
+            Some(key)
         );
     }
 
@@ -22003,7 +22240,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("busy-missing:web".to_owned(), service);
+            .insert_display("busy-missing:web".to_owned(), service);
         let calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: calls.clone(),
@@ -22057,8 +22294,8 @@ PATH = "/usr/bin:/bin"
         let other_path = dir.path().join("other");
 
         let service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
-        let service = |path: PathBuf| Service {
-            instance_id: test_instance_id(),
+        let service = |instance_id, path: PathBuf| Service {
+            instance_id,
             controller_generation: 1,
             projection_generation: 1,
             config: LocaldConfig::default(),
@@ -22075,19 +22312,25 @@ PATH = "/usr/bin:/bin"
 
         {
             let mut services = manager.services.lock().await;
-            services.insert("project:web".to_string(), service(project_path.clone()));
-            services.insert("other:web".to_string(), service(other_path));
+            services.insert_display(
+                "project:web",
+                service(test_instance_id(), project_path.clone()),
+            );
+            services.insert_display(
+                "other:web",
+                service(alternate_test_instance_id(), other_path),
+            );
         }
 
         manager.stop_project(&project_path).await.unwrap();
 
         let services = manager.services.lock().await;
         assert_eq!(
-            services.get("project:web").unwrap().health_status,
+            services[&test_service_key(test_instance_id(), "project:web")].health_status,
             HealthStatus::Unknown
         );
         assert_eq!(
-            services.get("other:web").unwrap().health_status,
+            services[&test_service_key(alternate_test_instance_id(), "other:web")].health_status,
             HealthStatus::Healthy
         );
     }
@@ -22130,7 +22373,8 @@ PATH = "/usr/bin:/bin"
             })
             .expect("attach editor");
 
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "project:web".to_owned(),
             Service {
                 instance_id: test_instance_id(),
@@ -22162,7 +22406,13 @@ PATH = "/usr/bin:/bin"
                 .is_empty()
         );
         assert_eq!(
-            manager.services.lock().await["project:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("project:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Unknown
         );
     }
@@ -22212,7 +22462,8 @@ PATH = "/usr/bin:/bin"
                 first_stop_entered: first_stop_entered.clone(),
                 release_first_stop: release_first_stop.clone(),
             }));
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "unresolved-reaper:web".to_owned(),
             Service {
                 instance_id: test_instance_id(),
@@ -22284,7 +22535,13 @@ PATH = "/usr/bin:/bin"
             ServiceState::Stopped
         );
         assert_eq!(
-            manager.services.lock().await["unresolved-reaper:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("unresolved-reaper:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Unknown
         );
     }
@@ -22338,7 +22595,8 @@ PATH = "/usr/bin:/bin"
                 stop_entered: stop_entered.clone(),
                 release_stop: release_stop.clone(),
             }));
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "unresolved-publication-race:web".to_owned(),
             Service {
                 instance_id: test_instance_id(),
@@ -22904,7 +23162,7 @@ PATH = "/usr/bin:/bin"
         retained_service.instance_id = instance_id;
         {
             let mut services = manager.services.lock().await;
-            services.insert("reload:web".to_owned(), retained_service);
+            services.insert_display("reload:web".to_owned(), retained_service);
         }
         let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
@@ -22987,7 +23245,7 @@ PATH = "/usr/bin:/bin"
                 .is_none()
         );
         let services = manager.services.lock().await;
-        let service = &services["reload:web"];
+        let service = &services.get_display("reload:web").expect("test service");
         let ServiceRuntime::Controller(restored_controller) = &service.runtime_state else {
             panic!("failing controller must remain installed");
         };
@@ -23083,7 +23341,7 @@ domain = "reload.localhost"
                 canonical_path.clone(),
             );
             service_a.instance_id = instance_id;
-            services.insert("reload:a".to_owned(), service_a);
+            services.insert_display("reload:a".to_owned(), service_a);
             let mut service_z = test_service(
                 previous_config,
                 service_config,
@@ -23091,7 +23349,7 @@ domain = "reload.localhost"
                 canonical_path,
             );
             service_z.instance_id = instance_id;
-            services.insert("reload:z".to_owned(), service_z);
+            services.insert_display("reload:z".to_owned(), service_z);
         }
         let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
@@ -23101,7 +23359,7 @@ domain = "reload.localhost"
             .service_stop_suppressions
             .lock()
             .await
-            .insert((instance_id, "reload:a".to_owned()));
+            .insert(test_service_key(instance_id, "reload:a"));
 
         let error = manager
             .apply_config(project_path, None, false)
@@ -23126,10 +23384,16 @@ domain = "reload.localhost"
         }
         let services = manager.services.lock().await;
         assert!(matches!(
-            &services["reload:a"].runtime_state,
+            &services
+                .get_display("reload:a")
+                .expect("test service")
+                .runtime_state,
             ServiceRuntime::None
         ));
-        let ServiceRuntime::Controller(restored_controller) = &services["reload:z"].runtime_state
+        let ServiceRuntime::Controller(restored_controller) = &services
+            .get_display("reload:z")
+            .expect("test service")
+            .runtime_state
         else {
             panic!("failing controller must remain installed");
         };
@@ -23140,7 +23404,7 @@ domain = "reload.localhost"
                 .service_stop_suppressions
                 .lock()
                 .await
-                .contains(&(instance_id, "reload:a".to_owned())),
+                .contains(&test_service_key(instance_id, "reload:a")),
             "failed publication preserves existing service stop intent"
         );
         assert!(
@@ -23217,7 +23481,7 @@ domain = "reload.localhost"
             .services
             .lock()
             .await
-            .insert("reload:web".to_owned(), service);
+            .insert_display("reload:web".to_owned(), service);
         let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: host_sync_calls.clone(),
@@ -23228,7 +23492,14 @@ domain = "reload.localhost"
             .await
             .expect("publish removal after stop");
 
-        assert!(manager.services.lock().await.get("reload:web").is_none());
+        assert!(
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("reload:web")
+                .is_none()
+        );
         assert!(
             registry
                 .lock()
@@ -23375,7 +23646,7 @@ domain = "reload.localhost"
             .services
             .lock()
             .await
-            .insert("busy:web".to_owned(), service);
+            .insert_display("busy:web".to_owned(), service);
 
         let error = manager
             .remove_project(&project_path)
@@ -23819,7 +24090,7 @@ PATH = "/usr/bin:/bin"
             .unwrap();
 
         let services = manager.services.lock().await;
-        assert!(services.contains_key("attached:web"));
+        assert!(services.get_display("attached:web").is_some());
         drop(services);
 
         let store = attachments.lock().await;
@@ -23970,7 +24241,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:web".to_owned(), service);
+            .insert_display("readiness:web".to_owned(), service);
 
         let readiness = tokio::spawn({
             let manager = manager.clone();
@@ -23980,7 +24251,7 @@ PATH = "/usr/bin:/bin"
         {
             let mut services = manager.services.lock().await;
             let service = services
-                .get_mut("readiness:web")
+                .get_display_mut("readiness:web")
                 .expect("readiness service remains present");
             service.health_status = HealthStatus::Unhealthy;
             service.health_source = HealthSource::Tcp;
@@ -24007,7 +24278,13 @@ PATH = "/usr/bin:/bin"
         assert!(message.contains("last runtime was running"));
         assert!(!message.contains("41237"));
         assert_eq!(
-            manager.services.lock().await["readiness:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Unhealthy
         );
         let persisted = manager
@@ -24051,7 +24328,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:site".to_owned(), service);
+            .insert_display("readiness:site".to_owned(), service);
 
         let readiness = tokio::spawn({
             let manager = manager.clone();
@@ -24064,7 +24341,7 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("controller state read does not hold the service registry");
         services
-            .get_mut("readiness:site")
+            .get_display_mut("readiness:site")
             .expect("readiness service remains present")
             .health_status = HealthStatus::Healthy;
         drop(services);
@@ -24109,7 +24386,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:worker".to_owned(), service);
+            .insert_display("readiness:worker".to_owned(), service);
 
         manager
             .wait_for_health("readiness:worker", instance_id)
@@ -24117,11 +24394,17 @@ PATH = "/usr/bin:/bin"
             .expect("live worker becomes ready");
         let services = manager.services.lock().await;
         assert_eq!(
-            services["readiness:worker"].health_status,
+            services
+                .get_display("readiness:worker")
+                .expect("test service")
+                .health_status,
             HealthStatus::Healthy
         );
         assert_eq!(
-            services["readiness:worker"].health_source,
+            services
+                .get_display("readiness:worker")
+                .expect("test service")
+                .health_source,
             HealthSource::Explicit
         );
     }
@@ -24154,7 +24437,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:worker".to_owned(), service);
+            .insert_display("readiness:worker".to_owned(), service);
 
         let readiness = tokio::spawn({
             let manager = manager.clone();
@@ -24183,7 +24466,13 @@ PATH = "/usr/bin:/bin"
             .expect("readiness task joins")
             .expect("final controller observation satisfies readiness");
         assert_eq!(
-            manager.services.lock().await["readiness:worker"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:worker")
+                .expect("test service")
+                .health_status,
             HealthStatus::Healthy
         );
     }
@@ -24216,7 +24505,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:worker".to_owned(), service);
+            .insert_display("readiness:worker".to_owned(), service);
 
         let readiness = tokio::spawn({
             let manager = manager.clone();
@@ -24234,11 +24523,23 @@ PATH = "/usr/bin:/bin"
             .expect_err("unowned PID evidence cannot satisfy worker readiness");
         assert!(format!("{error:#}").contains("owned process liveness"));
         assert_eq!(
-            manager.services.lock().await["readiness:worker"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:worker")
+                .expect("test service")
+                .health_status,
             HealthStatus::Unhealthy
         );
         assert_eq!(
-            manager.services.lock().await["readiness:worker"].health_source,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:worker")
+                .expect("test service")
+                .health_source,
             HealthSource::Explicit,
             "terminal worker readiness records its owned-process contract"
         );
@@ -24279,7 +24580,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:site".to_owned(), service);
+            .insert_display("readiness:site".to_owned(), service);
 
         let error = manager
             .wait_for_health("readiness:site", instance_id)
@@ -24287,11 +24588,23 @@ PATH = "/usr/bin:/bin"
             .expect_err("failed site build must not become ready");
         assert!(format!("{error:#}").contains("controller reported unhealthy"));
         assert_eq!(
-            manager.services.lock().await["readiness:site"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:site")
+                .expect("test service")
+                .health_status,
             HealthStatus::Unhealthy
         );
         assert_eq!(
-            manager.services.lock().await["readiness:site"].health_source,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:site")
+                .expect("test service")
+                .health_source,
             HealthSource::Tcp,
             "terminal combined readiness records its endpoint contract"
         );
@@ -24327,7 +24640,7 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:web".to_owned(), service);
+            .insert_display("readiness:web".to_owned(), service);
 
         let notify = tokio::spawn({
             let manager = manager.clone();
@@ -24345,10 +24658,19 @@ PATH = "/usr/bin:/bin"
 
         let services = manager.services.lock().await;
         assert_eq!(
-            services["readiness:web"].health_status,
+            services
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting
         );
-        assert_eq!(services["readiness:web"].health_source, HealthSource::None);
+        assert_eq!(
+            services
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_source,
+            HealthSource::None
+        );
     }
 
     #[tokio::test]
@@ -24387,11 +24709,17 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .insert("readiness:web".to_owned(), service);
+            .insert_display("readiness:web".to_owned(), service);
 
         manager.handle_notify(pid).await;
         assert_eq!(
-            manager.services.lock().await["readiness:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting,
             "notify cannot override an explicit readiness check"
         );
@@ -24400,28 +24728,43 @@ PATH = "/usr/bin:/bin"
             .services
             .lock()
             .await
-            .get_mut("readiness:web")
+            .get_display_mut("readiness:web")
             .expect("notify readiness service")
             .service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
         manager.handle_notify(pid).await;
         let services = manager.services.lock().await;
         assert_eq!(
-            services["readiness:web"].health_status,
+            services
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting
         );
-        assert_eq!(services["readiness:web"].health_source, HealthSource::None);
+        assert_eq!(
+            services
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_source,
+            HealthSource::None
+        );
         drop(services);
 
         manager
             .services
             .lock()
             .await
-            .get_mut("readiness:web")
+            .get_display_mut("readiness:web")
             .expect("notify readiness service remains present")
             .health_status = HealthStatus::Unhealthy;
         manager.handle_notify(pid).await;
         assert_eq!(
-            manager.services.lock().await["readiness:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("readiness:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Unhealthy,
             "notify cannot revive terminal readiness"
         );
@@ -24863,7 +25206,13 @@ PATH = "/usr/bin:/bin"
         );
         assert_eq!(creates.load(Ordering::SeqCst), 1);
         assert_eq!(
-            manager.services.lock().await["background-slow:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("background-slow:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting
         );
         tokio::time::pause();
@@ -24900,13 +25249,21 @@ PATH = "/usr/bin:/bin"
 
         assert_eq!(creates.load(Ordering::SeqCst), 2);
         assert_eq!(
-            manager.services.lock().await["background-slow:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("background-slow:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting,
             "the slow owned runtime remains eligible to finish"
         );
         let slow_port = {
             let services = manager.services.lock().await;
-            let service = &services["background-slow:web"];
+            let service = &services
+                .get_display("background-slow:web")
+                .expect("test service");
             assert!(
                 service.pending_port_guard.is_some(),
                 "the unbound cold build retains its allocator reservation"
@@ -24923,12 +25280,23 @@ PATH = "/usr/bin:/bin"
             "the retained cold build's unbound port cannot be reallocated"
         );
         assert_eq!(
-            manager.services.lock().await["background-later:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("background-later:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Healthy,
             "the later project converges in the same sweep"
         );
         assert!(
-            manager.services.lock().await["background-later:web"]
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("background-later:web")
+                .expect("test service")
                 .pending_port_guard
                 .is_none(),
             "a ready service releases its allocator reservation"
@@ -25124,17 +25492,21 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("multi-service ensure reaches its first service preparation");
 
-        let (started_service, controller_generation) = {
+        let (started_key, started_service, controller_generation) = {
             let services = manager.services.lock().await;
-            let (name, service) = services
+            let (key, service) = services
                 .iter()
                 .next()
                 .expect("prepared service is published before its build blocks");
-            (name.clone(), service.controller_generation)
+            (
+                key.clone(),
+                ProcessManager::service_display_name(key, service),
+                service.controller_generation,
+            )
         };
         manager
             .broadcast_log(
-                instance_id,
+                started_key,
                 controller_generation,
                 LogEntry {
                     timestamp: 1,
@@ -25295,7 +25667,7 @@ PATH = "/usr/bin:/bin"
                         .services
                         .lock()
                         .await
-                        .get("timed-ensure:web")
+                        .get_display("timed-ensure:web")
                         .is_some_and(|service| service.health_status == HealthStatus::Starting)
                 {
                     break;
@@ -25350,7 +25722,13 @@ PATH = "/usr/bin:/bin"
                 .is_some_and(|message| message.contains("timed out after 300s"))
         );
         assert_eq!(
-            manager.services.lock().await["timed-ensure:web"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("timed-ensure:web")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting,
             "a live owned runtime remains eligible to finish after the caller's deadline"
         );
@@ -25411,7 +25789,7 @@ PATH = "/usr/bin:/bin"
                         .services
                         .lock()
                         .await
-                        .get("retry-readiness:db")
+                        .get_display("retry-readiness:db")
                         .is_some_and(|service| service.health_status == HealthStatus::Starting)
                 {
                     break;
@@ -25463,11 +25841,22 @@ PATH = "/usr/bin:/bin"
                 .is_some_and(|message| message.contains("timed out after 300s"))
         );
         assert_eq!(
-            manager.services.lock().await["retry-readiness:db"].health_status,
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("retry-readiness:db")
+                .expect("test service")
+                .health_status,
             HealthStatus::Starting
         );
 
-        let assigned_port = manager.services.lock().await["retry-readiness:db"]
+        let assigned_port = manager
+            .services
+            .lock()
+            .await
+            .get_display("retry-readiness:db")
+            .expect("test service")
             .sticky_port
             .expect("timed-out endpoint retains its assigned port");
         let listener =
@@ -25600,7 +25989,8 @@ PATH = "/usr/bin:/bin"
         )
         .expect("create process manager");
 
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "project:web".to_owned(),
             test_service(
                 LocaldConfig::default(),
@@ -25627,7 +26017,12 @@ PATH = "/usr/bin:/bin"
         tokio::task::yield_now().await;
 
         let services = manager.services.clone();
-        let remove = tokio::spawn(async move { services.lock().await.remove("project:web") });
+        let remove = tokio::spawn(async move {
+            services
+                .lock()
+                .await
+                .remove(&test_service_key(test_instance_id(), "project:web"))
+        });
         tokio::task::yield_now().await;
 
         drop(services_guard);
@@ -25735,13 +26130,13 @@ command = "api"
                 service
                     .resolved_env
                     .insert("TOKEN".to_owned(), token.to_owned());
-                services.insert(format!("reload:{name}"), service);
+                services.insert_display(format!("reload:{name}"), service);
             }
         }
         let desired_service_names = next_config
             .services
             .keys()
-            .map(|name| format!("reload:{name}"))
+            .map(|name| test_service_key(test_instance_id(), name))
             .collect::<HashSet<_>>();
         let dot_env_vars = HashMap::from([("TOKEN".to_owned(), "new".to_owned())]);
 
@@ -25763,7 +26158,7 @@ command = "api"
         assert!(plan.removed_service_names.is_empty());
         assert_eq!(
             plan.restart_service_names,
-            ["reload:api", "reload:web", "reload:db"]
+            ["api", "web", "db"].map(|name| test_service_key(test_instance_id(), name))
         );
         assert!(plan.reusable_service_envs.is_empty());
     }
@@ -25853,15 +26248,13 @@ path = "ready"
                     "ready" => Some(ready_port),
                     _ => None,
                 };
-                services.insert(format!("managed-reload:{name}"), service);
+                services.insert_display(format!("managed-reload:{name}"), service);
             }
         }
-        let desired_service_names = HashSet::from([
-            "managed-reload:db".to_owned(),
-            "managed-reload:docs".to_owned(),
-            "managed-reload:broken".to_owned(),
-            "managed-reload:ready".to_owned(),
-        ]);
+        let desired_service_names = ["db", "docs", "broken", "ready"]
+            .map(|name| test_service_key(test_instance_id(), name))
+            .into_iter()
+            .collect();
 
         let plan = manager
             .prepublication_stop_plan(
@@ -25886,22 +26279,27 @@ path = "ready"
         assert!(plan.removed_service_names.is_empty());
         assert_eq!(
             plan.restart_service_names,
-            ["managed-reload:broken"],
+            [test_service_key(test_instance_id(), "broken")],
             "only a completed site without its ready listener must be replaced"
         );
         assert_eq!(plan.reusable_service_envs.len(), 3);
-        assert!(plan.reusable_service_envs.contains_key("managed-reload:db"));
         assert!(
             plan.reusable_service_envs
-                .contains_key("managed-reload:docs")
+                .contains_key(&test_service_key(test_instance_id(), "db"))
         );
         assert!(
             plan.reusable_service_envs
-                .contains_key("managed-reload:ready"),
+                .contains_key(&test_service_key(test_instance_id(), "docs"))
+        );
+        assert!(
+            plan.reusable_service_envs
+                .contains_key(&test_service_key(test_instance_id(), "ready")),
             "a site that completed after the prior readiness deadline remains reusable"
         );
         let services = manager.services.lock().await;
-        let ready = &services["managed-reload:ready"];
+        let ready = &services
+            .get_display("managed-reload:ready")
+            .expect("test service");
         assert_eq!(
             ready.health_status,
             HealthStatus::Healthy,
@@ -25953,7 +26351,8 @@ path = "ready"
             calls: calls.clone(),
         }));
 
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "app:web".to_owned(),
             test_service(
                 test_config_with_domain("app", "stale.localhost"),
@@ -26053,11 +26452,13 @@ path = "ready"
             .services
             .lock()
             .await
-            .insert("app:web".to_owned(), first_service);
+            .insert_display("app:web".to_owned(), first_service);
         let mut instance_logs = manager.instance_log_sender.subscribe();
 
-        let desired_names = HashSet::from(["app:web".to_owned()]);
-        let error = manager
+        let first_key = test_service_key(first_instance, "app:web");
+        let second_key = test_service_key(second_instance, "app:web");
+        let desired_names = HashSet::from([second_key.clone()]);
+        let plan = manager
             .prepublication_stop_plan(
                 second_instance,
                 &second_config,
@@ -26070,16 +26471,13 @@ path = "ready"
                 },
             )
             .await
-            .expect_err("a live same-name instance cannot be reused or overwritten");
-        assert!(
-            error
-                .to_string()
-                .contains("still loaded by project instance")
-        );
+            .expect("a same-name service in another instance is independent");
+        assert!(plan.removed_service_names.is_empty());
+        assert!(plan.restart_service_names.is_empty());
 
         manager
             .broadcast_log(
-                first_instance,
+                first_key.clone(),
                 1,
                 LogEntry {
                     timestamp: 0,
@@ -26099,8 +26497,6 @@ path = "ready"
                 .get_recent_logs_for_instance(Some(second_instance))
                 .is_empty()
         );
-        manager.services.lock().await.remove("app:web");
-
         install_test_claim_for_instance(&manager, first_instance, "first.app.localhost", "app:web");
         install_test_claim_for_instance(
             &manager,
@@ -26117,19 +26513,44 @@ path = "ready"
             second_path,
         );
         second_service.instance_id = second_instance;
-        manager.clear_foreign_log_buffer("app:web", second_instance);
         manager
             .services
             .lock()
             .await
-            .insert("app:web".to_owned(), second_service);
-        assert!(manager.get_recent_logs().is_empty());
+            .insert_display("app:web".to_owned(), second_service);
+        assert_eq!(manager.get_recent_logs().len(), 1);
+        manager
+            .persist_state_checked()
+            .await
+            .expect("persist both instance-scoped runtime snapshots");
+        let persisted_keys = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load instance-scoped runtime snapshots")
+            .services
+            .into_iter()
+            .filter_map(|service| service.service_key)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            persisted_keys,
+            HashSet::from([first_key.clone(), second_key.clone()])
+        );
+
+        manager
+            .stop_service_instance_locked(&first_key)
+            .await
+            .expect("stopping the first instance is isolated");
 
         assert!(matches!(
             manager
                 .resolve_service_by_domain("first.app.localhost")
                 .await,
-            Some(locald_core::resolver::DomainResolution::OwnershipOnly)
+            Some(locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: None,
+                status: ServiceState::Stopped,
+            }) if name == "app:web"
         ));
         assert!(matches!(
             manager
@@ -26143,15 +26564,28 @@ path = "ready"
         ));
 
         let statuses = manager.list().await;
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].domain.as_deref(), Some("second.app.localhost"));
-        let inspection = manager.inspect("app:web").await.expect("inspect service");
-        assert_eq!(inspection["domain"], "second.app.localhost");
+        assert_eq!(statuses.len(), 2);
+        let domains = statuses
+            .iter()
+            .filter_map(|status| status.domain.as_deref())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            domains,
+            HashSet::from(["first.app.localhost", "second.app.localhost"])
+        );
+        assert!(
+            manager
+                .inspect("app:web")
+                .await
+                .expect_err("legacy display lookup is ambiguous across worktrees")
+                .to_string()
+                .contains("ambiguous across project instances")
+        );
 
         manager
             .broadcast_log(
-                first_instance,
-                1,
+                first_key,
+                0,
                 LogEntry {
                     timestamp: 1,
                     service: "app:web".to_owned(),
@@ -26160,10 +26594,10 @@ path = "ready"
                 },
             )
             .await;
-        assert!(manager.get_recent_logs().is_empty());
+        assert_eq!(manager.get_recent_logs().len(), 1);
         manager
             .broadcast_log(
-                second_instance,
+                second_key.clone(),
                 0,
                 LogEntry {
                     timestamp: 2,
@@ -26173,10 +26607,10 @@ path = "ready"
                 },
             )
             .await;
-        assert!(manager.get_recent_logs().is_empty());
+        assert_eq!(manager.get_recent_logs().len(), 1);
         manager
             .broadcast_log(
-                second_instance,
+                second_key.clone(),
                 1,
                 LogEntry {
                     timestamp: 3,
@@ -26186,11 +26620,10 @@ path = "ready"
                 },
             )
             .await;
-        assert_eq!(manager.get_recent_logs().len(), 1);
-        assert!(
-            manager
-                .get_recent_logs_for_instance(Some(first_instance))
-                .is_empty()
+        assert_eq!(manager.get_recent_logs().len(), 2);
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(first_instance))[0].message,
+            "first-instance history"
         );
         assert_eq!(
             manager.get_recent_logs_for_instance(Some(second_instance))[0].message,
@@ -26210,12 +26643,12 @@ path = "ready"
             .services
             .lock()
             .await
-            .get_mut("app:web")
+            .get_mut(&second_key)
             .expect("loaded service")
             .runtime_state = ServiceRuntime::None;
         manager
             .broadcast_log(
-                second_instance,
+                second_key,
                 1,
                 LogEntry {
                     timestamp: 4,
@@ -26225,7 +26658,7 @@ path = "ready"
                 },
             )
             .await;
-        assert_eq!(manager.get_recent_logs().len(), 1);
+        assert_eq!(manager.get_recent_logs().len(), 2);
     }
 
     #[tokio::test]
@@ -26290,10 +26723,11 @@ path = "ready"
             dir.path().join("second"),
         );
         db_service.instance_id = second_instance;
-        manager.services.lock().await.extend([
-            ("app:web".to_owned(), web_service),
-            ("app:db".to_owned(), db_service),
-        ]);
+        {
+            let mut services = manager.services.lock().await;
+            services.insert_display("app:web", web_service);
+            services.insert_display("app:db", db_service);
+        }
 
         let error = manager
             .get_service_env("app:web")
@@ -26333,7 +26767,8 @@ path = "ready"
                     health_status: HealthStatus::Healthy,
                 },
             }));
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "app:web".to_owned(),
             test_service(
                 config_with_services(
@@ -26363,7 +26798,7 @@ path = "ready"
             .services
             .lock()
             .await
-            .get_mut("app:web")
+            .get_display_mut("app:web")
             .expect("loaded service")
             .runtime_state = ServiceRuntime::None;
         release.notify_one();
@@ -26404,7 +26839,8 @@ path = "ready"
                     health_status: HealthStatus::Healthy,
                 },
             }));
-        manager.services.lock().await.insert(
+        insert_test_service(
+            &mut *manager.services.lock().await,
             "app:web".to_owned(),
             test_service(
                 config_with_services(
@@ -26424,7 +26860,9 @@ path = "ready"
         let status_task = tokio::spawn({
             let manager = manager.clone();
             async move {
-                manager.broadcast_service_update("app:web").await;
+                manager
+                    .broadcast_service_update(&test_service_key(test_instance_id(), "app:web"))
+                    .await;
             }
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
@@ -26432,7 +26870,7 @@ path = "ready"
             .expect("status construction starts");
         {
             let mut services = manager.services.lock().await;
-            let service = services.get_mut("app:web").expect("loaded service");
+            let service = services.get_display_mut("app:web").expect("loaded service");
             service.warnings.push("new projection".to_owned());
             ProcessManager::advance_service_projection(service);
         }
@@ -26485,8 +26923,8 @@ path = "ready"
 
         {
             let mut services = manager.services.lock().await;
-            services.insert("stale:web".to_string(), stopped);
-            services.insert("active:web".to_string(), running);
+            services.insert_display("stale:web".to_string(), stopped);
+            services.insert_display("active:web".to_string(), running);
         }
         install_test_claim(&manager, domain, "active:web");
 
@@ -26553,8 +26991,8 @@ path = "ready"
 
         {
             let mut services = manager.services.lock().await;
-            services.insert("stale:web".to_string(), stopped);
-            services.insert("active:web".to_string(), running);
+            services.insert_display("stale:web".to_string(), stopped);
+            services.insert_display("active:web".to_string(), running);
         }
         install_test_claim(&manager, domain, "active:web");
 
@@ -26615,8 +27053,8 @@ path = "ready"
 
         {
             let mut services = manager.services.lock().await;
-            services.insert("stale:web".to_string(), stopped);
-            services.insert("builder:web".to_string(), building);
+            services.insert_display("stale:web".to_string(), stopped);
+            services.insert_display("builder:web".to_string(), building);
         }
         install_test_claim(&manager, domain, "builder:web");
 
@@ -26660,7 +27098,7 @@ path = "ready"
 
         {
             let mut services = manager.services.lock().await;
-            services.insert("stale:web".to_string(), stopped);
+            services.insert_display("stale:web".to_string(), stopped);
         }
         install_test_claim(&manager, domain, "stale:web");
 
