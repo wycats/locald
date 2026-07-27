@@ -4,7 +4,7 @@ use crate::manager::{InstanceLogEntry, ProcessManager};
 use anyhow::{Context, Result};
 use locald_core::attachments::{AttachmentSource, EditorSession, ManualCliSession};
 use locald_core::config::LocaldConfig;
-use locald_core::ipc::{DaemonIdentity, LogEntry, MAX_IPC_REQUEST_BYTES};
+use locald_core::ipc::{DaemonIdentity, EnsureProjectResult, LogEntry, MAX_IPC_REQUEST_BYTES};
 use locald_core::{DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -87,6 +87,26 @@ fn authenticated_peer_pid(stream: &UnixStream) -> Result<u32> {
     let pid = u32::try_from(pid).context("kernel-authenticated IPC peer process ID was invalid")?;
     anyhow::ensure!(pid > 0, "kernel-authenticated IPC peer process ID was zero");
     Ok(pid)
+}
+
+async fn ensure_project_response(
+    manager: &ProcessManager,
+    project_path: &Path,
+    result: Result<EnsureProjectResult>,
+) -> IpcResponse {
+    match result {
+        Ok(result) => IpcResponse::ProjectEnsured(result),
+        Err(error) => match manager
+            .ensure_project_superseded_result(project_path, &error)
+            .await
+        {
+            Ok(Some(result)) => IpcResponse::ProjectEnsureSuperseded(result),
+            Ok(None) => IpcResponse::Error(format!("{error:#}")),
+            Err(projection_error) => IpcResponse::Error(format!(
+                "{error:#}; failed to project the superseding lifecycle state: {projection_error:#}"
+            )),
+        },
+    }
 }
 
 fn command_has_arg(command: &[OsString], expected: &str) -> bool {
@@ -509,11 +529,12 @@ async fn handle_connection(
             }
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let manager = manager.clone();
+        let task_manager = manager.clone();
         let project_path = project_path.clone();
+        let response_project_path = project_path.clone();
         let demand = demand.clone();
         let handle = tokio::spawn(async move {
-            manager
+            task_manager
                 .ensure_project_from_ipc_with_events(project_path, demand, launch_path, tx)
                 .await
         });
@@ -524,10 +545,8 @@ async fn handle_connection(
             stream.write_all(&bytes).await?;
         }
 
-        let response = match handle.await? {
-            Ok(result) => IpcResponse::ProjectEnsured(result),
-            Err(error) => IpcResponse::Error(format!("{error:#}")),
-        };
+        let response =
+            ensure_project_response(&manager, &response_project_path, handle.await?).await;
         let mut bytes = serde_json::to_vec(&response)?;
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
@@ -727,10 +746,12 @@ async fn handle_connection(
             project_path,
             editor,
         } => match validate_editor_session(&stream, &editor) {
-            Ok(()) => match manager.editor_ensure_project(project_path, &editor).await {
-                Ok(result) => IpcResponse::ProjectEnsured(result),
-                Err(error) => IpcResponse::Error(format!("{error:#}")),
-            },
+            Ok(()) => {
+                let result = manager
+                    .editor_ensure_project(project_path.clone(), &editor)
+                    .await;
+                ensure_project_response(&manager, &project_path, result).await
+            }
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
         IpcRequest::EditorRenewProject {
@@ -767,13 +788,12 @@ async fn handle_connection(
                 let authenticated_launch_path =
                     authenticate_ensure_launch_path(&stream, &demand, launch_path);
                 match authenticated_launch_path {
-                    Ok(launch_path) => match manager
-                        .ensure_project_from_ipc(project_path, demand, launch_path)
-                        .await
-                    {
-                        Ok(result) => IpcResponse::ProjectEnsured(result),
-                        Err(error) => IpcResponse::Error(format!("{error:#}")),
-                    },
+                    Ok(launch_path) => {
+                        let result = manager
+                            .ensure_project_from_ipc(project_path.clone(), demand, launch_path)
+                            .await;
+                        ensure_project_response(&manager, &project_path, result).await
+                    }
                     Err(error) => IpcResponse::Error(format!("{error:#}")),
                 }
             }

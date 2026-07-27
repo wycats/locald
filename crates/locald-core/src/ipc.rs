@@ -2,7 +2,7 @@ use crate::attachments::{
     AttachmentSource, EditorSession, ManualCliSession, ProjectFilter, ProjectListEntry,
     ProjectStatusInfo,
 };
-use crate::availability::DemandKey;
+use crate::availability::{AvailabilityReason, DemandKey, ProjectLifecycleState};
 use crate::config::{ServiceConfig, TypedServiceConfig};
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
@@ -190,6 +190,23 @@ pub struct EnsureProjectResult {
     pub services: Vec<EnsuredServiceStatus>,
     #[serde(default)]
     pub urls: Vec<String>,
+}
+
+/// Privacy-safe terminal status when a later lifecycle decision supersedes an
+/// in-flight project ensure.
+///
+/// This response deliberately omits instance IDs, convergence decisions,
+/// ports, PIDs, demand identities, and activity generations. Callers receive
+/// only enough authoritative state to explain why readiness was not reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnsureProjectSuperseded {
+    pub project_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    pub state: ProjectLifecycleState,
+    #[serde(default)]
+    pub reasons: Vec<AvailabilityReason>,
 }
 
 /// A log entry from a service.
@@ -435,7 +452,8 @@ pub enum IpcRequest {
     /// Semantically activate or refocus one authenticated VS Code window,
     /// converge its project, and wait for readiness.
     ///
-    /// **Response:** `IpcResponse::ProjectEnsured(EnsureProjectResult)`
+    /// **Response:** `IpcResponse::ProjectEnsured(EnsureProjectResult)` or
+    /// `IpcResponse::ProjectEnsureSuperseded(EnsureProjectSuperseded)`
     EditorEnsureProject {
         /// The path to the project root or configuration file.
         project_path: PathBuf,
@@ -465,7 +483,8 @@ pub enum IpcRequest {
     /// Acquire or renew one semantic demand, converge the project, and wait
     /// until every required service is ready.
     ///
-    /// **Response:** `IpcResponse::ProjectEnsured(EnsureProjectResult)`
+    /// **Response:** `IpcResponse::ProjectEnsured(EnsureProjectResult)` or
+    /// `IpcResponse::ProjectEnsureSuperseded(EnsureProjectSuperseded)`
     EnsureProject {
         /// The path to the project root or configuration file.
         project_path: PathBuf,
@@ -578,6 +597,8 @@ pub enum IpcResponse {
     ProjectList(Vec<ProjectListEntry>),
     /// Response to EnsureProject request.
     ProjectEnsured(EnsureProjectResult),
+    /// A later lifecycle decision prevented EnsureProject from reaching Ready.
+    ProjectEnsureSuperseded(EnsureProjectSuperseded),
 }
 
 /// Events broadcasted by the Server.
@@ -660,11 +681,11 @@ impl ServiceStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, IpcRequest, IpcResponse,
-        LogMode, ServiceType,
+        EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded, EnsuredServiceStatus,
+        IpcRequest, IpcResponse, LogMode, ServiceType,
     };
     use crate::attachments::{AttachmentSource, EditorSession};
-    use crate::availability::DemandKey;
+    use crate::availability::{AvailabilityReason, DemandKey, ProjectLifecycleState};
     use crate::state::{HealthStatus, ServiceState};
     use std::path::PathBuf;
 
@@ -731,6 +752,40 @@ mod tests {
         assert!(!rendered.contains("\"port\""));
         let decoded: IpcResponse =
             serde_json::from_value(encoded).expect("deserialize ensure response");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn ensure_supersession_round_trips_only_privacy_safe_lifecycle_context() {
+        let response = IpcResponse::ProjectEnsureSuperseded(EnsureProjectSuperseded {
+            project_path: PathBuf::from("/project"),
+            project_name: Some("project".to_owned()),
+            state: ProjectLifecycleState::Paused,
+            reasons: vec![AvailabilityReason {
+                code: "paused".to_owned(),
+                message: "The project is paused through its current activity.".to_owned(),
+            }],
+        });
+
+        let encoded = serde_json::to_value(&response).expect("serialize superseded ensure");
+        let rendered = encoded.to_string();
+        assert!(rendered.contains("\"state\":\"paused\""));
+        assert!(rendered.contains("\"code\":\"paused\""));
+        for private_field in [
+            "\"pid\"",
+            "\"port\"",
+            "instance_id",
+            "generation",
+            "decision",
+            "private-conversation",
+        ] {
+            assert!(
+                !rendered.contains(private_field),
+                "supersession response leaked `{private_field}`: {rendered}"
+            );
+        }
+        let decoded: IpcResponse =
+            serde_json::from_value(encoded).expect("deserialize superseded ensure");
         assert_eq!(decoded, response);
     }
 

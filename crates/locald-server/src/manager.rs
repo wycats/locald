@@ -25,8 +25,8 @@ use locald_core::attachments::{
 };
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{
-    BootEvent, EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, Event, LogEntry,
-    ServiceStatus,
+    BootEvent, EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded,
+    EnsuredServiceStatus, Event, LogEntry, ServiceStatus,
 };
 use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
@@ -147,11 +147,19 @@ pub(crate) struct InstanceLogEntry {
 #[error("Service not found")]
 pub struct ServiceNotFoundError;
 
-#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("project instance {instance_id} startup was superseded by {decision:?}")]
 struct AvailabilityStartSuperseded {
     instance_id: ProjectInstanceId,
     decision: ConvergenceDecision,
+    state: ProjectLifecycleState,
+    reasons: Vec<AvailabilityReason>,
+}
+
+#[derive(Clone, Debug)]
+struct AvailabilityConvergenceOutcome {
+    decision: ConvergenceDecision,
+    availability: ProjectAvailability,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -5196,8 +5204,8 @@ impl ProcessManager {
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
             self.clear_service_stop_suppressions(instance_id).await;
-            let decision = self
-                .converge_managed_instance_locked(
+            let outcome = self
+                .converge_managed_instance_outcome_locked(
                     instance_id,
                     None,
                     false,
@@ -5205,11 +5213,13 @@ impl ProcessManager {
                     SERVICE_READINESS_TIMEOUT,
                 )
                 .await?;
-            if !matches!(decision, ConvergenceDecision::EnsureUp) {
-                return Err(AvailabilityStartSuperseded {
+            if !matches!(outcome.decision, ConvergenceDecision::EnsureUp) {
+                return Err(Self::availability_start_superseded(
                     instance_id,
-                    decision,
-                }
+                    outcome.decision,
+                    &outcome.availability,
+                    self.availability_now(),
+                )
                 .into());
             }
             self.sync_hosts()
@@ -5887,7 +5897,7 @@ impl ProcessManager {
 
             self.clear_service_stop_suppressions(instance_id).await;
             let convergence = self
-                .converge_managed_instance_locked(
+                .converge_managed_instance_outcome_locked(
                     instance_id,
                     event_tx,
                     verbose,
@@ -5895,12 +5905,14 @@ impl ProcessManager {
                     SERVICE_READINESS_TIMEOUT,
                 )
                 .await;
-            let decision = Self::surface_availability_durability(convergence, durability_error)?;
-            if !matches!(decision, ConvergenceDecision::EnsureUp) {
-                return Err(AvailabilityStartSuperseded {
+            let outcome = Self::surface_availability_durability(convergence, durability_error)?;
+            if !matches!(outcome.decision, ConvergenceDecision::EnsureUp) {
+                return Err(Self::availability_start_superseded(
                     instance_id,
-                    decision,
-                }
+                    outcome.decision,
+                    &outcome.availability,
+                    self.availability_now(),
+                )
                 .into());
             }
 
@@ -6070,6 +6082,125 @@ impl ProcessManager {
             services,
             urls: urls.into_iter().collect(),
         })
+    }
+
+    fn availability_start_superseded(
+        instance_id: ProjectInstanceId,
+        decision: ConvergenceDecision,
+        availability: &ProjectAvailability,
+        now: SystemTime,
+    ) -> AvailabilityStartSuperseded {
+        let paused = availability.is_paused();
+        let state = if paused {
+            ProjectLifecycleState::Paused
+        } else {
+            match decision {
+                ConvergenceDecision::EnsureDown => ProjectLifecycleState::Stopped,
+                ConvergenceDecision::PreserveRuntimeUntil { .. } => {
+                    ProjectLifecycleState::CoolingDown
+                }
+                ConvergenceDecision::EnsureUp => ProjectLifecycleState::Starting,
+            }
+        };
+        let pause_through_generation = availability.pause_through_generation();
+        let live_demands = availability
+            .live_demands_at(now)
+            .map(|demand| {
+                (
+                    demand.kind(),
+                    demand.safe_label().to_owned(),
+                    pause_through_generation.is_none_or(|pause| demand.generation() > pause),
+                )
+            })
+            .collect::<Vec<_>>();
+        let has_effective_demand = live_demands.iter().any(|(_, _, effective)| *effective);
+        let mut reasons = Vec::new();
+        if paused {
+            reasons.push(AvailabilityReason {
+                code: "paused".to_owned(),
+                message: "The project is paused through its current activity; resume it to start a new activity generation.".to_owned(),
+            });
+        }
+        if availability.last_convergence_error().is_some() {
+            reasons.push(AvailabilityReason {
+                code: "convergence_failed".to_owned(),
+                message: "The last convergence attempt failed; inspect logs, then resume the project to retry.".to_owned(),
+            });
+        }
+        if matches!(state, ProjectLifecycleState::CoolingDown) {
+            reasons.push(AvailabilityReason {
+                code: "cooling_down".to_owned(),
+                message: "The last demand ended; locald is preserving the runtime briefly."
+                    .to_owned(),
+            });
+        }
+        if !availability.desired_up_at(now)
+            && !paused
+            && !availability.always_on()
+            && !has_effective_demand
+        {
+            reasons.push(AvailabilityReason {
+                code: "no_live_demand".to_owned(),
+                message:
+                    "No live demand currently requires this project; resume it when you need it."
+                        .to_owned(),
+            });
+        }
+        if availability.always_on() {
+            reasons.push(AvailabilityReason {
+                code: "always_on".to_owned(),
+                message: "Always On policy is enabled.".to_owned(),
+            });
+        }
+        for (kind, safe_label, effective) in live_demands {
+            reasons.push(AvailabilityReason {
+                code: format!("demand_{}", demand_kind_code(kind)),
+                message: if effective {
+                    format!("{safe_label} demand is active.")
+                } else {
+                    format!("{safe_label} demand remains live behind the last pause.")
+                },
+            });
+        }
+
+        AvailabilityStartSuperseded {
+            instance_id,
+            decision,
+            state,
+            reasons,
+        }
+    }
+
+    pub(crate) async fn ensure_project_superseded_result(
+        &self,
+        requested_path: &Path,
+        error: &anyhow::Error,
+    ) -> Result<Option<EnsureProjectSuperseded>> {
+        let Some(superseded) = error.downcast_ref::<AvailabilityStartSuperseded>() else {
+            return Ok(None);
+        };
+        let (project_path, project_name) = {
+            let registry = self.registry.lock().await;
+            registry.instances.get(&superseded.instance_id).map_or_else(
+                || (requested_path.to_path_buf(), None),
+                |record| {
+                    (
+                        record
+                            .current_path
+                            .clone()
+                            .unwrap_or_else(|| requested_path.to_path_buf()),
+                        record.display_name.clone(),
+                    )
+                },
+            )
+        };
+
+        Ok(Some(EnsureProjectSuperseded {
+            project_path,
+            project_name,
+            state: superseded.state,
+            reasons: superseded.reasons.clone(),
+        }))
     }
 
     /// Acquire or renew semantic availability and converge the project runtime.
@@ -7950,10 +8081,13 @@ impl ProcessManager {
         if matches!(decision, ConvergenceDecision::EnsureUp) {
             Ok(())
         } else {
-            Err(AvailabilityStartSuperseded {
+            let snapshot = availability.snapshot().await?;
+            Err(Self::availability_start_superseded(
                 instance_id,
                 decision,
-            }
+                &snapshot,
+                self.availability_now(),
+            )
             .into())
         }
     }
@@ -7977,10 +8111,13 @@ impl ProcessManager {
         if matches!(decision, ConvergenceDecision::EnsureUp) {
             Ok(())
         } else {
-            Err(AvailabilityStartSuperseded {
+            let snapshot = availability.snapshot().await?;
+            Err(Self::availability_start_superseded(
                 instance_id,
                 decision,
-            }
+                &snapshot,
+                self.availability_now(),
+            )
             .into())
         }
     }
@@ -8454,22 +8591,40 @@ impl ProcessManager {
         apply_config_when_up: bool,
         service_readiness_timeout: std::time::Duration,
     ) -> Result<ConvergenceDecision> {
+        Ok(self
+            .converge_managed_instance_outcome_locked(
+                instance_id,
+                event_tx,
+                verbose,
+                apply_config_when_up,
+                service_readiness_timeout,
+            )
+            .await?
+            .decision)
+    }
+
+    async fn converge_managed_instance_outcome_locked(
+        &self,
+        instance_id: ProjectInstanceId,
+        event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
+        verbose: bool,
+        apply_config_when_up: bool,
+        service_readiness_timeout: std::time::Duration,
+    ) -> Result<AvailabilityConvergenceOutcome> {
         self.ensure_accepting_lifecycle_requests()?;
         self.watch_active_instance(instance_id).await;
-        let decision = self
-            .converge_availability_locked(
-                instance_id,
-                None,
-                event_tx,
-                AvailabilityConvergenceOptions {
-                    verbose,
-                    apply_config_when_up,
-                    defer_config_reload_during_cooldown: false,
-                    service_readiness_timeout,
-                },
-            )
-            .await?;
-        Ok(decision)
+        self.converge_availability_locked(
+            instance_id,
+            None,
+            event_tx,
+            AvailabilityConvergenceOptions {
+                verbose,
+                apply_config_when_up,
+                defer_config_reload_during_cooldown: false,
+                service_readiness_timeout,
+            },
+        )
+        .await
     }
 
     async fn converge_availability_locked(
@@ -8478,7 +8633,7 @@ impl ProcessManager {
         mut requested_path: Option<PathBuf>,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         options: AvailabilityConvergenceOptions,
-    ) -> Result<ConvergenceDecision> {
+    ) -> Result<AvailabilityConvergenceOutcome> {
         let mut durability_error = None;
         loop {
             self.ensure_accepting_lifecycle_requests()?;
@@ -8538,14 +8693,26 @@ impl ProcessManager {
                     };
                     return Self::surface_availability_durability(result, durability_error);
                 }
-                let result = self
+                let result = match self
                     .finish_availability_action_locked(
                         &mut availability,
                         decision,
                         action,
                         matches!(decision, ConvergenceDecision::EnsureDown),
                     )
-                    .await;
+                    .await
+                {
+                    Ok(decision) => availability.snapshot().await.map_or_else(
+                        |error| Err(error.into()),
+                        |availability| {
+                            Ok(AvailabilityConvergenceOutcome {
+                                decision,
+                                availability,
+                            })
+                        },
+                    ),
+                    Err(error) => Err(error),
+                };
                 return Self::surface_availability_durability(result, durability_error);
             };
 
@@ -8683,14 +8850,26 @@ impl ProcessManager {
                 continue;
             }
 
-            let result = self
+            let result = match self
                 .finish_availability_action_locked(
                     &mut availability,
                     decision,
                     action,
                     clear_on_success,
                 )
-                .await;
+                .await
+            {
+                Ok(decision) => availability.snapshot().await.map_or_else(
+                    |error| Err(error.into()),
+                    |availability| {
+                        Ok(AvailabilityConvergenceOutcome {
+                            decision,
+                            availability,
+                        })
+                    },
+                ),
+                Err(error) => Err(error),
+            };
             return Self::surface_availability_durability(result, durability_error);
         }
     }
@@ -24905,6 +25084,170 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn paused_multi_service_ensure_is_projected_and_later_semantic_activity_resumes() {
+        let dir = tempdir().expect("create superseded EnsureProject directory");
+        let project_path = dir.path().join("superseded-ensure-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "superseded-ensure").await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        write_availability_worker_config(
+            &project_path,
+            "superseded-ensure",
+            "superseded-ensure.localhost",
+            &["web", "worker"],
+        );
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let ensure = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .ensure_project(project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("multi-service ensure reaches its first service preparation");
+
+        let (started_service, controller_generation) = {
+            let services = manager.services.lock().await;
+            let (name, service) = services
+                .iter()
+                .next()
+                .expect("prepared service is published before its build blocks");
+            (name.clone(), service.controller_generation)
+        };
+        manager
+            .broadcast_log(
+                instance_id,
+                controller_generation,
+                LogEntry {
+                    timestamp: 1,
+                    service: started_service.clone(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "build output retained across supersession".to_owned(),
+                },
+            )
+            .await;
+
+        let pause = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load superseded ensure availability");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if availability
+                    .snapshot()
+                    .await
+                    .expect("observe pause publication")
+                    .is_paused()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause becomes authoritative while prepare is blocked");
+        release_prepare.notify_one();
+
+        let error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, ensure)
+            .await
+            .expect("superseded ensure returns")
+            .expect("superseded ensure task joins")
+            .expect_err("pause prevents the in-flight ensure from reaching Ready");
+        assert!(error.is::<AvailabilityStartSuperseded>());
+
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, pause)
+            .await
+            .expect("pause convergence completes")
+            .expect("pause task joins")
+            .expect("pause succeeds");
+        assert_eq!(start_count.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        for service in ["web", "worker"] {
+            assert!(
+                manager
+                    .get_service_controller(&format!("superseded-ensure:{service}"))
+                    .await
+                    .is_none(),
+                "paused supersession leaves every required service stopped"
+            );
+        }
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(instance_id))
+                .iter()
+                .any(|entry| entry.message == "build output retained across supersession"),
+            "service logs remain available after the superseded controller is stopped"
+        );
+
+        manager.factories.remove(0);
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let resumed = manager
+            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+            .await
+            .expect("later semantic activity starts a new generation and resumes");
+        assert_eq!(resumed.state, EnsureProjectState::Ready);
+        assert_eq!(resumed.services.len(), 2);
+        assert!(
+            !availability
+                .snapshot()
+                .await
+                .expect("read resumed availability")
+                .is_paused()
+        );
+        let projected = manager
+            .ensure_project_superseded_result(&project_path, &error)
+            .await
+            .expect("project superseding lifecycle state")
+            .expect("availability supersession is recognized");
+        assert_eq!(projected.project_name.as_deref(), Some("superseded-ensure"));
+        assert_eq!(
+            projected.state,
+            ProjectLifecycleState::Paused,
+            "the first ensure reports the lifecycle snapshot that superseded it"
+        );
+        assert!(
+            projected
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paused"),
+            "a later semantic resume cannot replace the first ensure's supersession reason"
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed project");
+    }
+
+    #[tokio::test]
     async fn ensure_project_surfaces_the_exact_readiness_timeout() {
         let dir = tempdir().expect("create timed EnsureProject directory");
         let project_path = dir.path().join("timed-ensure-project");
@@ -24980,6 +25323,14 @@ PATH = "/usr/bin:/bin"
             .expect("join timed EnsureProject")
             .expect_err("unbound assigned endpoint times out");
         assert!(format!("{error:#}").contains("timed out after 300s"));
+        assert!(
+            manager
+                .ensure_project_superseded_result(&project_path, &error)
+                .await
+                .expect("classify readiness failure")
+                .is_none(),
+            "a genuine readiness failure remains distinct from lifecycle supersession"
+        );
 
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
