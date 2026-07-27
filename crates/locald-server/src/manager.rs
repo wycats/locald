@@ -1338,11 +1338,11 @@ impl ProcessManager {
                     health_status,
                     sticky_port,
                 )) => {
-                    let controller = controller.lock().await;
-                    let runtime_state = controller.read_state().await;
-                    let owned_process_id = controller.owned_process_id();
-                    let has_process_identity = controller.process_identity().is_some();
-                    drop(controller);
+                    let controller_guard = controller.lock().await;
+                    let runtime_state = controller_guard.read_state().await;
+                    let owned_process_id = controller_guard.owned_process_id();
+                    let has_process_identity = controller_guard.process_identity().is_some();
+                    drop(controller_guard);
                     let has_durable_process_ownership =
                         !Self::requires_durable_process_ownership(service_config)
                             || (owned_process_id.is_some() && has_process_identity);
@@ -1373,14 +1373,17 @@ impl ProcessManager {
                                 let probe_succeeded = requirement
                                     .probe_once(Some(&loaded_path), &current_env)
                                     .await;
-                                probe_succeeded
-                                    && Self::readiness_is_satisfied(
+                                if probe_succeeded {
+                                    self.publish_successful_readiness_probe(
+                                        &full_name,
+                                        instance_id,
+                                        &controller,
                                         &requirement,
-                                        HealthStatus::Healthy,
-                                        runtime_state.status,
-                                        runtime_state.health_status,
-                                        owned_process_id,
                                     )
+                                    .await
+                                } else {
+                                    false
+                                }
                             }
                             (ServiceState::Running, HealthStatus::Starting, _) => true,
                             (
@@ -1969,6 +1972,58 @@ impl ProcessManager {
                 projected_health == HealthStatus::Healthy
             }
         }
+    }
+
+    async fn publish_successful_readiness_probe(
+        &self,
+        name: &str,
+        instance_id: ProjectInstanceId,
+        controller: &Arc<tokio::sync::Mutex<dyn ServiceController>>,
+        requirement: &ReadinessRequirement,
+    ) -> bool {
+        let (runtime_state, owned_process_id) = {
+            let controller = controller.lock().await;
+            (controller.read_state().await, controller.owned_process_id())
+        };
+        if !Self::readiness_is_satisfied(
+            requirement,
+            HealthStatus::Healthy,
+            runtime_state.status,
+            runtime_state.health_status,
+            owned_process_id,
+        ) {
+            return false;
+        }
+
+        let (accepted, changed) = {
+            let mut services = self.services.lock().await;
+            services
+                .get_mut(name)
+                .filter(|service| {
+                    service.instance_id == instance_id
+                        && matches!(
+                            &service.runtime_state,
+                            ServiceRuntime::Controller(current)
+                                if Arc::ptr_eq(current, controller)
+                        )
+                })
+                .map_or((false, false), |service| {
+                    let changed = service.health_status != HealthStatus::Healthy
+                        || service.health_source != requirement.health_source()
+                        || service.pending_port_guard.is_some();
+                    service.health_status = HealthStatus::Healthy;
+                    service.health_source = requirement.health_source();
+                    service.pending_port_guard = None;
+                    if changed {
+                        Self::advance_service_projection(service);
+                    }
+                    (true, changed)
+                })
+        };
+        if changed {
+            self.broadcast_service_update(name).await;
+        }
+        accepted
     }
 
     const fn readiness_requires_controller_health(requirement: &ReadinessRequirement) -> bool {
@@ -25457,6 +25512,14 @@ path = "ready"
                 .contains_key("managed-reload:ready"),
             "a site that completed after the prior readiness deadline remains reusable"
         );
+        let services = manager.services.lock().await;
+        let ready = &services["managed-reload:ready"];
+        assert_eq!(
+            ready.health_status,
+            HealthStatus::Healthy,
+            "the successful catch-up probe publishes readiness immediately"
+        );
+        assert_eq!(ready.health_source, HealthSource::Tcp);
         drop(ready_listener);
     }
 
