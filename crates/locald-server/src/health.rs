@@ -189,6 +189,7 @@ impl ReadinessRequirement {
         &self,
         cwd: Option<&Path>,
         env: &HashMap<String, String>,
+        budget: Duration,
     ) -> bool {
         match self {
             Self::ExplicitHttp {
@@ -197,19 +198,31 @@ impl ReadinessRequirement {
                 timeout,
                 ..
             } => {
-                locald_utils::probe::check_http(&format!("http://127.0.0.1:{port}{path}"), *timeout)
-                    .await
+                locald_utils::probe::check_http(
+                    &format!("http://127.0.0.1:{port}{path}"),
+                    (*timeout).min(budget),
+                )
+                .await
             }
             Self::ExplicitTcp { port, timeout, .. } => {
-                locald_utils::probe::check_tcp(&format!("127.0.0.1:{port}"), *timeout).await
+                locald_utils::probe::check_tcp(&format!("127.0.0.1:{port}"), (*timeout).min(budget))
+                    .await
             }
             Self::ExplicitCommand {
                 command, timeout, ..
-            } => locald_utils::probe::check_command_with_env(command, cwd, env, *timeout).await,
+            } => {
+                locald_utils::probe::check_command_with_env(
+                    command,
+                    cwd,
+                    env,
+                    (*timeout).min(budget),
+                )
+                .await
+            }
             Self::AssignedPortTcp { port } | Self::ControllerAndAssignedPortTcp { port } => {
                 locald_utils::probe::check_tcp(
                     &format!("127.0.0.1:{port}"),
-                    Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS),
+                    Duration::from_secs(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS).min(budget),
                 )
                 .await
             }
@@ -957,6 +970,26 @@ mod tests {
             .expect("derive fail-closed container endpoint readiness"),
             ReadinessRequirement::ControllerAndAssignedPortTcp { port: 4125 }
         ));
+    }
+
+    #[tokio::test]
+    async fn one_shot_readiness_command_probe_respects_the_callers_budget() {
+        let requirement = ReadinessRequirement::ExplicitCommand {
+            command: "sleep 60".to_owned(),
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+        };
+        let started = std::time::Instant::now();
+
+        assert!(
+            !requirement
+                .probe_once(None, &HashMap::new(), Duration::from_millis(20))
+                .await
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a catch-up probe must remain inside the caller's convergence budget"
+        );
     }
 
     #[test]

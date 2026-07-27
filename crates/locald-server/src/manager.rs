@@ -313,6 +313,13 @@ struct ConfigTransitionPlan {
     stopped_service_projections: HashMap<String, (ServiceConfig, Option<HashMap<String, String>>)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PrepublicationStopOptions<'a> {
+    sorted_services: &'a [String],
+    desired_service_names: &'a HashSet<String>,
+    readiness_probe_budget: std::time::Duration,
+}
+
 #[derive(Debug)]
 struct CataloguedLifecycleTarget {
     instance_id: ProjectInstanceId,
@@ -1254,9 +1261,13 @@ impl ProcessManager {
         config: &LocaldConfig,
         dot_env_vars: &HashMap<String, String>,
         trusted_launch_path: Option<&str>,
-        sorted_services: &[String],
-        desired_service_names: &HashSet<String>,
+        options: PrepublicationStopOptions<'_>,
     ) -> Result<ConfigTransitionPlan> {
+        let PrepublicationStopOptions {
+            sorted_services,
+            desired_service_names,
+            readiness_probe_budget,
+        } = options;
         let mut removed_service_names = {
             let services = self.services.lock().await;
             services
@@ -1371,7 +1382,11 @@ impl ProcessManager {
                                     )
                                 })?;
                                 let probe_succeeded = requirement
-                                    .probe_once(Some(&loaded_path), &current_env)
+                                    .probe_once(
+                                        Some(&loaded_path),
+                                        &current_env,
+                                        readiness_probe_budget,
+                                    )
                                     .await;
                                 if probe_succeeded {
                                     self.publish_successful_readiness_probe(
@@ -1972,6 +1987,16 @@ impl ProcessManager {
                 projected_health == HealthStatus::Healthy
             }
         }
+    }
+
+    fn take_reserved_port_guard(
+        guards: &mut Vec<crate::port_allocator::PortGuard>,
+        port: u16,
+    ) -> Option<crate::port_allocator::PortGuard> {
+        guards
+            .iter()
+            .position(|guard| guard.port() == port)
+            .map(|index| guards.swap_remove(index))
     }
 
     async fn publish_successful_readiness_probe(
@@ -2977,8 +3002,11 @@ impl ProcessManager {
                     &config,
                     &dot_env_vars,
                     trusted_launch_path.as_deref(),
-                    &sorted_services,
-                    &desired_service_names,
+                    PrepublicationStopOptions {
+                        sorted_services: &sorted_services,
+                        desired_service_names: &desired_service_names,
+                        readiness_probe_budget: service_readiness_timeout,
+                    },
                 )
                 .await?;
             if expected_instance.is_some_and(ConfigIdentityExpectation::requires_existing_catalog) {
@@ -3258,7 +3286,10 @@ impl ProcessManager {
                 if !needs_port {
                     (None, None)
                 } else if let Some(p) = service_config.port() {
-                    (Some(p), None)
+                    (
+                        Some(p),
+                        Self::take_reserved_port_guard(&mut plugin_port_guards, p),
+                    )
                 } else {
                     // Check for sticky port
                     let sticky = {
@@ -25369,8 +25400,11 @@ command = "api"
                 &next_config,
                 &dot_env_vars,
                 None,
-                &["db".to_owned(), "web".to_owned(), "api".to_owned()],
-                &desired_service_names,
+                PrepublicationStopOptions {
+                    sorted_services: &["db".to_owned(), "web".to_owned(), "api".to_owned()],
+                    desired_service_names: &desired_service_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
             )
             .await
             .expect("build prepublication plan");
@@ -25484,13 +25518,16 @@ path = "ready"
                 &config,
                 &HashMap::new(),
                 None,
-                &[
-                    "db".to_owned(),
-                    "docs".to_owned(),
-                    "broken".to_owned(),
-                    "ready".to_owned(),
-                ],
-                &desired_service_names,
+                PrepublicationStopOptions {
+                    sorted_services: &[
+                        "db".to_owned(),
+                        "docs".to_owned(),
+                        "broken".to_owned(),
+                        "ready".to_owned(),
+                    ],
+                    desired_service_names: &desired_service_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
             )
             .await
             .expect("build managed-service reuse plan");
@@ -25521,6 +25558,31 @@ path = "ready"
         );
         assert_eq!(ready.health_source, HealthSource::Tcp);
         drop(ready_listener);
+    }
+
+    #[test]
+    fn plugin_allocated_guard_transfers_with_its_configured_port() {
+        let allocator = PortAllocator::new();
+        let mut target = allocator.allocate().expect("allocate target plugin port");
+        let target_port = target.port();
+        target.release_listener();
+        let mut other = allocator.allocate().expect("allocate other plugin port");
+        other.release_listener();
+        let mut plugin_guards = vec![other, target];
+
+        let retained = ProcessManager::take_reserved_port_guard(&mut plugin_guards, target_port)
+            .expect("take the guard matching the configured service port");
+        drop(plugin_guards);
+        assert!(
+            allocator.try_allocate_specific(target_port).is_none(),
+            "the service-owned guard keeps its plugin-allocated port pending"
+        );
+
+        drop(retained);
+        assert!(
+            allocator.try_allocate_specific(target_port).is_some(),
+            "releasing the service-owned guard makes the port allocatable"
+        );
     }
 
     #[tokio::test]
@@ -25650,8 +25712,11 @@ path = "ready"
                 &second_config,
                 &HashMap::new(),
                 None,
-                &["web".to_owned()],
-                &desired_names,
+                PrepublicationStopOptions {
+                    sorted_services: &["web".to_owned()],
+                    desired_service_names: &desired_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
             )
             .await
             .expect_err("a live same-name instance cannot be reused or overwritten");
