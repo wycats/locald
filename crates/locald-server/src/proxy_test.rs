@@ -5,6 +5,7 @@ use axum::{
     Router,
     body::Body,
     http::{Request, StatusCode},
+    routing::{get, post},
 };
 use locald_core::registry::Registry;
 use locald_core::resolver::DomainResolution;
@@ -129,6 +130,129 @@ impl locald_core::resolver::ServiceResolver for MockResolver {
     }
     async fn set_http_port(&self, _port: Option<u16>) {}
     async fn set_https_port(&self, _port: Option<u16>) {}
+}
+
+#[derive(Debug)]
+struct UnknownDomainResolver;
+
+#[async_trait::async_trait]
+impl locald_core::resolver::ServiceResolver for UnknownDomainResolver {
+    async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
+        None
+    }
+
+    async fn set_http_port(&self, _port: Option<u16>) {}
+    async fn set_https_port(&self, _port: Option<u16>) {}
+}
+
+async fn response_body(response: axum::response::Response) -> String {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn test_active_service_owns_its_api_paths() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nservice-api";
+        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+            .await
+            .unwrap();
+    });
+
+    let resolver = Arc::new(MockResolver {
+        port: Some(port),
+        status: ServiceState::Running,
+    });
+    let api = Router::new().route("/session-token", get(|| async { "locald-api" }));
+    let app = ProxyManager::new(resolver, api, None).make_app();
+    let req = Request::builder()
+        .uri("/api/session-token")
+        .header("Host", "workbench.agent-lab.localhost")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "service-api");
+}
+
+#[tokio::test]
+async fn test_dashboard_hosts_serve_locald_api() {
+    let api = Router::new().route("/state", get(|| async { "locald-api" }));
+    let app = ProxyManager::new(Arc::new(UnknownDomainResolver), api, None).make_app();
+
+    for host in [
+        "locald.localhost",
+        "locald.local",
+        "localhost",
+        "dev.locald.localhost",
+    ] {
+        let req = Request::builder()
+            .uri("/api/state")
+            .header("Host", host)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+        assert_eq!(response_body(response).await, "locald-api", "{host}");
+    }
+}
+
+#[tokio::test]
+async fn test_non_dashboard_hosts_cannot_reach_locald_api() {
+    let api = Router::new().route("/state", get(|| async { "locald-api" }));
+    let app = ProxyManager::new(Arc::new(UnknownDomainResolver), api, None).make_app();
+
+    for host in ["docs.localhost", "docs.local", "unknown.localhost"] {
+        let req = Request::builder()
+            .uri("/api/state")
+            .header("Host", host)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{host}");
+        assert!(
+            !response_body(response).await.contains("locald-api"),
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stopped_project_domain_exposes_only_resume_api() {
+    let resolver = Arc::new(MockResolver {
+        port: None,
+        status: ServiceState::Stopped,
+    });
+    let api = Router::new()
+        .route("/projects/resume-domain", post(|| async { "resumed" }))
+        .route("/state", get(|| async { "locald-api" }));
+    let app = ProxyManager::new(resolver, api, None).make_app();
+
+    let resume = Request::builder()
+        .method("POST")
+        .uri("/api/projects/resume-domain")
+        .header("Host", "paused.localhost")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(resume).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "resumed");
+
+    let state = Request::builder()
+        .uri("/api/state")
+        .header("Host", "paused.localhost")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(state).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response_body(response).await.contains("locald-api"));
 }
 
 #[tokio::test]
