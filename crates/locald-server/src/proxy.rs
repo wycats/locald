@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     handler::Handler,
-    http::Uri,
+    http::{Method, Uri},
     response::{IntoResponse, Response},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -14,6 +14,7 @@ use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tower::ServiceExt;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
@@ -70,10 +71,10 @@ impl ProxyManager {
         let state = AppState {
             resolver: self.resolver.clone(),
             client,
+            api_router: Router::new().nest("/api", self.api_router.clone()),
         };
 
         Router::new()
-            .nest("/api", self.api_router.clone())
             .fallback_service(handle_proxy.with_state(state))
             .layer(TraceLayer::new_for_http())
     }
@@ -151,6 +152,7 @@ struct AppState {
         hyper_util::client::legacy::connect::HttpConnector,
         Body,
     >,
+    api_router: Router,
 }
 
 async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri: Uri) -> Response {
@@ -232,7 +234,14 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     // own dashboard and docs through the same managed-domain workflow.
     let resolution = state.resolver.resolve_service_by_domain(&host).await;
     if let Some(resolution) = resolution {
+        if domain_resolution_is_unavailable(&resolution) && is_resume_api_request(&req) {
+            return route_locald_api(&state, req).await;
+        }
         return proxy_to_domain_resolution(&state, req, &host, resolution).await;
+    }
+
+    if is_dashboard_host(&host) && is_api_request(&req) {
+        return route_locald_api(&state, req).await;
     }
 
     // Dev UI fallback: support standalone Vite/Astro development when no
@@ -259,6 +268,36 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     }
 
     (StatusCode::NOT_FOUND, format!("Domain {host} not found")).into_response()
+}
+
+fn domain_resolution_is_unavailable(resolution: &DomainResolution) -> bool {
+    match resolution {
+        DomainResolution::Service { port, .. } => port.is_none(),
+        DomainResolution::OwnershipOnly => true,
+    }
+}
+
+fn is_resume_api_request(req: &Request) -> bool {
+    req.method() == Method::POST && req.uri().path() == "/api/projects/resume-domain"
+}
+
+fn is_api_request(req: &Request) -> bool {
+    let path = req.uri().path();
+    path == "/api" || path.starts_with("/api/")
+}
+
+fn is_dashboard_host(host: &str) -> bool {
+    matches!(host, "locald.localhost" | "locald.local" | "localhost")
+        || (dev_ui_enabled() && matches!(host, "dev.locald.localhost" | "dev.locald.local"))
+}
+
+async fn route_locald_api(state: &AppState, req: Request) -> Response {
+    state
+        .api_router
+        .clone()
+        .oneshot(req)
+        .await
+        .unwrap_or_else(|error| match error {})
 }
 
 async fn proxy_to_domain_resolution(
