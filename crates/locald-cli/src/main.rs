@@ -89,6 +89,10 @@ fn main() {
     let cli = cli::Cli::parse();
 
     if let Err(e) = run_main(cli) {
+        if e.is_expected() {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
         crash::handle_crash(miette::Report::new(e));
     }
 }

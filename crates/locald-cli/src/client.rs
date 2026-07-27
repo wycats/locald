@@ -200,8 +200,8 @@ mod tests {
         stream_boot_events_response_on_stream,
     };
     use locald_core::{
-        IpcRequest, IpcResponse,
-        ipc::{BootEvent, EnsureProjectResult, EnsureProjectState},
+        AvailabilityReason, IpcRequest, IpcResponse, ProjectLifecycleState,
+        ipc::{BootEvent, EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded},
     };
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
@@ -281,6 +281,67 @@ mod tests {
                 })
                 .unwrap(),
                 serde_json::to_vec(&final_response).unwrap(),
+            ] {
+                server.write_all(&payload).unwrap();
+                server.write_all(b"\n").unwrap();
+            }
+        });
+
+        let response =
+            stream_boot_events_response_on_stream(&mut client, &IpcRequest::Ping).unwrap();
+        server_thread.join().unwrap();
+
+        assert_eq!(response, expected);
+    }
+
+    fn superseded_response() -> IpcResponse {
+        IpcResponse::ProjectEnsureSuperseded(EnsureProjectSuperseded {
+            project_path: "/tmp/project".into(),
+            project_name: Some("project".to_owned()),
+            state: ProjectLifecycleState::Paused,
+            reasons: vec![AvailabilityReason {
+                code: "paused".to_owned(),
+                message: "The project is paused.".to_owned(),
+            }],
+        })
+    }
+
+    #[test]
+    fn quiet_ensure_preserves_structured_supersession_response() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let expected = superseded_response();
+        let response = expected.clone();
+        let server_thread = thread::spawn(move || {
+            let mut server = server;
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+            server
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .unwrap();
+        });
+
+        let response = send_request_on_stream(&mut client, &IpcRequest::Ping).unwrap();
+        server_thread.join().unwrap();
+
+        assert_eq!(response, expected);
+    }
+
+    #[test]
+    fn verbose_ensure_preserves_boot_events_and_structured_supersession_response() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let expected = superseded_response();
+        let response = expected.clone();
+        let server_thread = thread::spawn(move || {
+            let mut server = server;
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+            for payload in [
+                serde_json::to_vec(&BootEvent::StepProgress {
+                    id: "project".to_owned(),
+                    message: "waiting for readiness".to_owned(),
+                })
+                .unwrap(),
+                serde_json::to_vec(&response).unwrap(),
             ] {
                 server.write_all(&payload).unwrap();
                 server.write_all(b"\n").unwrap();

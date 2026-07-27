@@ -25,8 +25,8 @@ use locald_core::attachments::{
 };
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{
-    BootEvent, EnsureProjectResult, EnsureProjectState, EnsuredServiceStatus, Event, LogEntry,
-    ServiceStatus,
+    BootEvent, EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded,
+    EnsuredServiceStatus, Event, LogEntry, ServiceStatus,
 };
 use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
@@ -6070,6 +6070,49 @@ impl ProcessManager {
             services,
             urls: urls.into_iter().collect(),
         })
+    }
+
+    pub(crate) async fn ensure_project_superseded_result(
+        &self,
+        requested_path: &Path,
+        error: &anyhow::Error,
+    ) -> Result<Option<EnsureProjectSuperseded>> {
+        let Some(superseded) = error.downcast_ref::<AvailabilityStartSuperseded>() else {
+            return Ok(None);
+        };
+        let (project_path, project_name, presence) = {
+            let registry = self.registry.lock().await;
+            registry.instances.get(&superseded.instance_id).map_or_else(
+                || (requested_path.to_path_buf(), None, CatalogPresence::Missing),
+                |record| {
+                    (
+                        record
+                            .current_path
+                            .clone()
+                            .unwrap_or_else(|| requested_path.to_path_buf()),
+                        record.display_name.clone(),
+                        record.presence,
+                    )
+                },
+            )
+        };
+        let services = self
+            .list_with_instance_owners(Some(superseded.instance_id))
+            .await
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect::<Vec<_>>();
+        let availability = self
+            .project_availability_status(superseded.instance_id, presence, &services)
+            .await?
+            .context("superseded project ensure has no availability state")?;
+
+        Ok(Some(EnsureProjectSuperseded {
+            project_path,
+            project_name,
+            state: availability.state,
+            reasons: availability.reasons,
+        }))
     }
 
     /// Acquire or renew semantic availability and converge the project runtime.
@@ -24905,6 +24948,165 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn paused_multi_service_ensure_is_projected_and_later_semantic_activity_resumes() {
+        let dir = tempdir().expect("create superseded EnsureProject directory");
+        let project_path = dir.path().join("superseded-ensure-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "superseded-ensure").await;
+        manager.set_http_port(Some(80)).await;
+        manager.set_https_port(Some(443)).await;
+        write_availability_worker_config(
+            &project_path,
+            "superseded-ensure",
+            "superseded-ensure.localhost",
+            &["web", "worker"],
+        );
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: stop_count.clone(),
+            }),
+        );
+
+        let ensure = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move {
+                manager
+                    .ensure_project(project_path, DemandKey::manual_cli())
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("multi-service ensure reaches its first service preparation");
+
+        let (started_service, controller_generation) = {
+            let services = manager.services.lock().await;
+            let (name, service) = services
+                .iter()
+                .next()
+                .expect("prepared service is published before its build blocks");
+            (name.clone(), service.controller_generation)
+        };
+        manager
+            .broadcast_log(
+                instance_id,
+                controller_generation,
+                LogEntry {
+                    timestamp: 1,
+                    service: started_service.clone(),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "build output retained across supersession".to_owned(),
+                },
+            )
+            .await;
+
+        let pause = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.project_pause_availability(&project_path).await }
+        });
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load superseded ensure availability");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if availability
+                    .snapshot()
+                    .await
+                    .expect("observe pause publication")
+                    .is_paused()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause becomes authoritative while prepare is blocked");
+        release_prepare.notify_one();
+
+        let error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, ensure)
+            .await
+            .expect("superseded ensure returns")
+            .expect("superseded ensure task joins")
+            .expect_err("pause prevents the in-flight ensure from reaching Ready");
+        assert!(error.is::<AvailabilityStartSuperseded>());
+        let projected = manager
+            .ensure_project_superseded_result(&project_path, &error)
+            .await
+            .expect("project superseding lifecycle state")
+            .expect("availability supersession is recognized");
+        assert_eq!(projected.project_name.as_deref(), Some("superseded-ensure"));
+        assert_eq!(projected.state, ProjectLifecycleState::Paused);
+        assert!(
+            projected
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paused")
+        );
+
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, pause)
+            .await
+            .expect("pause convergence completes")
+            .expect("pause task joins")
+            .expect("pause succeeds");
+        assert_eq!(start_count.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        for service in ["web", "worker"] {
+            assert!(
+                manager
+                    .get_service_controller(&format!("superseded-ensure:{service}"))
+                    .await
+                    .is_none(),
+                "paused supersession leaves every required service stopped"
+            );
+        }
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(instance_id))
+                .iter()
+                .any(|entry| entry.message == "build output retained across supersession"),
+            "service logs remain available after the superseded controller is stopped"
+        );
+
+        manager.factories.remove(0);
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let resumed = manager
+            .ensure_project(project_path.clone(), DemandKey::manual_cli())
+            .await
+            .expect("later semantic activity starts a new generation and resumes");
+        assert_eq!(resumed.state, EnsureProjectState::Ready);
+        assert_eq!(resumed.services.len(), 2);
+        assert!(
+            !availability
+                .snapshot()
+                .await
+                .expect("read resumed availability")
+                .is_paused()
+        );
+
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("clean up resumed project");
+    }
+
+    #[tokio::test]
     async fn ensure_project_surfaces_the_exact_readiness_timeout() {
         let dir = tempdir().expect("create timed EnsureProject directory");
         let project_path = dir.path().join("timed-ensure-project");
@@ -24980,6 +25182,14 @@ PATH = "/usr/bin:/bin"
             .expect("join timed EnsureProject")
             .expect_err("unbound assigned endpoint times out");
         assert!(format!("{error:#}").contains("timed out after 300s"));
+        assert!(
+            manager
+                .ensure_project_superseded_result(&project_path, &error)
+                .await
+                .expect("classify readiness failure")
+                .is_none(),
+            "a genuine readiness failure remains distinct from lifecycle supersession"
+        );
 
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await

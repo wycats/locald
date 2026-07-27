@@ -4,7 +4,7 @@ use locald_core::attachments::{
     AttachmentSource, EditorSession, ProjectFilter, ProjectListEntry, ProjectSection,
     ProjectStatusInfo,
 };
-use locald_core::ipc::EnsureProjectResult;
+use locald_core::ipc::{EnsureProjectResult, EnsureProjectSuperseded};
 use locald_core::{DemandKey, IpcRequest, IpcResponse, LocaldConfig, ProjectAvailabilityStatus};
 #[cfg(target_os = "macos")]
 use locald_core::{DomainName, HostsFileSection};
@@ -218,6 +218,22 @@ const fn manual_follow_renewal_should_continue(response: &CliResult<IpcResponse>
 
 fn project_readiness_error(message: impl std::fmt::Display) -> CliError {
     CliError::message(format!("Failed to make project ready: {message}"))
+}
+
+fn project_superseded_error(result: &EnsureProjectSuperseded) -> CliError {
+    let project = result
+        .project_name
+        .as_deref()
+        .unwrap_or_else(|| result.project_path.to_str().unwrap_or("project"));
+    let mut message = format!(
+        "{project} did not become Ready because its availability is now {}.",
+        result.state
+    );
+    for reason in &result.reasons {
+        message.push_str("\n  - ");
+        message.push_str(&reason.message);
+    }
+    CliError::expected(message)
 }
 
 fn format_status_time(time: std::time::SystemTime) -> String {
@@ -720,6 +736,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
                 match response {
                     Ok(IpcResponse::ProjectEnsured(result)) => {
                         break result;
+                    }
+                    Ok(IpcResponse::ProjectEnsureSuperseded(result)) => {
+                        return Err(project_superseded_error(&result));
                     }
                     Ok(IpcResponse::Error(message)) => {
                         return Err(project_readiness_error(message));
@@ -1717,6 +1736,9 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     print_ensure_result(&result, false)?;
                                 }
                             }
+                            Ok(IpcResponse::ProjectEnsureSuperseded(result)) => {
+                                return Err(project_superseded_error(&result));
+                            }
                             Ok(IpcResponse::Error(message)) => {
                                 return Err(project_readiness_error(message));
                             }
@@ -2604,6 +2626,25 @@ name = "example"
         assert_eq!(
             error.to_string(),
             "Failed to make project ready: readiness timed out"
+        );
+    }
+
+    #[test]
+    fn project_supersession_is_an_expected_nonzero_failure_with_safe_reasons() {
+        let error = project_superseded_error(&EnsureProjectSuperseded {
+            project_path: "/projects/example".into(),
+            project_name: Some("example".to_owned()),
+            state: locald_core::ProjectLifecycleState::Paused,
+            reasons: vec![locald_core::AvailabilityReason {
+                code: "paused".to_owned(),
+                message: "The project is paused through its current activity.".to_owned(),
+            }],
+        });
+
+        assert!(error.is_expected());
+        assert_eq!(
+            error.to_string(),
+            "example did not become Ready because its availability is now Paused.\n  - The project is paused through its current activity."
         );
     }
 

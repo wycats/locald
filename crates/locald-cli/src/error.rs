@@ -16,6 +16,10 @@ pub enum CliError {
     #[error("{message}")]
     #[diagnostic(code(locald::cli::error))]
     Other { message: String },
+
+    #[error("{message}")]
+    #[diagnostic(code(locald::cli::expected_failure))]
+    Expected { message: String },
 }
 
 impl CliError {
@@ -23,6 +27,16 @@ impl CliError {
         Self::Other {
             message: message.into(),
         }
+    }
+
+    pub fn expected(message: impl Into<String>) -> Self {
+        Self::Expected {
+            message: message.into(),
+        }
+    }
+
+    pub const fn is_expected(&self) -> bool {
+        matches!(self, Self::Expected { .. })
     }
 }
 
@@ -198,6 +212,14 @@ mod tests {
         let err = CliError::message("test message");
         assert!(matches!(err, CliError::Other { .. }));
         assert_eq!(err.to_string(), "test message");
+    }
+
+    #[test]
+    fn expected_cli_failure_is_distinct_from_an_unexpected_error() {
+        let expected = CliError::expected("project was paused");
+        assert!(expected.is_expected());
+        assert_eq!(expected.to_string(), "project was paused");
+        assert!(!CliError::message("unexpected").is_expected());
     }
 
     #[test]
