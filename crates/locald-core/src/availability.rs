@@ -323,6 +323,16 @@ impl DemandKey {
         Self::owned(DemandKind::AgentConversation, private_identity)
     }
 
+    /// A demand owned by one already-opaque agent conversation key.
+    ///
+    /// The demand store applies its own domain-separated digest so the catalog
+    /// binding key cannot be correlated with the persisted availability owner.
+    pub fn agent_conversation_key(
+        conversation: &crate::AgentConversationKey,
+    ) -> Result<Self, DemandKeyError> {
+        Self::agent_conversation(conversation.as_opaque_str())
+    }
+
     /// A process-bound compatibility demand imported from legacy state.
     pub fn legacy_process_attachment(private_identity: &str) -> Result<Self, DemandKeyError> {
         Self::owned(DemandKind::LegacyProcessAttachment, private_identity)

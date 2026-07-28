@@ -74,11 +74,18 @@ pub use hosts::{HostsFileSection, LEGACY_MACOS_HOST_ALIASES};
 pub mod state;
 #[doc(inline)]
 pub use state::{ServerState, ServiceState};
+pub mod agent;
 pub mod availability;
 pub mod catalog;
 pub mod domain;
 pub mod locator;
 pub mod storage;
+#[doc(inline)]
+pub use agent::{
+    AGENT_ADAPTER_PROTOCOL_VERSION, AgentContextError, AgentConversationKey,
+    AgentProjectRegistration, AgentProjectStatus, AgentServiceStatus, AgentWorkspaceContext,
+    AgentWorktreeStatus,
+};
 #[doc(inline)]
 pub use availability::{
     AGENT_ACTIVE_TTL, AGENT_DEMAND_TTL, AGENT_REVIEW_GRACE, AVAILABILITY_VERSION,
