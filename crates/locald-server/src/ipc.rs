@@ -8,6 +8,8 @@ use locald_core::config::LocaldConfig;
 use locald_core::ipc::{DaemonIdentity, EnsureProjectResult, LogEntry, MAX_IPC_REQUEST_BYTES};
 use locald_core::{AgentWorkspaceContext, DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
 use std::ffi::{OsStr, OsString};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
@@ -238,50 +240,55 @@ fn validate_editor_session(stream: &UnixStream, editor: &EditorSession) -> Resul
     validate_editor_session_with(stream, editor, validate_editor_process_chain)
 }
 
-fn validate_agent_adapter_process(
-    peer_pid: u32,
-    expected_uid: u32,
-    daemon_executable: &Path,
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn authenticated_peer_audit_token(stream: &UnixStream) -> Result<[u8; 32]> {
+    let mut token = [0_u8; 32];
+    let mut length =
+        libc::socklen_t::try_from(token.len()).context("audit token length was invalid")?;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            token.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read kernel-authenticated agent-adapter audit token");
+    }
+    anyhow::ensure!(
+        usize::try_from(length).ok() == Some(token.len()),
+        "kernel-authenticated agent-adapter audit token had an invalid length"
+    );
+    Ok(token)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_agent_adapter_credential(stream: &UnixStream, daemon_executable: &Path) -> Result<()> {
+    let requirement =
+        locald_helper_protocol::code_signing::designated_requirement_for_path(daemon_executable)
+            .context("failed to derive the running locald code requirement")?;
+    let audit_token = authenticated_peer_audit_token(stream)?;
+    locald_helper_protocol::code_signing::audit_token_satisfies_requirement(
+        &audit_token,
+        &requirement,
+    )
+    .context("agent adapter does not satisfy the running locald code requirement")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_agent_adapter_credential(
+    _stream: &UnixStream,
+    _daemon_executable: &Path,
 ) -> Result<()> {
-    let system = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(
-            ProcessRefreshKind::nothing()
-                .with_user(UpdateKind::OnlyIfNotSet)
-                .with_exe(UpdateKind::OnlyIfNotSet),
-        ),
-    );
-    let process = system
-        .process(sysinfo::Pid::from_u32(peer_pid))
-        .context("kernel-authenticated agent adapter process was no longer live")?;
-    let owner = process
-        .user_id()
-        .context("agent adapter process owner was unavailable")?;
-    anyhow::ensure!(
-        owner.to_string() == expected_uid.to_string(),
-        "agent adapter PID {peer_pid} does not belong to locald daemon UID {expected_uid}"
-    );
-    let peer_executable = process
-        .exe()
-        .context("agent adapter executable path was unavailable")?;
-    let peer_executable = std::fs::canonicalize(peer_executable).with_context(|| {
-        format!(
-            "failed to canonicalize agent adapter executable `{}`",
-            peer_executable.display()
-        )
-    })?;
-    let daemon_executable = std::fs::canonicalize(daemon_executable).with_context(|| {
-        format!(
-            "failed to canonicalize locald daemon executable `{}`",
-            daemon_executable.display()
-        )
-    })?;
-    anyhow::ensure!(
-        peer_executable == daemon_executable,
-        "agent adapter executable `{}` does not match the running locald installation `{}`; restart the adapter from the installed locald binary",
-        peer_executable.display(),
-        daemon_executable.display()
-    );
-    Ok(())
+    // Executable-path equality is not an authentication boundary on platforms
+    // where same-UID callers can inject code into an otherwise approved image.
+    anyhow::bail!(
+        "ambient agent adapter authentication requires macOS audit-token code signing in this release"
+    )
 }
 
 fn validate_agent_adapter_with<ValidateProcess>(
@@ -309,7 +316,9 @@ where
 }
 
 fn validate_agent_adapter(stream: &UnixStream, context: &AgentWorkspaceContext) -> Result<()> {
-    validate_agent_adapter_with(stream, context, validate_agent_adapter_process)
+    validate_agent_adapter_with(stream, context, |_, _, daemon_executable| {
+        validate_agent_adapter_credential(stream, daemon_executable)
+    })
 }
 
 fn agent_authentication_error(error: &anyhow::Error) -> IpcResponse {
@@ -1042,27 +1051,32 @@ mod tests {
         assert!(!called.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn agent_adapter_process_requires_the_running_locald_executable() {
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn agent_adapter_credential_requires_the_running_locald_code_identity() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
         let current = std::env::current_exe().expect("resolve test executable");
-        validate_agent_adapter_process(
-            std::process::id(),
-            nix::unistd::geteuid().as_raw(),
-            &current,
-        )
-        .expect("current locald test executable authenticates");
+        validate_agent_adapter_credential(&server, &current)
+            .expect("current locald test executable authenticates");
 
         let directory = tempfile::tempdir().expect("create unrelated executable directory");
         let unrelated = directory.path().join("unrelated-locald");
         std::fs::write(&unrelated, "not the current executable")
             .expect("write unrelated executable");
-        let error = validate_agent_adapter_process(
-            std::process::id(),
-            nix::unistd::geteuid().as_raw(),
-            &unrelated,
-        )
-        .expect_err("unrelated executable identity must fail");
-        assert!(error.to_string().contains("does not match"));
+        validate_agent_adapter_credential(&server, &unrelated)
+            .expect_err("unrelated executable identity must fail");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn production_agent_adapter_authentication_fails_closed_without_code_signing() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let context = agent_context(AGENT_ADAPTER_PROTOCOL_VERSION);
+
+        let error = validate_agent_adapter(&server, &context)
+            .expect_err("non-macOS adapter authentication must fail closed");
+
+        assert!(error.to_string().contains("macOS audit-token code signing"));
     }
 
     #[test]

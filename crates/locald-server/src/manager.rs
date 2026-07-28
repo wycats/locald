@@ -6059,13 +6059,18 @@ impl ProcessManager {
         };
 
         if let Some(instance_id) = registered_instance {
-            self.reconcile_and_bind_agent_conversation(
-                &context.conversation,
-                discovery,
-                instance_id,
-            )
-            .await?;
-            self.agent_project_status_for_instance(instance_id).await
+            if self
+                .reconcile_and_bind_agent_conversation(
+                    &context.conversation,
+                    &discovery,
+                    instance_id,
+                )
+                .await?
+            {
+                self.agent_project_status_for_instance(instance_id).await
+            } else {
+                self.agent_unregistered_project_status(discovery).await
+            }
         } else {
             self.agent_unregistered_project_status(discovery).await
         }
@@ -6116,8 +6121,26 @@ impl ProcessManager {
                 .instances
                 .contains_key(&instance_id)
                 .then_some(instance_id),
-            None => registry.project_instance_for_path(discovery.project_root()),
+            None => Self::non_git_instance_for_path(registry, discovery.project_root()),
         }
+    }
+
+    fn non_git_instance_for_path(registry: &Registry, path: &Path) -> Option<ProjectInstanceId> {
+        registry
+            .instances
+            .iter()
+            .filter(|(_, record)| matches!(record.origin, ProjectInstanceOrigin::NonGit))
+            .filter(|(_, record)| {
+                record.current_path.as_deref() == Some(path) || record.last_known_path == path
+            })
+            .max_by_key(|(id, record)| {
+                (
+                    record.current_path.as_deref() == Some(path),
+                    record.last_seen,
+                    **id,
+                )
+            })
+            .map(|(id, _)| *id)
     }
 
     fn validate_agent_binding_target(
@@ -6130,15 +6153,16 @@ impl ProcessManager {
         };
         let discovered_instance = discovery
             .git_project_instance_id()
-            .or_else(|| registry.project_instance_for_path(discovery.project_root()));
+            .or_else(|| Self::non_git_instance_for_path(registry, discovery.project_root()));
         let same_target = discovered_instance == Some(bound_instance)
             || (discovered_instance.is_none()
                 && registry
                     .instances
                     .get(&bound_instance)
                     .is_some_and(|record| {
-                        record.current_path.as_deref() == Some(discovery.project_root())
-                            || record.last_known_path == discovery.project_root()
+                        matches!(record.origin, ProjectInstanceOrigin::NonGit)
+                            && (record.current_path.as_deref() == Some(discovery.project_root())
+                                || record.last_known_path == discovery.project_root())
                     }));
         if same_target {
             return Ok(());
@@ -6189,16 +6213,19 @@ impl ProcessManager {
     async fn reconcile_and_bind_agent_conversation(
         &self,
         conversation: &AgentConversationKey,
-        discovery: ProjectDiscovery,
+        discovery: &ProjectDiscovery,
         instance_id: ProjectInstanceId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.ensure_lifecycle_publication_available()?;
         let mut registry = self.registry.lock().await;
         let mut candidate = registry.clone();
-        if Self::agent_discovery_requires_reconciliation(&candidate, instance_id, &discovery) {
+        if !candidate.instances.contains_key(&instance_id) {
+            return Ok(false);
+        }
+        if Self::agent_discovery_requires_reconciliation(&candidate, instance_id, discovery) {
             let reconciled = candidate
-                .register_project(discovery, None)
+                .register_project(discovery.clone(), None)
                 .context("failed to reconcile ambient project metadata")?;
             anyhow::ensure!(
                 reconciled == instance_id,
@@ -6207,12 +6234,13 @@ impl ProcessManager {
         }
         candidate.bind_agent_conversation(conversation.clone(), instance_id)?;
         if candidate == *registry {
-            return Ok(());
+            return Ok(true);
         }
         registry
             .commit_candidate(candidate)
             .await
-            .context("failed to persist ambient project metadata and conversation binding")
+            .context("failed to persist ambient project metadata and conversation binding")?;
+        Ok(true)
     }
 
     fn agent_discovery_requires_reconciliation(
@@ -26074,6 +26102,103 @@ command = "unused-by-inspect"
             "an unregistered physical replacement cannot inherit the old instance binding"
         );
         assert!(registry.instances.contains_key(&historical_instance));
+    }
+
+    #[tokio::test]
+    async fn agent_inspect_does_not_treat_a_non_git_replacement_as_the_stale_git_instance() {
+        let dir = tempdir().expect("create Git-to-non-Git replacement directory");
+        let project_path = dir.path().join("agent-origin-replacement");
+        std::fs::create_dir(&project_path).expect("create original Git project");
+        git(&project_path, &["init"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            "[project]\nname = \"agent-origin-replacement\"\n",
+        )
+        .expect("write original config");
+        let (manager, historical_instance, _) =
+            availability_manager(dir.path(), &project_path, "agent-origin-replacement").await;
+
+        std::fs::remove_dir_all(project_path.join(".git")).expect("remove Git identity");
+        let unbound = test_agent_context(&project_path, "non-Git replacement conversation");
+        let status = manager
+            .agent_inspect_project(&unbound)
+            .await
+            .expect("inspect non-Git replacement");
+        assert_eq!(status.registration, AgentProjectRegistration::Unregistered);
+        assert_eq!(
+            manager
+                .registry
+                .lock()
+                .await
+                .agent_binding(&unbound.conversation),
+            None
+        );
+
+        let bound = test_agent_context(&project_path, "historical Git conversation");
+        {
+            let mut registry = manager.registry.lock().await;
+            let mut candidate = registry.clone();
+            candidate
+                .bind_agent_conversation(bound.conversation.clone(), historical_instance)
+                .expect("bind historical Git conversation");
+            registry
+                .commit_candidate(candidate)
+                .await
+                .expect("publish historical Git binding");
+        }
+        let error = manager
+            .agent_inspect_project(&bound)
+            .await
+            .expect_err("non-Git replacement cannot inherit a Git conversation binding");
+        assert!(format!("{error:#}").contains("cannot silently retarget"));
+    }
+
+    #[tokio::test]
+    async fn agent_inspect_binding_commit_does_not_recreate_a_forgotten_project() {
+        let dir = tempdir().expect("create inspect-forget race directory");
+        let project_path = dir.path().join("agent-inspect-forget-race");
+        std::fs::create_dir(&project_path).expect("create inspect-forget project");
+        git(&project_path, &["init"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            "[project]\nname = \"agent-inspect-forget-race\"\n",
+        )
+        .expect("write inspect-forget config");
+        let (manager, instance_id, _) =
+            availability_manager(dir.path(), &project_path, "agent-inspect-forget-race").await;
+        let discovery = Registry::discover(project_path.clone())
+            .await
+            .expect("capture inspect discovery before forget");
+        let context = test_agent_context(&project_path, "inspect-forget conversation");
+
+        {
+            let mut registry = manager.registry.lock().await;
+            let mut candidate = registry.clone();
+            assert!(
+                candidate
+                    .unregister_project(&project_path)
+                    .expect("forget inspected project")
+            );
+            registry
+                .commit_candidate(candidate)
+                .await
+                .expect("publish project forget");
+        }
+
+        assert!(
+            !manager
+                .reconcile_and_bind_agent_conversation(
+                    &context.conversation,
+                    &discovery,
+                    instance_id,
+                )
+                .await
+                .expect("recheck captured inspect target"),
+            "inspection reports the forgotten project as unregistered"
+        );
+        let registry = manager.registry.lock().await;
+        assert!(!registry.instances.contains_key(&instance_id));
+        assert_eq!(registry.agent_binding(&context.conversation), None);
     }
 
     #[tokio::test]

@@ -196,8 +196,8 @@ fn projects_for_locator(locator: &Path) -> Result<BTreeSet<PathBuf>> {
                 start.display()
             )
         })?;
-        if entry.file_type().is_some_and(|kind| kind.is_file())
-            && is_project_config_name(entry.file_name())
+        if is_project_config_name(entry.file_name())
+            && std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file())
         {
             let parent = entry
                 .path()
@@ -215,8 +215,8 @@ fn nearest_ancestor_project(start: &Path) -> Result<Option<PathBuf>> {
     for ancestor in start.ancestors() {
         for config_name in CONFIG_FILES {
             let config = ancestor.join(config_name);
-            match std::fs::symlink_metadata(&config) {
-                Ok(metadata) if metadata.file_type().is_file() => {
+            match std::fs::metadata(&config) {
+                Ok(metadata) if metadata.is_file() => {
                     return std::fs::canonicalize(ancestor).map(Some).with_context(|| {
                         format!(
                             "could not canonicalize project root `{}`",
@@ -338,6 +338,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_root_resolves_a_nested_symlinked_configuration() {
+        let directory = TempDir::new().expect("create temporary workspace");
+        let project = directory.path().join("packages/symlinked-app");
+        std::fs::create_dir_all(project.join("src")).expect("create symlinked project");
+        let shared = directory.path().join("shared-locald.toml");
+        std::fs::write(&shared, "[project]\nname = \"symlinked-app\"\n")
+            .expect("write shared configuration");
+        std::os::unix::fs::symlink(&shared, project.join("locald.toml"))
+            .expect("symlink project configuration");
+
+        let resolved =
+            resolve_agent_workspace(&context(vec![directory.path().to_path_buf()], None, None))
+                .await
+                .expect("resolve nested symlinked project");
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(project).expect("canonical symlinked project")
+        );
+    }
+
+    #[tokio::test]
     async fn locator_inside_project_resolves_nearest_ancestor() {
         let directory = TempDir::new().expect("create temporary workspace");
         let expected = project(directory.path(), "app");
@@ -345,6 +367,27 @@ mod tests {
             .await
             .expect("resolve ancestor project");
         assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
+    async fn locator_inside_project_resolves_a_symlinked_ancestor_configuration() {
+        let directory = TempDir::new().expect("create temporary workspace");
+        let project = directory.path().join("symlinked-ancestor");
+        let nested = project.join("src/deep");
+        std::fs::create_dir_all(&nested).expect("create nested project locator");
+        let shared = directory.path().join("shared-Procfile");
+        std::fs::write(&shared, "web: npm start\n").expect("write shared Procfile");
+        std::os::unix::fs::symlink(&shared, project.join("Procfile"))
+            .expect("symlink ancestor Procfile");
+
+        let resolved = resolve_agent_workspace(&context(vec![nested], None, None))
+            .await
+            .expect("resolve symlinked ancestor configuration");
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(project).expect("canonical symlinked ancestor")
+        );
     }
 
     #[tokio::test]
