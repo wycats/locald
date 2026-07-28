@@ -1407,7 +1407,13 @@ impl ProjectCatalog {
         self.reconcile_missing()?;
         let mut missing = Vec::new();
         for (id, record) in &self.instances {
-            if record.presence != CatalogPresence::Missing || record.pinned {
+            if record.presence != CatalogPresence::Missing
+                || record.pinned
+                || self
+                    .agent_bindings
+                    .values()
+                    .any(|bound_instance| bound_instance == id)
+            {
                 continue;
             }
             let removable = match record.origin {
@@ -4875,6 +4881,51 @@ mod tests {
                 .expect("forget bound project")
         );
         assert_eq!(reopened.agent_binding(&key), None);
+    }
+
+    #[tokio::test]
+    async fn missing_agent_bound_project_survives_pruning_until_explicit_forget() {
+        let fixture = Fixture::new();
+        let project = fixture.project("bound-missing-project");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project.clone())
+                    .await
+                    .expect("discover bound project"),
+                Some("bound-missing-project".to_owned()),
+            )
+            .expect("register bound project");
+        let conversation =
+            AgentConversationKey::digest("active conversation").expect("digest conversation");
+        catalog
+            .bind_agent_conversation(conversation.clone(), instance_id)
+            .expect("bind conversation");
+        std::fs::remove_dir_all(&project).expect("remove bound project");
+
+        assert_eq!(
+            catalog
+                .prune_missing_projects()
+                .expect("prune missing projects"),
+            0
+        );
+        assert_eq!(
+            catalog.instances[&instance_id].presence,
+            CatalogPresence::Missing
+        );
+        assert_eq!(
+            catalog.agent_binding(&conversation),
+            Some(instance_id),
+            "automatic pruning must preserve first-project binding authority"
+        );
+
+        assert!(
+            catalog
+                .unregister_project(&project)
+                .expect("explicitly forget bound project")
+        );
+        assert_eq!(catalog.agent_binding(&conversation), None);
+        assert!(!catalog.instances.contains_key(&instance_id));
     }
 
     #[tokio::test]

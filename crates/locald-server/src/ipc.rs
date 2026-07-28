@@ -1,4 +1,5 @@
 use crate::ShutdownReason;
+use crate::agent_context::AgentWorkspaceResolutionError;
 use crate::container::ContainerManager;
 use crate::manager::{InstanceLogEntry, ProcessManager};
 use anyhow::{Context, Result};
@@ -321,6 +322,12 @@ fn agent_authentication_error(error: &anyhow::Error) -> IpcResponse {
 
 fn agent_operation_error(operation: &str, error: &anyhow::Error) -> IpcResponse {
     warn!("Ambient agent {operation} failed: {error:#}");
+    if let Some(resolution) = error.downcast_ref::<AgentWorkspaceResolutionError>() {
+        return IpcResponse::Error(format!(
+            "ambient project {operation} failed: {}",
+            resolution.safe_message()
+        ));
+    }
     IpcResponse::Error(format!(
         "ambient project {operation} failed; inspect `locald status` and project logs for details"
     ))
@@ -1076,6 +1083,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn agent_workspace_errors_preserve_safe_recovery_guidance() {
+        let directory = tempfile::tempdir().expect("create ambiguous workspace");
+        for name in ["private-one", "private-two"] {
+            let project = directory.path().join(name);
+            std::fs::create_dir(&project).expect("create private project");
+            std::fs::write(
+                project.join("locald.toml"),
+                format!("[project]\nname = \"{name}\"\n"),
+            )
+            .expect("write private project config");
+        }
+        let mut context = agent_context(AGENT_ADAPTER_PROTOCOL_VERSION);
+        context.workspace_roots = vec![directory.path().to_path_buf()];
+        let error = crate::agent_context::resolve_agent_workspace(&context)
+            .await
+            .expect_err("ambiguous workspace must fail");
+
+        let rendered = serde_json::to_string(&agent_operation_error("inspection", &error))
+            .expect("serialize guided workspace error");
+
+        assert!(rendered.contains("narrow the task workspace"));
+        assert!(!rendered.contains("private-one"));
+        assert!(!rendered.contains("private-two"));
+        assert!(!rendered.contains(directory.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 #![allow(clippy::redundant_pub_crate)] // Explicitly mark the crate-internal journal surface.
 
 use locald_core::attachments::AttachmentStoreSnapshot;
+use locald_core::catalog::CATALOG_VERSION;
 use locald_core::{PreparedAvailabilityBatch, ProjectCatalog};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
@@ -606,15 +607,28 @@ impl LifecycleJournal {
     }
 
     pub(crate) async fn load(&self) -> Result<Option<LifecycleTransaction>, LifecycleJournalError> {
-        let loaded: Option<LifecycleTransaction> = read_versioned(
+        let value = read_versioned_value(
             &self.journal_path,
             LIFECYCLE_TRANSACTION_VERSION,
             "lifecycle transaction",
         )
         .await?;
-        let Some(mut transaction) = loaded else {
+        let Some(value) = value else {
             return Ok(None);
         };
+        validate_embedded_catalog_agent_bindings(&value).map_err(|reason| {
+            LifecycleJournalError::InvalidData {
+                entity: "lifecycle transaction",
+                path: self.journal_path.clone(),
+                reason,
+            }
+        })?;
+        let mut transaction: LifecycleTransaction =
+            serde_json::from_value(value).map_err(|source| LifecycleJournalError::InvalidData {
+                entity: "lifecycle transaction",
+                path: self.journal_path.clone(),
+                reason: source.to_string(),
+            })?;
         transaction
             .normalize_deserialized_paths()
             .map_err(|error| LifecycleJournalError::InvalidData {
@@ -1073,6 +1087,23 @@ async fn read_versioned<T: DeserializeOwned>(
     expected: u32,
     entity: &'static str,
 ) -> Result<Option<T>, LifecycleJournalError> {
+    let Some(value) = read_versioned_value(path, expected, entity).await? else {
+        return Ok(None);
+    };
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|source| LifecycleJournalError::InvalidData {
+            entity,
+            path: path.to_path_buf(),
+            reason: source.to_string(),
+        })
+}
+
+async fn read_versioned_value(
+    path: &Path,
+    expected: u32,
+    entity: &'static str,
+) -> Result<Option<serde_json::Value>, LifecycleJournalError> {
     let content = match read_optional_bytes(path, "read lifecycle journal state").await? {
         Some(content) => content,
         None => return Ok(None),
@@ -1099,13 +1130,27 @@ async fn read_versioned<T: DeserializeOwned>(
             expected,
         });
     }
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|source| LifecycleJournalError::InvalidData {
-            entity,
-            path: path.to_path_buf(),
-            reason: source.to_string(),
-        })
+    Ok(Some(value))
+}
+
+fn validate_embedded_catalog_agent_bindings(value: &serde_json::Value) -> Result<(), String> {
+    let Some(catalog) = value.get("catalog").filter(|catalog| !catalog.is_null()) else {
+        return Ok(());
+    };
+    for image_name in ["base", "target"] {
+        let Some(image) = catalog.get(image_name) else {
+            continue;
+        };
+        if image.get("version").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(CATALOG_VERSION))
+            && image.get("agent_bindings").is_none()
+        {
+            return Err(format!(
+                "current embedded catalog {image_name} is missing `agent_bindings`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn write_atomic_bytes(
@@ -1643,6 +1688,38 @@ mod tests {
             assert_eq!(catalog["version"], serde_json::Value::from(CATALOG_VERSION));
             assert_eq!(catalog["agent_bindings"], serde_json::json!({}));
         }
+    }
+
+    #[tokio::test]
+    async fn current_embedded_catalog_without_agent_bindings_is_rejected() {
+        let fixture = Fixture::new();
+        let transaction = fixture.transaction();
+        let mut value = serde_json::to_value(&transaction).expect("serialize lifecycle journal");
+        value
+            .get_mut("catalog")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|catalog| catalog.get_mut("target"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("embedded catalog target")
+            .remove("agent_bindings");
+        tokio::fs::write(
+            fixture.journal.journal_path(),
+            serde_json::to_vec_pretty(&value).expect("encode malformed lifecycle journal"),
+        )
+        .await
+        .expect("write malformed lifecycle journal");
+
+        let error = fixture
+            .journal
+            .load()
+            .await
+            .expect_err("current catalog image without bindings must fail closed");
+        assert!(matches!(
+            error,
+            LifecycleJournalError::InvalidData { reason, .. }
+                if reason.contains("catalog target")
+                    && reason.contains("agent_bindings")
+        ));
     }
 
     #[cfg(unix)]

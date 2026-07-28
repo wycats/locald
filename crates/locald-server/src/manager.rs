@@ -6389,6 +6389,7 @@ impl ProcessManager {
                 ))
             })
             .map(Self::agent_safe_availability);
+        let advertised_https_port = self.proxy_ports.lock().await.1;
         let mut urls = BTreeSet::new();
         let mut services = runtime_statuses
             .into_iter()
@@ -6399,8 +6400,10 @@ impl ProcessManager {
                     locald_core::ipc::ServiceType::Postgres | locald_core::ipc::ServiceType::Worker
                 ) {
                     None
+                } else if status.domain.is_some() {
+                    status.url
                 } else {
-                    status.domain.map(|domain| format!("https://{domain}"))
+                    None
                 };
                 if let Some(url) = &url {
                     urls.insert(url.clone());
@@ -6436,7 +6439,7 @@ impl ProcessManager {
                             .and_then(|runtime_name| {
                                 self.domain_for_service(instance_id, runtime_name)
                             })
-                            .map(|domain| format!("https://{domain}"))
+                            .map(|domain| Self::agent_https_url(&domain, advertised_https_port))
                     };
                     if let Some(url) = &url {
                         urls.insert(url.clone());
@@ -6472,6 +6475,13 @@ impl ProcessManager {
             );
         }
         availability
+    }
+
+    fn agent_https_url(domain: &str, advertised_https_port: Option<u16>) -> String {
+        match advertised_https_port {
+            Some(443) | None => format!("https://{domain}"),
+            Some(port) => format!("https://{domain}:{port}"),
+        }
     }
 
     /// Resume the active project that owns one exact domain and wait for readiness.
@@ -25975,6 +25985,7 @@ command = "unused-by-inspect"
         .expect("write agent inspect config");
         let (manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "agent-inspect").await;
+        manager.set_https_port(Some(8443)).await;
         let domain_index = {
             let mut registry = manager.registry.lock().await;
             registry
@@ -26008,9 +26019,9 @@ command = "unused-by-inspect"
         assert_eq!(status.services[0].health_status, HealthStatus::Unknown);
         assert_eq!(
             status.services[0].url.as_deref(),
-            Some("https://agent-inspect.localhost")
+            Some("https://agent-inspect.localhost:8443")
         );
-        assert_eq!(status.urls, vec!["https://agent-inspect.localhost"]);
+        assert_eq!(status.urls, vec!["https://agent-inspect.localhost:8443"]);
         assert_eq!(
             manager
                 .registry
@@ -26144,14 +26155,14 @@ command = "unused-by-test-factory"
             .await
             .expect("ensure ambient agent project");
         assert_eq!(status.registration, AgentProjectRegistration::Registered);
-        assert_eq!(status.urls, vec!["https://agent-ensure.localhost"]);
+        assert_eq!(status.urls, vec!["https://agent-ensure.localhost:8443"]);
         assert_eq!(status.services.len(), 1);
         assert_eq!(status.services[0].name, "web");
         assert_eq!(status.services[0].status, ServiceState::Running);
         assert_eq!(status.services[0].health_status, HealthStatus::Healthy);
         assert_eq!(
             status.services[0].url.as_deref(),
-            Some("https://agent-ensure.localhost")
+            Some("https://agent-ensure.localhost:8443")
         );
 
         let instance_id = manager
@@ -26288,7 +26299,7 @@ command = "unused-by-test-factory"
         assert_safe_keys(&encoded);
         let encoded = encoded.to_string();
         assert!(!encoded.contains("first private conversation"));
-        assert!(!encoded.contains("8443"));
+        assert!(encoded.contains("https://agent-ensure.localhost:8443"));
 
         let other_path = dir.path().join("other-agent-project");
         std::fs::create_dir(&other_path).expect("create conflicting project");

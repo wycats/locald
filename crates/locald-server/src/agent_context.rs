@@ -1,24 +1,80 @@
 //! Trusted ambient workspace resolution for agent adapters.
 
+#![allow(clippy::redundant_pub_crate)] // Shared with the sibling IPC module.
+
 use anyhow::{Context, Result};
 use ignore::{DirEntry, WalkBuilder};
 use locald_core::AgentWorkspaceContext;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 
-const CONFIG_FILE: &str = "locald.toml";
+const CONFIG_FILES: [&str; 2] = ["locald.toml", "Procfile"];
 const EXCLUDED_DIRECTORIES: [&str; 6] =
     [".git", "node_modules", "target", "dist", "build", ".next"];
 const MAX_DISCOVERY_ENTRIES: usize = 100_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentWorkspaceResolutionKind {
+    Ambiguous,
+    ConflictingSources,
+    MissingProject,
+    InspectionFailure,
+}
+
+/// A private ambient-resolution diagnostic with model-safe recovery guidance.
+#[derive(Debug, Error)]
+#[error("{details}")]
+pub(crate) struct AgentWorkspaceResolutionError {
+    kind: AgentWorkspaceResolutionKind,
+    details: String,
+}
+
+impl AgentWorkspaceResolutionError {
+    fn new(kind: AgentWorkspaceResolutionKind, details: impl Into<String>) -> Self {
+        Self {
+            kind,
+            details: details.into(),
+        }
+    }
+
+    /// Return actionable guidance without exposing private workspace paths.
+    pub(crate) const fn safe_message(&self) -> &'static str {
+        match self.kind {
+            AgentWorkspaceResolutionKind::Ambiguous => {
+                "ambient workspace contains multiple locald projects; narrow the task workspace to one project"
+            }
+            AgentWorkspaceResolutionKind::ConflictingSources => {
+                "trusted workspace sources identify different locald projects; reopen the task with one consistent workspace"
+            }
+            AgentWorkspaceResolutionKind::MissingProject => {
+                "ambient workspace does not contain `locald.toml` or `Procfile`; open the task inside one locald project"
+            }
+            AgentWorkspaceResolutionKind::InspectionFailure => {
+                "locald could not inspect the ambient workspace; verify that it exists and is readable"
+            }
+        }
+    }
+}
+
 /// Resolve trusted MCP/Codex context without accepting a model-provided path.
-#[allow(clippy::redundant_pub_crate)]
 pub(crate) async fn resolve_agent_workspace(context: &AgentWorkspaceContext) -> Result<PathBuf> {
-    context.validate().map_err(anyhow::Error::new)?;
+    context.validate().map_err(|error| {
+        AgentWorkspaceResolutionError::new(
+            AgentWorkspaceResolutionKind::InspectionFailure,
+            error.to_string(),
+        )
+    })?;
     let context = context.clone();
     tokio::task::spawn_blocking(move || resolve_agent_workspace_blocking(&context))
         .await
-        .context("ambient agent workspace resolution task failed")?
+        .map_err(|error| {
+            AgentWorkspaceResolutionError::new(
+                AgentWorkspaceResolutionKind::InspectionFailure,
+                format!("ambient agent workspace resolution task failed: {error}"),
+            )
+        })?
 }
 
 fn resolve_agent_workspace_blocking(context: &AgentWorkspaceContext) -> Result<PathBuf> {
@@ -34,11 +90,15 @@ fn resolve_agent_workspace_blocking(context: &AgentWorkspaceContext) -> Result<P
         if let Some(sandbox_root) = sandbox
             && sandbox_root != project_root
         {
-            anyhow::bail!(
-                "trusted MCP workspace roots resolve to `{}` while Codex sandbox metadata resolves to `{}`; refusing to choose between conflicting worktrees",
-                project_root.display(),
-                sandbox_root.display()
-            );
+            return Err(AgentWorkspaceResolutionError::new(
+                AgentWorkspaceResolutionKind::ConflictingSources,
+                format!(
+                    "trusted MCP workspace roots resolve to `{}` while Codex sandbox metadata resolves to `{}`; refusing to choose between conflicting worktrees",
+                    project_root.display(),
+                    sandbox_root.display()
+                ),
+            )
+            .into());
         }
         return Ok(project_root);
     }
@@ -56,17 +116,26 @@ fn resolve_agent_workspace_blocking(context: &AgentWorkspaceContext) -> Result<P
         return Ok(project_root);
     }
 
-    anyhow::bail!(
-        "ambient agent context does not resolve to a locald project; open the task inside a workspace containing one unambiguous `locald.toml`"
+    Err(AgentWorkspaceResolutionError::new(
+        AgentWorkspaceResolutionKind::MissingProject,
+        "ambient agent context does not resolve to a locald project",
     )
+    .into())
 }
 
 fn resolve_locator_group(label: &str, locators: &[PathBuf]) -> Result<Option<PathBuf>> {
     let mut projects = BTreeSet::new();
     for locator in locators {
-        projects.extend(projects_for_locator(locator).with_context(|| {
-            format!("failed to inspect {label} locator `{}`", locator.display())
-        })?);
+        let discovered = projects_for_locator(locator).map_err(|error| {
+            AgentWorkspaceResolutionError::new(
+                AgentWorkspaceResolutionKind::InspectionFailure,
+                format!(
+                    "failed to inspect {label} locator `{}`: {error:#}",
+                    locator.display()
+                ),
+            )
+        })?;
+        projects.extend(discovered);
     }
     match projects.len() {
         0 => Ok(None),
@@ -77,9 +146,13 @@ fn resolve_locator_group(label: &str, locators: &[PathBuf]) -> Result<Option<Pat
                 .map(|path| format!("`{}`", path.display()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::bail!(
-                "{label} contain multiple locald projects ({paths}); narrow the task workspace to one project"
+            Err(AgentWorkspaceResolutionError::new(
+                AgentWorkspaceResolutionKind::Ambiguous,
+                format!(
+                    "{label} contain multiple locald projects ({paths}); narrow the task workspace to one project"
+                ),
             )
+            .into())
         }
     }
 }
@@ -123,7 +196,8 @@ fn projects_for_locator(locator: &Path) -> Result<BTreeSet<PathBuf>> {
                 start.display()
             )
         })?;
-        if entry.file_type().is_some_and(|kind| kind.is_file()) && entry.file_name() == CONFIG_FILE
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && is_project_config_name(entry.file_name())
         {
             let parent = entry
                 .path()
@@ -139,34 +213,40 @@ fn projects_for_locator(locator: &Path) -> Result<BTreeSet<PathBuf>> {
 
 fn nearest_ancestor_project(start: &Path) -> Result<Option<PathBuf>> {
     for ancestor in start.ancestors() {
-        let config = ancestor.join(CONFIG_FILE);
-        match std::fs::symlink_metadata(&config) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                return std::fs::canonicalize(ancestor).map(Some).with_context(|| {
-                    format!(
-                        "could not canonicalize project root `{}`",
-                        ancestor.display()
-                    )
-                });
-            }
-            Ok(_) => {
-                anyhow::bail!(
-                    "locald configuration `{}` is not a regular file",
-                    config.display()
-                )
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "could not inspect locald configuration `{}`",
+        for config_name in CONFIG_FILES {
+            let config = ancestor.join(config_name);
+            match std::fs::symlink_metadata(&config) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    return std::fs::canonicalize(ancestor).map(Some).with_context(|| {
+                        format!(
+                            "could not canonicalize project root `{}`",
+                            ancestor.display()
+                        )
+                    });
+                }
+                Ok(_) => {
+                    anyhow::bail!(
+                        "locald configuration `{}` is not a regular file",
                         config.display()
                     )
-                });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "could not inspect locald configuration `{}`",
+                            config.display()
+                        )
+                    });
+                }
             }
         }
     }
     Ok(None)
+}
+
+fn is_project_config_name(name: &OsStr) -> bool {
+    CONFIG_FILES.iter().any(|config| name == *config)
 }
 
 fn include_walk_entry(entry: &DirEntry) -> bool {
@@ -181,7 +261,7 @@ fn include_walk_entry(entry: &DirEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_agent_workspace;
+    use super::{AgentWorkspaceResolutionError, resolve_agent_workspace};
     use locald_core::{
         AGENT_ADAPTER_PROTOCOL_VERSION, AgentConversationKey, AgentWorkspaceContext,
     };
@@ -211,6 +291,13 @@ mod tests {
         std::fs::canonicalize(project).expect("canonical project")
     }
 
+    fn procfile_project(parent: &Path, name: &str) -> PathBuf {
+        let project = parent.join(name);
+        std::fs::create_dir_all(project.join("src")).expect("create Procfile project");
+        std::fs::write(project.join("Procfile"), "web: npm start\n").expect("write Procfile");
+        std::fs::canonicalize(project).expect("canonical Procfile project")
+    }
+
     #[tokio::test]
     async fn workspace_root_resolves_one_nested_project() {
         let directory = TempDir::new().expect("create temporary workspace");
@@ -238,6 +325,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_root_resolves_one_nested_procfile_project() {
+        let directory = TempDir::new().expect("create temporary workspace");
+        let expected = procfile_project(directory.path(), "packages/procfile-app");
+
+        let resolved =
+            resolve_agent_workspace(&context(vec![directory.path().to_path_buf()], None, None))
+                .await
+                .expect("resolve nested Procfile project");
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
     async fn locator_inside_project_resolves_nearest_ancestor() {
         let directory = TempDir::new().expect("create temporary workspace");
         let expected = project(directory.path(), "app");
@@ -257,6 +357,12 @@ mod tests {
                 .await
                 .expect_err("ambiguous workspace must fail");
         assert!(error.to_string().contains("multiple locald projects"));
+        let safe = error
+            .downcast_ref::<AgentWorkspaceResolutionError>()
+            .expect("typed workspace-resolution error")
+            .safe_message();
+        assert!(safe.contains("narrow the task workspace"));
+        assert!(!safe.contains(directory.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
@@ -278,5 +384,22 @@ mod tests {
             .await
             .expect("resolve fallback");
         assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
+    async fn missing_project_guidance_names_both_supported_configurations_without_paths() {
+        let directory = TempDir::new().expect("create empty workspace");
+        let error =
+            resolve_agent_workspace(&context(vec![directory.path().to_path_buf()], None, None))
+                .await
+                .expect_err("empty workspace must fail");
+        let safe = error
+            .downcast_ref::<AgentWorkspaceResolutionError>()
+            .expect("typed workspace-resolution error")
+            .safe_message();
+
+        assert!(safe.contains("`locald.toml`"));
+        assert!(safe.contains("`Procfile`"));
+        assert!(!safe.contains(directory.path().to_string_lossy().as_ref()));
     }
 }
