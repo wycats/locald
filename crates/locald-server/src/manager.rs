@@ -3091,8 +3091,18 @@ impl ProcessManager {
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
-            let domain_slug =
-                candidate.ensure_worktree_domain_slug(instance_id, is_linked_worktree, None)?;
+            let reserved_slug_labels = config
+                .services
+                .keys()
+                .filter(|service_name| service_name.as_str() != "web")
+                .map(|service_name| sanitize_service_name_for_dns(service_name))
+                .collect::<BTreeSet<_>>();
+            let domain_slug = candidate.ensure_worktree_domain_slug(
+                instance_id,
+                is_linked_worktree,
+                None,
+                &reserved_slug_labels,
+            )?;
             if config
                 .worktrees
                 .as_ref()
@@ -21830,6 +21840,13 @@ command = "sleep 30"
 
 [services.web.env]
 PATH = "/usr/bin:/bin"
+
+[services.api]
+type = "worker"
+command = "sleep 30"
+
+[services.api.env]
+PATH = "/usr/bin:/bin"
 "#,
         )
         .expect("write project config");
@@ -21842,7 +21859,7 @@ PATH = "/usr/bin:/bin"
                 "worktree",
                 "add",
                 "-b",
-                "feature/turn-trace",
+                "feature/api",
                 worktree.to_str().expect("UTF-8 worktree path"),
             ],
         );
@@ -21862,13 +21879,13 @@ PATH = "/usr/bin:/bin"
         manager.set_host_syncer(Arc::new(NoopHostSyncer));
 
         manager
+            .apply_config(worktree.clone(), None, false)
+            .await
+            .expect("publish linked worktree before primary");
+        manager
             .apply_config(repository.clone(), None, false)
             .await
             .expect("publish primary checkout");
-        manager
-            .apply_config(worktree.clone(), None, false)
-            .await
-            .expect("publish linked worktree");
 
         let linked_discovery = Registry::discover(worktree.clone())
             .await
@@ -21882,13 +21899,19 @@ PATH = "/usr/bin:/bin"
             let catalog = registry.lock().await;
             assert_eq!(
                 catalog.instances[&linked_id].domain_slug.as_deref(),
-                Some("turn-trace")
+                Some("api-2")
             );
             assert!(catalog.domain_index().resolve("app.localhost").is_some());
             assert!(
                 catalog
                     .domain_index()
-                    .resolve("turn-trace.app.localhost")
+                    .resolve("api.app.localhost")
+                    .is_some()
+            );
+            assert!(
+                catalog
+                    .domain_index()
+                    .resolve("api-2.app.localhost")
                     .is_some()
             );
         }
@@ -21900,7 +21923,7 @@ PATH = "/usr/bin:/bin"
             .expect("republish after branch change");
         assert!(
             manager
-                .resolve_service_by_domain("turn-trace.app.localhost")
+                .resolve_service_by_domain("api-2.app.localhost")
                 .await
                 .is_some()
         );
