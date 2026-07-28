@@ -4,6 +4,8 @@
 	import DaemonControlCenter from './DaemonControlCenter.svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
+	import { services } from '$lib/stores/services';
+	import { serviceIdentity } from '$lib/types';
 
 	interface Props {
 		monitored: string[];
@@ -19,7 +21,8 @@
 </script>
 
 <div class="deck" data-testid="deck" class:single={monitored.length === 1}>
-	{#each monitored as serviceName (serviceName)}
+	{#each monitored as identity (identity)}
+		{@const service = $services.find((candidate) => serviceIdentity(candidate) === identity)}
 		<div
 			class="terminal-card"
 			in:fly={{ y: 20, duration: 300, easing: cubicOut }}
@@ -27,17 +30,17 @@
 		>
 			<div class="terminal-header">
 				<div class="header-left">
-					{#if serviceName === 'locald'}
+					{#if identity === 'locald'}
 						<Activity size={14} class="icon locald-icon" />
 						<span class="term-title">Daemon Control Center</span>
 					{:else}
 						<TerminalIcon size={14} class="icon" />
-						<span class="term-title">{serviceName}</span>
+						<span class="term-title">{service?.name ?? identity}</span>
 					{/if}
 				</div>
 				<div class="header-right">
 					<button
-						onclick={() => unmonitor(serviceName)}
+						onclick={() => unmonitor(identity)}
 						class="action-btn"
 						aria-label="Stop monitoring"
 						title="Stop monitoring"
@@ -47,10 +50,10 @@
 				</div>
 			</div>
 			<div class="terminal-body">
-				{#if serviceName === 'locald'}
+				{#if identity === 'locald'}
 					<DaemonControlCenter />
 				{:else}
-					<Terminal filter={serviceName} />
+					<Terminal filter={identity} />
 				{/if}
 			</div>
 		</div>

@@ -91,6 +91,13 @@ impl ServiceKey {
     pub fn display_name(&self, project_name: &str) -> String {
         format!("{project_name}:{}", self.name)
     }
+
+    /// Return a stable, filesystem-safe identifier for controller-owned
+    /// resources such as cgroups, container bundles, and data directories.
+    #[must_use]
+    pub fn resource_id(&self) -> String {
+        uuid::Uuid::new_v5(&self.instance.as_uuid(), self.name.as_str().as_bytes()).to_string()
+    }
 }
 
 /// The dynamic runtime state of a service.
@@ -219,4 +226,30 @@ pub trait ServiceFactory: Send + Sync + std::fmt::Debug {
         config: &ServiceConfig,
         ctx: &ServiceContext,
     ) -> Arc<Mutex<dyn ServiceController>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceKey;
+    use crate::identity::ProjectInstanceId;
+
+    fn instance_id(value: &str) -> ProjectInstanceId {
+        value.parse().expect("valid project instance ID")
+    }
+
+    #[test]
+    fn resource_ids_are_stable_and_instance_scoped() {
+        let first = ServiceKey::new(instance_id("00000000-0000-4000-8000-000000000001"), "web");
+        let same = ServiceKey::new(instance_id("00000000-0000-4000-8000-000000000001"), "web");
+        let second = ServiceKey::new(instance_id("00000000-0000-4000-8000-000000000002"), "web");
+
+        assert_eq!(first.resource_id(), same.resource_id());
+        assert_ne!(first.resource_id(), second.resource_id());
+        assert!(
+            first
+                .resource_id()
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || character == '-')
+        );
+    }
 }

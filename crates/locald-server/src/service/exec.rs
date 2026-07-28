@@ -30,6 +30,7 @@ type SpawnedProcess = (
 
 pub struct ExecController {
     id: String,
+    resource_id: String,
     runtime: ProcessRuntime,
     config: ServiceConfig,
     project_root: PathBuf,
@@ -53,6 +54,7 @@ impl fmt::Debug for ExecController {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecController")
             .field("id", &self.id)
+            .field("resource_id", &self.resource_id)
             .field("config", &self.config)
             .field("project_root", &self.project_root)
             .field("container_id", &self.container_id)
@@ -71,9 +73,22 @@ impl ExecController {
         port: Option<u16>,
         env: std::collections::HashMap<String, String>,
     ) -> Self {
+        Self::new_with_resource_id(id.clone(), id, runtime, config, project_root, port, env)
+    }
+
+    fn new_with_resource_id(
+        id: String,
+        resource_id: String,
+        runtime: ProcessRuntime,
+        config: ServiceConfig,
+        project_root: PathBuf,
+        port: Option<u16>,
+        env: std::collections::HashMap<String, String>,
+    ) -> Self {
         let (log_tx, _) = broadcast::channel(100);
         Self {
             id,
+            resource_id,
             runtime,
             config,
             project_root,
@@ -240,7 +255,8 @@ impl ServiceController for ExecController {
         // Phase 99: only set cgroupsPath once the cgroup root exists (admin setup).
         #[cfg(target_os = "linux")]
         {
-            self.cgroup_path = locald_utils::cgroup::maybe_cgroup_path_for_service(&self.id);
+            self.cgroup_path =
+                locald_utils::cgroup::maybe_cgroup_path_for_service(&self.resource_id);
         }
 
         match &self.config {
@@ -269,6 +285,8 @@ impl ServiceController for ExecController {
                             let _ = tx.send(LogEntry {
                                 timestamp,
                                 service: id,
+                                instance_id: None,
+                                service_name: None,
                                 stream: LogStream::Stdout,
                                 message: line,
                             });
@@ -278,7 +296,7 @@ impl ServiceController for ExecController {
                     let bundle_dir = self
                         .runtime
                         .prepare_cnb_container(
-                            self.id.clone(),
+                            self.resource_id.clone(),
                             &service_path,
                             c.command.as_ref(),
                             &env,
@@ -297,7 +315,7 @@ impl ServiceController for ExecController {
                 let bundle_dir = self
                     .runtime
                     .prepare_container(
-                        self.id.clone(),
+                        self.resource_id.clone(),
                         c.image.clone(),
                         c.command.clone(),
                         &env,
@@ -637,6 +655,8 @@ impl ServiceController for ExecController {
 
             return Ok(Some(ServiceMetrics {
                 name: self.id.clone(),
+                instance_id: None,
+                service_name: None,
                 cpu_percent: process.cpu_usage(),
                 memory_bytes: process.memory(),
                 timestamp: i64::try_from(timestamp).unwrap_or(0),
@@ -677,8 +697,9 @@ impl ServiceFactory for ExecFactory {
         config: &ServiceConfig,
         ctx: &ServiceContext,
     ) -> Arc<Mutex<dyn ServiceController>> {
-        Arc::new(Mutex::new(ExecController::new(
+        Arc::new(Mutex::new(ExecController::new_with_resource_id(
             name,
+            ctx.key.resource_id(),
             self.runtime.clone(),
             config.clone(),
             ctx.project_root.clone(),

@@ -4,6 +4,7 @@ export type ActionType = 'start' | 'stop' | 'restart' | 'reset';
 
 interface PendingAction {
 	serviceName: string;
+	instanceId: string | null;
 	action: ActionType;
 }
 
@@ -12,12 +13,15 @@ function createActionsStore() {
 
 	return {
 		subscribe,
-		start: (serviceName: string, action: ActionType) => {
-			update((actions) => [...actions, { serviceName, action }]);
+		start: (serviceName: string, instanceId: string | null, action: ActionType) => {
+			update((actions) => [...actions, { serviceName, instanceId, action }]);
 		},
-		finish: (serviceName: string, action: ActionType) => {
+		finish: (serviceName: string, instanceId: string | null, action: ActionType) => {
 			update((actions) =>
-				actions.filter((a) => !(a.serviceName === serviceName && a.action === action))
+				actions.filter(
+					(a) =>
+						!(a.serviceName === serviceName && a.instanceId === instanceId && a.action === action)
+				)
 			);
 		}
 	};

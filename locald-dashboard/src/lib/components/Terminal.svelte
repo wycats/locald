@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import type { Terminal } from 'ghostty-web';
 	import type { FitAddon } from 'ghostty-web';
-	import type { LogEntry } from '$lib/types';
+	import { logIdentity, type LogEntry } from '$lib/types';
 	import { logs, latestLog, stream } from '$lib/stores/logs';
 	import { terminalTheme } from '$lib/theme';
 	import { loadGhostty } from '$lib/ghostty';
@@ -121,7 +121,9 @@
 					const hasFilter = Array.isArray(filter) ? filter.length > 0 : !!filter;
 					const matchesService =
 						!hasFilter ||
-						(Array.isArray(filter) ? filter.includes(entry.service) : entry.service === filter);
+						(Array.isArray(filter)
+							? filter.includes(logIdentity(entry))
+							: logIdentity(entry) === filter);
 					const matchesText =
 						!textFilter ||
 						entry.message.toLowerCase().includes(textFilter.toLowerCase()) ||

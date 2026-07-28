@@ -497,6 +497,8 @@ impl HealthMonitor {
             )) = snapshot_info
             {
                 let status = crate::manager::ProcessManager::build_service_status(
+                    key.instance(),
+                    key.name().as_str().to_owned(),
                     display_name.to_string(),
                     domain,
                     path,
@@ -601,6 +603,8 @@ impl HealthMonitor {
             )) = snapshot_info
             {
                 let status = crate::manager::ProcessManager::build_service_status(
+                    key.instance(),
+                    key.name().as_str().to_owned(),
                     display_name.to_string(),
                     domain,
                     path,

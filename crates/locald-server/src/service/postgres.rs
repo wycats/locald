@@ -69,6 +69,8 @@ impl ServiceController for PostgresController {
                 yield LogEntry {
                     timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
                     service: service_name.clone(),
+                    instance_id: None,
+                    service_name: None,
                     stream: if stream_name == "stderr" { LogStream::Stderr } else { LogStream::Stdout },
                     message: line,
                 };
@@ -106,12 +108,34 @@ impl ServiceController for PostgresController {
 }
 
 use locald_core::config::{ServiceConfig, TypedServiceConfig};
-use locald_core::service::{ServiceContext, ServiceFactory};
+use locald_core::service::{ServiceContext, ServiceFactory, ServiceKey};
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Copy, Clone)]
 pub struct PostgresFactory;
+
+fn data_root() -> PathBuf {
+    directories::ProjectDirs::from("com", "locald", "locald").map_or_else(
+        || PathBuf::from(".locald"),
+        |directories| directories.data_dir().to_owned(),
+    )
+}
+
+fn data_dir_for_root(root: &std::path::Path, key: &ServiceKey) -> PathBuf {
+    root.join("instances")
+        .join(key.instance().to_string())
+        .join("postgres")
+        .join(key.resource_id())
+}
+
+pub(crate) fn data_dir_for(key: &ServiceKey) -> PathBuf {
+    data_dir_for_root(&data_root(), key)
+}
+
+pub(crate) fn legacy_data_dir(display_name: &str) -> PathBuf {
+    data_root().join("postgres").join(display_name)
+}
 
 impl ServiceFactory for PostgresFactory {
     fn can_handle(&self, config: &ServiceConfig) -> bool {
@@ -128,10 +152,7 @@ impl ServiceFactory for PostgresFactory {
         ctx: &ServiceContext,
     ) -> Arc<Mutex<dyn ServiceController>> {
         if let ServiceConfig::Typed(TypedServiceConfig::Postgres(pg_config)) = config {
-            // We need data_dir.
-            let data_dir = directories::ProjectDirs::from("com", "locald", "locald")
-                .map(|d| d.data_dir().join("postgres").join(&name))
-                .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(&name));
+            let data_dir = data_dir_for(&ctx.key);
 
             // Use port from: 1) config, 2) context (allocated by manager), 3) fallback to 5432
             let port = pg_config.common.port.or(ctx.port).unwrap_or(5432);
@@ -158,5 +179,43 @@ impl ServiceFactory for PostgresFactory {
                 panic!("PostgresFactory called with invalid config");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_dir_for_root;
+    use locald_core::identity::ProjectInstanceId;
+    use locald_core::service::ServiceKey;
+    use tempfile::tempdir;
+
+    fn instance_id(value: &str) -> ProjectInstanceId {
+        value.parse().expect("valid project instance ID")
+    }
+
+    #[test]
+    fn same_name_postgres_services_use_distinct_instance_directories() {
+        let root = tempdir().expect("create data root");
+        let first = ServiceKey::new(instance_id("00000000-0000-4000-8000-000000000001"), "db");
+        let second = ServiceKey::new(instance_id("00000000-0000-4000-8000-000000000002"), "db");
+
+        let first_dir = data_dir_for_root(root.path(), &first);
+        let second_dir = data_dir_for_root(root.path(), &second);
+
+        assert_ne!(first_dir, second_dir);
+        assert!(
+            first_dir.starts_with(
+                root.path()
+                    .join("instances")
+                    .join(first.instance().to_string())
+            )
+        );
+        assert!(
+            second_dir.starts_with(
+                root.path()
+                    .join("instances")
+                    .join(second.instance().to_string())
+            )
+        );
     }
 }

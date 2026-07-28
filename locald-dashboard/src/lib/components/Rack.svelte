@@ -37,7 +37,7 @@
 		AlertCircle,
 		Clock
 	} from 'lucide-svelte';
-	import type { ServiceStatus } from '$lib/types';
+	import { serviceIdentity, type ServiceStatus } from '$lib/types';
 	import Spinner from './Spinner.svelte';
 
 	export let monitored: string[] = [];
@@ -103,7 +103,7 @@
 		active: ProjectListEntry[],
 		alwaysOn: ProjectListEntry[],
 		recent: ProjectListEntry[],
-		serviceProjects: { name: string; services: ServiceStatus[] }[],
+		serviceProjects: { name: string; path: string | null; services: ServiceStatus[] }[],
 		collapsed: ProjectSection[]
 	): RackEntry[] {
 		const entries: RackEntry[] = [];
@@ -121,7 +121,11 @@
 			if (collapsed.includes(section)) return;
 			for (const entry of list) {
 				const entryName = entry.project_name || entry.project_path.split('/').pop() || '';
-				const group = serviceProjects.find((p) => p.name === entryName);
+				const group = serviceProjects.find(
+					(project) =>
+						project.path === entry.project_path ||
+						(project.path === null && project.name === entryName)
+				);
 				entries.push({
 					kind: 'project',
 					name: entryName,
@@ -212,7 +216,7 @@
 
 		let currentIndex = -1;
 		if (keyboardFocus) {
-			currentIndex = allServices.findIndex((s) => s.name === keyboardFocus);
+			currentIndex = allServices.findIndex((service) => serviceIdentity(service) === keyboardFocus);
 		}
 
 		let nextIndex = currentIndex + direction;
@@ -221,7 +225,7 @@
 		if (nextIndex < 0) nextIndex = 0;
 		if (nextIndex >= allServices.length) nextIndex = allServices.length - 1;
 
-		keyboardFocus = allServices[nextIndex].name;
+		keyboardFocus = serviceIdentity(allServices[nextIndex]);
 
 		// Ensure visible
 		ensureVisible(keyboardFocus);
@@ -244,7 +248,7 @@
 	}
 
 	function toggleMonitorGroup(groupServices: ServiceStatus[]) {
-		const serviceNames = groupServices.map((s) => s.name);
+		const serviceNames = groupServices.map(serviceIdentity);
 		const allMonitored = serviceNames.every((name) => monitored.includes(name));
 		const next = allMonitored
 			? monitored.filter((n) => !serviceNames.includes(n))
@@ -261,16 +265,18 @@
 		activeMenu = null;
 	}
 
-	function isPending(serviceName: string): boolean {
-		return $pendingActions.some((a) => a.serviceName === serviceName);
+	function isPending(service: ServiceStatus): boolean {
+		return $pendingActions.some(
+			(action) => action.serviceName === service.name && action.instanceId === service.instance_id
+		);
 	}
 
 	async function toggleGroup(groupServices: ServiceStatus[]) {
 		const allStopped = groupServices.every((s) => s.status === 'stopped');
 		await Promise.all(
 			groupServices.map((s) => {
-				if (allStopped) return startServiceWithFeedback(s.name);
-				return stopServiceWithFeedback(s.name);
+				if (allStopped) return startServiceWithFeedback(s.name, s.instance_id);
+				return stopServiceWithFeedback(s.name, s.instance_id);
 			})
 		);
 	}
@@ -397,7 +403,7 @@
 	}
 
 	function deckSummary(services: ServiceStatus[]): string | null {
-		const count = services.filter((s) => monitored.includes(s.name)).length;
+		const count = services.filter((service) => monitored.includes(serviceIdentity(service))).length;
 		if (count === 0) return null;
 		return `${count} in Deck`;
 	}
@@ -518,7 +524,7 @@
 							</div>
 						</div>
 						{#if project.entry || project.services.length > 0}
-							{@const serviceNames = project.services.map((s) => s.name)}
+							{@const serviceNames = project.services.map(serviceIdentity)}
 							{@const allMonitored =
 								serviceNames.length > 0 && serviceNames.every((n) => monitored.includes(n))}
 							{@const someMonitored = serviceNames.some((n) => monitored.includes(n))}
@@ -568,23 +574,24 @@
 					</div>
 
 					{#if !isCollapsed && project.services.length > 0}
-						{#each project.services as service (service.name)}
+						{#each project.services as service (serviceIdentity(service))}
+							{@const identity = serviceIdentity(service)}
 							{@const type = getServiceType(service)}
 							{@const displayName = getDisplayName(service.name, project.name)}
 							{@const urlLabel = displayUrl(service)}
-							{@const inDeck = monitored.includes(service.name)}
+							{@const inDeck = monitored.includes(identity)}
 
 							<div
-								id="service-{service.name}"
+								id="service-{identity}"
 								class="rack-item"
 								class:monitored={inDeck}
-								class:keyboard-focused={keyboardFocus === service.name}
+								class:keyboard-focused={keyboardFocus === identity}
 								class:disabled={service.status === 'stopped'}
-								on:click={() => toggleMonitor(service.name)}
+								on:click={() => toggleMonitor(identity)}
 								on:keydown={(e) => {
 									if (e.key === 'Enter' || e.key === ' ') {
 										e.preventDefault();
-										toggleMonitor(service.name);
+										toggleMonitor(identity);
 									}
 								}}
 								role="button"
@@ -622,7 +629,7 @@
 											class="control-btn monitor-btn"
 											class:active={inDeck}
 											title={inDeck ? 'Remove from Deck' : 'Add to Deck'}
-											on:click={(e) => toggleMonitor(service.name, e)}
+											on:click={(e) => toggleMonitor(identity, e)}
 										>
 											<Monitor size={14} />
 										</button>
@@ -630,10 +637,11 @@
 											<button
 												class="control-btn"
 												title="Restart"
-												disabled={isPending(service.name)}
-												on:click|stopPropagation={() => restartServiceWithFeedback(service.name)}
+												disabled={isPending(service)}
+												on:click|stopPropagation={() =>
+													restartServiceWithFeedback(service.name, service.instance_id)}
 											>
-												{#if isPending(service.name)}
+												{#if isPending(service)}
 													<Spinner size={14} />
 												{:else}
 													<RefreshCw size={14} />
@@ -642,12 +650,12 @@
 											<div class="menu-wrapper">
 												<button
 													class="control-btn"
-													on:click={(e) => toggleMenu(service.name, e)}
+													on:click={(e) => toggleMenu(identity, e)}
 													title="More"
 												>
 													<MoreHorizontal size={14} />
 												</button>
-												{#if activeMenu === service.name}
+												{#if activeMenu === identity}
 													<!-- Menu container only stops event propagation -->
 													<div
 														class="menu-dropdown"
@@ -662,10 +670,11 @@
 														<div class="menu-separator"></div>
 														<button
 															class="menu-action danger"
-															disabled={isPending(service.name)}
-															on:click={() => resetServiceWithFeedback(service.name)}
+															disabled={isPending(service)}
+															on:click={() =>
+																resetServiceWithFeedback(service.name, service.instance_id)}
 														>
-															{#if isPending(service.name)}
+															{#if isPending(service)}
 																<Spinner size={12} />
 															{:else}
 																<RotateCcw size={12} />
@@ -674,10 +683,11 @@
 														</button>
 														<button
 															class="menu-action danger"
-															disabled={isPending(service.name)}
-															on:click={() => stopServiceWithFeedback(service.name)}
+															disabled={isPending(service)}
+															on:click={() =>
+																stopServiceWithFeedback(service.name, service.instance_id)}
 														>
-															{#if isPending(service.name)}
+															{#if isPending(service)}
 																<Spinner size={12} />
 															{:else}
 																<Power size={12} />
@@ -690,11 +700,12 @@
 										{:else}
 											<button
 												class="control-btn power-btn"
-												disabled={isPending(service.name)}
-												on:click|stopPropagation={() => startServiceWithFeedback(service.name)}
+												disabled={isPending(service)}
+												on:click|stopPropagation={() =>
+													startServiceWithFeedback(service.name, service.instance_id)}
 												title="Start"
 											>
-												{#if isPending(service.name)}
+												{#if isPending(service)}
 													<Spinner size={14} />
 												{:else}
 													<Power size={14} />

@@ -16,7 +16,6 @@ use crate::port_allocator::PortAllocator;
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use futures_util::StreamExt;
 use locald_core::attachments::{
     Attachment, AttachmentCompatibilityEvidence, AttachmentSource, AttachmentStore,
@@ -655,10 +654,37 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    fn postgres_data_dir(name: &str) -> PathBuf {
-        ProjectDirs::from("com", "locald", "locald")
-            .map(|d| d.data_dir().join("postgres").join(name))
-            .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(name))
+    fn postgres_data_dir(key: &ServiceKey) -> PathBuf {
+        crate::service::postgres::data_dir_for(key)
+    }
+
+    fn ensure_postgres_resource_namespace_ready(
+        key: &ServiceKey,
+        display_name: &str,
+    ) -> Result<()> {
+        let namespaced = crate::service::postgres::data_dir_for(key);
+        let legacy = crate::service::postgres::legacy_data_dir(display_name);
+        Self::ensure_postgres_resource_namespace_paths_ready(
+            key,
+            display_name,
+            &namespaced,
+            &legacy,
+        )
+    }
+
+    fn ensure_postgres_resource_namespace_paths_ready(
+        key: &ServiceKey,
+        display_name: &str,
+        namespaced: &Path,
+        legacy: &Path,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !legacy.exists() || namespaced.exists(),
+            "service `{display_name}` has legacy Postgres data at {}; the data remains untouched, but it must be adopted into project instance {} before this service can start",
+            legacy.display(),
+            key.instance()
+        );
+        Ok(())
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -764,7 +790,24 @@ impl ProcessManager {
     ) -> Option<Arc<tokio::sync::Mutex<dyn ServiceController>>> {
         let services = self.services.lock().await;
         let key = Self::unique_service_key(&services, name).ok().flatten()?;
-        if let Some(service) = services.get(&key) {
+        Self::controller_for_key(&services, &key)
+    }
+
+    pub(crate) async fn get_instance_service_controller(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<dyn ServiceController>>> {
+        let services = self.services.lock().await;
+        let key = Self::service_key_for_instance(&services, instance_id, name)?;
+        Self::controller_for_key(&services, &key)
+    }
+
+    fn controller_for_key(
+        services: &HashMap<ServiceKey, Service>,
+        key: &ServiceKey,
+    ) -> Option<Arc<tokio::sync::Mutex<dyn ServiceController>>> {
+        if let Some(service) = services.get(key) {
             if let ServiceRuntime::Controller(c) = &service.runtime_state {
                 return Some(c.clone());
             }
@@ -970,6 +1013,8 @@ impl ProcessManager {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn build_service_status(
+        instance_id: ProjectInstanceId,
+        configured_name: String,
         name: String,
         domain: Option<String>,
         path: Option<PathBuf>,
@@ -1049,6 +1094,8 @@ impl ProcessManager {
 
         ServiceStatus {
             name: name.clone(),
+            instance_id: Some(instance_id),
+            service_name: Some(configured_name),
             service_type,
             pid,
             port,
@@ -1383,6 +1430,7 @@ impl ProcessManager {
                     (
                         service.instance_id,
                         service.path.clone(),
+                        service.config.project.name.clone(),
                         service.service_config.clone(),
                         service.resolved_env.clone(),
                         controller,
@@ -1393,7 +1441,7 @@ impl ProcessManager {
             };
 
             let (has_controller, is_up_to_date, is_stopped_projection) = match service_snapshot {
-                Some((loaded_instance, loaded_path, _, _, Some(_), _, _))
+                Some((loaded_instance, loaded_path, _, _, _, Some(_), _, _))
                     if loaded_instance != instance_id =>
                 {
                     anyhow::bail!(
@@ -1404,6 +1452,7 @@ impl ProcessManager {
                 Some((
                     _,
                     loaded_path,
+                    loaded_project_name,
                     current_config,
                     current_env,
                     Some(controller),
@@ -1423,6 +1472,7 @@ impl ProcessManager {
                         .is_some_and(|resolved_env| current_env == *resolved_env);
                     let static_configuration_matches = !dependency_will_change
                         && has_durable_process_ownership
+                        && loaded_project_name == config.project.name
                         && current_config == *service_config
                         && environment_matches;
                     let runtime_is_reusable =
@@ -1475,7 +1525,7 @@ impl ProcessManager {
                         false,
                     )
                 }
-                Some((_, _, _, _, None, _, _)) => (false, false, true),
+                Some((_, _, _, _, _, None, _, _)) => (false, false, true),
                 None => (false, false, false),
             };
 
@@ -1567,6 +1617,8 @@ impl ProcessManager {
 
         Some((
             Self::build_service_status(
+                key.instance(),
+                key.name().as_str().to_owned(),
                 display_name,
                 domain,
                 path,
@@ -1604,15 +1656,23 @@ impl ProcessManager {
             .remove(key);
     }
 
-    async fn broadcast_log(&self, key: ServiceKey, controller_generation: u64, entry: LogEntry) {
+    async fn broadcast_log(
+        &self,
+        key: ServiceKey,
+        controller_generation: u64,
+        mut entry: LogEntry,
+    ) {
         let services = self.services.lock().await;
-        let is_current_controller = services.get(&key).is_some_and(|service| {
+        let Some(service) = services.get(&key).filter(|service| {
             service.controller_generation == controller_generation
                 && matches!(service.runtime_state, ServiceRuntime::Controller(_))
-        });
-        if !is_current_controller {
+        }) else {
             return;
-        }
+        };
+        entry.instance_id = Some(key.instance());
+        entry.service_name = Some(key.name().as_str().to_owned());
+        entry.service = Self::service_display_name(&key, service);
+        drop(services);
 
         info!("Broadcasting log for {}: {}", entry.service, entry.message);
         // Add to buffer
@@ -3397,6 +3457,12 @@ impl ProcessManager {
             info!("Starting service {name} on port {:?}", port);
             let readiness = ReadinessRequirement::for_service(service_config, port)
                 .with_context(|| format!("service `{name}` has an invalid readiness contract"))?;
+            if matches!(
+                service_config,
+                ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+            ) {
+                Self::ensure_postgres_resource_namespace_ready(&key, &name)?;
+            }
 
             if let Some(tx) = &event_tx {
                 let _ = tx
@@ -3621,8 +3687,24 @@ impl ProcessManager {
     /// Returns an error if the service state cannot be persisted, though
     /// cleanup errors are generally logged as warnings rather than returned.
     pub async fn stop(&self, name: &str) -> Result<()> {
+        self.stop_selected_service(None, name).await
+    }
+
+    pub(crate) async fn stop_instance_service(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Result<()> {
+        self.stop_selected_service(Some(instance_id), name).await
+    }
+
+    async fn stop_selected_service(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<()> {
         loop {
-            let Some(key) = self.resolve_unique_service_key(name).await? else {
+            let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
                 return Ok(());
             };
             let instance_id = key.instance();
@@ -3646,13 +3728,33 @@ impl ProcessManager {
     /// Starts one explicitly selected service while preserving independent
     /// service-stop overrides in the same project.
     pub async fn start_service(&self, name: &str) -> Result<()> {
-        self.run_admitted_availability_transition(|| self.start_service_admitted(name))
+        self.start_selected_service(None, name).await
+    }
+
+    pub(crate) async fn start_instance_service(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Result<()> {
+        self.start_selected_service(Some(instance_id), name).await
+    }
+
+    async fn start_selected_service(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<()> {
+        self.run_admitted_availability_transition(|| self.start_service_admitted(instance_id, name))
             .await
     }
 
-    async fn start_service_admitted(&self, name: &str) -> Result<()> {
+    async fn start_service_admitted(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<()> {
         loop {
-            let Some(key) = self.resolve_unique_service_key(name).await? else {
+            let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
                 return Err(ServiceNotFoundError.into());
             };
             let instance_id = key.instance();
@@ -3984,8 +4086,24 @@ impl ProcessManager {
     }
 
     pub async fn restart(&self, name: &str) -> Result<()> {
+        self.restart_selected_service(None, name).await
+    }
+
+    pub(crate) async fn restart_instance_service(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Result<()> {
+        self.restart_selected_service(Some(instance_id), name).await
+    }
+
+    async fn restart_selected_service(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<()> {
         loop {
-            let Some(key) = self.resolve_unique_service_key(name).await? else {
+            let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
                 return Err(ServiceNotFoundError.into());
             };
             let instance_id = key.instance();
@@ -4083,9 +4201,25 @@ impl ProcessManager {
     /// - Data directories cannot be removed.
     /// - The service fails to restart.
     pub async fn reset(&self, name: &str) -> Result<()> {
+        self.reset_selected_service(None, name).await
+    }
+
+    pub(crate) async fn reset_instance_service(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Result<()> {
+        self.reset_selected_service(Some(instance_id), name).await
+    }
+
+    async fn reset_selected_service(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<()> {
         info!("Resetting service {}", name);
 
-        let Some(key) = self.resolve_unique_service_key(name).await? else {
+        let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
             anyhow::bail!("Service {name} not found");
         };
         let instance_id = key.instance();
@@ -4126,7 +4260,7 @@ impl ProcessManager {
                     // TODO: This path logic is duplicated. Should be centralized.
                     // For now, we only support resetting Postgres services which use this path.
                     // If we add other stateful services, we need a better way to know their data dir.
-                    Some(Self::postgres_data_dir(name))
+                    Some(Self::postgres_data_dir(&key))
                 } else {
                     None
                 }
@@ -4203,6 +4337,7 @@ impl ProcessManager {
 
                 snapshots.push((
                     service.instance_id,
+                    key.name().as_str().to_owned(),
                     Self::service_display_name(key, service),
                     self.domain_for_service(
                         service.instance_id,
@@ -4223,6 +4358,7 @@ impl ProcessManager {
         let mut results = Vec::new();
         for (
             instance_id,
+            configured_name,
             name,
             domain,
             path,
@@ -4238,6 +4374,8 @@ impl ProcessManager {
             results.push((
                 instance_id,
                 Self::build_service_status(
+                    instance_id,
+                    configured_name,
                     name,
                     domain,
                     path,
@@ -9024,6 +9162,26 @@ impl ProcessManager {
         Self::unique_service_key(&services, name)
     }
 
+    async fn resolve_instance_service_key(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Option<ServiceKey> {
+        let services = self.services.lock().await;
+        Self::service_key_for_instance(&services, instance_id, name)
+    }
+
+    async fn resolve_selected_service_key(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<Option<ServiceKey>> {
+        match instance_id {
+            Some(instance_id) => Ok(self.resolve_instance_service_key(instance_id, name).await),
+            None => self.resolve_unique_service_key(name).await,
+        }
+    }
+
     async fn get_service_path_by_key(&self, key: &ServiceKey) -> Option<PathBuf> {
         let services = self.services.lock().await;
         services.get(key).map(|service| service.path.clone())
@@ -9122,8 +9280,25 @@ impl ProcessManager {
     /// Returns an error if the service is not found.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn inspect(&self, name: &str) -> Result<serde_json::Value> {
+        self.inspect_selected_service(None, name).await
+    }
+
+    pub(crate) async fn inspect_instance_service(
+        &self,
+        instance_id: ProjectInstanceId,
+        name: &str,
+    ) -> Result<serde_json::Value> {
+        self.inspect_selected_service(Some(instance_id), name).await
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn inspect_selected_service(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<serde_json::Value> {
         let key = self
-            .resolve_unique_service_key(name)
+            .resolve_selected_service_key(instance_id, name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Service not found"))?;
         let proxy_ports = { *self.proxy_ports.lock().await };
@@ -9198,6 +9373,7 @@ impl ProcessManager {
 
         let mut info = serde_json::json!({
             "name": name,
+            "instance_id": key.instance(),
             "pid": pid,
             "container_id": container_id,
             "port": port,
@@ -9250,14 +9426,18 @@ impl ProcessManager {
                     c.metrics().await
                 };
 
-                if let Ok(Some(m)) = metrics {
+                if let Ok(Some(mut m)) = metrics {
                     let services = self.services.lock().await;
-                    let is_current_controller = services.get(&name).is_some_and(|service| {
-                        service.instance_id == instance_id
+                    let current_display_name = services.get(&name).and_then(|service| {
+                        (service.instance_id == instance_id
                             && service.controller_generation == controller_generation
-                            && matches!(service.runtime_state, ServiceRuntime::Controller(_))
+                            && matches!(service.runtime_state, ServiceRuntime::Controller(_)))
+                        .then(|| Self::service_display_name(&name, service))
                     });
-                    if is_current_controller {
+                    if let Some(display_name) = current_display_name {
+                        m.name = display_name;
+                        m.instance_id = Some(instance_id);
+                        m.service_name = Some(name.name().as_str().to_owned());
                         let _ = self.event_sender.send(Event::Metrics(m));
                     }
                 }
@@ -10443,6 +10623,8 @@ mod tests {
             self.release.notified().await;
             Ok(Some(locald_core::ipc::ServiceMetrics {
                 name: "app:web".to_owned(),
+                instance_id: None,
+                service_name: None,
                 cpu_percent: 1.0,
                 memory_bytes: 1,
                 timestamp: 1,
@@ -21632,17 +21814,37 @@ command = "api"
 
     #[test]
     fn test_postgres_reset_uses_xdg_path() {
-        let name = "test-postgres";
-        let expected = ProjectDirs::from("com", "locald", "locald")
-            .map(|d| d.data_dir().join("postgres").join(name))
-            .unwrap_or_else(|| PathBuf::from(".locald/postgres").join(name));
-
-        let actual = ProcessManager::postgres_data_dir(name);
+        let key = ServiceKey::new(test_instance_id(), "test-postgres");
+        let expected = crate::service::postgres::data_dir_for(&key);
+        let actual = ProcessManager::postgres_data_dir(&key);
 
         assert_eq!(actual, expected);
+        assert!(actual.ends_with(PathBuf::from("postgres").join(key.resource_id())));
+    }
 
-        let workspace_local = PathBuf::from(".locald/services/postgres").join(name);
-        assert!(!actual.ends_with(&workspace_local));
+    #[test]
+    fn legacy_postgres_data_blocks_namespaced_start_without_mutation() {
+        let dir = tempdir().expect("create data root");
+        let legacy = dir.path().join("postgres").join("app:db");
+        let namespaced = dir.path().join("instances").join("db");
+        std::fs::create_dir_all(&legacy).expect("create legacy data");
+        std::fs::write(legacy.join("PG_VERSION"), "15").expect("write legacy marker");
+        let key = ServiceKey::new(test_instance_id(), "db");
+
+        let error = ProcessManager::ensure_postgres_resource_namespace_paths_ready(
+            &key,
+            "app:db",
+            &namespaced,
+            &legacy,
+        )
+        .expect_err("legacy data requires explicit adoption");
+
+        assert!(error.to_string().contains("must be adopted"));
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("PG_VERSION")).expect("legacy data remains"),
+            "15"
+        );
+        assert!(!namespaced.exists());
     }
 
     #[tokio::test]
@@ -21661,6 +21863,8 @@ command = "api"
 
         // Case 1: HTTP on port 80 -> No port in URL
         let status = ProcessManager::build_service_status(
+            test_instance_id(),
+            name.clone(),
             name.clone(),
             Some("app.test".to_string()),
             path.clone(),
@@ -21678,6 +21882,8 @@ command = "api"
 
         // Case 2: HTTPS on port 443 -> No port in URL
         let status = ProcessManager::build_service_status(
+            test_instance_id(),
+            name.clone(),
             name.clone(),
             Some("app.test".to_string()),
             path.clone(),
@@ -21695,6 +21901,8 @@ command = "api"
 
         // Case 3: HTTP on non-standard port -> Port in URL
         let status = ProcessManager::build_service_status(
+            test_instance_id(),
+            name.clone(),
             name.clone(),
             Some("app.test".to_string()),
             path.clone(),
@@ -21712,6 +21920,8 @@ command = "api"
 
         // Case 4: HTTPS on non-standard port -> Port in URL
         let status = ProcessManager::build_service_status(
+            test_instance_id(),
+            name.clone(),
             name.clone(),
             Some("app.test".to_string()),
             path.clone(),
@@ -21729,6 +21939,8 @@ command = "api"
 
         // Case 5: Privileged ports (80/443). URLs should NOT contain port numbers.
         let status = ProcessManager::build_service_status(
+            test_instance_id(),
+            name.clone(),
             name.clone(),
             Some("myapp.localhost".to_string()),
             path.clone(),
@@ -21753,6 +21965,8 @@ command = "api"
             locald_core::config::WorkerServiceConfig::default(),
         ));
         let status = ProcessManager::build_service_status(
+            test_instance_id(),
+            "worker".to_owned(),
             "worker".to_owned(),
             Some("worker.app.test".to_owned()),
             path,
@@ -21775,6 +21989,8 @@ command = "api"
         let mut buffer = LogBuffer::new(3);
         let entry = LogEntry {
             service: "test".to_string(),
+            instance_id: None,
+            service_name: None,
             message: "msg".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 0,
@@ -21794,18 +22010,24 @@ command = "api"
         let mut buffer = LogBuffer::new(2);
         let entry1 = LogEntry {
             service: "test".to_string(),
+            instance_id: None,
+            service_name: None,
             message: "1".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 1,
         };
         let entry2 = LogEntry {
             service: "test".to_string(),
+            instance_id: None,
+            service_name: None,
             message: "2".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 2,
         };
         let entry3 = LogEntry {
             service: "test".to_string(),
+            instance_id: None,
+            service_name: None,
             message: "3".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 3,
@@ -25511,6 +25733,8 @@ PATH = "/usr/bin:/bin"
                 LogEntry {
                     timestamp: 1,
                     service: started_service.clone(),
+                    instance_id: None,
+                    service_name: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "build output retained across supersession".to_owned(),
                 },
@@ -26309,6 +26533,81 @@ path = "ready"
         drop(ready_listener);
     }
 
+    #[tokio::test]
+    async fn project_display_name_change_restarts_retained_controllers() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("renamed-project");
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        let previous_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "before"
+
+[services.db]
+type = "postgres"
+"#,
+        )
+        .expect("parse previous config");
+        let next_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "after"
+
+[services.db]
+type = "postgres"
+"#,
+        )
+        .expect("parse renamed config");
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "before:db",
+                RuntimeState {
+                    pid: None,
+                    port: Some(5432),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        manager.services.lock().await.insert_display(
+            "before:db",
+            test_service(
+                previous_config.clone(),
+                previous_config.services["db"].clone(),
+                ServiceRuntime::Controller(controller),
+                project_path,
+            ),
+        );
+        let key = test_service_key(test_instance_id(), "db");
+        let desired_service_names = HashSet::from([key.clone()]);
+
+        let plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &next_config,
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["db".to_owned()],
+                    desired_service_names: &desired_service_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
+            )
+            .await
+            .expect("build renamed-project plan");
+
+        assert_eq!(plan.restart_service_names, vec![key]);
+        assert!(plan.reusable_service_envs.is_empty());
+    }
+
     #[test]
     fn plugin_allocated_guard_transfers_with_its_configured_port() {
         let allocator = PortAllocator::new();
@@ -26482,6 +26781,8 @@ path = "ready"
                 LogEntry {
                     timestamp: 0,
                     service: "app:web".to_owned(),
+                    instance_id: None,
+                    service_name: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "first-instance history".to_owned(),
                 },
@@ -26538,7 +26839,7 @@ path = "ready"
         );
 
         manager
-            .stop_service_instance_locked(&first_key)
+            .stop_instance_service(first_instance, "app:web")
             .await
             .expect("stopping the first instance is isolated");
 
@@ -26565,6 +26866,18 @@ path = "ready"
 
         let statuses = manager.list().await;
         assert_eq!(statuses.len(), 2);
+        assert_eq!(
+            statuses
+                .iter()
+                .filter_map(|status| status.instance_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([first_instance, second_instance])
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.service_name.as_deref() == Some("web"))
+        );
         let domains = statuses
             .iter()
             .filter_map(|status| status.domain.as_deref())
@@ -26581,6 +26894,20 @@ path = "ready"
                 .to_string()
                 .contains("ambiguous across project instances")
         );
+        assert_eq!(
+            manager
+                .inspect_instance_service(first_instance, "app:web")
+                .await
+                .expect("inspect exact first instance")["instance_id"],
+            first_instance.to_string()
+        );
+        assert_eq!(
+            manager
+                .inspect_instance_service(second_instance, "app:web")
+                .await
+                .expect("inspect exact second instance")["instance_id"],
+            second_instance.to_string()
+        );
 
         manager
             .broadcast_log(
@@ -26589,6 +26916,8 @@ path = "ready"
                 LogEntry {
                     timestamp: 1,
                     service: "app:web".to_owned(),
+                    instance_id: None,
+                    service_name: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "stale first-instance log".to_owned(),
                 },
@@ -26602,6 +26931,8 @@ path = "ready"
                 LogEntry {
                     timestamp: 2,
                     service: "app:web".to_owned(),
+                    instance_id: None,
+                    service_name: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "stale second-instance controller log".to_owned(),
                 },
@@ -26615,6 +26946,8 @@ path = "ready"
                 LogEntry {
                     timestamp: 3,
                     service: "app:web".to_owned(),
+                    instance_id: None,
+                    service_name: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "current second-instance log".to_owned(),
                 },
@@ -26636,8 +26969,12 @@ path = "ready"
             .try_recv()
             .expect("second instance live log remains queued");
         assert_eq!(first_live_log.instance_id, first_instance);
+        assert_eq!(first_live_log.entry.instance_id, Some(first_instance));
+        assert_eq!(first_live_log.entry.service_name.as_deref(), Some("web"));
         assert_eq!(first_live_log.entry.message, "first-instance history");
         assert_eq!(second_live_log.instance_id, second_instance);
+        assert_eq!(second_live_log.entry.instance_id, Some(second_instance));
+        assert_eq!(second_live_log.entry.service_name.as_deref(), Some("web"));
         assert_eq!(second_live_log.entry.message, "current second-instance log");
         manager
             .services
@@ -26653,6 +26990,8 @@ path = "ready"
                 LogEntry {
                     timestamp: 4,
                     service: "app:web".to_owned(),
+                    instance_id: None,
+                    service_name: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "stopped controller log".to_owned(),
                 },
@@ -26808,6 +27147,71 @@ path = "ready"
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn metrics_projection_carries_the_exact_instance_identity() {
+        let dir = tempdir().expect("create temporary directory");
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(BlockingMetricsController {
+                entered: entered.clone(),
+                release: release.clone(),
+                state: RuntimeState {
+                    pid: Some(42),
+                    port: Some(4242),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            }));
+        insert_test_service(
+            &mut *manager.services.lock().await,
+            "app:web",
+            test_service(
+                config_with_services(
+                    ProjectConfig {
+                        name: "app".to_owned(),
+                        ..Default::default()
+                    },
+                    &["web"],
+                ),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                dir.path().join("app"),
+            ),
+        );
+        let mut events = manager.event_sender.subscribe();
+
+        let metrics_task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager.collect_metrics().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("metrics collection starts");
+        release.notify_one();
+        metrics_task.await.expect("metrics task");
+
+        let event = events.try_recv().expect("metrics event");
+        let Event::Metrics(metrics) = event else {
+            panic!("expected metrics event");
+        };
+        assert_eq!(metrics.name, "app:web");
+        assert_eq!(metrics.instance_id, Some(test_instance_id()));
+        assert_eq!(metrics.service_name.as_deref(), Some("web"));
     }
 
     #[tokio::test]

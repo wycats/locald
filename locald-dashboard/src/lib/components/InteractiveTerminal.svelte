@@ -5,7 +5,7 @@
 	import { loadGhostty } from '$lib/ghostty';
 	import { terminalTheme } from '$lib/theme';
 
-	let { serviceName }: { serviceName: string } = $props();
+	let { serviceName, instanceId }: { serviceName: string; instanceId: string } = $props();
 
 	let terminalContainer: HTMLDivElement;
 	let terminal: Terminal;
@@ -31,7 +31,7 @@
 
 			// Connect to WebSocket
 			const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-			const wsUrl = `${protocol}//${window.location.host}/api/services/${serviceName}/pty`;
+			const wsUrl = `${protocol}//${window.location.host}/api/instances/${encodeURIComponent(instanceId)}/services/${encodeURIComponent(serviceName)}/pty`;
 			socket = new WebSocket(wsUrl);
 			socket.binaryType = 'arraybuffer';
 

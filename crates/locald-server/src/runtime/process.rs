@@ -623,6 +623,8 @@ impl ProcessRuntime {
                                 let entry = LogEntry {
                                     timestamp,
                                     service: service_name.clone(),
+                                    instance_id: None,
+                                    service_name: None,
                                     stream: LogStream::Stdout,
                                     message: line,
                                 };
