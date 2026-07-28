@@ -180,6 +180,16 @@ impl ProjectDiscovery {
             Self::NonGit { project_root } => project_root,
         }
     }
+
+    /// Whether this project lives in a linked Git worktree rather than the
+    /// repository's primary checkout.
+    #[must_use]
+    pub fn is_linked_worktree(&self) -> bool {
+        matches!(
+            self,
+            Self::Git { resolved, .. } if resolved.common_git_dir != resolved.worktree_git_dir
+        )
+    }
 }
 
 /// A catalog load, validation, discovery, or persistence failure.
@@ -662,6 +672,68 @@ impl ProjectCatalog {
         self.domain_index = replacement;
         self.validate()?;
         Ok(())
+    }
+
+    /// Allocate and persist the stable DNS label for a linked worktree.
+    ///
+    /// Mutable task, branch, and path labels are allocation hints only. Once
+    /// assigned, a slug remains reserved until the project instance is
+    /// explicitly forgotten.
+    pub fn ensure_worktree_domain_slug(
+        &mut self,
+        instance_id: ProjectInstanceId,
+        is_linked_worktree: bool,
+        trusted_label: Option<&str>,
+    ) -> Result<Option<String>, CatalogError> {
+        let record = self.instances.get(&instance_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "domain slug references missing project instance {instance_id}"
+            ))
+        })?;
+        if let Some(slug) = &record.domain_slug {
+            return Ok(Some(slug.clone()));
+        }
+        if !is_linked_worktree {
+            return Ok(None);
+        }
+
+        let project_id = record.project_id;
+        let ProjectInstanceOrigin::Git { worktree_id } = record.origin else {
+            return Ok(None);
+        };
+        let worktree = self.worktrees.get(&worktree_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "project instance {instance_id} references missing worktree {worktree_id}"
+            ))
+        })?;
+        let branch_hint = worktree
+            .branch
+            .as_deref()
+            .map(crate::worktree::branch_last_segment);
+        let path_hint = worktree.display_name.as_deref();
+        let fallback = format!("wt-{}", &instance_id.to_string()[..8]);
+        let base = trusted_label
+            .into_iter()
+            .chain(branch_hint)
+            .chain(path_hint)
+            .find_map(crate::worktree::sanitize_slug_hint)
+            .unwrap_or(fallback);
+        let reserved = self
+            .instances
+            .values()
+            .filter(|candidate| candidate.project_id == project_id)
+            .filter_map(|candidate| candidate.domain_slug.as_deref())
+            .collect::<BTreeSet<_>>();
+        let slug = allocate_unique_domain_slug(&base, &reserved);
+
+        let mutable_record = self.instances.get_mut(&instance_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "domain slug allocation lost project instance {instance_id}"
+            ))
+        })?;
+        mutable_record.domain_slug = Some(slug.clone());
+        self.validate()?;
+        Ok(Some(slug))
     }
 
     fn hydrate_legacy_domain_index(&mut self) -> Result<(), CatalogError> {
@@ -1548,6 +1620,7 @@ impl ProjectCatalog {
         }
 
         let mut current_paths = BTreeMap::<&Path, ProjectInstanceId>::new();
+        let mut reserved_domain_slugs = BTreeMap::<(ProjectId, &str), ProjectInstanceId>::new();
         for (id, record) in &self.instances {
             if id != &record.id || !self.projects.contains_key(&record.project_id) {
                 return Err(CatalogError::Invariant(format!(
@@ -1604,6 +1677,19 @@ impl ProjectCatalog {
                     path.display()
                 )));
             }
+            if let Some(slug) = record.domain_slug.as_deref() {
+                if crate::worktree::sanitize_slug_hint(slug).as_deref() != Some(slug) {
+                    return Err(CatalogError::Invariant(format!(
+                        "project instance {id} has invalid persistent domain slug `{slug}`"
+                    )));
+                }
+                if let Some(previous) = reserved_domain_slugs.insert((record.project_id, slug), *id)
+                {
+                    return Err(CatalogError::Invariant(format!(
+                        "project instances {previous} and {id} both reserve domain slug `{slug}`"
+                    )));
+                }
+            }
             let indexed_domains = self.domain_index.domains_for_instance(*id);
             if record.domain_claims != indexed_domains {
                 return Err(CatalogError::Invariant(format!(
@@ -1654,6 +1740,24 @@ impl ProjectCatalog {
 
 fn data_dir() -> PathBuf {
     crate::storage::data_dir()
+}
+
+fn allocate_unique_domain_slug(base: &str, reserved: &BTreeSet<&str>) -> String {
+    if !reserved.contains(base) {
+        return base.to_owned();
+    }
+
+    for ordinal in 2_u64.. {
+        let suffix = format!("-{ordinal}");
+        let available = 63_usize.saturating_sub(suffix.len());
+        let prefix = base[..base.len().min(available)].trim_end_matches('-');
+        let candidate = format!("{prefix}{suffix}");
+        if !reserved.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+
+    unreachable!("the worktree slug suffix space is unbounded")
 }
 
 fn discover_project(project_root: &Path) -> Result<ProjectDiscovery, CatalogError> {
@@ -2367,6 +2471,21 @@ mod tests {
                 .expect("write project config");
             git(&path, &["add", "locald.toml"]);
             git(&path, &["commit", "-m", "initial"]);
+            path
+        }
+
+        fn linked_worktree(&self, repository: &Path, name: &str, branch: &str) -> PathBuf {
+            let path = self._temp.path().join(name);
+            git(
+                repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().expect("UTF-8 worktree path"),
+                ],
+            );
             path
         }
     }
@@ -3610,6 +3729,254 @@ mod tests {
         assert_eq!(detached_id, instance_id);
         assert_eq!(catalog.worktrees[&worktree_id].branch, None);
         assert!(catalog.worktrees[&worktree_id].head.is_some());
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_slug_is_allocated_once_from_mutable_hints() {
+        let fixture = Fixture::new();
+        let repository = fixture.git_project("repository");
+        let linked =
+            fixture.linked_worktree(&repository, "feature-worktree", "feature/checkout-flow");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+
+        let primary_discovery = ProjectCatalog::discover(repository.clone())
+            .await
+            .expect("discover primary checkout");
+        assert!(!primary_discovery.is_linked_worktree());
+        let primary_id = catalog
+            .register_project(primary_discovery, Some("primary".to_owned()))
+            .expect("register primary checkout");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(primary_id, false, None)
+                .expect("preserve primary base domain"),
+            None
+        );
+
+        let linked_discovery = ProjectCatalog::discover(linked.clone())
+            .await
+            .expect("discover linked worktree");
+        assert!(linked_discovery.is_linked_worktree());
+        let linked_id = catalog
+            .register_project(linked_discovery, Some("linked".to_owned()))
+            .expect("register linked worktree");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(linked_id, true, None)
+                .expect("allocate linked slug")
+                .as_deref(),
+            Some("checkout-flow")
+        );
+
+        git(&linked, &["checkout", "-b", "feature/renamed"]);
+        let renamed = ProjectCatalog::discover(linked.clone())
+            .await
+            .expect("rediscover renamed branch");
+        assert_eq!(
+            catalog
+                .register_project(renamed, Some("linked".to_owned()))
+                .expect("refresh renamed branch"),
+            linked_id
+        );
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(linked_id, true, None)
+                .expect("preserve slug after branch change")
+                .as_deref(),
+            Some("checkout-flow")
+        );
+
+        git(&linked, &["checkout", "--detach"]);
+        let detached = ProjectCatalog::discover(linked.clone())
+            .await
+            .expect("rediscover detached worktree");
+        catalog
+            .register_project(detached, Some("linked".to_owned()))
+            .expect("refresh detached worktree");
+
+        let moved = fixture._temp.path().join("moved-worktree");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "move",
+                linked.to_str().expect("UTF-8 source worktree"),
+                moved.to_str().expect("UTF-8 moved worktree"),
+            ],
+        );
+        let moved_discovery = ProjectCatalog::discover(moved)
+            .await
+            .expect("rediscover moved worktree");
+        assert_eq!(
+            catalog
+                .register_project(moved_discovery, Some("linked".to_owned()))
+                .expect("refresh moved worktree"),
+            linked_id
+        );
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(linked_id, true, Some("later-task-label"))
+                .expect("preserve slug after detach and move")
+                .as_deref(),
+            Some("checkout-flow")
+        );
+
+        catalog.save().await.expect("persist stable slug");
+        let reopened = ProjectCatalog::load_from_paths(fixture.paths())
+            .await
+            .expect("reopen stable slug");
+        assert_eq!(
+            reopened.instances[&linked_id].domain_slug.as_deref(),
+            Some("checkout-flow")
+        );
+    }
+
+    #[tokio::test]
+    async fn slug_collisions_reserve_missing_instances_until_forget() {
+        let fixture = Fixture::new();
+        let repository = fixture.git_project("repository");
+        let first_path =
+            fixture.linked_worktree(&repository, "first-worktree", "feature/turn-trace");
+        let second_path =
+            fixture.linked_worktree(&repository, "second-worktree", "bugfix/turn-trace");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+
+        let first = catalog
+            .register_project(
+                ProjectCatalog::discover(first_path.clone())
+                    .await
+                    .expect("discover first worktree"),
+                Some("first".to_owned()),
+            )
+            .expect("register first worktree");
+        let second = catalog
+            .register_project(
+                ProjectCatalog::discover(second_path)
+                    .await
+                    .expect("discover second worktree"),
+                Some("second".to_owned()),
+            )
+            .expect("register second worktree");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(first, true, None)
+                .expect("allocate first slug")
+                .as_deref(),
+            Some("turn-trace")
+        );
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(second, true, None)
+                .expect("allocate collision suffix")
+                .as_deref(),
+            Some("turn-trace-2")
+        );
+
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                first_path.to_str().expect("UTF-8 first worktree"),
+            ],
+        );
+        catalog
+            .reconcile_missing()
+            .expect("mark removed worktree missing");
+        assert_eq!(catalog.instances[&first].presence, CatalogPresence::Missing);
+
+        let third_path = fixture.linked_worktree(&repository, "third-worktree", "docs/turn-trace");
+        let third = catalog
+            .register_project(
+                ProjectCatalog::discover(third_path)
+                    .await
+                    .expect("discover third worktree"),
+                Some("third".to_owned()),
+            )
+            .expect("register third worktree");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(third, true, None)
+                .expect("reserve missing slug")
+                .as_deref(),
+            Some("turn-trace-3")
+        );
+
+        catalog
+            .remove_instance(first)
+            .expect("forget missing project instance");
+        let fourth_path =
+            fixture.linked_worktree(&repository, "fourth-worktree", "test/turn-trace");
+        let fourth = catalog
+            .register_project(
+                ProjectCatalog::discover(fourth_path)
+                    .await
+                    .expect("discover fourth worktree"),
+                Some("fourth".to_owned()),
+            )
+            .expect("register fourth worktree");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(fourth, true, None)
+                .expect("reuse explicitly released slug")
+                .as_deref(),
+            Some("turn-trace")
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_worktrees_use_trusted_then_path_allocation_hints() {
+        let fixture = Fixture::new();
+        let repository = fixture.git_project("repository");
+        let path_hint = fixture.linked_worktree(&repository, "detached-path-hint", "scratch/first");
+        let trusted_hint =
+            fixture.linked_worktree(&repository, "detached-trusted-hint", "scratch/second");
+        git(&path_hint, &["checkout", "--detach"]);
+        git(&trusted_hint, &["checkout", "--detach"]);
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+
+        let path_instance = catalog
+            .register_project(
+                ProjectCatalog::discover(path_hint)
+                    .await
+                    .expect("discover path-hinted detached worktree"),
+                Some("path hinted".to_owned()),
+            )
+            .expect("register path-hinted detached worktree");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(path_instance, true, None)
+                .expect("allocate from path hint")
+                .as_deref(),
+            Some("detached-path-hint")
+        );
+
+        let trusted_instance = catalog
+            .register_project(
+                ProjectCatalog::discover(trusted_hint)
+                    .await
+                    .expect("discover trusted detached worktree"),
+                Some("trusted".to_owned()),
+            )
+            .expect("register trusted detached worktree");
+        assert_eq!(
+            catalog
+                .ensure_worktree_domain_slug(trusted_instance, true, Some("Chat: Turn Trace"))
+                .expect("allocate from trusted hint")
+                .as_deref(),
+            Some("chat-turn-trace")
+        );
+    }
+
+    #[test]
+    fn collision_suffixes_keep_the_slug_within_one_dns_label() {
+        let base = "a".repeat(63);
+        let reserved = BTreeSet::from([base.as_str()]);
+
+        let allocated = allocate_unique_domain_slug(&base, &reserved);
+
+        assert_eq!(allocated.len(), 63);
+        assert!(allocated.ends_with("-2"));
     }
 
     #[tokio::test]

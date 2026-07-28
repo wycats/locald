@@ -28,7 +28,7 @@ $ locald ai schema
       "default": {}
     },
     "worktrees": {
-      "description": "Worktree-specific configuration (domain templates for git worktrees).",
+      "description": "Deprecated worktree configuration retained for config compatibility.",
       "anyOf": [
         {
           "$ref": "#/$defs/WorktreesConfig"
@@ -650,11 +650,11 @@ $ locald ai schema
       ]
     },
     "WorktreesConfig": {
-      "description": "Configuration for git worktree domain resolution./n/nWhen a project is opened from a git worktree, the domain can be/nqualified with the branch name using template variables./n/n# Example/n```toml/n[worktrees]/ndomain = /"{{branch.last}}.{{project.domain}}/"/n```",
+      "description": "Deprecated configuration for branch-derived worktree domains./n/nlocald now allocates a persistent worktree slug automatically. This shape/nremains parseable during the compatibility window, but no longer controls/ndomain ownership.",
       "type": "object",
       "properties": {
         "domain": {
-          "description": "Domain template for worktrees. Supports `{{branch.last}}`, `{{branch.hyphenated}}`,/n`{{name}}`, and `{{project.domain}}`.",
+          "description": "Deprecated domain template. Accepted but ignored.",
           "type": [
             "string",
             "null"

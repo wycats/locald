@@ -96,25 +96,19 @@ pub struct LocaldConfig {
     /// Service definitions for the project.
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
-    /// Worktree-specific configuration (domain templates for git worktrees).
+    /// Deprecated worktree configuration retained for config compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees: Option<WorktreesConfig>,
 }
 
-/// Configuration for git worktree domain resolution.
+/// Deprecated configuration for branch-derived worktree domains.
 ///
-/// When a project is opened from a git worktree, the domain can be
-/// qualified with the branch name using template variables.
-///
-/// # Example
-/// ```toml
-/// [worktrees]
-/// domain = "{{branch.last}}.{{project.domain}}"
-/// ```
+/// locald now allocates a persistent worktree slug automatically. This shape
+/// remains parseable during the compatibility window, but no longer controls
+/// domain ownership.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct WorktreesConfig {
-    /// Domain template for worktrees. Supports `{{branch.last}}`, `{{branch.hyphenated}}`,
-    /// `{{name}}`, and `{{project.domain}}`.
+    /// Deprecated domain template. Accepted but ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
 }
