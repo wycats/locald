@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::option_if_let_else)]
+use crate::agent_context::resolve_agent_workspace;
 use crate::config_loader::ConfigLoader;
 use crate::health::{HealthMonitor, ReadinessRequirement};
 use crate::lifecycle_migration::{
@@ -37,12 +38,14 @@ use locald_core::state::{
     ServiceState,
 };
 use locald_core::{
-    AvailabilityBatch, AvailabilityBatchOperation, AvailabilityDemandStatus, AvailabilityError,
-    AvailabilityReason, AvailabilityStore, CatalogError, CatalogPresence, Clock,
-    ConvergenceDecision, DemandKey, DemandKind, DomainClaim, DomainIndex, DomainName, DomainTarget,
-    EnsureDemandResult, ProjectAvailability, ProjectAvailabilityStatus, ProjectDiscovery,
-    ProjectInstanceId, ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock,
-    availability_path, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
+    AgentConversationKey, AgentProjectRegistration, AgentProjectStatus, AgentServiceStatus,
+    AgentWorkspaceContext, AgentWorktreeStatus, AvailabilityBatch, AvailabilityBatchOperation,
+    AvailabilityDemandStatus, AvailabilityError, AvailabilityReason, AvailabilityStore,
+    CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DemandKind, DomainClaim,
+    DomainIndex, DomainName, DomainTarget, EnsureDemandResult, ProjectAvailability,
+    ProjectAvailabilityStatus, ProjectDiscovery, ProjectInstanceId, ProjectInstanceOrigin,
+    ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock, availability_path,
+    sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -477,6 +480,7 @@ struct ConfigApplyOptions<'a> {
     start_services: bool,
     service_activation: Option<&'a str>,
     service_readiness_timeout: std::time::Duration,
+    agent_conversation: Option<&'a AgentConversationKey>,
 }
 
 impl<'a> ConfigApplyOptions<'a> {
@@ -485,6 +489,7 @@ impl<'a> ConfigApplyOptions<'a> {
             start_services,
             service_activation,
             service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
+            agent_conversation: None,
         }
     }
 
@@ -495,7 +500,16 @@ impl<'a> ConfigApplyOptions<'a> {
             start_services: true,
             service_activation: None,
             service_readiness_timeout,
+            agent_conversation: None,
         }
+    }
+
+    const fn with_agent_conversation(
+        mut self,
+        agent_conversation: &'a AgentConversationKey,
+    ) -> Self {
+        self.agent_conversation = Some(agent_conversation);
+        self
     }
 }
 
@@ -2754,7 +2768,7 @@ impl ProcessManager {
     ) -> Result<(ProjectInstanceId, PendingInitialAvailabilityGuard)> {
         let (path, transition_lock) = self.transition_lock_for_path(&path).await;
         let _transition_guard = transition_lock.lock().await;
-        self.start_runtime_locked(path, event_tx, verbose, initial_identity)
+        self.start_runtime_locked(path, event_tx, verbose, initial_identity, None)
             .await
     }
 
@@ -2764,6 +2778,7 @@ impl ProcessManager {
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
         initial_identity: ConfigPhysicalIdentity,
+        agent_conversation: Option<&AgentConversationKey>,
     ) -> Result<(ProjectInstanceId, PendingInitialAvailabilityGuard)> {
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
         self.ensure_accepting_lifecycle_requests()?;
@@ -2772,13 +2787,17 @@ impl ProcessManager {
         // reactivation. Events during a slow build/readiness wait are queued;
         // their reload will take this lock after the initial apply finishes.
         self.watch_config(path.clone()).await;
+        let mut options = ConfigApplyOptions::foreground(false, None);
+        if let Some(agent_conversation) = agent_conversation {
+            options = options.with_agent_conversation(agent_conversation);
+        }
         let outcome = self
             .apply_config_locked(
                 path,
                 event_tx,
                 verbose,
                 Some(ConfigIdentityExpectation::Initial(initial_identity)),
-                ConfigApplyOptions::foreground(false, None),
+                options,
             )
             .await?;
         let pending = outcome
@@ -2790,6 +2809,7 @@ impl ProcessManager {
     async fn resolve_or_register_ensure_project(
         &self,
         project_path: &Path,
+        agent_conversation: Option<&AgentConversationKey>,
     ) -> Result<(ProjectInstanceId, Option<PendingInitialAvailabilityGuard>)> {
         let (canonical, transition_lock) = self.transition_lock_for_path(project_path).await;
         let _transition_guard = transition_lock.lock().await;
@@ -2803,13 +2823,20 @@ impl ProcessManager {
                         None,
                         false,
                         ConfigPhysicalIdentity::Git(instance_id),
+                        agent_conversation,
                     )
                     .await?;
                 Ok((registered, Some(pending)))
             }
             LifecycleTargetResolution::UnresolvedLegacy => {
                 let (registered, pending) = self
-                    .start_runtime_locked(canonical, None, false, ConfigPhysicalIdentity::NonGit)
+                    .start_runtime_locked(
+                        canonical,
+                        None,
+                        false,
+                        ConfigPhysicalIdentity::NonGit,
+                        agent_conversation,
+                    )
                     .await?;
                 Ok((registered, Some(pending)))
             }
@@ -3014,6 +3041,7 @@ impl ProcessManager {
             start_services,
             service_activation,
             service_readiness_timeout,
+            agent_conversation,
         } = options;
         self.ensure_accepting_lifecycle_requests()?;
         let discovery_before_config = Registry::discover(path.clone()).await?;
@@ -3097,6 +3125,13 @@ impl ProcessManager {
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            if let Some(agent_conversation) = agent_conversation {
+                candidate
+                    .bind_agent_conversation(agent_conversation.clone(), instance_id)
+                    .context(
+                        "ambient agent conversation is already bound to another project instance",
+                    )?;
+            }
             let domain_slug =
                 candidate.ensure_worktree_domain_slug(instance_id, is_linked_worktree, None)?;
             if config
@@ -6002,8 +6037,441 @@ impl ProcessManager {
         project_path: PathBuf,
         demand: DemandKey,
     ) -> Result<EnsureProjectResult> {
-        self.ensure_project_with_trusted_launch_path(project_path, demand, None, None, false)
+        self.ensure_project_with_trusted_launch_path(project_path, demand, None, None, false, None)
             .await
+    }
+
+    /// Inspect the project selected by private ambient agent context.
+    ///
+    /// The operation may persist the first conversation-to-instance binding
+    /// for an already registered project. It never creates availability
+    /// demand, registers a new project, or starts services.
+    pub(crate) async fn agent_inspect_project(
+        &self,
+        context: &AgentWorkspaceContext,
+    ) -> Result<AgentProjectStatus> {
+        let workspace = resolve_agent_workspace(context).await?;
+        let discovery = Registry::discover(workspace.clone()).await?;
+        let registered_instance = {
+            let registry = self.registry.lock().await;
+            Self::validate_agent_binding_target(&registry, &context.conversation, &discovery)?;
+            Self::registered_instance_for_discovery(&registry, &discovery)
+        };
+
+        if let Some(instance_id) = registered_instance {
+            self.reconcile_and_bind_agent_conversation(
+                &context.conversation,
+                discovery,
+                instance_id,
+            )
+            .await?;
+            self.agent_project_status_for_instance(instance_id).await
+        } else {
+            self.agent_unregistered_project_status(discovery).await
+        }
+    }
+
+    /// Ensure the project selected by private ambient agent context.
+    ///
+    /// Conversation ownership is derived server-side after authenticating the
+    /// locald MCP adapter. The binding is durable before the availability
+    /// demand is published.
+    pub(crate) async fn agent_ensure_project(
+        &self,
+        context: &AgentWorkspaceContext,
+        trusted_launch_path: Option<String>,
+    ) -> Result<AgentProjectStatus> {
+        let workspace = resolve_agent_workspace(context).await?;
+        let discovery = Registry::discover(workspace.clone()).await?;
+        {
+            let registry = self.registry.lock().await;
+            Self::validate_agent_binding_target(&registry, &context.conversation, &discovery)?;
+        }
+        let demand = DemandKey::agent_conversation_key(&context.conversation)
+            .map_err(|error| anyhow::anyhow!("invalid agent demand identity: {error}"))?;
+        self.ensure_project_with_trusted_launch_path(
+            workspace,
+            demand,
+            trusted_launch_path,
+            None,
+            false,
+            Some(context.conversation.clone()),
+        )
+        .await?;
+        let instance_id = {
+            let registry = self.registry.lock().await;
+            registry
+                .agent_binding(&context.conversation)
+                .context("agent ensure completed without a durable conversation binding")?
+        };
+        self.agent_project_status_for_instance(instance_id).await
+    }
+
+    fn registered_instance_for_discovery(
+        registry: &Registry,
+        discovery: &ProjectDiscovery,
+    ) -> Option<ProjectInstanceId> {
+        match discovery.git_project_instance_id() {
+            Some(instance_id) => registry
+                .instances
+                .contains_key(&instance_id)
+                .then_some(instance_id),
+            None => registry.project_instance_for_path(discovery.project_root()),
+        }
+    }
+
+    fn validate_agent_binding_target(
+        registry: &Registry,
+        conversation: &AgentConversationKey,
+        discovery: &ProjectDiscovery,
+    ) -> Result<()> {
+        let Some(bound_instance) = registry.agent_binding(conversation) else {
+            return Ok(());
+        };
+        let discovered_instance = discovery
+            .git_project_instance_id()
+            .or_else(|| registry.project_instance_for_path(discovery.project_root()));
+        let same_target = discovered_instance == Some(bound_instance)
+            || (discovered_instance.is_none()
+                && registry
+                    .instances
+                    .get(&bound_instance)
+                    .is_some_and(|record| {
+                        record.current_path.as_deref() == Some(discovery.project_root())
+                            || record.last_known_path == discovery.project_root()
+                    }));
+        if same_target {
+            return Ok(());
+        }
+        let bound_path = registry
+            .instances
+            .get(&bound_instance)
+            .map(|record| {
+                record
+                    .current_path
+                    .as_deref()
+                    .unwrap_or(&record.last_known_path)
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "its original locald worktree".to_owned());
+        anyhow::bail!(
+            "this agent conversation is already bound to `{bound_path}`; ambient context now resolves to `{}` and cannot silently retarget the conversation",
+            discovery.project_root().display()
+        )
+    }
+
+    async fn bind_agent_conversation(
+        &self,
+        conversation: &AgentConversationKey,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let mut registry = self.registry.lock().await;
+        match registry.agent_binding(conversation) {
+            Some(bound) if bound == instance_id => return Ok(()),
+            Some(_) => {
+                return Err(CatalogError::AgentBindingConflict).context(
+                    "agent conversation binding changed during ambient project resolution",
+                );
+            }
+            None => {}
+        }
+        let mut candidate = registry.clone();
+        candidate.bind_agent_conversation(conversation.clone(), instance_id)?;
+        registry
+            .commit_candidate(candidate)
+            .await
+            .context("failed to persist the ambient agent conversation binding")
+    }
+
+    async fn reconcile_and_bind_agent_conversation(
+        &self,
+        conversation: &AgentConversationKey,
+        discovery: ProjectDiscovery,
+        instance_id: ProjectInstanceId,
+    ) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let mut registry = self.registry.lock().await;
+        let mut candidate = registry.clone();
+        if Self::agent_discovery_requires_reconciliation(&candidate, instance_id, &discovery) {
+            let reconciled = candidate
+                .register_project(discovery, None)
+                .context("failed to reconcile ambient project metadata")?;
+            anyhow::ensure!(
+                reconciled == instance_id,
+                "ambient project identity changed while reconciling its catalog metadata"
+            );
+        }
+        candidate.bind_agent_conversation(conversation.clone(), instance_id)?;
+        if candidate == *registry {
+            return Ok(());
+        }
+        registry
+            .commit_candidate(candidate)
+            .await
+            .context("failed to persist ambient project metadata and conversation binding")
+    }
+
+    fn agent_discovery_requires_reconciliation(
+        registry: &Registry,
+        instance_id: ProjectInstanceId,
+        discovery: &ProjectDiscovery,
+    ) -> bool {
+        let Some(instance) = registry.instances.get(&instance_id) else {
+            return true;
+        };
+        if instance.current_path.as_deref() != Some(discovery.project_root())
+            || instance.presence != CatalogPresence::Active
+        {
+            return true;
+        }
+        match discovery {
+            ProjectDiscovery::Git {
+                resolved,
+                branch,
+                head,
+            } => {
+                let Some(repository) = registry.repositories.get(&resolved.identity.repository_id)
+                else {
+                    return true;
+                };
+                let Some(worktree) = registry.worktrees.get(&resolved.identity.worktree_id) else {
+                    return true;
+                };
+                repository.current_git_dir.as_deref() != Some(&resolved.common_git_dir)
+                    || repository.presence != CatalogPresence::Active
+                    || worktree.current_path.as_deref() != Some(&resolved.worktree_root)
+                    || worktree.presence != CatalogPresence::Active
+                    || worktree.branch != *branch
+                    || worktree.head != *head
+            }
+            ProjectDiscovery::NonGit { .. } => false,
+        }
+    }
+
+    async fn agent_unregistered_project_status(
+        &self,
+        discovery: ProjectDiscovery,
+    ) -> Result<AgentProjectStatus> {
+        let project_path = discovery.project_root().to_path_buf();
+        let (config, _) = ConfigLoader::load_project_config(&project_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load ambient locald project `{}`",
+                    project_path.display()
+                )
+            })?;
+        let worktree = match &discovery {
+            ProjectDiscovery::Git {
+                resolved,
+                branch,
+                head,
+            } => Some(AgentWorktreeStatus {
+                linked: discovery.is_linked_worktree(),
+                label: resolved
+                    .worktree_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                domain_slug: None,
+                branch: branch.clone(),
+                head: head.clone(),
+            }),
+            ProjectDiscovery::NonGit { .. } => None,
+        };
+        let mut services = config
+            .services
+            .iter()
+            .map(|(name, service)| AgentServiceStatus {
+                name: name.clone(),
+                service_type: locald_core::ipc::ServiceType::from(service),
+                status: ServiceState::Stopped,
+                health_status: HealthStatus::Unknown,
+                url: None,
+            })
+            .collect::<Vec<_>>();
+        services.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(AgentProjectStatus {
+            registration: AgentProjectRegistration::Unregistered,
+            project_path,
+            project_name: Some(config.project.name),
+            worktree,
+            availability: None,
+            services,
+            urls: Vec::new(),
+        })
+    }
+
+    async fn agent_project_status_for_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<AgentProjectStatus> {
+        let (project_path, mut project_name, presence, worktree) = {
+            let registry = self.registry.lock().await;
+            let record = registry
+                .instances
+                .get(&instance_id)
+                .context("ambient agent project is no longer catalogued")?;
+            let project_path = record
+                .current_path
+                .clone()
+                .unwrap_or_else(|| record.last_known_path.clone());
+            let worktree = match record.origin {
+                ProjectInstanceOrigin::Git { worktree_id } => {
+                    let worktree = registry.worktrees.get(&worktree_id).with_context(
+                        || "ambient agent project references missing worktree metadata",
+                    )?;
+                    Some(AgentWorktreeStatus {
+                        linked: record.domain_slug.is_some(),
+                        label: worktree.display_name.clone().or_else(|| {
+                            worktree
+                                .current_path
+                                .as_deref()
+                                .unwrap_or(&worktree.last_known_path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                        }),
+                        domain_slug: record.domain_slug.clone(),
+                        branch: worktree.branch.clone(),
+                        head: worktree.head.clone(),
+                    })
+                }
+                ProjectInstanceOrigin::NonGit => None,
+            };
+            (
+                project_path,
+                record.display_name.clone(),
+                record.presence,
+                worktree,
+            )
+        };
+
+        let configured_services = if presence == CatalogPresence::Active {
+            let (config, _) = ConfigLoader::load_project_config(&project_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load catalogued ambient locald project `{}`",
+                        project_path.display()
+                    )
+                })?;
+            if project_name.is_none() {
+                project_name = Some(config.project.name);
+            }
+            Some(config.services)
+        } else {
+            None
+        };
+        let mut runtime_statuses = self
+            .list_with_instance_owners(Some(instance_id))
+            .await
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect::<Vec<_>>();
+        runtime_statuses.sort_by(|left, right| {
+            left.service_name
+                .as_deref()
+                .unwrap_or(&left.name)
+                .cmp(right.service_name.as_deref().unwrap_or(&right.name))
+        });
+        let availability = self
+            .project_availability_status(instance_id, presence, &runtime_statuses)
+            .await?
+            .or_else(|| {
+                Some(Self::inactive_project_availability(
+                    presence,
+                    "no_availability_state",
+                    "No availability demand or policy has been recorded; call `ensure_available` to start the project."
+                        .to_owned(),
+                ))
+            })
+            .map(Self::agent_safe_availability);
+        let mut urls = BTreeSet::new();
+        let mut services = runtime_statuses
+            .into_iter()
+            .map(|status| {
+                let name = status.service_name.unwrap_or(status.name);
+                let url = if matches!(
+                    status.service_type,
+                    locald_core::ipc::ServiceType::Postgres | locald_core::ipc::ServiceType::Worker
+                ) {
+                    None
+                } else {
+                    status.domain.map(|domain| format!("https://{domain}"))
+                };
+                if let Some(url) = &url {
+                    urls.insert(url.clone());
+                }
+                (
+                    name.clone(),
+                    AgentServiceStatus {
+                        name,
+                        service_type: status.service_type,
+                        status: status.status,
+                        health_status: status.health_status,
+                        url,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Some(configured_services) = configured_services {
+            for (name, service) in configured_services {
+                services.entry(name.clone()).or_insert_with(|| {
+                    let service_type = locald_core::ipc::ServiceType::from(&service);
+                    let url = if matches!(
+                        service_type,
+                        locald_core::ipc::ServiceType::Postgres
+                            | locald_core::ipc::ServiceType::Worker
+                    ) {
+                        None
+                    } else {
+                        let runtime_name = project_name
+                            .as_deref()
+                            .map(|project_name| format!("{project_name}:{name}"));
+                        runtime_name
+                            .as_deref()
+                            .and_then(|runtime_name| {
+                                self.domain_for_service(instance_id, runtime_name)
+                            })
+                            .map(|domain| format!("https://{domain}"))
+                    };
+                    if let Some(url) = &url {
+                        urls.insert(url.clone());
+                    }
+                    AgentServiceStatus {
+                        name,
+                        service_type,
+                        status: ServiceState::Stopped,
+                        health_status: HealthStatus::Unknown,
+                        url,
+                    }
+                });
+            }
+        }
+        Ok(AgentProjectStatus {
+            registration: AgentProjectRegistration::Registered,
+            project_path,
+            project_name,
+            worktree,
+            availability,
+            services: services.into_values().collect(),
+            urls: urls.into_iter().collect(),
+        })
+    }
+
+    fn agent_safe_availability(
+        mut availability: ProjectAvailabilityStatus,
+    ) -> ProjectAvailabilityStatus {
+        if availability.last_error.is_some() {
+            availability.last_error = Some(
+                "The last project convergence attempt failed; inspect the project logs for details."
+                    .to_owned(),
+            );
+        }
+        availability
     }
 
     /// Resume the active project that owns one exact domain and wait for readiness.
@@ -6067,6 +6535,7 @@ impl ProcessManager {
             trusted_launch_path,
             None,
             false,
+            None,
         )
         .await
     }
@@ -6084,6 +6553,7 @@ impl ProcessManager {
             trusted_launch_path,
             Some(event_tx),
             true,
+            None,
         )
         .await
     }
@@ -6095,6 +6565,7 @@ impl ProcessManager {
         trusted_launch_path: Option<String>,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
+        agent_conversation: Option<AgentConversationKey>,
     ) -> Result<EnsureProjectResult> {
         demand
             .validate()
@@ -6108,8 +6579,13 @@ impl ProcessManager {
         self.wait_for_https_proxy_listener().await?;
         self.run_admitted_availability_transition(|| async {
             self.ensure_accepting_lifecycle_requests()?;
-            let (instance_id, pending_initial) =
-                self.resolve_or_register_ensure_project(&canonical).await?;
+            let (instance_id, pending_initial) = self
+                .resolve_or_register_ensure_project(&canonical, agent_conversation.as_ref())
+                .await?;
+            if let Some(conversation) = &agent_conversation {
+                self.bind_agent_conversation(conversation, instance_id)
+                    .await?;
+            }
 
             // Runtime convergence owns the outer per-instance lock and may
             // briefly acquire lifecycle publication while it is held. Every
@@ -6133,6 +6609,16 @@ impl ProcessManager {
                 target.instance_id
             );
             let mut batch = AvailabilityBatch::new(self.availability_now());
+            let trusted_launch_path = if agent_conversation.is_some()
+                && self
+                    .trusted_launch_path_if_present(instance_id)
+                    .await?
+                    .is_some()
+            {
+                None
+            } else {
+                trusted_launch_path
+            };
             if let Some(path) = trusted_launch_path {
                 batch.push(AvailabilityBatchOperation::SetTrustedLaunchPath(Some(path)));
             }
@@ -10913,6 +11399,16 @@ mod tests {
         .expect("create unregistered availability manager");
         manager.set_host_syncer(Arc::new(NoopHostSyncer));
         manager
+    }
+
+    fn test_agent_context(project_path: &Path, identity: &str) -> AgentWorkspaceContext {
+        AgentWorkspaceContext {
+            protocol_version: locald_core::AGENT_ADAPTER_PROTOCOL_VERSION,
+            conversation: AgentConversationKey::digest(identity).expect("digest conversation"),
+            workspace_roots: vec![project_path.to_path_buf()],
+            sandbox_cwd: Some(project_path.to_path_buf()),
+            process_cwd: None,
+        }
     }
 
     async fn availability_manager_with_clock(
@@ -25459,6 +25955,354 @@ PATH = "/usr/bin:/bin"
                 .iter()
                 .any(|lease| lease.kind() == DemandKind::ManualCli)
         );
+    }
+
+    #[tokio::test]
+    async fn agent_inspect_binds_registered_project_without_creating_availability() {
+        let dir = tempdir().expect("create agent inspect directory");
+        let project_path = dir.path().join("agent-inspect");
+        std::fs::create_dir(&project_path).expect("create agent inspect project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "agent-inspect"
+
+[services.web]
+command = "unused-by-inspect"
+"#,
+        )
+        .expect("write agent inspect config");
+        let (manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "agent-inspect").await;
+        let domain_index = {
+            let mut registry = manager.registry.lock().await;
+            registry
+                .replace_domain_claims(
+                    instance_id,
+                    [DomainClaim::service(
+                        "agent-inspect.localhost"
+                            .parse()
+                            .expect("parse agent inspect domain"),
+                        instance_id,
+                        "agent-inspect:web".to_owned(),
+                    )],
+                )
+                .expect("publish agent inspect domain");
+            registry.save().await.expect("persist agent inspect domain");
+            registry.domain_index().clone()
+        };
+        manager.domain_index.store(domain_index);
+        let context = test_agent_context(&project_path, "inspect conversation");
+
+        let status = manager
+            .agent_inspect_project(&context)
+            .await
+            .expect("inspect registered project");
+
+        assert_eq!(status.registration, AgentProjectRegistration::Registered);
+        assert_eq!(status.project_name.as_deref(), Some("agent-inspect"));
+        assert_eq!(status.services.len(), 1);
+        assert_eq!(status.services[0].name, "web");
+        assert_eq!(status.services[0].status, ServiceState::Stopped);
+        assert_eq!(status.services[0].health_status, HealthStatus::Unknown);
+        assert_eq!(
+            status.services[0].url.as_deref(),
+            Some("https://agent-inspect.localhost")
+        );
+        assert_eq!(status.urls, vec!["https://agent-inspect.localhost"]);
+        assert_eq!(
+            manager
+                .registry
+                .lock()
+                .await
+                .agent_binding(&context.conversation),
+            Some(instance_id)
+        );
+        assert!(
+            !availability_path(&availability_data_dir, instance_id).exists(),
+            "observational inspect does not create availability state"
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_inspect_does_not_retarget_a_recreated_git_worktree_by_path() {
+        let dir = tempdir().expect("create recreated worktree directory");
+        let project_path = dir.path().join("recreated-agent-project");
+        std::fs::create_dir(&project_path).expect("create original Git project");
+        git(&project_path, &["init"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            "[project]\nname = \"recreated-agent-project\"\n",
+        )
+        .expect("write original config");
+        let (manager, historical_instance, _) =
+            availability_manager(dir.path(), &project_path, "recreated-agent-project").await;
+
+        std::fs::remove_dir_all(&project_path).expect("remove original Git project");
+        std::fs::create_dir(&project_path).expect("recreate Git project at old path");
+        git(&project_path, &["init"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            "[project]\nname = \"recreated-agent-project\"\n",
+        )
+        .expect("write replacement config");
+        let context = test_agent_context(&project_path, "replacement conversation");
+
+        let status = manager
+            .agent_inspect_project(&context)
+            .await
+            .expect("inspect replacement worktree");
+
+        assert_eq!(status.registration, AgentProjectRegistration::Unregistered);
+        let registry = manager.registry.lock().await;
+        assert_eq!(
+            registry.agent_binding(&context.conversation),
+            None,
+            "an unregistered physical replacement cannot inherit the old instance binding"
+        );
+        assert!(registry.instances.contains_key(&historical_instance));
+    }
+
+    #[tokio::test]
+    async fn agent_inspect_reconciles_a_moved_git_worktree_by_identity() {
+        let dir = tempdir().expect("create moved worktree directory");
+        let original = dir.path().join("original-agent-project");
+        let moved = dir.path().join("moved-agent-project");
+        std::fs::create_dir(&original).expect("create original Git project");
+        git(&original, &["init"]);
+        std::fs::write(
+            original.join("locald.toml"),
+            "[project]\nname = \"moved-agent-project\"\n",
+        )
+        .expect("write original config");
+        let (manager, instance_id, _) =
+            availability_manager(dir.path(), &original, "moved-agent-project").await;
+
+        std::fs::rename(&original, &moved).expect("move whole Git project");
+        let context = test_agent_context(&moved, "moved conversation");
+
+        let status = manager
+            .agent_inspect_project(&context)
+            .await
+            .expect("inspect moved worktree");
+
+        assert_eq!(status.registration, AgentProjectRegistration::Registered);
+        assert_eq!(
+            status.project_path,
+            std::fs::canonicalize(&moved).expect("canonical moved project")
+        );
+        let registry = manager.registry.lock().await;
+        assert_eq!(
+            registry.instances[&instance_id].current_path.as_deref(),
+            Some(status.project_path.as_path())
+        );
+        assert_eq!(
+            registry.agent_binding(&context.conversation),
+            Some(instance_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_ensure_registers_binds_renews_and_returns_only_semantic_state() {
+        let dir = tempdir().expect("create agent ensure directory");
+        let project_path = dir.path().join("agent-ensure");
+        std::fs::create_dir(&project_path).expect("create agent ensure project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "agent-ensure"
+domain = "agent-ensure.localhost"
+
+[services.web]
+command = "unused-by-test-factory"
+"#,
+        )
+        .expect("write agent ensure config");
+        let mut manager = unregistered_availability_manager(dir.path());
+        manager.factories.insert(
+            0,
+            Arc::new(RetryingTcpReadinessFactory {
+                creates: Arc::new(AtomicUsize::new(1)),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        manager.set_https_port(Some(8443)).await;
+        let first = test_agent_context(&project_path, "first private conversation");
+
+        let before = manager
+            .agent_inspect_project(&first)
+            .await
+            .expect("inspect unregistered project");
+        assert_eq!(before.registration, AgentProjectRegistration::Unregistered);
+        assert!(manager.registry.lock().await.instances.is_empty());
+
+        let status = manager
+            .agent_ensure_project(&first, Some("/agent/bin:/usr/bin".to_owned()))
+            .await
+            .expect("ensure ambient agent project");
+        assert_eq!(status.registration, AgentProjectRegistration::Registered);
+        assert_eq!(status.urls, vec!["https://agent-ensure.localhost"]);
+        assert_eq!(status.services.len(), 1);
+        assert_eq!(status.services[0].name, "web");
+        assert_eq!(status.services[0].status, ServiceState::Running);
+        assert_eq!(status.services[0].health_status, HealthStatus::Healthy);
+        assert_eq!(
+            status.services[0].url.as_deref(),
+            Some("https://agent-ensure.localhost")
+        );
+
+        let instance_id = manager
+            .registry
+            .lock()
+            .await
+            .agent_binding(&first.conversation)
+            .expect("conversation is durably bound");
+        let snapshot = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load agent availability")
+            .snapshot()
+            .await
+            .expect("read agent availability");
+        assert_eq!(snapshot.trusted_launch_path(), Some("/agent/bin:/usr/bin"));
+        assert_eq!(
+            snapshot
+                .demands()
+                .iter()
+                .filter(|lease| lease.kind() == DemandKind::AgentConversation)
+                .count(),
+            1
+        );
+
+        let reopened = reopen_availability_manager_with_clock(
+            dir.path(),
+            dir.path().join("availability-data"),
+            SharedAvailabilityClock::system(),
+        )
+        .await;
+        let reopened_status = reopened
+            .agent_inspect_project(&first)
+            .await
+            .expect("inspect the same conversation after daemon restart");
+        assert_eq!(
+            reopened_status.registration,
+            AgentProjectRegistration::Registered
+        );
+        assert_eq!(
+            reopened
+                .registry
+                .lock()
+                .await
+                .agent_binding(&first.conversation),
+            Some(instance_id),
+            "conversation binding survives a fresh daemon catalog load"
+        );
+        drop(reopened);
+
+        manager
+            .load_availability(instance_id)
+            .await
+            .expect("load availability for safe error projection")
+            .record_convergence_error(
+                "service failed on port 54321 with PID 123 and private instance details".to_owned(),
+            )
+            .await
+            .expect("record private convergence diagnostic");
+        let failed_status = manager
+            .agent_inspect_project(&first)
+            .await
+            .expect("inspect privacy-safe convergence failure");
+        let projected_error = failed_status
+            .availability
+            .and_then(|availability| availability.last_error)
+            .expect("project convergence error");
+        assert_eq!(
+            projected_error,
+            "The last project convergence attempt failed; inspect the project logs for details."
+        );
+        assert!(!projected_error.contains("54321"));
+        assert!(!projected_error.contains("PID 123"));
+
+        manager
+            .agent_ensure_project(&first, Some("/untrusted/replacement".to_owned()))
+            .await
+            .expect("renew the same agent owner");
+        let second = test_agent_context(&project_path, "second private conversation");
+        manager
+            .agent_ensure_project(&second, Some("/another/seed".to_owned()))
+            .await
+            .expect("ensure an independent agent owner");
+        let snapshot = manager
+            .load_availability(instance_id)
+            .await
+            .expect("reload agent availability")
+            .snapshot()
+            .await
+            .expect("read renewed agent availability");
+        assert_eq!(
+            snapshot.trusted_launch_path(),
+            Some("/agent/bin:/usr/bin"),
+            "agent context seeds PATH once and never replaces known-good launch context"
+        );
+        assert_eq!(
+            snapshot
+                .demands()
+                .iter()
+                .filter(|lease| lease.kind() == DemandKind::AgentConversation)
+                .count(),
+            2,
+            "separate conversations retain independent demand owners"
+        );
+
+        let encoded = serde_json::to_value(&status).expect("serialize agent status");
+        fn assert_safe_keys(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        assert!(
+                            ![
+                                "pid",
+                                "port",
+                                "instance_id",
+                                "project_instance_id",
+                                "demand_id",
+                                "activity_generation"
+                            ]
+                            .contains(&key.as_str()),
+                            "agent projection exposes forbidden key `{key}`"
+                        );
+                        assert_safe_keys(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        assert_safe_keys(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_safe_keys(&encoded);
+        let encoded = encoded.to_string();
+        assert!(!encoded.contains("first private conversation"));
+        assert!(!encoded.contains("8443"));
+
+        let other_path = dir.path().join("other-agent-project");
+        std::fs::create_dir(&other_path).expect("create conflicting project");
+        std::fs::write(
+            other_path.join("locald.toml"),
+            "[project]\nname = \"other-agent-project\"\n",
+        )
+        .expect("write conflicting config");
+        let conflicting = test_agent_context(&other_path, "first private conversation");
+        let error = manager
+            .agent_inspect_project(&conflicting)
+            .await
+            .expect_err("conversation cannot silently retarget");
+        assert!(format!("{error:#}").contains("cannot silently retarget"));
     }
 
     #[tokio::test]

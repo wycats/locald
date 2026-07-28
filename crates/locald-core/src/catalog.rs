@@ -5,6 +5,7 @@
 //! readiness, and runtime state; those change at a different cadence and have
 //! their own persistence model.
 
+use crate::agent::AgentConversationKey;
 use crate::identity::{
     IdentityError, ProjectId, ProjectIdentity, ProjectInstanceId, RepositoryId,
     ResolvedProjectIdentity, WorktreeId, derive_project_id, derive_project_instance_id,
@@ -22,9 +23,10 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// The current identity and exact-domain catalog schema.
-pub const CATALOG_VERSION: u32 = 3;
-const PREVIOUS_CATALOG_VERSION: u32 = 2;
+/// The current identity, exact-domain, and ambient-agent binding schema.
+pub const CATALOG_VERSION: u32 = 4;
+const PREVIOUS_CATALOG_VERSION: u32 = 3;
+const LEGACY_CATALOG_VERSION: u32 = 2;
 
 /// Paths used to initialize a catalog and collect legacy locator evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,10 +176,21 @@ pub enum ProjectDiscovery {
 }
 
 impl ProjectDiscovery {
-    fn project_root(&self) -> &Path {
+    /// Return the canonical project root associated with this discovery.
+    #[must_use]
+    pub fn project_root(&self) -> &Path {
         match self {
             Self::Git { resolved, .. } => &resolved.project_root,
             Self::NonGit { project_root } => project_root,
+        }
+    }
+
+    /// Return the stable physical instance identity when Git supplies it.
+    #[must_use]
+    pub fn git_project_instance_id(&self) -> Option<ProjectInstanceId> {
+        match self {
+            Self::Git { resolved, .. } => Some(resolved.identity.project_instance_id),
+            Self::NonGit { .. } => None,
         }
     }
 
@@ -240,6 +253,9 @@ pub enum CatalogError {
 
     #[error("catalog `{path}` was published and its parent-directory sync failed: {reason}")]
     PublishedNotDurable { path: PathBuf, reason: String },
+
+    #[error("agent conversation is already bound to another project instance")]
+    AgentBindingConflict,
 }
 
 /// Versioned durable identity catalog.
@@ -254,6 +270,8 @@ pub struct ProjectCatalog {
     pub legacy_paths: BTreeMap<PathBuf, ProjectInstanceId>,
     pub unresolved_legacy: BTreeMap<PathBuf, UnresolvedLegacyProject>,
     pub domain_index: DomainIndex,
+    #[serde(default)]
+    agent_bindings: BTreeMap<AgentConversationKey, ProjectInstanceId>,
     #[serde(skip, default = "ProjectCatalog::path")]
     storage_path: PathBuf,
 }
@@ -275,6 +293,7 @@ impl ProjectCatalog {
             legacy_paths: BTreeMap::new(),
             unresolved_legacy: BTreeMap::new(),
             domain_index: DomainIndex::default(),
+            agent_bindings: BTreeMap::new(),
             storage_path,
         }
     }
@@ -451,6 +470,9 @@ impl ProjectCatalog {
                 Self::deserialize_current(value, path)
             }
             version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
+                Self::migrate_v3(value, path)
+            }
+            version if version == u64::from(LEGACY_CATALOG_VERSION) => {
                 Self::migrate_v2(value, path)
             }
             found => Err(CatalogError::UnsupportedVersion {
@@ -500,6 +522,13 @@ impl ProjectCatalog {
                 Self::deserialize_current(value, path)
             }
             version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
+                let catalog = Self::migrate_v3(value, path)?;
+                match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
+                    Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => Ok(catalog),
+                    Err(error) => Err(error),
+                }
+            }
+            version if version == u64::from(LEGACY_CATALOG_VERSION) => {
                 let catalog = Self::migrate_v2(value, path)?;
                 match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
                     Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => Ok(catalog),
@@ -515,6 +544,12 @@ impl ProjectCatalog {
     }
 
     fn deserialize_current(value: Value, path: &Path) -> Result<Self, CatalogError> {
+        if value.get("agent_bindings").is_none() {
+            return Err(CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "current catalog is missing `agent_bindings`".to_owned(),
+            });
+        }
         let mut catalog: Self =
             serde_json::from_value(value).map_err(|source| CatalogError::InvalidData {
                 path: path.to_path_buf(),
@@ -523,6 +558,21 @@ impl ProjectCatalog {
         catalog.storage_path = path.to_path_buf();
         catalog.validate()?;
         Ok(catalog)
+    }
+
+    fn migrate_v3(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "catalog must be an object".to_owned(),
+            })?;
+        object.insert("version".to_owned(), Value::from(CATALOG_VERSION));
+        object.insert(
+            "agent_bindings".to_owned(),
+            Value::Object(serde_json::Map::new()),
+        );
+        Self::deserialize_current(value, path)
     }
 
     fn migrate_v2(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
@@ -534,6 +584,10 @@ impl ProjectCatalog {
                 reason: "catalog must be an object".to_owned(),
             })?;
         object.insert("version".to_owned(), Value::from(CATALOG_VERSION));
+        object.insert(
+            "agent_bindings".to_owned(),
+            Value::Object(serde_json::Map::new()),
+        );
         if !had_domain_index {
             object.insert(
                 "domain_index".to_owned(),
@@ -645,6 +699,62 @@ impl ProjectCatalog {
     #[must_use]
     pub const fn domain_index(&self) -> &DomainIndex {
         &self.domain_index
+    }
+
+    /// Return the durable project-instance binding for one opaque conversation.
+    #[must_use]
+    pub fn agent_binding(&self, conversation: &AgentConversationKey) -> Option<ProjectInstanceId> {
+        self.agent_bindings.get(conversation).copied()
+    }
+
+    /// Upgrade one catalog image embedded in a replayable lifecycle journal.
+    ///
+    /// Catalog files migrate before use, but a prepared transaction may retain
+    /// exact version-3 before/after images across the daemon upgrade.
+    pub fn upgrade_embedded_schema(&mut self) -> Result<bool, CatalogError> {
+        let upgraded = match self.version {
+            CATALOG_VERSION => false,
+            PREVIOUS_CATALOG_VERSION => {
+                self.version = CATALOG_VERSION;
+                self.agent_bindings.clear();
+                true
+            }
+            version => {
+                return Err(CatalogError::Invariant(format!(
+                    "embedded catalog schema version {version} cannot be upgraded to {CATALOG_VERSION}"
+                )));
+            }
+        };
+        self.validate()?;
+        Ok(upgraded)
+    }
+
+    /// Bind one opaque conversation to its first resolved project instance.
+    ///
+    /// Repeating the same binding is idempotent. A different target fails
+    /// closed so mutable workspace labels cannot silently retarget a chat.
+    pub fn bind_agent_conversation(
+        &mut self,
+        conversation: AgentConversationKey,
+        instance_id: ProjectInstanceId,
+    ) -> Result<bool, CatalogError> {
+        conversation.validate().map_err(|error| {
+            CatalogError::Invariant(format!("invalid agent conversation key: {error}"))
+        })?;
+        if !self.instances.contains_key(&instance_id) {
+            return Err(CatalogError::Invariant(
+                "agent conversation binding references a missing project instance".to_owned(),
+            ));
+        }
+        match self.agent_bindings.get(&conversation) {
+            Some(bound) if *bound == instance_id => Ok(false),
+            Some(_) => Err(CatalogError::AgentBindingConflict),
+            None => {
+                self.agent_bindings.insert(conversation, instance_id);
+                self.validate()?;
+                Ok(true)
+            }
+        }
     }
 
     /// Replace one instance's complete exact claim set in memory.
@@ -1139,6 +1249,12 @@ impl ProjectCatalog {
             })
     }
 
+    /// Resolve a current or historical path locator to its catalogued instance.
+    #[must_use]
+    pub fn project_instance_for_path(&self, path: &Path) -> Option<ProjectInstanceId> {
+        self.instance_for_path(path)
+    }
+
     fn entry_for_instance(&self, instance_id: ProjectInstanceId) -> Option<ProjectEntry> {
         self.instances.get(&instance_id).map(|record| ProjectEntry {
             path: record
@@ -1337,6 +1453,7 @@ impl ProjectCatalog {
             return Ok(());
         };
         self.legacy_paths.retain(|_, id| *id != instance_id);
+        self.agent_bindings.retain(|_, id| *id != instance_id);
 
         if !self
             .instances
@@ -1526,6 +1643,13 @@ impl ProjectCatalog {
             )));
         }
         self.domain_index.validate()?;
+        for instance_id in self.agent_bindings.values() {
+            if !self.instances.contains_key(instance_id) {
+                return Err(CatalogError::Invariant(
+                    "agent conversation binding references a missing project instance".to_owned(),
+                ));
+            }
+        }
         for (domain, target) in self.domain_index.claims() {
             if let DomainTarget::Service {
                 project_instance_id,
@@ -2536,7 +2660,10 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first_bytes, second_bytes);
-        assert!(first_bytes.starts_with(b"{\n  \"version\": 3,"));
+        assert_eq!(
+            catalog_fixture_version(&first_bytes),
+            u64::from(CATALOG_VERSION)
+        );
     }
 
     #[tokio::test]
@@ -2695,7 +2822,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn current_v3_unresolved_alias_mutations_match_the_normalized_locator() {
+    async fn current_v4_unresolved_alias_mutations_match_the_normalized_locator() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let real_parent = fixture._temp.path().join("real-parent");
@@ -2718,19 +2845,19 @@ mod tests {
                 sources: BTreeSet::from([LegacyLocatorSource::Registry]),
             },
         );
-        catalog.save().await.expect("persist current v3 catalog");
+        catalog.save().await.expect("persist current v4 catalog");
         let before_reload = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read current v3 catalog before reload");
+            .expect("read current v4 catalog before reload");
 
         let mut reopened = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect("reload current v3 catalog");
+            .expect("reload current v4 catalog");
 
         assert_eq!(
             tokio::fs::read(&paths.catalog)
                 .await
-                .expect("read current v3 catalog after reload"),
+                .expect("read current v4 catalog after reload"),
             before_reload
         );
         assert!(reopened.unresolved_legacy.contains_key(&raw_alias));
@@ -4593,7 +4720,7 @@ mod tests {
                 )],
             )
             .expect("record v2 flat claim");
-        let v2_bytes = catalog_fixture_bytes(&source, PREVIOUS_CATALOG_VERSION, false);
+        let v2_bytes = catalog_fixture_bytes(&source, LEGACY_CATALOG_VERSION, false);
         tokio::fs::write(&paths.catalog, v2_bytes)
             .await
             .expect("write v2 catalog without domain index");
@@ -4616,28 +4743,138 @@ mod tests {
             })
         );
 
-        let first_v3_bytes = tokio::fs::read(&paths.catalog)
+        let first_v4_bytes = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read migrated v3 catalog");
+            .expect("read migrated v4 catalog");
         assert_eq!(
-            catalog_fixture_version(&first_v3_bytes),
+            catalog_fixture_version(&first_v4_bytes),
             u64::from(CATALOG_VERSION)
         );
         assert!(
-            serde_json::from_slice::<Value>(&first_v3_bytes)
-                .expect("parse migrated v3 catalog")
+            serde_json::from_slice::<Value>(&first_v4_bytes)
+                .expect("parse migrated v4 catalog")
                 .get("domain_index")
                 .is_some()
         );
 
         let reopened = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect("reopen migrated v3 catalog");
-        let second_v3_bytes = tokio::fs::read(&paths.catalog)
+            .expect("reopen migrated v4 catalog");
+        let second_v4_bytes = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read reopened v3 catalog");
+            .expect("read reopened v4 catalog");
         assert_eq!(reopened, migrated);
-        assert_eq!(second_v3_bytes, first_v3_bytes);
+        assert_eq!(second_v4_bytes, first_v4_bytes);
+    }
+
+    #[tokio::test]
+    async fn v3_migrates_with_an_empty_agent_binding_index() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.git_project("v3-agent-project");
+        let mut source = ProjectCatalog::with_path(paths.catalog.clone());
+        let instance_id = source
+            .register_project(
+                ProjectCatalog::discover(project.clone())
+                    .await
+                    .expect("discover v3 project"),
+                Some("v3-agent".to_owned()),
+            )
+            .expect("register v3 project");
+        let key = AgentConversationKey::digest("private conversation")
+            .expect("digest private conversation");
+        source
+            .bind_agent_conversation(key.clone(), instance_id)
+            .expect("bind current catalog");
+        let mut value = serde_json::to_value(&source).expect("serialize v3 migration fixture");
+        value["version"] = Value::from(PREVIOUS_CATALOG_VERSION);
+        value
+            .as_object_mut()
+            .expect("catalog fixture object")
+            .remove("agent_bindings");
+        tokio::fs::write(
+            &paths.catalog,
+            serde_json::to_vec_pretty(&value).expect("encode v3 fixture"),
+        )
+        .await
+        .expect("write v3 fixture");
+
+        let migrated = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("migrate v3 catalog");
+
+        assert_eq!(migrated.agent_binding(&key), None);
+        assert_eq!(
+            catalog_fixture_version(
+                &tokio::fs::read(&paths.catalog)
+                    .await
+                    .expect("read migrated v4 catalog")
+            ),
+            u64::from(CATALOG_VERSION)
+        );
+        let stored: Value = serde_json::from_slice(
+            &tokio::fs::read(&paths.catalog)
+                .await
+                .expect("read migrated catalog"),
+        )
+        .expect("parse migrated catalog");
+        assert_eq!(stored["agent_bindings"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn agent_binding_is_durable_idempotent_and_released_by_forget() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let first_path = fixture.git_project("bound-project");
+        let second_path = fixture.git_project("other-project");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let first = catalog
+            .register_project(
+                ProjectCatalog::discover(first_path.clone())
+                    .await
+                    .expect("discover first project"),
+                Some("bound".to_owned()),
+            )
+            .expect("register first project");
+        let second = catalog
+            .register_project(
+                ProjectCatalog::discover(second_path)
+                    .await
+                    .expect("discover second project"),
+                Some("other".to_owned()),
+            )
+            .expect("register second project");
+        let key =
+            AgentConversationKey::digest("private conversation").expect("digest conversation");
+
+        assert!(
+            catalog
+                .bind_agent_conversation(key.clone(), first)
+                .expect("bind first instance")
+        );
+        assert!(
+            !catalog
+                .bind_agent_conversation(key.clone(), first)
+                .expect("repeat binding")
+        );
+        assert!(matches!(
+            catalog.bind_agent_conversation(key.clone(), second),
+            Err(CatalogError::AgentBindingConflict)
+        ));
+        catalog.save().await.expect("persist binding");
+
+        let mut reopened = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("reopen binding");
+        assert_eq!(reopened.agent_binding(&key), Some(first));
+        assert!(
+            reopened
+                .unregister_project(&first_path)
+                .expect("forget bound project")
+        );
+        assert_eq!(reopened.agent_binding(&key), None);
     }
 
     #[tokio::test]
@@ -4662,7 +4899,7 @@ mod tests {
                 )],
             )
             .expect("record v2 exact target");
-        let v2_bytes = catalog_fixture_bytes(&source, PREVIOUS_CATALOG_VERSION, true);
+        let v2_bytes = catalog_fixture_bytes(&source, LEGACY_CATALOG_VERSION, true);
         tokio::fs::write(&paths.catalog, v2_bytes)
             .await
             .expect("write v2 catalog with domain index");
@@ -4681,7 +4918,7 @@ mod tests {
         );
         let stored = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read indexed v3 catalog");
+            .expect("read indexed v4 catalog");
         assert_eq!(catalog_fixture_version(&stored), u64::from(CATALOG_VERSION));
     }
 
@@ -4711,7 +4948,7 @@ mod tests {
             .expect("record indexed v2 claim");
         let mut value: Value = serde_json::from_slice(&catalog_fixture_bytes(
             &source,
-            PREVIOUS_CATALOG_VERSION,
+            LEGACY_CATALOG_VERSION,
             true,
         ))
         .expect("parse invalid v2 fixture");
@@ -4737,34 +4974,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_v3_requires_domain_index_without_rewriting() {
+    async fn native_v4_requires_domain_index_without_rewriting() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let catalog = ProjectCatalog::with_path(paths.catalog.clone());
         let original = catalog_fixture_bytes(&catalog, CATALOG_VERSION, false);
         tokio::fs::write(&paths.catalog, &original)
             .await
-            .expect("write incomplete v3 catalog");
+            .expect("write incomplete v4 catalog");
 
         let error = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect_err("v3 domain index is required");
+            .expect_err("v4 domain index is required");
 
         assert!(matches!(error, CatalogError::InvalidData { .. }));
         assert_eq!(
             tokio::fs::read(&paths.catalog)
                 .await
-                .expect("read rejected v3 catalog"),
+                .expect("read rejected v4 catalog"),
             original
         );
     }
 
     #[tokio::test]
-    async fn v2_migration_sync_failure_returns_published_v3() {
+    async fn native_v4_requires_agent_bindings_without_rewriting() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let catalog = ProjectCatalog::with_path(paths.catalog.clone());
-        let v2_bytes = catalog_fixture_bytes(&catalog, PREVIOUS_CATALOG_VERSION, false);
+        let mut value = serde_json::to_value(catalog).expect("serialize current catalog");
+        value
+            .as_object_mut()
+            .expect("catalog object")
+            .remove("agent_bindings");
+        let mut original = serde_json::to_vec_pretty(&value).expect("encode incomplete catalog");
+        original.push(b'\n');
+        tokio::fs::write(&paths.catalog, &original)
+            .await
+            .expect("write incomplete v4 catalog");
+
+        let error = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect_err("v4 agent binding index is required");
+
+        assert!(matches!(error, CatalogError::InvalidData { .. }));
+        assert_eq!(
+            tokio::fs::read(&paths.catalog)
+                .await
+                .expect("read rejected v4 catalog"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_migration_sync_failure_returns_published_v4() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let catalog = ProjectCatalog::with_path(paths.catalog.clone());
+        let v2_bytes = catalog_fixture_bytes(&catalog, LEGACY_CATALOG_VERSION, false);
         tokio::fs::write(&paths.catalog, v2_bytes)
             .await
             .expect("write v2 migration fixture");
@@ -4789,7 +5055,7 @@ mod tests {
         );
         let reopened = ProjectCatalog::load_existing(&paths.catalog)
             .await
-            .expect("published v3 migration remains readable");
+            .expect("published v4 migration remains readable");
         assert_eq!(reopened, migrated);
     }
 
@@ -4857,7 +5123,7 @@ mod tests {
         let mut stored: Value =
             serde_json::from_slice(&tokio::fs::read(&paths.catalog).await.expect("read catalog"))
                 .expect("parse catalog");
-        stored["version"] = Value::from(PREVIOUS_CATALOG_VERSION);
+        stored["version"] = Value::from(LEGACY_CATALOG_VERSION);
         stored
             .as_object_mut()
             .expect("catalog object")

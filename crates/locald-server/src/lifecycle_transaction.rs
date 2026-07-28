@@ -228,11 +228,22 @@ impl LifecycleTransaction {
         }
     }
 
-    fn normalize_deserialized_paths(&mut self) {
+    fn normalize_deserialized_paths(&mut self) -> Result<(), LifecycleJournalError> {
         if let Some(catalog) = &mut self.catalog {
             let storage_path = catalog.storage_path.clone();
             catalog.normalize_storage_path(&storage_path);
+            catalog.base.upgrade_embedded_schema().map_err(|error| {
+                LifecycleJournalError::InvalidPlan {
+                    reason: format!("failed to upgrade embedded catalog base: {error}"),
+                }
+            })?;
+            catalog.target.upgrade_embedded_schema().map_err(|error| {
+                LifecycleJournalError::InvalidPlan {
+                    reason: format!("failed to upgrade embedded catalog target: {error}"),
+                }
+            })?;
         }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), LifecycleJournalError> {
@@ -604,7 +615,13 @@ impl LifecycleJournal {
         let Some(mut transaction) = loaded else {
             return Ok(None);
         };
-        transaction.normalize_deserialized_paths();
+        transaction
+            .normalize_deserialized_paths()
+            .map_err(|error| LifecycleJournalError::InvalidData {
+                entity: "lifecycle transaction",
+                path: self.journal_path.clone(),
+                reason: error.to_string(),
+            })?;
         transaction
             .validate()
             .map_err(|error| LifecycleJournalError::InvalidData {
@@ -1244,6 +1261,7 @@ mod tests {
         V1BackupDisposition, finish_create_once_publication,
     };
     use locald_core::attachments::{Attachment, AttachmentSource, AttachmentStoreSnapshot};
+    use locald_core::catalog::CATALOG_VERSION;
     use locald_core::{
         AvailabilityBatch, AvailabilityBatchOperation, AvailabilityStore,
         PreparedAvailabilityBatch, ProjectCatalog, ProjectInstanceId,
@@ -1586,6 +1604,45 @@ mod tests {
                 .expect_err("unsupported journal must block"),
             LifecycleJournalError::UnsupportedVersion { found: 999, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_upgrades_embedded_v3_catalog_images() {
+        let fixture = Fixture::new();
+        let transaction = fixture.transaction();
+        let mut value = serde_json::to_value(&transaction).expect("serialize lifecycle journal");
+        for image in ["base", "target"] {
+            let catalog = value
+                .get_mut("catalog")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|catalog| catalog.get_mut(image))
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("embedded catalog image");
+            catalog.insert(
+                "version".to_owned(),
+                serde_json::Value::from(CATALOG_VERSION - 1),
+            );
+            catalog.remove("agent_bindings");
+        }
+        tokio::fs::write(
+            fixture.journal.journal_path(),
+            serde_json::to_vec_pretty(&value).expect("encode v3 lifecycle journal"),
+        )
+        .await
+        .expect("write v3 lifecycle journal");
+
+        let loaded = fixture
+            .journal
+            .load()
+            .await
+            .expect("load upgraded lifecycle journal")
+            .expect("journal remains present");
+        let loaded = serde_json::to_value(loaded).expect("serialize upgraded journal");
+        for image in ["base", "target"] {
+            let catalog = &loaded["catalog"][image];
+            assert_eq!(catalog["version"], serde_json::Value::from(CATALOG_VERSION));
+            assert_eq!(catalog["agent_bindings"], serde_json::json!({}));
+        }
     }
 
     #[cfg(unix)]

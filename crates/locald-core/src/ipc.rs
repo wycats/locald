@@ -506,6 +506,26 @@ pub enum IpcRequest {
         /// Private editor provenance validated against the IPC peer.
         editor: EditorSession,
     },
+    /// Inspect the project ambiently associated with an authenticated agent
+    /// conversation without creating availability demand or starting services.
+    ///
+    /// **Response:** `IpcResponse::AgentProject(AgentProjectStatus)`
+    AgentInspectProject {
+        /// Private host context derived by the locald MCP adapter.
+        context: crate::AgentWorkspaceContext,
+    },
+    /// Semantically ensure the project ambiently associated with an
+    /// authenticated agent conversation and wait for readiness.
+    ///
+    /// **Response:** `IpcResponse::AgentProject(AgentProjectStatus)`
+    AgentEnsureProject {
+        /// Private host context derived by the locald MCP adapter.
+        context: crate::AgentWorkspaceContext,
+        /// Trusted host-process search path inherited by the adapter. It seeds
+        /// launch context only when the project has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_path: Option<String>,
+    },
     /// Acquire or renew one semantic demand, converge the project, and wait
     /// until every required service is ready.
     ///
@@ -621,6 +641,8 @@ pub enum IpcResponse {
     ProjectStatus(ProjectStatusInfo),
     /// Response to ProjectList request.
     ProjectList(Vec<ProjectListEntry>),
+    /// Privacy-safe project state for an ambient agent conversation.
+    AgentProject(crate::AgentProjectStatus),
     /// Response to EnsureProject request.
     ProjectEnsured(EnsureProjectResult),
     /// A later lifecycle decision prevented EnsureProject from reaching Ready.
@@ -713,6 +735,10 @@ mod tests {
     use super::{
         EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded, EnsuredServiceStatus,
         IpcRequest, IpcResponse, LogMode, ServiceType,
+    };
+    use crate::agent::{
+        AGENT_ADAPTER_PROTOCOL_VERSION, AgentConversationKey, AgentProjectRegistration,
+        AgentProjectStatus, AgentServiceStatus, AgentWorkspaceContext,
     };
     use crate::attachments::{AttachmentSource, EditorSession};
     use crate::availability::{AvailabilityReason, DemandKey, ProjectLifecycleState};
@@ -853,6 +879,72 @@ mod tests {
                 serde_json::from_value(encoded).expect("deserialize editor request");
             assert_eq!(decoded, request);
         }
+    }
+
+    #[test]
+    fn agent_requests_and_status_round_trip_without_raw_private_provenance() {
+        let private_identity = "issuer=codex;conversation=private-agent-thread";
+        let context = AgentWorkspaceContext {
+            protocol_version: AGENT_ADAPTER_PROTOCOL_VERSION,
+            conversation: AgentConversationKey::digest(private_identity)
+                .expect("digest private conversation"),
+            workspace_roots: vec![PathBuf::from("/workspace")],
+            sandbox_cwd: None,
+            process_cwd: Some(PathBuf::from("/workspace")),
+        };
+        let requests = [
+            IpcRequest::AgentInspectProject {
+                context: context.clone(),
+            },
+            IpcRequest::AgentEnsureProject {
+                context,
+                launch_path: Some("/usr/bin:/bin".to_owned()),
+            },
+        ];
+
+        for request in requests {
+            let encoded = serde_json::to_value(&request).expect("serialize agent request");
+            let rendered = encoded.to_string();
+            assert!(!rendered.contains(private_identity));
+            assert!(!rendered.contains("private-agent-thread"));
+            let decoded: IpcRequest =
+                serde_json::from_value(encoded).expect("deserialize agent request");
+            assert_eq!(decoded, request);
+        }
+
+        let response = IpcResponse::AgentProject(AgentProjectStatus {
+            registration: AgentProjectRegistration::Registered,
+            project_path: PathBuf::from("/workspace"),
+            project_name: Some("workspace".to_owned()),
+            worktree: None,
+            availability: None,
+            services: vec![AgentServiceStatus {
+                name: "web".to_owned(),
+                service_type: ServiceType::Exec,
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+                url: Some("https://workspace.localhost".to_owned()),
+            }],
+            urls: vec!["https://workspace.localhost".to_owned()],
+        });
+        let encoded = serde_json::to_value(&response).expect("serialize agent response");
+        let rendered = encoded.to_string();
+        for forbidden in [
+            "\"pid\"",
+            "\"port\"",
+            "instance_id",
+            "demand_id",
+            "activity_generation",
+            "private-agent-thread",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "agent response leaked `{forbidden}`: {rendered}"
+            );
+        }
+        let decoded: IpcResponse =
+            serde_json::from_value(encoded).expect("deserialize agent response");
+        assert_eq!(decoded, response);
     }
 
     #[test]

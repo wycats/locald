@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use locald_core::attachments::{AttachmentSource, EditorSession, ManualCliSession};
 use locald_core::config::LocaldConfig;
 use locald_core::ipc::{DaemonIdentity, EnsureProjectResult, LogEntry, MAX_IPC_REQUEST_BYTES};
-use locald_core::{DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
+use locald_core::{AgentWorkspaceContext, DemandKey, IpcRequest, IpcResponse, ProjectInstanceId};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc::Sender};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub async fn run_ipc_server(
     manager: ProcessManager,
@@ -235,6 +235,95 @@ where
 
 fn validate_editor_session(stream: &UnixStream, editor: &EditorSession) -> Result<()> {
     validate_editor_session_with(stream, editor, validate_editor_process_chain)
+}
+
+fn validate_agent_adapter_process(
+    peer_pid: u32,
+    expected_uid: u32,
+    daemon_executable: &Path,
+) -> Result<()> {
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(
+            ProcessRefreshKind::nothing()
+                .with_user(UpdateKind::OnlyIfNotSet)
+                .with_exe(UpdateKind::OnlyIfNotSet),
+        ),
+    );
+    let process = system
+        .process(sysinfo::Pid::from_u32(peer_pid))
+        .context("kernel-authenticated agent adapter process was no longer live")?;
+    let owner = process
+        .user_id()
+        .context("agent adapter process owner was unavailable")?;
+    anyhow::ensure!(
+        owner.to_string() == expected_uid.to_string(),
+        "agent adapter PID {peer_pid} does not belong to locald daemon UID {expected_uid}"
+    );
+    let peer_executable = process
+        .exe()
+        .context("agent adapter executable path was unavailable")?;
+    let peer_executable = std::fs::canonicalize(peer_executable).with_context(|| {
+        format!(
+            "failed to canonicalize agent adapter executable `{}`",
+            peer_executable.display()
+        )
+    })?;
+    let daemon_executable = std::fs::canonicalize(daemon_executable).with_context(|| {
+        format!(
+            "failed to canonicalize locald daemon executable `{}`",
+            daemon_executable.display()
+        )
+    })?;
+    anyhow::ensure!(
+        peer_executable == daemon_executable,
+        "agent adapter executable `{}` does not match the running locald installation `{}`; restart the adapter from the installed locald binary",
+        peer_executable.display(),
+        daemon_executable.display()
+    );
+    Ok(())
+}
+
+fn validate_agent_adapter_with<ValidateProcess>(
+    stream: &UnixStream,
+    context: &AgentWorkspaceContext,
+    validate_process: ValidateProcess,
+) -> Result<()>
+where
+    ValidateProcess: FnOnce(u32, u32, &Path) -> Result<()>,
+{
+    context.validate().map_err(anyhow::Error::new)?;
+    let credentials = stream
+        .peer_cred()
+        .context("failed to read kernel-authenticated agent-adapter IPC credentials")?;
+    let daemon_uid = nix::unistd::geteuid().as_raw();
+    anyhow::ensure!(
+        credentials.uid() == daemon_uid,
+        "agent adapter UID {} does not match locald daemon UID {daemon_uid}",
+        credentials.uid()
+    );
+    let peer_pid = authenticated_peer_pid(stream)?;
+    let daemon_executable =
+        std::env::current_exe().context("failed to resolve the running locald executable")?;
+    validate_process(peer_pid, daemon_uid, &daemon_executable)
+}
+
+fn validate_agent_adapter(stream: &UnixStream, context: &AgentWorkspaceContext) -> Result<()> {
+    validate_agent_adapter_with(stream, context, validate_agent_adapter_process)
+}
+
+fn agent_authentication_error(error: &anyhow::Error) -> IpcResponse {
+    warn!("Rejected ambient agent adapter: {error:#}");
+    IpcResponse::Error(
+        "locald rejected the agent adapter; restart it from the installed locald executable"
+            .to_owned(),
+    )
+}
+
+fn agent_operation_error(operation: &str, error: &anyhow::Error) -> IpcResponse {
+    warn!("Ambient agent {operation} failed: {error:#}");
+    IpcResponse::Error(format!(
+        "ambient project {operation} failed; inspect `locald status` and project logs for details"
+    ))
 }
 
 fn validate_manual_cli_session(stream: &UnixStream, session: ManualCliSession) -> Result<()> {
@@ -780,6 +869,25 @@ async fn handle_connection(
             },
             Err(error) => IpcResponse::Error(format!("{error:#}")),
         },
+        IpcRequest::AgentInspectProject { context } => {
+            match validate_agent_adapter(&stream, &context) {
+                Ok(()) => match manager.agent_inspect_project(&context).await {
+                    Ok(status) => IpcResponse::AgentProject(status),
+                    Err(error) => agent_operation_error("inspection", &error),
+                },
+                Err(error) => agent_authentication_error(&error),
+            }
+        }
+        IpcRequest::AgentEnsureProject {
+            context,
+            launch_path,
+        } => match validate_agent_adapter(&stream, &context) {
+            Ok(()) => match manager.agent_ensure_project(&context, launch_path).await {
+                Ok(status) => IpcResponse::AgentProject(status),
+                Err(error) => agent_operation_error("ensure", &error),
+            },
+            Err(error) => agent_authentication_error(&error),
+        },
         IpcRequest::EnsureProject {
             project_path,
             demand,
@@ -859,10 +967,23 @@ async fn handle_connection(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    use locald_core::{AGENT_ADAPTER_PROTOCOL_VERSION, AgentConversationKey};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
 
     fn different_pid(pid: u32) -> u32 {
         pid.wrapping_add(1)
+    }
+
+    fn agent_context(protocol_version: u32) -> AgentWorkspaceContext {
+        AgentWorkspaceContext {
+            protocol_version,
+            conversation: AgentConversationKey::digest("private test conversation")
+                .expect("digest conversation"),
+            workspace_roots: vec![Path::new("/tmp/project").to_path_buf()],
+            sandbox_cwd: None,
+            process_cwd: None,
+        }
     }
 
     #[tokio::test]
@@ -873,6 +994,88 @@ mod tests {
             authenticated_peer_pid(&server).expect("authenticate IPC peer PID"),
             std::process::id()
         );
+    }
+
+    #[tokio::test]
+    async fn agent_adapter_authenticates_protocol_uid_and_kernel_peer() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let peer_pid = authenticated_peer_pid(&server).expect("authenticate IPC peer PID");
+        let context = agent_context(AGENT_ADAPTER_PROTOCOL_VERSION);
+
+        validate_agent_adapter_with(
+            &server,
+            &context,
+            |observed_peer, observed_uid, daemon_executable| {
+                assert_eq!(observed_peer, peer_pid);
+                assert_eq!(observed_uid, nix::unistd::geteuid().as_raw());
+                assert_eq!(
+                    std::fs::canonicalize(daemon_executable).expect("canonical daemon executable"),
+                    std::fs::canonicalize(std::env::current_exe().expect("current executable"))
+                        .expect("canonical current executable")
+                );
+                Ok(())
+            },
+        )
+        .expect("authenticated adapter reaches process validation");
+    }
+
+    #[tokio::test]
+    async fn agent_adapter_rejects_protocol_mismatch_before_process_trust() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+        let context = agent_context(AGENT_ADAPTER_PROTOCOL_VERSION + 1);
+        let called = AtomicBool::new(false);
+
+        let error = validate_agent_adapter_with(&server, &context, |_, _, _| {
+            called.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect_err("unsupported protocol must fail");
+
+        assert!(error.to_string().contains("unsupported"));
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn agent_adapter_process_requires_the_running_locald_executable() {
+        let current = std::env::current_exe().expect("resolve test executable");
+        validate_agent_adapter_process(
+            std::process::id(),
+            nix::unistd::geteuid().as_raw(),
+            &current,
+        )
+        .expect("current locald test executable authenticates");
+
+        let directory = tempfile::tempdir().expect("create unrelated executable directory");
+        let unrelated = directory.path().join("unrelated-locald");
+        std::fs::write(&unrelated, "not the current executable")
+            .expect("write unrelated executable");
+        let error = validate_agent_adapter_process(
+            std::process::id(),
+            nix::unistd::geteuid().as_raw(),
+            &unrelated,
+        )
+        .expect_err("unrelated executable identity must fail");
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn agent_error_responses_keep_private_diagnostics_in_daemon_logs() {
+        let private = anyhow::anyhow!(
+            "conversation private-thread at port 54321 from PID 123 and instance 00000000"
+        );
+
+        for response in [
+            agent_authentication_error(&private),
+            agent_operation_error("inspection", &private),
+        ] {
+            let rendered = serde_json::to_string(&response).expect("serialize safe agent error");
+            for forbidden in ["private-thread", "54321", "PID 123", "00000000"] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "agent error response leaked `{forbidden}`: {rendered}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

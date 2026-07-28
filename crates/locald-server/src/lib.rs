@@ -70,6 +70,7 @@
 #![allow(clippy::unnecessary_debug_formatting)]
 #![allow(clippy::uninlined_format_args)]
 
+mod agent_context;
 #[doc(hidden)]
 pub mod api;
 #[doc(hidden)]
