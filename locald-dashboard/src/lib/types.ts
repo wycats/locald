@@ -63,6 +63,17 @@ export function serviceIdentity(
 		: service.name;
 }
 
+export function resolveServiceSelector(selector: string, candidates: ServiceStatus[]): string {
+	if (
+		selector === 'locald' ||
+		candidates.some((service) => serviceIdentity(service) === selector)
+	) {
+		return selector;
+	}
+	const legacyMatches = candidates.filter((service) => service.name === selector);
+	return legacyMatches.length === 1 ? serviceIdentity(legacyMatches[0]) : selector;
+}
+
 export function logIdentity(
 	entry: Pick<LogEntry, 'instance_id' | 'service'> & Partial<Pick<LogEntry, 'service_name'>>
 ): string {

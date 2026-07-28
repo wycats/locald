@@ -6,6 +6,7 @@
 	import { services } from '$lib/stores/services';
 	import { projectList } from '$lib/stores/projects';
 	import { connectEvents } from '$lib/api';
+	import { resolveServiceSelector } from '$lib/types';
 	import Rack from '$lib/components/Rack.svelte';
 	import Deck from '$lib/components/Deck.svelte';
 	import Stream from '$lib/components/Stream.svelte';
@@ -23,7 +24,10 @@
 		return entry?.project_path ?? null;
 	});
 
-	let monitored = $derived($page.url.searchParams.get('monitor')?.split(',').filter(Boolean) ?? []);
+	let monitored = $derived.by(() => {
+		const selectors = $page.url.searchParams.get('monitor')?.split(',').filter(Boolean) ?? [];
+		return [...new Set(selectors.map((selector) => resolveServiceSelector(selector, $services)))];
+	});
 
 	// --- Navigation (writes to URL) ---
 

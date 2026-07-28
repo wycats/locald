@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { get } from 'svelte/store';
-import type { ServiceStatus } from '$lib/types';
+import { resolveServiceSelector, type ServiceStatus } from '$lib/types';
 import { projects, services } from './services';
 
 const base: ServiceStatus = {
@@ -83,5 +83,21 @@ describe('instance-scoped service projections', () => {
 		services.updateService(renamed);
 
 		expect(get(services)).toEqual([renamed]);
+	});
+
+	it('translates a unique legacy monitor label to the stable service identity', () => {
+		expect(resolveServiceSelector(base.name, [base])).toBe(
+			`${base.instance_id}/${base.service_name}`
+		);
+	});
+
+	it('keeps an ambiguous legacy monitor label unresolved', () => {
+		const second = {
+			...base,
+			instance_id: '00000000-0000-0000-0000-000000000002',
+			path: '/second'
+		};
+
+		expect(resolveServiceSelector(base.name, [base, second])).toBe(base.name);
 	});
 });

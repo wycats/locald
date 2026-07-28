@@ -687,6 +687,26 @@ impl ProcessManager {
         Ok(())
     }
 
+    fn postgres_reset_data_dirs_for_paths(
+        key: &ServiceKey,
+        display_name: &str,
+        legacy_candidate_count: usize,
+        namespaced: PathBuf,
+        legacy: PathBuf,
+    ) -> Result<Vec<PathBuf>> {
+        if legacy.exists() {
+            anyhow::ensure!(
+                legacy_candidate_count == 1,
+                "service `{display_name}` has legacy Postgres data at {} that is ambiguous across {legacy_candidate_count} project instances; adopt the data into project instance {} before resetting it",
+                legacy.display(),
+                key.instance()
+            );
+            Ok(vec![namespaced, legacy])
+        } else {
+            Ok(vec![namespaced])
+        }
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(AtomicOrdering::Acquire)
     }
@@ -1285,15 +1305,24 @@ impl ProcessManager {
         instance_id: ProjectInstanceId,
         name: &str,
     ) -> Option<ServiceKey> {
+        if let Some(key) = services
+            .keys()
+            .find(|key| key.instance() == instance_id && key.name().as_str() == name)
+        {
+            return Some(key.clone());
+        }
+        if let Some(key) = services.iter().find_map(|(key, service)| {
+            (key.instance() == instance_id && Self::service_display_name(key, service) == name)
+                .then(|| key.clone())
+        }) {
+            return Some(key);
+        }
         let legacy_configured_name = name
             .split_once(':')
             .map(|(_, configured_name)| configured_name);
-        services.iter().find_map(|(key, service)| {
-            (key.instance() == instance_id
-                && (key.name().as_str() == name
-                    || Self::service_display_name(key, service) == name
-                    || legacy_configured_name == Some(key.name().as_str())))
-            .then(|| key.clone())
+        services.keys().find_map(|key| {
+            (key.instance() == instance_id && legacy_configured_name == Some(key.name().as_str()))
+                .then(|| key.clone())
         })
     }
 
@@ -1695,6 +1724,29 @@ impl ProcessManager {
         });
         let _ = self.log_sender.send(entry.clone());
         let _ = self.event_sender.send(Event::Log(entry));
+    }
+
+    fn forward_boot_logs_for_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+        tx: tokio::sync::mpsc::Sender<BootEvent>,
+    ) -> TaskGuard {
+        let mut rx = self.instance_log_sender.subscribe();
+        TaskGuard(tokio::spawn(async move {
+            while let Ok(entry) = rx.recv().await {
+                if entry.instance_id != instance_id {
+                    continue;
+                }
+                let entry = entry.entry;
+                let _ = tx
+                    .send(BootEvent::Log {
+                        id: entry.service,
+                        line: entry.message,
+                        stream: entry.stream,
+                    })
+                    .await;
+            }
+        }))
     }
 
     #[must_use]
@@ -2967,27 +3019,6 @@ impl ProcessManager {
                 "project identity changed before initial config loading"
             );
         }
-        // Setup log forwarding if verbose
-        let _log_guard = if verbose {
-            event_tx.as_ref().map(|tx| {
-                let tx = tx.clone();
-                let mut rx = self.log_sender.subscribe();
-                TaskGuard(tokio::spawn(async move {
-                    while let Ok(entry) = rx.recv().await {
-                        let _ = tx
-                            .send(BootEvent::Log {
-                                id: entry.service,
-                                line: entry.message,
-                                stream: entry.stream,
-                            })
-                            .await;
-                    }
-                }))
-            })
-        } else {
-            None
-        };
-
         if let Some(tx) = &event_tx {
             let _ = tx
                 .send(BootEvent::StepStarted {
@@ -3285,6 +3316,17 @@ impl ProcessManager {
             drop(lifecycle_publication_guard);
         }
         commit_result?;
+
+        // Runtime logs begin only after the project instance is resolved and
+        // its ownership is published. Bind verbose boot output to that exact
+        // instance so concurrent worktree starts cannot observe one another.
+        let _log_guard = if verbose {
+            event_tx
+                .as_ref()
+                .map(|tx| self.forward_boot_logs_for_instance(instance_id, tx.clone()))
+        } else {
+            None
+        };
 
         if let Some(service_names) = &service_activation {
             self.clear_service_stop_suppressions_for(instance_id, service_names)
@@ -4237,6 +4279,37 @@ impl ProcessManager {
         self.ensure_accepting_lifecycle_requests()?;
         self.availability_authorizes_start(instance_id).await?;
 
+        let reset_data_dirs = {
+            let services = self.services.lock().await;
+            let Some(service) = services.get(&key) else {
+                anyhow::bail!("Service {name} not found");
+            };
+            if matches!(
+                &service.service_config,
+                ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+            ) {
+                let display_name = Self::service_display_name(&key, service);
+                let legacy_candidate_count = services
+                    .iter()
+                    .filter(|(candidate_key, candidate)| {
+                        matches!(
+                            &candidate.service_config,
+                            ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+                        ) && Self::service_display_name(candidate_key, candidate) == display_name
+                    })
+                    .count();
+                Self::postgres_reset_data_dirs_for_paths(
+                    &key,
+                    &display_name,
+                    legacy_candidate_count,
+                    Self::postgres_data_dir(&key),
+                    crate::service::postgres::legacy_data_dir(&display_name),
+                )?
+            } else {
+                Vec::new()
+            }
+        };
+
         // 1. Stop the service
         self.stop_service_locked(&key, &path).await?;
         self.clear_service_stop_suppression(&key).await;
@@ -4249,25 +4322,10 @@ impl ProcessManager {
             }
         }
 
-        // 2. Wipe data (if applicable)
-        let data_dir = {
-            let services = self.services.lock().await;
-            services.get(&key).and_then(|service| {
-                if matches!(
-                    &service.service_config,
-                    ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
-                ) {
-                    // TODO: This path logic is duplicated. Should be centralized.
-                    // For now, we only support resetting Postgres services which use this path.
-                    // If we add other stateful services, we need a better way to know their data dir.
-                    Some(Self::postgres_data_dir(&key))
-                } else {
-                    None
-                }
-            })
-        };
-
-        if let Some(dir) = data_dir {
+        // 2. Wipe data (if applicable). An exact, unambiguous reset also
+        // retires the pre-instance Postgres directory so the namespaced
+        // service can restart cleanly.
+        for dir in reset_data_dirs {
             if dir.exists() {
                 info!("Removing data directory {:?}", dir);
                 if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
@@ -21558,20 +21616,32 @@ TOKEN = "reloaded"
             },
             ..Default::default()
         };
-        let key = ServiceKey::new(instance_id, "worker:blue");
-        let services = HashMap::from([(
-            key.clone(),
-            test_service(
-                config,
-                ServiceConfig::Legacy(ExecServiceConfig::default()),
-                ServiceRuntime::None,
-                PathBuf::from("/team-app"),
+        let blue_key = ServiceKey::new(instance_id, "blue");
+        let worker_blue_key = ServiceKey::new(instance_id, "worker:blue");
+        let services = HashMap::from([
+            (
+                blue_key.clone(),
+                test_service(
+                    config.clone(),
+                    ServiceConfig::Legacy(ExecServiceConfig::default()),
+                    ServiceRuntime::None,
+                    PathBuf::from("/team-app"),
+                ),
             ),
-        )]);
+            (
+                worker_blue_key.clone(),
+                test_service(
+                    config,
+                    ServiceConfig::Legacy(ExecServiceConfig::default()),
+                    ServiceRuntime::None,
+                    PathBuf::from("/team-app"),
+                ),
+            ),
+        ]);
 
         assert_eq!(
             ProcessManager::service_key_for_instance(&services, instance_id, "worker:blue"),
-            Some(key.clone())
+            Some(worker_blue_key.clone())
         );
         assert_eq!(
             ProcessManager::service_key_for_instance(
@@ -21579,11 +21649,15 @@ TOKEN = "reloaded"
                 instance_id,
                 "team:app:worker:blue"
             ),
-            Some(key.clone())
+            Some(worker_blue_key.clone())
         );
         assert_eq!(
             ProcessManager::service_key_for_instance(&services, instance_id, "legacy:worker:blue"),
-            Some(key)
+            Some(worker_blue_key)
+        );
+        assert_eq!(
+            ProcessManager::service_key_for_instance(&services, instance_id, "legacy:blue"),
+            Some(blue_key)
         );
     }
 
@@ -21845,6 +21919,52 @@ command = "api"
             "15"
         );
         assert!(!namespaced.exists());
+    }
+
+    #[test]
+    fn postgres_reset_includes_unambiguous_legacy_data() {
+        let dir = tempdir().expect("create data root");
+        let namespaced = dir.path().join("instances").join("db");
+        let legacy = dir.path().join("postgres").join("app:db");
+        std::fs::create_dir_all(&legacy).expect("create legacy data");
+        let key = ServiceKey::new(test_instance_id(), "db");
+
+        assert_eq!(
+            ProcessManager::postgres_reset_data_dirs_for_paths(
+                &key,
+                "app:db",
+                1,
+                namespaced.clone(),
+                legacy.clone(),
+            )
+            .expect("one exact service may retire its legacy data"),
+            vec![namespaced, legacy]
+        );
+    }
+
+    #[test]
+    fn postgres_reset_rejects_ambiguous_legacy_data() {
+        let dir = tempdir().expect("create data root");
+        let namespaced = dir.path().join("instances").join("db");
+        let legacy = dir.path().join("postgres").join("app:db");
+        std::fs::create_dir_all(&legacy).expect("create legacy data");
+        let key = ServiceKey::new(test_instance_id(), "db");
+
+        let error = ProcessManager::postgres_reset_data_dirs_for_paths(
+            &key,
+            "app:db",
+            2,
+            namespaced,
+            legacy.clone(),
+        )
+        .expect_err("shared legacy ownership remains fail-closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous across 2 project instances")
+        );
+        assert!(legacy.exists());
     }
 
     #[tokio::test]
@@ -26998,6 +27118,64 @@ type = "postgres"
             )
             .await;
         assert_eq!(manager.get_recent_logs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn verbose_boot_logs_are_filtered_by_project_instance() {
+        let dir = tempdir().expect("create temporary directory");
+        let manager = readiness_test_manager(dir.path());
+        let target_instance = test_instance_id();
+        let foreign_instance = alternate_test_instance_id();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let _forwarder = manager.forward_boot_logs_for_instance(target_instance, event_tx);
+
+        manager
+            .instance_log_sender
+            .send(InstanceLogEntry {
+                instance_id: foreign_instance,
+                entry: LogEntry {
+                    timestamp: 1,
+                    service: "app:web".to_owned(),
+                    instance_id: Some(foreign_instance),
+                    service_name: Some("web".to_owned()),
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "foreign".to_owned(),
+                },
+            })
+            .expect("foreign log has a subscriber");
+        manager
+            .instance_log_sender
+            .send(InstanceLogEntry {
+                instance_id: target_instance,
+                entry: LogEntry {
+                    timestamp: 2,
+                    service: "app:web".to_owned(),
+                    instance_id: Some(target_instance),
+                    service_name: Some("web".to_owned()),
+                    stream: locald_core::ipc::LogStream::Stderr,
+                    message: "target".to_owned(),
+                },
+            })
+            .expect("target log has a subscriber");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("target log is forwarded")
+            .expect("boot event channel remains open");
+        assert!(matches!(
+            event,
+            BootEvent::Log {
+                id,
+                line,
+                stream: locald_core::ipc::LogStream::Stderr,
+            } if id == "app:web" && line == "target"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), event_rx.recv())
+                .await
+                .is_err(),
+            "the foreign instance log is never forwarded"
+        );
     }
 
     #[tokio::test]
