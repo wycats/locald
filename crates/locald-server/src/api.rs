@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::manager::{ProcessManager, ServiceNotFoundError};
-use locald_core::DemandKey;
 use locald_core::ipc::Event;
+use locald_core::{DemandKey, ProjectInstanceId};
 
 pub fn router(pm: ProcessManager) -> Router {
     Router::new()
@@ -40,6 +40,30 @@ pub fn router(pm: ProcessManager) -> Router {
         .route("/services/:name/reset", post(handle_service_reset))
         .route("/services/:name/pty", get(handle_pty_ws))
         .route("/services/:name", get(handle_service_inspect))
+        .route(
+            "/instances/:instance_id/services/:name/start",
+            post(handle_instance_service_start),
+        )
+        .route(
+            "/instances/:instance_id/services/:name/stop",
+            post(handle_instance_service_stop),
+        )
+        .route(
+            "/instances/:instance_id/services/:name/restart",
+            post(handle_instance_service_restart),
+        )
+        .route(
+            "/instances/:instance_id/services/:name/reset",
+            post(handle_instance_service_reset),
+        )
+        .route(
+            "/instances/:instance_id/services/:name/pty",
+            get(handle_instance_pty_ws),
+        )
+        .route(
+            "/instances/:instance_id/services/:name",
+            get(handle_instance_service_inspect),
+        )
         .with_state(Arc::new(pm))
 }
 
@@ -58,12 +82,39 @@ async fn handle_pty_ws(
     ws.on_upgrade(move |socket| handle_pty_socket(socket, name, pm))
 }
 
+async fn handle_instance_pty_ws(
+    ws: WebSocketUpgrade,
+    Path((instance_id, name)): Path<(ProjectInstanceId, String)>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_instance_pty_socket(socket, instance_id, name, pm))
+}
+
 async fn handle_pty_socket(socket: WebSocket, name: String, pm: Arc<ProcessManager>) {
     let controller = match pm.get_service_controller(&name).await {
         Some(c) => c,
         None => return,
     };
+    handle_pty_controller(socket, controller).await;
+}
 
+async fn handle_instance_pty_socket(
+    socket: WebSocket,
+    instance_id: ProjectInstanceId,
+    name: String,
+    pm: Arc<ProcessManager>,
+) {
+    let controller = match pm.get_instance_service_controller(instance_id, &name).await {
+        Some(controller) => controller,
+        None => return,
+    };
+    handle_pty_controller(socket, controller).await;
+}
+
+async fn handle_pty_controller(
+    socket: WebSocket,
+    controller: Arc<tokio::sync::Mutex<dyn locald_core::service::ServiceController>>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to PTY output
@@ -217,6 +268,19 @@ async fn handle_service_start(
     }
 }
 
+async fn handle_instance_service_start(
+    Path((instance_id, name)): Path<(ProjectInstanceId, String)>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    match pm.start_instance_service(instance_id, &name).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) if error.is::<ServiceNotFoundError>() => {
+            (StatusCode::NOT_FOUND, "Service not found").into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn handle_service_stop(
     Path(name): Path<String>,
     State(pm): State<Arc<ProcessManager>>,
@@ -224,6 +288,16 @@ async fn handle_service_stop(
     match pm.stop(&name).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_instance_service_stop(
+    Path((instance_id, name)): Path<(ProjectInstanceId, String)>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    match pm.stop_instance_service(instance_id, &name).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -240,6 +314,19 @@ async fn handle_service_restart(
     }
 }
 
+async fn handle_instance_service_restart(
+    Path((instance_id, name)): Path<(ProjectInstanceId, String)>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    match pm.restart_instance_service(instance_id, &name).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) if error.is::<ServiceNotFoundError>() => {
+            (StatusCode::NOT_FOUND, "Service not found").into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn handle_service_reset(
     Path(name): Path<String>,
     State(pm): State<Arc<ProcessManager>>,
@@ -250,6 +337,16 @@ async fn handle_service_reset(
     }
 }
 
+async fn handle_instance_service_reset(
+    Path((instance_id, name)): Path<(ProjectInstanceId, String)>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    match pm.reset_instance_service(instance_id, &name).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn handle_service_inspect(
     Path(name): Path<String>,
     State(pm): State<Arc<ProcessManager>>,
@@ -257,6 +354,16 @@ async fn handle_service_inspect(
     match pm.inspect(&name).await {
         Ok(info) => axum::Json(info).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_instance_service_inspect(
+    Path((instance_id, name)): Path<(ProjectInstanceId, String)>,
+    State(pm): State<Arc<ProcessManager>>,
+) -> impl IntoResponse {
+    match pm.inspect_instance_service(instance_id, &name).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(error) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     }
 }
 

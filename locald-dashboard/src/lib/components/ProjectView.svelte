@@ -22,7 +22,7 @@
 		projectCanResume
 	} from '$lib/availability';
 	import type { ProjectListEntry } from '$lib/api';
-	import type { ServiceStatus } from '$lib/types';
+	import { serviceIdentity, type ServiceStatus } from '$lib/types';
 	import {
 		RotateCw,
 		Square,
@@ -91,7 +91,8 @@
 	});
 
 	let deckCount = $derived(
-		projectServices.filter((s: ServiceStatus) => monitored.includes(s.name)).length
+		projectServices.filter((service: ServiceStatus) => monitored.includes(serviceIdentity(service)))
+			.length
 	);
 
 	let runningCount = $derived(
@@ -104,8 +105,10 @@
 
 	let stoppedCount = $derived(projectServices.length - runningCount - buildingCount);
 
-	function isPending(serviceName: string): boolean {
-		return $pendingActions.some((a) => a.serviceName === serviceName);
+	function isPending(service: ServiceStatus): boolean {
+		return $pendingActions.some(
+			(action) => action.serviceName === service.name && action.instanceId === service.instance_id
+		);
 	}
 
 	function getDisplayName(service: ServiceStatus): string {
@@ -139,12 +142,12 @@
 	async function handleServiceAction(
 		e: Event,
 		action: 'start' | 'stop' | 'restart',
-		serviceName: string
+		service: ServiceStatus
 	) {
 		e.stopPropagation();
-		if (action === 'start') await startServiceWithFeedback(serviceName);
-		if (action === 'stop') await stopServiceWithFeedback(serviceName);
-		if (action === 'restart') await restartServiceWithFeedback(serviceName);
+		if (action === 'start') await startServiceWithFeedback(service.name, service.instance_id);
+		if (action === 'stop') await stopServiceWithFeedback(service.name, service.instance_id);
+		if (action === 'restart') await restartServiceWithFeedback(service.name, service.instance_id);
 	}
 
 	async function handleProjectAction(action: 'resume' | 'pause' | 'always-on') {
@@ -302,22 +305,23 @@
 			{/if}
 		</div>
 		<div class="service-list">
-			{#each projectServices as service (service.name)}
-				{@const pending = isPending(service.name)}
+			{#each projectServices as service (serviceIdentity(service))}
+				{@const identity = serviceIdentity(service)}
+				{@const pending = isPending(service)}
 				{@const type = getServiceType(service)}
 				{@const urlLabel = displayUrl(service)}
-				{@const inDeck = monitored.includes(service.name)}
+				{@const inDeck = monitored.includes(identity)}
 				<div
 					class="service-row"
 					class:disabled={service.status === 'stopped'}
 					class:monitored={inDeck}
 					onclick={() => {
-						onToggleMonitor(service.name);
+						onToggleMonitor(identity);
 					}}
 					onkeydown={(e) => {
 						if (e.key === 'Enter' || e.key === ' ') {
 							e.preventDefault();
-							onToggleMonitor(service.name);
+							onToggleMonitor(identity);
 						}
 					}}
 					role="button"
@@ -356,7 +360,7 @@
 									class="control-btn"
 									title="Restart"
 									disabled={pending}
-									onclick={(e) => handleServiceAction(e, 'restart', service.name)}
+									onclick={(e) => handleServiceAction(e, 'restart', service)}
 								>
 									{#if pending}
 										<Spinner size={14} />
@@ -368,7 +372,7 @@
 									class="control-btn"
 									title="Stop"
 									disabled={pending}
-									onclick={(e) => handleServiceAction(e, 'stop', service.name)}
+									onclick={(e) => handleServiceAction(e, 'stop', service)}
 								>
 									<Square size={14} />
 								</button>
@@ -377,7 +381,7 @@
 									class="control-btn"
 									title="Start"
 									disabled={pending}
-									onclick={(e) => handleServiceAction(e, 'start', service.name)}
+									onclick={(e) => handleServiceAction(e, 'start', service)}
 								>
 									{#if pending}
 										<Spinner size={14} />

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ServiceStatus } from '$lib/types';
+	import { serviceIdentity, type ServiceStatus } from '$lib/types';
 	import { logs } from '$lib/stores/logs';
 	import { pendingActions } from '$lib/stores/actions';
 	import { RotateCw, Square, Play, ExternalLink, Settings } from 'lucide-svelte';
@@ -37,9 +37,14 @@
 	});
 
 	// Access store value reactively
-	let serviceLogs = $derived($logs[service.name] || []);
+	let identity = $derived(serviceIdentity(service));
+	let serviceLogs = $derived($logs[identity] || []);
 	let lastLogs = $derived(serviceLogs.slice(-3));
-	let isPending = $derived($pendingActions.some((a) => a.serviceName === service.name));
+	let isPending = $derived(
+		$pendingActions.some(
+			(a) => a.serviceName === service.name && a.instanceId === service.instance_id
+		)
+	);
 	let status = $derived.by((): StatusDotStatus => {
 		if (service.status === 'building') return 'building';
 		if (service.health_status === 'Healthy') return 'healthy';
@@ -52,17 +57,17 @@
 
 	async function handleStart(e: Event) {
 		e.stopPropagation();
-		await startServiceWithFeedback(service.name);
+		await startServiceWithFeedback(service.name, service.instance_id);
 	}
 
 	async function handleStop(e: Event) {
 		e.stopPropagation();
-		await stopServiceWithFeedback(service.name);
+		await stopServiceWithFeedback(service.name, service.instance_id);
 	}
 
 	async function handleRestart(e: Event) {
 		e.stopPropagation();
-		await restartServiceWithFeedback(service.name);
+		await restartServiceWithFeedback(service.name, service.instance_id);
 	}
 
 	function getDisplayUrl(service: ServiceStatus) {

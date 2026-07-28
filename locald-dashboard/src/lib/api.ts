@@ -9,29 +9,36 @@ export async function getServices(): Promise<ServiceStatus[]> {
 	return res.json();
 }
 
-export async function startService(name: string): Promise<void> {
-	const res = await fetch(`/api/services/${name}/start`, { method: 'POST' });
+function serviceApiPath(name: string, instanceId: string | null): string {
+	const encodedName = encodeURIComponent(name);
+	return instanceId
+		? `/api/instances/${encodeURIComponent(instanceId)}/services/${encodedName}`
+		: `/api/services/${encodedName}`;
+}
+
+export async function startService(name: string, instanceId: string | null): Promise<void> {
+	const res = await fetch(`${serviceApiPath(name, instanceId)}/start`, { method: 'POST' });
 	if (!res.ok) {
 		throw new Error(`Failed to start service ${name}`);
 	}
 }
 
-export async function stopService(name: string): Promise<void> {
-	const res = await fetch(`/api/services/${name}/stop`, { method: 'POST' });
+export async function stopService(name: string, instanceId: string | null): Promise<void> {
+	const res = await fetch(`${serviceApiPath(name, instanceId)}/stop`, { method: 'POST' });
 	if (!res.ok) {
 		throw new Error(`Failed to stop service ${name}`);
 	}
 }
 
-export async function restartService(name: string): Promise<void> {
-	const res = await fetch(`/api/services/${name}/restart`, { method: 'POST' });
+export async function restartService(name: string, instanceId: string | null): Promise<void> {
+	const res = await fetch(`${serviceApiPath(name, instanceId)}/restart`, { method: 'POST' });
 	if (!res.ok) {
 		throw new Error(`Failed to restart service ${name}`);
 	}
 }
 
-export async function resetService(name: string): Promise<void> {
-	const res = await fetch(`/api/services/${name}/reset`, { method: 'POST' });
+export async function resetService(name: string, instanceId: string | null): Promise<void> {
+	const res = await fetch(`${serviceApiPath(name, instanceId)}/reset`, { method: 'POST' });
 	if (!res.ok) {
 		throw new Error(`Failed to reset service ${name}`);
 	}
@@ -149,8 +156,11 @@ export async function setProjectAlwaysOn(path: string, enabled: boolean): Promis
 import { services } from '$lib/stores/services';
 import { logs } from '$lib/stores/logs';
 
-export async function getServiceInspect(name: string): Promise<ServiceInspectResponse> {
-	const res = await fetch(`/api/services/${name}`);
+export async function getServiceInspect(
+	name: string,
+	instanceId: string | null
+): Promise<ServiceInspectResponse> {
+	const res = await fetch(serviceApiPath(name, instanceId));
 	if (!res.ok) {
 		throw new Error(`Failed to inspect service ${name}`);
 	}

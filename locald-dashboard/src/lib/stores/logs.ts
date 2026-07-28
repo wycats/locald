@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import type { LogEntry } from '$lib/types';
+import { logIdentity, type LogEntry } from '$lib/types';
 
 const MAX_LOGS = 1000; // Keep last 1000 logs per service for mini-log
 const MAX_STREAM_LOGS = 5000; // Keep last 5000 logs for the main stream
@@ -37,14 +37,15 @@ function createLogsStore() {
 
 			// Update per-service logs
 			update((logs) => {
-				const serviceLogs = logs[entry.service] || [];
+				const identity = logIdentity(entry);
+				const serviceLogs = logs[identity] || [];
 				const newLogs = [...serviceLogs, entry];
 				if (newLogs.length > MAX_LOGS) {
 					newLogs.shift();
 				}
 				return {
 					...logs,
-					[entry.service]: newLogs
+					[identity]: newLogs
 				};
 			});
 

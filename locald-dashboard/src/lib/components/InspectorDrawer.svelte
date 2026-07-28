@@ -9,17 +9,18 @@
 		Container
 	} from 'lucide-svelte';
 	import { getServiceInspect } from '$lib/api';
-	import type { ServiceInspectResponse } from '$lib/types';
+	import { serviceIdentity, type ServiceInspectResponse } from '$lib/types';
 	import { copyToClipboard } from '$lib/utils/clipboard';
 	import Terminal from './Terminal.svelte';
 	import InteractiveTerminal from './InteractiveTerminal.svelte';
 
 	interface Props {
 		serviceName: string | null;
+		instanceId: string | null;
 		onClose: () => void;
 	}
 
-	let { serviceName, onClose }: Props = $props();
+	let { serviceName, instanceId, onClose }: Props = $props();
 
 	let info: ServiceInspectResponse | null = $state(null);
 	let loading = $state(false);
@@ -28,17 +29,17 @@
 
 	$effect(() => {
 		if (serviceName) {
-			loadInfo(serviceName);
+			loadInfo(serviceName, instanceId);
 		} else {
 			info = null;
 		}
 	});
 
-	async function loadInfo(name: string) {
+	async function loadInfo(name: string, owner: string | null) {
 		loading = true;
 		error = null;
 		try {
-			info = await getServiceInspect(name);
+			info = await getServiceInspect(name, owner);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -152,9 +153,9 @@
 				<div class="terminal-section">
 					<div class="terminal-wrapper">
 						{#if viewMode === 'logs'}
-							<Terminal filter={serviceName} />
-						{:else}
-							<InteractiveTerminal {serviceName} />
+							<Terminal filter={serviceIdentity({ name: serviceName, instance_id: instanceId })} />
+						{:else if instanceId}
+							<InteractiveTerminal {serviceName} {instanceId} />
 						{/if}
 					</div>
 				</div>

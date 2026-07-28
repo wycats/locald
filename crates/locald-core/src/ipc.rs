@@ -4,6 +4,7 @@ use crate::attachments::{
 };
 use crate::availability::{AvailabilityReason, DemandKey, ProjectLifecycleState};
 use crate::config::{ServiceConfig, TypedServiceConfig};
+use crate::identity::ProjectInstanceId;
 use crate::state::{HealthSource, HealthStatus, ServiceState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,8 @@ impl std::fmt::Display for LogStream {
 ///
 /// let status = ServiceStatus {
 ///     name: "web".to_string(),
+///     instance_id: None,
+///     service_name: None,
 ///     service_type: ServiceType::Exec,
 ///     pid: Some(1234),
 ///     port: Some(8080),
@@ -115,6 +118,13 @@ impl std::fmt::Display for LogStream {
 pub struct ServiceStatus {
     /// The unique name of the service (e.g., "project:web").
     pub name: String,
+    /// The physical project instance that owns this service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub instance_id: Option<ProjectInstanceId>,
+    /// The configured service name within the owning project instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// The type of service (exec, postgres, worker, container, site).
     #[serde(default)]
     pub service_type: ServiceType,
@@ -218,6 +228,8 @@ pub struct EnsureProjectSuperseded {
 /// let entry = LogEntry {
 ///     timestamp: 1678886400,
 ///     service: "web".to_string(),
+///     instance_id: None,
+///     service_name: None,
 ///     stream: LogStream::Stdout,
 ///     message: "Server started".to_string(),
 /// };
@@ -228,6 +240,13 @@ pub struct LogEntry {
     pub timestamp: i64,
     /// The name of the service that generated the log.
     pub service: String,
+    /// The physical project instance that generated the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub instance_id: Option<ProjectInstanceId>,
+    /// The configured service name within the owning project instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// The stream the log came from (stdout/stderr).
     pub stream: LogStream,
     /// The log message content.
@@ -239,6 +258,13 @@ pub struct LogEntry {
 pub struct ServiceMetrics {
     /// The name of the service.
     pub name: String,
+    /// The physical project instance measured by this sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub instance_id: Option<ProjectInstanceId>,
+    /// The configured service name within the owning project instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// CPU usage percentage (0.0 - 100.0 * cores).
     pub cpu_percent: f32,
     /// Memory usage in bytes.
@@ -610,6 +636,8 @@ pub enum IpcResponse {
 /// let event = Event::Log(LogEntry {
 ///     timestamp: 123,
 ///     service: "web".to_string(),
+///     instance_id: None,
+///     service_name: None,
 ///     stream: LogStream::Stdout,
 ///     message: "hello".to_string(),
 /// });
@@ -661,6 +689,8 @@ impl ServiceStatus {
     pub fn new(name: impl Into<String>, status: ServiceState) -> Self {
         Self {
             name: name.into(),
+            instance_id: None,
+            service_name: None,
             service_type: ServiceType::default(),
             pid: None,
             port: None,

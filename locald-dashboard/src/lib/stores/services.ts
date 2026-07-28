@@ -1,5 +1,5 @@
 import { writable, derived } from 'svelte/store';
-import type { ServiceStatus, ServiceMetrics } from '$lib/types';
+import { serviceIdentity, type ServiceStatus, type ServiceMetrics } from '$lib/types';
 import { getServices } from '$lib/api';
 
 export const servicesLoading = writable<boolean>(true);
@@ -27,7 +27,8 @@ function createServicesStore() {
 		},
 		updateService: (updatedService: ServiceStatus) => {
 			update((services) => {
-				const index = services.findIndex((s) => s.name === updatedService.name);
+				const identity = serviceIdentity(updatedService);
+				const index = services.findIndex((s) => serviceIdentity(s) === identity);
 				if (index !== -1) {
 					const newServices = [...services];
 					newServices[index] = updatedService;
@@ -42,7 +43,8 @@ function createServicesStore() {
 			if (event.type === 'ServiceUpdate') {
 				const updatedService = event.data as ServiceStatus;
 				update((services) => {
-					const index = services.findIndex((s) => s.name === updatedService.name);
+					const identity = serviceIdentity(updatedService);
+					const index = services.findIndex((s) => serviceIdentity(s) === identity);
 					if (index !== -1) {
 						const newServices = [...services];
 						// Preserve metrics/history across status updates
@@ -61,7 +63,8 @@ function createServicesStore() {
 			} else if (event.type === 'Metrics') {
 				const metrics = event.data as ServiceMetrics;
 				update((services) => {
-					const index = services.findIndex((s) => s.name === metrics.name);
+					const identity = serviceIdentity(metrics);
+					const index = services.findIndex((s) => serviceIdentity(s) === identity);
 					if (index !== -1) {
 						const newServices = [...services];
 						const oldService = newServices[index];
@@ -90,7 +93,10 @@ export const services = createServicesStore();
 
 // Derived store for grouping by project/workspace
 export const projects = derived(services, ($services) => {
-	const groups: Record<string, ServiceStatus[]> = {};
+	const groups = new Map<
+		string,
+		{ name: string; path: string | null; services: ServiceStatus[] }
+	>();
 	for (const service of $services) {
 		let groupName: string | null = null;
 
@@ -106,13 +112,14 @@ export const projects = derived(services, ($services) => {
 			groupName = parts.length > 1 ? parts[0] : 'default';
 		}
 
-		if (!groups[groupName]) {
-			groups[groupName] = [];
-		}
-		groups[groupName].push(service);
+		const groupKey = service.path ?? groupName;
+		const group = groups.get(groupKey) ?? {
+			name: groupName,
+			path: service.path,
+			services: []
+		};
+		group.services.push(service);
+		groups.set(groupKey, group);
 	}
-	return Object.entries(groups).map(([name, services]) => ({
-		name,
-		services
-	}));
+	return [...groups.values()];
 });

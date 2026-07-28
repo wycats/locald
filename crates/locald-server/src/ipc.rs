@@ -421,6 +421,8 @@ async fn handle_connection(
                     .unwrap_or_default()
                     .as_secs() as i64,
                 service: "container".to_string(),
+                instance_id: None,
+                service_name: None,
                 stream: stream_type,
                 message: line,
             });
@@ -1022,6 +1024,8 @@ mod tests {
         let entry = LogEntry {
             timestamp: 0,
             service: "locald".to_owned(),
+            instance_id: None,
+            service_name: None,
             stream: locald_core::ipc::LogStream::Stdout,
             message: "daemon diagnostic".to_owned(),
         };

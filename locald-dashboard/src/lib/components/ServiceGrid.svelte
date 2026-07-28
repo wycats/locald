@@ -1,21 +1,21 @@
 <script lang="ts">
-	import type { ServiceStatus } from '$lib/types';
+	import { serviceIdentity, type ServiceStatus } from '$lib/types';
 	import ServiceCard from './ServiceCard.svelte';
 
 	interface Props {
 		services: ServiceStatus[];
-		onInspect: (name: string) => void;
+		onInspect: (service: ServiceStatus) => void;
 	}
 
 	let { services, onInspect }: Props = $props();
 </script>
 
 <div class="grid">
-	{#each services as service (service.name)}
+	{#each services as service (serviceIdentity(service))}
 		<ServiceCard
 			{service}
-			onSelect={() => onInspect(service.name)}
-			onConfig={() => onInspect(service.name)}
+			onSelect={() => onInspect(service)}
+			onConfig={() => onInspect(service)}
 		/>
 	{/each}
 </div>

@@ -3,6 +3,7 @@
 	import type { ComponentType } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { services } from '$lib/stores/services';
+	import { serviceIdentity } from '$lib/types';
 	import {
 		startService,
 		stopService,
@@ -43,25 +44,26 @@
 		// Service specific commands
 		for (const service of $services) {
 			const name = service.name;
+			const identity = serviceIdentity(service);
 
 			if (service.status === 'running') {
 				list.push({
-					id: `restart-${name}`,
+					id: `restart-${identity}`,
 					title: `Restart ${name}`,
-					action: () => restartService(name),
+					action: () => restartService(name, service.instance_id),
 					icon: RotateCw
 				});
 				list.push({
-					id: `stop-${name}`,
+					id: `stop-${identity}`,
 					title: `Stop ${name}`,
-					action: () => stopService(name),
+					action: () => stopService(name, service.instance_id),
 					icon: Square
 				});
 			} else {
 				list.push({
-					id: `start-${name}`,
+					id: `start-${identity}`,
 					title: `Start ${name}`,
-					action: () => startService(name),
+					action: () => startService(name, service.instance_id),
 					icon: Play
 				});
 			}

@@ -75,6 +75,8 @@ impl SiteService {
         // in the unified stream. The frontend can filter on this if needed.
         let entry = LogEntry {
             service: format!("{}:build", name),
+            instance_id: None,
+            service_name: None,
             stream,
             message,
             timestamp: chrono::Utc::now().timestamp_millis(),

@@ -6,6 +6,7 @@
 	import { services } from '$lib/stores/services';
 	import { projectList } from '$lib/stores/projects';
 	import { connectEvents } from '$lib/api';
+	import { resolveServiceSelector } from '$lib/types';
 	import Rack from '$lib/components/Rack.svelte';
 	import Deck from '$lib/components/Deck.svelte';
 	import Stream from '$lib/components/Stream.svelte';
@@ -15,13 +16,18 @@
 	// All view state derives from the URL. Helpers below write back via goto().
 
 	let selectedProject = $derived.by(() => {
-		const name = $page.url.searchParams.get('project');
-		if (!name) return null;
-		const entry = $projectList.find((p) => p.project_name === name);
+		const selector = $page.url.searchParams.get('project');
+		if (!selector) return null;
+		const entry =
+			$projectList.find((project) => project.project_path === selector) ??
+			$projectList.find((project) => project.project_name === selector);
 		return entry?.project_path ?? null;
 	});
 
-	let monitored = $derived($page.url.searchParams.get('monitor')?.split(',').filter(Boolean) ?? []);
+	let monitored = $derived.by(() => {
+		const selectors = $page.url.searchParams.get('monitor')?.split(',').filter(Boolean) ?? [];
+		return [...new Set(selectors.map((selector) => resolveServiceSelector(selector, $services)))];
+	});
 
 	// --- Navigation (writes to URL) ---
 
@@ -30,11 +36,7 @@
 			goto('/', { replaceState: true });
 			return;
 		}
-		const entry = $projectList.find((p) => p.project_path === path);
-		const name = entry?.project_name ?? path.split('/').pop();
-		if (name) {
-			goto(`?project=${encodeURIComponent(name)}`, { replaceState: true });
-		}
+		goto(`?project=${encodeURIComponent(path)}`, { replaceState: true });
 	}
 
 	function toggleMonitor(name: string | string[]) {

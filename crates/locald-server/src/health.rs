@@ -2,6 +2,7 @@ use locald_core::config::{
     DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_TIMEOUT_SECS, HealthCheckConfig,
     ProbeType, ServiceConfig, TypedServiceConfig,
 };
+use locald_core::service::ServiceKey;
 use locald_core::state::{HealthSource, HealthStatus};
 use locald_core::{ProjectInstanceId, SharedDomainIndex};
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use tracing::info;
 
 #[derive(Debug)]
 pub(crate) struct HealthMonitor {
-    services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
+    services: Arc<Mutex<std::collections::HashMap<ServiceKey, crate::manager::Service>>>,
     event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
     domain_index: SharedDomainIndex,
@@ -245,7 +246,7 @@ impl HealthMonitor {
     }
 
     pub(crate) fn new(
-        services: Arc<Mutex<std::collections::HashMap<String, crate::manager::Service>>>,
+        services: Arc<Mutex<std::collections::HashMap<ServiceKey, crate::manager::Service>>>,
         event_sender: tokio::sync::broadcast::Sender<locald_core::ipc::Event>,
         proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>,
         domain_index: SharedDomainIndex,
@@ -261,8 +262,8 @@ impl HealthMonitor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_check(
         &self,
-        name: String,
-        instance_id: ProjectInstanceId,
+        key: ServiceKey,
+        display_name: String,
         controller_generation: u64,
         requirement: ReadinessRequirement,
         port: Option<u16>,
@@ -271,12 +272,18 @@ impl HealthMonitor {
         cwd: Option<std::path::PathBuf>,
     ) {
         let controller = ControllerIdentity {
-            instance_id,
+            instance_id: key.instance(),
             controller_generation,
         };
         // Spawn port mismatch detector if we have a PID and an expected port
         if let (Some(pid), Some(expected_port)) = (pid, port) {
-            self.spawn_port_mismatch_monitor(name.clone(), controller, pid, expected_port);
+            self.spawn_port_mismatch_monitor(
+                key.clone(),
+                display_name.clone(),
+                controller,
+                pid,
+                expected_port,
+            );
         }
 
         match requirement {
@@ -285,19 +292,44 @@ impl HealthMonitor {
                 path,
                 interval,
                 timeout,
-            } => self.spawn_http_monitor(name, controller, port, path, interval, timeout),
+            } => self.spawn_http_monitor(
+                key,
+                display_name,
+                controller,
+                port,
+                path,
+                interval,
+                timeout,
+            ),
             ReadinessRequirement::ExplicitTcp {
                 port,
                 interval,
                 timeout,
-            } => self.spawn_tcp_monitor(name, controller, port, interval, timeout, false),
+            } => self.spawn_tcp_monitor(
+                key,
+                display_name,
+                controller,
+                port,
+                interval,
+                timeout,
+                false,
+            ),
             ReadinessRequirement::ExplicitCommand {
                 command,
                 interval,
                 timeout,
-            } => self.spawn_command_monitor(name, controller, command, cwd, interval, timeout),
+            } => self.spawn_command_monitor(
+                key,
+                display_name,
+                controller,
+                command,
+                cwd,
+                interval,
+                timeout,
+            ),
             ReadinessRequirement::AssignedPortTcp { port } => self.spawn_tcp_monitor(
-                name,
+                key,
+                display_name,
                 controller,
                 port,
                 Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
@@ -305,7 +337,8 @@ impl HealthMonitor {
                 false,
             ),
             ReadinessRequirement::ControllerAndAssignedPortTcp { port } => self.spawn_tcp_monitor(
-                name,
+                key,
+                display_name,
                 controller,
                 port,
                 Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
@@ -318,7 +351,8 @@ impl HealthMonitor {
 
     fn spawn_port_mismatch_monitor(
         &self,
-        name: String,
+        key: ServiceKey,
+        display_name: String,
         controller: ControllerIdentity,
         pid: u32,
         expected_port: u16,
@@ -333,7 +367,7 @@ impl HealthMonitor {
                 {
                     let services = monitor.services.lock().await;
                     if let Some(service) = services
-                        .get(&name)
+                        .get(&key)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
                         match &service.runtime_state {
@@ -367,10 +401,12 @@ impl HealthMonitor {
                             ));
                         }
 
-                        monitor.update_warnings(&name, controller, warnings).await;
+                        monitor
+                            .update_warnings(&key, &display_name, controller, warnings)
+                            .await;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to check ports for service {}: {}", name, e);
+                        tracing::warn!("Failed to check ports for service {}: {}", display_name, e);
                     }
                 }
 
@@ -381,7 +417,8 @@ impl HealthMonitor {
 
     async fn update_health(
         &self,
-        name: &str,
+        key: &ServiceKey,
+        display_name: &str,
         controller: ControllerIdentity,
         status: HealthStatus,
         source: HealthSource,
@@ -389,14 +426,14 @@ impl HealthMonitor {
         let (changed, snapshot_info) = {
             let mut services = self.services.lock().await;
             if let Some(service) = services
-                .get_mut(name)
+                .get_mut(key)
                 .filter(|service| Self::matches_controller(service, controller))
                 .filter(|service| service.health_status == HealthStatus::Starting)
             {
                 if service.health_status != status || service.health_source != source {
                     info!(
                         "Service {} health changed to {:?} (source: {:?})",
-                        name, status, source
+                        display_name, status, source
                     );
                     service.health_status = status;
                     service.health_source = source;
@@ -427,7 +464,7 @@ impl HealthMonitor {
                             projection_generation,
                             self.domain_index
                                 .snapshot()
-                                .domain_for_service(service.instance_id, name)
+                                .domain_for_service(service.instance_id, display_name)
                                 .map(ToString::to_string),
                             Some(service.path.clone()),
                             proxy_ports,
@@ -460,7 +497,9 @@ impl HealthMonitor {
             )) = snapshot_info
             {
                 let status = crate::manager::ProcessManager::build_service_status(
-                    name.to_string(),
+                    key.instance(),
+                    key.name().as_str().to_owned(),
+                    display_name.to_string(),
                     domain,
                     path,
                     proxy_ports,
@@ -475,7 +514,7 @@ impl HealthMonitor {
                 .await;
 
                 let services = self.services.lock().await;
-                if services.get(name).is_some_and(|service| {
+                if services.get(key).is_some_and(|service| {
                     Self::matches_controller(service, controller)
                         && service.projection_generation == projection_generation
                 }) {
@@ -489,20 +528,21 @@ impl HealthMonitor {
 
     async fn update_warnings(
         &self,
-        name: &str,
+        key: &ServiceKey,
+        display_name: &str,
         controller: ControllerIdentity,
         warnings: Vec<String>,
     ) {
         let (changed, snapshot_info) = {
             let mut services = self.services.lock().await;
             if let Some(service) = services
-                .get_mut(name)
+                .get_mut(key)
                 .filter(|service| Self::matches_controller(service, controller))
             {
                 if service.warnings == warnings {
                     (false, None)
                 } else {
-                    info!("Service {} warnings changed: {:?}", name, warnings);
+                    info!("Service {} warnings changed: {:?}", display_name, warnings);
                     service.warnings.clone_from(&warnings);
                     let projection_generation =
                         crate::manager::ProcessManager::advance_service_projection(service);
@@ -528,7 +568,7 @@ impl HealthMonitor {
                             projection_generation,
                             self.domain_index
                                 .snapshot()
-                                .domain_for_service(service.instance_id, name)
+                                .domain_for_service(service.instance_id, display_name)
                                 .map(ToString::to_string),
                             Some(service.path.clone()),
                             proxy_ports,
@@ -563,7 +603,9 @@ impl HealthMonitor {
             )) = snapshot_info
             {
                 let status = crate::manager::ProcessManager::build_service_status(
-                    name.to_string(),
+                    key.instance(),
+                    key.name().as_str().to_owned(),
+                    display_name.to_string(),
                     domain,
                     path,
                     proxy_ports,
@@ -578,7 +620,7 @@ impl HealthMonitor {
                 .await;
 
                 let services = self.services.lock().await;
-                if services.get(name).is_some_and(|service| {
+                if services.get(key).is_some_and(|service| {
                     Self::matches_controller(service, controller)
                         && service.projection_generation == projection_generation
                 }) {
@@ -590,9 +632,11 @@ impl HealthMonitor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_http_monitor(
         &self,
-        name: String,
+        key: ServiceKey,
+        display_name: String,
         controller: ControllerIdentity,
         port: u16,
         path: String,
@@ -608,7 +652,7 @@ impl HealthMonitor {
                 {
                     let services = monitor.services.lock().await;
                     if let Some(service) = services
-                        .get(&name)
+                        .get(&key)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
                         if service.health_status != HealthStatus::Starting {
@@ -620,7 +664,13 @@ impl HealthMonitor {
                 }
                 if locald_utils::probe::check_http(&url, timeout).await {
                     monitor
-                        .update_health(&name, controller, HealthStatus::Healthy, HealthSource::Http)
+                        .update_health(
+                            &key,
+                            &display_name,
+                            controller,
+                            HealthStatus::Healthy,
+                            HealthSource::Http,
+                        )
                         .await;
                     break;
                 }
@@ -629,9 +679,11 @@ impl HealthMonitor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_command_monitor(
         &self,
-        name: String,
+        key: ServiceKey,
+        display_name: String,
         controller: ControllerIdentity,
         command: String,
         cwd: Option<std::path::PathBuf>,
@@ -647,7 +699,7 @@ impl HealthMonitor {
                 let env = {
                     let services = monitor.services.lock().await;
                     if let Some(service) = services
-                        .get(&name)
+                        .get(&key)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
                         if service.health_status != HealthStatus::Starting {
@@ -670,7 +722,8 @@ impl HealthMonitor {
                 if success {
                     monitor
                         .update_health(
-                            &name,
+                            &key,
+                            &display_name,
                             controller,
                             HealthStatus::Healthy,
                             HealthSource::Command,
@@ -684,9 +737,11 @@ impl HealthMonitor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tcp_monitor(
         &self,
-        name: String,
+        key: ServiceKey,
+        display_name: String,
         controller: ControllerIdentity,
         assigned_port: u16,
         interval: Duration,
@@ -695,7 +750,7 @@ impl HealthMonitor {
     ) {
         info!(
             "Starting TCP monitor for {} on port {}",
-            name, assigned_port
+            display_name, assigned_port
         );
         let monitor = self.clone();
         tokio::spawn(async move {
@@ -705,36 +760,39 @@ impl HealthMonitor {
                 {
                     let services = monitor.services.lock().await;
                     if let Some(service) = services
-                        .get(&name)
+                        .get(&key)
                         .filter(|service| Self::matches_controller(service, controller))
                     {
                         if service.health_status != HealthStatus::Starting {
-                            info!("Service {} readiness is terminal, stopping monitor", name);
+                            info!(
+                                "Service {} readiness is terminal, stopping monitor",
+                                display_name
+                            );
                             break;
                         }
                     } else {
                         info!(
                             "Service {} not found in services map, stopping monitor",
-                            name
+                            display_name
                         );
                         break;
                     }
                 }
 
-                info!("About to probe {} on {}", name, assigned_port);
+                info!("About to probe {} on {}", display_name, assigned_port);
                 let result =
                     locald_utils::probe::check_tcp(&format!("127.0.0.1:{assigned_port}"), timeout)
                         .await;
                 info!(
                     "Probing {} on {}... Success: {}",
-                    name, assigned_port, result
+                    display_name, assigned_port, result
                 );
 
                 let controller_ready = if result && require_controller_health {
                     let runtime = {
                         let services = monitor.services.lock().await;
                         services
-                            .get(&name)
+                            .get(&key)
                             .filter(|service| Self::matches_controller(service, controller))
                             .and_then(|service| match &service.runtime_state {
                                 crate::manager::ServiceRuntime::Controller(controller) => {
@@ -755,7 +813,13 @@ impl HealthMonitor {
 
                 if result && controller_ready {
                     monitor
-                        .update_health(&name, controller, HealthStatus::Healthy, HealthSource::Tcp)
+                        .update_health(
+                            &key,
+                            &display_name,
+                            controller,
+                            HealthStatus::Healthy,
+                            HealthSource::Tcp,
+                        )
                         .await;
                     break;
                 }
@@ -859,6 +923,15 @@ mod tests {
 
     fn instance_id(value: &str) -> ProjectInstanceId {
         value.parse().expect("valid project instance ID")
+    }
+
+    fn service_key(instance_id: ProjectInstanceId, display_name: &str) -> ServiceKey {
+        ServiceKey::new(
+            instance_id,
+            display_name
+                .split_once(':')
+                .map_or(display_name, |(_, configured_name)| configured_name),
+        )
     }
 
     fn legacy_config(health_check: Option<HealthCheckConfig>) -> ServiceConfig {
@@ -1045,8 +1118,9 @@ mod tests {
         drop(assigned_reservation);
 
         let instance_id = instance_id("00000000-0000-4000-8000-000000000003");
+        let key = service_key(instance_id, "app:web");
         let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:web".to_owned(),
+            key.clone(),
             monitored_service(instance_id, legacy_config(None), Some(assigned_port)),
         )])));
         let (event_sender, _) = tokio::sync::broadcast::channel(8);
@@ -1057,8 +1131,8 @@ mod tests {
             SharedDomainIndex::default(),
         );
         monitor.spawn_check(
+            key.clone(),
             "app:web".to_owned(),
-            instance_id,
             1,
             ReadinessRequirement::ExplicitTcp {
                 port: assigned_port,
@@ -1073,7 +1147,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_ne!(
-            services.lock().await["app:web"].health_status,
+            services.lock().await[&key].health_status,
             HealthStatus::Healthy,
             "another listening port owned by the process must not satisfy readiness"
         );
@@ -1084,7 +1158,7 @@ mod tests {
                 .expect("listen on assigned port");
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if services.lock().await["app:web"].health_status == HealthStatus::Healthy {
+                if services.lock().await[&key].health_status == HealthStatus::Healthy {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1092,10 +1166,7 @@ mod tests {
         })
         .await
         .expect("assigned TCP port becomes ready");
-        assert_eq!(
-            services.lock().await["app:web"].health_source,
-            HealthSource::Tcp
-        );
+        assert_eq!(services.lock().await[&key].health_source, HealthSource::Tcp);
     }
 
     #[tokio::test]
@@ -1108,6 +1179,7 @@ mod tests {
             .expect("assigned listener address")
             .port();
         let instance_id = instance_id("00000000-0000-4000-8000-000000000007");
+        let key = service_key(instance_id, "app:site");
         let controller = Arc::new(Mutex::new(TestController::unknown()));
         let runtime_controller: Arc<Mutex<dyn ServiceController>> = controller.clone();
         let mut service = monitored_service(
@@ -1116,10 +1188,7 @@ mod tests {
             Some(assigned_port),
         );
         service.runtime_state = ServiceRuntime::Controller(runtime_controller);
-        let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:site".to_owned(),
-            service,
-        )])));
+        let services = Arc::new(Mutex::new(HashMap::from([(key.clone(), service)])));
         let (event_sender, _) = tokio::sync::broadcast::channel(8);
         let monitor = HealthMonitor::new(
             services.clone(),
@@ -1128,8 +1197,8 @@ mod tests {
             SharedDomainIndex::default(),
         );
         monitor.spawn_check(
+            key.clone(),
             "app:site".to_owned(),
-            instance_id,
             1,
             ReadinessRequirement::ControllerAndAssignedPortTcp {
                 port: assigned_port,
@@ -1142,7 +1211,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(
-            services.lock().await["app:site"].health_status,
+            services.lock().await[&key].health_status,
             HealthStatus::Starting,
             "a bound endpoint cannot bypass controller health"
         );
@@ -1150,7 +1219,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if services.lock().await["app:site"].health_status == HealthStatus::Healthy {
+                if services.lock().await[&key].health_status == HealthStatus::Healthy {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1172,8 +1241,9 @@ mod tests {
         drop(reservation);
 
         let instance_id = instance_id("00000000-0000-4000-8000-000000000006");
+        let key = service_key(instance_id, "app:web");
         let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:web".to_owned(),
+            key.clone(),
             monitored_service(instance_id, legacy_config(None), Some(port)),
         )])));
         let (event_sender, _) = tokio::sync::broadcast::channel(8);
@@ -1184,8 +1254,8 @@ mod tests {
             SharedDomainIndex::default(),
         );
         monitor.spawn_check(
+            key.clone(),
             "app:web".to_owned(),
-            instance_id,
             1,
             ReadinessRequirement::ExplicitTcp {
                 port,
@@ -1201,7 +1271,7 @@ mod tests {
         services
             .lock()
             .await
-            .get_mut("app:web")
+            .get_mut(&key)
             .expect("readiness service remains present")
             .health_status = HealthStatus::Unhealthy;
         let _listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
@@ -1210,6 +1280,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         monitor
             .update_health(
+                &key,
                 "app:web",
                 ControllerIdentity {
                     instance_id,
@@ -1221,7 +1292,7 @@ mod tests {
             .await;
 
         assert_eq!(
-            services.lock().await["app:web"].health_status,
+            services.lock().await[&key].health_status,
             HealthStatus::Unhealthy,
             "a probe completing after the readiness deadline cannot publish Healthy"
         );
@@ -1257,10 +1328,8 @@ mod tests {
         )));
         let mut service = monitored_service(instance_id, service_config, None);
         service.resolved_env = probe_env;
-        let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:worker".to_owned(),
-            service,
-        )])));
+        let key = service_key(instance_id, "app:worker");
+        let services = Arc::new(Mutex::new(HashMap::from([(key.clone(), service)])));
         let (event_sender, _) = tokio::sync::broadcast::channel(8);
         let monitor = HealthMonitor::new(
             services.clone(),
@@ -1269,8 +1338,8 @@ mod tests {
             SharedDomainIndex::default(),
         );
         monitor.spawn_check(
+            key.clone(),
             "app:worker".to_owned(),
-            instance_id,
             1,
             ReadinessRequirement::ExplicitCommand {
                 command: "command -v service-ready >/dev/null".to_owned(),
@@ -1285,7 +1354,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if services.lock().await["app:worker"].health_status == HealthStatus::Healthy {
+                if services.lock().await[&key].health_status == HealthStatus::Healthy {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1294,7 +1363,7 @@ mod tests {
         .await
         .expect("explicit command becomes ready");
         assert_eq!(
-            services.lock().await["app:worker"].health_source,
+            services.lock().await[&key].health_source,
             HealthSource::Command
         );
     }
@@ -1333,6 +1402,7 @@ mod tests {
         });
 
         let instance_id = instance_id("00000000-0000-4000-8000-000000000005");
+        let key = service_key(instance_id, "app:web");
         let service_config = legacy_config(Some(HealthCheckConfig::Probe(ProbeConfig {
             kind: ProbeType::Http,
             path: Some("/ready".to_owned()),
@@ -1341,7 +1411,7 @@ mod tests {
             command: None,
         })));
         let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:web".to_owned(),
+            key.clone(),
             monitored_service(instance_id, service_config, Some(port)),
         )])));
         let (event_sender, _) = tokio::sync::broadcast::channel(8);
@@ -1352,8 +1422,8 @@ mod tests {
             SharedDomainIndex::default(),
         );
         monitor.spawn_check(
+            key.clone(),
             "app:web".to_owned(),
-            instance_id,
             1,
             ReadinessRequirement::ExplicitHttp {
                 port,
@@ -1369,7 +1439,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if services.lock().await["app:web"].health_status == HealthStatus::Healthy {
+                if services.lock().await[&key].health_status == HealthStatus::Healthy {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1379,7 +1449,7 @@ mod tests {
         .expect("explicit HTTP path becomes ready");
         server.await.expect("HTTP readiness fixture joins");
         assert_eq!(
-            services.lock().await["app:web"].health_source,
+            services.lock().await[&key].health_source,
             HealthSource::Http
         );
     }
@@ -1400,8 +1470,9 @@ mod tests {
             instance_id: second_instance,
             controller_generation: 2,
         };
+        let key = service_key(second_instance, "app:web");
         let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:web".to_owned(),
+            key.clone(),
             Service {
                 instance_id: second_instance,
                 controller_generation: 2,
@@ -1430,6 +1501,7 @@ mod tests {
 
         monitor
             .update_health(
+                &key,
                 "app:web",
                 first_controller,
                 HealthStatus::Healthy,
@@ -1438,6 +1510,7 @@ mod tests {
             .await;
         monitor
             .update_warnings(
+                &key,
                 "app:web",
                 first_controller,
                 vec!["stale warning".to_owned()],
@@ -1445,6 +1518,7 @@ mod tests {
             .await;
         monitor
             .update_health(
+                &key,
                 "app:web",
                 stale_second_controller,
                 HealthStatus::Healthy,
@@ -1453,6 +1527,7 @@ mod tests {
             .await;
         monitor
             .update_warnings(
+                &key,
                 "app:web",
                 stale_second_controller,
                 vec!["stale controller warning".to_owned()],
@@ -1462,11 +1537,12 @@ mod tests {
         services
             .lock()
             .await
-            .get_mut("app:web")
+            .get_mut(&key)
             .expect("replacement service")
             .runtime_state = ServiceRuntime::None;
         monitor
             .update_health(
+                &key,
                 "app:web",
                 current_second_controller,
                 HealthStatus::Healthy,
@@ -1475,7 +1551,7 @@ mod tests {
             .await;
 
         let services = services.lock().await;
-        let replacement = &services["app:web"];
+        let replacement = &services[&key];
         assert_eq!(replacement.instance_id, second_instance);
         assert_eq!(replacement.health_status, HealthStatus::Unknown);
         assert_eq!(replacement.health_source, HealthSource::None);
@@ -1491,8 +1567,9 @@ mod tests {
         };
         let controller: Arc<Mutex<dyn ServiceController>> =
             Arc::new(Mutex::new(TestController::unknown()));
+        let key = service_key(instance_id, "app:web");
         let services = Arc::new(Mutex::new(HashMap::from([(
-            "app:web".to_owned(),
+            key.clone(),
             Service {
                 instance_id,
                 controller_generation: 1,
@@ -1518,11 +1595,13 @@ mod tests {
         );
 
         let controller_guard = controller.lock().await;
+        let update_key = key.clone();
         let update_task = tokio::spawn({
             let monitor = monitor.clone();
             async move {
                 monitor
                     .update_warnings(
+                        &update_key,
                         "app:web",
                         controller_identity,
                         vec!["old projection".to_owned()],
@@ -1536,7 +1615,7 @@ mod tests {
                 let warning_published = services
                     .lock()
                     .await
-                    .get("app:web")
+                    .get(&key)
                     .is_some_and(|service| !service.warnings.is_empty());
                 if warning_published {
                     break;
@@ -1549,7 +1628,7 @@ mod tests {
 
         {
             let mut services = services.lock().await;
-            let service = services.get_mut("app:web").expect("loaded service");
+            let service = services.get_mut(&key).expect("loaded service");
             service.config.project.domain = Some("new.app.localhost".to_owned());
             crate::manager::ProcessManager::advance_service_projection(service);
         }

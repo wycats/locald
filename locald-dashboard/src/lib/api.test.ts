@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { connectEvents, reconnect } from './api';
+import { connectEvents, reconnect, restartService } from './api';
 import type { ServiceStatus } from './types';
 
 class FakeEventSource {
@@ -24,6 +24,8 @@ class FakeEventSource {
 
 const service: ServiceStatus = {
 	name: 'example:web',
+	instance_id: '00000000-0000-0000-0000-000000000001',
+	service_name: 'web',
 	service_type: 'exec',
 	pid: 42,
 	port: 3000,
@@ -61,5 +63,17 @@ describe('dashboard lifecycle events', () => {
 
 		expect(lifecycleChange).toHaveBeenCalledOnce();
 		disconnect();
+	});
+
+	it('targets service lifecycle actions by project instance', async () => {
+		const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+		vi.stubGlobal('fetch', fetchMock);
+
+		await restartService(service.name, service.instance_id);
+
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/instances/00000000-0000-0000-0000-000000000001/services/example%3Aweb/restart',
+			{ method: 'POST' }
+		);
 	});
 });
