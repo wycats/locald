@@ -1178,7 +1178,7 @@ impl ProcessManager {
     fn build_domain_claims(
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
-        project_path: &Path,
+        domain_slug: Option<&str>,
     ) -> Result<Vec<DomainClaim>> {
         let base_domain = config.project.domain.clone().unwrap_or_else(|| {
             format!(
@@ -1186,18 +1186,26 @@ impl ProcessManager {
                 sanitize_project_name_for_dns(&config.project.name)
             )
         });
-        let base_domain = resolve_worktree_domain(
-            &base_domain,
-            &config.project.name,
-            config.worktrees.as_ref(),
-            project_path,
-        );
-        let base_domain = base_domain.parse::<DomainName>().with_context(|| {
+        let mut base_domain = base_domain.parse::<DomainName>().with_context(|| {
             format!(
                 "project `{}` has an invalid exact base domain `{base_domain}`",
                 config.project.name
             )
         })?;
+        if let Some(domain_slug) = domain_slug {
+            // Worktree instances occupy a dedicated, readable DNS level:
+            // <service>.<slug>.on.<project-domain>. This keeps mutable service
+            // sets from ever colliding with persistent worktree slugs.
+            base_domain = base_domain
+                .with_prefix("on")
+                .and_then(|worktree_namespace| worktree_namespace.with_prefix(domain_slug))
+                .with_context(|| {
+                    format!(
+                        "project `{}` has an invalid persistent worktree slug `{domain_slug}`",
+                        config.project.name
+                    )
+                })?;
+        }
         let mut service_names = config.services.keys().cloned().collect::<Vec<_>>();
         service_names.sort();
 
@@ -3083,11 +3091,25 @@ impl ProcessManager {
             trusted_launch_path,
             service_activation,
         ) = {
+            let is_linked_worktree = discovery.is_linked_worktree();
             let mut registry = self.registry.lock().await;
             let catalog_base = registry.clone();
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            let domain_slug =
+                candidate.ensure_worktree_domain_slug(instance_id, is_linked_worktree, None)?;
+            if config
+                .worktrees
+                .as_ref()
+                .and_then(|worktrees| worktrees.domain.as_ref())
+                .is_some()
+            {
+                warn!(
+                    "project `{}` uses deprecated `[worktrees].domain`; locald now preserves its automatically allocated worktree domain",
+                    config.project.name
+                );
+            }
             let service_activation = service_activation
                 .map(|selected| Self::service_activation_closure(instance_id, &config, selected))
                 .transpose()?;
@@ -3155,7 +3177,7 @@ impl ProcessManager {
             } else {
                 None
             };
-            let claims = Self::build_domain_claims(instance_id, &config, &path)?;
+            let claims = Self::build_domain_claims(instance_id, &config, domain_slug.as_deref())?;
             candidate.replace_domain_claims(instance_id, claims)?;
 
             // Keep the previous claim set published until every removed or
@@ -9502,32 +9524,6 @@ impl ProcessManager {
             }
         }
     }
-}
-
-/// Resolve the domain for a project, applying worktree branch qualification
-/// when the project is in a linked Git worktree with a domain template.
-fn resolve_worktree_domain(
-    base_domain: &str,
-    project_name: &str,
-    worktrees_config: Option<&locald_core::config::WorktreesConfig>,
-    project_path: &Path,
-) -> String {
-    let Some(git_context) = locald_core::worktree::detect(project_path) else {
-        return base_domain.to_owned();
-    };
-
-    if !git_context.is_worktree || git_context.is_default_branch {
-        return base_domain.to_owned();
-    }
-
-    let Some(template) = worktrees_config.and_then(|config| config.domain.as_ref()) else {
-        return base_domain.to_owned();
-    };
-    let Some(branch) = git_context.branch.as_ref() else {
-        return base_domain.to_owned();
-    };
-
-    locald_core::worktree::resolve_domain_template(template, project_name, branch, base_domain)
 }
 
 #[async_trait::async_trait]
@@ -21207,24 +21203,20 @@ command = "unused-by-test-factory"
     }
 
     fn claim_domains(config: &LocaldConfig) -> HashMap<String, String> {
-        ProcessManager::build_domain_claims(
-            test_instance_id(),
-            config,
-            Path::new("/nonexistent/locald-domain-claims-test"),
-        )
-        .expect("valid claims")
-        .into_iter()
-        .filter_map(|claim| match claim.target {
-            DomainTarget::Service {
-                service_name: Some(service_name),
-                ..
-            } => Some((service_name, claim.domain.to_string())),
-            DomainTarget::Platform { .. }
-            | DomainTarget::Service {
-                service_name: None, ..
-            } => None,
-        })
-        .collect()
+        ProcessManager::build_domain_claims(test_instance_id(), config, None)
+            .expect("valid claims")
+            .into_iter()
+            .filter_map(|claim| match claim.target {
+                DomainTarget::Service {
+                    service_name: Some(service_name),
+                    ..
+                } => Some((service_name, claim.domain.to_string())),
+                DomainTarget::Platform { .. }
+                | DomainTarget::Service {
+                    service_name: None, ..
+                } => None,
+            })
+            .collect()
     }
 
     fn git(current_dir: &Path, arguments: &[&str]) {
@@ -21724,14 +21716,10 @@ TOKEN = "reloaded"
             &["web"],
         );
         assert!(
-            ProcessManager::build_domain_claims(
-                test_instance_id(),
-                &invalid_project_domain,
-                Path::new("/nonexistent/locald-domain-claims-test"),
-            )
-            .expect_err("explicit project domains are not rewritten")
-            .to_string()
-            .contains("invalid exact base domain")
+            ProcessManager::build_domain_claims(test_instance_id(), &invalid_project_domain, None,)
+                .expect_err("explicit project domains are not rewritten")
+                .to_string()
+                .contains("invalid exact base domain")
         );
 
         let generated_service_domain = config_with_services(
@@ -21758,12 +21746,8 @@ TOKEN = "reloaded"
             },
             &["web", "my_api", "my-api"],
         );
-        let claims = ProcessManager::build_domain_claims(
-            test_instance_id(),
-            &config,
-            Path::new("/nonexistent/locald-domain-claims-test"),
-        )
-        .expect("generated labels are individually valid");
+        let claims = ProcessManager::build_domain_claims(test_instance_id(), &config, None)
+            .expect("generated labels are individually valid");
 
         let error = locald_core::DomainIndex::default()
             .replacing_instance(test_instance_id(), claims)
@@ -21773,34 +21757,8 @@ TOKEN = "reloaded"
     }
 
     #[test]
-    fn worktree_templates_qualify_claims_before_exact_domain_validation() {
-        let temp = tempdir().expect("create temporary directory");
-        let repository = temp.path().join("repository");
-        std::fs::create_dir(&repository).expect("create repository directory");
-        git(&repository, &["init", "-b", "main"]);
-        git(&repository, &["config", "user.name", "locald tests"]);
-        git(
-            &repository,
-            &["config", "user.email", "locald@example.test"],
-        );
-        std::fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
-        git(&repository, &["add", "README.md"]);
-        git(&repository, &["commit", "-m", "initial"]);
-
-        let worktree = temp.path().join("feature-worktree");
-        let worktree_path = worktree.to_str().expect("UTF-8 worktree path");
-        git(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature/JIRA-123_foo",
-                worktree_path,
-            ],
-        );
-
-        let mut config: LocaldConfig = toml::from_str(
+    fn persistent_worktree_slugs_qualify_exact_service_domains() {
+        let config: LocaldConfig = toml::from_str(
             r#"
 [project]
 name = "app"
@@ -21816,11 +21774,10 @@ command = "web"
 command = "api"
 "#,
         )
-        .expect("parse worktree config");
+        .expect("parse compatibility config");
 
-        let main_claims =
-            ProcessManager::build_domain_claims(test_instance_id(), &config, &repository)
-                .expect("primary checkout claims");
+        let main_claims = ProcessManager::build_domain_claims(test_instance_id(), &config, None)
+            .expect("primary checkout claims");
         let main_domains = main_claims
             .into_iter()
             .map(|claim| claim.domain.to_string())
@@ -21831,7 +21788,7 @@ command = "api"
         );
 
         let worktree_claims =
-            ProcessManager::build_domain_claims(test_instance_id(), &config, &worktree)
+            ProcessManager::build_domain_claims(test_instance_id(), &config, Some("turn-trace"))
                 .expect("linked worktree claims");
         let worktree_domains = worktree_claims
             .into_iter()
@@ -21840,16 +21797,163 @@ command = "api"
         assert_eq!(
             worktree_domains,
             HashSet::from([
-                "jira-123-foo.app.localhost".to_owned(),
-                "api.jira-123-foo.app.localhost".to_owned(),
+                "turn-trace.on.app.localhost".to_owned(),
+                "api.turn-trace.on.app.localhost".to_owned(),
             ])
         );
 
-        config.worktrees.as_mut().expect("worktree config").domain =
-            Some("bad_{{branch.last}}.{{project.domain}}".to_owned());
-        let error = ProcessManager::build_domain_claims(test_instance_id(), &config, &worktree)
-            .expect_err("invalid expanded templates remain strict");
-        assert!(error.to_string().contains("invalid exact base domain"));
+        let error =
+            ProcessManager::build_domain_claims(test_instance_id(), &config, Some("bad_slug"))
+                .expect_err("invalid persisted slugs remain strict");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid persistent worktree slug")
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_namespace_separates_slugs_from_divergent_service_sets() {
+        let dir = tempdir().expect("create temporary directory");
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&repository).expect("create repository directory");
+        git(&repository, &["init", "-b", "main"]);
+        git(&repository, &["config", "user.name", "locald tests"]);
+        git(
+            &repository,
+            &["config", "user.email", "locald@example.test"],
+        );
+        std::fs::write(
+            repository.join("locald.toml"),
+            r#"
+[project]
+name = "app"
+domain = "app.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+
+[services.api]
+type = "worker"
+command = "sleep 30"
+
+[services.api.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("write project config");
+        git(&repository, &["add", "locald.toml"]);
+        git(&repository, &["commit", "-m", "initial"]);
+        let worktree = dir.path().join("turn-trace-worktree");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/api",
+                worktree.to_str().expect("UTF-8 worktree path"),
+            ],
+        );
+        std::fs::write(
+            worktree.join("locald.toml"),
+            r#"
+[project]
+name = "app"
+domain = "app.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("write linked worktree config with a different service set");
+
+        let catalog_path = dir.path().join("catalog.json");
+        let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path)));
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .apply_config(worktree.clone(), None, false)
+            .await
+            .expect("publish linked worktree before primary");
+        manager
+            .apply_config(repository.clone(), None, false)
+            .await
+            .expect("publish primary checkout");
+
+        let linked_discovery = Registry::discover(worktree.clone())
+            .await
+            .expect("rediscover linked worktree");
+        let ConfigPhysicalIdentity::Git(linked_id) =
+            ConfigPhysicalIdentity::from_discovery(&linked_discovery)
+        else {
+            panic!("linked worktree has Git identity");
+        };
+        {
+            let catalog = registry.lock().await;
+            assert_eq!(
+                catalog.instances[&linked_id].domain_slug.as_deref(),
+                Some("api")
+            );
+            assert!(catalog.domain_index().resolve("app.localhost").is_some());
+            assert!(
+                catalog
+                    .domain_index()
+                    .resolve("api.app.localhost")
+                    .is_some()
+            );
+            assert!(
+                catalog
+                    .domain_index()
+                    .resolve("api.on.app.localhost")
+                    .is_some()
+            );
+        }
+
+        git(&worktree, &["checkout", "-b", "feature/renamed"]);
+        manager
+            .apply_config(worktree.clone(), None, false)
+            .await
+            .expect("republish after branch change");
+        assert!(
+            manager
+                .resolve_service_by_domain("api.on.app.localhost")
+                .await
+                .is_some()
+        );
+        assert!(
+            manager
+                .resolve_service_by_domain("renamed.on.app.localhost")
+                .await
+                .is_none()
+        );
+
+        manager
+            .stop_project(&repository)
+            .await
+            .expect("stop primary project");
+        manager
+            .stop_project(&worktree)
+            .await
+            .expect("stop linked project");
     }
 
     #[test]
