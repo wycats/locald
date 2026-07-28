@@ -1193,12 +1193,18 @@ impl ProcessManager {
             )
         })?;
         if let Some(domain_slug) = domain_slug {
-            base_domain = base_domain.with_prefix(domain_slug).with_context(|| {
-                format!(
-                    "project `{}` has an invalid persistent worktree slug `{domain_slug}`",
-                    config.project.name
-                )
-            })?;
+            // Worktree instances occupy a dedicated, readable DNS level:
+            // <service>.<slug>.on.<project-domain>. This keeps mutable service
+            // sets from ever colliding with persistent worktree slugs.
+            base_domain = base_domain
+                .with_prefix("on")
+                .and_then(|worktree_namespace| worktree_namespace.with_prefix(domain_slug))
+                .with_context(|| {
+                    format!(
+                        "project `{}` has an invalid persistent worktree slug `{domain_slug}`",
+                        config.project.name
+                    )
+                })?;
         }
         let mut service_names = config.services.keys().cloned().collect::<Vec<_>>();
         service_names.sort();
@@ -3091,18 +3097,8 @@ impl ProcessManager {
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
-            let reserved_slug_labels = config
-                .services
-                .keys()
-                .filter(|service_name| service_name.as_str() != "web")
-                .map(|service_name| sanitize_service_name_for_dns(service_name))
-                .collect::<BTreeSet<_>>();
-            let domain_slug = candidate.ensure_worktree_domain_slug(
-                instance_id,
-                is_linked_worktree,
-                None,
-                &reserved_slug_labels,
-            )?;
+            let domain_slug =
+                candidate.ensure_worktree_domain_slug(instance_id, is_linked_worktree, None)?;
             if config
                 .worktrees
                 .as_ref()
@@ -21801,8 +21797,8 @@ command = "api"
         assert_eq!(
             worktree_domains,
             HashSet::from([
-                "turn-trace.app.localhost".to_owned(),
-                "api.turn-trace.app.localhost".to_owned(),
+                "turn-trace.on.app.localhost".to_owned(),
+                "api.turn-trace.on.app.localhost".to_owned(),
             ])
         );
 
@@ -21817,7 +21813,7 @@ command = "api"
     }
 
     #[tokio::test]
-    async fn config_publication_persists_linked_worktree_domain_before_claims() {
+    async fn worktree_namespace_separates_slugs_from_divergent_service_sets() {
         let dir = tempdir().expect("create temporary directory");
         let repository = dir.path().join("repository");
         std::fs::create_dir(&repository).expect("create repository directory");
@@ -21863,6 +21859,22 @@ PATH = "/usr/bin:/bin"
                 worktree.to_str().expect("UTF-8 worktree path"),
             ],
         );
+        std::fs::write(
+            worktree.join("locald.toml"),
+            r#"
+[project]
+name = "app"
+domain = "app.localhost"
+
+[services.web]
+type = "worker"
+command = "sleep 30"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("write linked worktree config with a different service set");
 
         let catalog_path = dir.path().join("catalog.json");
         let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path)));
@@ -21899,7 +21911,7 @@ PATH = "/usr/bin:/bin"
             let catalog = registry.lock().await;
             assert_eq!(
                 catalog.instances[&linked_id].domain_slug.as_deref(),
-                Some("api-2")
+                Some("api")
             );
             assert!(catalog.domain_index().resolve("app.localhost").is_some());
             assert!(
@@ -21911,7 +21923,7 @@ PATH = "/usr/bin:/bin"
             assert!(
                 catalog
                     .domain_index()
-                    .resolve("api-2.app.localhost")
+                    .resolve("api.on.app.localhost")
                     .is_some()
             );
         }
@@ -21923,13 +21935,13 @@ PATH = "/usr/bin:/bin"
             .expect("republish after branch change");
         assert!(
             manager
-                .resolve_service_by_domain("api-2.app.localhost")
+                .resolve_service_by_domain("api.on.app.localhost")
                 .await
                 .is_some()
         );
         assert!(
             manager
-                .resolve_service_by_domain("renamed.app.localhost")
+                .resolve_service_by_domain("renamed.on.app.localhost")
                 .await
                 .is_none()
         );

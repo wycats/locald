@@ -684,7 +684,6 @@ impl ProjectCatalog {
         instance_id: ProjectInstanceId,
         is_linked_worktree: bool,
         trusted_label: Option<&str>,
-        reserved_labels: &BTreeSet<String>,
     ) -> Result<Option<String>, CatalogError> {
         let record = self.instances.get(&instance_id).ok_or_else(|| {
             CatalogError::Invariant(format!(
@@ -724,8 +723,6 @@ impl ProjectCatalog {
             .values()
             .filter(|candidate| candidate.project_id == project_id)
             .filter_map(|candidate| candidate.domain_slug.as_deref())
-            .map(str::to_owned)
-            .chain(reserved_labels.iter().cloned())
             .collect::<BTreeSet<_>>();
         let slug = allocate_unique_domain_slug(&base, &reserved);
 
@@ -1745,7 +1742,7 @@ fn data_dir() -> PathBuf {
     crate::storage::data_dir()
 }
 
-fn allocate_unique_domain_slug(base: &str, reserved: &BTreeSet<String>) -> String {
+fn allocate_unique_domain_slug(base: &str, reserved: &BTreeSet<&str>) -> String {
     if !reserved.contains(base) {
         return base.to_owned();
     }
@@ -3751,7 +3748,7 @@ mod tests {
             .expect("register primary checkout");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(primary_id, false, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(primary_id, false, None)
                 .expect("preserve primary base domain"),
             None
         );
@@ -3765,7 +3762,7 @@ mod tests {
             .expect("register linked worktree");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(linked_id, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(linked_id, true, None)
                 .expect("allocate linked slug")
                 .as_deref(),
             Some("checkout-flow")
@@ -3783,7 +3780,7 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(linked_id, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(linked_id, true, None)
                 .expect("preserve slug after branch change")
                 .as_deref(),
             Some("checkout-flow")
@@ -3818,12 +3815,7 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(
-                    linked_id,
-                    true,
-                    Some("later-task-label"),
-                    &BTreeSet::new(),
-                )
+                .ensure_worktree_domain_slug(linked_id, true, Some("later-task-label"))
                 .expect("preserve slug after detach and move")
                 .as_deref(),
             Some("checkout-flow")
@@ -3867,14 +3859,14 @@ mod tests {
             .expect("register second worktree");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(first, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(first, true, None)
                 .expect("allocate first slug")
                 .as_deref(),
             Some("turn-trace")
         );
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(second, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(second, true, None)
                 .expect("allocate collision suffix")
                 .as_deref(),
             Some("turn-trace-2")
@@ -3904,7 +3896,7 @@ mod tests {
             .expect("register third worktree");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(third, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(third, true, None)
                 .expect("reserve missing slug")
                 .as_deref(),
             Some("turn-trace-3")
@@ -3925,7 +3917,7 @@ mod tests {
             .expect("register fourth worktree");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(fourth, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(fourth, true, None)
                 .expect("reuse explicitly released slug")
                 .as_deref(),
             Some("turn-trace")
@@ -3953,7 +3945,7 @@ mod tests {
             .expect("register path-hinted detached worktree");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(path_instance, true, None, &BTreeSet::new())
+                .ensure_worktree_domain_slug(path_instance, true, None)
                 .expect("allocate from path hint")
                 .as_deref(),
             Some("detached-path-hint")
@@ -3969,12 +3961,7 @@ mod tests {
             .expect("register trusted detached worktree");
         assert_eq!(
             catalog
-                .ensure_worktree_domain_slug(
-                    trusted_instance,
-                    true,
-                    Some("Chat: Turn Trace"),
-                    &BTreeSet::new(),
-                )
+                .ensure_worktree_domain_slug(trusted_instance, true, Some("Chat: Turn Trace"))
                 .expect("allocate from trusted hint")
                 .as_deref(),
             Some("chat-turn-trace")
@@ -3984,7 +3971,7 @@ mod tests {
     #[test]
     fn collision_suffixes_keep_the_slug_within_one_dns_label() {
         let base = "a".repeat(63);
-        let reserved = BTreeSet::from([base.clone()]);
+        let reserved = BTreeSet::from([base.as_str()]);
 
         let allocated = allocate_unique_domain_slug(&base, &reserved);
 
