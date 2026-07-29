@@ -270,7 +270,6 @@ async fn test_proxy_error_page() {
         .uri("/")
         .header("Host", "broken.localhost")
         .header("Accept", "text/html")
-        .header("Cookie", "__locald_loading_ready=1")
         .body(Body::empty())
         .unwrap();
 
@@ -278,14 +277,6 @@ async fn test_proxy_error_page() {
 
     // Should be 502 Bad Gateway
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        response
-            .headers()
-            .get(hyper::header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok()),
-        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
-    );
-
     // Should be HTML
     let content_type = response.headers().get("content-type").unwrap();
     assert_eq!(content_type, "text/html; charset=utf-8");
@@ -575,32 +566,16 @@ async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
         .unwrap();
     let response = app.clone().oneshot(poll).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let bypass_cookie = response
-        .headers()
-        .get(hyper::header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .expect("passthrough response should set the loading handoff cookie");
-    assert!(bypass_cookie.starts_with("__locald_loading_ready=1;"));
 
     let reload = Request::builder()
         .uri("/")
         .header("Host", "slow.localhost")
         .header("Accept", "text/html")
-        .header(
-            "Cookie",
-            "session=abc; theme=dark; __locald_loading_ready=1",
-        )
+        .header("Cookie", "session=abc; theme=dark")
         .body(Body::empty())
         .unwrap();
     let response = app.clone().oneshot(reload).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(hyper::header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok()),
-        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
-    );
     assert_eq!(response_body(response).await, "slow-app");
 
     {
@@ -619,15 +594,11 @@ async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
         .unwrap();
     let response = app.oneshot(later_navigation).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        response_body(response)
-            .await
-            .contains("Waiting for first response")
-    );
+    assert_eq!(response_body(response).await, "slow-app");
 }
 
 #[tokio::test]
-async fn test_loading_handoff_survives_redirects_until_the_final_html_response() {
+async fn test_loading_handoff_is_shared_across_service_aliases_and_redirects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let backend = Router::new()
@@ -655,9 +626,8 @@ async fn test_loading_handoff_survives_redirects_until_the_final_html_response()
 
     let redirect = Request::builder()
         .uri("/")
-        .header("Host", "redirect.localhost")
-        .header("Accept", "text/html")
-        .header("Cookie", "__locald_loading_ready=1")
+        .header("Host", "alias.localhost")
+        .header("X-Locald-Passthrough", "true")
         .body(Body::empty())
         .unwrap();
     let response = app.clone().oneshot(redirect).await.unwrap();
@@ -669,40 +639,23 @@ async fn test_loading_handoff_survives_redirects_until_the_final_html_response()
             .and_then(|value| value.to_str().ok()),
         Some("/final")
     );
-    assert!(response.headers().get(hyper::header::SET_COOKIE).is_none());
 
     let final_navigation = Request::builder()
         .uri("/final")
-        .header("Host", "redirect.localhost")
+        .header("Host", "canonical.localhost")
         .header("Accept", "text/html")
-        .header("Cookie", "__locald_loading_ready=1")
         .body(Body::empty())
         .unwrap();
     let response = app.clone().oneshot(final_navigation).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(hyper::header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok()),
-        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
-    );
     assert_eq!(response_body(response).await, "redirected-slow-app");
 
     let cached_navigation = Request::builder()
         .uri("/cached")
-        .header("Host", "redirect.localhost")
+        .header("Host", "canonical.localhost")
         .header("Accept", "text/html")
-        .header("Cookie", "__locald_loading_ready=1")
         .body(Body::empty())
         .unwrap();
     let response = app.oneshot(cached_navigation).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(
-        response
-            .headers()
-            .get(hyper::header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok()),
-        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
-    );
 }

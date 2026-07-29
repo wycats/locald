@@ -1,12 +1,14 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
     body::Body,
     extract::{Request, State},
     handler::Handler,
-    http::{HeaderMap, HeaderValue, Method, Uri},
+    http::{Method, Uri},
     response::{IntoResponse, Response},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -24,11 +26,7 @@ use locald_core::state::ServiceState;
 use locald_core::{DomainName, ProjectAvailabilityStatus, ProjectLifecycleState};
 use locald_utils::cert::CertManager;
 
-const LOADING_BYPASS_COOKIE: &str = "__locald_loading_ready=1";
-const LOADING_BYPASS_SET_COOKIE: &str =
-    "__locald_loading_ready=1; Max-Age=60; Path=/; HttpOnly; SameSite=Lax";
-const LOADING_BYPASS_CLEAR_COOKIE: &str =
-    "__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax";
+const RESPONSIVE_BACKEND_TTL: Duration = Duration::from_mins(1);
 
 /// Manages the reverse proxy for routing requests to services.
 ///
@@ -42,6 +40,7 @@ pub struct ProxyManager {
     resolver: Arc<dyn ServiceResolver>,
     api_router: Router,
     cert_manager: Option<Arc<CertManager>>,
+    responsive_backends: Arc<Mutex<HashMap<u16, Instant>>>,
 }
 
 impl ProxyManager {
@@ -61,6 +60,7 @@ impl ProxyManager {
             resolver,
             api_router,
             cert_manager,
+            responsive_backends: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -78,6 +78,7 @@ impl ProxyManager {
             resolver: self.resolver.clone(),
             client,
             api_router: Router::new().nest("/api", self.api_router.clone()),
+            responsive_backends: self.responsive_backends.clone(),
         };
 
         Router::new()
@@ -159,6 +160,7 @@ struct AppState {
         Body,
     >,
     api_router: Router,
+    responsive_backends: Arc<Mutex<HashMap<u16, Instant>>>,
 }
 
 async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri: Uri) -> Response {
@@ -369,8 +371,8 @@ async fn proxy_to_domain_resolution(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("text/html"))
         .unwrap_or(false);
-    let cookie_passthrough = take_loading_bypass_cookie(req.headers_mut());
-    let is_passthrough = header_passthrough || (accepts_html && cookie_passthrough);
+    let backend_is_responsive = accepts_html && backend_is_recently_responsive(state, port);
+    let is_passthrough = header_passthrough || backend_is_responsive;
 
     *req.uri_mut() = uri;
 
@@ -378,25 +380,16 @@ async fn proxy_to_domain_resolution(
 
     if is_passthrough || !accepts_html {
         return match backend_future.await {
-            Ok(mut res) => {
+            Ok(res) => {
                 if header_passthrough {
-                    set_loading_bypass_cookie(res.headers_mut());
-                } else if accepts_html
-                    && cookie_passthrough
-                    && !is_navigation_redirect(res.status())
-                {
-                    clear_loading_bypass_cookie(res.headers_mut());
+                    mark_backend_responsive(state, port);
                 }
                 res.into_response()
             }
             Err(e) => {
                 error!("Proxy error: {e}");
-                let mut response =
-                    error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"));
-                if accepts_html && cookie_passthrough {
-                    clear_loading_bypass_cookie(response.headers_mut());
-                }
-                response
+                forget_responsive_backend(state, port);
+                error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
             }
         };
     }
@@ -417,71 +410,30 @@ async fn proxy_to_domain_resolution(
     }
 }
 
-fn take_loading_bypass_cookie(headers: &mut HeaderMap) -> bool {
-    let values = headers
-        .get_all(hyper::header::COOKIE)
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return false;
-    }
-
-    headers.remove(hyper::header::COOKIE);
-    let mut found = false;
-
-    for value in values {
-        let Ok(cookies) = value.to_str() else {
-            headers.append(hyper::header::COOKIE, value);
-            continue;
-        };
-        let remaining = cookies
-            .split(';')
-            .map(str::trim)
-            .filter(|cookie| {
-                if *cookie == LOADING_BYPASS_COOKIE {
-                    found = true;
-                    false
-                } else {
-                    !cookie.is_empty()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-
-        if !remaining.is_empty() {
-            if let Ok(value) = HeaderValue::from_str(&remaining) {
-                headers.append(hyper::header::COOKIE, value);
-            }
-        }
-    }
-
-    found
+fn backend_is_recently_responsive(state: &AppState, port: u16) -> bool {
+    let now = Instant::now();
+    let mut backends = state
+        .responsive_backends
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    backends.retain(|_, expires_at| *expires_at > now);
+    backends.contains_key(&port)
 }
 
-fn set_loading_bypass_cookie(headers: &mut HeaderMap) {
-    headers.append(
-        hyper::header::SET_COOKIE,
-        HeaderValue::from_static(LOADING_BYPASS_SET_COOKIE),
-    );
+fn mark_backend_responsive(state: &AppState, port: u16) {
+    state
+        .responsive_backends
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(port, Instant::now() + RESPONSIVE_BACKEND_TTL);
 }
 
-fn clear_loading_bypass_cookie(headers: &mut HeaderMap) {
-    headers.append(
-        hyper::header::SET_COOKIE,
-        HeaderValue::from_static(LOADING_BYPASS_CLEAR_COOKIE),
-    );
-}
-
-fn is_navigation_redirect(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    )
+fn forget_responsive_backend(state: &AppState, port: u16) {
+    state
+        .responsive_backends
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&port);
 }
 
 async fn proxy_to_local_port(
@@ -1058,93 +1010,4 @@ fn loading_response(service_name: &str) -> Response {
         html,
     )
         .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loading_bypass_cookie_is_removed_without_disturbing_app_cookies() {
-        let mut headers = HeaderMap::new();
-        headers.append(
-            hyper::header::COOKIE,
-            HeaderValue::from_static("session=abc; __locald_loading_ready=1"),
-        );
-        headers.append(
-            hyper::header::COOKIE,
-            HeaderValue::from_static("theme=dark"),
-        );
-
-        assert!(take_loading_bypass_cookie(&mut headers));
-        assert_eq!(
-            headers
-                .get_all(hyper::header::COOKIE)
-                .iter()
-                .map(|value| value.to_str().expect("valid cookie header"))
-                .collect::<Vec<_>>(),
-            ["session=abc", "theme=dark"]
-        );
-    }
-
-    #[test]
-    fn app_cookies_do_not_enable_loading_bypass() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            hyper::header::COOKIE,
-            HeaderValue::from_static("session=abc; theme=dark"),
-        );
-
-        assert!(!take_loading_bypass_cookie(&mut headers));
-        assert_eq!(
-            headers
-                .get(hyper::header::COOKIE)
-                .and_then(|value| value.to_str().ok()),
-            Some("session=abc; theme=dark")
-        );
-    }
-
-    #[test]
-    fn completed_passthrough_sets_short_lived_host_cookie() {
-        let mut headers = HeaderMap::new();
-
-        set_loading_bypass_cookie(&mut headers);
-
-        assert_eq!(
-            headers
-                .get(hyper::header::SET_COOKIE)
-                .and_then(|value| value.to_str().ok()),
-            Some(LOADING_BYPASS_SET_COOKIE)
-        );
-    }
-
-    #[test]
-    fn completed_reload_clears_loading_bypass_cookie() {
-        let mut headers = HeaderMap::new();
-
-        clear_loading_bypass_cookie(&mut headers);
-
-        assert_eq!(
-            headers
-                .get(hyper::header::SET_COOKIE)
-                .and_then(|value| value.to_str().ok()),
-            Some(LOADING_BYPASS_CLEAR_COOKIE)
-        );
-    }
-
-    #[test]
-    fn only_navigation_redirects_preserve_loading_bypass_cookie() {
-        for status in [
-            StatusCode::MOVED_PERMANENTLY,
-            StatusCode::FOUND,
-            StatusCode::SEE_OTHER,
-            StatusCode::TEMPORARY_REDIRECT,
-            StatusCode::PERMANENT_REDIRECT,
-        ] {
-            assert!(is_navigation_redirect(status), "{status}");
-        }
-
-        assert!(!is_navigation_redirect(StatusCode::MULTIPLE_CHOICES));
-        assert!(!is_navigation_redirect(StatusCode::NOT_MODIFIED));
-    }
 }

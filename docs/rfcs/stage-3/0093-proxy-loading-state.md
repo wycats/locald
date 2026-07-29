@@ -40,7 +40,7 @@ When the proxy forwards a request to a backend service, it races the backend's r
 We only intervene if:
 
 1. The request is for **HTML** (`Accept: text/html`). We don't want to return HTML for a JSON API request or an image load.
-2. The request does **not** have the `X-Locald-Passthrough` header or the single-use loading handoff marker described below.
+2. The request does **not** have the `X-Locald-Passthrough` header and the backend has not responded to a loading-page poll within the last 60 seconds.
 
 ### 3. The "Building..." Page
 
@@ -57,10 +57,10 @@ The JavaScript on the loading page performs the following loop:
 1. `fetch(window.location.href, { headers: { 'X-Locald-Passthrough': 'true' } })`
 2. The `X-Locald-Passthrough` header tells the `locald` proxy: **"Do not serve the loading page. Wait as long as it takes."**
 3. The proxy forwards this request to the backend and awaits the real response, no matter how long it takes.
-4. When the `fetch` completes, the proxy sets a host-scoped, HttpOnly loading handoff cookie that expires after 60 seconds, and the JavaScript calls `window.location.reload()`.
-5. The browser reloads the page with that marker. `locald` removes the marker before forwarding the request and waits for the real backend response without applying the 500ms cutoff.
-6. Navigation redirects (`301`, `302`, `303`, `307`, and `308`) preserve the browser marker for the next location. The first final HTML response, including `304 Not Modified` or a generated transport-error response, expires it.
-7. The marker is therefore consumed by one redirect-following navigation chain. Application cookies remain unchanged, and later slow HTML navigations receive the normal loading screen.
+4. When the `fetch` receives a backend response, the proxy marks that internal backend port responsive for 60 seconds and the JavaScript calls `window.location.reload()`.
+5. HTML requests routed to that backend during the responsive window wait for the real response without applying the 500ms cutoff.
+6. The responsive window is backend-scoped, so simultaneous tabs and alternate exact domains for the same service share the observation. Redirect status and browser cookie behavior do not carry or consume the handoff.
+7. A backend transport error clears the observation immediately. Otherwise it expires after 60 seconds, allowing a later cold or replaced backend to use the loading screen again.
 
 ## Implementation Details
 
@@ -70,17 +70,16 @@ The JavaScript on the loading page performs the following loop:
 // Simplified logic
 let accepts_html = req.headers().get("accept").contains("text/html");
 let header_passthrough = req.headers().contains_key("x-locald-passthrough");
-let cookie_passthrough = take_loading_bypass_cookie(req.headers_mut());
-let is_passthrough = header_passthrough || (accepts_html && cookie_passthrough);
+let backend_is_responsive =
+    accepts_html && backend_is_recently_responsive(backend_port);
+let is_passthrough = header_passthrough || backend_is_responsive;
 
 let backend_future = client.request(req);
 
 if is_passthrough || !accepts_html {
-    let mut response = backend_future.await;
+    let response = backend_future.await;
     if header_passthrough {
-        set_loading_bypass_cookie(response.headers_mut());
-    } else if cookie_passthrough && !is_navigation_redirect(response.status()) {
-        clear_loading_bypass_cookie(response.headers_mut());
+        mark_backend_responsive(backend_port, 60_seconds);
     }
     return response;
 }
@@ -96,9 +95,9 @@ tokio::select! {
 
 - **APIs**: API requests usually don't accept `text/html`, so they will just hang until completion (standard behavior).
 - **WebSockets**: The upgrade handshake happens before this logic, so WebSockets are unaffected.
-- **Errors**: If the polling request fails (500/502), the JavaScript retries after a delay. A transport failure on the cookie-bearing reload expires the marker before returning locald's error response.
-- **Redirects**: `301`, `302`, `303`, `307`, and `308` retain the marker so authentication or canonical-origin redirects remain part of the same handoff. Other `3xx` responses, including `304 Not Modified`, are terminal and consume it.
-- **Cookie isolation**: The handoff cookie has no `Domain` attribute, so it is scoped to the concrete service hostname. `locald` strips it before proxying and consumes it on the next HTML navigation.
+- **Errors**: If the polling request fails at the transport layer, the JavaScript retries after a delay and the proxy clears any responsive observation for that backend. HTTP responses, including application errors, prove that the backend is responsive.
+- **Redirects and aliases**: The responsive observation is keyed by locald's unique internal backend port, so redirect status details do not control its lifetime and another exact domain for the same service receives the same behavior.
+- **Browser isolation**: The handoff uses no browser cookie or URL marker. Concurrent tabs cannot consume one another's handoff, and locald forwards application cookies unchanged.
 
 ## Phase 2: High-Fidelity Build Logs (Refinement)
 
