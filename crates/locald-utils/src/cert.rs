@@ -638,8 +638,9 @@ impl CertManager {
     /// Creates a new `CertManager`.
     ///
     /// Loads the root CA key and certificate from the locald certificates directory.
-    /// The authorizer returns the canonical owned server name, or `None` to
-    /// reject the TLS handshake. It is invoked before every cache lookup.
+    /// The authorizer returns the finite exact or wildcard certificate identity,
+    /// or `None` to reject the TLS handshake. It is invoked before every cache
+    /// lookup.
     ///
     /// # Errors
     ///
@@ -1524,6 +1525,48 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec!["owned.localhost".to_owned()]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wildcard_authorization_reuses_one_bounded_certificate() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = unique_temp_dir();
+        let manager = Arc::new(
+            CertManager::new_in_dir(&dir, |requested| {
+                let requested = requested
+                    .strip_suffix('.')
+                    .unwrap_or(requested)
+                    .to_ascii_lowercase();
+                matches!(
+                    requested.as_str(),
+                    "first.frame.app.localhost" | "second.frame.app.localhost"
+                )
+                .then(|| "*.frame.app.localhost".to_owned())
+            })
+            .await
+            .expect("create wildcard certificate manager"),
+        );
+
+        assert_eq!(
+            tls_handshake_results(manager.clone(), "first.frame.app.localhost").await,
+            (true, true)
+        );
+        assert_eq!(
+            tls_handshake_results(manager.clone(), "second.frame.app.localhost").await,
+            (true, true)
+        );
+        assert_eq!(
+            manager
+                .cache
+                .lock()
+                .expect("certificate cache lock")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["*.frame.app.localhost".to_owned()]
         );
 
         let _ = std::fs::remove_dir_all(&dir);

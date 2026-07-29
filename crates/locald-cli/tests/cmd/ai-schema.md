@@ -89,6 +89,16 @@ $ locald ai schema
             "type": "string"
           }
         },
+        "domains": {
+          "description": "Relative domain claims for this service./n/n`@` claims the project-instance root, plain values claim exact relative/nnames, and a leftmost `*.` claims exactly one relative DNS label. When/nomitted, locald preserves its conventional service-domain mapping. The/nfirst exact claim is the service's canonical semantic origin.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "env": {
           "description": "Environment variables to pass to the service.",
           "type": "object",
@@ -165,6 +175,16 @@ $ locald ai schema
         "depends_on": {
           "description": "List of services that must be started before this one.",
           "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domains": {
+          "description": "Relative domain claims for this service./n/n`@` claims the project-instance root, plain values claim exact relative/nnames, and a leftmost `*.` claims exactly one relative DNS label. When/nomitted, locald preserves its conventional service-domain mapping. The/nfirst exact claim is the service's canonical semantic origin.",
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "string"
           }
@@ -288,6 +308,16 @@ $ locald ai schema
         "depends_on": {
           "description": "List of services that must be started before this one.",
           "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domains": {
+          "description": "Relative domain claims for this service./n/n`@` claims the project-instance root, plain values claim exact relative/nnames, and a leftmost `*.` claims exactly one relative DNS label. When/nomitted, locald preserves its conventional service-domain mapping. The/nfirst exact claim is the service's canonical semantic origin.",
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "string"
           }
@@ -468,6 +498,16 @@ $ locald ai schema
             "type": "string"
           }
         },
+        "domains": {
+          "description": "Relative domain claims for this service./n/n`@` claims the project-instance root, plain values claim exact relative/nnames, and a leftmost `*.` claims exactly one relative DNS label. When/nomitted, locald preserves its conventional service-domain mapping. The/nfirst exact claim is the service's canonical semantic origin.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "env": {
           "description": "Environment variables to pass to the service.",
           "type": "object",
@@ -598,6 +638,16 @@ $ locald ai schema
         "depends_on": {
           "description": "List of services that must be started before this one.",
           "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domains": {
+          "description": "Relative domain claims for this service./n/n`@` claims the project-instance root, plain values claim exact relative/nnames, and a leftmost `*.` claims exactly one relative DNS label. When/nomitted, locald preserves its conventional service-domain mapping. The/nfirst exact claim is the service's canonical semantic origin.",
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "string"
           }

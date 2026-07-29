@@ -42,7 +42,7 @@ use locald_core::{
     AgentWorkspaceContext, AgentWorktreeStatus, AvailabilityBatch, AvailabilityBatchOperation,
     AvailabilityDemandStatus, AvailabilityError, AvailabilityReason, AvailabilityStore,
     CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DemandKind, DomainClaim,
-    DomainIndex, DomainName, DomainTarget, EnsureDemandResult, ProjectAvailability,
+    DomainIndex, DomainName, DomainPattern, DomainTarget, EnsureDemandResult, ProjectAvailability,
     ProjectAvailabilityStatus, ProjectDiscovery, ProjectInstanceId, ProjectInstanceOrigin,
     ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock, availability_path,
     sanitize_project_name_for_dns, sanitize_service_name_for_dns,
@@ -82,12 +82,25 @@ fn domain_target_remains_compatible(
             DomainTarget::Service {
                 project_instance_id: expected_instance,
                 service_name: None,
+                ..
             },
             Some(DomainTarget::Service {
                 project_instance_id: current_instance,
                 ..
             }),
         ) => expected_instance == current_instance,
+        (
+            DomainTarget::Service {
+                project_instance_id: expected_instance,
+                service_name: Some(expected_service),
+                ..
+            },
+            Some(DomainTarget::Service {
+                project_instance_id: current_instance,
+                service_name: Some(current_service),
+                ..
+            }),
+        ) => expected_instance == current_instance && expected_service == current_service,
         _ => current == Some(expected),
     }
 }
@@ -1160,7 +1173,7 @@ impl ProcessManager {
         // Controllers handle their own reaping/status updates
     }
 
-    /// Return a cloneable exact-domain snapshot handle for routing and TLS.
+    /// Return a cloneable domain-ownership snapshot handle for routing and TLS.
     #[must_use]
     pub fn domain_index(&self) -> SharedDomainIndex {
         self.domain_index.clone()
@@ -1225,21 +1238,75 @@ impl ProcessManager {
 
         let mut claims = Vec::with_capacity(service_names.len());
         for service_name in service_names {
-            let domain = if service_name == "web" {
-                base_domain.clone()
-            } else {
-                let label = sanitize_service_name_for_dns(&service_name);
-                base_domain
-                    .with_prefix(&label)
-                    .with_context(|| format!("service `{service_name}` has an invalid domain"))?
-            };
-            claims.push(DomainClaim::service(
-                domain,
-                instance_id,
-                format!("{}:{service_name}", config.project.name),
-            ));
+            let service_config = &config.services[&service_name];
+            let runtime_name = format!("{}:{service_name}", config.project.name);
+            match service_config.domains() {
+                None => {
+                    let domain = if service_name == "web" {
+                        base_domain.clone()
+                    } else {
+                        let label = sanitize_service_name_for_dns(&service_name);
+                        base_domain.with_prefix(&label).with_context(|| {
+                            format!("service `{service_name}` has an invalid domain")
+                        })?
+                    };
+                    claims.push(DomainClaim::service(domain, instance_id, runtime_name));
+                }
+                Some(configured_domains) => {
+                    let mut has_primary = false;
+                    for configured_domain in configured_domains {
+                        let pattern =
+                            Self::relative_service_domain(&base_domain, configured_domain)
+                                .with_context(|| {
+                                    format!(
+                                        "service `{service_name}` has invalid relative domain claim `{configured_domain}`"
+                                    )
+                                })?;
+                        let primary = pattern.is_exact() && !has_primary;
+                        has_primary |= primary;
+                        claims.push(DomainClaim::service_pattern(
+                            pattern,
+                            instance_id,
+                            runtime_name.clone(),
+                            primary,
+                        ));
+                    }
+                }
+            }
         }
         Ok(claims)
+    }
+
+    fn relative_service_domain(
+        instance_root: &DomainName,
+        configured: &str,
+    ) -> Result<DomainPattern> {
+        if configured == "@" {
+            return Ok(DomainPattern::exact(instance_root.clone()));
+        }
+        if let Some(relative_suffix) = configured.strip_prefix("*.") {
+            anyhow::ensure!(
+                !relative_suffix.contains('*'),
+                "only one leftmost `*.` wildcard label is supported"
+            );
+            anyhow::ensure!(
+                instance_root.as_str() == "localhost"
+                    || instance_root.as_str().ends_with(".localhost"),
+                "wildcard service domains require a `.localhost` project namespace because custom suffixes do not have wildcard DNS resolution"
+            );
+            let suffix = format!("{relative_suffix}.{instance_root}")
+                .parse::<DomainName>()
+                .context("invalid wildcard suffix")?;
+            return Ok(DomainPattern::wildcard(suffix));
+        }
+        anyhow::ensure!(
+            !configured.contains('*'),
+            "only a leftmost `*.` wildcard label is supported"
+        );
+        let domain = format!("{configured}.{instance_root}")
+            .parse::<DomainName>()
+            .context("invalid exact relative domain")?;
+        Ok(DomainPattern::exact(domain))
     }
 
     fn effective_service_env(
@@ -1418,6 +1485,7 @@ impl ProcessManager {
         &self,
         instance_id: ProjectInstanceId,
         config: &LocaldConfig,
+        candidate_domain_index: Arc<DomainIndex>,
         dot_env_vars: &HashMap<String, String>,
         trusted_launch_path: Option<&str>,
         options: PrepublicationStopOptions<'_>,
@@ -1458,12 +1526,19 @@ impl ProcessManager {
             );
             let manager = self.clone();
             let expected_instance = instance_id;
+            let candidate_domain_index = Arc::clone(&candidate_domain_index);
             let resolved_env =
                 ConfigLoader::resolve_env(&combined_env, config, move |name, field| {
                     let manager = manager.clone();
+                    let candidate_domain_index = Arc::clone(&candidate_domain_index);
                     async move {
                         manager
-                            .get_service_field(&name, &field, expected_instance)
+                            .get_service_field_from_domain_index(
+                                &name,
+                                &field,
+                                expected_instance,
+                                Some(candidate_domain_index),
+                            )
                             .await
                     }
                 })
@@ -1524,7 +1599,7 @@ impl ProcessManager {
                     let static_configuration_matches = !dependency_will_change
                         && has_durable_process_ownership
                         && loaded_project_name == config.project.name
-                        && current_config == *service_config
+                        && current_config.runtime_eq(service_config)
                         && environment_matches;
                     let runtime_is_reusable =
                         match (runtime_state.status, health_status, service_config) {
@@ -2561,6 +2636,36 @@ impl ProcessManager {
         field: &str,
         expected_instance: ProjectInstanceId,
     ) -> Result<String> {
+        self.get_service_field_from_domain_index(name, field, expected_instance, None)
+            .await
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn get_service_field_from_domain_index(
+        &self,
+        name: &str,
+        field: &str,
+        expected_instance: ProjectInstanceId,
+        domain_index: Option<Arc<DomainIndex>>,
+    ) -> Result<String> {
+        if field == "origin" {
+            let domain_index = domain_index.unwrap_or_else(|| self.domain_index.snapshot());
+            let domain = domain_index
+                .domain_for_service(expected_instance, name)
+                .map(ToString::to_string)
+                .with_context(|| {
+                    format!("service `{name}` has no exact domain for a semantic origin")
+                })?;
+            self.wait_for_https_proxy_listener().await?;
+            let advertised_https_port = self
+                .proxy_ports
+                .lock()
+                .await
+                .1
+                .context("locald's HTTPS proxy listener stopped before origin resolution")?;
+            return Ok(Self::agent_https_url(&domain, advertised_https_port));
+        }
+
         // Re-acquire lock to get port, or just get it all at once?
         // The issue is holding the lock across await points or significant drops.
         // Let's get everything we need in one go.
@@ -3214,6 +3319,7 @@ impl ProcessManager {
             };
             let claims = Self::build_domain_claims(instance_id, &config, domain_slug.as_deref())?;
             candidate.replace_domain_claims(instance_id, claims)?;
+            let candidate_domain_index = Arc::new(candidate.domain_index().clone());
 
             // Keep the previous claim set published until every removed or
             // restart-required service has stopped. A failed stop retains both
@@ -3227,6 +3333,7 @@ impl ProcessManager {
                 .prepublication_stop_plan(
                     instance_id,
                     &config,
+                    candidate_domain_index,
                     &dot_env_vars,
                     trusted_launch_path.as_deref(),
                     PrepublicationStopOptions {
@@ -4577,6 +4684,7 @@ impl ProcessManager {
                 Some(DomainTarget::Service {
                     project_instance_id,
                     service_name: Some(service_name),
+                    ..
                 }) => (*project_instance_id, service_name.clone()),
                 Some(DomainTarget::Service {
                     service_name: None, ..
@@ -6467,7 +6575,10 @@ impl ProcessManager {
                             .and_then(|runtime_name| {
                                 self.domain_for_service(instance_id, runtime_name)
                             })
-                            .map(|domain| Self::agent_https_url(&domain, advertised_https_port))
+                            .and_then(|domain| {
+                                advertised_https_port
+                                    .map(|port| Self::agent_https_url(&domain, port))
+                            })
                     };
                     if let Some(url) = &url {
                         urls.insert(url.clone());
@@ -6505,14 +6616,14 @@ impl ProcessManager {
         availability
     }
 
-    fn agent_https_url(domain: &str, advertised_https_port: Option<u16>) -> String {
+    fn agent_https_url(domain: &str, advertised_https_port: u16) -> String {
         match advertised_https_port {
-            Some(443) | None => format!("https://{domain}"),
-            Some(port) => format!("https://{domain}:{port}"),
+            443 => format!("https://{domain}"),
+            port => format!("https://{domain}:{port}"),
         }
     }
 
-    /// Resume the active project that owns one exact domain and wait for readiness.
+    /// Resume the active project that owns one concrete domain and wait for readiness.
     ///
     /// Domain-backed surfaces use this instead of exposing a filesystem path or
     /// starting one service outside the authoritative project lifecycle.
@@ -21830,6 +21941,7 @@ command = "unused-by-test-factory"
         let initial_target = DomainTarget::Service {
             project_instance_id: instance_id,
             service_name: Some("resume:web".to_owned()),
+            primary: true,
         };
         let replacement = DomainIndex::default()
             .replacing_instance(
@@ -21855,6 +21967,7 @@ command = "unused-by-test-factory"
         let initial_target = DomainTarget::Service {
             project_instance_id: instance_id,
             service_name: None,
+            primary: true,
         };
         let replacement = DomainIndex::default()
             .replacing_instance(
@@ -21870,6 +21983,79 @@ command = "unused-by-test-factory"
         assert!(
             domain_target_remains_compatible(&replacement, &domain, &initial_target),
             "a legacy ownership-only claim may become a concrete service in the same project"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_origin_resolves_from_owned_domains_without_a_live_service() {
+        let dir = tempdir().expect("create manager directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let index = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    DomainClaim::service(
+                        "frame.app.localhost".parse().expect("exact frame domain"),
+                        instance_id,
+                        "app:frame".to_owned(),
+                    ),
+                    DomainClaim::service_pattern(
+                        "*.frame.app.localhost"
+                            .parse()
+                            .expect("wildcard frame domain"),
+                        instance_id,
+                        "app:frame".to_owned(),
+                        false,
+                    ),
+                ],
+            )
+            .expect("install semantic domains");
+        manager.domain_index.store(index);
+
+        manager.set_https_port(Some(443)).await;
+        assert_eq!(
+            manager
+                .get_service_field("app:frame", "origin", instance_id)
+                .await
+                .expect("resolve standard origin"),
+            "https://frame.app.localhost"
+        );
+        manager.set_https_port(Some(8443)).await;
+        assert_eq!(
+            manager
+                .get_service_field("app:frame", "origin", instance_id)
+                .await
+                .expect("resolve sandbox origin"),
+            "https://frame.app.localhost:8443"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_origin_waits_for_the_advertised_https_listener() {
+        let dir = tempdir().expect("create manager directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        install_test_claim_for_instance(&manager, instance_id, "frame.app.localhost", "app:frame");
+
+        let resolving = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_service_field("app:frame", "origin", instance_id)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!resolving.is_finished());
+
+        manager.set_https_port(Some(8443)).await;
+        assert_eq!(
+            resolving
+                .await
+                .expect("origin task completes")
+                .expect("origin resolves after listener advertisement"),
+            "https://frame.app.localhost:8443"
         );
     }
 
@@ -22344,6 +22530,90 @@ command = "api"
                 .to_string()
                 .contains("invalid persistent worktree slug")
         );
+    }
+
+    #[test]
+    fn explicit_service_domains_are_relative_to_the_instance_namespace() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "v0"
+domain = "v0.localhost"
+
+[services.web]
+command = "web"
+domains = ["@"]
+
+[services.frame]
+command = "frame"
+domains = ["frame", "*.frame", "frame-alias"]
+
+[services.internal]
+command = "internal"
+domains = []
+"#,
+        )
+        .expect("parse explicit service domains");
+
+        let claims =
+            ProcessManager::build_domain_claims(test_instance_id(), &config, Some("turn-trace"))
+                .expect("build namespaced claims");
+        let claims = claims
+            .into_iter()
+            .map(|claim| {
+                let primary = matches!(claim.target, DomainTarget::Service { primary: true, .. });
+                (claim.domain.to_string(), primary)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            claims,
+            BTreeMap::from([
+                ("frame-alias.turn-trace.on.v0.localhost".to_owned(), false,),
+                ("frame.turn-trace.on.v0.localhost".to_owned(), true),
+                ("turn-trace.on.v0.localhost".to_owned(), true),
+                ("*.frame.turn-trace.on.v0.localhost".to_owned(), false),
+            ])
+        );
+    }
+
+    #[test]
+    fn explicit_service_domains_reject_non_leftmost_wildcards() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "web"
+domains = ["frame.*"]
+"#,
+        )
+        .expect("parse syntactic config");
+
+        let error = ProcessManager::build_domain_claims(test_instance_id(), &config, None)
+            .expect_err("invalid wildcard must fail before publication");
+        assert!(format!("{error:#}").contains("leftmost `*.` wildcard"));
+    }
+
+    #[test]
+    fn explicit_service_wildcards_require_native_localhost_resolution() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+domain = "app.test"
+
+[services.frame]
+command = "frame"
+domains = ["frame", "*.frame"]
+"#,
+        )
+        .expect("parse custom-domain config");
+
+        let error = ProcessManager::build_domain_claims(test_instance_id(), &config, None)
+            .expect_err("custom suffix cannot publish an unresolved wildcard");
+        assert!(format!("{error:#}").contains("require a `.localhost` project namespace"));
     }
 
     #[tokio::test]
@@ -27572,6 +27842,7 @@ command = "api"
             .prepublication_stop_plan(
                 test_instance_id(),
                 &next_config,
+                manager.domain_index.snapshot(),
                 &dot_env_vars,
                 None,
                 PrepublicationStopOptions {
@@ -27589,6 +27860,240 @@ command = "api"
             ["api", "web", "db"].map(|name| test_service_key(test_instance_id(), name))
         );
         assert!(plan.reusable_service_envs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepublication_plan_uses_candidate_semantic_origin() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("origin-reload-project");
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        manager.set_https_port(Some(443)).await;
+        let previous_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+domain = "first.localhost"
+
+[services.web]
+type = "site"
+path = "public"
+
+[services.web.env]
+PUBLIC_ORIGIN = "${services.web.origin}"
+"#,
+        )
+        .expect("parse previous config");
+        let next_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+domain = "second.localhost"
+
+[services.web]
+type = "site"
+path = "public"
+
+[services.web.env]
+PUBLIC_ORIGIN = "${services.web.origin}"
+"#,
+        )
+        .expect("parse next config");
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind healthy service port");
+        let service_port = listener.local_addr().expect("read service port").port();
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "reload:web",
+                RuntimeState {
+                    pid: Some(42),
+                    port: Some(service_port),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let mut service = test_service(
+            previous_config,
+            next_config.services["web"].clone(),
+            ServiceRuntime::Controller(controller),
+            project_path,
+        );
+        service.resolved_env.insert(
+            "PUBLIC_ORIGIN".to_owned(),
+            "https://first.localhost".to_owned(),
+        );
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("reload:web".to_owned(), service);
+
+        let claims = ProcessManager::build_domain_claims(test_instance_id(), &next_config, None)
+            .expect("build candidate claims");
+        let candidate_domain_index = Arc::new(
+            DomainIndex::default()
+                .replacing_instance(test_instance_id(), claims)
+                .expect("build candidate domain index"),
+        );
+        let desired_service_names = HashSet::from([test_service_key(test_instance_id(), "web")]);
+
+        let plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &next_config,
+                Arc::clone(&candidate_domain_index),
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["web".to_owned()],
+                    desired_service_names: &desired_service_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
+            )
+            .await
+            .expect("build semantic-origin transition plan");
+
+        assert_eq!(
+            plan.restart_service_names,
+            [test_service_key(test_instance_id(), "web")]
+        );
+        assert!(plan.reusable_service_envs.is_empty());
+
+        manager
+            .services
+            .lock()
+            .await
+            .get_display_mut("reload:web")
+            .expect("loaded web service")
+            .resolved_env
+            .insert(
+                "PUBLIC_ORIGIN".to_owned(),
+                "https://second.localhost".to_owned(),
+            );
+        let reuse_plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &next_config,
+                candidate_domain_index,
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["web".to_owned()],
+                    desired_service_names: &desired_service_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
+            )
+            .await
+            .expect("build reusable semantic-origin transition plan");
+
+        assert!(reuse_plan.restart_service_names.is_empty());
+        assert_eq!(
+            reuse_plan
+                .reusable_service_envs
+                .get(&test_service_key(test_instance_id(), "web"))
+                .and_then(|env| env.get("PUBLIC_ORIGIN"))
+                .map(String::as_str),
+            Some("https://second.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepublication_plan_reuses_runtime_for_alias_only_domain_changes() {
+        let dir = tempdir().expect("create temporary directory");
+        let project_path = dir.path().join("alias-reload-project");
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        let previous_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+
+[services.web]
+type = "site"
+path = "public"
+domains = ["web"]
+"#,
+        )
+        .expect("parse previous config");
+        let next_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reload"
+
+[services.web]
+type = "site"
+path = "public"
+domains = ["web", "web-alias", "*.preview"]
+"#,
+        )
+        .expect("parse next config");
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "reload:web",
+                RuntimeState {
+                    pid: Some(42),
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let service = test_service(
+            previous_config.clone(),
+            previous_config.services["web"].clone(),
+            ServiceRuntime::Controller(controller),
+            project_path,
+        );
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("reload:web".to_owned(), service);
+        let claims = ProcessManager::build_domain_claims(test_instance_id(), &next_config, None)
+            .expect("build candidate claims");
+        let candidate_domain_index = Arc::new(
+            DomainIndex::default()
+                .replacing_instance(test_instance_id(), claims)
+                .expect("build candidate domain index"),
+        );
+        let desired_service_names = HashSet::from([test_service_key(test_instance_id(), "web")]);
+
+        let plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &next_config,
+                candidate_domain_index,
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["web".to_owned()],
+                    desired_service_names: &desired_service_names,
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                },
+            )
+            .await
+            .expect("build alias-only transition plan");
+
+        assert!(plan.restart_service_names.is_empty());
+        assert!(
+            plan.reusable_service_envs
+                .contains_key(&test_service_key(test_instance_id(), "web"))
+        );
     }
 
     #[tokio::test]
@@ -27688,6 +28193,7 @@ path = "ready"
             .prepublication_stop_plan(
                 test_instance_id(),
                 &config,
+                manager.domain_index.snapshot(),
                 &HashMap::new(),
                 None,
                 PrepublicationStopOptions {
@@ -27797,6 +28303,7 @@ type = "postgres"
             .prepublication_stop_plan(
                 test_instance_id(),
                 &next_config,
+                manager.domain_index.snapshot(),
                 &HashMap::new(),
                 None,
                 PrepublicationStopOptions {
@@ -27965,6 +28472,7 @@ type = "postgres"
             .prepublication_stop_plan(
                 second_instance,
                 &second_config,
+                manager.domain_index.snapshot(),
                 &HashMap::new(),
                 None,
                 PrepublicationStopOptions {
@@ -28607,6 +29115,80 @@ type = "postgres"
                 status: ServiceState::Running,
             } if name == "active:web"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_service_by_domain_uses_one_label_wildcard_owner() {
+        let dir = tempdir().expect("create temporary directory");
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        let running_controller = Arc::new(Mutex::new(TestController::new(
+            "app:frame",
+            RuntimeState {
+                pid: Some(123),
+                port: Some(3_000),
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+        )));
+        manager.services.lock().await.insert_display(
+            "app:frame".to_owned(),
+            test_service(
+                test_config_with_domain("app", "app.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(running_controller),
+                dir.path().join("app"),
+            ),
+        );
+        let index = DomainIndex::default()
+            .replacing_instance(
+                test_instance_id(),
+                [
+                    DomainClaim::service(
+                        "frame.app.localhost".parse().expect("valid frame origin"),
+                        test_instance_id(),
+                        "app:frame".to_owned(),
+                    ),
+                    DomainClaim::service_pattern(
+                        "*.frame.app.localhost"
+                            .parse()
+                            .expect("valid wildcard claim"),
+                        test_instance_id(),
+                        "app:frame".to_owned(),
+                        false,
+                    ),
+                ],
+            )
+            .expect("install wildcard owner");
+        manager.domain_index.store(index);
+
+        let resolution = manager
+            .resolve_service_by_domain("preview.frame.app.localhost")
+            .await
+            .expect("resolve concrete wildcard-owned hostname");
+
+        assert!(matches!(
+            resolution,
+            locald_core::resolver::DomainResolution::Service {
+                ref name,
+                port: Some(3_000),
+                status: ServiceState::Running,
+            } if name == "app:frame"
+        ));
+        assert!(
+            manager
+                .resolve_service_by_domain("deep.preview.frame.app.localhost")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

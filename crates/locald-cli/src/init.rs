@@ -80,6 +80,7 @@ pub fn run() -> Result<()> {
         let service_config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
             common: CommonServiceConfig {
                 port,
+                domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
                 health_check: None,

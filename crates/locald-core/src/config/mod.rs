@@ -324,6 +324,14 @@ pub struct CommonServiceConfig {
     /// The port the service listens on. If None, locald will assign a port and pass it via PORT env var.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Relative domain claims for this service.
+    ///
+    /// `@` claims the project-instance root, plain values claim exact relative
+    /// names, and a leftmost `*.` claims exactly one relative DNS label. When
+    /// omitted, locald preserves its conventional service-domain mapping. The
+    /// first exact claim is the service's canonical semantic origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
     /// Environment variables to pass to the service.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
@@ -520,12 +528,40 @@ impl ServiceConfig {
         &self.common().env
     }
 
+    pub fn domains(&self) -> Option<&[String]> {
+        self.common().domains.as_deref()
+    }
+
+    /// Return whether two service definitions require the same runtime.
+    ///
+    /// Domain aliases and wildcard claims are proxy ownership. A changed
+    /// canonical origin still changes any resolved `${services.*.origin}`
+    /// environment and is therefore detected separately by the manager.
+    #[must_use]
+    pub fn runtime_eq(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.common_mut().domains = None;
+        right.common_mut().domains = None;
+        left == right
+    }
+
     pub const fn depends_on(&self) -> &Vec<String> {
         &self.common().depends_on
     }
 
     pub const fn health_check(&self) -> Option<&HealthCheckConfig> {
         self.common().health_check.as_ref()
+    }
+
+    const fn common_mut(&mut self) -> &mut CommonServiceConfig {
+        match self {
+            Self::Typed(TypedServiceConfig::Exec(c)) | Self::Legacy(c) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Postgres(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Worker(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Container(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Site(c)) => &mut c.common,
+        }
     }
 }
 
@@ -538,6 +574,7 @@ mod tests {
         let service_config = ServiceConfig::Legacy(ExecServiceConfig {
             common: CommonServiceConfig {
                 port: None,
+                domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
                 health_check: None,
@@ -575,6 +612,33 @@ mod tests {
         assert!(toml_string.contains("command = \"echo hello\""));
         assert!(toml_string.contains("[project]"));
         assert!(toml_string.contains("name = \"test-project\""));
+    }
+
+    #[test]
+    fn runtime_equality_ignores_only_domain_claims() {
+        let mut current: ServiceConfig = toml::from_str(
+            r#"
+command = "serve"
+domains = ["frame", "*.frame"]
+"#,
+        )
+        .expect("parse current service");
+        let mut candidate = current.clone();
+        candidate.common_mut().domains = Some(
+            ["frame", "preview"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+
+        assert!(current.runtime_eq(&candidate));
+
+        current.common_mut().env.insert("MODE".into(), "old".into());
+        candidate
+            .common_mut()
+            .env
+            .insert("MODE".into(), "new".into());
+        assert!(!current.runtime_eq(&candidate));
     }
 
     #[test]

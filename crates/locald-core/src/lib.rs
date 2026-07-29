@@ -105,7 +105,7 @@ pub use catalog::{
 };
 #[doc(inline)]
 pub use domain::{
-    DomainClaim, DomainError, DomainIndex, DomainName, DomainTarget, PlatformDomain,
+    DomainClaim, DomainError, DomainIndex, DomainName, DomainPattern, DomainTarget, PlatformDomain,
     SharedDomainIndex, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 #[doc(inline)]
