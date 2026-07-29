@@ -126,6 +126,7 @@ impl locald_core::resolver::ServiceResolver for MockResolver {
             name: "mock-service".to_string(),
             port: self.port,
             status: self.status,
+            runtime_generation: 1,
         })
     }
     async fn set_http_port(&self, _port: Option<u16>) {}

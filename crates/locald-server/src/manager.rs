@@ -4696,20 +4696,23 @@ impl ProcessManager {
             let services = self.services.lock().await;
             Self::service_key_for_instance(&services, claimed_instance_id, &service_name).and_then(
                 |key| {
-                    services
-                        .get(&key)
-                        .map(|service| service.runtime_state.clone())
+                    services.get(&key).map(|service| {
+                        (service.runtime_state.clone(), service.controller_generation)
+                    })
                 },
             )
         };
         match runtime {
             None => Some(locald_core::resolver::DomainResolution::OwnershipOnly),
-            Some(ServiceRuntime::None) => Some(locald_core::resolver::DomainResolution::Service {
-                name: service_name,
-                port: None,
-                status: locald_core::state::ServiceState::Stopped,
-            }),
-            Some(ServiceRuntime::Controller(controller)) => {
+            Some((ServiceRuntime::None, runtime_generation)) => {
+                Some(locald_core::resolver::DomainResolution::Service {
+                    name: service_name,
+                    port: None,
+                    status: locald_core::state::ServiceState::Stopped,
+                    runtime_generation,
+                })
+            }
+            Some((ServiceRuntime::Controller(controller), runtime_generation)) => {
                 let runtime = controller.lock().await.read_state().await;
                 let port = (runtime.status == locald_core::state::ServiceState::Running)
                     .then_some(runtime.port)
@@ -4718,6 +4721,7 @@ impl ProcessManager {
                     name: service_name,
                     port,
                     status: runtime.status,
+                    runtime_generation,
                 })
             }
         }
@@ -28563,6 +28567,7 @@ type = "postgres"
                 ref name,
                 port: None,
                 status: ServiceState::Stopped,
+                ..
             }) if name == "app:web"
         ));
         assert!(matches!(
@@ -28573,6 +28578,7 @@ type = "postgres"
                 ref name,
                 port: Some(4242),
                 status: ServiceState::Running,
+                ..
             }) if name == "app:web"
         ));
 
@@ -29113,6 +29119,7 @@ type = "postgres"
                 ref name,
                 port: Some(3000),
                 status: ServiceState::Running,
+                ..
             } if name == "active:web"
         ));
     }
@@ -29181,6 +29188,7 @@ type = "postgres"
                 ref name,
                 port: Some(3_000),
                 status: ServiceState::Running,
+                ..
             } if name == "app:frame"
         ));
         assert!(
@@ -29255,6 +29263,7 @@ type = "postgres"
                 ref name,
                 port: Some(4000),
                 status: ServiceState::Running,
+                ..
             } if name == "active:web"
         ));
     }
@@ -29317,6 +29326,7 @@ type = "postgres"
                 ref name,
                 port: None,
                 status: ServiceState::Building,
+                ..
             } if name == "builder:web"
         ));
     }
@@ -29361,6 +29371,7 @@ type = "postgres"
                 ref name,
                 port: None,
                 status: ServiceState::Stopped,
+                ..
             } if name == "stale:web"
         ));
     }
