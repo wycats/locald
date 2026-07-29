@@ -324,6 +324,14 @@ pub struct CommonServiceConfig {
     /// The port the service listens on. If None, locald will assign a port and pass it via PORT env var.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Relative domain claims for this service.
+    ///
+    /// `@` claims the project-instance root, plain values claim exact relative
+    /// names, and a leftmost `*.` claims exactly one relative DNS label. When
+    /// omitted, locald preserves its conventional service-domain mapping. The
+    /// first exact claim is the service's canonical semantic origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
     /// Environment variables to pass to the service.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
@@ -520,6 +528,10 @@ impl ServiceConfig {
         &self.common().env
     }
 
+    pub fn domains(&self) -> Option<&[String]> {
+        self.common().domains.as_deref()
+    }
+
     pub const fn depends_on(&self) -> &Vec<String> {
         &self.common().depends_on
     }
@@ -538,6 +550,7 @@ mod tests {
         let service_config = ServiceConfig::Legacy(ExecServiceConfig {
             common: CommonServiceConfig {
                 port: None,
+                domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
                 health_check: None,

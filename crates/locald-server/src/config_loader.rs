@@ -184,6 +184,9 @@ impl ConfigLoader {
         if let Some(port) = override_svc.common.port {
             base.common.port = Some(port);
         }
+        if override_svc.common.domains.is_some() {
+            base.common.domains.clone_from(&override_svc.common.domains);
+        }
         if !override_svc.common.depends_on.is_empty() {
             base.common
                 .depends_on
@@ -574,6 +577,7 @@ impl ConfigLoader {
                     ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
                         common: CommonServiceConfig {
                             port: None, // Will be assigned
+                            domains: None,
                             env: HashMap::new(),
                             depends_on: Vec::new(),
                             health_check: None,
@@ -587,6 +591,7 @@ impl ConfigLoader {
                     ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
                         common: CommonServiceConfig {
                             port: None,
+                            domains: None,
                             env: HashMap::new(),
                             depends_on: Vec::new(),
                             health_check: None,
@@ -679,9 +684,10 @@ impl ConfigLoader {
     /// Validate service references without consulting mutable runtime state.
     ///
     /// This is the declarative validation phase for `${services.name.field}`
-    /// interpolation. It runs before project identity and domain ownership are
-    /// published; runtime values are resolved later, after dependencies become
-    /// ready.
+    /// interpolation. Runtime host/port/URL values require a dependency and
+    /// are resolved after that dependency becomes ready. Semantic `origin`
+    /// values come from declarative domain ownership, so they may reference
+    /// the current service or another service without creating a dependency.
     pub(crate) fn validate_env_references(
         env: &HashMap<String, String>,
         config: &LocaldConfig,
@@ -728,15 +734,34 @@ impl ConfigLoader {
                             "environment variable `{env_name}` references `{service_name}.{field}`, but worker services have no {field}"
                         );
                     }
+                    "origin" => {
+                        anyhow::ensure!(
+                            !matches!(
+                                service,
+                                ServiceConfig::Typed(
+                                    TypedServiceConfig::Worker(_) | TypedServiceConfig::Postgres(_)
+                                )
+                            ),
+                            "environment variable `{env_name}` references `{service_name}.origin`, but that service type has no routable HTTP origin"
+                        );
+                        anyhow::ensure!(
+                            service.domains().is_none_or(|domains| {
+                                domains.iter().any(|domain| !domain.starts_with("*."))
+                            }),
+                            "environment variable `{env_name}` references `{service_name}.origin`, but that service declares no exact domain"
+                        );
+                    }
                     _ => anyhow::bail!(
                         "environment variable `{env_name}` references unknown field `{field}` on service `{service_name}`"
                     ),
                 }
 
-                anyhow::ensure!(
-                    dependencies.contains(service_name),
-                    "environment variable `{env_name}` references service `{service_name}`, but service `{consumer_name}` does not depend on it; add `{service_name}` to `{consumer_name}.depends_on`"
-                );
+                if field != "origin" {
+                    anyhow::ensure!(
+                        dependencies.contains(service_name),
+                        "environment variable `{env_name}` references service `{service_name}`, but service `{consumer_name}` does not depend on it; add `{service_name}` to `{consumer_name}.depends_on`"
+                    );
+                }
             }
         }
 
@@ -884,6 +909,123 @@ depends_on = ["db", "jobs"]
         let error = ConfigLoader::validate_env_references(&self_reference, &config, "web")
             .expect_err("self-reference must fail before ownership publication");
         assert!(error.to_string().contains("service `web` does not depend"));
+    }
+
+    #[test]
+    fn semantic_origins_allow_self_and_cross_service_references_without_dependencies() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "v0"
+
+[services.web]
+command = "web"
+domains = ["@"]
+
+[services.frame]
+command = "frame"
+domains = ["frame", "*.frame"]
+"#,
+        )
+        .expect("parse service domains");
+        let web_env = HashMap::from([
+            (
+                "MAIN_ORIGIN".to_owned(),
+                "${services.web.origin}".to_owned(),
+            ),
+            (
+                "FRAME_ORIGIN".to_owned(),
+                "${services.frame.origin}".to_owned(),
+            ),
+        ]);
+
+        ConfigLoader::validate_env_references(&web_env, &config, "web")
+            .expect("semantic origins do not create runtime dependency edges");
+    }
+
+    #[test]
+    fn semantic_origin_requires_an_exact_routable_domain() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "web"
+domains = ["*.preview"]
+
+[services.worker]
+type = "worker"
+command = "worker"
+
+[services.database]
+type = "postgres"
+"#,
+        )
+        .expect("parse services");
+
+        let wildcard_only =
+            HashMap::from([("ORIGIN".to_owned(), "${services.web.origin}".to_owned())]);
+        let error = ConfigLoader::validate_env_references(&wildcard_only, &config, "worker")
+            .expect_err("wildcard-only services have no canonical origin");
+        assert!(error.to_string().contains("declares no exact domain"));
+
+        let worker_origin =
+            HashMap::from([("ORIGIN".to_owned(), "${services.worker.origin}".to_owned())]);
+        let error = ConfigLoader::validate_env_references(&worker_origin, &config, "web")
+            .expect_err("workers have no routable origin");
+        assert!(error.to_string().contains("no routable HTTP origin"));
+
+        let postgres_origin = HashMap::from([(
+            "ORIGIN".to_owned(),
+            "${services.database.origin}".to_owned(),
+        )]);
+        let error = ConfigLoader::validate_env_references(&postgres_origin, &config, "web")
+            .expect_err("databases have no HTTP origin");
+        assert!(error.to_string().contains("no routable HTTP origin"));
+    }
+
+    #[test]
+    fn layered_exec_config_can_preserve_or_clear_domain_claims() {
+        let mut base: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "base"
+domains = ["@", "*.preview"]
+"#,
+        )
+        .expect("parse base config");
+        let preserve: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "preserve"
+"#,
+        )
+        .expect("parse preserving override");
+        ConfigLoader::merge_service_configs(&mut base.services, &preserve.services);
+        assert_eq!(
+            base.services["web"].domains(),
+            Some(&["@".to_owned(), "*.preview".to_owned()] as &[String])
+        );
+
+        let clear: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+domains = []
+"#,
+        )
+        .expect("parse clearing override");
+        ConfigLoader::merge_service_configs(&mut base.services, &clear.services);
+        assert_eq!(base.services["web"].domains(), Some(&[] as &[String]));
     }
 
     #[tokio::test]

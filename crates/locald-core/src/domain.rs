@@ -1,8 +1,8 @@
-//! Exact domain ownership shared by routing, status, hosts, and TLS.
+//! Domain ownership shared by routing, status, hosts, and TLS.
 
 use crate::identity::ProjectInstanceId;
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -55,7 +55,7 @@ pub(crate) fn sanitize_dns_label(value: &str, empty_fallback: &str) -> String {
 /// A normalized exact DNS hostname.
 ///
 /// Names are ASCII lowercase and omit the optional trailing root dot. Wildcard
-/// claims are intentionally outside this milestone.
+/// ownership composes this exact type as a suffix through [`DomainPattern`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct DomainName(String);
@@ -111,7 +111,7 @@ impl FromStr for DomainName {
         if value.contains('*') {
             return Err(DomainError::InvalidName {
                 value: value.to_owned(),
-                reason: "wildcard claims are not supported by the exact domain index".to_owned(),
+                reason: "wildcard syntax is not valid in an exact hostname".to_owned(),
             });
         }
 
@@ -180,6 +180,121 @@ impl<'de> Deserialize<'de> for DomainName {
     }
 }
 
+/// An exact hostname or a leftmost, one-label wildcard claim.
+///
+/// Wildcards are stored by their exact suffix and serialize in the familiar
+/// `*.example.localhost` form. A wildcard matches exactly one additional DNS
+/// label; it never absorbs multiple labels.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
+#[schemars(with = "String")]
+pub enum DomainPattern {
+    Exact(DomainName),
+    Wildcard(DomainName),
+}
+
+impl DomainPattern {
+    /// Build an exact claim.
+    #[must_use]
+    pub const fn exact(domain: DomainName) -> Self {
+        Self::Exact(domain)
+    }
+
+    /// Build a one-label wildcard claim from its exact suffix.
+    #[must_use]
+    pub const fn wildcard(suffix: DomainName) -> Self {
+        Self::Wildcard(suffix)
+    }
+
+    /// Return the underlying exact name or wildcard suffix.
+    #[must_use]
+    pub const fn domain(&self) -> &DomainName {
+        match self {
+            Self::Exact(domain) | Self::Wildcard(domain) => domain,
+        }
+    }
+
+    /// Return whether this is an exact claim.
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+
+    /// Return whether this pattern owns a concrete hostname.
+    #[must_use]
+    pub fn matches(&self, concrete: &DomainName) -> bool {
+        match self {
+            Self::Exact(domain) => domain == concrete,
+            Self::Wildcard(suffix) => {
+                let Some(prefix) = concrete
+                    .as_str()
+                    .strip_suffix(suffix.as_str())
+                    .and_then(|prefix| prefix.strip_suffix('.'))
+                else {
+                    return false;
+                };
+                !prefix.is_empty() && !prefix.contains('.')
+            }
+        }
+    }
+}
+
+impl fmt::Display for DomainPattern {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(domain) => domain.fmt(formatter),
+            Self::Wildcard(suffix) => write!(formatter, "*.{suffix}"),
+        }
+    }
+}
+
+impl From<DomainName> for DomainPattern {
+    fn from(domain: DomainName) -> Self {
+        Self::Exact(domain)
+    }
+}
+
+impl FromStr for DomainPattern {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(suffix) = value.strip_prefix("*.") {
+            if suffix.contains('*') {
+                return Err(DomainError::InvalidName {
+                    value: value.to_owned(),
+                    reason: "only one leftmost `*.` wildcard label is supported".to_owned(),
+                });
+            }
+            return suffix.parse::<DomainName>().map(Self::Wildcard);
+        }
+        if value.contains('*') {
+            return Err(DomainError::InvalidName {
+                value: value.to_owned(),
+                reason: "only a leftmost `*.` wildcard label is supported".to_owned(),
+            });
+        }
+        value.parse::<DomainName>().map(Self::Exact)
+    }
+}
+
+impl Serialize for DomainPattern {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DomainPattern {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// A locald-owned platform surface used when no project service overrides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,7 +305,7 @@ pub enum PlatformDomain {
     DocsDev,
 }
 
-/// The durable owner and routing target for one exact hostname.
+/// The durable owner and routing target for one domain claim.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DomainTarget {
@@ -202,7 +317,17 @@ pub enum DomainTarget {
         /// Legacy flat claims may not identify their service. All newly applied
         /// configuration records the full runtime service name.
         service_name: Option<String>,
+        /// The exact claim used as the service's canonical semantic origin.
+        ///
+        /// Catalogs written before multi-domain services implicitly contain
+        /// exactly one claim per service, so a missing field remains primary.
+        #[serde(default = "default_primary_domain")]
+        primary: bool,
     },
+}
+
+const fn default_primary_domain() -> bool {
+    true
 }
 
 impl fmt::Display for DomainTarget {
@@ -212,6 +337,7 @@ impl fmt::Display for DomainTarget {
             Self::Service {
                 project_instance_id,
                 service_name,
+                ..
             } => match service_name {
                 Some(service_name) => {
                     write!(
@@ -225,11 +351,11 @@ impl fmt::Display for DomainTarget {
     }
 }
 
-/// One desired exact hostname claim.
+/// One desired exact or one-label wildcard hostname claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DomainClaim {
-    pub domain: DomainName,
+    pub domain: DomainPattern,
     pub target: DomainTarget,
 }
 
@@ -241,11 +367,28 @@ impl DomainClaim {
         project_instance_id: ProjectInstanceId,
         service_name: String,
     ) -> Self {
+        Self::service_pattern(
+            DomainPattern::Exact(domain),
+            project_instance_id,
+            service_name,
+            true,
+        )
+    }
+
+    /// Build a service claim with explicit pattern and canonical-origin status.
+    #[must_use]
+    pub const fn service_pattern(
+        domain: DomainPattern,
+        project_instance_id: ProjectInstanceId,
+        service_name: String,
+        primary: bool,
+    ) -> Self {
         Self {
             domain,
             target: DomainTarget::Service {
                 project_instance_id,
                 service_name: Some(service_name),
+                primary,
             },
         }
     }
@@ -254,20 +397,23 @@ impl DomainClaim {
     #[must_use]
     pub const fn legacy(domain: DomainName, project_instance_id: ProjectInstanceId) -> Self {
         Self {
-            domain,
+            domain: DomainPattern::Exact(domain),
             target: DomainTarget::Service {
                 project_instance_id,
                 service_name: None,
+                primary: true,
             },
         }
     }
 }
 
-/// A complete immutable snapshot of all exact domains owned by locald.
+/// A complete immutable snapshot of all domains owned by locald.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DomainIndex {
     claims: BTreeMap<DomainName, DomainTarget>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    wildcard_claims: BTreeMap<DomainName, DomainTarget>,
 }
 
 impl Default for DomainIndex {
@@ -279,7 +425,10 @@ impl Default for DomainIndex {
                 DomainTarget::Platform { surface: *surface },
             );
         }
-        Self { claims }
+        Self {
+            claims,
+            wildcard_claims: BTreeMap::new(),
+        }
     }
 }
 
@@ -296,21 +445,35 @@ const PLATFORM_DOMAINS: &[(&str, PlatformDomain)] = &[
 ];
 
 impl DomainIndex {
-    /// Return the exact target for a normalized or normalizable hostname.
+    /// Return the owner for a normalized or normalizable concrete hostname.
+    ///
+    /// Exact ownership wins over a wildcard. Wildcards match exactly one
+    /// leading label.
     #[must_use]
     pub fn resolve(&self, domain: &str) -> Option<&DomainTarget> {
         let domain = domain.parse::<DomainName>().ok()?;
-        self.claims.get(&domain)
+        self.claims.get(&domain).or_else(|| {
+            self.wildcard_claims
+                .iter()
+                .filter(|(suffix, _)| DomainPattern::Wildcard((*suffix).clone()).matches(&domain))
+                .max_by_key(|(suffix, _)| suffix.as_str().len())
+                .map(|(_, target)| target)
+        })
     }
 
-    /// Return the complete persisted map.
+    /// Return the complete persisted exact-claim map.
     #[must_use]
     pub const fn claims(&self) -> &BTreeMap<DomainName, DomainTarget> {
         &self.claims
     }
 
-    /// Return an instance service's exact domain. Milestone A assigns one claim
-    /// per service within each project instance.
+    /// Return the complete persisted wildcard-suffix map.
+    #[must_use]
+    pub const fn wildcard_claims(&self) -> &BTreeMap<DomainName, DomainTarget> {
+        &self.wildcard_claims
+    }
+
+    /// Return an instance service's canonical exact domain.
     #[must_use]
     pub fn domain_for_service(
         &self,
@@ -323,6 +486,7 @@ impl DomainIndex {
                 DomainTarget::Service {
                     project_instance_id,
                     service_name: Some(candidate),
+                    primary: true,
                 } if *project_instance_id == instance_id && candidate == service_name => {
                     Some(domain)
                 }
@@ -395,10 +559,11 @@ impl DomainIndex {
             .collect()
     }
 
-    /// Return every exact hostname owned by one project instance.
+    /// Return every exact and wildcard claim owned by one project instance.
     #[must_use]
     pub fn domains_for_instance(&self, instance_id: ProjectInstanceId) -> BTreeSet<String> {
-        self.claims
+        let exact = self
+            .claims
             .iter()
             .filter_map(|(domain, target)| match target {
                 DomainTarget::Service {
@@ -407,6 +572,20 @@ impl DomainIndex {
                 } if *project_instance_id == instance_id => Some(domain.to_string()),
                 DomainTarget::Platform { .. } | DomainTarget::Service { .. } => None,
             })
+            .collect::<BTreeSet<_>>();
+        exact
+            .into_iter()
+            .chain(
+                self.wildcard_claims
+                    .iter()
+                    .filter_map(|(suffix, target)| match target {
+                        DomainTarget::Service {
+                            project_instance_id,
+                            ..
+                        } if *project_instance_id == instance_id => Some(format!("*.{suffix}")),
+                        DomainTarget::Platform { .. } | DomainTarget::Service { .. } => None,
+                    }),
+            )
             .collect()
     }
 
@@ -426,9 +605,19 @@ impl DomainIndex {
                 } if *project_instance_id == instance_id
             )
         });
+        replacement.wildcard_claims.retain(|_, target| {
+            !matches!(
+                target,
+                DomainTarget::Service {
+                    project_instance_id,
+                    ..
+                } if *project_instance_id == instance_id
+            )
+        });
         replacement.restore_platform_fallbacks();
 
-        let mut incoming = BTreeMap::<DomainName, DomainTarget>::new();
+        let mut incoming_exact = BTreeMap::<DomainName, DomainTarget>::new();
+        let mut incoming_wildcards = BTreeMap::<DomainName, DomainTarget>::new();
         for claim in desired {
             match &claim.target {
                 DomainTarget::Service {
@@ -453,29 +642,49 @@ impl DomainIndex {
                 }
             }
 
-            if let Some(existing) = incoming.insert(claim.domain.clone(), claim.target.clone()) {
+            let incoming = match &claim.domain {
+                DomainPattern::Exact(_) => &mut incoming_exact,
+                DomainPattern::Wildcard(_) => &mut incoming_wildcards,
+            };
+            if let Some(existing) =
+                incoming.insert(claim.domain.domain().clone(), claim.target.clone())
+            {
                 return Err(DomainError::Conflict {
                     domain: claim.domain,
-                    existing,
-                    requested: claim.target,
+                    existing: Box::new(existing),
+                    requested: Box::new(claim.target),
                 });
             }
         }
 
-        for (domain, target) in incoming {
+        for (domain, target) in incoming_exact {
             match replacement.claims.get(&domain) {
                 Some(DomainTarget::Platform { .. }) if platform_surface(&domain).is_some() => {
                     replacement.claims.insert(domain, target);
                 }
                 Some(existing) => {
                     return Err(DomainError::Conflict {
-                        domain,
-                        existing: existing.clone(),
-                        requested: target,
+                        domain: DomainPattern::Exact(domain),
+                        existing: Box::new(existing.clone()),
+                        requested: Box::new(target),
                     });
                 }
                 None => {
                     replacement.claims.insert(domain, target);
+                }
+            }
+        }
+        for (suffix, target) in incoming_wildcards {
+            match replacement.wildcard_claims.get(&suffix) {
+                Some(existing) => {
+                    return Err(DomainError::Conflict {
+                        domain: DomainPattern::Wildcard(suffix),
+                        existing: Box::new(existing.clone()),
+                        requested: Box::new(target),
+                    });
+                }
+                None => {
+                    replacement.wildcard_claims.insert(suffix, target);
                 }
             }
         }
@@ -491,7 +700,7 @@ impl DomainIndex {
         }
     }
 
-    /// Check platform fallbacks, exact owners, and per-instance service targets.
+    /// Check platform fallbacks, owners, and canonical service origins.
     pub fn validate(&self) -> Result<(), DomainError> {
         for (name, surface) in PLATFORM_DOMAINS {
             let domain = DomainName((*name).to_owned());
@@ -501,16 +710,17 @@ impl DomainIndex {
                     if actual == &expected || matches!(actual, DomainTarget::Service { .. }) => {}
                 Some(actual) => {
                     return Err(DomainError::Conflict {
-                        domain,
-                        existing: expected,
-                        requested: actual.clone(),
+                        domain: DomainPattern::Exact(domain),
+                        existing: Box::new(expected),
+                        requested: Box::new(actual.clone()),
                     });
                 }
                 None => return Err(DomainError::MissingPlatformDomain { domain }),
             }
         }
 
-        let mut runtime_services = BTreeMap::<(ProjectInstanceId, &str), &DomainName>::new();
+        let mut claimed_services = BTreeSet::<(ProjectInstanceId, &str)>::new();
+        let mut primary_domains = BTreeMap::<(ProjectInstanceId, &str), &DomainName>::new();
         for (domain, target) in &self.claims {
             match target {
                 DomainTarget::Platform { surface } => {
@@ -524,22 +734,60 @@ impl DomainIndex {
                 DomainTarget::Service {
                     project_instance_id,
                     service_name: Some(service_name),
+                    primary,
                 } => {
-                    if let Some(existing_domain) =
-                        runtime_services.insert((*project_instance_id, service_name), domain)
+                    claimed_services.insert((*project_instance_id, service_name));
+                    if *primary
+                        && let Some(existing_domain) =
+                            primary_domains.insert((*project_instance_id, service_name), domain)
                     {
-                        return Err(DomainError::RuntimeServiceConflict {
+                        return Err(DomainError::PrimaryDomainConflict {
                             service_name: service_name.clone(),
                             existing_domain: existing_domain.clone(),
-                            existing_instance: *project_instance_id,
+                            instance_id: *project_instance_id,
                             requested_domain: domain.clone(),
-                            requested_instance: *project_instance_id,
                         });
                     }
                 }
                 DomainTarget::Service {
                     service_name: None, ..
                 } => {}
+            }
+        }
+        for (suffix, target) in &self.wildcard_claims {
+            match target {
+                DomainTarget::Platform { .. } => {
+                    return Err(DomainError::WildcardPlatformDomain {
+                        domain: DomainPattern::Wildcard(suffix.clone()),
+                    });
+                }
+                DomainTarget::Service {
+                    service_name: None, ..
+                } => {
+                    return Err(DomainError::WildcardLegacyDomain {
+                        domain: DomainPattern::Wildcard(suffix.clone()),
+                    });
+                }
+                DomainTarget::Service { primary: true, .. } => {
+                    return Err(DomainError::WildcardPrimaryDomain {
+                        domain: DomainPattern::Wildcard(suffix.clone()),
+                    });
+                }
+                DomainTarget::Service {
+                    project_instance_id,
+                    service_name: Some(service_name),
+                    primary: false,
+                } => {
+                    claimed_services.insert((*project_instance_id, service_name));
+                }
+            }
+        }
+        for (instance_id, service_name) in claimed_services {
+            if !primary_domains.contains_key(&(instance_id, service_name)) {
+                return Err(DomainError::MissingPrimaryDomain {
+                    service_name: service_name.to_owned(),
+                    instance_id,
+                });
             }
         }
         Ok(())
@@ -586,7 +834,7 @@ impl Default for SharedDomainIndex {
     }
 }
 
-/// An invalid exact claim or ownership conflict.
+/// An invalid domain claim or ownership conflict.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DomainError {
     #[error("invalid domain `{value}`: {reason}")]
@@ -596,22 +844,22 @@ pub enum DomainError {
         "domain `{domain}` is already owned by {existing}; it cannot also be claimed by {requested}"
     )]
     Conflict {
-        domain: DomainName,
-        existing: DomainTarget,
-        requested: DomainTarget,
+        domain: DomainPattern,
+        existing: Box<DomainTarget>,
+        requested: Box<DomainTarget>,
     },
 
     #[error("domain `{domain}` belongs to instance {actual}, not replacement instance {expected}")]
     WrongInstance {
         expected: ProjectInstanceId,
         actual: ProjectInstanceId,
-        domain: DomainName,
+        domain: DomainPattern,
     },
 
     #[error("project instance {instance_id} cannot install platform ownership for `{domain}`")]
     PlatformReplacement {
         instance_id: ProjectInstanceId,
-        domain: DomainName,
+        domain: DomainPattern,
     },
 
     #[error("domain index is missing platform ownership for `{domain}`")]
@@ -624,15 +872,31 @@ pub enum DomainError {
     },
 
     #[error(
-        "service `{service_name}` in instance {existing_instance} is already targeted by `{existing_domain}`; it cannot also be targeted by `{requested_domain}` in instance {requested_instance}"
+        "service `{service_name}` in instance {instance_id} already uses `{existing_domain}` as its canonical origin; it cannot also use `{requested_domain}`"
     )]
-    RuntimeServiceConflict {
+    PrimaryDomainConflict {
         service_name: String,
         existing_domain: DomainName,
-        existing_instance: ProjectInstanceId,
+        instance_id: ProjectInstanceId,
         requested_domain: DomainName,
-        requested_instance: ProjectInstanceId,
     },
+
+    #[error(
+        "service `{service_name}` in instance {instance_id} owns exact domains but has no canonical origin"
+    )]
+    MissingPrimaryDomain {
+        service_name: String,
+        instance_id: ProjectInstanceId,
+    },
+
+    #[error("platform ownership cannot use wildcard claim `{domain}`")]
+    WildcardPlatformDomain { domain: DomainPattern },
+
+    #[error("legacy ownership-only records cannot use wildcard claim `{domain}`")]
+    WildcardLegacyDomain { domain: DomainPattern },
+
+    #[error("wildcard claim `{domain}` cannot be a service's canonical origin")]
+    WildcardPrimaryDomain { domain: DomainPattern },
 }
 
 #[cfg(test)]
@@ -655,6 +919,20 @@ mod tests {
             domain.parse().expect("valid test domain"),
             instance_id,
             service.to_owned(),
+        )
+    }
+
+    fn service_pattern_claim(
+        domain: &str,
+        instance_id: ProjectInstanceId,
+        service: &str,
+        primary: bool,
+    ) -> DomainClaim {
+        DomainClaim::service_pattern(
+            domain.parse().expect("valid test domain pattern"),
+            instance_id,
+            service.to_owned(),
+            primary,
         )
     }
 
@@ -714,6 +992,27 @@ mod tests {
         ] {
             assert!(
                 invalid.parse::<DomainName>().is_err(),
+                "`{invalid}` should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_patterns_accept_only_one_leftmost_label() {
+        let pattern: DomainPattern = "*.FRAME.App.Localhost."
+            .parse()
+            .expect("valid wildcard pattern");
+        assert_eq!(pattern.to_string(), "*.frame.app.localhost");
+
+        for invalid in [
+            "*",
+            "*frame.app.localhost",
+            "frame.*.app.localhost",
+            "*.*.app.localhost",
+            "*.api..localhost",
+        ] {
+            assert!(
+                invalid.parse::<DomainPattern>().is_err(),
                 "`{invalid}` should be invalid"
             );
         }
@@ -841,6 +1140,93 @@ mod tests {
     }
 
     #[test]
+    fn exact_claims_override_one_label_wildcards() {
+        let wildcard_instance = instance(11);
+        let exact_instance = instance(12);
+        let index = DomainIndex::default()
+            .replacing_instance(
+                wildcard_instance,
+                [
+                    service_pattern_claim(
+                        "frame.app.localhost",
+                        wildcard_instance,
+                        "app:frame",
+                        true,
+                    ),
+                    service_pattern_claim(
+                        "*.frame.app.localhost",
+                        wildcard_instance,
+                        "app:frame",
+                        false,
+                    ),
+                ],
+            )
+            .expect("wildcard claim")
+            .replacing_instance(
+                exact_instance,
+                [service_claim(
+                    "special.frame.app.localhost",
+                    exact_instance,
+                    "special:web",
+                )],
+            )
+            .expect("more-specific exact claim");
+
+        assert!(matches!(
+            index.resolve("other.frame.app.localhost"),
+            Some(DomainTarget::Service {
+                project_instance_id,
+                ..
+            }) if *project_instance_id == wildcard_instance
+        ));
+        assert!(matches!(
+            index.resolve("special.frame.app.localhost"),
+            Some(DomainTarget::Service {
+                project_instance_id,
+                ..
+            }) if *project_instance_id == exact_instance
+        ));
+        assert!(index.resolve("deep.other.frame.app.localhost").is_none());
+    }
+
+    #[test]
+    fn wildcard_claims_are_not_hosts_entries_and_leave_with_their_instance() {
+        let instance_id = instance(13);
+        let index = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    service_pattern_claim("frame.app.localhost", instance_id, "app:frame", true),
+                    service_pattern_claim("*.frame.app.localhost", instance_id, "app:frame", false),
+                ],
+            )
+            .expect("frame claims");
+
+        assert_eq!(
+            index
+                .domain_for_service(instance_id, "app:frame")
+                .map(DomainName::as_str),
+            Some("frame.app.localhost")
+        );
+        assert!(
+            index
+                .hosts_domains()
+                .iter()
+                .all(|domain| !domain.starts_with("*."))
+        );
+        assert!(
+            index
+                .domains_for_instance(instance_id)
+                .contains("*.frame.app.localhost")
+        );
+
+        let removed = index
+            .replacing_instance(instance_id, std::iter::empty())
+            .expect("remove claims");
+        assert!(removed.resolve("preview.frame.app.localhost").is_none());
+    }
+
+    #[test]
     fn same_candidate_duplicates_are_rejected() {
         let instance_id = instance(20);
         let error = DomainIndex::default()
@@ -886,6 +1272,60 @@ mod tests {
         assert!(error.to_string().contains("second:web"));
         assert!(matches!(
             current.resolve("shared.localhost"),
+            Some(DomainTarget::Service {
+                project_instance_id,
+                ..
+            }) if *project_instance_id == first_instance
+        ));
+    }
+
+    #[test]
+    fn wildcard_conflict_preserves_the_old_snapshot() {
+        let first_instance = instance(41);
+        let second_instance = instance(42);
+        let current = DomainIndex::default()
+            .replacing_instance(
+                first_instance,
+                [
+                    service_pattern_claim(
+                        "frame-first.app.localhost",
+                        first_instance,
+                        "first:frame",
+                        true,
+                    ),
+                    service_pattern_claim(
+                        "*.frame.app.localhost",
+                        first_instance,
+                        "first:frame",
+                        false,
+                    ),
+                ],
+            )
+            .expect("first wildcard claim");
+
+        let error = current
+            .replacing_instance(
+                second_instance,
+                [
+                    service_pattern_claim(
+                        "frame-second.app.localhost",
+                        second_instance,
+                        "second:frame",
+                        true,
+                    ),
+                    service_pattern_claim(
+                        "*.frame.app.localhost",
+                        second_instance,
+                        "second:frame",
+                        false,
+                    ),
+                ],
+            )
+            .expect_err("conflicting wildcard must fail");
+
+        assert!(matches!(error, DomainError::Conflict { .. }));
+        assert!(matches!(
+            current.resolve("preview.frame.app.localhost"),
             Some(DomainTarget::Service {
                 project_instance_id,
                 ..
@@ -949,6 +1389,7 @@ mod tests {
             Some(DomainTarget::Service {
                 project_instance_id,
                 service_name: Some(service_name),
+                ..
             }) if *project_instance_id == first_instance && service_name == "same:web"
         ));
         assert!(matches!(
@@ -956,12 +1397,13 @@ mod tests {
             Some(DomainTarget::Service {
                 project_instance_id,
                 service_name: Some(service_name),
+                ..
             }) if *project_instance_id == second_instance && service_name == "same:web"
         ));
     }
 
     #[test]
-    fn duplicate_runtime_service_target_within_one_instance_is_rejected() {
+    fn duplicate_primary_service_domains_within_one_instance_are_rejected() {
         let instance_id = instance(90);
         let error = DomainIndex::default()
             .replacing_instance(
@@ -971,11 +1413,69 @@ mod tests {
                     service_claim("second.localhost", instance_id, "same:web"),
                 ],
             )
-            .expect_err("one service cannot target two exact domains in milestone A");
+            .expect_err("one service cannot have two canonical origins");
 
-        assert!(matches!(error, DomainError::RuntimeServiceConflict { .. }));
+        assert!(matches!(error, DomainError::PrimaryDomainConflict { .. }));
         assert!(error.to_string().contains("first.localhost"));
         assert!(error.to_string().contains("second.localhost"));
+    }
+
+    #[test]
+    fn one_service_can_own_exact_aliases_with_one_primary() {
+        let instance_id = instance(91);
+        let index = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    service_pattern_claim("first.localhost", instance_id, "same:web", true),
+                    service_pattern_claim("alias.localhost", instance_id, "same:web", false),
+                ],
+            )
+            .expect("one primary and one alias");
+
+        assert_eq!(
+            index
+                .domain_for_service(instance_id, "same:web")
+                .map(DomainName::as_str),
+            Some("first.localhost")
+        );
+        assert!(index.resolve("alias.localhost").is_some());
+    }
+
+    #[test]
+    fn exact_service_domains_require_one_primary_origin() {
+        let instance_id = instance(92);
+        let error = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [service_pattern_claim(
+                    "alias.localhost",
+                    instance_id,
+                    "same:web",
+                    false,
+                )],
+            )
+            .expect_err("an exact alias needs one canonical origin");
+
+        assert!(matches!(error, DomainError::MissingPrimaryDomain { .. }));
+    }
+
+    #[test]
+    fn wildcard_service_domains_require_an_exact_primary_origin() {
+        let instance_id = instance(93);
+        let error = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [service_pattern_claim(
+                    "*.frame.app.localhost",
+                    instance_id,
+                    "app:frame",
+                    false,
+                )],
+            )
+            .expect_err("a wildcard service needs one exact canonical origin");
+
+        assert!(matches!(error, DomainError::MissingPrimaryDomain { .. }));
     }
 
     #[test]

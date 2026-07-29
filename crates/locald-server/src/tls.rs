@@ -1,6 +1,6 @@
 use locald_core::{DomainName, SharedDomainIndex};
 
-/// Return the canonical exact hostname when the live domain index owns it.
+/// Return the canonical concrete hostname when the live domain index owns it.
 ///
 /// The snapshot is loaded for every TLS handshake so new claims become
 /// available immediately and removed claims cannot reuse cached certificates.
@@ -13,14 +13,14 @@ pub(crate) fn owned_server_name(
 ) -> Option<String> {
     let domain = requested_server_name.parse::<DomainName>().ok()?;
     let snapshot = domain_index.snapshot();
-    snapshot.claims().get(&domain)?;
+    snapshot.resolve(domain.as_str())?;
     Some(domain.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use locald_core::{DomainClaim, DomainIndex, ProjectInstanceId};
+    use locald_core::{DomainClaim, DomainIndex, DomainPattern, ProjectInstanceId};
     use uuid::Uuid;
 
     fn instance(seed: u128) -> ProjectInstanceId {
@@ -31,7 +31,7 @@ mod tests {
     }
 
     #[test]
-    fn only_exact_owned_names_are_canonicalized_and_authorized() {
+    fn only_concrete_owned_names_are_canonicalized_and_authorized() {
         let domains = SharedDomainIndex::default();
 
         assert_eq!(
@@ -84,5 +84,44 @@ mod tests {
             owned_server_name(&domains, "SECOND.LOCALHOST."),
             Some("second.localhost".to_owned())
         );
+    }
+
+    #[test]
+    fn concrete_one_label_wildcard_names_are_authorized() {
+        let instance_id = instance(2);
+        let index = DomainIndex::default()
+            .replacing_instance(
+                instance_id,
+                [
+                    DomainClaim::service(
+                        "frame.app.localhost".parse().expect("valid frame origin"),
+                        instance_id,
+                        "app:frame".to_owned(),
+                    ),
+                    DomainClaim::service_pattern(
+                        DomainPattern::wildcard(
+                            "frame.app.localhost"
+                                .parse()
+                                .expect("valid wildcard suffix"),
+                        ),
+                        instance_id,
+                        "app:frame".to_owned(),
+                        false,
+                    ),
+                ],
+            )
+            .expect("install wildcard claim");
+        let domains = SharedDomainIndex::new(index);
+
+        assert_eq!(
+            owned_server_name(&domains, "PREVIEW.frame.app.localhost."),
+            Some("preview.frame.app.localhost".to_owned())
+        );
+        assert_eq!(
+            owned_server_name(&domains, "frame.app.localhost"),
+            Some("frame.app.localhost".to_owned())
+        );
+        assert!(owned_server_name(&domains, "deep.preview.frame.app.localhost").is_none());
+        assert!(owned_server_name(&domains, "unowned.app.localhost").is_none());
     }
 }

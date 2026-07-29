@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// The current identity, exact-domain, and ambient-agent binding schema.
+/// The current identity, domain-ownership, and ambient-agent binding schema.
 pub const CATALOG_VERSION: u32 = 4;
 const PREVIOUS_CATALOG_VERSION: u32 = 3;
 const LEGACY_CATALOG_VERSION: u32 = 2;
@@ -695,7 +695,7 @@ impl ProjectCatalog {
         .await
     }
 
-    /// Return the complete persistent exact-domain ownership index.
+    /// Return the complete persistent domain ownership index.
     #[must_use]
     pub const fn domain_index(&self) -> &DomainIndex {
         &self.domain_index
@@ -757,7 +757,7 @@ impl ProjectCatalog {
         }
     }
 
-    /// Replace one instance's complete exact claim set in memory.
+    /// Replace one instance's complete domain claim set in memory.
     ///
     /// Callers commit the resulting catalog candidate through [`Self::commit_candidate`]
     /// so identity reconciliation and domain ownership publish together.
@@ -1656,7 +1656,12 @@ impl ProjectCatalog {
                 ));
             }
         }
-        for (domain, target) in self.domain_index.claims() {
+        for (domain, target) in self
+            .domain_index
+            .claims()
+            .iter()
+            .chain(self.domain_index.wildcard_claims())
+        {
             if let DomainTarget::Service {
                 project_instance_id,
                 ..
@@ -2566,6 +2571,7 @@ async fn sync_parent(path: &Path) -> Result<(), CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DomainPattern;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -4746,6 +4752,7 @@ mod tests {
             Some(&DomainTarget::Service {
                 project_instance_id: instance_id,
                 service_name: None,
+                primary: true,
             })
         );
 
@@ -4965,6 +4972,7 @@ mod tests {
             Some(&DomainTarget::Service {
                 project_instance_id: instance_id,
                 service_name: Some("v2-indexed:web".to_owned()),
+                primary: true,
             })
         );
         let stored = tokio::fs::read(&paths.catalog)
@@ -5111,7 +5119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_domain_targets_survive_catalog_reopen() {
+    async fn exact_and_wildcard_domain_targets_survive_catalog_reopen() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let project = fixture.project("domain-project");
@@ -5127,16 +5135,35 @@ mod tests {
         catalog
             .replace_domain_claims(
                 instance_id,
-                [DomainClaim::service(
-                    "domain-project.localhost"
-                        .parse()
-                        .expect("valid exact domain"),
-                    instance_id,
-                    "domain-project:web".to_owned(),
-                )],
+                [
+                    DomainClaim::service(
+                        "domain-project.localhost"
+                            .parse()
+                            .expect("valid exact domain"),
+                        instance_id,
+                        "domain-project:web".to_owned(),
+                    ),
+                    DomainClaim::service_pattern(
+                        DomainPattern::wildcard(
+                            "frame.domain-project.localhost"
+                                .parse()
+                                .expect("valid wildcard suffix"),
+                        ),
+                        instance_id,
+                        "domain-project:frame".to_owned(),
+                        false,
+                    ),
+                    DomainClaim::service(
+                        "frame.domain-project.localhost"
+                            .parse()
+                            .expect("valid frame origin"),
+                        instance_id,
+                        "domain-project:frame".to_owned(),
+                    ),
+                ],
             )
-            .expect("replace exact claims");
-        catalog.save().await.expect("save exact claims");
+            .expect("replace domain claims");
+        catalog.save().await.expect("save domain claims");
 
         let reopened = ProjectCatalog::load_from_paths(paths)
             .await
@@ -5147,12 +5174,29 @@ mod tests {
             Some(&DomainTarget::Service {
                 project_instance_id: instance_id,
                 service_name: Some("domain-project:web".to_owned()),
+                primary: true,
             })
         );
         assert!(
             reopened.instances[&instance_id]
                 .domain_claims
                 .contains("domain-project.localhost")
+        );
+        assert!(matches!(
+            reopened
+                .domain_index()
+                .resolve("preview.frame.domain-project.localhost"),
+            Some(DomainTarget::Service {
+                project_instance_id,
+                service_name: Some(service_name),
+                primary: false,
+            }) if *project_instance_id == instance_id
+                && service_name == "domain-project:frame"
+        ));
+        assert!(
+            reopened.instances[&instance_id]
+                .domain_claims
+                .contains("*.frame.domain-project.localhost")
         );
     }
 
@@ -5197,6 +5241,7 @@ mod tests {
             Some(&DomainTarget::Service {
                 project_instance_id: instance_id,
                 service_name: None,
+                primary: true,
             })
         );
         assert_eq!(
