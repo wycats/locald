@@ -980,7 +980,8 @@ fn loading_response(service_name: &str) -> Response {
         // 1. Poll for readiness
         function poll() {{
             fetch(window.location.href, {{
-                headers: {{ 'X-Locald-Passthrough': 'true' }}
+                headers: {{ 'X-Locald-Passthrough': 'true' }},
+                redirect: 'manual'
             }}).then(() => {{
                 window.location.reload();
             }}).catch(() => {{

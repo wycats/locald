@@ -54,13 +54,14 @@ If the timeout is hit, `locald` returns a `200 OK` response with a static HTML p
 
 The JavaScript on the loading page performs the following loop:
 
-1. `fetch(window.location.href, { headers: { 'X-Locald-Passthrough': 'true' } })`
+1. `fetch(window.location.href, { headers: { 'X-Locald-Passthrough': 'true' }, redirect: 'manual' })`
 2. The `X-Locald-Passthrough` header tells the `locald` proxy: **"Do not serve the loading page. Wait as long as it takes."**
 3. The proxy forwards this request to the backend and awaits the real response, no matter how long it takes.
 4. When the `fetch` receives a backend response, the proxy marks that service-controller generation and its internal backend port responsive for 60 seconds, and the JavaScript calls `window.location.reload()`.
 5. HTML requests routed to that backend during the responsive window wait for the real response without applying the 500ms cutoff.
-6. The responsive window is backend-scoped, so simultaneous tabs and alternate exact domains for the same service share the observation. Redirect status and browser cookie behavior do not carry or consume the handoff.
-7. A backend transport error clears the observation that existed when that request began. A later successful poll cannot be cleared by an older in-flight failure. Otherwise the observation expires after 60 seconds, and a replacement controller receives a new generation immediately.
+6. The poll stops at an initial redirect instead of following it as a cross-origin fetch. Its resolved response triggers a top-level reload, which follows the redirect under normal navigation rules without requiring application CORS policy.
+7. The responsive window is backend-scoped, so simultaneous tabs and alternate exact domains for the same service share the observation. Redirect status and browser cookie behavior do not carry or consume the handoff.
+8. A backend transport error clears the observation that existed when that request began. A later successful poll cannot be cleared by an older in-flight failure. Otherwise the observation expires after 60 seconds, and a replacement controller receives a new generation immediately.
 
 ## Implementation Details
 
@@ -97,7 +98,7 @@ tokio::select! {
 - **APIs**: API requests usually don't accept `text/html`, so they will just hang until completion (standard behavior).
 - **WebSockets**: The upgrade handshake happens before this logic, so WebSockets are unaffected.
 - **Errors**: If the polling request fails at the transport layer, the JavaScript retries after a delay. The proxy removes responsiveness only when the cached observation still matches the one present at request start, so an older failure cannot invalidate a newer success. HTTP responses, including application errors, prove that the backend is responsive.
-- **Redirects and aliases**: The responsive observation is keyed by locald's daemon-local controller generation and internal backend port, so redirect status details do not control its lifetime and another exact domain for the same service receives the same behavior.
+- **Redirects and aliases**: The poll uses manual redirect handling, so an initial redirect counts as a responsive backend response without becoming a cross-origin fetch. The subsequent top-level reload follows the redirect normally. The responsive observation is keyed by locald's daemon-local controller generation and internal backend port, so another exact domain for the same service receives the same behavior.
 - **Restarts**: Every replacement controller receives a new generation. Sticky-port reuse therefore never transfers responsiveness from an old process to a new one.
 - **Browser isolation**: The handoff uses no browser cookie or URL marker. Concurrent tabs cannot consume one another's handoff, and locald forwards application cookies unchanged.
 

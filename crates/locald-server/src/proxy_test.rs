@@ -553,10 +553,11 @@ async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
         .unwrap();
     let response = app.clone().oneshot(initial).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let loading_page = response_body(response).await;
+    assert!(loading_page.contains("Waiting for first response"));
     assert!(
-        response_body(response)
-            .await
-            .contains("Waiting for first response")
+        loading_page.contains("redirect: 'manual'"),
+        "the readiness poll must stop at redirects so top-level navigation can follow them"
     );
 
     let poll = Request::builder()
