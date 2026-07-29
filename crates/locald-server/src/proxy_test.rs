@@ -635,6 +635,7 @@ async fn test_loading_handoff_survives_redirects_until_the_final_html_response()
             "/",
             get(|| async { axum::response::Redirect::temporary("/final") }),
         )
+        .route("/cached", get(|| async { StatusCode::NOT_MODIFIED }))
         .route(
             "/final",
             get(|| async {
@@ -677,7 +678,7 @@ async fn test_loading_handoff_survives_redirects_until_the_final_html_response()
         .header("Cookie", "__locald_loading_ready=1")
         .body(Body::empty())
         .unwrap();
-    let response = app.oneshot(final_navigation).await.unwrap();
+    let response = app.clone().oneshot(final_navigation).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
@@ -687,4 +688,21 @@ async fn test_loading_handoff_survives_redirects_until_the_final_html_response()
         Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
     );
     assert_eq!(response_body(response).await, "redirected-slow-app");
+
+    let cached_navigation = Request::builder()
+        .uri("/cached")
+        .header("Host", "redirect.localhost")
+        .header("Accept", "text/html")
+        .header("Cookie", "__locald_loading_ready=1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(cached_navigation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+    );
 }

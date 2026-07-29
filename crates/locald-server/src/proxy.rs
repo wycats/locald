@@ -381,7 +381,10 @@ async fn proxy_to_domain_resolution(
             Ok(mut res) => {
                 if header_passthrough {
                     set_loading_bypass_cookie(res.headers_mut());
-                } else if accepts_html && cookie_passthrough && !res.status().is_redirection() {
+                } else if accepts_html
+                    && cookie_passthrough
+                    && !is_navigation_redirect(res.status())
+                {
                     clear_loading_bypass_cookie(res.headers_mut());
                 }
                 res.into_response()
@@ -468,6 +471,17 @@ fn clear_loading_bypass_cookie(headers: &mut HeaderMap) {
         hyper::header::SET_COOKIE,
         HeaderValue::from_static(LOADING_BYPASS_CLEAR_COOKIE),
     );
+}
+
+fn is_navigation_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
 }
 
 async fn proxy_to_local_port(
@@ -1116,5 +1130,21 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(LOADING_BYPASS_CLEAR_COOKIE)
         );
+    }
+
+    #[test]
+    fn only_navigation_redirects_preserve_loading_bypass_cookie() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            assert!(is_navigation_redirect(status), "{status}");
+        }
+
+        assert!(!is_navigation_redirect(StatusCode::MULTIPLE_CHOICES));
+        assert!(!is_navigation_redirect(StatusCode::NOT_MODIFIED));
     }
 }

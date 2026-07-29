@@ -59,7 +59,7 @@ The JavaScript on the loading page performs the following loop:
 3. The proxy forwards this request to the backend and awaits the real response, no matter how long it takes.
 4. When the `fetch` completes, the proxy sets a host-scoped, HttpOnly loading handoff cookie that expires after 60 seconds, and the JavaScript calls `window.location.reload()`.
 5. The browser reloads the page with that marker. `locald` removes the marker before forwarding the request and waits for the real backend response without applying the 500ms cutoff.
-6. Redirect responses preserve the browser marker for the next location. The first final HTML response, including a generated transport-error response, expires it.
+6. Navigation redirects (`301`, `302`, `303`, `307`, and `308`) preserve the browser marker for the next location. The first final HTML response, including `304 Not Modified` or a generated transport-error response, expires it.
 7. The marker is therefore consumed by one redirect-following navigation chain. Application cookies remain unchanged, and later slow HTML navigations receive the normal loading screen.
 
 ## Implementation Details
@@ -79,7 +79,7 @@ if is_passthrough || !accepts_html {
     let mut response = backend_future.await;
     if header_passthrough {
         set_loading_bypass_cookie(response.headers_mut());
-    } else if cookie_passthrough && !response.status().is_redirection() {
+    } else if cookie_passthrough && !is_navigation_redirect(response.status()) {
         clear_loading_bypass_cookie(response.headers_mut());
     }
     return response;
@@ -97,7 +97,7 @@ tokio::select! {
 - **APIs**: API requests usually don't accept `text/html`, so they will just hang until completion (standard behavior).
 - **WebSockets**: The upgrade handshake happens before this logic, so WebSockets are unaffected.
 - **Errors**: If the polling request fails (500/502), the JavaScript retries after a delay. A transport failure on the cookie-bearing reload expires the marker before returning locald's error response.
-- **Redirects**: Redirect responses retain the marker so authentication or canonical-origin redirects remain part of the same handoff. The final HTML response consumes it.
+- **Redirects**: `301`, `302`, `303`, `307`, and `308` retain the marker so authentication or canonical-origin redirects remain part of the same handoff. Other `3xx` responses, including `304 Not Modified`, are terminal and consume it.
 - **Cookie isolation**: The handoff cookie has no `Domain` attribute, so it is scoped to the concrete service hostname. `locald` strips it before proxying and consumes it on the next HTML navigation.
 
 ## Phase 2: High-Fidelity Build Logs (Refinement)
