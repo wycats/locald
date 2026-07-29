@@ -381,14 +381,19 @@ async fn proxy_to_domain_resolution(
             Ok(mut res) => {
                 if header_passthrough {
                     set_loading_bypass_cookie(res.headers_mut());
-                } else if accepts_html && cookie_passthrough {
+                } else if accepts_html && cookie_passthrough && !res.status().is_redirection() {
                     clear_loading_bypass_cookie(res.headers_mut());
                 }
                 res.into_response()
             }
             Err(e) => {
                 error!("Proxy error: {e}");
-                error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
+                let mut response =
+                    error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"));
+                if accepts_html && cookie_passthrough {
+                    clear_loading_bypass_cookie(response.headers_mut());
+                }
+                response
             }
         };
     }

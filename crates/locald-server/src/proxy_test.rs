@@ -269,6 +269,8 @@ async fn test_proxy_error_page() {
     let req = Request::builder()
         .uri("/")
         .header("Host", "broken.localhost")
+        .header("Accept", "text/html")
+        .header("Cookie", "__locald_loading_ready=1")
         .body(Body::empty())
         .unwrap();
 
@@ -276,6 +278,13 @@ async fn test_proxy_error_page() {
 
     // Should be 502 Bad Gateway
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+    );
 
     // Should be HTML
     let content_type = response.headers().get("content-type").unwrap();
@@ -615,4 +624,67 @@ async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
             .await
             .contains("Waiting for first response")
     );
+}
+
+#[tokio::test]
+async fn test_loading_handoff_survives_redirects_until_the_final_html_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let backend = Router::new()
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/final") }),
+        )
+        .route(
+            "/final",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                "redirected-slow-app"
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+
+    let resolver = Arc::new(MockResolver {
+        port: Some(port),
+        status: ServiceState::Running,
+    });
+    let app = ProxyManager::new(resolver, Router::new(), None).make_app();
+
+    let redirect = Request::builder()
+        .uri("/")
+        .header("Host", "redirect.localhost")
+        .header("Accept", "text/html")
+        .header("Cookie", "__locald_loading_ready=1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(redirect).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/final")
+    );
+    assert!(response.headers().get(hyper::header::SET_COOKIE).is_none());
+
+    let final_navigation = Request::builder()
+        .uri("/final")
+        .header("Host", "redirect.localhost")
+        .header("Accept", "text/html")
+        .header("Cookie", "__locald_loading_ready=1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(final_navigation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+    );
+    assert_eq!(response_body(response).await, "redirected-slow-app");
 }
