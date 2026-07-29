@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
 use locald_core::registry::Registry;
@@ -513,4 +513,83 @@ async fn test_proxy_connection_success() {
         .await
         .unwrap();
     assert_eq!(&body_bytes[..], b"Hello World!");
+}
+
+#[tokio::test]
+async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen_cookies = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let backend_cookies = seen_cookies.clone();
+    let backend = Router::new().fallback(move |headers: HeaderMap| {
+        let backend_cookies = backend_cookies.clone();
+        async move {
+            backend_cookies.lock().await.push(
+                headers
+                    .get(hyper::header::COOKIE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            "slow-app"
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+
+    let resolver = Arc::new(MockResolver {
+        port: Some(port),
+        status: ServiceState::Running,
+    });
+    let app = ProxyManager::new(resolver, Router::new(), None).make_app();
+
+    let initial = Request::builder()
+        .uri("/")
+        .header("Host", "slow.localhost")
+        .header("Accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(initial).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response_body(response)
+            .await
+            .contains("Waiting for first response")
+    );
+
+    let poll = Request::builder()
+        .uri("/")
+        .header("Host", "slow.localhost")
+        .header("X-Locald-Passthrough", "true")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(poll).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bypass_cookie = response
+        .headers()
+        .get(hyper::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("passthrough response should set the loading handoff cookie");
+    assert!(bypass_cookie.starts_with("__locald_loading_ready=1;"));
+
+    let reload = Request::builder()
+        .uri("/")
+        .header("Host", "slow.localhost")
+        .header("Accept", "text/html")
+        .header(
+            "Cookie",
+            "session=abc; theme=dark; __locald_loading_ready=1",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(reload).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "slow-app");
+
+    let seen_cookies = seen_cookies.lock().await;
+    assert_eq!(
+        seen_cookies.last().and_then(Option::as_deref),
+        Some("session=abc; theme=dark")
+    );
 }

@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     handler::Handler,
-    http::{Method, Uri},
+    http::{HeaderMap, HeaderValue, Method, Uri},
     response::{IntoResponse, Response},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -23,6 +23,10 @@ use locald_core::resolver::{DomainResolution, ServiceResolver};
 use locald_core::state::ServiceState;
 use locald_core::{DomainName, ProjectAvailabilityStatus, ProjectLifecycleState};
 use locald_utils::cert::CertManager;
+
+const LOADING_BYPASS_COOKIE: &str = "__locald_loading_ready=1";
+const LOADING_BYPASS_SET_COOKIE: &str =
+    "__locald_loading_ready=1; Max-Age=60; Path=/; HttpOnly; SameSite=Lax";
 
 /// Manages the reverse proxy for routing requests to services.
 ///
@@ -356,13 +360,15 @@ async fn proxy_to_domain_resolution(
         return handle_websocket_upgrade(state.clone(), req, uri).await;
     }
 
-    let is_passthrough = req.headers().get("x-locald-passthrough").is_some();
+    let header_passthrough = req.headers().get("x-locald-passthrough").is_some();
     let accepts_html = req
         .headers()
         .get(hyper::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("text/html"))
         .unwrap_or(false);
+    let cookie_passthrough = take_loading_bypass_cookie(req.headers_mut());
+    let is_passthrough = header_passthrough || (accepts_html && cookie_passthrough);
 
     *req.uri_mut() = uri;
 
@@ -370,7 +376,12 @@ async fn proxy_to_domain_resolution(
 
     if is_passthrough || !accepts_html {
         return match backend_future.await {
-            Ok(res) => res.into_response(),
+            Ok(mut res) => {
+                if header_passthrough || (accepts_html && cookie_passthrough) {
+                    set_loading_bypass_cookie(res.headers_mut());
+                }
+                res.into_response()
+            }
             Err(e) => {
                 error!("Proxy error: {e}");
                 error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
@@ -392,6 +403,55 @@ async fn proxy_to_domain_resolution(
             loading_response(&service_name)
         }
     }
+}
+
+fn take_loading_bypass_cookie(headers: &mut HeaderMap) -> bool {
+    let values = headers
+        .get_all(hyper::header::COOKIE)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return false;
+    }
+
+    headers.remove(hyper::header::COOKIE);
+    let mut found = false;
+
+    for value in values {
+        let Ok(cookies) = value.to_str() else {
+            headers.append(hyper::header::COOKIE, value);
+            continue;
+        };
+        let remaining = cookies
+            .split(';')
+            .map(str::trim)
+            .filter(|cookie| {
+                if *cookie == LOADING_BYPASS_COOKIE {
+                    found = true;
+                    false
+                } else {
+                    !cookie.is_empty()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        if !remaining.is_empty() {
+            if let Ok(value) = HeaderValue::from_str(&remaining) {
+                headers.append(hyper::header::COOKIE, value);
+            }
+        }
+    }
+
+    found
+}
+
+fn set_loading_bypass_cookie(headers: &mut HeaderMap) {
+    headers.append(
+        hyper::header::SET_COOKIE,
+        HeaderValue::from_static(LOADING_BYPASS_SET_COOKIE),
+    );
 }
 
 async fn proxy_to_local_port(
@@ -968,4 +1028,63 @@ fn loading_response(service_name: &str) -> Response {
         html,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_bypass_cookie_is_removed_without_disturbing_app_cookies() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            hyper::header::COOKIE,
+            HeaderValue::from_static("session=abc; __locald_loading_ready=1"),
+        );
+        headers.append(
+            hyper::header::COOKIE,
+            HeaderValue::from_static("theme=dark"),
+        );
+
+        assert!(take_loading_bypass_cookie(&mut headers));
+        assert_eq!(
+            headers
+                .get_all(hyper::header::COOKIE)
+                .iter()
+                .map(|value| value.to_str().expect("valid cookie header"))
+                .collect::<Vec<_>>(),
+            ["session=abc", "theme=dark"]
+        );
+    }
+
+    #[test]
+    fn app_cookies_do_not_enable_loading_bypass() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::COOKIE,
+            HeaderValue::from_static("session=abc; theme=dark"),
+        );
+
+        assert!(!take_loading_bypass_cookie(&mut headers));
+        assert_eq!(
+            headers
+                .get(hyper::header::COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some("session=abc; theme=dark")
+        );
+    }
+
+    #[test]
+    fn completed_passthrough_sets_short_lived_host_cookie() {
+        let mut headers = HeaderMap::new();
+
+        set_loading_bypass_cookie(&mut headers);
+
+        assert_eq!(
+            headers
+                .get(hyper::header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some(LOADING_BYPASS_SET_COOKIE)
+        );
+    }
 }
