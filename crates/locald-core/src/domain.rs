@@ -461,6 +461,24 @@ impl DomainIndex {
         })
     }
 
+    /// Return the finite certificate identity that authorizes one concrete SNI.
+    ///
+    /// Exact claims use their concrete hostname. A concrete hostname owned by
+    /// a wildcard uses the reusable wildcard identity, preventing arbitrary
+    /// matching labels from growing the certificate cache.
+    #[must_use]
+    pub fn certificate_name_for(&self, domain: &str) -> Option<String> {
+        let domain = domain.parse::<DomainName>().ok()?;
+        if self.claims.contains_key(&domain) {
+            return Some(domain.to_string());
+        }
+        self.wildcard_claims
+            .keys()
+            .filter(|suffix| DomainPattern::Wildcard((*suffix).clone()).matches(&domain))
+            .max_by_key(|suffix| suffix.as_str().len())
+            .map(|suffix| format!("*.{suffix}"))
+    }
+
     /// Return the complete persisted exact-claim map.
     #[must_use]
     pub const fn claims(&self) -> &BTreeMap<DomainName, DomainTarget> {
@@ -1187,6 +1205,19 @@ mod tests {
             }) if *project_instance_id == exact_instance
         ));
         assert!(index.resolve("deep.other.frame.app.localhost").is_none());
+        assert_eq!(
+            index.certificate_name_for("other.frame.app.localhost"),
+            Some("*.frame.app.localhost".to_owned())
+        );
+        assert_eq!(
+            index.certificate_name_for("special.frame.app.localhost"),
+            Some("special.frame.app.localhost".to_owned())
+        );
+        assert!(
+            index
+                .certificate_name_for("deep.other.frame.app.localhost")
+                .is_none()
+        );
     }
 
     #[test]

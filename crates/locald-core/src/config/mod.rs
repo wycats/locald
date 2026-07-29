@@ -532,12 +532,36 @@ impl ServiceConfig {
         self.common().domains.as_deref()
     }
 
+    /// Return whether two service definitions require the same runtime.
+    ///
+    /// Domain aliases and wildcard claims are proxy ownership. A changed
+    /// canonical origin still changes any resolved `${services.*.origin}`
+    /// environment and is therefore detected separately by the manager.
+    #[must_use]
+    pub fn runtime_eq(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.common_mut().domains = None;
+        right.common_mut().domains = None;
+        left == right
+    }
+
     pub const fn depends_on(&self) -> &Vec<String> {
         &self.common().depends_on
     }
 
     pub const fn health_check(&self) -> Option<&HealthCheckConfig> {
         self.common().health_check.as_ref()
+    }
+
+    const fn common_mut(&mut self) -> &mut CommonServiceConfig {
+        match self {
+            Self::Typed(TypedServiceConfig::Exec(c)) | Self::Legacy(c) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Postgres(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Worker(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Container(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Site(c)) => &mut c.common,
+        }
     }
 }
 
@@ -588,6 +612,33 @@ mod tests {
         assert!(toml_string.contains("command = \"echo hello\""));
         assert!(toml_string.contains("[project]"));
         assert!(toml_string.contains("name = \"test-project\""));
+    }
+
+    #[test]
+    fn runtime_equality_ignores_only_domain_claims() {
+        let mut current: ServiceConfig = toml::from_str(
+            r#"
+command = "serve"
+domains = ["frame", "*.frame"]
+"#,
+        )
+        .expect("parse current service");
+        let mut candidate = current.clone();
+        candidate.common_mut().domains = Some(
+            ["frame", "preview"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+
+        assert!(current.runtime_eq(&candidate));
+
+        current.common_mut().env.insert("MODE".into(), "old".into());
+        candidate
+            .common_mut()
+            .env
+            .insert("MODE".into(), "new".into());
+        assert!(!current.runtime_eq(&candidate));
     }
 
     #[test]

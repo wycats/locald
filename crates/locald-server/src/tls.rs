@@ -1,9 +1,10 @@
 use locald_core::{DomainName, SharedDomainIndex};
 
-/// Return the canonical concrete hostname when the live domain index owns it.
+/// Return the finite certificate identity when the live domain index owns SNI.
 ///
 /// The snapshot is loaded for every TLS handshake so new claims become
 /// available immediately and removed claims cannot reuse cached certificates.
+/// Wildcard-owned concrete names share their bounded wildcard certificate.
 // The private module keeps this internal, while parent and sibling modules
 // need crate visibility; `pub` would violate the crate's `unreachable_pub` lint.
 #[allow(clippy::redundant_pub_crate)]
@@ -13,8 +14,7 @@ pub(crate) fn owned_server_name(
 ) -> Option<String> {
     let domain = requested_server_name.parse::<DomainName>().ok()?;
     let snapshot = domain_index.snapshot();
-    snapshot.resolve(domain.as_str())?;
-    Some(domain.to_string())
+    snapshot.certificate_name_for(domain.as_str())
 }
 
 #[cfg(test)]
@@ -115,7 +115,7 @@ mod tests {
 
         assert_eq!(
             owned_server_name(&domains, "PREVIEW.frame.app.localhost."),
-            Some("preview.frame.app.localhost".to_owned())
+            Some("*.frame.app.localhost".to_owned())
         );
         assert_eq!(
             owned_server_name(&domains, "frame.app.localhost"),

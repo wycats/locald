@@ -24,8 +24,9 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 /// The current identity, domain-ownership, and ambient-agent binding schema.
-pub const CATALOG_VERSION: u32 = 4;
-const PREVIOUS_CATALOG_VERSION: u32 = 3;
+pub const CATALOG_VERSION: u32 = 5;
+const SERVICE_DOMAIN_CATALOG_VERSION: u32 = 4;
+const AGENT_BINDING_CATALOG_VERSION: u32 = 3;
 const LEGACY_CATALOG_VERSION: u32 = 2;
 
 /// Paths used to initialize a catalog and collect legacy locator evidence.
@@ -469,7 +470,10 @@ impl ProjectCatalog {
             version if version == u64::from(CATALOG_VERSION) => {
                 Self::deserialize_current(value, path)
             }
-            version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
+            version if version == u64::from(SERVICE_DOMAIN_CATALOG_VERSION) => {
+                Self::migrate_v4(value, path)
+            }
+            version if version == u64::from(AGENT_BINDING_CATALOG_VERSION) => {
                 Self::migrate_v3(value, path)
             }
             version if version == u64::from(LEGACY_CATALOG_VERSION) => {
@@ -521,7 +525,14 @@ impl ProjectCatalog {
             version if version == u64::from(CATALOG_VERSION) => {
                 Self::deserialize_current(value, path)
             }
-            version if version == u64::from(PREVIOUS_CATALOG_VERSION) => {
+            version if version == u64::from(SERVICE_DOMAIN_CATALOG_VERSION) => {
+                let catalog = Self::migrate_v4(value, path)?;
+                match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
+                    Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => Ok(catalog),
+                    Err(error) => Err(error),
+                }
+            }
+            version if version == u64::from(AGENT_BINDING_CATALOG_VERSION) => {
                 let catalog = Self::migrate_v3(value, path)?;
                 match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
                     Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => Ok(catalog),
@@ -558,6 +569,17 @@ impl ProjectCatalog {
         catalog.storage_path = path.to_path_buf();
         catalog.validate()?;
         Ok(catalog)
+    }
+
+    fn migrate_v4(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "catalog must be an object".to_owned(),
+            })?;
+        object.insert("version".to_owned(), Value::from(CATALOG_VERSION));
+        Self::deserialize_current(value, path)
     }
 
     fn migrate_v3(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
@@ -710,11 +732,15 @@ impl ProjectCatalog {
     /// Upgrade one catalog image embedded in a replayable lifecycle journal.
     ///
     /// Catalog files migrate before use, but a prepared transaction may retain
-    /// exact version-3 before/after images across the daemon upgrade.
+    /// older before/after images across the daemon upgrade.
     pub fn upgrade_embedded_schema(&mut self) -> Result<bool, CatalogError> {
         let upgraded = match self.version {
             CATALOG_VERSION => false,
-            PREVIOUS_CATALOG_VERSION => {
+            SERVICE_DOMAIN_CATALOG_VERSION => {
+                self.version = CATALOG_VERSION;
+                true
+            }
+            AGENT_BINDING_CATALOG_VERSION => {
                 self.version = CATALOG_VERSION;
                 self.agent_bindings.clear();
                 true
@@ -2834,7 +2860,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn current_v4_unresolved_alias_mutations_match_the_normalized_locator() {
+    async fn current_v5_unresolved_alias_mutations_match_the_normalized_locator() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let real_parent = fixture._temp.path().join("real-parent");
@@ -2857,19 +2883,19 @@ mod tests {
                 sources: BTreeSet::from([LegacyLocatorSource::Registry]),
             },
         );
-        catalog.save().await.expect("persist current v4 catalog");
+        catalog.save().await.expect("persist current v5 catalog");
         let before_reload = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read current v4 catalog before reload");
+            .expect("read current v5 catalog before reload");
 
         let mut reopened = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect("reload current v4 catalog");
+            .expect("reload current v5 catalog");
 
         assert_eq!(
             tokio::fs::read(&paths.catalog)
                 .await
-                .expect("read current v4 catalog after reload"),
+                .expect("read current v5 catalog after reload"),
             before_reload
         );
         assert!(reopened.unresolved_legacy.contains_key(&raw_alias));
@@ -4756,28 +4782,99 @@ mod tests {
             })
         );
 
-        let first_v4_bytes = tokio::fs::read(&paths.catalog)
+        let first_v5_bytes = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read migrated v4 catalog");
+            .expect("read migrated v5 catalog");
         assert_eq!(
-            catalog_fixture_version(&first_v4_bytes),
+            catalog_fixture_version(&first_v5_bytes),
             u64::from(CATALOG_VERSION)
         );
         assert!(
-            serde_json::from_slice::<Value>(&first_v4_bytes)
-                .expect("parse migrated v4 catalog")
+            serde_json::from_slice::<Value>(&first_v5_bytes)
+                .expect("parse migrated v5 catalog")
                 .get("domain_index")
                 .is_some()
         );
 
         let reopened = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect("reopen migrated v4 catalog");
-        let second_v4_bytes = tokio::fs::read(&paths.catalog)
+            .expect("reopen migrated v5 catalog");
+        let second_v5_bytes = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read reopened v4 catalog");
+            .expect("read reopened v5 catalog");
         assert_eq!(reopened, migrated);
-        assert_eq!(second_v4_bytes, first_v4_bytes);
+        assert_eq!(second_v5_bytes, first_v5_bytes);
+    }
+
+    #[tokio::test]
+    async fn v4_migrates_service_targets_and_empty_wildcards_to_v5() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("v4-domain-project");
+        let mut source = ProjectCatalog::with_path(paths.catalog.clone());
+        let instance_id = source
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover v4 project"),
+                Some("v4-domain".to_owned()),
+            )
+            .expect("register v4 project");
+        source
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "v4-domain.localhost".parse().expect("valid v4 domain"),
+                    instance_id,
+                    "v4-domain:web".to_owned(),
+                )],
+            )
+            .expect("record v4 domain");
+        let mut value = serde_json::to_value(&source).expect("serialize v4 fixture");
+        value["version"] = Value::from(SERVICE_DOMAIN_CATALOG_VERSION);
+        value["domain_index"]
+            .as_object_mut()
+            .expect("domain index object")
+            .remove("wildcard_claims");
+        for target in value["domain_index"]["claims"]
+            .as_object_mut()
+            .expect("exact claim map")
+            .values_mut()
+        {
+            if target.get("kind").and_then(Value::as_str) == Some("service") {
+                target
+                    .as_object_mut()
+                    .expect("service target object")
+                    .remove("primary");
+            }
+        }
+        tokio::fs::write(
+            &paths.catalog,
+            serde_json::to_vec_pretty(&value).expect("encode v4 fixture"),
+        )
+        .await
+        .expect("write v4 fixture");
+
+        let migrated = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("migrate v4 catalog");
+
+        assert_eq!(
+            migrated
+                .domain_index()
+                .domain_for_service(instance_id, "v4-domain:web")
+                .map(DomainName::as_str),
+            Some("v4-domain.localhost")
+        );
+        assert!(migrated.domain_index().wildcard_claims().is_empty());
+        assert_eq!(
+            catalog_fixture_version(
+                &tokio::fs::read(&paths.catalog)
+                    .await
+                    .expect("read migrated v5 catalog")
+            ),
+            u64::from(CATALOG_VERSION)
+        );
     }
 
     #[tokio::test]
@@ -4800,7 +4897,7 @@ mod tests {
             .bind_agent_conversation(key.clone(), instance_id)
             .expect("bind current catalog");
         let mut value = serde_json::to_value(&source).expect("serialize v3 migration fixture");
-        value["version"] = Value::from(PREVIOUS_CATALOG_VERSION);
+        value["version"] = Value::from(AGENT_BINDING_CATALOG_VERSION);
         value
             .as_object_mut()
             .expect("catalog fixture object")
@@ -4821,7 +4918,7 @@ mod tests {
             catalog_fixture_version(
                 &tokio::fs::read(&paths.catalog)
                     .await
-                    .expect("read migrated v4 catalog")
+                    .expect("read migrated v5 catalog")
             ),
             u64::from(CATALOG_VERSION)
         );
@@ -4977,7 +5074,7 @@ mod tests {
         );
         let stored = tokio::fs::read(&paths.catalog)
             .await
-            .expect("read indexed v4 catalog");
+            .expect("read indexed v5 catalog");
         assert_eq!(catalog_fixture_version(&stored), u64::from(CATALOG_VERSION));
     }
 
@@ -5033,30 +5130,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_v4_requires_domain_index_without_rewriting() {
+    async fn native_v5_requires_domain_index_without_rewriting() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let catalog = ProjectCatalog::with_path(paths.catalog.clone());
         let original = catalog_fixture_bytes(&catalog, CATALOG_VERSION, false);
         tokio::fs::write(&paths.catalog, &original)
             .await
-            .expect("write incomplete v4 catalog");
+            .expect("write incomplete v5 catalog");
 
         let error = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect_err("v4 domain index is required");
+            .expect_err("v5 domain index is required");
 
         assert!(matches!(error, CatalogError::InvalidData { .. }));
         assert_eq!(
             tokio::fs::read(&paths.catalog)
                 .await
-                .expect("read rejected v4 catalog"),
+                .expect("read rejected v5 catalog"),
             original
         );
     }
 
     #[tokio::test]
-    async fn native_v4_requires_agent_bindings_without_rewriting() {
+    async fn native_v5_requires_agent_bindings_without_rewriting() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let catalog = ProjectCatalog::with_path(paths.catalog.clone());
@@ -5069,23 +5166,23 @@ mod tests {
         original.push(b'\n');
         tokio::fs::write(&paths.catalog, &original)
             .await
-            .expect("write incomplete v4 catalog");
+            .expect("write incomplete v5 catalog");
 
         let error = ProjectCatalog::load_from_paths(paths.clone())
             .await
-            .expect_err("v4 agent binding index is required");
+            .expect_err("v5 agent binding index is required");
 
         assert!(matches!(error, CatalogError::InvalidData { .. }));
         assert_eq!(
             tokio::fs::read(&paths.catalog)
                 .await
-                .expect("read rejected v4 catalog"),
+                .expect("read rejected v5 catalog"),
             original
         );
     }
 
     #[tokio::test]
-    async fn v2_migration_sync_failure_returns_published_v4() {
+    async fn v2_migration_sync_failure_returns_published_v5() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
         let catalog = ProjectCatalog::with_path(paths.catalog.clone());
@@ -5114,7 +5211,7 @@ mod tests {
         );
         let reopened = ProjectCatalog::load_existing(&paths.catalog)
             .await
-            .expect("published v4 migration remains readable");
+            .expect("published v5 migration remains readable");
         assert_eq!(reopened, migrated);
     }
 
