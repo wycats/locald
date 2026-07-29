@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -24,6 +26,52 @@ use locald_core::state::ServiceState;
 use locald_core::{DomainName, ProjectAvailabilityStatus, ProjectLifecycleState};
 use locald_utils::cert::CertManager;
 
+const RESPONSIVE_BACKEND_TTL: Duration = Duration::from_mins(1);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResponsiveBackend {
+    port: u16,
+    runtime_generation: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResponsiveBackends {
+    entries: Arc<Mutex<HashMap<ResponsiveBackend, Instant>>>,
+}
+
+impl ResponsiveBackends {
+    fn observe(&self, backend: ResponsiveBackend) -> Option<Instant> {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|_, expires_at| *expires_at > now);
+        entries.get(&backend).copied()
+    }
+
+    fn mark(&self, backend: ResponsiveBackend) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(backend, Instant::now() + RESPONSIVE_BACKEND_TTL);
+    }
+
+    fn forget_if_unchanged(&self, backend: ResponsiveBackend, observed: Option<Instant>) {
+        let Some(observed) = observed else {
+            return;
+        };
+
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.get(&backend) == Some(&observed) {
+            entries.remove(&backend);
+        }
+    }
+}
+
 /// Manages the reverse proxy for routing requests to services.
 ///
 /// The `ProxyManager` handles:
@@ -36,6 +84,7 @@ pub struct ProxyManager {
     resolver: Arc<dyn ServiceResolver>,
     api_router: Router,
     cert_manager: Option<Arc<CertManager>>,
+    responsive_backends: ResponsiveBackends,
 }
 
 impl ProxyManager {
@@ -55,6 +104,7 @@ impl ProxyManager {
             resolver,
             api_router,
             cert_manager,
+            responsive_backends: ResponsiveBackends::default(),
         }
     }
 
@@ -72,6 +122,7 @@ impl ProxyManager {
             resolver: self.resolver.clone(),
             client,
             api_router: Router::new().nest("/api", self.api_router.clone()),
+            responsive_backends: self.responsive_backends.clone(),
         };
 
         Router::new()
@@ -153,6 +204,7 @@ struct AppState {
         Body,
     >,
     api_router: Router,
+    responsive_backends: ResponsiveBackends,
 }
 
 async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri: Uri) -> Response {
@@ -310,6 +362,7 @@ async fn proxy_to_domain_resolution(
         name: service_name,
         port,
         status,
+        runtime_generation,
     } = resolution
     else {
         let availability = state.resolver.project_availability_by_domain(host).await;
@@ -336,6 +389,10 @@ async fn proxy_to_domain_resolution(
     }
 
     let port = port.unwrap_or_default();
+    let backend = ResponsiveBackend {
+        port,
+        runtime_generation,
+    };
     let uri_string = format!(
         "http://localhost:{port}{}",
         req.uri().path_and_query().map_or("", |x| x.as_str())
@@ -356,13 +413,16 @@ async fn proxy_to_domain_resolution(
         return handle_websocket_upgrade(state.clone(), req, uri).await;
     }
 
-    let is_passthrough = req.headers().get("x-locald-passthrough").is_some();
+    let header_passthrough = req.headers().get("x-locald-passthrough").is_some();
     let accepts_html = req
         .headers()
         .get(hyper::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("text/html"))
         .unwrap_or(false);
+    let responsive_observation = state.responsive_backends.observe(backend);
+    let backend_is_responsive = accepts_html && responsive_observation.is_some();
+    let is_passthrough = header_passthrough || backend_is_responsive;
 
     *req.uri_mut() = uri;
 
@@ -370,9 +430,17 @@ async fn proxy_to_domain_resolution(
 
     if is_passthrough || !accepts_html {
         return match backend_future.await {
-            Ok(res) => res.into_response(),
+            Ok(res) => {
+                if header_passthrough {
+                    state.responsive_backends.mark(backend);
+                }
+                res.into_response()
+            }
             Err(e) => {
                 error!("Proxy error: {e}");
+                state
+                    .responsive_backends
+                    .forget_if_unchanged(backend, responsive_observation);
                 error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {e}"))
             }
         };
@@ -912,7 +980,8 @@ fn loading_response(service_name: &str) -> Response {
         // 1. Poll for readiness
         function poll() {{
             fetch(window.location.href, {{
-                headers: {{ 'X-Locald-Passthrough': 'true' }}
+                headers: {{ 'X-Locald-Passthrough': 'true' }},
+                redirect: 'manual'
             }}).then(() => {{
                 window.location.reload();
             }}).catch(() => {{
@@ -968,4 +1037,54 @@ fn loading_response(service_name: &str) -> Response {
         html,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod responsive_backend_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_controller_does_not_inherit_responsiveness() {
+        let responsive = ResponsiveBackends::default();
+        let original = ResponsiveBackend {
+            port: 4_242,
+            runtime_generation: 7,
+        };
+        let replacement = ResponsiveBackend {
+            runtime_generation: 8,
+            ..original
+        };
+
+        responsive.mark(original);
+
+        assert!(responsive.observe(original).is_some());
+        assert!(responsive.observe(replacement).is_none());
+    }
+
+    #[test]
+    fn older_failure_does_not_clear_a_newer_observation() {
+        let responsive = ResponsiveBackends::default();
+        let backend = ResponsiveBackend {
+            port: 4_242,
+            runtime_generation: 7,
+        };
+        let first_deadline = Instant::now() + Duration::from_secs(10);
+        let newer_deadline = Instant::now() + Duration::from_secs(20);
+
+        responsive
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(backend, first_deadline);
+        let observed = responsive.observe(backend);
+        responsive
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(backend, newer_deadline);
+
+        responsive.forget_if_unchanged(backend, observed);
+
+        assert_eq!(responsive.observe(backend), Some(newer_deadline));
+    }
 }

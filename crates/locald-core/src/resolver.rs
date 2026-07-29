@@ -10,6 +10,11 @@ pub enum DomainResolution {
         name: String,
         port: Option<u16>,
         status: ServiceState,
+        /// Daemon-local identity for the current service controller.
+        ///
+        /// A replacement controller receives a new generation even when it
+        /// reuses the service's sticky internal port.
+        runtime_generation: u64,
     },
     /// A persisted project claim that cannot currently be mapped to loaded
     /// service context. The domain remains owned and must not fall through to a

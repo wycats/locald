@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
 use locald_core::registry::Registry;
@@ -126,6 +126,7 @@ impl locald_core::resolver::ServiceResolver for MockResolver {
             name: "mock-service".to_string(),
             port: self.port,
             status: self.status,
+            runtime_generation: 1,
         })
     }
     async fn set_http_port(&self, _port: Option<u16>) {}
@@ -269,6 +270,7 @@ async fn test_proxy_error_page() {
     let req = Request::builder()
         .uri("/")
         .header("Host", "broken.localhost")
+        .header("Accept", "text/html")
         .body(Body::empty())
         .unwrap();
 
@@ -276,7 +278,6 @@ async fn test_proxy_error_page() {
 
     // Should be 502 Bad Gateway
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
     // Should be HTML
     let content_type = response.headers().get("content-type").unwrap();
     assert_eq!(content_type, "text/html; charset=utf-8");
@@ -513,4 +514,150 @@ async fn test_proxy_connection_success() {
         .await
         .unwrap();
     assert_eq!(&body_bytes[..], b"Hello World!");
+}
+
+#[tokio::test]
+async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen_cookies = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let backend_cookies = seen_cookies.clone();
+    let backend = Router::new().fallback(move |headers: HeaderMap| {
+        let backend_cookies = backend_cookies.clone();
+        async move {
+            backend_cookies.lock().await.push(
+                headers
+                    .get(hyper::header::COOKIE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            "slow-app"
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+
+    let resolver = Arc::new(MockResolver {
+        port: Some(port),
+        status: ServiceState::Running,
+    });
+    let app = ProxyManager::new(resolver, Router::new(), None).make_app();
+
+    let initial = Request::builder()
+        .uri("/")
+        .header("Host", "slow.localhost")
+        .header("Accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(initial).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let loading_page = response_body(response).await;
+    assert!(loading_page.contains("Waiting for first response"));
+    assert!(
+        loading_page.contains("redirect: 'manual'"),
+        "the readiness poll must stop at redirects so top-level navigation can follow them"
+    );
+
+    let poll = Request::builder()
+        .uri("/")
+        .header("Host", "slow.localhost")
+        .header("X-Locald-Passthrough", "true")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(poll).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let reload = Request::builder()
+        .uri("/")
+        .header("Host", "slow.localhost")
+        .header("Accept", "text/html")
+        .header("Cookie", "session=abc; theme=dark")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(reload).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "slow-app");
+
+    {
+        let seen_cookies = seen_cookies.lock().await;
+        assert_eq!(
+            seen_cookies.last().and_then(Option::as_deref),
+            Some("session=abc; theme=dark")
+        );
+    }
+
+    let later_navigation = Request::builder()
+        .uri("/another-slow-page")
+        .header("Host", "slow.localhost")
+        .header("Accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(later_navigation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "slow-app");
+}
+
+#[tokio::test]
+async fn test_loading_handoff_is_shared_across_service_aliases_and_redirects() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let backend = Router::new()
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/final") }),
+        )
+        .route("/cached", get(|| async { StatusCode::NOT_MODIFIED }))
+        .route(
+            "/final",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                "redirected-slow-app"
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+
+    let resolver = Arc::new(MockResolver {
+        port: Some(port),
+        status: ServiceState::Running,
+    });
+    let app = ProxyManager::new(resolver, Router::new(), None).make_app();
+
+    let redirect = Request::builder()
+        .uri("/")
+        .header("Host", "alias.localhost")
+        .header("X-Locald-Passthrough", "true")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(redirect).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/final")
+    );
+
+    let final_navigation = Request::builder()
+        .uri("/final")
+        .header("Host", "canonical.localhost")
+        .header("Accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(final_navigation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "redirected-slow-app");
+
+    let cached_navigation = Request::builder()
+        .uri("/cached")
+        .header("Host", "canonical.localhost")
+        .header("Accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(cached_navigation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 }
