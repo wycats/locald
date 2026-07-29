@@ -583,13 +583,36 @@ async fn test_loading_passthrough_hands_slow_warm_pages_to_the_browser() {
         )
         .body(Body::empty())
         .unwrap();
-    let response = app.oneshot(reload).await.unwrap();
+    let response = app.clone().oneshot(reload).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        Some("__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+    );
     assert_eq!(response_body(response).await, "slow-app");
 
-    let seen_cookies = seen_cookies.lock().await;
-    assert_eq!(
-        seen_cookies.last().and_then(Option::as_deref),
-        Some("session=abc; theme=dark")
+    {
+        let seen_cookies = seen_cookies.lock().await;
+        assert_eq!(
+            seen_cookies.last().and_then(Option::as_deref),
+            Some("session=abc; theme=dark")
+        );
+    }
+
+    let later_navigation = Request::builder()
+        .uri("/another-slow-page")
+        .header("Host", "slow.localhost")
+        .header("Accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(later_navigation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response_body(response)
+            .await
+            .contains("Waiting for first response")
     );
 }

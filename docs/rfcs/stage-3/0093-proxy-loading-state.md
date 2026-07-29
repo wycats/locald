@@ -40,7 +40,7 @@ When the proxy forwards a request to a backend service, it races the backend's r
 We only intervene if:
 
 1. The request is for **HTML** (`Accept: text/html`). We don't want to return HTML for a JSON API request or an image load.
-2. The request does **not** have the `X-Locald-Passthrough` header (see below).
+2. The request does **not** have the `X-Locald-Passthrough` header or the single-use loading handoff marker described below.
 
 ### 3. The "Building..." Page
 
@@ -57,8 +57,9 @@ The JavaScript on the loading page performs the following loop:
 1. `fetch(window.location.href, { headers: { 'X-Locald-Passthrough': 'true' } })`
 2. The `X-Locald-Passthrough` header tells the `locald` proxy: **"Do not serve the loading page. Wait as long as it takes."**
 3. The proxy forwards this request to the backend and awaits the real response, no matter how long it takes.
-4. When the `fetch` completes (meaning the backend finally responded), the JavaScript calls `window.location.reload()`.
-5. The browser reloads the page. Since the build is now cached/complete, the backend responds instantly (<500ms), and the user sees their app.
+4. When the `fetch` completes, the proxy sets a host-scoped, HttpOnly loading handoff cookie that expires after 60 seconds, and the JavaScript calls `window.location.reload()`.
+5. The browser reloads the page with that marker. `locald` removes the marker before forwarding the request, waits for the real backend response without applying the 500ms cutoff, and expires the browser cookie in the response.
+6. The marker is therefore consumed by exactly the next HTML navigation. Application cookies remain unchanged, and later slow HTML navigations receive the normal loading screen.
 
 ## Implementation Details
 
@@ -66,14 +67,21 @@ The JavaScript on the loading page performs the following loop:
 
 ```rust
 // Simplified logic
-let is_passthrough = req.headers().contains_key("x-locald-passthrough");
 let accepts_html = req.headers().get("accept").contains("text/html");
+let header_passthrough = req.headers().contains_key("x-locald-passthrough");
+let cookie_passthrough = take_loading_bypass_cookie(req.headers_mut());
+let is_passthrough = header_passthrough || (accepts_html && cookie_passthrough);
 
 let backend_future = client.request(req);
 
 if is_passthrough || !accepts_html {
-    // Standard behavior: wait forever
-    return backend_future.await;
+    let mut response = backend_future.await;
+    if header_passthrough {
+        set_loading_bypass_cookie(response.headers_mut());
+    } else if cookie_passthrough {
+        clear_loading_bypass_cookie(response.headers_mut());
+    }
+    return response;
 }
 
 // Race against timeout
@@ -88,6 +96,7 @@ tokio::select! {
 - **APIs**: API requests usually don't accept `text/html`, so they will just hang until completion (standard behavior).
 - **WebSockets**: The upgrade handshake happens before this logic, so WebSockets are unaffected.
 - **Errors**: If the polling request fails (500/502), the JavaScript retries after a delay.
+- **Cookie isolation**: The handoff cookie has no `Domain` attribute, so it is scoped to the concrete service hostname. `locald` strips it before proxying and consumes it on the next HTML navigation.
 
 ## Phase 2: High-Fidelity Build Logs (Refinement)
 

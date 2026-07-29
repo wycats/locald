@@ -27,6 +27,8 @@ use locald_utils::cert::CertManager;
 const LOADING_BYPASS_COOKIE: &str = "__locald_loading_ready=1";
 const LOADING_BYPASS_SET_COOKIE: &str =
     "__locald_loading_ready=1; Max-Age=60; Path=/; HttpOnly; SameSite=Lax";
+const LOADING_BYPASS_CLEAR_COOKIE: &str =
+    "__locald_loading_ready=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax";
 
 /// Manages the reverse proxy for routing requests to services.
 ///
@@ -377,8 +379,10 @@ async fn proxy_to_domain_resolution(
     if is_passthrough || !accepts_html {
         return match backend_future.await {
             Ok(mut res) => {
-                if header_passthrough || (accepts_html && cookie_passthrough) {
+                if header_passthrough {
                     set_loading_bypass_cookie(res.headers_mut());
+                } else if accepts_html && cookie_passthrough {
+                    clear_loading_bypass_cookie(res.headers_mut());
                 }
                 res.into_response()
             }
@@ -451,6 +455,13 @@ fn set_loading_bypass_cookie(headers: &mut HeaderMap) {
     headers.append(
         hyper::header::SET_COOKIE,
         HeaderValue::from_static(LOADING_BYPASS_SET_COOKIE),
+    );
+}
+
+fn clear_loading_bypass_cookie(headers: &mut HeaderMap) {
+    headers.append(
+        hyper::header::SET_COOKIE,
+        HeaderValue::from_static(LOADING_BYPASS_CLEAR_COOKIE),
     );
 }
 
@@ -1085,6 +1096,20 @@ mod tests {
                 .get(hyper::header::SET_COOKIE)
                 .and_then(|value| value.to_str().ok()),
             Some(LOADING_BYPASS_SET_COOKIE)
+        );
+    }
+
+    #[test]
+    fn completed_reload_clears_loading_bypass_cookie() {
+        let mut headers = HeaderMap::new();
+
+        clear_loading_bypass_cookie(&mut headers);
+
+        assert_eq!(
+            headers
+                .get(hyper::header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some(LOADING_BYPASS_CLEAR_COOKIE)
         );
     }
 }
