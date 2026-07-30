@@ -2,7 +2,7 @@
 #![allow(clippy::option_if_let_else)]
 use crate::agent_context::resolve_agent_workspace;
 use crate::config_loader::ConfigLoader;
-use crate::generated_files::GeneratedFileSet;
+use crate::generated_files::{GeneratedFileSet, PreparedGeneratedFileSet};
 use crate::health::{HealthMonitor, ReadinessRequirement};
 use crate::lifecycle_migration::{
     availability_demand_for_attachment_source, manual_cli_session_demand,
@@ -297,10 +297,35 @@ fn config_reload_event_is_relevant(
         path.ends_with("locald.toml")
             || path.ends_with("Procfile")
             || path.ends_with(".env")
-            || generated_sources.contains(path)
-            || locald_core::normalize_project_locator(path)
-                .is_ok_and(|canonical| generated_sources.contains(&canonical))
+            || generated_sources
+                .iter()
+                .any(|source| source == path || source.starts_with(path))
+            || locald_core::normalize_project_locator(path).is_ok_and(|canonical| {
+                generated_sources
+                    .iter()
+                    .any(|source| source == &canonical || source.starts_with(&canonical))
+            })
     })
+}
+
+fn generated_source_watch_candidates(project_path: &Path, source_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(mut directory) = source_path.parent() else {
+        return candidates;
+    };
+    while directory.starts_with(project_path) && directory != project_path {
+        if std::fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir())
+            && std::fs::canonicalize(directory)
+                .is_ok_and(|canonical| canonical.starts_with(project_path))
+        {
+            candidates.push(directory.to_path_buf());
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        directory = parent;
+    }
+    candidates
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +402,7 @@ struct ConfigTransitionPlan {
     reusable_service_envs: HashMap<ServiceKey, HashMap<String, String>>,
     stopped_service_projections:
         HashMap<ServiceKey, (ServiceConfig, Option<HashMap<String, String>>)>,
+    prepared_generated_files: HashMap<ServiceKey, PreparedGeneratedFileSet>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -384,6 +410,7 @@ struct PrepublicationStopOptions<'a> {
     sorted_services: &'a [String],
     desired_service_names: &'a HashSet<ServiceKey>,
     readiness_probe_budget: std::time::Duration,
+    project_path: &'a Path,
 }
 
 #[derive(Debug)]
@@ -1595,6 +1622,7 @@ impl ProcessManager {
             sorted_services,
             desired_service_names,
             readiness_probe_budget,
+            project_path,
         } = options;
         let mut removed_service_names = {
             let services = self.services.lock().await;
@@ -1612,6 +1640,7 @@ impl ProcessManager {
         let mut restart_service_names = Vec::new();
         let mut reusable_service_envs = HashMap::new();
         let mut stopped_service_projections = HashMap::new();
+        let mut prepared_generated_files = HashMap::new();
 
         for service_name in sorted_services {
             let service_config = &config.services[service_name];
@@ -1668,60 +1697,74 @@ impl ProcessManager {
                 })
             };
 
-            let (has_controller, is_up_to_date, is_stopped_projection) = match service_snapshot {
-                Some((loaded_instance, loaded_path, _, _, _, Some(_), _, _, _))
-                    if loaded_instance != instance_id =>
-                {
-                    anyhow::bail!(
-                        "service `{full_name}` is still loaded by project instance {loaded_instance} at {}; stop that project before starting instance {instance_id}",
-                        loaded_path.display()
-                    );
-                }
-                Some((
-                    _,
-                    loaded_path,
-                    loaded_project_name,
-                    current_config,
-                    current_env,
-                    Some(controller),
-                    health_status,
-                    sticky_port,
-                    generated_files,
-                )) => {
-                    let controller_guard = controller.lock().await;
-                    let runtime_state = controller_guard.read_state().await;
-                    let owned_process_id = controller_guard.owned_process_id();
-                    let has_process_identity = controller_guard.process_identity().is_some();
-                    drop(controller_guard);
-                    let has_durable_process_ownership =
-                        !Self::requires_durable_process_ownership(service_config)
-                            || (owned_process_id.is_some() && has_process_identity);
-                    let environment_matches = resolved_env
-                        .as_ref()
-                        .is_some_and(|resolved_env| current_env == *resolved_env);
-                    let generated_sources_match = match generated_files.as_ref() {
-                        Some(generated_files) => {
-                            generated_files
-                                .sources_match(&loaded_path, service_config)
-                                .await
-                        }
-                        None => service_config.generated().is_empty(),
-                    };
-                    let static_configuration_matches = !dependency_will_change
-                        && has_durable_process_ownership
-                        && loaded_project_name == config.project.name
-                        && current_config.runtime_eq(service_config)
-                        && generated_sources_match
-                        && environment_matches;
-                    let runtime_is_reusable =
-                        match (runtime_state.status, health_status, service_config) {
-                            (ServiceState::Running, HealthStatus::Healthy, _) => true,
-                            (
-                                ServiceState::Running,
-                                HealthStatus::Starting,
-                                ServiceConfig::Typed(TypedServiceConfig::Site(_)),
-                            ) if static_configuration_matches => {
-                                let requirement = ReadinessRequirement::for_service(
+            let (has_controller, is_up_to_date, is_stopped_projection, prepared_generated_file_set) =
+                match service_snapshot {
+                    Some((loaded_instance, loaded_path, _, _, _, Some(_), _, _, _))
+                        if loaded_instance != instance_id =>
+                    {
+                        anyhow::bail!(
+                            "service `{full_name}` is still loaded by project instance {loaded_instance} at {}; stop that project before starting instance {instance_id}",
+                            loaded_path.display()
+                        );
+                    }
+                    Some((
+                        _,
+                        loaded_path,
+                        loaded_project_name,
+                        current_config,
+                        current_env,
+                        Some(controller),
+                        health_status,
+                        sticky_port,
+                        generated_files,
+                    )) => {
+                        let controller_guard = controller.lock().await;
+                        let runtime_state = controller_guard.read_state().await;
+                        let owned_process_id = controller_guard.owned_process_id();
+                        let has_process_identity = controller_guard.process_identity().is_some();
+                        drop(controller_guard);
+                        let has_durable_process_ownership =
+                            !Self::requires_durable_process_ownership(service_config)
+                                || (owned_process_id.is_some() && has_process_identity);
+                        let environment_matches = resolved_env
+                            .as_ref()
+                            .is_some_and(|resolved_env| current_env == *resolved_env);
+                        let prepared_generated_file_set = crate::generated_files::prepare(
+                            project_path,
+                            &key,
+                            service_config,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to prepare generated files for active service `{full_name}`"
+                            )
+                        })?;
+                        let generated_sources_match = match (
+                            generated_files.as_ref(),
+                            prepared_generated_file_set.as_ref(),
+                        ) {
+                            (Some(generated_files), Some(prepared)) => {
+                                generated_files.matches_prepared(prepared)
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        let static_configuration_matches = !dependency_will_change
+                            && has_durable_process_ownership
+                            && loaded_project_name == config.project.name
+                            && current_config.runtime_eq(service_config)
+                            && generated_sources_match
+                            && environment_matches;
+                        let runtime_is_reusable =
+                            match (runtime_state.status, health_status, service_config) {
+                                (ServiceState::Running, HealthStatus::Healthy, _) => true,
+                                (
+                                    ServiceState::Running,
+                                    HealthStatus::Starting,
+                                    ServiceConfig::Typed(TypedServiceConfig::Site(_)),
+                                ) if static_configuration_matches => {
+                                    let requirement = ReadinessRequirement::for_service(
                                     service_config,
                                     sticky_port,
                                 )
@@ -1730,42 +1773,43 @@ impl ProcessManager {
                                         "service `{full_name}` has an invalid readiness contract"
                                     )
                                 })?;
-                                let probe_succeeded = requirement
-                                    .probe_once(
-                                        Some(&loaded_path),
-                                        &current_env,
-                                        readiness_probe_budget,
-                                    )
-                                    .await;
-                                if probe_succeeded {
-                                    self.publish_successful_readiness_probe(
-                                        &full_name,
-                                        instance_id,
-                                        &controller,
-                                        &requirement,
-                                    )
-                                    .await
-                                } else {
-                                    false
+                                    let probe_succeeded = requirement
+                                        .probe_once(
+                                            Some(&loaded_path),
+                                            &current_env,
+                                            readiness_probe_budget,
+                                        )
+                                        .await;
+                                    if probe_succeeded {
+                                        self.publish_successful_readiness_probe(
+                                            &full_name,
+                                            instance_id,
+                                            &controller,
+                                            &requirement,
+                                        )
+                                        .await
+                                    } else {
+                                        false
+                                    }
                                 }
-                            }
-                            (ServiceState::Running, HealthStatus::Starting, _) => true,
-                            (
-                                ServiceState::Building,
-                                HealthStatus::Starting,
-                                ServiceConfig::Typed(TypedServiceConfig::Site(_)),
-                            ) => true,
-                            _ => false,
-                        };
-                    (
-                        true,
-                        static_configuration_matches && runtime_is_reusable,
-                        false,
-                    )
-                }
-                Some((_, _, _, _, _, None, _, _, _)) => (false, false, true),
-                None => (false, false, false),
-            };
+                                (ServiceState::Running, HealthStatus::Starting, _) => true,
+                                (
+                                    ServiceState::Building,
+                                    HealthStatus::Starting,
+                                    ServiceConfig::Typed(TypedServiceConfig::Site(_)),
+                                ) => true,
+                                _ => false,
+                            };
+                        (
+                            true,
+                            static_configuration_matches && runtime_is_reusable,
+                            false,
+                            prepared_generated_file_set,
+                        )
+                    }
+                    Some((_, _, _, _, _, None, _, _, _)) => (false, false, true, None),
+                    None => (false, false, false, None),
+                };
 
             if is_stopped_projection {
                 stopped_service_projections
@@ -1775,6 +1819,9 @@ impl ProcessManager {
             if !is_up_to_date {
                 changed_services.insert(service_name.clone());
                 if has_controller {
+                    if let Some(prepared) = prepared_generated_file_set {
+                        prepared_generated_files.insert(key.clone(), prepared);
+                    }
                     restart_service_names.push(key);
                 }
             } else if let Some(resolved_env) = resolved_env {
@@ -1789,6 +1836,7 @@ impl ProcessManager {
             restart_service_names,
             reusable_service_envs,
             stopped_service_projections,
+            prepared_generated_files,
         })
     }
 
@@ -3290,50 +3338,73 @@ impl ProcessManager {
                 }
             }
         }
-        let desired_directories = desired_sources
-            .iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .filter(|directory| directory != &project_path)
-            .collect::<HashSet<_>>();
-
         let mut watchers = self.watchers.lock().await;
         let Some(config_watcher) = watchers.get_mut(&project_path) else {
             return;
         };
-        let removed = config_watcher
-            .generated_directories
-            .difference(&desired_directories)
-            .cloned()
-            .collect::<Vec<_>>();
-        let added = desired_directories
-            .difference(&config_watcher.generated_directories)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for directory in removed {
-            if let Err(error) = config_watcher.watcher.unwatch(&directory) {
-                warn!(
-                    "Failed to stop watching generated-file directory {}: {error}",
-                    directory.display()
-                );
-            }
-        }
-        for directory in added {
-            if let Err(error) = config_watcher
-                .watcher
-                .watch(&directory, RecursiveMode::NonRecursive)
-            {
-                warn!(
-                    "Failed to watch generated-file directory {}: {error}",
-                    directory.display()
-                );
-            }
-        }
+        let watcher_sources = desired_sources.clone();
         *config_watcher
             .generated_sources
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = desired_sources;
-        config_watcher.generated_directories = desired_directories;
+
+        let mut retained_directories = HashSet::new();
+        for source in &watcher_sources {
+            // Try the deepest existing directory first. If it disappears
+            // between discovery and `watch`, fall back through its existing
+            // ancestors. The previous ancestor watch remains active until a
+            // deeper replacement has been installed successfully.
+            for directory in generated_source_watch_candidates(&project_path, source) {
+                if config_watcher.generated_directories.contains(&directory) {
+                    retained_directories.insert(directory);
+                    break;
+                }
+                match config_watcher
+                    .watcher
+                    .watch(&directory, RecursiveMode::NonRecursive)
+                {
+                    Ok(()) => {
+                        config_watcher
+                            .generated_directories
+                            .insert(directory.clone());
+                        retained_directories.insert(directory);
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failed to watch generated-file directory {}: {error}",
+                            directory.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        let removed = config_watcher
+            .generated_directories
+            .difference(&retained_directories)
+            .cloned()
+            .collect::<Vec<_>>();
+        for directory in removed {
+            match config_watcher.watcher.unwatch(&directory) {
+                Ok(()) => {
+                    config_watcher.generated_directories.remove(&directory);
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to stop watching generated-file directory {}: {error}",
+                        directory.display()
+                    );
+                    if !directory.is_dir() {
+                        // A backend commonly drops a watch when its directory
+                        // disappears, then reports that no watch remains to
+                        // remove. Keep bookkeeping aligned so recreation can
+                        // install a fresh watch.
+                        config_watcher.generated_directories.remove(&directory);
+                    }
+                }
+            }
+        }
     }
 
     async fn loaded_generated_sources_match(&self, instance_id: ProjectInstanceId) -> bool {
@@ -3549,6 +3620,7 @@ impl ProcessManager {
             published_domain_index,
             mut reusable_service_envs,
             stopped_service_projections,
+            mut prepared_generated_files,
             pending_initial,
             trusted_launch_path,
             service_activation,
@@ -3650,6 +3722,12 @@ impl ProcessManager {
             candidate.replace_domain_claims(instance_id, claims)?;
             let candidate_domain_index = Arc::new(candidate.domain_index().clone());
 
+            // Publish declared generated-source paths to the existing project
+            // watcher before source preparation can reject this transition.
+            // Correcting a malformed or newly created nested source must be
+            // enough to retry convergence without another locald.toml edit.
+            self.update_generated_source_watches(&path, &config).await;
+
             // Keep the previous claim set published until every removed or
             // restart-required service has stopped. A failed stop retains both
             // ownership and the retryable service record.
@@ -3658,6 +3736,7 @@ impl ProcessManager {
                 restart_service_names,
                 reusable_service_envs,
                 stopped_service_projections,
+                prepared_generated_files,
             } = self
                 .prepublication_stop_plan(
                     instance_id,
@@ -3669,6 +3748,7 @@ impl ProcessManager {
                         sorted_services: &sorted_services,
                         desired_service_names: &desired_service_names,
                         readiness_probe_budget: service_readiness_timeout,
+                        project_path: &path,
                     },
                 )
                 .await?;
@@ -3751,6 +3831,7 @@ impl ProcessManager {
                 published_domain_index,
                 reusable_service_envs,
                 stopped_service_projections,
+                prepared_generated_files,
                 pending_initial,
                 trusted_launch_path,
                 service_activation,
@@ -3815,7 +3896,6 @@ impl ProcessManager {
             drop(lifecycle_publication_guard);
         }
         commit_result?;
-        self.update_generated_source_watches(&path, &config).await;
 
         // Runtime logs begin only after the project instance is resolved and
         // its ownership is published. Bind verbose boot output to that exact
@@ -3996,14 +4076,27 @@ impl ProcessManager {
             ) {
                 Self::ensure_postgres_resource_namespace_ready(&key, &name)?;
             }
-            let mut generated_files = crate::generated_files::materialize(
-                &self.availability_data_dir,
-                &path,
-                &key,
-                service_config,
-                &listener_runtime.bindings,
-            )
-            .await?;
+            let mut generated_files = if let Some(prepared) = prepared_generated_files.remove(&key)
+            {
+                Some(
+                    crate::generated_files::materialize_prepared(
+                        &self.availability_data_dir,
+                        &key,
+                        &listener_runtime.bindings,
+                        &prepared,
+                    )
+                    .await?,
+                )
+            } else {
+                crate::generated_files::materialize(
+                    &self.availability_data_dir,
+                    &path,
+                    &key,
+                    service_config,
+                    &listener_runtime.bindings,
+                )
+                .await?
+            };
             let resolved_env = self
                 .resolve_env_with_candidate_bindings(
                     &combined_env,
@@ -26222,12 +26315,22 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
     #[test]
     fn generated_source_paths_participate_in_config_reload_filtering() {
         let root = tempdir().expect("create watcher path directory");
-        let source = root.path().join("chat/microfrontends.jsonc");
-        let unrelated = root.path().join("chat/README.md");
+        let project_path =
+            std::fs::canonicalize(root.path()).expect("canonicalize watcher path directory");
+        let source = project_path.join("chat/nested/microfrontends.jsonc");
+        let unrelated = project_path.join("chat/README.md");
         let generated_sources = HashSet::from([source.clone()]);
 
         assert!(config_reload_event_is_relevant(
             std::slice::from_ref(&source),
+            &generated_sources
+        ));
+        assert!(config_reload_event_is_relevant(
+            &[project_path.join("chat")],
+            &generated_sources
+        ));
+        assert!(config_reload_event_is_relevant(
+            &[project_path.join("chat/nested")],
             &generated_sources
         ));
         assert!(!config_reload_event_is_relevant(
@@ -26235,9 +26338,108 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
             &generated_sources
         ));
         assert!(config_reload_event_is_relevant(
-            &[root.path().join("locald.toml")],
+            &[project_path.join("locald.toml")],
             &HashSet::new()
         ));
+
+        let nested = project_path.join("chat/nested");
+        std::fs::create_dir_all(&nested).expect("create generated-source ancestors");
+        assert_eq!(
+            generated_source_watch_candidates(&project_path, &source),
+            vec![nested.clone(), project_path.join("chat")]
+        );
+        std::fs::remove_dir(&nested).expect("remove deepest generated-source ancestor");
+        assert_eq!(
+            generated_source_watch_candidates(&project_path, &source),
+            vec![project_path.join("chat")],
+            "a failed or vanished deepest watch can fall back to its parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_source_watches_follow_newly_created_ancestor_directories() {
+        let dir = tempdir().expect("create generated-source watcher directory");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let project_path = std::fs::canonicalize(project_path).expect("canonicalize project");
+        let manager = readiness_test_manager(dir.path());
+        manager.watch_config(project_path.clone()).await;
+
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "generated-source-watcher"
+
+[services.worker]
+type = "worker"
+command = "unused"
+
+[services.worker.generated.runtime]
+source = "config/nested/runtime.json"
+"#,
+        )
+        .expect("parse generated-source watcher config");
+        let source = project_path.join("config/nested/runtime.json");
+        manager
+            .update_generated_source_watches(&project_path, &config)
+            .await;
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&project_path).expect("project watcher exists");
+            assert!(
+                watcher
+                    .generated_sources
+                    .lock()
+                    .expect("read generated sources")
+                    .contains(&source)
+            );
+            assert!(
+                watcher.generated_directories.is_empty(),
+                "the project-root watcher covers a wholly missing source hierarchy"
+            );
+        }
+
+        let config_directory = project_path.join("config");
+        std::fs::create_dir(&config_directory).expect("create first source ancestor");
+        manager
+            .update_generated_source_watches(&project_path, &config)
+            .await;
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&project_path).expect("project watcher exists");
+            assert_eq!(
+                watcher.generated_directories,
+                HashSet::from([config_directory.clone()])
+            );
+        }
+
+        let nested_directory = config_directory.join("nested");
+        std::fs::create_dir(&nested_directory).expect("create final source ancestor");
+        manager
+            .update_generated_source_watches(&project_path, &config)
+            .await;
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&project_path).expect("project watcher exists");
+            assert_eq!(
+                watcher.generated_directories,
+                HashSet::from([nested_directory])
+            );
+        }
+
+        manager
+            .update_generated_source_watches(&project_path, &LocaldConfig::default())
+            .await;
+        let watchers = manager.watchers.lock().await;
+        let watcher = watchers.get(&project_path).expect("project watcher exists");
+        assert!(watcher.generated_directories.is_empty());
+        assert!(
+            watcher
+                .generated_sources
+                .lock()
+                .expect("read generated sources")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -26456,6 +26658,145 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
                 .generated_directories
                 .contains(&canonical_project.join("config"))
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_generated_reload_preserves_the_active_service_and_generation() {
+        let dir = tempdir().expect("create generated-file reload directory");
+        let project_path = dir.path().join("generated-file-reload");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "generated-file-reload").await;
+        std::fs::create_dir(project_path.join("config"))
+            .expect("create generated-file source directory");
+        let source_path = project_path.join("config/runtime.json");
+        std::fs::write(&source_path, r#"{"listener":3001}"#).expect("write generated-file source");
+        let config_path = project_path.join("locald.toml");
+        let valid_config = r#"
+[project]
+name = "generated-file-reload"
+domain = "generated-file-reload.localhost"
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+listeners = ["events"]
+
+[services.worker.generated.runtime]
+source = "config/runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/listener" = "${services.worker.listeners.events.port}"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
+"#;
+        std::fs::write(&config_path, valid_config).expect("write generated-file config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load generated-file availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed generated-file policy");
+
+        let captured_env = Arc::new(StdMutex::new(None));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: captured_env.clone(),
+                bindings: Arc::new(StdMutex::new(None)),
+                stop_count: stop_count.clone(),
+                fail_prepare: false,
+            }),
+        );
+        manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect("start generated-file service");
+
+        let key = ServiceKey::new(instance_id, "worker");
+        let (active_controller, active_generation) = {
+            let services = manager.services.lock().await;
+            let service = services.get(&key).expect("active generated-file service");
+            let controller = match &service.runtime_state {
+                ServiceRuntime::Controller(controller) => controller.clone(),
+                ServiceRuntime::None => panic!("generated-file service must have a controller"),
+            };
+            (
+                controller,
+                service
+                    .generated_files
+                    .as_ref()
+                    .expect("active generated-file generation")
+                    .path("runtime")
+                    .expect("active runtime path")
+                    .to_path_buf(),
+            )
+        };
+        let active_contents =
+            std::fs::read(&active_generation).expect("read active generated-file generation");
+        let active_domain_index = manager.domain_index.snapshot();
+        let active_catalog = manager.registry.lock().await.clone();
+
+        std::fs::write(&source_path, r#"{"listener":"#)
+            .expect("write malformed generated-file source");
+        let malformed_error = manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect_err("malformed generated source must reject reload");
+        assert!(
+            format!("{malformed_error:#}").contains("failed to parse generated file"),
+            "{malformed_error:#}"
+        );
+
+        std::fs::write(&source_path, r#"{"listener":3001}"#)
+            .expect("restore valid generated-file source");
+        std::fs::write(
+            &config_path,
+            valid_config
+                .replace(
+                    "domain = \"generated-file-reload.localhost\"",
+                    "domain = \"candidate.localhost\"",
+                )
+                .replace("\"/listener\"", "\"/missing\""),
+        )
+        .expect("write missing-target generated-file config");
+        let target_error = manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect_err("missing generated replacement target must reject reload");
+        assert!(
+            format!("{target_error:#}").contains("does not identify an existing value"),
+            "{target_error:#}"
+        );
+
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            0,
+            "invalid generated input must not stop the healthy controller"
+        );
+        let current_controller = {
+            let services = manager.services.lock().await;
+            let service = services
+                .get(&key)
+                .expect("preserved generated-file service");
+            match &service.runtime_state {
+                ServiceRuntime::Controller(controller) => controller.clone(),
+                ServiceRuntime::None => panic!("generated-file controller must remain active"),
+            }
+        };
+        assert!(Arc::ptr_eq(&active_controller, &current_controller));
+        assert_eq!(
+            std::fs::read(&active_generation).expect("read preserved generation"),
+            active_contents
+        );
+        assert!(Arc::ptr_eq(
+            &active_domain_index,
+            &manager.domain_index.snapshot()
+        ));
+        assert_eq!(*manager.registry.lock().await, active_catalog);
     }
 
     #[tokio::test(start_paused = true)]
@@ -28844,6 +29185,7 @@ command = "api"
                     sorted_services: &["db".to_owned(), "web".to_owned(), "api".to_owned()],
                     desired_service_names: &desired_service_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &project_path,
                 },
             )
             .await
@@ -28855,6 +29197,150 @@ command = "api"
             ["api", "web", "db"].map(|name| test_service_key(test_instance_id(), name))
         );
         assert!(plan.reusable_service_envs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepublication_plan_prepares_generated_sources_from_the_candidate_path() {
+        let dir = tempdir().expect("create moved generated-file project");
+        let old_path = dir.path().join("before-move");
+        let candidate_path = dir.path().join("after-move");
+        std::fs::create_dir(&old_path).expect("create original project path");
+        std::fs::write(
+            old_path.join("runtime.json"),
+            r#"{"listener":3001,"version":1}"#,
+        )
+        .expect("write generated-file source");
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "moved-generated"
+
+[services.worker]
+type = "worker"
+command = "unused"
+listeners = ["events"]
+
+[services.worker.generated.runtime]
+source = "runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/listener" = "${services.worker.listeners.events.port}"
+"#,
+        )
+        .expect("parse moved generated-file config");
+        let key = test_service_key(test_instance_id(), "worker");
+        let bindings = ServiceRuntimeBindings::new(
+            None,
+            BTreeMap::from([(ListenerName::new("events"), 41_237)]),
+        );
+        let generated_files = crate::generated_files::materialize(
+            &dir.path().join("data"),
+            &old_path,
+            &key,
+            &config.services["worker"],
+            &bindings,
+        )
+        .await
+        .expect("materialize original generated-file generation")
+        .expect("generated-file declarations");
+
+        let manager = readiness_test_manager(dir.path());
+        let mut controller = TestController::new(
+            "moved-generated:worker",
+            RuntimeState {
+                pid: Some(42),
+                port: None,
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+        );
+        controller.owned_process_id = Some(42);
+        controller.process_identity = Some(test_process_identity(
+            1_237,
+            42,
+            "/test/moved-generated-worker",
+        ));
+        let mut service = test_service(
+            config.clone(),
+            config.services["worker"].clone(),
+            ServiceRuntime::Controller(Arc::new(Mutex::new(controller))),
+            old_path.clone(),
+        );
+        service.generated_files = Some(generated_files);
+        manager.services.lock().await.insert(key.clone(), service);
+
+        std::fs::rename(&old_path, &candidate_path).expect("move the project directory");
+        let plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &config,
+                manager.domain_index.snapshot(),
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["worker".to_owned()],
+                    desired_service_names: &HashSet::from([key.clone()]),
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &candidate_path,
+                },
+            )
+            .await
+            .expect("prepare generated sources from the moved candidate path");
+
+        assert!(plan.restart_service_names.is_empty());
+        assert!(plan.prepared_generated_files.is_empty());
+        assert!(plan.reusable_service_envs.contains_key(&key));
+
+        let candidate_source = candidate_path.join("runtime.json");
+        std::fs::write(&candidate_source, r#"{"listener":3001,"version":2}"#)
+            .expect("change source after the project move");
+        let mut restart_plan = manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                &config,
+                manager.domain_index.snapshot(),
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["worker".to_owned()],
+                    desired_service_names: &HashSet::from([key.clone()]),
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &candidate_path,
+                },
+            )
+            .await
+            .expect("prepare the changed source before restart");
+        assert_eq!(restart_plan.restart_service_names, [key.clone()]);
+        let prepared = restart_plan
+            .prepared_generated_files
+            .remove(&key)
+            .expect("restart plan carries the prepared source snapshot");
+
+        std::fs::write(&candidate_source, r#"{"listener":"#)
+            .expect("invalidate the live source after transition planning");
+        let staged = crate::generated_files::materialize_prepared(
+            &dir.path().join("post-plan-data"),
+            &key,
+            &bindings,
+            &prepared,
+        )
+        .await
+        .expect("materialize the exact prepared snapshot");
+        let staged_value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(staged.path("runtime").expect("staged runtime path"))
+                .expect("read staged runtime"),
+        )
+        .expect("parse staged runtime");
+        assert_eq!(
+            staged_value.pointer("/version"),
+            Some(&serde_json::Value::from(2))
+        );
+        assert!(
+            !staged
+                .sources_match(&candidate_path, &config.services["worker"])
+                .await,
+            "the post-plan edit remains visible to the final reload check"
+        );
     }
 
     #[tokio::test]
@@ -28919,7 +29405,7 @@ PUBLIC_ORIGIN = "${services.web.origin}"
             previous_config,
             next_config.services["web"].clone(),
             ServiceRuntime::Controller(controller),
-            project_path,
+            project_path.clone(),
         );
         service.resolved_env.insert(
             "PUBLIC_ORIGIN".to_owned(),
@@ -28951,6 +29437,7 @@ PUBLIC_ORIGIN = "${services.web.origin}"
                     sorted_services: &["web".to_owned()],
                     desired_service_names: &desired_service_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &project_path,
                 },
             )
             .await
@@ -28984,6 +29471,7 @@ PUBLIC_ORIGIN = "${services.web.origin}"
                     sorted_services: &["web".to_owned()],
                     desired_service_names: &desired_service_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &project_path,
                 },
             )
             .await
@@ -29052,7 +29540,7 @@ domains = ["web", "web-alias", "*.preview"]
             previous_config.clone(),
             previous_config.services["web"].clone(),
             ServiceRuntime::Controller(controller),
-            project_path,
+            project_path.clone(),
         );
         manager
             .services
@@ -29079,6 +29567,7 @@ domains = ["web", "web-alias", "*.preview"]
                     sorted_services: &["web".to_owned()],
                     desired_service_names: &desired_service_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &project_path,
                 },
             )
             .await
@@ -29200,6 +29689,7 @@ path = "ready"
                     ],
                     desired_service_names: &desired_service_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &project_path,
                 },
             )
             .await
@@ -29288,7 +29778,7 @@ type = "postgres"
                 previous_config.clone(),
                 previous_config.services["db"].clone(),
                 ServiceRuntime::Controller(controller),
-                project_path,
+                project_path.clone(),
             ),
         );
         let key = test_service_key(test_instance_id(), "db");
@@ -29305,6 +29795,7 @@ type = "postgres"
                     sorted_services: &["db".to_owned()],
                     desired_service_names: &desired_service_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &project_path,
                 },
             )
             .await
@@ -29474,6 +29965,7 @@ type = "postgres"
                     sorted_services: &["web".to_owned()],
                     desired_service_names: &desired_names,
                     readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path: &second_path,
                 },
             )
             .await

@@ -29,6 +29,19 @@ enum GeneratedFileFormat {
     Jsonc,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedGeneratedSource {
+    value: Value,
+    replacements: BTreeMap<String, Value>,
+    fingerprint: SourceFingerprint,
+}
+
+/// An immutable, validated snapshot of one service's generated-file sources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedGeneratedFileSet {
+    sources: BTreeMap<String, PreparedGeneratedSource>,
+}
+
 /// One complete generation of runtime files owned by a service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GeneratedFileSet {
@@ -60,6 +73,13 @@ impl GeneratedFileSet {
             }
         }
         true
+    }
+
+    pub(crate) fn matches_prepared(&self, prepared: &PreparedGeneratedFileSet) -> bool {
+        self.source_fingerprints.len() == prepared.sources.len()
+            && prepared.sources.iter().all(|(name, source)| {
+                self.source_fingerprints.get(name) == Some(&source.fingerprint)
+            })
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
@@ -108,6 +128,49 @@ pub(crate) fn validate_declarations(config: &LocaldConfig) -> Result<()> {
     Ok(())
 }
 
+/// Load, parse, and validate generated-file sources before a runtime transition begins.
+pub(crate) async fn prepare(
+    project_root: &Path,
+    key: &ServiceKey,
+    service_config: &ServiceConfig,
+) -> Result<Option<PreparedGeneratedFileSet>> {
+    if service_config.generated().is_empty() {
+        return Ok(None);
+    }
+
+    let mut sources = BTreeMap::new();
+    for (name, config) in service_config.generated() {
+        let source = load_source(project_root, config).await.with_context(|| {
+            format!(
+                "failed to load generated file `{name}` for service `{}`",
+                key.name()
+            )
+        })?;
+        let value = parse_source(&source).with_context(|| {
+            format!(
+                "failed to parse generated file `{name}` source `{}`",
+                config.source
+            )
+        })?;
+        validate_replacement_targets(&value, &config.replace).with_context(|| {
+            format!(
+                "failed to validate replacements for generated file `{name}` on service `{}`",
+                key.name()
+            )
+        })?;
+        sources.insert(
+            name.clone(),
+            PreparedGeneratedSource {
+                value,
+                replacements: config.replace.clone(),
+                fingerprint: source.fingerprint,
+            },
+        );
+    }
+
+    Ok(Some(PreparedGeneratedFileSet { sources }))
+}
+
 /// Materialize one service's complete generated-file set.
 pub(crate) async fn materialize(
     data_dir: &Path,
@@ -120,6 +183,27 @@ pub(crate) async fn materialize(
         return Ok(None);
     }
 
+    let service_root = prepare_service_root(data_dir, key).await?;
+    let prepared = prepare(project_root, key, service_config)
+        .await?
+        .context("non-empty generated-file declarations produced no prepared snapshot")?;
+    publish_prepared(&service_root, key, bindings, &prepared)
+        .await
+        .map(Some)
+}
+
+/// Materialize a previously prepared snapshot after runtime bindings are allocated.
+pub(crate) async fn materialize_prepared(
+    data_dir: &Path,
+    key: &ServiceKey,
+    bindings: &ServiceRuntimeBindings,
+    prepared: &PreparedGeneratedFileSet,
+) -> Result<GeneratedFileSet> {
+    let service_root = prepare_service_root(data_dir, key).await?;
+    publish_prepared(&service_root, key, bindings, prepared).await
+}
+
+async fn prepare_service_root(data_dir: &Path, key: &ServiceKey) -> Result<PathBuf> {
     let generated_root = data_dir
         .join("instances")
         .join(key.instance().to_string())
@@ -128,14 +212,21 @@ pub(crate) async fn materialize(
 
     let service_root = generated_root.join(key.resource_id());
     create_private_directory(&service_root, true).await?;
+    Ok(service_root)
+}
 
+async fn publish_prepared(
+    service_root: &Path,
+    key: &ServiceKey,
+    bindings: &ServiceRuntimeBindings,
+    prepared: &PreparedGeneratedFileSet,
+) -> Result<GeneratedFileSet> {
     let generation = uuid::Uuid::new_v4().to_string();
     let staging_dir = service_root.join(format!(".staging-{generation}"));
     let generation_dir = service_root.join(generation);
     create_private_directory(&staging_dir, false).await?;
 
-    let render_result =
-        render_generation(project_root, key, service_config, bindings, &staging_dir).await;
+    let render_result = render_generation(key, bindings, prepared, &staging_dir).await;
     let (relative_paths, source_fingerprints) = match render_result {
         Ok(rendered) => rendered,
         Err(error) => {
@@ -157,9 +248,9 @@ pub(crate) async fn materialize(
             )
         });
     }
-    if let Err(error) = sync_directory(&service_root).await {
+    if let Err(error) = sync_directory(service_root).await {
         let _ = tokio::fs::remove_dir_all(&generation_dir).await;
-        let _ = sync_directory(&service_root).await;
+        let _ = sync_directory(service_root).await;
         return Err(error);
     }
 
@@ -167,11 +258,11 @@ pub(crate) async fn materialize(
         .into_iter()
         .map(|(name, relative)| (name, generation_dir.join(relative)))
         .collect();
-    Ok(Some(GeneratedFileSet {
+    Ok(GeneratedFileSet {
         generation_dir,
         paths,
         source_fingerprints,
-    }))
+    })
 }
 
 /// Remove every generated runtime file for one project instance.
@@ -281,10 +372,9 @@ async fn create_private_directory(path: &Path, recursive: bool) -> Result<()> {
 }
 
 async fn render_generation(
-    project_root: &Path,
     key: &ServiceKey,
-    service_config: &ServiceConfig,
     bindings: &ServiceRuntimeBindings,
+    prepared: &PreparedGeneratedFileSet,
     staging_dir: &Path,
 ) -> Result<(
     BTreeMap<String, PathBuf>,
@@ -293,26 +383,20 @@ async fn render_generation(
     let mut relative_paths = BTreeMap::new();
     let mut source_fingerprints = BTreeMap::new();
 
-    for (name, config) in service_config.generated() {
-        let source = load_source(project_root, config).await.with_context(|| {
+    for (name, source) in &prepared.sources {
+        let mut value = source.value.clone();
+        apply_replacements(
+            &mut value,
+            &source.replacements,
+            key.name().as_str(),
+            bindings,
+        )
+        .with_context(|| {
             format!(
-                "failed to load generated file `{name}` for service `{}`",
+                "failed to apply replacements for generated file `{name}` on service `{}`",
                 key.name()
             )
         })?;
-        let mut value = parse_source(&source).with_context(|| {
-            format!(
-                "failed to parse generated file `{name}` source `{}`",
-                config.source
-            )
-        })?;
-        apply_replacements(&mut value, &config.replace, key.name().as_str(), bindings)
-            .with_context(|| {
-                format!(
-                    "failed to apply replacements for generated file `{name}` on service `{}`",
-                    key.name()
-                )
-            })?;
 
         let mut rendered =
             serde_json::to_vec_pretty(&value).context("failed to serialize generated JSON")?;
@@ -334,7 +418,7 @@ async fn render_generation(
             .await
             .with_context(|| format!("failed to sync generated file `{}`", output.display()))?;
         relative_paths.insert(name.clone(), relative);
-        source_fingerprints.insert(name.clone(), source.fingerprint);
+        source_fingerprints.insert(name.clone(), source.fingerprint.clone());
     }
 
     Ok((relative_paths, source_fingerprints))
@@ -435,6 +519,24 @@ fn parse_source(source: &LoadedSource) -> Result<Value> {
                 .context("JSONC source is empty")
         }
     }
+}
+
+fn validate_replacement_targets(
+    root: &Value,
+    replacements: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let mut candidate = root.clone();
+    for (pointer, replacement) in replacements {
+        let target = candidate.pointer_mut(pointer).with_context(|| {
+            format!("JSON Pointer `{pointer}` does not identify an existing value")
+        })?;
+        // Preserve the configured replacement's container shape while
+        // validating targets in the same deterministic order used during
+        // rendering. Runtime binding resolution changes scalar values, not
+        // whether a replacement is an object, array, or scalar.
+        *target = replacement.clone();
+    }
+    Ok(())
 }
 
 fn apply_replacements(
@@ -988,9 +1090,9 @@ source = "runtime.json"
     #[test]
     fn jsonc_rejects_extensions_beyond_comments_and_trailing_commas() {
         for source in [
-            r#"{ loose: 1 }"#,
+            r"{ loose: 1 }",
             r#"{"first": 1 "second": 2}"#,
-            r#"{'single': 1}"#,
+            r"{'single': 1}",
             r#"{"hex": 0x10}"#,
             r#"{"positive": +1}"#,
         ] {
@@ -1048,7 +1150,7 @@ source = "runtime.json"
     }
 
     #[tokio::test]
-    async fn missing_pointer_fails_without_publishing_a_generation() {
+    async fn missing_pointer_is_rejected_during_preparation_without_publishing_a_generation() {
         let root = tempdir().expect("create project root");
         tokio::fs::write(root.path().join("runtime.json"), r#"{"port":3000}"#)
             .await
@@ -1061,6 +1163,15 @@ source = "runtime.json"
             )]),
         );
         let data_dir = root.path().join("data");
+
+        let error = prepare(root.path(), &key(), &config)
+            .await
+            .expect_err("preparation must validate replacement targets");
+        assert!(format!("{error:#}").contains("does not identify an existing value"));
+        assert!(
+            !data_dir.exists(),
+            "preparation must not create runtime output directories"
+        );
 
         let error = materialize(&data_dir, root.path(), &key(), &config, &bindings())
             .await
@@ -1114,6 +1225,47 @@ source = "runtime.json"
             .await
             .expect("change source");
         assert!(!generated.sources_match(root.path(), &config).await);
+    }
+
+    #[tokio::test]
+    async fn prepared_snapshot_survives_live_invalid_mutation_and_detects_the_mismatch() {
+        let root = tempdir().expect("create project root");
+        let source = root.path().join("runtime.json");
+        tokio::fs::write(&source, r#"{"port":3000}"#)
+            .await
+            .expect("write valid source");
+        let config = service_config(
+            "runtime.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let prepared = prepare(root.path(), &key(), &config)
+            .await
+            .expect("prepare valid source")
+            .expect("prepared generated files");
+
+        tokio::fs::write(&source, r#"{"port":"#)
+            .await
+            .expect("replace live source with invalid JSON");
+
+        let generated =
+            materialize_prepared(&root.path().join("data"), &key(), &bindings(), &prepared)
+                .await
+                .expect("materialize the validated snapshot");
+        let output =
+            tokio::fs::read_to_string(generated.path("microfrontends").expect("generated path"))
+                .await
+                .expect("read generated output");
+        let value: Value = serde_json::from_str(&output).expect("valid generated JSON");
+
+        assert_eq!(value.pointer("/port"), Some(&Value::from(4100)));
+        assert!(generated.matches_prepared(&prepared));
+        assert!(
+            !generated.sources_match(root.path(), &config).await,
+            "the invalid live source must queue a later retry without changing this generation"
+        );
     }
 
     #[tokio::test]
@@ -1276,7 +1428,7 @@ source = "runtime.json"
         let root = tempdir().expect("create project root");
         tokio::fs::write(
             root.path().join("runtime.json"),
-            vec![b' '; MAX_GENERATED_SOURCE_BYTES as usize + 1],
+            vec![b' '; MAX_GENERATED_SOURCE_BYTES + 1],
         )
         .await
         .expect("write oversized source");
