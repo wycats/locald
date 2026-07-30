@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use jsonc_parser::{ParseOptions, parse_to_serde_value};
+use jsonc_parser::{ParseOptions, parse_to_serde_value, parse_to_value};
 use locald_core::config::{GeneratedFileConfig, LocaldConfig, ServiceConfig};
 use locald_core::service::{ListenerName, ServiceKey, ServiceRuntimeBindings};
 use regex::Regex;
@@ -514,9 +514,10 @@ fn parse_source(source: &LoadedSource) -> Result<Value> {
                 allow_hexadecimal_numbers: false,
                 allow_unary_plus_numbers: false,
             };
-            parse_to_serde_value::<Option<Value>>(text, &options)
+            parse_to_value(text, &options)
                 .context("source is not supported JSONC")?
-                .context("JSONC source is empty")
+                .context("JSONC source is empty")?;
+            parse_to_serde_value::<Value>(text, &options).context("source is not supported JSONC")
         }
     }
 }
@@ -1102,6 +1103,31 @@ source = "runtime.json"
                 format: GeneratedFileFormat::Jsonc,
             };
             assert!(parse_source(&loaded).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn jsonc_preserves_null_and_rejects_empty_documents() {
+        for source in ["null", "/* comment */ null // trailing comment"] {
+            let loaded = LoadedSource {
+                bytes: source.as_bytes().to_vec(),
+                fingerprint: SourceFingerprint([0; 32]),
+                format: GeneratedFileFormat::Jsonc,
+            };
+            assert_eq!(
+                parse_source(&loaded).expect("parse JSONC null"),
+                Value::Null
+            );
+        }
+
+        for source in ["", " \n\t", "// comment only"] {
+            let loaded = LoadedSource {
+                bytes: source.as_bytes().to_vec(),
+                fingerprint: SourceFingerprint([0; 32]),
+                format: GeneratedFileFormat::Jsonc,
+            };
+            let error = parse_source(&loaded).expect_err("empty JSONC must be rejected");
+            assert!(error.to_string().contains("JSONC source is empty"));
         }
     }
 
