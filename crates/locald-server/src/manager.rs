@@ -3815,6 +3815,7 @@ impl ProcessManager {
             drop(lifecycle_publication_guard);
         }
         commit_result?;
+        self.update_generated_source_watches(&path, &config).await;
 
         // Runtime logs begin only after the project instance is resolved and
         // its ownership is published. Bind verbose boot output to that exact
@@ -4274,7 +4275,6 @@ impl ProcessManager {
         }
 
         self.persist_state().await;
-        self.update_generated_source_watches(&path, &config).await;
         if !self.loaded_generated_sources_match(instance_id).await {
             info!(
                 "Generated-file source changed while applying config for {}; queuing reload",
@@ -26371,8 +26371,13 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
         let project_path = dir.path().join("generated-file-failure");
         let (mut manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "generated-file-failure").await;
-        std::fs::write(project_path.join("runtime.json"), r#"{"listener":3001}"#)
-            .expect("write generated-file source");
+        std::fs::create_dir(project_path.join("config"))
+            .expect("create nested generated-file source directory");
+        std::fs::write(
+            project_path.join("config/runtime.json"),
+            r#"{"listener":3001}"#,
+        )
+        .expect("write generated-file source");
         std::fs::write(
             project_path.join("locald.toml"),
             r#"
@@ -26385,7 +26390,7 @@ command = "unused-by-test-factory"
 listeners = ["events"]
 
 [services.worker.generated.runtime]
-source = "runtime.json"
+source = "config/runtime.json"
 
 [services.worker.generated.runtime.replace]
 "/listener" = "${services.worker.listeners.events.port}"
@@ -26432,6 +26437,24 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
         assert!(
             !generated_path.exists(),
             "preparation rollback must remove the unpublished runtime file"
+        );
+        let canonical_project =
+            std::fs::canonicalize(&project_path).expect("canonical generated-file project");
+        let watchers = manager.watchers.lock().await;
+        let watcher = watchers
+            .get(&canonical_project)
+            .expect("project watcher survives failed preparation");
+        assert!(
+            watcher
+                .generated_sources
+                .lock()
+                .expect("read generated source watches")
+                .contains(&canonical_project.join("config/runtime.json"))
+        );
+        assert!(
+            watcher
+                .generated_directories
+                .contains(&canonical_project.join("config"))
         );
     }
 

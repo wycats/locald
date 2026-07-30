@@ -1239,7 +1239,47 @@ source = "runtime.json"
         .expect("parse unsupported generated owner");
         let error = crate::generated_files::validate_declarations(&unsupported)
             .expect_err("postgres cannot own generated files");
-        assert!(error.to_string().contains("only exec and worker"));
+        assert!(error.to_string().contains("only host exec and worker"));
+
+        for service in [
+            r#"
+[services.web]
+command = "serve"
+
+[services.web.build]
+builder = "builder"
+
+[services.web.generated.runtime]
+source = "runtime.json"
+"#,
+            r#"
+[services.web]
+type = "exec"
+command = "serve"
+
+[services.web.build]
+builder = "builder"
+
+[services.web.generated.runtime]
+source = "runtime.json"
+"#,
+        ] {
+            let built: LocaldConfig = toml::from_str(&format!(
+                r#"
+[project]
+name = "app"
+{service}
+"#
+            ))
+            .expect("parse build-enabled generated owner");
+            let error = crate::generated_files::validate_declarations(&built)
+                .expect_err("build-enabled exec cannot consume a host generated path");
+            assert!(
+                error
+                    .to_string()
+                    .contains("explicit container mount contract")
+            );
+        }
     }
 
     #[test]

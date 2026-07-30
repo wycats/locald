@@ -85,7 +85,7 @@ pub(crate) fn validate_declarations(config: &LocaldConfig) -> Result<()> {
         }
         anyhow::ensure!(
             service.supports_generated_files(),
-            "service `{service_name}` declares generated files, but only exec and worker services support them"
+            "service `{service_name}` declares generated files, but only host exec and worker services support them; build-enabled exec services require an explicit container mount contract"
         );
 
         let mut output_names = BTreeMap::new();
@@ -120,29 +120,19 @@ pub(crate) async fn materialize(
         return Ok(None);
     }
 
-    let service_root = data_dir
+    let generated_root = data_dir
         .join("instances")
         .join(key.instance().to_string())
-        .join("generated")
-        .join(key.resource_id());
-    tokio::fs::create_dir_all(&service_root)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create generated-file service directory `{}`",
-                service_root.display()
-            )
-        })?;
+        .join("generated");
+    create_private_directory(&generated_root, true).await?;
+
+    let service_root = generated_root.join(key.resource_id());
+    create_private_directory(&service_root, true).await?;
 
     let generation = uuid::Uuid::new_v4().to_string();
     let staging_dir = service_root.join(format!(".staging-{generation}"));
     let generation_dir = service_root.join(generation);
-    tokio::fs::create_dir(&staging_dir).await.with_context(|| {
-        format!(
-            "failed to create generated-file staging directory `{}`",
-            staging_dir.display()
-        )
-    })?;
+    create_private_directory(&staging_dir, false).await?;
 
     let render_result =
         render_generation(project_root, key, service_config, bindings, &staging_dir).await;
@@ -261,6 +251,35 @@ async fn remove_generated_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn create_private_directory(path: &Path, recursive: bool) -> Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).await.with_context(|| {
+        format!(
+            "failed to create generated-file directory `{}`",
+            path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to make generated-file directory private `{}`",
+                    path.display()
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
 async fn render_generation(
     project_root: &Path,
     key: &ServiceKey,
@@ -300,9 +319,11 @@ async fn render_generation(
         rendered.push(b'\n');
         let relative = PathBuf::from(format!("{name}.json"));
         let output = staging_dir.join(&relative);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
             .open(&output)
             .await
             .with_context(|| format!("failed to create generated file `{}`", output.display()))?;
@@ -462,7 +483,7 @@ fn resolve_string(
     bindings: &ServiceRuntimeBindings,
 ) -> Result<Value> {
     let pattern = Regex::new(SERVICE_REFERENCE_PATTERN)?;
-    let captures = pattern.captures(value).into_iter().collect::<Vec<_>>();
+    let captures = pattern.captures_iter(value).collect::<Vec<_>>();
     if captures.is_empty() {
         return Ok(Value::String(value.to_owned()));
     }
@@ -772,6 +793,7 @@ mod tests {
                 "options": { "localProxyPort": 3000, },
                 "applications": { "chat": { "development": { "local": 3002 } } },
                 "label": "",
+                "combined": "",
                 "metadata": null,
             }"#,
         )
@@ -791,6 +813,12 @@ mod tests {
                 (
                     "/label".to_owned(),
                     Value::String("chat-${services.web.listeners.chat.port}".to_owned()),
+                ),
+                (
+                    "/combined".to_owned(),
+                    Value::String(
+                        "${services.web.port}:${services.web.listeners.chat.port}".to_owned(),
+                    ),
                 ),
                 (
                     "/metadata".to_owned(),
@@ -826,6 +854,7 @@ mod tests {
             Some(&Value::from(4200))
         );
         assert_eq!(value.pointer("/label"), Some(&Value::from("chat-4200")));
+        assert_eq!(value.pointer("/combined"), Some(&Value::from("4100:4200")));
         assert_eq!(value.pointer("/metadata/primary"), Some(&Value::from(4100)));
         assert_eq!(
             value.pointer("/metadata/listener"),
@@ -833,6 +862,69 @@ mod tests {
         );
         assert!(output.ends_with('\n'));
         generated.cleanup().await.expect("clean generation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_hierarchy_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("create project root");
+        tokio::fs::write(root.path().join("runtime.json"), r#"{"port":3000}"#)
+            .await
+            .expect("write source");
+        let data_dir = root.path().join("data");
+        let generated_root = data_dir
+            .join("instances")
+            .join(key().instance().to_string())
+            .join("generated");
+        let existing_service_root = generated_root.join(key().resource_id());
+        tokio::fs::create_dir_all(&existing_service_root)
+            .await
+            .expect("seed permissive generated hierarchy");
+        for directory in [&generated_root, &existing_service_root] {
+            tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))
+                .await
+                .expect("seed permissive generated directory");
+        }
+        let config = service_config(
+            "runtime.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let service_root = generated
+            .generation_dir
+            .parent()
+            .expect("generation has service root");
+        let output = generated.path("microfrontends").expect("generated path");
+
+        for directory in [
+            generated_root.as_path(),
+            service_root,
+            generated.generation_dir.as_path(),
+        ] {
+            let mode = tokio::fs::metadata(directory)
+                .await
+                .expect("inspect generated directory")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{}", directory.display());
+        }
+        let file_mode = tokio::fs::metadata(output)
+            .await
+            .expect("inspect generated file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]

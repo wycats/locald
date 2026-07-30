@@ -362,7 +362,7 @@ pub struct CommonServiceConfig {
     pub stop_signal: Option<String>,
 }
 
-/// One JSON or JSONC file generated for an exec or worker service.
+/// One JSON or JSONC file generated for a host exec or worker service.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct GeneratedFileConfig {
     /// Project-relative source JSON or JSONC file.
@@ -582,9 +582,19 @@ impl ServiceConfig {
         )
     }
 
-    /// Whether this service kind can own generated runtime files.
+    /// Whether this service kind can own host-accessible generated runtime files.
     pub const fn supports_generated_files(&self) -> bool {
-        self.supports_named_listeners()
+        match self {
+            Self::Legacy(config) | Self::Typed(TypedServiceConfig::Exec(config)) => {
+                config.build.is_none()
+            }
+            Self::Typed(TypedServiceConfig::Worker(_)) => true,
+            Self::Typed(
+                TypedServiceConfig::Postgres(_)
+                | TypedServiceConfig::Container(_)
+                | TypedServiceConfig::Site(_),
+            ) => false,
+        }
     }
 
     pub const fn env(&self) -> &HashMap<String, String> {

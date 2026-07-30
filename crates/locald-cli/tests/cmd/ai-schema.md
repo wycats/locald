@@ -248,7 +248,7 @@ $ locald ai schema
       }
     },
     "GeneratedFileConfig": {
-      "description": "One JSON or JSONC file generated for an exec or worker service.",
+      "description": "One JSON or JSONC file generated for a host exec or worker service.",
       "type": "object",
       "properties": {
         "replace": {
