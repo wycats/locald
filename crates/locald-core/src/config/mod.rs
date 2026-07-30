@@ -272,6 +272,7 @@ pub enum TypedServiceConfig {
 /// container_port = 6379
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(transform = remove_named_listener_property)]
 pub struct ContainerServiceConfig {
     /// Common configuration shared by all services.
     #[serde(flatten)]
@@ -352,6 +353,15 @@ pub struct CommonServiceConfig {
     /// The signal to send to stop the service. Defaults to "SIGTERM".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_signal: Option<String>,
+}
+
+fn remove_named_listener_property(schema: &mut schemars::Schema) {
+    if let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        properties.remove("listeners");
+    }
 }
 
 /// Configuration for service health checks.
@@ -481,6 +491,7 @@ fn default_builder() -> String {
 /// version = "15"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(transform = remove_named_listener_property)]
 pub struct PostgresServiceConfig {
     /// Common configuration shared by all services.
     #[serde(flatten)]
@@ -501,6 +512,7 @@ pub struct PostgresServiceConfig {
 /// build = "cargo doc"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(transform = remove_named_listener_property)]
 pub struct SiteServiceConfig {
     /// Common configuration shared by all services.
     #[serde(flatten)]
@@ -697,6 +709,34 @@ listeners = ["chat", "hmr-control"]
         let without_listeners: ServiceConfig =
             toml::from_str("command = \"serve\"").expect("parse plain service");
         assert!(!service.runtime_eq(&without_listeners));
+    }
+
+    #[test]
+    fn named_listener_schema_matches_supported_service_kinds() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(LocaldConfig)).expect("serialize schema");
+
+        for supported in ["ExecServiceConfig", "WorkerServiceConfig"] {
+            assert!(
+                schema
+                    .pointer(&format!("/$defs/{supported}/properties/listeners"))
+                    .is_some(),
+                "{supported} should expose listeners"
+            );
+        }
+
+        for unsupported in [
+            "ContainerServiceConfig",
+            "PostgresServiceConfig",
+            "SiteServiceConfig",
+        ] {
+            assert!(
+                schema
+                    .pointer(&format!("/$defs/{unsupported}/properties/listeners"))
+                    .is_none(),
+                "{unsupported} must not expose listeners"
+            );
+        }
     }
 
     #[test]

@@ -185,6 +185,11 @@ impl ConfigLoader {
         if let Some(port) = override_svc.common.port {
             base.common.port = Some(port);
         }
+        if !override_svc.common.listeners.is_empty() {
+            base.common
+                .listeners
+                .clone_from(&override_svc.common.listeners);
+        }
         if override_svc.common.domains.is_some() {
             base.common.domains.clone_from(&override_svc.common.domains);
         }
@@ -1193,6 +1198,46 @@ domains = []
         .expect("parse clearing override");
         ConfigLoader::merge_service_configs(&mut base.services, &clear.services);
         assert_eq!(base.services["web"].domains(), Some(&[] as &[String]));
+    }
+
+    #[test]
+    fn layered_exec_config_preserves_or_replaces_named_listeners() {
+        let mut base: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "base"
+listeners = ["upstream"]
+"#,
+        )
+        .expect("parse base config");
+        let preserve: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "preserve"
+"#,
+        )
+        .expect("parse preserving override");
+        ConfigLoader::merge_service_configs(&mut base.services, &preserve.services);
+        assert_eq!(base.services["web"].listeners(), &["upstream"]);
+
+        let replace: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+listeners = ["chat", "events"]
+"#,
+        )
+        .expect("parse replacing override");
+        ConfigLoader::merge_service_configs(&mut base.services, &replace.services);
+        assert_eq!(base.services["web"].listeners(), &["chat", "events"]);
     }
 
     #[tokio::test]
