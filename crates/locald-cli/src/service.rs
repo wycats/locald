@@ -60,6 +60,7 @@ pub fn add_exec(command: String, name: Option<String>, port: Option<u16>) -> Res
     let service_config = ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
         common: CommonServiceConfig {
             port,
+            listeners: Vec::new(),
             domains: None,
             env: HashMap::new(),
             depends_on: Vec::new(),
@@ -93,6 +94,7 @@ pub fn add_container(
         ServiceConfig::Typed(TypedServiceConfig::Container(ContainerServiceConfig {
             common: CommonServiceConfig {
                 port: None,
+                listeners: Vec::new(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
@@ -121,6 +123,7 @@ pub fn add_postgres(name: &str, version: Option<String>) -> Result<()> {
         ServiceConfig::Typed(TypedServiceConfig::Postgres(PostgresServiceConfig {
             common: CommonServiceConfig {
                 port: None,
+                listeners: Vec::new(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
@@ -151,6 +154,7 @@ pub fn add_site(
     let service_config = ServiceConfig::Typed(TypedServiceConfig::Site(SiteServiceConfig {
         common: CommonServiceConfig {
             port,
+            listeners: Vec::new(),
             domains: None,
             env: HashMap::new(),
             depends_on: Vec::new(),

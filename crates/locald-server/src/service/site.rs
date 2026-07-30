@@ -386,7 +386,7 @@ impl ServiceFactory for SiteFactory {
             name,
             site_config,
             ctx.project_root.clone(),
-            ctx.port,
+            ctx.bindings.primary_port(),
             ctx.env.clone(),
         )))
     }

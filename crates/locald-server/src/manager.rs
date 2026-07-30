@@ -13,7 +13,7 @@ use crate::lifecycle_transaction::{
     validate_attachment_authority,
 };
 use crate::plugins;
-use crate::port_allocator::PortAllocator;
+use crate::port_allocator::{PortAllocator, PortGuard};
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
@@ -31,7 +31,8 @@ use locald_core::ipc::{
 use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
 use locald_core::service::{
-    ServiceContext, ServiceController, ServiceFactory, ServiceKey, ServiceName,
+    ListenerName, ServiceContext, ServiceController, ServiceFactory, ServiceKey, ServiceName,
+    ServiceRuntimeBindings,
 };
 use locald_core::state::{
     HealthSource, HealthStatus, PersistedProcessIdentity, PersistedServiceState, ServerState,
@@ -329,6 +330,12 @@ pub(crate) struct Service {
 }
 
 impl Service {}
+
+#[derive(Debug)]
+struct ServiceListenerRuntime {
+    bindings: ServiceRuntimeBindings,
+    guards: Vec<PortGuard>,
+}
 
 #[derive(Debug)]
 struct ConfigTransitionPlan {
@@ -635,6 +642,7 @@ pub(crate) enum RuntimeSnapshot {
 #[derive(Clone, Debug)]
 pub struct ProcessManager {
     services: Arc<Mutex<HashMap<ServiceKey, Service>>>,
+    listener_runtimes: Arc<Mutex<HashMap<ServiceKey, ServiceListenerRuntime>>>,
     pub log_sender: broadcast::Sender<LogEntry>,
     pub(crate) instance_log_sender: broadcast::Sender<InstanceLogEntry>,
     pub event_sender: broadcast::Sender<Event>,
@@ -732,6 +740,65 @@ impl ProcessManager {
         } else {
             Ok(vec![namespaced])
         }
+    }
+
+    async fn allocate_listener_runtime(
+        &self,
+        key: &ServiceKey,
+        service_config: &ServiceConfig,
+        primary_port: Option<u16>,
+        display_name: &str,
+    ) -> Result<ServiceListenerRuntime> {
+        let previous = self
+            .listener_runtimes
+            .lock()
+            .await
+            .get(key)
+            .map(|runtime| runtime.bindings.listeners().clone())
+            .unwrap_or_default();
+        let mut listeners = BTreeMap::new();
+        let mut guards = Vec::with_capacity(service_config.listeners().len());
+
+        for configured_name in service_config.listeners() {
+            let name = ListenerName::new(configured_name.clone());
+            let guard = if let Some(sticky_port) = previous.get(&name) {
+                if let Some(guard) = self.port_allocator.try_allocate_specific(*sticky_port) {
+                    info!(
+                        "Reusing listener {configured_name} port {sticky_port} for service {display_name}"
+                    );
+                    guard
+                } else {
+                    warn!(
+                        "Listener {configured_name} sticky port {sticky_port} for service {display_name} is taken, assigning a new port"
+                    );
+                    self.port_allocator.allocate()?
+                }
+            } else {
+                self.port_allocator.allocate()?
+            };
+            anyhow::ensure!(
+                Some(guard.port()) != primary_port,
+                "listener `{configured_name}` for service `{display_name}` collided with its primary port"
+            );
+            let port = guard.port();
+            listeners.insert(name, port);
+            guards.push(guard);
+        }
+
+        Ok(ServiceListenerRuntime {
+            bindings: ServiceRuntimeBindings::new(primary_port, listeners),
+            guards,
+        })
+    }
+
+    async fn release_listener_guards(&self, key: &ServiceKey) {
+        if let Some(runtime) = self.listener_runtimes.lock().await.get_mut(key) {
+            runtime.guards.clear();
+        }
+    }
+
+    async fn remove_listener_runtime(&self, key: &ServiceKey) {
+        self.listener_runtimes.lock().await.remove(key);
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -961,6 +1028,7 @@ impl ProcessManager {
         let lifecycle_journal = LifecycleJournal::at(&availability_data_dir);
         Ok(Self {
             services,
+            listener_runtimes: Arc::new(Mutex::new(HashMap::new())),
             log_sender: tx,
             instance_log_sender: instance_log_tx,
             event_sender: event_tx,
@@ -2640,6 +2708,50 @@ impl ProcessManager {
             .await
     }
 
+    async fn resolve_env_with_candidate_bindings(
+        &self,
+        env: &HashMap<String, String>,
+        config: &LocaldConfig,
+        expected_instance: ProjectInstanceId,
+        candidate_service_name: &str,
+        candidate_bindings: &ServiceRuntimeBindings,
+    ) -> Result<HashMap<String, String>> {
+        let manager = self.clone();
+        let candidate_service_name = candidate_service_name.to_owned();
+        let candidate_bindings = candidate_bindings.clone();
+        ConfigLoader::resolve_env(env, config, move |service_name, field| {
+            let manager = manager.clone();
+            let candidate_service_name = candidate_service_name.clone();
+            let candidate_bindings = candidate_bindings.clone();
+            async move {
+                if service_name == candidate_service_name {
+                    if field == "port" {
+                        return candidate_bindings
+                            .primary_port()
+                            .map(|port| port.to_string())
+                            .with_context(|| {
+                                format!("service `{service_name}` has no primary port")
+                            });
+                    }
+                    if let Some(listener_name) = ListenerName::from_port_field(&field) {
+                        return candidate_bindings
+                            .listener_port(listener_name)
+                            .map(|port| port.to_string())
+                            .with_context(|| {
+                                format!(
+                                    "service `{service_name}` has no listener `{listener_name}`"
+                                )
+                            });
+                    }
+                }
+                manager
+                    .get_service_field(&service_name, &field, expected_instance)
+                    .await
+            }
+        })
+        .await
+    }
+
     #[allow(clippy::significant_drop_tightening)]
     async fn get_service_field_from_domain_index(
         &self,
@@ -2669,7 +2781,7 @@ impl ProcessManager {
         // Re-acquire lock to get port, or just get it all at once?
         // The issue is holding the lock across await points or significant drops.
         // Let's get everything we need in one go.
-        let (service_config, port_result) = {
+        let (key, service_config, port_result) = {
             let services = self.services.lock().await;
             let key = if let Some(key) =
                 Self::service_key_for_instance(&services, expected_instance, name)
@@ -2697,8 +2809,21 @@ impl ProcessManager {
                 ServiceRuntime::None => Ok(None),
             };
 
-            (service.config.clone(), port_result)
+            (key, service.config.clone(), port_result)
         };
+
+        if let Some(listener_name) = ListenerName::from_port_field(field) {
+            return self
+                .listener_runtimes
+                .lock()
+                .await
+                .get(&key)
+                .and_then(|runtime| runtime.bindings.listener_port(listener_name))
+                .map(|port| port.to_string())
+                .with_context(|| {
+                    format!("Service {name} has no listener `{listener_name}` binding")
+                });
+        }
 
         let port = match port_result {
             Ok(p) => p,
@@ -3192,6 +3317,7 @@ impl ProcessManager {
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
+        ConfigLoader::validate_listener_declarations(&config)?;
         for (service_name, service_config) in &config.services {
             let (effective_env, _) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config, None);
@@ -3465,6 +3591,12 @@ impl ProcessManager {
                 }
                 self.domain_index.store(published_domain_index);
             }
+            if !removed_service_names.is_empty() {
+                let mut listener_runtimes = self.listener_runtimes.lock().await;
+                for key in &removed_service_names {
+                    listener_runtimes.remove(key);
+                }
+            }
             for key in &published_stopped_service_names {
                 self.broadcast_service_update(key).await;
             }
@@ -3593,19 +3725,6 @@ impl ProcessManager {
                 );
             }
 
-            let manager = self.clone();
-            let expected_instance = instance_id;
-            let lookup = move |service_name: String, field: String| {
-                let manager = manager.clone();
-                async move {
-                    manager
-                        .get_service_field(&service_name, &field, expected_instance)
-                        .await
-                }
-            };
-
-            let resolved_env = ConfigLoader::resolve_env(&combined_env, &config, lookup).await?;
-
             let has_controller = {
                 let services = self.services.lock().await;
                 services.get(&key).is_some_and(|service| {
@@ -3631,10 +3750,12 @@ impl ProcessManager {
                 if !needs_port {
                     (None, None)
                 } else if let Some(p) = service_config.port() {
-                    (
-                        Some(p),
-                        Self::take_reserved_port_guard(&mut plugin_port_guards, p),
-                    )
+                    let guard = Self::take_reserved_port_guard(&mut plugin_port_guards, p)
+                        .or_else(|| self.port_allocator.try_allocate_specific(p))
+                        .with_context(|| {
+                            format!("configured port {p} for service `{name}` is unavailable")
+                        })?;
+                    (Some(p), Some(guard))
                 } else {
                     // Check for sticky port
                     let sticky = {
@@ -3660,7 +3781,24 @@ impl ProcessManager {
                     }
                 };
 
-            info!("Starting service {name} on port {:?}", port);
+            let mut listener_runtime = self
+                .allocate_listener_runtime(&key, service_config, port, &name)
+                .await?;
+            let resolved_env = self
+                .resolve_env_with_candidate_bindings(
+                    &combined_env,
+                    &config,
+                    instance_id,
+                    &name,
+                    &listener_runtime.bindings,
+                )
+                .await?;
+
+            info!(
+                "Starting service {name} with primary port {:?} and {} named listeners",
+                port,
+                listener_runtime.bindings.listeners().len()
+            );
             let readiness = ReadinessRequirement::for_service(service_config, port)
                 .with_context(|| format!("service `{name}` has an invalid readiness contract"))?;
             if matches!(
@@ -3686,13 +3824,18 @@ impl ProcessManager {
                     let ctx = ServiceContext {
                         key: key.clone(),
                         project_root: path.clone(),
-                        port,
+                        bindings: listener_runtime.bindings.clone(),
                         env: resolved_env.clone(),
                     };
 
-                    // Release the port guard's listener so the service can bind.
-                    // The guard stays alive (preventing re-allocation) until we're done.
+                    // Release reservation listeners immediately before the
+                    // controller takes ownership. Guards continue to prevent
+                    // locald from allocating the same ports to another
+                    // in-flight or active service.
                     if let Some(ref mut guard) = port_guard {
+                        guard.release_listener();
+                    }
+                    for guard in &mut listener_runtime.guards {
                         guard.release_listener();
                     }
 
@@ -3709,6 +3852,10 @@ impl ProcessManager {
                     };
                     // Insert into map immediately so status is visible
                     {
+                        self.listener_runtimes
+                            .lock()
+                            .await
+                            .insert(key.clone(), listener_runtime);
                         let mut services = self.services.lock().await;
                         self.clear_log_buffer(&key);
                         services.insert(
@@ -4058,6 +4205,7 @@ impl ProcessManager {
                 }
             }
         }
+        self.release_listener_guards(key).await;
 
         // Clear health and broadcast after stop
         {
@@ -4485,6 +4633,7 @@ impl ProcessManager {
                 service.sticky_port = None;
             }
         }
+        self.remove_listener_runtime(&key).await;
 
         // 2. Wipe data (if applicable). An exact, unambiguous reset also
         // retires the pre-instance Postgres directory so the namespaced
@@ -4669,6 +4818,7 @@ impl ProcessManager {
             });
         }
         futures_util::future::join_all(futures).await;
+        self.listener_runtimes.lock().await.clear();
         drop(availability_guards);
 
         Ok(())
@@ -7888,11 +8038,26 @@ impl ProcessManager {
                 .lock()
                 .await
                 .retain(|_, service| service.instance_id != instance_id);
+            self.listener_runtimes
+                .lock()
+                .await
+                .retain(|key, _| key.instance() != instance_id);
         } else {
             self.services
                 .lock()
                 .await
                 .retain(|_, service| Self::canonicalize_path(&service.path) != canonical);
+            let surviving_keys = self
+                .services
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>();
+            self.listener_runtimes
+                .lock()
+                .await
+                .retain(|key, _| surviving_keys.contains(key));
         }
         self.persist_state().await;
         drop(publication_guard);
@@ -10969,7 +11134,10 @@ mod tests {
             let creation = self.creates.fetch_add(1, Ordering::SeqCst);
             Arc::new(Mutex::new(RetryingTcpReadinessController {
                 id: name,
-                port: ctx.port.expect("portful readiness fixture receives a port"),
+                port: ctx
+                    .bindings
+                    .primary_port()
+                    .expect("portful readiness fixture receives a port"),
                 pid: 50 + u32::try_from(creation).expect("creation count fits in PID"),
                 bind_on_start: creation > 0,
                 running: false,
@@ -25465,6 +25633,185 @@ PATH = "/usr/bin:/bin"
             None,
         )
         .expect("create readiness test manager")
+    }
+
+    #[tokio::test]
+    async fn named_listener_allocation_is_instance_scoped_sticky_and_releasable() {
+        let dir = tempdir().expect("create listener allocation directory");
+        let manager = readiness_test_manager(dir.path());
+        let service_config: ServiceConfig = toml::from_str(
+            r#"
+command = "serve"
+listeners = ["chat", "hmr"]
+"#,
+        )
+        .expect("parse listener service");
+        let first_key = ServiceKey::new(test_instance_id(), "web");
+        let second_key = ServiceKey::new(
+            "00000000-0000-4000-8000-000000000002"
+                .parse::<ProjectInstanceId>()
+                .expect("second instance ID"),
+            "web",
+        );
+        let first_primary = manager
+            .port_allocator
+            .allocate()
+            .expect("allocate first primary");
+        let second_primary = manager
+            .port_allocator
+            .allocate()
+            .expect("allocate second primary");
+
+        let first = manager
+            .allocate_listener_runtime(
+                &first_key,
+                &service_config,
+                Some(first_primary.port()),
+                "app:web",
+            )
+            .await
+            .expect("allocate first listener runtime");
+        let second = manager
+            .allocate_listener_runtime(
+                &second_key,
+                &service_config,
+                Some(second_primary.port()),
+                "app:web",
+            )
+            .await
+            .expect("allocate second listener runtime");
+
+        let first_ports = first
+            .bindings
+            .listeners()
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        let second_ports = second
+            .bindings
+            .listeners()
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(first_ports.len(), 2);
+        assert_eq!(second_ports.len(), 2);
+        assert!(first_ports.is_disjoint(&second_ports));
+        assert!(!first_ports.contains(&first_primary.port()));
+        assert!(!second_ports.contains(&second_primary.port()));
+
+        let sticky_bindings = first.bindings.clone();
+        manager
+            .listener_runtimes
+            .lock()
+            .await
+            .insert(first_key.clone(), first);
+        let mut stopped_service = test_service(
+            test_config_with_domain("app", "app.localhost"),
+            service_config.clone(),
+            ServiceRuntime::None,
+            dir.path().to_path_buf(),
+        );
+        stopped_service.instance_id = first_key.instance();
+        manager
+            .services
+            .lock()
+            .await
+            .insert(first_key.clone(), stopped_service);
+        manager
+            .stop_service_instance_runtime_locked(&first_key)
+            .await
+            .expect("stop releases listener guards");
+        {
+            let listener_runtimes = manager.listener_runtimes.lock().await;
+            let stopped = listener_runtimes
+                .get(&first_key)
+                .expect("stopped listener runtime remains sticky");
+            assert!(stopped.guards.is_empty());
+            assert_eq!(stopped.bindings, sticky_bindings);
+        }
+
+        let restarted = manager
+            .allocate_listener_runtime(
+                &first_key,
+                &service_config,
+                Some(first_primary.port()),
+                "app:web",
+            )
+            .await
+            .expect("reallocate sticky listeners");
+        assert_eq!(restarted.bindings, sticky_bindings);
+
+        manager.remove_listener_runtime(&first_key).await;
+        assert!(
+            !manager
+                .listener_runtimes
+                .lock()
+                .await
+                .contains_key(&first_key)
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_runtime_bindings_resolve_before_service_publication() {
+        let dir = tempdir().expect("create listener interpolation directory");
+        let manager = readiness_test_manager(dir.path());
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "serve"
+listeners = ["chat", "hmr"]
+
+[services.web.env]
+PRIMARY = "${services.web.port}"
+CHAT = "${services.web.listeners.chat.port}"
+COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
+"#,
+        )
+        .expect("parse listener interpolation config");
+        let service_config = config.services.get("web").expect("web service");
+        let primary = manager.port_allocator.allocate().expect("allocate primary");
+        let runtime = manager
+            .allocate_listener_runtime(
+                &ServiceKey::new(test_instance_id(), "web"),
+                service_config,
+                Some(primary.port()),
+                "app:web",
+            )
+            .await
+            .expect("allocate listener runtime");
+
+        let resolved = manager
+            .resolve_env_with_candidate_bindings(
+                service_config.env(),
+                &config,
+                test_instance_id(),
+                "app:web",
+                &runtime.bindings,
+            )
+            .await
+            .expect("resolve candidate bindings");
+
+        assert_eq!(resolved["PRIMARY"], primary.port().to_string());
+        assert_eq!(
+            resolved["CHAT"],
+            runtime
+                .bindings
+                .listener_port("chat")
+                .expect("chat listener")
+                .to_string()
+        );
+        assert_eq!(
+            resolved["COMBINED"],
+            format!(
+                "{}:{}",
+                primary.port(),
+                runtime.bindings.listener_port("hmr").expect("hmr listener")
+            )
+        );
+        assert!(manager.services.lock().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

@@ -56,6 +56,88 @@ impl From<String> for ServiceName {
     }
 }
 
+/// The configured name of an internal listener owned by one service.
+///
+/// Listener names are meaningful only inside their owning [`ServiceKey`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ListenerName(String);
+
+impl ListenerName {
+    /// Construct a listener name from an already validated configuration key.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Return the exact configured listener name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse the interpolation suffix for one named listener port.
+    #[must_use]
+    pub fn from_port_field(field: &str) -> Option<&str> {
+        field
+            .strip_prefix("listeners.")
+            .and_then(|field| field.strip_suffix(".port"))
+            .filter(|name| !name.is_empty())
+    }
+}
+
+impl fmt::Display for ListenerName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::borrow::Borrow<str> for ListenerName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Dynamically allocated network bindings owned by one service runtime.
+///
+/// The primary port remains the service's conventional `PORT`. Named
+/// listeners are additional private endpoints for service-internal topology;
+/// they do not imply proxy routing or domain ownership.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceRuntimeBindings {
+    primary_port: Option<u16>,
+    listeners: BTreeMap<ListenerName, u16>,
+}
+
+impl ServiceRuntimeBindings {
+    /// Construct one complete service binding set.
+    #[must_use]
+    pub const fn new(primary_port: Option<u16>, listeners: BTreeMap<ListenerName, u16>) -> Self {
+        Self {
+            primary_port,
+            listeners,
+        }
+    }
+
+    /// Return the conventional primary service port, when the service has one.
+    #[must_use]
+    pub const fn primary_port(&self) -> Option<u16> {
+        self.primary_port
+    }
+
+    /// Return every private named listener allocated to the service.
+    #[must_use]
+    pub const fn listeners(&self) -> &BTreeMap<ListenerName, u16> {
+        &self.listeners
+    }
+
+    /// Return one private named listener port.
+    #[must_use]
+    pub fn listener_port(&self, name: &str) -> Option<u16> {
+        self.listeners.get(name).copied()
+    }
+}
+
 /// The stable runtime identity of one service in one physical project
 /// instance.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -200,13 +282,13 @@ pub trait ServiceController: Send + Sync + std::fmt::Debug {
     async fn metrics(&self) -> Result<Option<ServiceMetrics>>;
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug)]
 pub struct ServiceContext {
     pub key: ServiceKey,
     pub project_root: PathBuf,
-    pub port: Option<u16>,
+    pub bindings: ServiceRuntimeBindings,
     pub env: HashMap<String, String>,
 }
 
@@ -230,8 +312,9 @@ pub trait ServiceFactory: Send + Sync + std::fmt::Debug {
 
 #[cfg(test)]
 mod tests {
-    use super::ServiceKey;
+    use super::{ListenerName, ServiceKey, ServiceRuntimeBindings};
     use crate::identity::ProjectInstanceId;
+    use std::collections::BTreeMap;
 
     fn instance_id(value: &str) -> ProjectInstanceId {
         value.parse().expect("valid project instance ID")
@@ -251,5 +334,26 @@ mod tests {
                 .chars()
                 .all(|character| character.is_ascii_hexdigit() || character == '-')
         );
+    }
+
+    #[test]
+    fn runtime_bindings_keep_primary_and_named_listeners_distinct() {
+        let bindings = ServiceRuntimeBindings::new(
+            Some(30_000),
+            BTreeMap::from([
+                (ListenerName::new("chat"), 30_001),
+                (ListenerName::new("hmr"), 30_002),
+            ]),
+        );
+
+        assert_eq!(bindings.primary_port(), Some(30_000));
+        assert_eq!(bindings.listener_port("chat"), Some(30_001));
+        assert_eq!(bindings.listener_port("hmr"), Some(30_002));
+        assert_eq!(bindings.listener_port("missing"), None);
+        assert_eq!(
+            ListenerName::from_port_field("listeners.chat.port"),
+            Some("chat")
+        );
+        assert_eq!(ListenerName::from_port_field("listeners.chat.host"), None);
     }
 }

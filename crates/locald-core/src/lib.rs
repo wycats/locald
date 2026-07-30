@@ -134,8 +134,8 @@ pub use plugin::{
 pub mod service;
 #[doc(inline)]
 pub use service::{
-    RuntimeState, ServiceCommand, ServiceContext, ServiceController, ServiceFactory, ServiceKey,
-    ServiceName,
+    ListenerName, RuntimeState, ServiceCommand, ServiceContext, ServiceController, ServiceFactory,
+    ServiceKey, ServiceName, ServiceRuntimeBindings,
 };
 
 #[cfg(test)]

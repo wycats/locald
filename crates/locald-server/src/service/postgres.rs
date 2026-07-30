@@ -155,7 +155,11 @@ impl ServiceFactory for PostgresFactory {
             let data_dir = data_dir_for(&ctx.key);
 
             // Use port from: 1) config, 2) context (allocated by manager), 3) fallback to 5432
-            let port = pg_config.common.port.or(ctx.port).unwrap_or(5432);
+            let port = pg_config
+                .common
+                .port
+                .or_else(|| ctx.bindings.primary_port())
+                .unwrap_or(5432);
 
             let runner = Arc::new(PostgresRunner::new(
                 name.clone(),

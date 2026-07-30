@@ -324,6 +324,13 @@ pub struct CommonServiceConfig {
     /// The port the service listens on. If None, locald will assign a port and pass it via PORT env var.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Additional process-owned listeners that locald allocates dynamically.
+    ///
+    /// These listeners are private runtime bindings. They do not claim
+    /// domains and are exposed to the owning service only through explicit
+    /// `${services.<service>.listeners.<listener>.port}` interpolation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listeners: Vec<String>,
     /// Relative domain claims for this service.
     ///
     /// `@` claims the project-instance root, plain values claim exact relative
@@ -524,6 +531,23 @@ impl ServiceConfig {
         self.common().port
     }
 
+    pub const fn listeners(&self) -> &Vec<String> {
+        &self.common().listeners
+    }
+
+    /// Whether this service kind can own dynamically allocated listeners.
+    ///
+    /// The first listener-backed runtime surface is intentionally limited to
+    /// host exec and worker processes. Other service kinds can be added only
+    /// when their process/network ownership contract is explicit.
+    pub const fn supports_named_listeners(&self) -> bool {
+        matches!(
+            self,
+            Self::Legacy(_)
+                | Self::Typed(TypedServiceConfig::Exec(_) | TypedServiceConfig::Worker(_))
+        )
+    }
+
     pub const fn env(&self) -> &HashMap<String, String> {
         &self.common().env
     }
@@ -574,6 +598,7 @@ mod tests {
         let service_config = ServiceConfig::Legacy(ExecServiceConfig {
             common: CommonServiceConfig {
                 port: None,
+                listeners: Vec::new(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
@@ -639,6 +664,39 @@ domains = ["frame", "*.frame"]
             .env
             .insert("MODE".into(), "new".into());
         assert!(!current.runtime_eq(&candidate));
+    }
+
+    #[test]
+    fn named_listeners_round_trip_and_change_runtime_identity() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "listener-app"
+
+[services.web]
+command = "serve"
+listeners = ["chat", "hmr-control"]
+"#,
+        )
+        .expect("parse named listener config");
+        let service = config.services.get("web").expect("web service");
+        assert_eq!(service.listeners(), &["chat", "hmr-control"]);
+
+        let encoded = toml::to_string(&config).expect("serialize named listener config");
+        let round_tripped: LocaldConfig =
+            toml::from_str(&encoded).expect("round-trip named listener config");
+        assert_eq!(
+            round_tripped
+                .services
+                .get("web")
+                .expect("round-tripped web service")
+                .listeners(),
+            &["chat", "hmr-control"]
+        );
+
+        let without_listeners: ServiceConfig =
+            toml::from_str("command = \"serve\"").expect("parse plain service");
+        assert!(!service.runtime_eq(&without_listeners));
     }
 
     #[test]
