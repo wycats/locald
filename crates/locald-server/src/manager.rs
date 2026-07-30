@@ -2,6 +2,7 @@
 #![allow(clippy::option_if_let_else)]
 use crate::agent_context::resolve_agent_workspace;
 use crate::config_loader::ConfigLoader;
+use crate::generated_files::GeneratedFileSet;
 use crate::health::{HealthMonitor, ReadinessRequirement};
 use crate::lifecycle_migration::{
     availability_demand_for_attachment_source, manual_cli_session_demand,
@@ -272,6 +273,36 @@ impl Drop for TaskGuard {
     }
 }
 
+struct ConfigWatcher {
+    watcher: RecommendedWatcher,
+    reload_tx: tokio::sync::mpsc::Sender<()>,
+    generated_sources: Arc<StdMutex<HashSet<PathBuf>>>,
+    generated_directories: HashSet<PathBuf>,
+}
+
+impl fmt::Debug for ConfigWatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigWatcher")
+            .field("generated_directories", &self.generated_directories)
+            .finish_non_exhaustive()
+    }
+}
+
+fn config_reload_event_is_relevant(
+    paths: &[PathBuf],
+    generated_sources: &HashSet<PathBuf>,
+) -> bool {
+    paths.iter().any(|path| {
+        path.ends_with("locald.toml")
+            || path.ends_with("Procfile")
+            || path.ends_with(".env")
+            || generated_sources.contains(path)
+            || locald_core::normalize_project_locator(path)
+                .is_ok_and(|canonical| generated_sources.contains(&canonical))
+    })
+}
+
 #[derive(Clone, Debug)]
 struct ConcurrencyGuard {
     lock: Arc<Mutex<()>>,
@@ -323,6 +354,8 @@ pub(crate) struct Service {
     /// Keeps an allocator-selected endpoint reserved while its controller is
     /// still building or otherwise waiting to prove readiness.
     pub pending_port_guard: Option<crate::port_allocator::PortGuard>,
+    /// The exact instance-scoped runtime files owned by this controller.
+    pub generated_files: Option<GeneratedFileSet>,
     pub path: PathBuf,
     pub health_status: HealthStatus,
     pub health_source: HealthSource,
@@ -651,7 +684,7 @@ pub struct ProcessManager {
     runtime: Arc<Runtime>,
     proxy_ports: Arc<Mutex<(Option<u16>, Option<u16>)>>, // (http, https)
     proxy_ports_changed: Arc<Notify>,
-    watchers: Arc<Mutex<HashMap<PathBuf, RecommendedWatcher>>>,
+    watchers: Arc<Mutex<HashMap<PathBuf, ConfigWatcher>>>,
     registry: Arc<Mutex<Registry>>,
     domain_index: SharedDomainIndex,
     attachments: Arc<Mutex<AttachmentStore>>,
@@ -1630,12 +1663,13 @@ impl ProcessManager {
                         controller,
                         service.health_status,
                         service.sticky_port,
+                        service.generated_files.clone(),
                     )
                 })
             };
 
             let (has_controller, is_up_to_date, is_stopped_projection) = match service_snapshot {
-                Some((loaded_instance, loaded_path, _, _, _, Some(_), _, _))
+                Some((loaded_instance, loaded_path, _, _, _, Some(_), _, _, _))
                     if loaded_instance != instance_id =>
                 {
                     anyhow::bail!(
@@ -1652,6 +1686,7 @@ impl ProcessManager {
                     Some(controller),
                     health_status,
                     sticky_port,
+                    generated_files,
                 )) => {
                     let controller_guard = controller.lock().await;
                     let runtime_state = controller_guard.read_state().await;
@@ -1664,10 +1699,19 @@ impl ProcessManager {
                     let environment_matches = resolved_env
                         .as_ref()
                         .is_some_and(|resolved_env| current_env == *resolved_env);
+                    let generated_sources_match = match generated_files.as_ref() {
+                        Some(generated_files) => {
+                            generated_files
+                                .sources_match(&loaded_path, service_config)
+                                .await
+                        }
+                        None => service_config.generated().is_empty(),
+                    };
                     let static_configuration_matches = !dependency_will_change
                         && has_durable_process_ownership
                         && loaded_project_name == config.project.name
                         && current_config.runtime_eq(service_config)
+                        && generated_sources_match
                         && environment_matches;
                     let runtime_is_reusable =
                         match (runtime_state.status, health_status, service_config) {
@@ -1719,7 +1763,7 @@ impl ProcessManager {
                         false,
                     )
                 }
-                Some((_, _, _, _, _, None, _, _)) => (false, false, true),
+                Some((_, _, _, _, _, None, _, _, _)) => (false, false, true),
                 None => (false, false, false),
             };
 
@@ -2214,6 +2258,8 @@ impl ProcessManager {
                 details.join("; ")
             );
         }
+
+        crate::generated_files::cleanup_all_instances(&self.availability_data_dir).await?;
 
         // Runtime snapshots authorize stale-process cleanup only. Availability
         // migration establishes every future restart decision before IPC is
@@ -2715,14 +2761,17 @@ impl ProcessManager {
         expected_instance: ProjectInstanceId,
         candidate_service_name: &str,
         candidate_bindings: &ServiceRuntimeBindings,
+        candidate_generated_files: Option<&GeneratedFileSet>,
     ) -> Result<HashMap<String, String>> {
         let manager = self.clone();
         let candidate_service_name = candidate_service_name.to_owned();
         let candidate_bindings = candidate_bindings.clone();
+        let candidate_generated_files = candidate_generated_files.cloned();
         ConfigLoader::resolve_env(env, config, move |service_name, field| {
             let manager = manager.clone();
             let candidate_service_name = candidate_service_name.clone();
             let candidate_bindings = candidate_bindings.clone();
+            let candidate_generated_files = candidate_generated_files.clone();
             async move {
                 if service_name == candidate_service_name {
                     if field == "port" {
@@ -2742,6 +2791,23 @@ impl ProcessManager {
                                     "service `{service_name}` has no listener `{listener_name}`"
                                 )
                             });
+                    }
+                    if let Some(generated_name) =
+                        crate::generated_files::generated_name_from_path_field(&field)
+                    {
+                        let path = candidate_generated_files
+                            .as_ref()
+                            .and_then(|generated| generated.path(generated_name))
+                            .with_context(|| {
+                                format!(
+                                    "service `{service_name}` has no generated file `{generated_name}`"
+                                )
+                            })?;
+                        return path.to_str().map(str::to_owned).with_context(|| {
+                            format!(
+                                "service `{service_name}` generated file `{generated_name}` has a non-UTF-8 path"
+                            )
+                        });
                     }
                 }
                 manager
@@ -2781,7 +2847,7 @@ impl ProcessManager {
         // Re-acquire lock to get port, or just get it all at once?
         // The issue is holding the lock across await points or significant drops.
         // Let's get everything we need in one go.
-        let (key, service_config, port_result) = {
+        let (key, service_config, port_result, generated_path) = {
             let services = self.services.lock().await;
             let key = if let Some(key) =
                 Self::service_key_for_instance(&services, expected_instance, name)
@@ -2808,9 +2874,27 @@ impl ProcessManager {
                 ServiceRuntime::Controller(c) => Err(c.clone()),
                 ServiceRuntime::None => Ok(None),
             };
+            let generated_path = crate::generated_files::generated_name_from_path_field(field)
+                .and_then(|generated_name| {
+                    service
+                        .generated_files
+                        .as_ref()
+                        .and_then(|generated| generated.path(generated_name))
+                        .map(Path::to_path_buf)
+                });
 
-            (key, service.config.clone(), port_result)
+            (key, service.config.clone(), port_result, generated_path)
         };
+
+        if let Some(generated_name) = crate::generated_files::generated_name_from_path_field(field)
+        {
+            let path = generated_path.with_context(|| {
+                format!("Service {name} has no generated file `{generated_name}`")
+            })?;
+            return path.to_str().map(str::to_owned).with_context(|| {
+                format!("Service {name} generated file `{generated_name}` has a non-UTF-8 path")
+            });
+        }
 
         if let Some(listener_name) = ListenerName::from_port_field(field) {
             return self
@@ -3141,20 +3225,23 @@ impl ProcessManager {
         });
 
         let handle = tokio::runtime::Handle::current();
+        let generated_sources = Arc::new(StdMutex::new(HashSet::<PathBuf>::new()));
+        let callback_generated_sources = Arc::clone(&generated_sources);
+        let callback_tx = tx.clone();
 
         let watcher_res = notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(event) => {
-                    if event.kind.is_modify() || event.kind.is_create() {
-                        let relevant = event.paths.iter().any(|p| {
-                            p.ends_with("locald.toml")
-                                || p.ends_with("Procfile")
-                                || p.ends_with(".env")
-                        });
+                    if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {
+                        let generated_sources = callback_generated_sources
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let relevant =
+                            config_reload_event_is_relevant(&event.paths, &generated_sources);
 
                         if relevant {
                             info!("Config changed: {:?}", event.paths);
-                            let tx = tx.clone();
+                            let tx = callback_tx.clone();
                             handle.spawn(async move {
                                 let _ = tx.send(()).await;
                             });
@@ -3174,10 +3261,125 @@ impl ProcessManager {
                         return;
                     }
                     let mut watchers = self.watchers.lock().await;
-                    watchers.insert(path, watcher);
+                    watchers.insert(
+                        path,
+                        ConfigWatcher {
+                            watcher,
+                            reload_tx: tx,
+                            generated_sources,
+                            generated_directories: HashSet::new(),
+                        },
+                    );
                 }
             }
             Err(e) => error!("Failed to create watcher: {e}"),
+        }
+    }
+
+    async fn update_generated_source_watches(&self, project_path: &Path, config: &LocaldConfig) {
+        let project_path = Self::canonicalize_path(project_path);
+        let mut desired_sources = HashSet::new();
+        for service in config.services.values() {
+            for generated in service.generated().values() {
+                let configured = project_path.join(&generated.source);
+                desired_sources.insert(configured.clone());
+                if let Ok(canonical) = std::fs::canonicalize(&configured) {
+                    if canonical.starts_with(&project_path) {
+                        desired_sources.insert(canonical);
+                    }
+                }
+            }
+        }
+        let desired_directories = desired_sources
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .filter(|directory| directory != &project_path)
+            .collect::<HashSet<_>>();
+
+        let mut watchers = self.watchers.lock().await;
+        let Some(config_watcher) = watchers.get_mut(&project_path) else {
+            return;
+        };
+        let removed = config_watcher
+            .generated_directories
+            .difference(&desired_directories)
+            .cloned()
+            .collect::<Vec<_>>();
+        let added = desired_directories
+            .difference(&config_watcher.generated_directories)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for directory in removed {
+            if let Err(error) = config_watcher.watcher.unwatch(&directory) {
+                warn!(
+                    "Failed to stop watching generated-file directory {}: {error}",
+                    directory.display()
+                );
+            }
+        }
+        for directory in added {
+            if let Err(error) = config_watcher
+                .watcher
+                .watch(&directory, RecursiveMode::NonRecursive)
+            {
+                warn!(
+                    "Failed to watch generated-file directory {}: {error}",
+                    directory.display()
+                );
+            }
+        }
+        *config_watcher
+            .generated_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = desired_sources;
+        config_watcher.generated_directories = desired_directories;
+    }
+
+    async fn loaded_generated_sources_match(&self, instance_id: ProjectInstanceId) -> bool {
+        let generated_files = {
+            let services = self.services.lock().await;
+            services
+                .values()
+                .filter(|service| service.instance_id == instance_id)
+                .filter_map(|service| {
+                    service.generated_files.clone().map(|generated| {
+                        (
+                            generated,
+                            service.path.clone(),
+                            service.service_config.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (generated, project_root, service_config) in generated_files {
+            if !generated
+                .sources_match(&project_root, &service_config)
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn queue_config_reload(&self, project_path: &Path) {
+        let project_path = Self::canonicalize_path(project_path);
+        let reload_tx = self
+            .watchers
+            .lock()
+            .await
+            .get(&project_path)
+            .map(|watcher| watcher.reload_tx.clone());
+        if let Some(reload_tx) = reload_tx {
+            if let Err(error) = reload_tx.send(()).await {
+                warn!(
+                    "Failed to queue generated-file source recheck for {}: {error}",
+                    project_path.display()
+                );
+            }
         }
     }
 
@@ -3318,6 +3520,7 @@ impl ProcessManager {
         // identity or domain ownership.
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
         ConfigLoader::validate_listener_declarations(&config)?;
+        crate::generated_files::validate_declarations(&config)?;
         for (service_name, service_config) in &config.services {
             let (effective_env, _) =
                 Self::effective_service_env(&config, &dot_env_vars, service_config, None);
@@ -3784,21 +3987,6 @@ impl ProcessManager {
             let listener_runtime = self
                 .allocate_listener_runtime(&key, service_config, port, &name)
                 .await?;
-            let resolved_env = self
-                .resolve_env_with_candidate_bindings(
-                    &combined_env,
-                    &config,
-                    instance_id,
-                    &name,
-                    &listener_runtime.bindings,
-                )
-                .await?;
-
-            info!(
-                "Starting service {name} with primary port {:?} and {} named listeners",
-                port,
-                listener_runtime.bindings.listeners().len()
-            );
             let readiness = ReadinessRequirement::for_service(service_config, port)
                 .with_context(|| format!("service `{name}` has an invalid readiness contract"))?;
             if matches!(
@@ -3807,6 +3995,43 @@ impl ProcessManager {
             ) {
                 Self::ensure_postgres_resource_namespace_ready(&key, &name)?;
             }
+            let mut generated_files = crate::generated_files::materialize(
+                &self.availability_data_dir,
+                &path,
+                &key,
+                service_config,
+                &listener_runtime.bindings,
+            )
+            .await?;
+            let resolved_env = self
+                .resolve_env_with_candidate_bindings(
+                    &combined_env,
+                    &config,
+                    instance_id,
+                    &name,
+                    &listener_runtime.bindings,
+                    generated_files.as_ref(),
+                )
+                .await;
+            let resolved_env = match resolved_env {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    if let Some(generated_files) = &generated_files {
+                        if let Err(cleanup_error) = generated_files.cleanup().await {
+                            return Err(error.context(format!(
+                                "failed to clean generated files after environment resolution failed: {cleanup_error:#}"
+                            )));
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+
+            info!(
+                "Starting service {name} with primary port {:?} and {} named listeners",
+                port,
+                listener_runtime.bindings.listeners().len()
+            );
 
             if let Some(tx) = &event_tx {
                 let _ = tx
@@ -3859,6 +4084,7 @@ impl ProcessManager {
                                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                                 sticky_port: port,
                                 pending_port_guard: port_guard.take(),
+                                generated_files: generated_files.take(),
                                 path: path.clone(),
                                 health_status: HealthStatus::Starting,
                                 health_source: HealthSource::None,
@@ -3878,9 +4104,18 @@ impl ProcessManager {
 
                     self.broadcast_service_update(&key).await;
 
-                    {
+                    let prepare_result = {
                         let mut c = controller.lock().await;
-                        c.prepare().await.context("Failed to prepare service")?;
+                        c.prepare().await.context("Failed to prepare service")
+                    };
+                    if let Err(prepare_error) = prepare_result {
+                        let cleanup = self.stop_service_instance_locked(&key).await;
+                        return match cleanup {
+                            Ok(()) => Err(prepare_error),
+                            Err(cleanup_error) => Err(prepare_error.context(format!(
+                                "failed to stop service `{name}` after preparation failed: {cleanup_error:#}"
+                            ))),
+                        };
                         // Broadcast update after prepare (state might be Building)
                     }
                     self.broadcast_service_update(&key).await;
@@ -4012,6 +4247,9 @@ impl ProcessManager {
             }
 
             if !handled {
+                if let Some(generated_files) = &generated_files {
+                    generated_files.cleanup().await?;
+                }
                 anyhow::bail!("No factory found for service {name}");
             }
 
@@ -4036,6 +4274,14 @@ impl ProcessManager {
         }
 
         self.persist_state().await;
+        self.update_generated_source_watches(&path, &config).await;
+        if !self.loaded_generated_sources_match(instance_id).await {
+            info!(
+                "Generated-file source changed while applying config for {}; queuing reload",
+                path.display()
+            );
+            self.queue_config_reload(&path).await;
+        }
         Ok(ConfigApplyOutcome {
             instance_id,
             pending_initial,
@@ -4221,7 +4467,21 @@ impl ProcessManager {
             }
         }
         self.release_listener_guards(key).await;
-
+        let generated_files = {
+            let services = self.services.lock().await;
+            services
+                .get(key)
+                .and_then(|service| service.generated_files.clone())
+        };
+        if let Some(generated_files) = generated_files {
+            generated_files.cleanup().await?;
+            let mut services = self.services.lock().await;
+            if let Some(service) = services.get_mut(key) {
+                if service.generated_files.as_ref() == Some(&generated_files) {
+                    service.generated_files = None;
+                }
+            }
+        }
         // Clear health and broadcast after stop
         {
             let mut services = self.services.lock().await;
@@ -5447,12 +5707,12 @@ impl ProcessManager {
         project_path: PathBuf,
         source: AttachmentSource,
     ) -> Result<()> {
-        self.project_attach_with_convergence(
+        Box::pin(self.project_attach_with_convergence(
             project_path,
             source,
             true,
             AttachmentDemandActivity::Compatibility,
-        )
+        ))
         .await
         .map(drop)
     }
@@ -5465,12 +5725,12 @@ impl ProcessManager {
     ) -> Result<()> {
         let converge_after_publication =
             standalone || !matches!(&source, AttachmentSource::CLI { .. });
-        self.project_attach_with_convergence(
+        Box::pin(self.project_attach_with_convergence(
             project_path,
             source,
             converge_after_publication,
             AttachmentDemandActivity::Compatibility,
-        )
+        ))
         .await
         .map(drop)
     }
@@ -5482,12 +5742,12 @@ impl ProcessManager {
     ) -> Result<EnsureProjectResult> {
         let project_path = Self::normalize_ensure_project_root(project_path).await?;
         self.wait_for_https_proxy_listener().await?;
-        self.project_attach_with_convergence(
+        Box::pin(self.project_attach_with_convergence(
             project_path,
             editor.attachment_source(),
             true,
             AttachmentDemandActivity::SemanticEnsure,
-        )
+        ))
         .await?
         .context("semantic editor ensure completed without a readiness result")
     }
@@ -5573,8 +5833,7 @@ impl ProcessManager {
         editor: &EditorSession,
     ) -> Result<()> {
         let project_path = Self::normalize_ensure_project_root(project_path).await?;
-        self.project_detach(project_path, Some(editor.attachment_source()))
-            .await
+        Box::pin(self.project_detach(project_path, Some(editor.attachment_source()))).await
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -11088,6 +11347,51 @@ mod tests {
     #[derive(Debug)]
     struct CountingStartFactory {
         creates: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct CapturingContextFactory {
+        env: Arc<StdMutex<Option<HashMap<String, String>>>>,
+        bindings: Arc<StdMutex<Option<ServiceRuntimeBindings>>>,
+        stop_count: Arc<AtomicUsize>,
+        fail_prepare: bool,
+    }
+
+    impl ServiceFactory for CapturingContextFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            *self.env.lock().expect("capture service environment") = Some(ctx.env.clone());
+            *self.bindings.lock().expect("capture service bindings") = Some(ctx.bindings.clone());
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: None,
+                spawn_identity: Some((
+                    45,
+                    test_process_identity(1_237, 45, "/test/generated-file-worker"),
+                )),
+                prepare_entered: None,
+                release_prepare: None,
+                start_entered: None,
+                start_release: None,
+                start_count: None,
+                fail_prepare: self.fail_prepare,
+                stop_count: self.stop_count.clone(),
+            }))
+        }
     }
 
     impl ServiceFactory for CountingStartFactory {
@@ -23741,6 +24045,7 @@ PATH = "/usr/bin:/bin"
             runtime_state: ServiceRuntime::None,
             sticky_port: None,
             pending_port_guard: None,
+            generated_files: None,
             path,
             health_status: HealthStatus::Healthy,
             health_source: HealthSource::None,
@@ -23823,6 +24128,7 @@ PATH = "/usr/bin:/bin"
                 runtime_state: ServiceRuntime::None,
                 sticky_port: None,
                 pending_port_guard: None,
+                generated_files: None,
                 path: canonical,
                 health_status: HealthStatus::Healthy,
                 health_source: HealthSource::None,
@@ -23912,6 +24218,7 @@ PATH = "/usr/bin:/bin"
                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                 sticky_port: None,
                 pending_port_guard: None,
+                generated_files: None,
                 path: canonical.clone(),
                 health_status: HealthStatus::Healthy,
                 health_source: HealthSource::None,
@@ -24045,6 +24352,7 @@ PATH = "/usr/bin:/bin"
                 runtime_state: ServiceRuntime::Controller(controller.clone()),
                 sticky_port: None,
                 pending_port_guard: None,
+                generated_files: None,
                 path: canonical.clone(),
                 health_status: HealthStatus::Healthy,
                 health_source: HealthSource::None,
@@ -25630,6 +25938,7 @@ PATH = "/usr/bin:/bin"
             runtime_state,
             sticky_port: None,
             pending_port_guard: None,
+            generated_files: None,
             path,
             health_status: HealthStatus::Healthy,
             health_source: HealthSource::None,
@@ -25885,6 +26194,7 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
                 test_instance_id(),
                 "app:web",
                 &runtime.bindings,
+                None,
             )
             .await
             .expect("resolve candidate bindings");
@@ -25907,6 +26217,222 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
             )
         );
         assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[test]
+    fn generated_source_paths_participate_in_config_reload_filtering() {
+        let root = tempdir().expect("create watcher path directory");
+        let source = root.path().join("chat/microfrontends.jsonc");
+        let unrelated = root.path().join("chat/README.md");
+        let generated_sources = HashSet::from([source.clone()]);
+
+        assert!(config_reload_event_is_relevant(
+            std::slice::from_ref(&source),
+            &generated_sources
+        ));
+        assert!(!config_reload_event_is_relevant(
+            &[unrelated],
+            &generated_sources
+        ));
+        assert!(config_reload_event_is_relevant(
+            &[root.path().join("locald.toml")],
+            &HashSet::new()
+        ));
+    }
+
+    #[tokio::test]
+    async fn generated_file_is_materialized_before_prepare_and_removed_on_stop() {
+        let dir = tempdir().expect("create generated-file lifecycle directory");
+        let project_path = dir.path().join("generated-file-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "generated-file-project").await;
+        std::fs::create_dir(project_path.join("config"))
+            .expect("create generated-file source directory");
+        std::fs::write(
+            project_path.join("config/runtime.jsonc"),
+            r#"{
+                // locald replaces this with the reserved listener
+                "listener": 3001,
+            }"#,
+        )
+        .expect("write generated-file source");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "generated-file-project"
+domain = "generated-file-project.localhost"
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+listeners = ["events"]
+
+[services.worker.generated.runtime]
+source = "config/runtime.jsonc"
+
+[services.worker.generated.runtime.replace]
+"/listener" = "${services.worker.listeners.events.port}"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
+"#,
+        )
+        .expect("write generated-file project config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load generated-file availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed generated-file policy");
+
+        let captured_env = Arc::new(StdMutex::new(None));
+        let captured_bindings = Arc::new(StdMutex::new(None));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: captured_env.clone(),
+                bindings: captured_bindings.clone(),
+                stop_count: stop_count.clone(),
+                fail_prepare: false,
+            }),
+        );
+
+        manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect("converge generated-file project");
+
+        let canonical_project =
+            std::fs::canonicalize(&project_path).expect("canonical generated-file project");
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers
+                .get(&canonical_project)
+                .expect("project watcher exists");
+            assert!(
+                watcher
+                    .generated_sources
+                    .lock()
+                    .expect("read generated source watches")
+                    .contains(&canonical_project.join("config/runtime.jsonc"))
+            );
+            assert!(
+                watcher
+                    .generated_directories
+                    .contains(&canonical_project.join("config"))
+            );
+        }
+
+        let env = captured_env
+            .lock()
+            .expect("read captured environment")
+            .clone()
+            .expect("factory received environment");
+        let bindings = captured_bindings
+            .lock()
+            .expect("read captured bindings")
+            .clone()
+            .expect("factory received bindings");
+        let generated_path = PathBuf::from(&env["RUNTIME_CONFIG"]);
+        assert!(
+            generated_path.starts_with(
+                availability_data_dir
+                    .join("instances")
+                    .join(instance_id.to_string())
+                    .join("generated")
+            )
+        );
+        let generated: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&generated_path).expect("read generated runtime file"),
+        )
+        .expect("generated output is JSON");
+        assert_eq!(
+            generated.pointer("/listener"),
+            Some(&serde_json::Value::from(
+                bindings.listener_port("events").expect("events listener")
+            ))
+        );
+
+        manager
+            .stop_service_instance_locked(&ServiceKey::new(instance_id, "worker"))
+            .await
+            .expect("stop generated-file service");
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(!generated_path.exists());
+    }
+
+    #[tokio::test]
+    async fn generated_file_is_removed_when_service_preparation_fails() {
+        let dir = tempdir().expect("create generated-file failure directory");
+        let project_path = dir.path().join("generated-file-failure");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "generated-file-failure").await;
+        std::fs::write(project_path.join("runtime.json"), r#"{"listener":3001}"#)
+            .expect("write generated-file source");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "generated-file-failure"
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+listeners = ["events"]
+
+[services.worker.generated.runtime]
+source = "runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/listener" = "${services.worker.listeners.events.port}"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
+"#,
+        )
+        .expect("write generated-file project config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load generated-file availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed generated-file policy");
+
+        let captured_env = Arc::new(StdMutex::new(None));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: captured_env.clone(),
+                bindings: Arc::new(StdMutex::new(None)),
+                stop_count: stop_count.clone(),
+                fail_prepare: true,
+            }),
+        );
+
+        let error = manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect_err("preparation failure must fail convergence");
+        assert!(format!("{error:#}").contains("Failed to prepare service"));
+        let generated_path = PathBuf::from(
+            &captured_env
+                .lock()
+                .expect("read captured environment")
+                .as_ref()
+                .expect("factory received environment")["RUNTIME_CONFIG"],
+        );
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !generated_path.exists(),
+            "preparation rollback must remove the unpublished runtime file"
+        );
     }
 
     #[tokio::test(start_paused = true)]

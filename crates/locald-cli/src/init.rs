@@ -4,7 +4,7 @@ use locald_core::config::{
     CommonServiceConfig, ExecServiceConfig, LocaldConfig, ProjectConfig, ServiceConfig,
     TypedServiceConfig,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -81,6 +81,7 @@ pub fn run() -> Result<()> {
             common: CommonServiceConfig {
                 port,
                 listeners: Vec::new(),
+                generated: BTreeMap::default(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),

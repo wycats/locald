@@ -190,6 +190,11 @@ impl ConfigLoader {
                 .listeners
                 .clone_from(&override_svc.common.listeners);
         }
+        for (name, generated) in &override_svc.common.generated {
+            base.common
+                .generated
+                .insert(name.clone(), generated.clone());
+        }
         if override_svc.common.domains.is_some() {
             base.common.domains.clone_from(&override_svc.common.domains);
         }
@@ -584,6 +589,7 @@ impl ConfigLoader {
                         common: CommonServiceConfig {
                             port: None, // Will be assigned
                             listeners: Vec::new(),
+                            generated: BTreeMap::new(),
                             domains: None,
                             env: HashMap::new(),
                             depends_on: Vec::new(),
@@ -599,6 +605,7 @@ impl ConfigLoader {
                         common: CommonServiceConfig {
                             port: None,
                             listeners: Vec::new(),
+                            generated: BTreeMap::new(),
                             domains: None,
                             env: HashMap::new(),
                             depends_on: Vec::new(),
@@ -736,6 +743,23 @@ impl ConfigLoader {
 
                 let self_reference = service_name == consumer_name;
                 let listener_reference = ListenerName::from_port_field(field);
+                if let Some(generated_name) =
+                    crate::generated_files::generated_name_from_path_field(field)
+                {
+                    anyhow::ensure!(
+                        self_reference,
+                        "environment variable `{env_name}` references private generated file `{service_name}.{field}`; generated paths are visible only to their owning service"
+                    );
+                    anyhow::ensure!(
+                        service.supports_generated_files(),
+                        "environment variable `{env_name}` references generated file `{generated_name}` on unsupported service `{service_name}`"
+                    );
+                    anyhow::ensure!(
+                        service.generated().contains_key(generated_name),
+                        "environment variable `{env_name}` references unknown generated file `{generated_name}` on service `{service_name}`"
+                    );
+                    continue;
+                }
 
                 match (field, listener_reference) {
                     ("host", None) => {
@@ -1084,6 +1108,141 @@ listeners = ["wire"]
     }
 
     #[test]
+    fn generated_file_validation_accepts_owner_paths_and_rejects_private_leaks() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "serve"
+listeners = ["chat"]
+
+[services.web.generated.microfrontends]
+source = "chat/microfrontends.jsonc"
+
+[services.web.generated.microfrontends.replace]
+"/applications/chat/development/local" = "${services.web.listeners.chat.port}"
+"/options/localProxyPort" = "${services.web.port}"
+
+[services.web.env]
+MICROFRONTENDS_CONFIG = "${services.web.generated.microfrontends.path}"
+
+[services.worker]
+type = "worker"
+command = "work"
+"#,
+        )
+        .expect("parse generated file config");
+        crate::generated_files::validate_declarations(&config)
+            .expect("valid generated declarations");
+        ConfigLoader::validate_env_references(config.services["web"].env(), &config, "web")
+            .expect("own generated path is private and valid");
+
+        let leaked = HashMap::from([(
+            "CONFIG".to_owned(),
+            "${services.web.generated.microfrontends.path}".to_owned(),
+        )]);
+        let error = ConfigLoader::validate_env_references(&leaked, &config, "worker")
+            .expect_err("another service cannot inspect a generated path");
+        assert!(
+            error
+                .to_string()
+                .contains("visible only to their owning service")
+        );
+    }
+
+    #[test]
+    fn generated_file_validation_rejects_cross_service_and_unsupported_owners() {
+        let cross_service: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "serve"
+
+[services.worker]
+type = "worker"
+command = "work"
+
+[services.worker.generated.runtime]
+source = "runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/port" = "${services.web.port}"
+"#,
+        )
+        .expect("parse cross-service generated config");
+        let error = crate::generated_files::validate_declarations(&cross_service)
+            .expect_err("cross-service generated replacement must fail");
+        assert!(error.to_string().contains("owning service"));
+
+        let worker_primary: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.worker]
+type = "worker"
+command = "work"
+
+[services.worker.generated.runtime]
+source = "runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/port" = "${services.worker.port}"
+"#,
+        )
+        .expect("parse worker primary-port generated config");
+        let error = crate::generated_files::validate_declarations(&worker_primary)
+            .expect_err("worker primary port must fail declaratively");
+        assert!(
+            error
+                .to_string()
+                .contains("worker has no configured primary port")
+        );
+
+        let portful_worker: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.worker]
+type = "worker"
+command = "work"
+port = 3000
+
+[services.worker.generated.runtime]
+source = "runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/port" = "${services.worker.port}"
+"#,
+        )
+        .expect("parse portful worker generated config");
+        crate::generated_files::validate_declarations(&portful_worker)
+            .expect("configured worker primary port is available to its generated file");
+
+        let unsupported: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.database]
+type = "postgres"
+
+[services.database.generated.runtime]
+source = "runtime.json"
+"#,
+        )
+        .expect("parse unsupported generated owner");
+        let error = crate::generated_files::validate_declarations(&unsupported)
+            .expect_err("postgres cannot own generated files");
+        assert!(error.to_string().contains("only exec and worker"));
+    }
+
+    #[test]
     fn semantic_origins_allow_self_and_cross_service_references_without_dependencies() {
         let config: LocaldConfig = toml::from_str(
             r#"
@@ -1238,6 +1397,48 @@ listeners = ["chat", "events"]
         .expect("parse replacing override");
         ConfigLoader::merge_service_configs(&mut base.services, &replace.services);
         assert_eq!(base.services["web"].listeners(), &["chat", "events"]);
+    }
+
+    #[test]
+    fn layered_exec_config_unions_generated_files_and_replaces_named_declarations() {
+        let mut base: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "base"
+
+[services.web.generated.shared]
+source = "base.json"
+
+[services.web.generated.base_only]
+source = "base-only.json"
+"#,
+        )
+        .expect("parse base generated config");
+        let override_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "override"
+
+[services.web.generated.shared]
+source = "override.jsonc"
+
+[services.web.generated.override_only]
+source = "override-only.json"
+"#,
+        )
+        .expect("parse generated override");
+
+        ConfigLoader::merge_service_configs(&mut base.services, &override_config.services);
+        let generated = base.services["web"].generated();
+        assert_eq!(generated["shared"].source, "override.jsonc");
+        assert_eq!(generated["base_only"].source, "base-only.json");
+        assert_eq!(generated["override_only"].source, "override-only.json");
     }
 
     #[tokio::test]

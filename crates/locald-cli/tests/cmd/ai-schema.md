@@ -196,6 +196,13 @@ $ locald ai schema
             "type": "string"
           }
         },
+        "generated": {
+          "description": "Runtime JSON or JSONC files generated for this service./n/nGenerated files are materialized in the owning project instance's/nlocald data directory. Their replacements may reference only this/nservice's primary port and declared named listeners.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/GeneratedFileConfig"
+          }
+        },
         "health_check": {
           "description": "Optional command to run to check if the service is healthy./nIf not provided, locald will attempt to infer a health check (Docker, Notify, or TCP).",
           "anyOf": [
@@ -239,6 +246,24 @@ $ locald ai schema
           ]
         }
       }
+    },
+    "GeneratedFileConfig": {
+      "description": "One JSON or JSONC file generated for an exec or worker service.",
+      "type": "object",
+      "properties": {
+        "replace": {
+          "description": "Existing JSON Pointer targets and their replacement values.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "source": {
+          "description": "Project-relative source JSON or JSONC file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ]
     },
     "HealthCheckConfig": {
       "description": "Configuration for service health checks./n/n# Example/n```toml/nhealth_check = { type = /"http/", path = /"/health/" }/n# OR/nhealth_check = /"curl -f http://localhost:3000/health/"/n```",
@@ -664,6 +689,13 @@ $ locald ai schema
           "type": "object",
           "additionalProperties": {
             "type": "string"
+          }
+        },
+        "generated": {
+          "description": "Runtime JSON or JSONC files generated for this service./n/nGenerated files are materialized in the owning project instance's/nlocald data directory. Their replacements may reference only this/nservice's primary port and declared named listeners.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/GeneratedFileConfig"
           }
         },
         "health_check": {
