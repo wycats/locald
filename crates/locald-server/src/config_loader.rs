@@ -1200,7 +1200,7 @@ source = "runtime.json"
         assert!(
             error
                 .to_string()
-                .contains("worker has no configured primary port")
+                .contains("worker has no configured or probe-assigned primary port")
         );
 
         let portful_worker: LocaldConfig = toml::from_str(
@@ -1223,6 +1223,29 @@ source = "runtime.json"
         .expect("parse portful worker generated config");
         crate::generated_files::validate_declarations(&portful_worker)
             .expect("configured worker primary port is available to its generated file");
+
+        for probe in ["http", "tcp"] {
+            let probe_worker: LocaldConfig = toml::from_str(&format!(
+                r#"
+[project]
+name = "app"
+
+[services.worker]
+type = "worker"
+command = "work"
+health_check = {{ type = "{probe}" }}
+
+[services.worker.generated.runtime]
+source = "runtime.json"
+
+[services.worker.generated.runtime.replace]
+"/port" = "${{services.worker.port}}"
+"#
+            ))
+            .expect("parse probe-backed worker generated config");
+            crate::generated_files::validate_declarations(&probe_worker)
+                .expect("probe-assigned worker primary port is available to its generated file");
+        }
 
         let unsupported: LocaldConfig = toml::from_str(
             r#"

@@ -3660,6 +3660,7 @@ impl ProcessManager {
                 .map(|service_name| Self::service_key(instance_id, service_name.clone()))
                 .collect::<HashSet<_>>();
             let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
+            let mut generated_start_candidates = Vec::new();
             if start_services {
                 for (service_name, service_config) in &config.services {
                     let key = Self::service_key(instance_id, service_name.clone());
@@ -3682,6 +3683,7 @@ impl ProcessManager {
                         service_config,
                         &effective_env,
                     )?;
+                    generated_start_candidates.push((key, service_name.clone()));
                 }
             }
             if let Some(expectation) = expected_instance {
@@ -3728,6 +3730,25 @@ impl ProcessManager {
             // enough to retry convergence without another locald.toml edit.
             self.update_generated_source_watches(&path, &config).await;
 
+            let mut prepared_start_generated_files = HashMap::new();
+            for (key, service_name) in generated_start_candidates {
+                let service_config = config
+                    .services
+                    .get(&service_name)
+                    .expect("generated start candidate belongs to the loaded config");
+                if let Some(prepared) =
+                    crate::generated_files::prepare(&path, &key, service_config)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to prepare generated files for service `{service_name}` before the runtime transition"
+                            )
+                        })?
+                {
+                    prepared_start_generated_files.insert(key, prepared);
+                }
+            }
+
             // Keep the previous claim set published until every removed or
             // restart-required service has stopped. A failed stop retains both
             // ownership and the retryable service record.
@@ -3736,7 +3757,7 @@ impl ProcessManager {
                 restart_service_names,
                 reusable_service_envs,
                 stopped_service_projections,
-                prepared_generated_files,
+                prepared_generated_files: planned_generated_files,
             } = self
                 .prepublication_stop_plan(
                     instance_id,
@@ -3752,6 +3773,11 @@ impl ProcessManager {
                     },
                 )
                 .await?;
+            // Every service that will start was validated before any healthy
+            // dependent can be stopped. Active-controller planning may have
+            // observed a newer source snapshot, so its preparation wins.
+            prepared_start_generated_files.extend(planned_generated_files);
+            let prepared_generated_files = prepared_start_generated_files;
             if expected_instance.is_some_and(ConfigIdentityExpectation::requires_existing_catalog) {
                 self.availability_authorizes_start_locked(instance_id)
                     .await?;
@@ -26651,6 +26677,191 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
                 .generated_sources
                 .lock()
                 .expect("read generated source watches")
+                .contains(&canonical_project.join("config/runtime.json"))
+        );
+        assert!(
+            watcher
+                .generated_directories
+                .contains(&canonical_project.join("config"))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_stopped_dependency_generation_preserves_its_healthy_dependent() {
+        let dir = tempdir().expect("create generated dependency directory");
+        let project_path = dir.path().join("generated-dependency");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "generated-dependency").await;
+        let config_path = project_path.join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "generated-dependency"
+domain = "generated-dependency.localhost"
+
+[services.runtime]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.runtime.env]
+PATH = "/usr/bin:/bin"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["runtime"]
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("write generated dependency config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load generated dependency availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed generated dependency policy");
+
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: Arc::new(StdMutex::new(None)),
+                bindings: Arc::new(StdMutex::new(None)),
+                stop_count: stop_count.clone(),
+                fail_prepare: false,
+            }),
+        );
+        manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect("start generated dependency and dependent");
+
+        manager
+            .stop_service_instance_locked(&ServiceKey::new(instance_id, "runtime"))
+            .await
+            .expect("stop only the generated dependency");
+        let stops_before_reload = stop_count.load(Ordering::SeqCst);
+        let web_key = ServiceKey::new(instance_id, "web");
+        let active_web_controller = {
+            let services = manager.services.lock().await;
+            match &services
+                .get(&web_key)
+                .expect("healthy dependent remains loaded")
+                .runtime_state
+            {
+                ServiceRuntime::Controller(controller) => controller.clone(),
+                ServiceRuntime::None => panic!("healthy dependent must remain active"),
+            }
+        };
+        let active_domain_index = manager.domain_index.snapshot();
+        let active_catalog = manager.registry.lock().await.clone();
+
+        let canonical_project =
+            std::fs::canonicalize(&project_path).expect("canonical generated dependency project");
+        let old_watcher = manager
+            .watchers
+            .lock()
+            .await
+            .remove(&canonical_project)
+            .expect("remove the initial project watcher");
+        drop(old_watcher);
+        std::fs::create_dir(project_path.join("config"))
+            .expect("create generated dependency source directory");
+        let source_path = project_path.join("config/runtime.json");
+        std::fs::write(&source_path, r#"{"version":"#).expect("write invalid generated source");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "generated-dependency"
+domain = "generated-dependency.localhost"
+
+[services.runtime]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.runtime.generated.runtime]
+source = "config/runtime.json"
+
+[services.runtime.env]
+PATH = "/usr/bin:/bin"
+RUNTIME_CONFIG = "${services.runtime.generated.runtime.path}"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["runtime"]
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("add generated dependency configuration");
+        manager.watch_config(canonical_project.clone()).await;
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers
+                .get(&canonical_project)
+                .expect("replacement project watcher exists");
+            assert!(
+                watcher
+                    .generated_sources
+                    .lock()
+                    .expect("read generated sources before convergence")
+                    .is_empty(),
+                "the generated source is new to this convergence"
+            );
+        }
+        let error = manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect_err("invalid stopped dependency must reject convergence before stopping");
+        assert!(
+            format!("{error:#}")
+                .contains("failed to prepare generated files for service `runtime`"),
+            "{error:#}"
+        );
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            stops_before_reload,
+            "invalid stopped dependency input must not stop its healthy dependent"
+        );
+        let services = manager.services.lock().await;
+        let current_web_controller = match &services
+            .get(&web_key)
+            .expect("healthy dependent remains loaded")
+            .runtime_state
+        {
+            ServiceRuntime::Controller(controller) => controller.clone(),
+            ServiceRuntime::None => panic!("healthy dependent must remain active"),
+        };
+        assert!(Arc::ptr_eq(&active_web_controller, &current_web_controller));
+        assert!(matches!(
+            services
+                .get(&ServiceKey::new(instance_id, "runtime"))
+                .expect("stopped dependency projection remains")
+                .runtime_state,
+            ServiceRuntime::None
+        ));
+        drop(services);
+        assert!(Arc::ptr_eq(
+            &active_domain_index,
+            &manager.domain_index.snapshot()
+        ));
+        assert_eq!(*manager.registry.lock().await, active_catalog);
+        let watchers = manager.watchers.lock().await;
+        let watcher = watchers
+            .get(&canonical_project)
+            .expect("project watcher survives failed generated preparation");
+        assert!(
+            watcher
+                .generated_sources
+                .lock()
+                .expect("read generated sources after failed convergence")
                 .contains(&canonical_project.join("config/runtime.json"))
         );
         assert!(

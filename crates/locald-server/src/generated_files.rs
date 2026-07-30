@@ -1,3 +1,4 @@
+use crate::health::ReadinessRequirement;
 use anyhow::{Context, Result};
 use jsonc_parser::{ParseOptions, parse_to_serde_value, parse_to_value};
 use locald_core::config::{GeneratedFileConfig, LocaldConfig, ServiceConfig};
@@ -713,7 +714,6 @@ fn parse_pointer(pointer: &str) -> Result<Vec<String>> {
     pointer[1..]
         .split('/')
         .map(|token| {
-            anyhow::ensure!(token != "-", "array append token `-` is not supported");
             let mut decoded = String::new();
             let mut characters = token.chars();
             while let Some(character) = characters.next() {
@@ -761,13 +761,8 @@ fn validate_replacement_references(
                 );
                 if field == "port" {
                     anyhow::ensure!(
-                        !matches!(
-                            service,
-                            ServiceConfig::Typed(locald_core::config::TypedServiceConfig::Worker(
-                                _
-                            ))
-                        ) || service.port().is_some(),
-                        "service `{service_name}` generated file `{name}` references its primary port, but this worker has no configured primary port"
+                        ReadinessRequirement::service_requires_port(service),
+                        "service `{service_name}` generated file `{name}` references its primary port, but this worker has no configured or probe-assigned primary port"
                     );
                     continue;
                 }
@@ -1042,7 +1037,7 @@ mod tests {
         }
 
         let replacement = Value::from(1);
-        for pointer in ["", "options/port", "/options/~2port", "/array/-"] {
+        for pointer in ["", "options/port", "/options/~2port"] {
             let config = service_config(
                 "source.json",
                 BTreeMap::from([(pointer.to_owned(), replacement.clone())]),
@@ -1086,6 +1081,65 @@ source = "runtime.json"
         let error = validate_declarations(&case_collision)
             .expect_err("case-insensitive output names must not collide");
         assert!(error.to_string().contains("case-insensitive filesystem"));
+    }
+
+    #[tokio::test]
+    async fn hyphen_pointer_replaces_object_members_but_never_appends_to_arrays() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::write(
+            root.path().join("runtime.json"),
+            r#"{"options":{"-":1},"array":[1]}"#,
+        )
+        .await
+        .expect("write source");
+
+        let object_config = service_config(
+            "runtime.json",
+            BTreeMap::from([(
+                "/options/-".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let object_locald = LocaldConfig {
+            services: std::collections::HashMap::from([("web".to_owned(), object_config.clone())]),
+            ..LocaldConfig::default()
+        };
+        validate_declarations(&object_locald).expect("hyphen object member is a valid pointer");
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &object_config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize object member")
+        .expect("generated file declarations");
+        let value: Value = serde_json::from_slice(
+            &tokio::fs::read(generated.path("microfrontends").expect("generated path"))
+                .await
+                .expect("read generated file"),
+        )
+        .expect("parse generated file");
+        assert_eq!(value.pointer("/options/-"), Some(&Value::from(4100)));
+
+        let array_config = service_config(
+            "runtime.json",
+            BTreeMap::from([(
+                "/array/-".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let array_locald = LocaldConfig {
+            services: std::collections::HashMap::from([("web".to_owned(), array_config.clone())]),
+            ..LocaldConfig::default()
+        };
+        validate_declarations(&array_locald)
+            .expect("array append cannot be rejected before the source is known");
+        let error = prepare(root.path(), &key(), &array_config)
+            .await
+            .expect_err("generated replacements never append to arrays");
+        assert!(format!("{error:#}").contains("does not identify an existing value"));
     }
 
     #[test]
