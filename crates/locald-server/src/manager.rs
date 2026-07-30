@@ -3781,7 +3781,7 @@ impl ProcessManager {
                     }
                 };
 
-            let mut listener_runtime = self
+            let listener_runtime = self
                 .allocate_listener_runtime(&key, service_config, port, &name)
                 .await?;
             let resolved_env = self
@@ -3827,17 +3827,6 @@ impl ProcessManager {
                         bindings: listener_runtime.bindings.clone(),
                         env: resolved_env.clone(),
                     };
-
-                    // Release reservation listeners immediately before the
-                    // controller takes ownership. Guards continue to prevent
-                    // locald from allocating the same ports to another
-                    // in-flight or active service.
-                    if let Some(ref mut guard) = port_guard {
-                        guard.release_listener();
-                    }
-                    for guard in &mut listener_runtime.guards {
-                        guard.release_listener();
-                    }
 
                     let controller = factory.create(name.clone(), service_config, &ctx);
                     let controller_generation = self
@@ -3913,6 +3902,32 @@ impl ProcessManager {
                             )));
                         }
                         return Err(superseded);
+                    }
+
+                    // Keep every socket reserved through potentially long
+                    // preparation work. Release them only when the controller
+                    // is about to bind, while retaining allocator ownership
+                    // until the service stops.
+                    {
+                        let mut services = self.services.lock().await;
+                        if let Some(guard) = services
+                            .get_mut(&key)
+                            .expect("service was published with its controller")
+                            .pending_port_guard
+                            .as_mut()
+                        {
+                            guard.release_listener();
+                        }
+                    }
+                    for guard in &mut self
+                        .listener_runtimes
+                        .lock()
+                        .await
+                        .get_mut(&key)
+                        .expect("listener runtime was published with its controller")
+                        .guards
+                    {
+                        guard.release_listener();
                     }
 
                     let start_result = {
@@ -25749,6 +25764,86 @@ listeners = ["chat", "hmr"]
                 .await
                 .contains_key(&first_key)
         );
+    }
+
+    #[tokio::test]
+    async fn named_listener_sockets_remain_reserved_through_prepare() {
+        let dir = tempdir().expect("create listener preparation directory");
+        let project_path = dir.path().join("listener-preparation-project");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "listener-preparation").await;
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "listener-preparation"
+domain = "listener-preparation.localhost"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+listeners = ["chat"]
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("write listener preparation config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load listener preparation availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed listener preparation policy");
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        let start_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                start_count: start_count.clone(),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .converge_managed_instance(instance_id, None, false, true)
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("listener-owned service enters prepare");
+
+        let key = ServiceKey::new(instance_id, "web");
+        let listener_port = manager
+            .listener_runtimes
+            .lock()
+            .await
+            .get(&key)
+            .and_then(|runtime| runtime.bindings.listener_port("chat"))
+            .expect("prepared service publishes its listener binding");
+        let bind_error = std::net::TcpListener::bind(("127.0.0.1", listener_port))
+            .expect_err("listener socket remains reserved during prepare");
+        assert_eq!(bind_error.kind(), std::io::ErrorKind::AddrInUse);
+
+        release_prepare.notify_one();
+        convergence
+            .await
+            .expect("listener convergence task joins")
+            .expect("listener convergence completes");
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+        let rebound = std::net::TcpListener::bind(("127.0.0.1", listener_port))
+            .expect("reservation listener is released immediately before start");
+        drop(rebound);
     }
 
     #[tokio::test]
