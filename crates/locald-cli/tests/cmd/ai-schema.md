@@ -121,6 +121,13 @@ $ locald ai schema
           "description": "The Docker image to run.",
           "type": "string"
         },
+        "listeners": {
+          "description": "Additional process-owned listeners that locald allocates dynamically./n/nThese listeners are private runtime bindings. They do not claim/ndomains and are exposed to the owning service only through explicit/n`${services.<service>.listeners.<listener>.port}` interpolation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "port": {
           "description": "The port the service listens on. If None, locald will assign a port and pass it via PORT env var.",
           "type": [
@@ -206,6 +213,13 @@ $ locald ai schema
               "type": "null"
             }
           ]
+        },
+        "listeners": {
+          "description": "Additional process-owned listeners that locald allocates dynamically./n/nThese listeners are private runtime bindings. They do not claim/ndomains and are exposed to the owning service only through explicit/n`${services.<service>.listeners.<listener>.port}` interpolation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "port": {
           "description": "The port the service listens on. If None, locald will assign a port and pass it via PORT env var.",
@@ -339,6 +353,13 @@ $ locald ai schema
               "type": "null"
             }
           ]
+        },
+        "listeners": {
+          "description": "Additional process-owned listeners that locald allocates dynamically./n/nThese listeners are private runtime bindings. They do not claim/ndomains and are exposed to the owning service only through explicit/n`${services.<service>.listeners.<listener>.port}` interpolation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "port": {
           "description": "The port the service listens on. If None, locald will assign a port and pass it via PORT env var.",
@@ -526,6 +547,13 @@ $ locald ai schema
             }
           ]
         },
+        "listeners": {
+          "description": "Additional process-owned listeners that locald allocates dynamically./n/nThese listeners are private runtime bindings. They do not claim/ndomains and are exposed to the owning service only through explicit/n`${services.<service>.listeners.<listener>.port}` interpolation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "path": {
           "description": "The path to the directory to serve.",
           "type": "string"
@@ -669,6 +697,13 @@ $ locald ai schema
               "type": "null"
             }
           ]
+        },
+        "listeners": {
+          "description": "Additional process-owned listeners that locald allocates dynamically./n/nThese listeners are private runtime bindings. They do not claim/ndomains and are exposed to the owning service only through explicit/n`${services.<service>.listeners.<listener>.port}` interpolation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "port": {
           "description": "The port the service listens on. If None, locald will assign a port and pass it via PORT env var.",
