@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use locald_core::ListenerName;
 use locald_core::config::{
     CommonServiceConfig, EnvLayer, EnvLayerKind, EnvLayerSource, ExecServiceConfig, GlobalConfig,
     LocaldConfig, ProjectConfig, ResolvedEnv, ServiceConfig, TypedServiceConfig,
@@ -183,6 +184,11 @@ impl ConfigLoader {
         }
         if let Some(port) = override_svc.common.port {
             base.common.port = Some(port);
+        }
+        if !override_svc.common.listeners.is_empty() {
+            base.common
+                .listeners
+                .clone_from(&override_svc.common.listeners);
         }
         if override_svc.common.domains.is_some() {
             base.common.domains.clone_from(&override_svc.common.domains);
@@ -577,6 +583,7 @@ impl ConfigLoader {
                     ServiceConfig::Typed(TypedServiceConfig::Exec(ExecServiceConfig {
                         common: CommonServiceConfig {
                             port: None, // Will be assigned
+                            listeners: Vec::new(),
                             domains: None,
                             env: HashMap::new(),
                             depends_on: Vec::new(),
@@ -591,6 +598,7 @@ impl ConfigLoader {
                     ServiceConfig::Typed(TypedServiceConfig::Worker(WorkerServiceConfig {
                         common: CommonServiceConfig {
                             port: None,
+                            listeners: Vec::new(),
                             domains: None,
                             env: HashMap::new(),
                             depends_on: Vec::new(),
@@ -726,15 +734,27 @@ impl ConfigLoader {
                     )
                 })?;
 
-                match field {
-                    "host" => {}
-                    "port" | "url" => {
+                let self_reference = service_name == consumer_name;
+                let listener_reference = ListenerName::from_port_field(field);
+
+                match (field, listener_reference) {
+                    ("host", None) => {
+                        anyhow::ensure!(
+                            !self_reference,
+                            "environment variable `{env_name}` references `{service_name}.host`; self-service interpolation supports `port`, `origin`, and declared named listener ports"
+                        );
+                    }
+                    ("port" | "url", None) => {
                         anyhow::ensure!(
                             !matches!(service, ServiceConfig::Typed(TypedServiceConfig::Worker(_))),
                             "environment variable `{env_name}` references `{service_name}.{field}`, but worker services have no {field}"
                         );
+                        anyhow::ensure!(
+                            !self_reference || field == "port",
+                            "environment variable `{env_name}` references `{service_name}.{field}`; self-service interpolation supports `port`, `origin`, and declared named listener ports"
+                        );
                     }
-                    "origin" => {
+                    ("origin", None) => {
                         anyhow::ensure!(
                             !matches!(
                                 service,
@@ -751,17 +771,62 @@ impl ConfigLoader {
                             "environment variable `{env_name}` references `{service_name}.origin`, but that service declares no exact domain"
                         );
                     }
+                    (_, Some(listener_name)) => {
+                        anyhow::ensure!(
+                            self_reference,
+                            "environment variable `{env_name}` references private listener `{service_name}.{field}`; named listeners are visible only to their owning service"
+                        );
+                        anyhow::ensure!(
+                            service
+                                .listeners()
+                                .iter()
+                                .any(|configured| configured == listener_name),
+                            "environment variable `{env_name}` references unknown listener `{listener_name}` on service `{service_name}`"
+                        );
+                    }
                     _ => anyhow::bail!(
                         "environment variable `{env_name}` references unknown field `{field}` on service `{service_name}`"
                     ),
                 }
 
-                if field != "origin" {
+                if field != "origin" && !self_reference {
                     anyhow::ensure!(
                         dependencies.contains(service_name),
                         "environment variable `{env_name}` references service `{service_name}`, but service `{consumer_name}` does not depend on it; add `{service_name}` to `{consumer_name}.depends_on`"
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate private named-listener declarations independently of runtime
+    /// allocation.
+    pub(crate) fn validate_listener_declarations(config: &LocaldConfig) -> Result<()> {
+        let valid_name = regex::Regex::new(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")?;
+
+        for (service_name, service) in &config.services {
+            let listeners = service.listeners();
+            if listeners.is_empty() {
+                continue;
+            }
+
+            anyhow::ensure!(
+                service.supports_named_listeners(),
+                "service `{service_name}` declares named listeners, but only exec and worker services support them"
+            );
+
+            let mut seen = HashSet::new();
+            for listener in listeners {
+                anyhow::ensure!(
+                    valid_name.is_match(listener),
+                    "service `{service_name}` listener `{listener}` is invalid; listener names must start with a letter and contain only letters, digits, `_`, or `-` (maximum 63 characters)"
+                );
+                anyhow::ensure!(
+                    seen.insert(listener),
+                    "service `{service_name}` declares duplicate listener `{listener}`"
+                );
             }
         }
 
@@ -908,7 +973,114 @@ depends_on = ["db", "jobs"]
             HashMap::from([("SELF_URL".to_owned(), "${services.web.host}".to_owned())]);
         let error = ConfigLoader::validate_env_references(&self_reference, &config, "web")
             .expect_err("self-reference must fail before ownership publication");
-        assert!(error.to_string().contains("service `web` does not depend"));
+        assert!(
+            error
+                .to_string()
+                .contains("self-service interpolation supports")
+        );
+    }
+
+    #[test]
+    fn named_listener_validation_accepts_owner_references_and_rejects_leaks() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "serve"
+listeners = ["chat", "hmr-control"]
+
+[services.worker]
+type = "worker"
+command = "work"
+depends_on = ["web"]
+"#,
+        )
+        .expect("parse named listener config");
+        ConfigLoader::validate_listener_declarations(&config).expect("valid listener declarations");
+
+        let owner_env = HashMap::from([
+            ("PRIMARY_PORT".to_owned(), "${services.web.port}".to_owned()),
+            (
+                "CHAT_PORT".to_owned(),
+                "${services.web.listeners.chat.port}".to_owned(),
+            ),
+            (
+                "HMR_PORT".to_owned(),
+                "${services.web.listeners.hmr-control.port}".to_owned(),
+            ),
+        ]);
+        ConfigLoader::validate_env_references(&owner_env, &config, "web")
+            .expect("own primary and listener ports are valid");
+
+        let leaked = HashMap::from([(
+            "CHAT_PORT".to_owned(),
+            "${services.web.listeners.chat.port}".to_owned(),
+        )]);
+        let error = ConfigLoader::validate_env_references(&leaked, &config, "worker")
+            .expect_err("another service cannot inspect a private listener");
+        assert!(
+            error
+                .to_string()
+                .contains("visible only to their owning service")
+        );
+
+        let unknown = HashMap::from([(
+            "UNKNOWN_PORT".to_owned(),
+            "${services.web.listeners.missing.port}".to_owned(),
+        )]);
+        let error = ConfigLoader::validate_env_references(&unknown, &config, "web")
+            .expect_err("undeclared listener must fail");
+        assert!(error.to_string().contains("unknown listener `missing`"));
+    }
+
+    #[test]
+    fn named_listener_declarations_reject_invalid_duplicate_and_unsupported_entries() {
+        let invalid: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "serve"
+listeners = [".chat"]
+"#,
+        )
+        .expect("parse invalid listener config structurally");
+        let error = ConfigLoader::validate_listener_declarations(&invalid)
+            .expect_err("invalid listener name must fail");
+        assert!(error.to_string().contains("listener `.chat` is invalid"));
+
+        let duplicate: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "serve"
+listeners = ["chat", "chat"]
+"#,
+        )
+        .expect("parse duplicate listener config structurally");
+        let error = ConfigLoader::validate_listener_declarations(&duplicate)
+            .expect_err("duplicate listener must fail");
+        assert!(error.to_string().contains("duplicate listener `chat`"));
+
+        let unsupported: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.db]
+type = "postgres"
+listeners = ["wire"]
+"#,
+        )
+        .expect("parse unsupported listener config structurally");
+        let error = ConfigLoader::validate_listener_declarations(&unsupported)
+            .expect_err("managed database listener declaration must fail");
+        assert!(error.to_string().contains("only exec and worker"));
     }
 
     #[test]
@@ -1026,6 +1198,46 @@ domains = []
         .expect("parse clearing override");
         ConfigLoader::merge_service_configs(&mut base.services, &clear.services);
         assert_eq!(base.services["web"].domains(), Some(&[] as &[String]));
+    }
+
+    #[test]
+    fn layered_exec_config_preserves_or_replaces_named_listeners() {
+        let mut base: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "base"
+listeners = ["upstream"]
+"#,
+        )
+        .expect("parse base config");
+        let preserve: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+command = "preserve"
+"#,
+        )
+        .expect("parse preserving override");
+        ConfigLoader::merge_service_configs(&mut base.services, &preserve.services);
+        assert_eq!(base.services["web"].listeners(), &["upstream"]);
+
+        let replace: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.web]
+listeners = ["chat", "events"]
+"#,
+        )
+        .expect("parse replacing override");
+        ConfigLoader::merge_service_configs(&mut base.services, &replace.services);
+        assert_eq!(base.services["web"].listeners(), &["chat", "events"]);
     }
 
     #[tokio::test]

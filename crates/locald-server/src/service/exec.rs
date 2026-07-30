@@ -703,7 +703,7 @@ impl ServiceFactory for ExecFactory {
             self.runtime.clone(),
             config.clone(),
             ctx.project_root.clone(),
-            ctx.port,
+            ctx.bindings.primary_port(),
             ctx.env.clone(),
         )))
     }
