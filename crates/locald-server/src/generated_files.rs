@@ -445,14 +445,29 @@ async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Resul
         config.source,
         canonical_root.display()
     );
-    let file = tokio::fs::File::open(&canonical_source)
+    let path_metadata = tokio::fs::symlink_metadata(&canonical_source)
         .await
         .with_context(|| {
             format!(
-                "failed to open generated-file source `{}`",
+                "failed to inspect generated-file source `{}`",
                 canonical_source.display()
             )
         })?;
+    anyhow::ensure!(
+        path_metadata.is_file(),
+        "generated-file source `{}` is not a regular file",
+        config.source
+    );
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(&canonical_source).await.with_context(|| {
+        format!(
+            "failed to open generated-file source safely `{}`",
+            canonical_source.display()
+        )
+    })?;
     let metadata = file.metadata().await.with_context(|| {
         format!(
             "failed to inspect generated-file source `{}`",
@@ -1474,6 +1489,45 @@ source = "runtime.json"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn source_symlink_within_the_project_root_remains_supported() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::create_dir(root.path().join("config"))
+            .await
+            .expect("create source directory");
+        tokio::fs::write(root.path().join("config/runtime.json"), r#"{"port":3000}"#)
+            .await
+            .expect("write source");
+        std::os::unix::fs::symlink("config/runtime.json", root.path().join("runtime.json"))
+            .expect("create in-project source symlink");
+        let config = service_config(
+            "runtime.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize in-project symlink")
+        .expect("generated set");
+        let output =
+            tokio::fs::read_to_string(generated.path("microfrontends").expect("generated path"))
+                .await
+                .expect("read generated output");
+        let value: Value = serde_json::from_str(&output).expect("valid generated JSON");
+        assert_eq!(value.pointer("/port"), Some(&Value::from(4100)));
+        generated.cleanup().await.expect("clean generation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn source_symlink_cannot_escape_the_project_root() {
         let root = tempdir().expect("create project root");
         let outside = tempdir().expect("create outside directory");
@@ -1501,6 +1555,66 @@ source = "runtime.json"
         .await
         .expect_err("escaping source must fail");
         assert!(format!("{error:#}").contains("resolves outside project root"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_source_is_rejected_without_waiting_for_a_writer() {
+        let root = tempdir().expect("create project root");
+        let source = root.path().join("runtime.json");
+        let output = std::process::Command::new("mkfifo")
+            .arg(&source)
+            .output()
+            .expect("create FIFO source");
+        assert!(
+            output.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = service_config(
+            "runtime.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let watchdog_source = source.clone();
+        let watchdog = std::thread::spawn(move || -> std::io::Result<()> {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if completed_rx
+                .recv_timeout(std::time::Duration::from_secs(6))
+                .is_ok()
+            {
+                return Ok(());
+            }
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(watchdog_source)?;
+            Ok(())
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prepare(root.path(), &key(), &config),
+        )
+        .await;
+        if result.is_ok() {
+            let _ = completed_tx.send(());
+        } else {
+            drop(completed_tx);
+        }
+        watchdog
+            .join()
+            .expect("FIFO regression watchdog must not panic")
+            .expect("FIFO regression watchdog must release a blocked reader");
+        let error = result
+            .expect("special-file rejection must not wait for a writer")
+            .expect_err("FIFO generated source must fail closed");
+        assert!(format!("{error:#}").contains("not a regular file"));
     }
 
     #[tokio::test]
