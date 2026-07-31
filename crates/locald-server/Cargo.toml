@@ -17,6 +17,7 @@ async-stream = "0.3.6"
 async-trait = "0.1.89"
 axum = { version = "0.7.5", features = ["ws"] }
 axum-server = { version = "0.7.3", features = ["tls-rustls"] }
+cap-std = "3.4.5"
 daemonize = "0.5.0"
 directories = "6.0.0"
 dotenvy = "0.15.7"

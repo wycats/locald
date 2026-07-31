@@ -339,9 +339,14 @@ fn generated_source_watch_candidates(project_path: &Path, source_path: &Path) ->
         return candidates;
     };
     while directory.starts_with(project_path) && directory != project_path {
-        if std::fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir())
-            && std::fs::canonicalize(directory)
-                .is_ok_and(|canonical| canonical.starts_with(project_path))
+        // A lexical path beneath a symlink would attach the backend watch to
+        // the symlink's current target. Keep walking to the first real lexical
+        // ancestor so replacing the link itself remains observable; the
+        // canonical source path independently watches the current target.
+        if std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir())
+            && std::fs::canonicalize(directory).is_ok_and(|canonical| {
+                canonical == directory && canonical.starts_with(project_path)
+            })
         {
             candidates.push(directory.to_path_buf());
         }
@@ -351,6 +356,16 @@ fn generated_source_watch_candidates(project_path: &Path, source_path: &Path) ->
         directory = parent;
     }
     candidates
+}
+
+fn enqueue_config_reload(
+    reload_tx: &tokio::sync::mpsc::Sender<()>,
+) -> std::result::Result<bool, tokio::sync::mpsc::error::TrySendError<()>> {
+    match reload_tx.try_send(()) {
+        Ok(()) => Ok(true),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Ok(false),
+        Err(error @ tokio::sync::mpsc::error::TrySendError::Closed(())) => Err(error),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3536,11 +3551,18 @@ impl ProcessManager {
             .get(&project_path)
             .map(|watcher| watcher.reload_tx.clone());
         if let Some(reload_tx) = reload_tx {
-            if let Err(error) = reload_tx.send(()).await {
-                warn!(
-                    "Failed to queue generated-file source recheck for {}: {error}",
+            match enqueue_config_reload(&reload_tx) {
+                Ok(true) => {}
+                Ok(false) => info!(
+                    "Generated-file source recheck for {} is already queued",
                     project_path.display()
-                );
+                ),
+                Err(error) => {
+                    warn!(
+                        "Failed to queue generated-file source recheck for {}: {error}",
+                        project_path.display()
+                    );
+                }
             }
         }
     }
@@ -26553,6 +26575,35 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
             "a failed or vanished deepest watch can fall back to its parent"
         );
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let config = project_path.join("config");
+            let shared = project_path.join("shared");
+            let shared_nested = shared.join("nested");
+            std::fs::create_dir(&config).expect("create symlink parent");
+            std::fs::create_dir_all(&shared_nested).expect("create symlink target");
+            std::fs::write(shared_nested.join("runtime.json"), "{}")
+                .expect("write symlinked generated source");
+            symlink("../shared", config.join("link")).expect("link generated-source ancestor");
+
+            let configured_source = config.join("link/nested/runtime.json");
+            assert_eq!(
+                generated_source_watch_candidates(&project_path, &configured_source),
+                vec![config.clone()],
+                "the lexical parent remains watched so replacing the symlink is observable"
+            );
+
+            let canonical_source =
+                std::fs::canonicalize(&configured_source).expect("canonicalize symlinked source");
+            assert_eq!(
+                generated_source_watch_candidates(&project_path, &canonical_source),
+                vec![shared_nested, shared],
+                "the current in-project symlink target remains watched independently"
+            );
+        }
+
         assert_eq!(
             collect_invalidated_generated_watch_paths(
                 &[project_path.join("chat")],
@@ -26567,6 +26618,78 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
                 &generated_sources
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn generated_source_recheck_coalesces_when_the_reload_queue_is_full() {
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(enqueue_config_reload(&reload_tx).expect("queue first reload"));
+        assert!(
+            !enqueue_config_reload(&reload_tx).expect("coalesce full reload queue"),
+            "a full queue already carries the level-triggered reload request"
+        );
+        assert!(
+            reload_rx.try_recv().is_ok(),
+            "the previously queued reload remains available to the debouncer"
+        );
+
+        drop(reload_rx);
+        assert!(matches!(
+            enqueue_config_reload(&reload_tx),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(()))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_source_watches_keep_the_parent_of_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("create symlinked-source watcher directory");
+        let project_path = dir.path().join("project");
+        let config_directory = project_path.join("config");
+        let shared_directory = project_path.join("shared");
+        let shared_nested = shared_directory.join("nested");
+        std::fs::create_dir_all(&config_directory).expect("create lexical source parent");
+        std::fs::create_dir_all(&shared_nested).expect("create source target directory");
+        std::fs::write(shared_nested.join("runtime.json"), "{}")
+            .expect("write symlinked generated source");
+        symlink("../shared", config_directory.join("link"))
+            .expect("link generated-source ancestor");
+        let project_path = std::fs::canonicalize(project_path).expect("canonicalize project");
+
+        let manager = readiness_test_manager(dir.path());
+        manager.watch_config(project_path.clone()).await;
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "symlinked-generated-source-watcher"
+
+[services.worker]
+type = "worker"
+command = "unused"
+
+[services.worker.generated.runtime]
+source = "config/link/nested/runtime.json"
+"#,
+        )
+        .expect("parse symlinked generated-source config");
+
+        manager
+            .update_generated_source_watches(&project_path, &config)
+            .await;
+
+        let watchers = manager.watchers.lock().await;
+        let watcher = watchers.get(&project_path).expect("project watcher exists");
+        assert_eq!(
+            watcher.generated_directories,
+            HashSet::from([
+                project_path.join("config"),
+                std::fs::canonicalize(shared_nested).expect("canonical source target"),
+            ]),
+            "locald watches both the mutable lexical link parent and its current target"
         );
     }
 

@@ -3487,6 +3487,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "cap-std",
  "chrono",
  "daemonize",
  "directories",

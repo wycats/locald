@@ -3,6 +3,12 @@ use crate::config_loader::{
 };
 use crate::health::ReadinessRequirement;
 use anyhow::{Context, Result};
+#[cfg(unix)]
+use cap_std::fs::{MetadataExt as CapMetadataExt, OpenOptionsExt as CapOpenOptionsExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
 use jsonc_parser::{ParseOptions, parse_to_serde_value, parse_to_value};
 use locald_core::config::{GeneratedFileConfig, LocaldConfig, ServiceConfig};
 use locald_core::service::{ListenerName, ServiceKey, ServiceRuntimeBindings};
@@ -25,6 +31,11 @@ struct LoadedSource {
     fingerprint: SourceFingerprint,
     format: GeneratedFileFormat,
 }
+
+#[cfg(unix)]
+type RootIdentity = (u64, u64);
+#[cfg(not(unix))]
+type RootIdentity = ();
 
 #[derive(Clone, Copy, Debug)]
 enum GeneratedFileFormat {
@@ -438,6 +449,27 @@ async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Resul
                 project_root.display()
             )
         })?;
+    let root_metadata = tokio::fs::symlink_metadata(&canonical_root)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect generated-file project root `{}`",
+                canonical_root.display()
+            )
+        })?;
+    anyhow::ensure!(
+        root_metadata.is_dir(),
+        "generated-file project root `{}` is not a directory",
+        canonical_root.display()
+    );
+    #[cfg(unix)]
+    let root_identity = {
+        use std::os::unix::fs::MetadataExt;
+
+        (root_metadata.dev(), root_metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let root_identity = ();
     let canonical_source = tokio::fs::canonicalize(canonical_root.join(configured))
         .await
         .with_context(|| format!("generated-file source `{}` does not exist", config.source))?;
@@ -460,16 +492,26 @@ async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Resul
         "generated-file source `{}` is not a regular file",
         config.source
     );
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options.open(&canonical_source).await.with_context(|| {
+    // Open the configured relative path through a directory capability rooted at the
+    // canonical project directory. `cap_std` resolves every component beneath that
+    // capability, so a replacement of an ancestor after the diagnostic
+    // canonicalization above cannot redirect this descriptor outside the project.
+    // It still follows supported in-project symlinks while rejecting escapes.
+    let capability_root = canonical_root.clone();
+    let configured = configured.to_path_buf();
+    let source_for_diagnostics = canonical_source.clone();
+    let file = tokio::task::spawn_blocking(move || {
+        open_source_under_project_capability(&capability_root, &configured, root_identity)
+    })
+    .await
+    .context("generated-file source capability-open task failed")?
+    .with_context(|| {
         format!(
             "failed to open generated-file source safely `{}`",
-            canonical_source.display()
+            source_for_diagnostics.display()
         )
     })?;
+    let file = tokio::fs::File::from_std(file);
     let metadata = file.metadata().await.with_context(|| {
         format!(
             "failed to inspect generated-file source `{}`",
@@ -514,6 +556,41 @@ async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Resul
         fingerprint,
         format,
     })
+}
+
+fn open_source_under_project_capability(
+    canonical_root: &Path,
+    configured: &Path,
+    expected_root_identity: RootIdentity,
+) -> std::io::Result<std::fs::File> {
+    let root = Dir::open_ambient_dir(canonical_root, ambient_authority())?;
+    #[cfg(unix)]
+    {
+        let opened_root = root.dir_metadata()?;
+        if (
+            CapMetadataExt::dev(&opened_root),
+            CapMetadataExt::ino(&opened_root),
+        ) != expected_root_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "generated-file project root changed while opening the source",
+            ));
+        }
+    }
+    open_source_from_root_capability(&root, configured)
+}
+
+fn open_source_from_root_capability(
+    root: &Dir,
+    configured: &Path,
+) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    root.open_with(configured, &options)
+        .map(cap_std::fs::File::into_std)
 }
 
 fn parse_source(source: &LoadedSource) -> Result<Value> {
@@ -1617,6 +1694,64 @@ source = "runtime.json"
         .await
         .expect_err("escaping source must fail");
         assert!(format!("{error:#}").contains("resolves outside project root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_open_rejects_an_ancestor_replaced_with_an_outside_symlink() {
+        let root = tempdir().expect("create project root");
+        let outside = tempdir().expect("create outside directory");
+        let config_dir = root.path().join("config");
+        std::fs::create_dir(&config_dir).expect("create source directory");
+        std::fs::write(config_dir.join("runtime.json"), r#"{"port":3000}"#)
+            .expect("write in-project source");
+        std::fs::write(outside.path().join("runtime.json"), r#"{"port":9999}"#)
+            .expect("write outside source");
+
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize project root");
+        let root_capability = Dir::open_ambient_dir(&canonical_root, ambient_authority())
+            .expect("acquire root capability");
+
+        std::fs::rename(&config_dir, root.path().join("config-original"))
+            .expect("move original source directory");
+        std::os::unix::fs::symlink(outside.path(), &config_dir)
+            .expect("replace nested ancestor with outside symlink");
+
+        open_source_from_root_capability(&root_capability, Path::new("config/runtime.json"))
+            .expect_err("root capability must reject an escaping ancestor replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_open_rejects_a_replaced_project_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = tempdir().expect("create project parent");
+        let project = parent.path().join("project");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&project).expect("create project root");
+        std::fs::create_dir(&outside).expect("create outside root");
+        std::fs::write(project.join("runtime.json"), r#"{"port":3000}"#)
+            .expect("write in-project source");
+        std::fs::write(outside.join("runtime.json"), r#"{"port":9999}"#)
+            .expect("write outside source");
+
+        let canonical_root = std::fs::canonicalize(&project).expect("canonicalize project root");
+        let original_metadata =
+            std::fs::symlink_metadata(&canonical_root).expect("inspect original project root");
+        let original_identity = (original_metadata.dev(), original_metadata.ino());
+
+        std::fs::rename(&project, parent.path().join("project-original"))
+            .expect("move original project root");
+        std::os::unix::fs::symlink(&outside, &project)
+            .expect("replace project root with outside symlink");
+
+        open_source_under_project_capability(
+            &canonical_root,
+            Path::new("runtime.json"),
+            original_identity,
+        )
+        .expect_err("root identity check must reject a substituted capability root");
     }
 
     #[cfg(unix)]
