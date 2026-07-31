@@ -1,3 +1,4 @@
+use crate::health::ReadinessRequirement;
 use anyhow::{Context, Result};
 use locald_core::ListenerName;
 use locald_core::config::{
@@ -10,7 +11,169 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use tracing::info;
 
-const SERVICE_REFERENCE_PATTERN: &str = r"\$\{services\.([^.]+)\.([^}]+)\}";
+pub(crate) const SERVICE_REFERENCE_PATTERN: &str = r"\$\{services\.([^}]+)\}";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServiceReference {
+    pub(crate) service_name: String,
+    pub(crate) field: String,
+}
+
+fn service_reference_field_exists(service: &ServiceConfig, field: &str) -> bool {
+    match field {
+        "host" => return true,
+        "port" => return ReadinessRequirement::service_requires_port(service),
+        "url" => {
+            return !matches!(service, ServiceConfig::Typed(TypedServiceConfig::Worker(_)));
+        }
+        "origin" => {
+            return !matches!(
+                service,
+                ServiceConfig::Typed(
+                    TypedServiceConfig::Worker(_) | TypedServiceConfig::Postgres(_)
+                )
+            ) && service
+                .domains()
+                .is_none_or(|domains| domains.iter().any(|domain| !domain.starts_with("*.")));
+        }
+        _ => {}
+    }
+    if let Some(listener) = ListenerName::from_port_field(field) {
+        return service
+            .listeners()
+            .iter()
+            .any(|configured| configured == listener);
+    }
+    field
+        .strip_prefix("generated.")
+        .and_then(|field| field.strip_suffix(".path"))
+        .is_some_and(|name| service.generated().contains_key(name))
+}
+
+pub(crate) fn resolve_service_reference<'a>(
+    body: &str,
+    services: impl IntoIterator<Item = (&'a str, &'a ServiceConfig)>,
+) -> Result<ServiceReference> {
+    let mut services = services.into_iter().collect::<Vec<_>>();
+    services.sort_by_key(|(service_name, _)| *service_name);
+    services.dedup_by_key(|(service_name, _)| *service_name);
+
+    let (first_service, first_field) = body.split_once('.').with_context(|| {
+        format!("service reference `${{services.{body}}}` is missing its field")
+    })?;
+    if services.iter().any(|(service_name, service)| {
+        *service_name == first_service && service_reference_field_exists(service, first_field)
+    }) {
+        return Ok(ServiceReference {
+            service_name: first_service.to_owned(),
+            field: first_field.to_owned(),
+        });
+    }
+    let mut shaped_candidates = services
+        .iter()
+        .filter_map(|(service_name, service)| {
+            body.strip_prefix(*service_name)
+                .and_then(|field| field.strip_prefix('.'))
+                .filter(|field| service_reference_field_exists(service, field))
+                .map(|field| ServiceReference {
+                    service_name: (*service_name).to_owned(),
+                    field: field.to_owned(),
+                })
+        })
+        .collect::<Vec<_>>();
+    shaped_candidates.sort_by(|left, right| left.service_name.cmp(&right.service_name));
+
+    match shaped_candidates.as_slice() {
+        [reference] => return Ok(reference.clone()),
+        [_, _, ..] => {
+            let candidates = shaped_candidates
+                .iter()
+                .map(|reference| format!("`{}`", reference.service_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "service reference `${{services.{body}}}` is ambiguous between configured services {candidates}"
+            );
+        }
+        [] => {}
+    }
+
+    if services
+        .iter()
+        .any(|(service_name, _)| *service_name == body)
+    {
+        anyhow::bail!("service reference `${{services.{body}}}` is missing its field");
+    }
+
+    if services
+        .iter()
+        .any(|(service_name, _)| *service_name == first_service)
+    {
+        return Ok(ServiceReference {
+            service_name: first_service.to_owned(),
+            field: first_field.to_owned(),
+        });
+    }
+
+    let mut prefix_candidates = services
+        .iter()
+        .filter_map(|(service_name, _)| {
+            body.strip_prefix(*service_name)
+                .and_then(|field| field.strip_prefix('.'))
+                .filter(|field| !field.is_empty())
+                .map(|field| ServiceReference {
+                    service_name: (*service_name).to_owned(),
+                    field: field.to_owned(),
+                })
+        })
+        .collect::<Vec<_>>();
+    prefix_candidates.sort_by(|left, right| left.service_name.cmp(&right.service_name));
+    match prefix_candidates.as_slice() {
+        [reference] => return Ok(reference.clone()),
+        [_, _, ..] => {
+            let candidates = prefix_candidates
+                .iter()
+                .map(|reference| format!("`{}`", reference.service_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "service reference `${{services.{body}}}` is ambiguous between configured services {candidates}"
+            );
+        }
+        [] => {}
+    }
+
+    Ok(ServiceReference {
+        service_name: first_service.to_owned(),
+        field: first_field.to_owned(),
+    })
+}
+
+pub(crate) fn resolve_owned_service_reference(
+    body: &str,
+    service_name: &str,
+) -> Result<ServiceReference> {
+    anyhow::ensure!(
+        body != service_name,
+        "service reference `${{services.{body}}}` is missing its field"
+    );
+    if let Some(field) = body
+        .strip_prefix(service_name)
+        .and_then(|field| field.strip_prefix('.'))
+    {
+        return Ok(ServiceReference {
+            service_name: service_name.to_owned(),
+            field: field.to_owned(),
+        });
+    }
+    let (referenced_service, field) = body.split_once('.').with_context(|| {
+        format!("service reference `${{services.{body}}}` is missing its field")
+    })?;
+    Ok(ServiceReference {
+        service_name: referenced_service.to_owned(),
+        field: field.to_owned(),
+    })
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayerConfig {
@@ -668,21 +831,28 @@ impl ConfigLoader {
             // We need to collect captures first because of async closure
             let mut captures = Vec::new();
             for cap in re.captures_iter(v) {
-                captures.push((
-                    cap.get(0).map(|m| m.range()),
-                    cap.get(1).map(|m| m.as_str().to_string()),
-                    cap.get(2).map(|m| m.as_str().to_string()),
-                ));
+                let body = cap
+                    .get(1)
+                    .context("service reference is missing its body")?
+                    .as_str();
+                let reference = resolve_service_reference(
+                    body,
+                    config
+                        .services
+                        .iter()
+                        .map(|(name, service)| (name.as_str(), service)),
+                )?;
+                let range = cap
+                    .get(0)
+                    .context("service reference has no complete match")?
+                    .range();
+                captures.push((range, reference.service_name, reference.field));
             }
 
-            for (range_opt, service_name_opt, field_opt) in captures {
-                if let (Some(range), Some(service_name), Some(field)) =
-                    (range_opt, service_name_opt, field_opt)
-                {
-                    let full_service_name = format!("{}:{}", config.project.name, service_name);
-                    let val = lookup_fn(full_service_name, field).await?;
-                    replacements.push((range, val));
-                }
+            for (range, service_name, field) in captures {
+                let full_service_name = format!("{}:{}", config.project.name, service_name);
+                let val = lookup_fn(full_service_name, field).await?;
+                replacements.push((range, val));
             }
 
             replacements.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
@@ -727,14 +897,19 @@ impl ConfigLoader {
 
         for (env_name, value) in env {
             for captures in re.captures_iter(value) {
-                let service_name = captures
+                let body = captures
                     .get(1)
-                    .ok_or_else(|| anyhow::anyhow!("service reference is missing its service"))?
+                    .ok_or_else(|| anyhow::anyhow!("service reference is missing its body"))?
                     .as_str();
-                let field = captures
-                    .get(2)
-                    .ok_or_else(|| anyhow::anyhow!("service reference is missing its field"))?
-                    .as_str();
+                let reference = resolve_service_reference(
+                    body,
+                    config
+                        .services
+                        .iter()
+                        .map(|(name, service)| (name.as_str(), service)),
+                )?;
+                let service_name = reference.service_name.as_str();
+                let field = reference.field.as_str();
                 let service = config.services.get(service_name).ok_or_else(|| {
                     anyhow::anyhow!(
                         "environment variable `{env_name}` references unknown service `{service_name}`"
@@ -924,6 +1099,171 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_reference_resolution_preserves_legacy_and_exact_dotted_names() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "reference-resolution"
+
+[services.api]
+command = "serve-api"
+listeners = ["worker"]
+
+[services."api.listeners.worker"]
+command = "serve-dotted"
+
+[services."api.port"]
+command = "serve-port"
+
+[services."api.worker"]
+command = "serve-worker"
+listeners = ["events"]
+
+[services."api.worker".generated.runtime]
+source = "runtime.json"
+"#,
+        )
+        .expect("parse service-reference resolution config");
+        let services = config
+            .services
+            .iter()
+            .map(|(name, service)| (name.as_str(), service))
+            .collect::<Vec<_>>();
+        let legacy =
+            resolve_service_reference("api.listeners.worker.port", services.iter().copied())
+                .expect("declared first-dot listener reference remains stable");
+        assert_eq!(
+            legacy,
+            ServiceReference {
+                service_name: "api".to_owned(),
+                field: "listeners.worker.port".to_owned(),
+            }
+        );
+        let legacy_primary = resolve_service_reference("api.port", services.iter().copied())
+            .expect("a configured exact name cannot hide a valid legacy field");
+        assert_eq!(
+            legacy_primary,
+            ServiceReference {
+                service_name: "api".to_owned(),
+                field: "port".to_owned(),
+            }
+        );
+
+        for (body, expected_field) in [
+            ("api.worker.port", "port"),
+            ("api.worker.listeners.events.port", "listeners.events.port"),
+            (
+                "api.worker.generated.runtime.path",
+                "generated.runtime.path",
+            ),
+            ("api.worker.password", "password"),
+        ] {
+            let reference = resolve_service_reference(
+                body,
+                std::iter::once((
+                    "api.worker",
+                    config
+                        .services
+                        .get("api.worker")
+                        .expect("dotted service config"),
+                )),
+            )
+            .expect("unique dotted service reference");
+            assert_eq!(reference.service_name, "api.worker");
+            assert_eq!(reference.field, expected_field);
+        }
+
+        let unknown = resolve_service_reference("missing.url", services.iter().copied())
+            .expect("unknown service remains available for declarative diagnostics");
+        assert_eq!(unknown.service_name, "missing");
+        assert_eq!(unknown.field, "url");
+        let missing_field = resolve_service_reference("api.worker", services.iter().copied())
+            .expect_err("an exact dotted service still requires a field");
+        assert!(missing_field.to_string().contains("is missing its field"));
+    }
+
+    #[test]
+    fn service_reference_resolution_uses_declared_fields_and_rejects_genuine_ambiguity() {
+        let exact_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "exact-reference"
+
+[services.api]
+command = "serve-api"
+
+[services."api.listeners.chat"]
+command = "serve-chat"
+"#,
+        )
+        .expect("parse exact dotted reference config");
+        let exact = resolve_service_reference(
+            "api.listeners.chat.port",
+            exact_config
+                .services
+                .iter()
+                .map(|(name, service)| (name.as_str(), service)),
+        )
+        .expect("undeclared legacy listener cannot hide an exact dotted service");
+        assert_eq!(exact.service_name, "api.listeners.chat");
+        assert_eq!(exact.field, "port");
+
+        let portless_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "portless-reference"
+
+[services."api.worker"]
+type = "worker"
+command = "serve-worker"
+listeners = ["chat"]
+
+[services."api.worker.listeners.chat"]
+type = "worker"
+command = "serve-chat-worker"
+"#,
+        )
+        .expect("parse portless dotted reference config");
+        let listener = resolve_service_reference(
+            "api.worker.listeners.chat.port",
+            portless_config
+                .services
+                .iter()
+                .map(|(name, service)| (name.as_str(), service)),
+        )
+        .expect("a portless exact service cannot make the declared listener ambiguous");
+        assert_eq!(listener.service_name, "api.worker");
+        assert_eq!(listener.field, "listeners.chat.port");
+
+        let ambiguous_config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "ambiguous-reference"
+
+[services."api.worker"]
+command = "serve-worker"
+listeners = ["chat"]
+
+[services."api.worker.listeners.chat"]
+command = "serve-chat"
+"#,
+        )
+        .expect("parse ambiguous dotted reference config");
+        let error = resolve_service_reference(
+            "api.worker.listeners.chat.port",
+            ambiguous_config
+                .services
+                .iter()
+                .map(|(name, service)| (name.as_str(), service)),
+        )
+        .expect_err("two recognized exact service boundaries are ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("is ambiguous"));
+        assert!(message.contains("`api.worker`"));
+        assert!(message.contains("`api.worker.listeners.chat`"));
+    }
+
+    #[test]
     fn service_reference_validation_rejects_missing_services_and_fields() {
         let config: LocaldConfig = toml::from_str(
             r#"
@@ -956,6 +1296,70 @@ depends_on = ["db"]
         let error = ConfigLoader::validate_env_references(&unknown_field, &config, "web")
             .expect_err("unknown service field must fail");
         assert!(error.to_string().contains("unknown field `password`"));
+    }
+
+    #[tokio::test]
+    async fn dotted_service_references_validate_and_resolve_exact_names() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services."api.worker"]
+command = "serve"
+listeners = ["events"]
+
+[services."api.worker".generated.runtime]
+source = "config/runtime.json"
+
+[services."api.worker".env]
+PRIMARY = "${services.api.worker.port}"
+EVENTS = "${services.api.worker.listeners.events.port}"
+RUNTIME = "${services.api.worker.generated.runtime.path}"
+"#,
+        )
+        .expect("parse dotted service config");
+        crate::generated_files::validate_declarations(&config)
+            .expect("dotted owner has valid generated declarations");
+        ConfigLoader::validate_env_references(
+            config.services["api.worker"].env(),
+            &config,
+            "api.worker",
+        )
+        .expect("dotted owner references resolve declaratively");
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolved = ConfigLoader::resolve_env(config.services["api.worker"].env(), &config, {
+            let calls = std::sync::Arc::clone(&calls);
+            move |service, field| {
+                let calls = std::sync::Arc::clone(&calls);
+                async move {
+                    calls
+                        .lock()
+                        .expect("record dotted service lookup")
+                        .push((service, field.clone()));
+                    let value = match field.as_str() {
+                        "port" => "4100",
+                        "listeners.events.port" => "4200",
+                        "generated.runtime.path" => "/tmp/runtime.json",
+                        other => anyhow::bail!("unexpected dotted service field {other}"),
+                    };
+                    Ok(value.to_owned())
+                }
+            }
+        })
+        .await
+        .expect("resolve dotted service environment");
+        assert_eq!(resolved["PRIMARY"], "4100");
+        assert_eq!(resolved["EVENTS"], "4200");
+        assert_eq!(resolved["RUNTIME"], "/tmp/runtime.json");
+        assert!(
+            calls
+                .lock()
+                .expect("read dotted service lookups")
+                .iter()
+                .all(|(service, _)| service == "app:api.worker")
+        );
     }
 
     #[test]

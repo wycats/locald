@@ -278,6 +278,7 @@ struct ConfigWatcher {
     reload_tx: tokio::sync::mpsc::Sender<()>,
     generated_sources: Arc<StdMutex<HashSet<PathBuf>>>,
     generated_directories: HashSet<PathBuf>,
+    invalidated_generated_watch_paths: Arc<StdMutex<HashSet<PathBuf>>>,
 }
 
 impl fmt::Debug for ConfigWatcher {
@@ -297,15 +298,39 @@ fn config_reload_event_is_relevant(
         path.ends_with("locald.toml")
             || path.ends_with("Procfile")
             || path.ends_with(".env")
-            || generated_sources
-                .iter()
-                .any(|source| source == path || source.starts_with(path))
-            || locald_core::normalize_project_locator(path).is_ok_and(|canonical| {
-                generated_sources
-                    .iter()
-                    .any(|source| source == &canonical || source.starts_with(&canonical))
-            })
+            || generated_source_event_path_is_relevant(path, generated_sources)
     })
+}
+
+fn generated_source_event_path_is_relevant(
+    path: &Path,
+    generated_sources: &HashSet<PathBuf>,
+) -> bool {
+    generated_sources
+        .iter()
+        .any(|source| source == path || source.starts_with(path))
+        || locald_core::normalize_project_locator(path).is_ok_and(|canonical| {
+            generated_sources
+                .iter()
+                .any(|source| source == &canonical || source.starts_with(&canonical))
+        })
+}
+
+fn collect_invalidated_generated_watch_paths(
+    paths: &[PathBuf],
+    generated_sources: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    let mut invalidated = HashSet::new();
+    for path in paths {
+        if !generated_source_event_path_is_relevant(path, generated_sources) {
+            continue;
+        }
+        invalidated.insert(path.clone());
+        if let Ok(canonical) = locald_core::normalize_project_locator(path) {
+            invalidated.insert(canonical);
+        }
+    }
+    invalidated
 }
 
 fn generated_source_watch_candidates(project_path: &Path, source_path: &Path) -> Vec<PathBuf> {
@@ -403,6 +428,12 @@ struct ConfigTransitionPlan {
     stopped_service_projections:
         HashMap<ServiceKey, (ServiceConfig, Option<HashMap<String, String>>)>,
     prepared_generated_files: HashMap<ServiceKey, PreparedGeneratedFileSet>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeferredGeneratedFileCleanup {
+    key: ServiceKey,
+    generated_files: GeneratedFileSet,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -733,6 +764,7 @@ pub struct ProcessManager {
     // survives automatic availability convergence without rewriting project
     // availability, and explicit lifecycle actions or daemon restart clear it.
     service_stop_suppressions: Arc<Mutex<HashSet<ServiceKey>>>,
+    deferred_generated_file_cleanups: Arc<Mutex<Vec<DeferredGeneratedFileCleanup>>>,
     availability_data_dir: PathBuf,
     availability_clock: SharedAvailabilityClock,
     lifecycle_journal: LifecycleJournal,
@@ -1116,6 +1148,7 @@ impl ProcessManager {
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
             forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
             service_stop_suppressions: Arc::new(Mutex::new(HashSet::new())),
+            deferred_generated_file_cleanups: Arc::new(Mutex::new(Vec::new())),
             availability_data_dir,
             availability_clock,
             lifecycle_journal,
@@ -3275,17 +3308,42 @@ impl ProcessManager {
         let handle = tokio::runtime::Handle::current();
         let generated_sources = Arc::new(StdMutex::new(HashSet::<PathBuf>::new()));
         let callback_generated_sources = Arc::clone(&generated_sources);
+        let invalidated_generated_watch_paths = Arc::new(StdMutex::new(HashSet::<PathBuf>::new()));
+        let callback_invalidated_generated_watch_paths =
+            Arc::clone(&invalidated_generated_watch_paths);
         let callback_tx = tx.clone();
 
         let watcher_res = notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(event) => {
                     if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {
-                        let generated_sources = callback_generated_sources
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let relevant =
-                            config_reload_event_is_relevant(&event.paths, &generated_sources);
+                        let (relevant, invalidated) = {
+                            let generated_sources = callback_generated_sources
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let invalidating_watch = event.kind.is_remove()
+                                || matches!(
+                                    event.kind,
+                                    notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                                );
+                            let invalidated = invalidating_watch.then(|| {
+                                collect_invalidated_generated_watch_paths(
+                                    &event.paths,
+                                    &generated_sources,
+                                )
+                            });
+                            (
+                                config_reload_event_is_relevant(&event.paths, &generated_sources),
+                                invalidated,
+                            )
+                        };
+
+                        if let Some(invalidated) = invalidated {
+                            callback_invalidated_generated_watch_paths
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .extend(invalidated);
+                        }
 
                         if relevant {
                             info!("Config changed: {:?}", event.paths);
@@ -3316,6 +3374,7 @@ impl ProcessManager {
                             reload_tx: tx,
                             generated_sources,
                             generated_directories: HashSet::new(),
+                            invalidated_generated_watch_paths,
                         },
                     );
                 }
@@ -3347,6 +3406,38 @@ impl ProcessManager {
             .generated_sources
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = desired_sources;
+
+        let invalidated = std::mem::take(
+            &mut *config_watcher
+                .invalidated_generated_watch_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let stale_directories = config_watcher
+            .generated_directories
+            .iter()
+            .filter(|directory| {
+                invalidated
+                    .iter()
+                    .any(|path| *directory == path || directory.starts_with(path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for directory in stale_directories {
+            config_watcher.generated_directories.remove(&directory);
+            match config_watcher.watcher.unwatch(&directory) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        &error.kind,
+                        notify::ErrorKind::WatchNotFound | notify::ErrorKind::PathNotFound
+                    ) => {}
+                Err(error) => warn!(
+                    "Failed to discard invalidated generated-file watch {}: {error}",
+                    directory.display()
+                ),
+            }
+        }
 
         let mut retained_directories = HashSet::new();
         for source in &watcher_sources {
@@ -4137,9 +4228,12 @@ impl ProcessManager {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     if let Some(generated_files) = &generated_files {
-                        if let Err(cleanup_error) = generated_files.cleanup().await {
+                        if let Err(cleanup_error) = self
+                            .cleanup_generated_files_or_defer(&key, generated_files)
+                            .await
+                        {
                             return Err(error.context(format!(
-                                "failed to clean generated files after environment resolution failed: {cleanup_error:#}"
+                                "generated-file cleanup was deferred after environment resolution failed: {cleanup_error:#}"
                             )));
                         }
                     }
@@ -4368,7 +4462,14 @@ impl ProcessManager {
 
             if !handled {
                 if let Some(generated_files) = &generated_files {
-                    generated_files.cleanup().await?;
+                    if let Err(cleanup_error) = self
+                        .cleanup_generated_files_or_defer(&key, generated_files)
+                        .await
+                    {
+                        anyhow::bail!(
+                            "No factory found for service {name}; generated-file cleanup was deferred: {cleanup_error:#}"
+                        );
+                    }
                 }
                 anyhow::bail!("No factory found for service {name}");
             }
@@ -4544,7 +4645,78 @@ impl ProcessManager {
         Ok(())
     }
 
+    async fn clear_generated_file_owner(&self, generated_files: &GeneratedFileSet) {
+        let mut services = self.services.lock().await;
+        for service in services.values_mut() {
+            if service.generated_files.as_ref() == Some(generated_files) {
+                service.generated_files = None;
+            }
+        }
+    }
+
+    async fn cleanup_generated_files_or_defer(
+        &self,
+        key: &ServiceKey,
+        generated_files: &GeneratedFileSet,
+    ) -> Result<()> {
+        match generated_files.cleanup().await {
+            Ok(()) => {
+                self.deferred_generated_file_cleanups
+                    .lock()
+                    .await
+                    .retain(|pending| pending.generated_files != *generated_files);
+                self.clear_generated_file_owner(generated_files).await;
+                Ok(())
+            }
+            Err(error) => {
+                let mut deferred = self.deferred_generated_file_cleanups.lock().await;
+                if !deferred
+                    .iter()
+                    .any(|pending| pending.generated_files == *generated_files)
+                {
+                    deferred.push(DeferredGeneratedFileCleanup {
+                        key: key.clone(),
+                        generated_files: generated_files.clone(),
+                    });
+                }
+                drop(deferred);
+                self.clear_generated_file_owner(generated_files).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn retry_deferred_generated_file_cleanups(&self) {
+        let pending = std::mem::take(&mut *self.deferred_generated_file_cleanups.lock().await);
+        let mut failures = Vec::new();
+        for cleanup in pending {
+            match cleanup.generated_files.cleanup().await {
+                Ok(()) => {
+                    self.clear_generated_file_owner(&cleanup.generated_files)
+                        .await;
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to retry deferred generated-file cleanup for service {}: {error:#}",
+                        cleanup.key.name()
+                    );
+                    failures.push(cleanup);
+                }
+            }
+        }
+        let mut deferred = self.deferred_generated_file_cleanups.lock().await;
+        for failure in failures {
+            if !deferred
+                .iter()
+                .any(|pending| pending.generated_files == failure.generated_files)
+            {
+                deferred.push(failure);
+            }
+        }
+    }
+
     async fn stop_service_instance_runtime_locked(&self, key: &ServiceKey) -> Result<()> {
+        self.retry_deferred_generated_file_cleanups().await;
         let (runtime_state, name) = {
             let services = self.services.lock().await;
             if let Some(service) = services.get(key) {
@@ -4593,12 +4765,11 @@ impl ProcessManager {
                 .and_then(|service| service.generated_files.clone())
         };
         if let Some(generated_files) = generated_files {
-            generated_files.cleanup().await?;
-            let mut services = self.services.lock().await;
-            if let Some(service) = services.get_mut(key) {
-                if service.generated_files.as_ref() == Some(&generated_files) {
-                    service.generated_files = None;
-                }
+            if let Err(error) = self
+                .cleanup_generated_files_or_defer(key, &generated_files)
+                .await
+            {
+                warn!("Failed to clean generated files for stopped service {name}: {error:#}");
             }
         }
         // Clear health and broadcast after stop
@@ -9351,6 +9522,7 @@ impl ProcessManager {
         if self.is_shutting_down() {
             return;
         }
+        self.retry_deferred_generated_file_cleanups().await;
         let instance_ids = {
             let registry = self.registry.lock().await;
             registry.instances.keys().copied().collect::<Vec<_>>()
@@ -26380,6 +26552,22 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
             vec![project_path.join("chat")],
             "a failed or vanished deepest watch can fall back to its parent"
         );
+
+        assert_eq!(
+            collect_invalidated_generated_watch_paths(
+                &[project_path.join("chat")],
+                &generated_sources
+            ),
+            HashSet::from([project_path.join("chat")]),
+            "removing a watched source ancestor invalidates its inode-backed watch"
+        );
+        assert!(
+            collect_invalidated_generated_watch_paths(
+                &[project_path.join("unrelated")],
+                &generated_sources
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -26449,7 +26637,36 @@ source = "config/nested/runtime.json"
             let watcher = watchers.get(&project_path).expect("project watcher exists");
             assert_eq!(
                 watcher.generated_directories,
-                HashSet::from([nested_directory])
+                HashSet::from([nested_directory.clone()])
+            );
+        }
+
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&project_path).expect("project watcher exists");
+            watcher
+                .invalidated_generated_watch_paths
+                .lock()
+                .expect("record replaced generated directory")
+                .insert(nested_directory.clone());
+        }
+        manager
+            .update_generated_source_watches(&project_path, &config)
+            .await;
+        {
+            let watchers = manager.watchers.lock().await;
+            let watcher = watchers.get(&project_path).expect("project watcher exists");
+            assert_eq!(
+                watcher.generated_directories,
+                HashSet::from([nested_directory]),
+                "an invalidated path is unregistered and watched again"
+            );
+            assert!(
+                watcher
+                    .invalidated_generated_watch_paths
+                    .lock()
+                    .expect("read invalidated generated watches")
+                    .is_empty()
             );
         }
 
@@ -26469,7 +26686,7 @@ source = "config/nested/runtime.json"
     }
 
     #[tokio::test]
-    async fn generated_file_is_materialized_before_prepare_and_removed_on_stop() {
+    async fn generated_cleanup_failure_does_not_prevent_stop_and_retries() {
         let dir = tempdir().expect("create generated-file lifecycle directory");
         let project_path = dir.path().join("generated-file-project");
         let (mut manager, instance_id, availability_data_dir) =
@@ -26491,20 +26708,20 @@ source = "config/nested/runtime.json"
 name = "generated-file-project"
 domain = "generated-file-project.localhost"
 
-[services.worker]
+[services."api.worker"]
 type = "worker"
 command = "unused-by-test-factory"
 listeners = ["events"]
 
-[services.worker.generated.runtime]
+[services."api.worker".generated.runtime]
 source = "config/runtime.jsonc"
 
-[services.worker.generated.runtime.replace]
-"/listener" = "${services.worker.listeners.events.port}"
+[services."api.worker".generated.runtime.replace]
+"/listener" = "${services.api.worker.listeners.events.port}"
 
-[services.worker.env]
+[services."api.worker".env]
 PATH = "/usr/bin:/bin"
-RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
+RUNTIME_CONFIG = "${services.api.worker.generated.runtime.path}"
 "#,
         )
         .expect("write generated-file project config");
@@ -26585,12 +26802,141 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
             ))
         );
 
-        manager
-            .stop_service_instance_locked(&ServiceKey::new(instance_id, "worker"))
+        let key = ServiceKey::new(instance_id, "api.worker");
+        let projection_before_stop = manager
+            .services
+            .lock()
             .await
-            .expect("stop generated-file service");
+            .get(&key)
+            .expect("generated-file service remains loaded")
+            .projection_generation;
+        let mut events = manager.event_sender.subscribe();
+        let generation_dir = generated_path
+            .parent()
+            .expect("generated file belongs to a generation directory")
+            .to_path_buf();
+        tokio::fs::remove_dir_all(&generation_dir)
+            .await
+            .expect("remove generated directory");
+        tokio::fs::write(&generation_dir, "blocks remove_dir_all")
+            .await
+            .expect("replace generation directory with a regular file");
+
+        manager
+            .stop("generated-file-project:api.worker")
+            .await
+            .expect("cleanup failure does not prevent the selected service from stopping");
         assert_eq!(stop_count.load(Ordering::SeqCst), 1);
         assert!(!generated_path.exists());
+        {
+            let services = manager.services.lock().await;
+            let service = services.get(&key).expect("stopped service remains loaded");
+            assert!(matches!(&service.runtime_state, ServiceRuntime::None));
+            assert_eq!(service.health_status, HealthStatus::Unknown);
+            assert!(service.projection_generation > projection_before_stop);
+            assert!(
+                service.generated_files.is_none(),
+                "cleanup ownership transfers out of the stopped projection"
+            );
+        }
+        assert_eq!(
+            manager.deferred_generated_file_cleanups.lock().await.len(),
+            1,
+            "failed cleanup remains independently owned for retry"
+        );
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&key),
+            "cleanup failure must not bypass selected-service stop intent"
+        );
+        manager.converge_all_project_availability().await;
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "availability convergence respects the finalized service stop"
+        );
+        assert_eq!(
+            manager.deferred_generated_file_cleanups.lock().await.len(),
+            1,
+            "failed background retry remains queued"
+        );
+
+        let persisted = manager
+            .state_manager
+            .load()
+            .await
+            .expect("load stopped generated-file projection");
+        let persisted_service = persisted
+            .services
+            .iter()
+            .find(|service| service.name == "generated-file-project:api.worker")
+            .expect("stopped generated-file service is persisted");
+        assert_eq!(persisted_service.status, ServiceState::Stopped);
+        assert_eq!(persisted_service.health_status, HealthStatus::Unknown);
+        let event = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+            .await
+            .expect("stopped generated-file projection is broadcast")
+            .expect("generated-file service event channel remains open");
+        let status = match event {
+            Event::ServiceUpdate(status) => Some(status),
+            _ => None,
+        }
+        .expect("generated-file stop broadcasts a service update");
+        assert_eq!(status.name, "generated-file-project:api.worker");
+        assert_eq!(status.status, ServiceState::Stopped);
+        assert_eq!(status.health_status, HealthStatus::Unknown);
+
+        manager.watchers.lock().await.remove(&canonical_project);
+        tokio::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "generated-file-project"
+domain = "generated-file-project.localhost"
+
+[services.keeper]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.keeper.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .await
+        .expect("remove the stopped service from configuration");
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("publish service removal while cleanup remains blocked");
+        assert!(
+            !manager.services.lock().await.contains_key(&key),
+            "service removal drops the projection without dropping cleanup ownership"
+        );
+        assert_eq!(
+            manager.deferred_generated_file_cleanups.lock().await.len(),
+            1
+        );
+
+        tokio::fs::remove_file(&generation_dir)
+            .await
+            .expect("remove cleanup blocker");
+        manager.converge_all_project_availability().await;
+        assert!(
+            manager
+                .deferred_generated_file_cleanups
+                .lock()
+                .await
+                .is_empty(),
+            "background convergence retries cleanup after the service record is gone"
+        );
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "cleanup retry does not stop an already stopped controller"
+        );
     }
 
     #[tokio::test]

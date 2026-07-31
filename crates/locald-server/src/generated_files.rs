@@ -1,3 +1,6 @@
+use crate::config_loader::{
+    SERVICE_REFERENCE_PATTERN, ServiceReference, resolve_owned_service_reference,
+};
 use crate::health::ReadinessRequirement;
 use anyhow::{Context, Result};
 use jsonc_parser::{ParseOptions, parse_to_serde_value, parse_to_value};
@@ -12,7 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_GENERATED_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_GENERATED_SOURCE_BYTES_U64: u64 = 1024 * 1024;
-const SERVICE_REFERENCE_PATTERN: &str = r"\$\{services\.([^.]+)\.([^}]+)\}";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceFingerprint([u8; 32]);
@@ -602,28 +604,34 @@ fn resolve_string(
     bindings: &ServiceRuntimeBindings,
 ) -> Result<Value> {
     let pattern = Regex::new(SERVICE_REFERENCE_PATTERN)?;
-    let captures = pattern.captures_iter(value).collect::<Vec<_>>();
-    if captures.is_empty() {
+    let references = pattern
+        .captures_iter(value)
+        .map(|captures| {
+            let full = captures
+                .get(0)
+                .context("generated replacement reference has no complete match")?;
+            let body = captures
+                .get(1)
+                .context("generated replacement reference is missing its body")?
+                .as_str();
+            let reference = resolve_owned_service_reference(body, service_name)?;
+            Ok((full.range(), reference))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if references.is_empty() {
         return Ok(Value::String(value.to_owned()));
     }
 
-    if captures.len() == 1
-        && captures[0]
-            .get(0)
-            .is_some_and(|full| full.as_str() == value)
-    {
-        let port = resolve_binding_reference(&captures[0], service_name, bindings)?;
+    if references.len() == 1 && references[0].0 == (0..value.len()) {
+        let port = resolve_binding_reference(&references[0].1, service_name, bindings)?;
         return Ok(Value::Number(port.into()));
     }
 
     let mut resolved = value.to_owned();
     let mut replacements = Vec::new();
-    for captures in captures {
-        let full = captures
-            .get(0)
-            .context("generated replacement reference has no complete match")?;
-        let port = resolve_binding_reference(&captures, service_name, bindings)?;
-        replacements.push((full.range(), port.to_string()));
+    for (range, reference) in references {
+        let port = resolve_binding_reference(&reference, service_name, bindings)?;
+        replacements.push((range, port.to_string()));
     }
     replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     for (range, port) in replacements {
@@ -633,18 +641,12 @@ fn resolve_string(
 }
 
 fn resolve_binding_reference(
-    captures: &regex::Captures<'_>,
+    reference: &ServiceReference,
     service_name: &str,
     bindings: &ServiceRuntimeBindings,
 ) -> Result<u16> {
-    let referenced_service = captures
-        .get(1)
-        .context("generated replacement reference is missing its service")?
-        .as_str();
-    let field = captures
-        .get(2)
-        .context("generated replacement reference is missing its field")?
-        .as_str();
+    let referenced_service = reference.service_name.as_str();
+    let field = reference.field.as_str();
     anyhow::ensure!(
         referenced_service == service_name,
         "generated replacement references service `{referenced_service}`; generated files may use only their owning service `{service_name}`"
@@ -762,14 +764,13 @@ fn validate_replacement_references(
     for replacement in config.replace.values() {
         visit_strings(replacement, &mut |value| {
             for captures in pattern.captures_iter(value) {
-                let referenced_service = captures
+                let body = captures
                     .get(1)
-                    .context("generated replacement reference is missing its service")?
+                    .context("generated replacement reference is missing its body")?
                     .as_str();
-                let field = captures
-                    .get(2)
-                    .context("generated replacement reference is missing its field")?
-                    .as_str();
+                let reference = resolve_owned_service_reference(body, service_name)?;
+                let referenced_service = reference.service_name.as_str();
+                let field = reference.field.as_str();
                 anyhow::ensure!(
                     referenced_service == service_name,
                     "service `{service_name}` generated file `{name}` references service `{referenced_service}`; generated files may use only their owning service"
@@ -974,6 +975,67 @@ mod tests {
             Some(&Value::from(4200))
         );
         assert!(output.ends_with('\n'));
+        generated.cleanup().await.expect("clean generation");
+    }
+
+    #[tokio::test]
+    async fn dotted_owner_materializes_primary_and_listener_bindings() {
+        let root = tempdir().expect("create dotted-service project root");
+        tokio::fs::write(
+            root.path().join("runtime.json"),
+            r#"{"primary":3000,"listener":3001}"#,
+        )
+        .await
+        .expect("write dotted-service source");
+        let config = service_config(
+            "runtime.json",
+            BTreeMap::from([
+                (
+                    "/primary".to_owned(),
+                    Value::String("${services.api.worker.port}".to_owned()),
+                ),
+                (
+                    "/listener".to_owned(),
+                    Value::String("${services.api.worker.listeners.chat.port}".to_owned()),
+                ),
+            ]),
+        );
+        let locald = LocaldConfig {
+            services: std::collections::HashMap::from([
+                ("api.worker".to_owned(), config.clone()),
+                (
+                    "api.worker.port".to_owned(),
+                    ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ),
+                (
+                    "api.worker.listeners.chat".to_owned(),
+                    ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ),
+            ]),
+            ..LocaldConfig::default()
+        };
+        validate_declarations(&locald)
+            .expect("exact sibling names cannot hide the dotted owner's runtime bindings");
+        let key = ServiceKey::new(key().instance(), "api.worker");
+
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key,
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize dotted owner")
+        .expect("generated dotted-owner set");
+        let value: Value = serde_json::from_slice(
+            &tokio::fs::read(generated.path("microfrontends").expect("generated path"))
+                .await
+                .expect("read dotted-owner output"),
+        )
+        .expect("parse dotted-owner output");
+        assert_eq!(value.pointer("/primary"), Some(&Value::from(4100)));
+        assert_eq!(value.pointer("/listener"), Some(&Value::from(4200)));
         generated.cleanup().await.expect("clean generation");
     }
 
