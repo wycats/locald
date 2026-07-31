@@ -3,7 +3,7 @@ use locald_core::config::{
     CommonServiceConfig, ContainerServiceConfig, ExecServiceConfig, LocaldConfig,
     PostgresServiceConfig, ProjectConfig, ServiceConfig, SiteServiceConfig, TypedServiceConfig,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn load_or_create_config() -> Result<(std::path::PathBuf, LocaldConfig)> {
     let cwd = std::env::current_dir()?;
@@ -61,6 +61,7 @@ pub fn add_exec(command: String, name: Option<String>, port: Option<u16>) -> Res
         common: CommonServiceConfig {
             port,
             listeners: Vec::new(),
+            generated: BTreeMap::default(),
             domains: None,
             env: HashMap::new(),
             depends_on: Vec::new(),
@@ -95,6 +96,7 @@ pub fn add_container(
             common: CommonServiceConfig {
                 port: None,
                 listeners: Vec::new(),
+                generated: BTreeMap::default(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
@@ -124,6 +126,7 @@ pub fn add_postgres(name: &str, version: Option<String>) -> Result<()> {
             common: CommonServiceConfig {
                 port: None,
                 listeners: Vec::new(),
+                generated: BTreeMap::default(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
@@ -155,6 +158,7 @@ pub fn add_site(
         common: CommonServiceConfig {
             port,
             listeners: Vec::new(),
+            generated: BTreeMap::default(),
             domains: None,
             env: HashMap::new(),
             depends_on: Vec::new(),

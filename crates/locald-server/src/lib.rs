@@ -80,6 +80,10 @@ pub mod assets;
 pub mod config_loader;
 #[doc(hidden)]
 pub mod container;
+// This module is an internal sibling API. Keep its surface explicitly
+// crate-scoped instead of exporting generated runtime-file internals.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod generated_files;
 #[doc(hidden)]
 pub mod health;
 #[cfg(target_os = "macos")]

@@ -48,7 +48,7 @@ pub use env_provenance::{
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// Root configuration for a locald project.
@@ -272,7 +272,7 @@ pub enum TypedServiceConfig {
 /// container_port = 6379
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[schemars(transform = remove_named_listener_property)]
+#[schemars(transform = remove_process_runtime_properties)]
 pub struct ContainerServiceConfig {
     /// Common configuration shared by all services.
     #[serde(flatten)]
@@ -332,6 +332,13 @@ pub struct CommonServiceConfig {
     /// `${services.<service>.listeners.<listener>.port}` interpolation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listeners: Vec<String>,
+    /// Runtime JSON or JSONC files generated for this service.
+    ///
+    /// Generated files are materialized in the owning project instance's
+    /// locald data directory. Their replacements may reference only this
+    /// service's primary port and declared named listeners.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated: BTreeMap<String, GeneratedFileConfig>,
     /// Relative domain claims for this service.
     ///
     /// `@` claims the project-instance root, plain values claim exact relative
@@ -355,12 +362,23 @@ pub struct CommonServiceConfig {
     pub stop_signal: Option<String>,
 }
 
-fn remove_named_listener_property(schema: &mut schemars::Schema) {
+/// One JSON or JSONC file generated for a host exec or worker service.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct GeneratedFileConfig {
+    /// Project-relative source JSON or JSONC file.
+    pub source: String,
+    /// Existing JSON Pointer targets and their replacement values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub replace: BTreeMap<String, serde_json::Value>,
+}
+
+fn remove_process_runtime_properties(schema: &mut schemars::Schema) {
     if let Some(properties) = schema
         .get_mut("properties")
         .and_then(serde_json::Value::as_object_mut)
     {
         properties.remove("listeners");
+        properties.remove("generated");
     }
 }
 
@@ -491,7 +509,7 @@ fn default_builder() -> String {
 /// version = "15"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[schemars(transform = remove_named_listener_property)]
+#[schemars(transform = remove_process_runtime_properties)]
 pub struct PostgresServiceConfig {
     /// Common configuration shared by all services.
     #[serde(flatten)]
@@ -512,7 +530,7 @@ pub struct PostgresServiceConfig {
 /// build = "cargo doc"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[schemars(transform = remove_named_listener_property)]
+#[schemars(transform = remove_process_runtime_properties)]
 pub struct SiteServiceConfig {
     /// Common configuration shared by all services.
     #[serde(flatten)]
@@ -547,6 +565,10 @@ impl ServiceConfig {
         &self.common().listeners
     }
 
+    pub const fn generated(&self) -> &BTreeMap<String, GeneratedFileConfig> {
+        &self.common().generated
+    }
+
     /// Whether this service kind can own dynamically allocated listeners.
     ///
     /// The first listener-backed runtime surface is intentionally limited to
@@ -558,6 +580,21 @@ impl ServiceConfig {
             Self::Legacy(_)
                 | Self::Typed(TypedServiceConfig::Exec(_) | TypedServiceConfig::Worker(_))
         )
+    }
+
+    /// Whether this service kind can own host-accessible generated runtime files.
+    pub const fn supports_generated_files(&self) -> bool {
+        match self {
+            Self::Legacy(config) | Self::Typed(TypedServiceConfig::Exec(config)) => {
+                config.build.is_none()
+            }
+            Self::Typed(TypedServiceConfig::Worker(_)) => true,
+            Self::Typed(
+                TypedServiceConfig::Postgres(_)
+                | TypedServiceConfig::Container(_)
+                | TypedServiceConfig::Site(_),
+            ) => false,
+        }
     }
 
     pub const fn env(&self) -> &HashMap<String, String> {
@@ -611,6 +648,7 @@ mod tests {
             common: CommonServiceConfig {
                 port: None,
                 listeners: Vec::new(),
+                generated: BTreeMap::new(),
                 domains: None,
                 env: HashMap::new(),
                 depends_on: Vec::new(),
@@ -712,17 +750,56 @@ listeners = ["chat", "hmr-control"]
     }
 
     #[test]
-    fn named_listener_schema_matches_supported_service_kinds() {
+    fn generated_files_round_trip_with_typed_replacements() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "generated-app"
+
+[services.web]
+command = "serve"
+listeners = ["chat"]
+
+[services.web.generated.microfrontends]
+source = "chat/microfrontends.jsonc"
+
+[services.web.generated.microfrontends.replace]
+"/applications/chat/development/local" = "${services.web.listeners.chat.port}"
+"/options/enabled" = true
+"#,
+        )
+        .expect("parse generated file config");
+        let generated = &config.services["web"].generated()["microfrontends"];
+        assert_eq!(generated.source, "chat/microfrontends.jsonc");
+        assert_eq!(
+            generated.replace["/options/enabled"],
+            serde_json::Value::Bool(true)
+        );
+
+        let encoded = toml::to_string(&config).expect("serialize generated file config");
+        let round_tripped: LocaldConfig =
+            toml::from_str(&encoded).expect("round-trip generated file config");
+        assert_eq!(round_tripped, config);
+
+        let without_generated: ServiceConfig =
+            toml::from_str("command = \"serve\"").expect("parse plain service");
+        assert!(!config.services["web"].runtime_eq(&without_generated));
+    }
+
+    #[test]
+    fn process_runtime_schema_matches_supported_service_kinds() {
         let schema =
             serde_json::to_value(schemars::schema_for!(LocaldConfig)).expect("serialize schema");
 
         for supported in ["ExecServiceConfig", "WorkerServiceConfig"] {
-            assert!(
-                schema
-                    .pointer(&format!("/$defs/{supported}/properties/listeners"))
-                    .is_some(),
-                "{supported} should expose listeners"
-            );
+            for property in ["listeners", "generated"] {
+                assert!(
+                    schema
+                        .pointer(&format!("/$defs/{supported}/properties/{property}"))
+                        .is_some(),
+                    "{supported} should expose {property}"
+                );
+            }
         }
 
         for unsupported in [
@@ -730,12 +807,14 @@ listeners = ["chat", "hmr-control"]
             "PostgresServiceConfig",
             "SiteServiceConfig",
         ] {
-            assert!(
-                schema
-                    .pointer(&format!("/$defs/{unsupported}/properties/listeners"))
-                    .is_none(),
-                "{unsupported} must not expose listeners"
-            );
+            for property in ["listeners", "generated"] {
+                assert!(
+                    schema
+                        .pointer(&format!("/$defs/{unsupported}/properties/{property}"))
+                        .is_none(),
+                    "{unsupported} must not expose {property}"
+                );
+            }
         }
     }
 
