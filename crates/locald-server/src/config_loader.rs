@@ -1000,6 +1000,17 @@ impl ConfigLoader {
         Ok(())
     }
 
+    /// Validate service names against the interpolation grammar.
+    pub(crate) fn validate_service_names(config: &LocaldConfig) -> Result<()> {
+        for service_name in config.services.keys() {
+            anyhow::ensure!(
+                !service_name.contains('}'),
+                "service `{service_name}` has an invalid name: `}}` is reserved as the closing delimiter in `${{services.<service>.<field>}}` references; rename the service to omit `}}`"
+            );
+        }
+        Ok(())
+    }
+
     /// Validate private named-listener declarations independently of runtime
     /// allocation.
     pub(crate) fn validate_listener_declarations(config: &LocaldConfig) -> Result<()> {
@@ -1296,6 +1307,42 @@ depends_on = ["db"]
         let error = ConfigLoader::validate_env_references(&unknown_field, &config, "web")
             .expect_err("unknown service field must fail");
         assert!(error.to_string().contains("unknown field `password`"));
+    }
+
+    #[test]
+    fn service_name_validation_reserves_only_the_reference_closing_delimiter() {
+        let invalid: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "invalid-service-name"
+
+[services."api}worker"]
+command = "serve"
+"#,
+        )
+        .expect("quoted service name remains valid TOML");
+        let error = ConfigLoader::validate_service_names(&invalid)
+            .expect_err("reference closing delimiter must be reserved");
+        let message = error.to_string();
+        assert!(message.contains("service `api}worker` has an invalid name"));
+        assert!(message.contains("reserved as the closing delimiter"));
+        assert!(message.contains("rename the service to omit `}`"));
+
+        let valid: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "valid-service-names"
+
+[services."api.worker"]
+command = "serve-dotted"
+
+[services."worker:blue"]
+command = "serve-colon"
+"#,
+        )
+        .expect("parse accepted service names");
+        ConfigLoader::validate_service_names(&valid)
+            .expect("dots, colons, and other existing service-name characters remain valid");
     }
 
     #[tokio::test]

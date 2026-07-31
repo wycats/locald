@@ -3702,6 +3702,7 @@ impl ProcessManager {
 
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
+        ConfigLoader::validate_service_names(&config)?;
         let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
         ConfigLoader::validate_listener_declarations(&config)?;
         crate::generated_files::validate_declarations(&config)?;
@@ -25120,6 +25121,62 @@ BROKEN_URL = "${services.missing.url}"
             .stop_project(&project_path)
             .await
             .expect("stop initial project");
+    }
+
+    #[tokio::test]
+    async fn invalid_service_name_fails_before_catalog_and_domain_publication() {
+        let dir = tempdir().expect("create invalid service-name directory");
+        let project_path = dir.path().join("invalid-service-name-project");
+        std::fs::create_dir(&project_path).expect("create project directory");
+        let catalog_path = dir.path().join("catalog.json");
+        let registry = Arc::new(Mutex::new(Registry::with_path(catalog_path.clone())));
+        let manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create process manager");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "invalid-service-name"
+domain = "invalid-service-name.localhost"
+
+[services."api}worker"]
+command = "sleep 30"
+"#,
+        )
+        .expect("write invalid service-name config");
+
+        let error = manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect_err("invalid service name must fail before publication");
+        assert!(
+            format!("{error:#}").contains("reserved as the closing delimiter"),
+            "unexpected invalid service-name error: {error:#}"
+        );
+        let registry = registry.lock().await;
+        assert!(registry.get_project(&project_path).is_none());
+        assert!(
+            registry
+                .domain_index()
+                .resolve("invalid-service-name.localhost")
+                .is_none()
+        );
+        drop(registry);
+        assert!(!catalog_path.exists());
+        assert!(
+            manager
+                .get_service_controller("invalid-service-name:api}worker")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
