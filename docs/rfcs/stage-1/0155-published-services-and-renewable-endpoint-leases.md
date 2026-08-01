@@ -185,7 +185,7 @@ The exact request names and encoding remain Stage 2 details. The public contract
 2. The peer UID must equal the daemon UID.
 3. The daemon obtains the peer PID from kernel credentials and captures a high-resolution process-birth identity.
 4. Acquisition resolves the locator server-side, verifies the exact project instance, and requires `type = "published"` for the named service.
-5. The only endpoint input is a nonzero `u16` port. The daemon constructs `http://127.0.0.1:<port>`. Hostnames, arbitrary IPs, URLs, Unix sockets, and caller-selected schemes are rejected by construction.
+5. The only endpoint input is a nonzero `u16` port that is not an active locald front-door listener. Acquisition and rebind check the daemon's current standard or sandbox HTTP and HTTPS listener ports and reject any match, preventing a published route from recursively targeting locald itself. The daemon constructs `http://127.0.0.1:<port>`. Hostnames, arbitrary IPs, URLs, Unix sockets, and caller-selected schemes are rejected by construction.
 6. Acquisition establishes the lease, returns the stable semantic origin plus a redacted opaque lease handle, and begins locald-observed health evaluation. A retry-stable publisher session nonce makes a lost acquisition response idempotent.
 7. The owning workflow waits for the exact binding to become ready before returning a user-facing launch URL. Renewal never self-attests readiness.
 8. Renewal extends only the exact current lease. It does not revive an expired lease, change a binding, clear project pause, or restore routing while paused.
@@ -193,13 +193,13 @@ The exact request names and encoding remain Stage 2 details. The public contract
 10. Release removes only the exact current lease.
 11. Every expiry, process-exit reap, health update, rebind, release, and configuration invalidation compares the complete current fence before mutation.
 
-A lease fence contains a random daemon epoch, monotonically increasing per-service lease generation, unguessable token, exact publisher principal, and binding revision. A stale publisher cannot renew, replace, release, or publish delayed health for a successor.
+A lease fence contains a random daemon epoch, monotonically increasing per-service lease generation, unguessable token, exact publisher principal, binding revision, renewal revision, and expiry deadline. Renewal atomically advances the renewal revision and deadline. An expiry task removes a lease only after atomically confirming the exact expected renewal revision and deadline are still current and have elapsed. A timer captured before a successful renewal therefore cannot expire the renewed lease. A stale publisher cannot renew, replace, release, or publish delayed health for a successor.
 
 A different publisher may take over immediately only after the daemon proves the previous publisher process is gone; otherwise it waits for expiry or an explicit future handoff mechanism. Successful takeover creates a new lease generation.
 
 The initial threat boundary is same-daemon-user local development. UID, kernel-observed PID, process-birth identity, and the unguessable handle prevent cross-user and stale-process mutations. They do not authorize one same-user program over another: any process already executing as the daemon user may attempt to claim an available published declaration. Consequently, another same-user program can race or squat an available declaration, deny service, or serve content under its semantic origin. This proposal accepts that boundary for the first consumer and does not describe the publisher as trusted. Stronger code-signing allowlists or per-project capabilities are future hardening.
 
-The lease authorizes endpoint designation; it is not portable proof that the peer itself owns the listening socket. External owners commonly spawn child servers, and portable strict listener-to-parent proof is not available. locald independently probes health before routing.
+The lease authorizes endpoint designation; it is not portable proof that the peer itself owns the listening socket. External owners commonly spawn child servers, and portable strict listener-to-parent proof is not available. locald independently probes health before routing. HTTP probes connect only to the selected loopback port, send the exact semantic `Host` authority—hostname plus the advertised port when non-default—and never follow redirects. Redirect responses are unhealthy in the initial protocol rather than permission to probe another endpoint.
 
 ### 5.6 Lifecycle and availability
 
@@ -272,7 +272,7 @@ concrete host
   -> 127.0.0.1:<private-port>
 ```
 
-A successful rebind installs the new endpoint and a new binding revision atomically. Existing requests may finish on the old binding; new requests use the new one. Proxy responsiveness and health caches include the binding revision so a successor cannot inherit stale evidence, even when it reuses a port.
+A successful rebind installs the new endpoint and a new binding revision atomically. Every proxied request, response body, streaming response, and upgraded connection is tracked under that binding revision. Rebind, project pause, health withdrawal, lease expiry or release, configuration invalidation, and daemon shutdown cancel the invalidated binding's connection scope: new requests cannot select it, ongoing upstream I/O is stopped, and WebSocket or other upgraded bridges are actively closed. A finite response whose upstream body was already fully consumed may finish delivering buffered bytes, but an invalidated publisher cannot retain indefinite reachability through a stream or upgraded connection. Proxy responsiveness and health caches include the binding revision so a successor cannot inherit stale evidence, even when it reuses a port.
 
 HTTP and WebSocket forwarding preserve the public semantic `Host` and `Origin` by default. locald does not blindly rewrite them to loopback. The application owner must explicitly accept the exact semantic origin returned by publication.
 
@@ -313,7 +313,7 @@ When a project declares a published workbench and locald is available:
 
 The lane identifier never enters locald configuration, identity, status, or hostname. A focus change may reuse or atomically rebind the endpoint without renaming the service.
 
-Projects that do not opt in keep Exo's current direct-loopback behavior. If locald is absent, Exo retains that direct-loopback path. Once a published declaration is present and a locald daemon accepts the integration path, publication, health, or origin-authorization failures are surfaced rather than silently bypassed through a second origin.
+Projects that do not opt in keep Exo's current direct-loopback behavior. Once a published declaration is present, it selects the standard locald platform contract: an absent or inconsistent locald installation, failed publication, failed health, or failed origin authorization returns actionable locald setup or recovery guidance and never silently switches to a high-port loopback origin. Any future direct-loopback escape hatch for an opted-in project must be part of the explicitly selected sandbox mode, with its constrained origin made visible; it is not part of the normal workflow defined here.
 
 ## 6. Implementation Boundaries
 
@@ -323,7 +323,7 @@ The first locald implementation is bounded to:
 - an ephemeral per-service publisher registry and deterministic clock-driven tests;
 - same-user acquire, renew, rebind, and release IPC;
 - continuous endpoint health;
-- health-gated proxy resolution with generation-safe rebinding;
+- health-gated proxy resolution with semantic-host, no-redirect probes and generation-scoped connection cancellation;
 - independent published-service status and safe agent projections;
 - config reload, project pause, expiry, and daemon-restart behavior;
 - one Exo workbench integration proof.
@@ -351,9 +351,11 @@ The implementation must prove:
 - one external endpoint may safely fulfill several worktree identities;
 - unknown, undeclared, wrong-instance, or non-published services cannot be published;
 - wrong UID, spoofed PID, PID reuse, forged token, wrong epoch, and stale generation fail closed;
+- locald's active standard and sandbox listener ports cannot be acquired or rebound as published endpoints;
 - retry-stable acquisition is idempotent and concurrent different publishers produce one winner;
-- stale renewal, rebind, release, expiry, health callback, and process reaping cannot affect a successor;
+- stale renewal, rebind, release, expiry, health callback, and process reaping cannot affect a successor, and an expiry timer captured before renewal cannot remove the renewed lease;
 - a failed candidate rebind preserves the healthy route and a successful rebind is atomic;
+- invalidating a binding actively closes its WebSocket, upgraded, and streaming connections;
 - renewal does not change health, clear pause, or restore a paused route;
 - lease loss and daemon restart preserve the declaration and origin but remove reachability;
 - no lifecycle action signals the external process;
@@ -361,9 +363,9 @@ The implementation must prove:
 - the owning launch workflow waits for the exact published binding to become ready;
 - service-level stop and restart return an honest externally-managed result without changing route or process;
 - status and agent output distinguish all required publication states without leaking private authority or endpoints;
-- HTTP, WebSocket, TLS, and Origin behavior work through the semantic domain;
+- HTTP, WebSocket, TLS, and Origin behavior work through the semantic domain; HTTP health probes send that exact semantic `Host` authority, including the advertised port when non-default, while remaining on the selected loopback port and never following redirects;
 - an Exo ticket for one worktree cannot be replayed through another worktree;
-- Exo still returns a direct loopback launch when the project has not opted in or locald is absent.
+- Exo still returns a direct loopback launch when the project has not opted in, while an opted-in project fails with actionable guidance when locald is absent or inconsistent.
 
 ## 8. Drawbacks
 
