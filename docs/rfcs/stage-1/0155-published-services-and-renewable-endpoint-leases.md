@@ -41,7 +41,7 @@ The user never selects, remembers, or passes the private loopback port. Changing
 
 ### 2.2 Interaction with ordinary locald lifecycle
 
-Published services are provider-activated. locald cannot honestly start an externally owned process, so an absent publisher or unhealthy endpoint does not prevent generic `locald up` or `ensure_available` from making locald-managed services ready. The published service remains independently visible as waiting, checking, unhealthy, or ready. Successful generic ensure output must call out any published services that remain waiting or unhealthy; it must not present a bare `Ready` that conceals them.
+Published services are provider-activated. locald cannot honestly start an externally owned process, so an absent publisher or unhealthy endpoint does not prevent generic `locald up` or `ensure_available` from making locald-managed services ready. The published service remains independently visible as waiting, checking, unhealthy, paused, or ready. Successful generic ensure output must report every published service whose publication state is not `ready`, including `waiting_for_publisher`, `checking_endpoint`, `endpoint_unhealthy`, and `route_paused`; it must not present a bare `Ready` that conceals any of them.
 
 A consumer that needs the published service must use its owning workflow. For the first consumer, `exo workbench launch` starts or reuses the host, publishes it, waits for locald-observed readiness, and only then returns the launch URL.
 
@@ -144,9 +144,9 @@ Omitting `domains` uses the existing conventional exact service domain. An expli
 
 Omitting `health_check` uses an HTTP request to `/`. The initial published-service schema accepts only HTTP health checks. TCP health checks are insufficient because locald's retained listener capability can continue completing handshakes after the application stops accepting requests; command health checks are also rejected because locald does not own the publisher's execution context.
 
-A published service has no configured port. The initial schema rejects process-owned fields such as `command`, `workdir`, `build`, `env`, `listeners`, `generated`, and `stop_signal`.
+A published service has no configured port. The initial schema rejects process-owned fields such as `command`, `workdir`, `build`, `env`, `listeners`, `generated`, `depends_on`, and `stop_signal`.
 
-Dependency edges involving published services are outside the first implementation. Stable `${services.workbench.origin}` interpolation is valid; private `port`, `host`, and raw `url` interpolation is not.
+The initial whole-project validator rejects every dependency edge involving a published service in either direction: a published service cannot depend on another service, and a managed service cannot depend on a published service. This preserves provider-activated readiness instead of making generic convergence wait for a runtime locald cannot start. Stable `${services.workbench.origin}` interpolation is valid; private `port`, `host`, and raw `url` interpolation is not.
 
 A Procfile cannot declare a published service.
 
@@ -203,7 +203,7 @@ The protocol uses three nested fences:
 - the **binding fence** adds the binding revision and identifies one exact retained listener capability;
 - the **expiry fence** adds the renewal revision and expiry deadline.
 
-A lease is active only while its current deadline is strictly later than daemon time. Deadline expiry is authoritative even before the cleanup task runs; the reaper removes state but does not define when authority ends. Renewal compares the lease identity fence and atomically confirms the lease is still active before advancing only the renewal revision and deadline. An expiry task removes a lease only after atomically confirming that its complete expiry fence is still current and that the current deadline has elapsed. A timer captured before a successful renewal therefore cannot expire the renewed lease. Health results compare the binding fence and confirm that the current lease is still active at commit time; ordinary renewal does not make an otherwise current health result stale. Rebind compares the lease identity fence plus the expected binding revision and reconfirms that the lease is active after candidate probing, immediately before committing the new binding. A probe that crosses the deadline cannot install its candidate. Release and process-exit reaping compare the exact current lease identity. Configuration invalidation compares the exact configuration generation before removing the lease then current for that declaration, so delayed removal from an older configuration cannot revoke a newly reintroduced service. Any delayed work tied to an endpoint also compares its binding revision. A stale or expired publisher cannot regain authority, mutate a successor, or publish delayed health for it.
+A lease is active only while its current deadline is strictly later than daemon time. Deadline expiry is authoritative even before the cleanup task runs; the reaper removes state but does not define when authority ends. Renewal compares the lease identity fence and atomically confirms the lease is still active before advancing only the renewal revision and deadline. An expiry task removes a lease only after atomically confirming that its complete expiry fence is still current and that the current deadline has elapsed. A timer captured before a successful renewal therefore cannot expire the renewed lease. Health results compare the binding fence and confirm that the current lease is still active at commit time; ordinary renewal does not make an otherwise current health result stale. Rebind compares the lease identity fence plus the expected binding revision and reconfirms that the lease is active after candidate probing, immediately before committing the new binding. A probe that crosses the deadline cannot install its candidate. Release and process-exit reaping compare the exact current lease identity. Configuration invalidation compares the exact configuration generation before removing the lease then current for that declaration, so delayed removal from an older configuration cannot revoke a newly reintroduced service. Removing the declaration, changing its type, or changing its primary semantic origin revokes the current lease and binding; locald never exposes the old binding under a new origin. The publisher must reacquire, receive the new origin, pass health again, and reauthorize its application before routing resumes. Any delayed work tied to an endpoint also compares its binding revision. A stale or expired publisher cannot regain authority, mutate a successor, or publish delayed health for it.
 
 A different publisher may take over immediately only after the daemon proves the previous publisher process is gone; otherwise it waits for expiry or an explicit future handoff mechanism. Successful takeover creates a new lease generation.
 
@@ -224,7 +224,7 @@ Publication renewal is passive runtime maintenance:
 - it does not start, restore, or keep locald-managed sibling processes alive;
 - it does not clear project pause or restore routing while paused.
 
-Published-service readiness is independent from generic project readiness. `locald up` and `ensure_available` start and wait for the services locald can ensure. A missing or unhealthy endpoint remains visible in project status and successful ensure output but does not turn the generic ensure into an impossible request. The consumer-specific launch workflow waits for its published service to become ready.
+Published-service readiness is independent from generic project readiness. `locald up` and `ensure_available` start and wait for the services locald can ensure. Every non-ready published state remains visible in project status and successful ensure output but does not turn the generic ensure into an impossible request. The consumer-specific launch workflow waits for its published service to become ready.
 
 Project pause immediately suppresses the published route but never signals the external runtime. An existing publisher may continue renewing while paused. Project pause persists across daemon restart under the existing availability contract; a reacquired lease remains suppressed until explicit Resume. Resume restores routing if the exact lease remains current and healthy; otherwise the stable origin continues to explain what is missing.
 
@@ -253,6 +253,7 @@ A publication request can load and register the declared project without first r
 | Service stop, restart, or reset command | Actionable externally-managed result; no route, binding, or data change | Untouched | Use the owning workflow |
 | Daemon restart | Project pause persists; declaration and origin remain; lease is absent | Untouched | Publisher reacquires with new daemon epoch; route remains paused until Resume |
 | Declaration removed or type changed | Domain and publication removed through normal config application | Untouched | Restore a valid declaration before publishing |
+| Primary semantic origin changed | Old lease and binding revoked; new origin waits for a publisher | Untouched | Publisher reacquires, authorizes the new origin, and passes health |
 
 ### 5.8 Endpoint and health states
 
@@ -273,6 +274,8 @@ Lease loss immediately removes reachability. Normal domain ownership remains, so
 ### 5.9 Atomic routing and origin preservation
 
 The domain index remains the source of stable hostname ownership. A separate published-endpoint registry supplies the currently eligible upstream.
+
+An origin-changing configuration application revokes the current lease, binding, and connection scope before publishing the new primary claim. The new origin begins in `waiting_for_publisher`; no atomic configuration snapshot can pair it with authority granted for the old origin. Alias-only changes that preserve the primary semantic origin do not require lease reacquisition.
 
 The proxy resolves:
 
@@ -339,7 +342,7 @@ The first locald implementation is bounded to:
 - continuous endpoint health;
 - health-gated proxy resolution with application-level HTTP probes, semantic-origin forwarding, standard HTTP-to-HTTPS redirect, no-redirect probe handling, and generation-scoped connection cancellation;
 - independent published-service status and safe agent projections;
-- config reload, project pause, expiry, and daemon-restart behavior;
+- config reload with origin-change revocation, project pause, expiry, and daemon-restart behavior;
 - one Exo workbench integration proof.
 
 It does not include:
@@ -350,7 +353,7 @@ It does not include:
 - service-level published-route pause or execution of stop, restart, or reset against the external runtime;
 - publisher log ingestion;
 - lane-aware hostnames or locald knowledge of Exo state;
-- generalized service dependencies involving published services;
+- service dependencies involving published services in either direction;
 - persisted live leases across daemon restart;
 - a public CLI intended for manual port management;
 - RFC 0147 reconciliation.
@@ -366,6 +369,7 @@ The implementation must prove:
 - unknown, undeclared, wrong-instance, or non-published services cannot be published;
 - omitted domains produce the conventional exact origin, while an empty or wildcard-only domain list and a missing primary exact origin fail configuration validation;
 - omitted health configuration performs an application-level HTTP `/` probe, while TCP and command probes are rejected for published services;
+- dependency edges from a published service and dependency edges from a managed service to a published service both fail configuration validation;
 - wrong UID, spoofed PID, PID reuse, forged token, wrong epoch, and stale generation fail closed;
 - a raw port, non-listener descriptor, non-loopback listener, shareable listener, and descriptor from an unauthenticated publisher are rejected, while locald's retained capability prevents cross-user address takeover for the active binding;
 - locald's active standard and sandbox listener ports cannot be acquired or rebound as published endpoints;
@@ -375,8 +379,9 @@ The implementation must prove:
 - invalidating a binding actively closes its WebSocket, upgraded, and streaming connections;
 - renewal does not change health, clear pause, or restore a paused route;
 - lease loss and daemon restart preserve the declaration and origin but remove reachability;
+- changing the primary semantic origin revokes the old lease and binding, closes its connections, and requires reacquisition and health before the old upstream can appear under the new origin;
 - no lifecycle action signals the external process;
-- generic `locald up` can complete while an absent published service remains visibly waiting, and its success output names that service instead of presenting a bare `Ready`;
+- generic `locald up` can complete while a published service is independently non-ready, and its success output names every such service with its exact state—including waiting, checking, unhealthy, or paused—instead of presenting a bare `Ready`;
 - the owning launch workflow waits for the exact published binding to become ready;
 - a launch attempted while the route is paused fails immediately with actionable `locald up` or Resume guidance and does not clear the pause;
 - service-level stop, restart, and reset return an honest externally-managed result without changing route, binding, process, or external data;
