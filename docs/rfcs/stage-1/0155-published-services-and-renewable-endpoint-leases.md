@@ -47,7 +47,7 @@ A consumer that needs the published service must use its owning workflow. For th
 
 Project-level pause remains authoritative. Pausing a project suppresses the published route without signaling the external process. The publisher may maintain its lease while paused, but passive renewal cannot clear the pause or restore routing. Explicit project resume restores the route when the current endpoint is healthy.
 
-The initial version does not pretend that locald can stop or restart an externally owned runtime. Service-level stop and restart commands return an actionable result explaining that the service is externally managed and that no process or route was changed. The external owner remains the place to stop or restart that runtime.
+The initial version does not pretend that locald can stop, restart, or reset an externally owned runtime. Service-level stop, restart, and reset commands return an actionable result explaining that the service is externally managed and that no route, binding, process, or external data was changed. The external owner remains the place to control that runtime and its data.
 
 ### 2.3 User and maintainer impact
 
@@ -140,9 +140,11 @@ type = "http"
 path = "/"
 ```
 
-Omitting `domains` uses the existing conventional service domain. Omitting `health_check` uses a TCP probe.
+Omitting `domains` uses the existing conventional exact service domain. An explicit domain list must contain at least one exact claim; `domains = []` and wildcard-only lists are invalid for a published service because they cannot supply its canonical semantic origin. The first exact claim remains the primary origin under existing domain rules.
 
-A published service has no configured port. The initial schema rejects process-owned fields such as `command`, `workdir`, `build`, `env`, `listeners`, `generated`, and `stop_signal`. Command health checks are also rejected because locald does not own the publisher's execution context.
+Omitting `health_check` uses an HTTP request to `/`. The initial published-service schema accepts only HTTP health checks. TCP health checks are insufficient because locald's retained listener capability can continue completing handshakes after the application stops accepting requests; command health checks are also rejected because locald does not own the publisher's execution context.
+
+A published service has no configured port. The initial schema rejects process-owned fields such as `command`, `workdir`, `build`, `env`, `listeners`, `generated`, and `stop_signal`.
 
 Dependency edges involving published services are outside the first implementation. Stable `${services.workbench.origin}` interpolation is valid; private `port`, `host`, and raw `url` interpolation is not.
 
@@ -226,15 +228,16 @@ Published-service readiness is independent from generic project readiness. `loca
 
 Project pause immediately suppresses the published route but never signals the external runtime. An existing publisher may continue renewing while paused. Project pause persists across daemon restart under the existing availability contract; a reacquired lease remains suppressed until explicit Resume. Resume restores routing if the exact lease remains current and healthy; otherwise the stable origin continues to explain what is missing.
 
-The initial version does not implement service-level route suppression or external process control. `locald service stop <published-service>` and `locald service restart <published-service>` leave both route and process unchanged and explain that the service is externally managed. This avoids a second hidden pause policy that automatic publisher reacquisition could defeat.
+The initial version does not implement service-level route suppression or external process control. `locald service stop <published-service>`, `locald service restart <published-service>`, and `locald service reset <published-service>` leave the route, binding, external process, and external data unchanged and explain that the service is externally managed. This avoids both a hidden pause policy that automatic publisher reacquisition could defeat and a destructive reset that locald has no authority to perform.
 
 A publication request can load and register the declared project without first running ordinary `EnsureProject`. This avoids a bootstrap cycle:
 
 1. the external owner validates its workspace and starts its loopback endpoint;
 2. it acquires the declared publication;
-3. locald probes the endpoint;
-4. the owner waits for the published service to become ready;
-5. the owner returns the semantic-origin launch URL.
+3. if the project is paused, the owning workflow stops immediately with actionable `locald up` or Resume guidance; publication does not clear the pause;
+4. locald probes the endpoint;
+5. the owner waits for the published service to become ready;
+6. the owner returns the semantic-origin launch URL.
 
 ### 5.7 Lifecycle matrix
 
@@ -247,7 +250,7 @@ A publication request can load and register the declared project without first r
 | Lease expires or publisher dies | Stable unavailable surface; `waiting_for_publisher` | Never signaled | Publisher starts a new lease generation |
 | Project pause | Stable paused surface; `route_paused` | Untouched; lease may renew | Explicit project Resume |
 | Project resume | Route restored only if exact binding is healthy | Untouched | Otherwise wait for publisher or health |
-| Service stop or restart command | Actionable externally-managed result; no route change | Untouched | Use the owning workflow |
+| Service stop, restart, or reset command | Actionable externally-managed result; no route, binding, or data change | Untouched | Use the owning workflow |
 | Daemon restart | Project pause persists; declaration and origin remain; lease is absent | Untouched | Publisher reacquires with new daemon epoch; route remains paused until Resume |
 | Declaration removed or type changed | Domain and publication removed through normal config application | Untouched | Restore a valid declaration before publishing |
 
@@ -282,7 +285,9 @@ concrete host
 
 A successful rebind installs the new endpoint and a new binding revision atomically. Every proxied request, response body, streaming response, and upgraded connection is tracked under that binding revision. Rebind, project pause, health withdrawal, lease expiry or release, configuration invalidation, and daemon shutdown cancel the invalidated binding's connection scope: new requests cannot select it, ongoing upstream I/O is stopped, and WebSocket or other upgraded bridges are actively closed. A finite response whose upstream body was already fully consumed may finish delivering buffered bytes, but an invalidated publisher cannot retain indefinite reachability through a stream or upgraded connection. Proxy responsiveness and health caches include the binding revision so a successor cannot inherit stale evidence, even when it reuses a port.
 
-HTTP and WebSocket forwarding preserve the public semantic `Host` and `Origin` by default. locald does not blindly rewrite them to loopback. For both normal proxying and health probes, locald removes caller-supplied forwarding metadata and supplies canonical forwarding scheme and authority derived from the selected semantic origin: normally `https` and its exact public authority in standard mode, or the explicitly advertised sandbox scheme and authority in sandbox mode. The exact compatible header encoding is a Stage 2 detail, but the upstream can rely on locald-generated public-origin metadata rather than an untrusted `Forwarded` or `X-Forwarded-*` value. The application owner must explicitly accept the exact semantic origin returned by publication.
+HTTP and WebSocket forwarding preserve the public semantic `Host` and `Origin` by default. locald does not blindly rewrite them to loopback. A published-service request arriving through the standard port-80 front door is redirected to the exact semantic HTTPS origin, preserving path and query, before any upstream is selected. It is never proxied while labeled as secure.
+
+For standard HTTPS proxying, explicit sandbox proxying, and health probes, locald removes caller-supplied forwarding metadata and supplies canonical forwarding scheme and authority derived from the selected semantic origin: `https` and its exact public authority in standard mode, or the explicitly advertised sandbox scheme and authority in sandbox mode. The exact compatible header encoding is a Stage 2 detail. This synthesized metadata is advisory request context for framework behavior such as absolute-URL and secure-cookie generation; it is not proof that a request traversed locald, because another local process can connect to the private listener and forge the same headers. Applications must not use it alone for authentication, authorization, CSRF bypass, or capability binding. The application owner must explicitly accept the exact semantic origin returned by publication and retain its own request authorization. Exo continues to bind tickets and sessions to the exact workspace and public origin.
 
 For Exo, every workbench ticket and session must be bound to both its exact workspace and the returned public origin. A ticket minted for one worktree origin must fail through another worktree origin even when both leases point at the same Exo daemon endpoint.
 
@@ -316,8 +321,9 @@ When a project declares a published workbench and locald is available:
 1. Exo validates the exact workspace and resolves the focused lane.
 2. Exo starts or reuses its loopback workbench host.
 3. Exo acquires or renews the worktree's published service lease.
-4. Exo waits for locald to report the exact binding ready.
-5. Exo mints a fresh workspace-and-origin-bound launch ticket and returns a URL using that origin and ticket fragment.
+4. If locald reports `route_paused`, Exo fails immediately with actionable `locald up` or Resume guidance instead of waiting or returning an unreachable URL.
+5. Exo waits for locald to report the exact binding ready.
+6. Exo mints a fresh workspace-and-origin-bound launch ticket and returns a URL using that origin and ticket fragment.
 
 The lane identifier never enters locald configuration, identity, status, or hostname. A focus change may reuse or atomically rebind the endpoint without renaming the service.
 
@@ -331,7 +337,7 @@ The first locald implementation is bounded to:
 - an ephemeral per-service publisher registry and deterministic clock-driven tests;
 - same-user acquire, renew, rebind, and release IPC with ownership-preserving loopback-listener transfer;
 - continuous endpoint health;
-- health-gated proxy resolution with semantic-origin forwarding, no-redirect probes, and generation-scoped connection cancellation;
+- health-gated proxy resolution with application-level HTTP probes, semantic-origin forwarding, standard HTTP-to-HTTPS redirect, no-redirect probe handling, and generation-scoped connection cancellation;
 - independent published-service status and safe agent projections;
 - config reload, project pause, expiry, and daemon-restart behavior;
 - one Exo workbench integration proof.
@@ -341,7 +347,7 @@ It does not include:
 - arbitrary remote hosts, URLs, or non-loopback endpoints;
 - remote publication;
 - publisher process adoption or signaling;
-- service-level published-route pause, stop, or restart;
+- service-level published-route pause or execution of stop, restart, or reset against the external runtime;
 - publisher log ingestion;
 - lane-aware hostnames or locald knowledge of Exo state;
 - generalized service dependencies involving published services;
@@ -358,6 +364,8 @@ The implementation must prove:
 - a lane focus change never changes the hostname;
 - one external endpoint may safely fulfill several worktree identities;
 - unknown, undeclared, wrong-instance, or non-published services cannot be published;
+- omitted domains produce the conventional exact origin, while an empty or wildcard-only domain list and a missing primary exact origin fail configuration validation;
+- omitted health configuration performs an application-level HTTP `/` probe, while TCP and command probes are rejected for published services;
 - wrong UID, spoofed PID, PID reuse, forged token, wrong epoch, and stale generation fail closed;
 - a raw port, non-listener descriptor, non-loopback listener, shareable listener, and descriptor from an unauthenticated publisher are rejected, while locald's retained capability prevents cross-user address takeover for the active binding;
 - locald's active standard and sandbox listener ports cannot be acquired or rebound as published endpoints;
@@ -370,9 +378,10 @@ The implementation must prove:
 - no lifecycle action signals the external process;
 - generic `locald up` can complete while an absent published service remains visibly waiting, and its success output names that service instead of presenting a bare `Ready`;
 - the owning launch workflow waits for the exact published binding to become ready;
-- service-level stop and restart return an honest externally-managed result without changing route or process;
+- a launch attempted while the route is paused fails immediately with actionable `locald up` or Resume guidance and does not clear the pause;
+- service-level stop, restart, and reset return an honest externally-managed result without changing route, binding, process, or external data;
 - status and agent output distinguish all required publication states without leaking private authority or endpoints;
-- HTTP, WebSocket, TLS, and Origin behavior work through the semantic domain; normal proxying and HTTP health probes replace untrusted forwarding headers with locald-generated public scheme and authority; probes send the exact semantic `Host`, including the advertised port when non-default, remain on the selected loopback binding, and never follow redirects;
+- HTTP, WebSocket, TLS, and Origin behavior work through the semantic domain; standard port-80 requests redirect to the exact HTTPS origin without reaching the upstream; HTTPS and sandbox proxying plus HTTP health probes replace untrusted forwarding headers with locald-generated public scheme and authority; that metadata is documented and tested as advisory rather than proxy authentication; probes send the exact semantic `Host`, including the advertised port when non-default, remain on the selected loopback binding, and never follow redirects;
 - an Exo ticket for one worktree cannot be replayed through another worktree;
 - Exo still returns a direct loopback launch when the project has not opted in, while an opted-in project fails with actionable guidance when locald is absent or inconsistent.
 
@@ -384,6 +393,7 @@ The implementation must prove:
 - External process logs and restart controls are not available through locald.
 - A short lease requires renewal and careful clock-driven race testing.
 - Listener-capability transfer and platform socket validation add Unix-specific IPC work to the first implementation.
+- HTTP-only health makes a non-HTTP externally owned runtime ineligible for the initial published-service type.
 - An unhealthy endpoint preserves identity but cannot provide automatic runtime recovery.
 - Exo must add origin-aware ticket and session validation before the stable origin is safe.
 - Status must explain a process that can remain alive while locald suppresses or loses its route.
@@ -455,4 +465,5 @@ Deferred. Automatic publisher reacquisition could immediately defeat an unpersis
 - external log ingestion;
 - a durable service-level route pause;
 - optional dependency edges involving published services;
+- authenticated proxy-to-upstream request metadata for consumers that need stronger provenance than advisory forwarding context;
 - additional external runtime owners beyond Exo.
