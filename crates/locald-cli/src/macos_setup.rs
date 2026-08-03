@@ -70,7 +70,11 @@ impl<T> RuntimeQuiescence for T {}
 
 trait SetupPlatform {
     fn install_system_trust(&self, certificate: &Path) -> Result<()>;
-    fn quiesce_runtime(&self, owner: &SetupOwner) -> Result<Box<dyn RuntimeQuiescence>>;
+    fn quiesce_runtime(
+        &self,
+        owner: &SetupOwner,
+        launch_agent_plist: &Path,
+    ) -> Result<Box<dyn RuntimeQuiescence>>;
     fn retire_native_host_entries(&self) -> Result<()>;
     fn start_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()>;
     fn install_helper(&self, bytes: &[u8], authority: &HelperAuthority) -> Result<()>;
@@ -84,9 +88,16 @@ impl SetupPlatform for SystemPlatform {
         crate::trust::install_ca_macos(certificate)
     }
 
-    fn quiesce_runtime(&self, owner: &SetupOwner) -> Result<Box<dyn RuntimeQuiescence>> {
-        bootout_launch_agent(owner)?;
-        stop_user_daemon(owner).map(|guard| Box::new(guard) as Box<dyn RuntimeQuiescence>)
+    fn quiesce_runtime(
+        &self,
+        owner: &SetupOwner,
+        launch_agent_plist: &Path,
+    ) -> Result<Box<dyn RuntimeQuiescence>> {
+        quiesce_runtime_transactionally(
+            || bootout_launch_agent(owner),
+            || stop_user_daemon(owner),
+            || self.start_launch_agent(owner, launch_agent_plist),
+        )
     }
 
     fn retire_native_host_entries(&self) -> Result<()> {
@@ -123,6 +134,26 @@ impl SetupPlatform for SystemPlatform {
 
     fn probe_helper(&self) -> Result<()> {
         crate::macos_helper::probe()
+    }
+}
+
+fn quiesce_runtime_transactionally<T>(
+    bootout: impl FnOnce() -> Result<()>,
+    stop_daemon: impl FnOnce() -> Result<T>,
+    restore_launch_agent: impl FnOnce() -> Result<()>,
+) -> Result<Box<dyn RuntimeQuiescence>>
+where
+    T: RuntimeQuiescence + 'static,
+{
+    bootout()?;
+    match stop_daemon() {
+        Ok(guard) => Ok(Box::new(guard)),
+        Err(quiescence_error) => match restore_launch_agent() {
+            Ok(()) => Err(quiescence_error),
+            Err(restart_error) => Err(quiescence_error.context(format!(
+                "the daemon could not be quiesced and the locald LaunchAgent could not be restored: {restart_error:#}"
+            ))),
+        },
     }
 }
 
@@ -518,9 +549,6 @@ fn run_setup_with(
     platform
         .install_system_trust(&ca.paths.cert_path)
         .context("could not install Root CA into system trust")?;
-    let runtime_quiescence = platform
-        .quiesce_runtime(owner)
-        .context("could not quiesce the installed locald runtime for repair")?;
     platform
         .retire_native_host_entries()
         .context("could not remove redundant .localhost hosts-file entries")?;
@@ -561,19 +589,32 @@ fn run_setup_with(
         owner.gid,
     )
     .context("could not install the locald LaunchAgent plist")?;
-    platform
-        .install_helper(helper_bytes, authority)
-        .map_err(|error| {
-            anyhow::anyhow!("could not install the privileged helper transaction: {error:#}")
-        })?;
-    platform
-        .probe_helper()
-        .context("privileged helper postflight probe failed")?;
+
+    let runtime_quiescence = platform
+        .quiesce_runtime(owner, &paths.launch_agent)
+        .context("could not quiesce the installed locald runtime for repair")?;
+    let helper_result = (|| {
+        platform
+            .install_helper(helper_bytes, authority)
+            .map_err(|error| {
+                anyhow::anyhow!("could not install the privileged helper transaction: {error:#}")
+            })?;
+        platform
+            .probe_helper()
+            .context("privileged helper postflight probe failed")
+    })();
     drop(runtime_quiescence);
-    platform
+    let launch_agent_result = platform
         .start_launch_agent(owner, &paths.launch_agent)
-        .context("could not start the locald menu bar agent")?;
-    Ok(())
+        .context("could not start the locald menu bar agent");
+
+    match (helper_result, launch_agent_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(repair_error), Err(restart_error)) => Err(repair_error.context(format!(
+            "the helper repair failed and the locald LaunchAgent could not be restored: {restart_error:#}"
+        ))),
+    }
 }
 
 /// Collect the canonical structured macOS installation-readiness report.
@@ -1200,6 +1241,17 @@ mod tests {
     #[derive(Default)]
     struct RecordingPlatform {
         calls: Arc<Mutex<Vec<&'static str>>>,
+        fail_at: Vec<&'static str>,
+    }
+
+    impl RecordingPlatform {
+        fn record(&self, call: &'static str) -> Result<()> {
+            self.calls.lock().unwrap().push(call);
+            if self.fail_at.contains(&call) {
+                anyhow::bail!("injected {call} failure");
+            }
+            Ok(())
+        }
     }
 
     struct RecordingQuiescence {
@@ -1214,35 +1266,34 @@ mod tests {
 
     impl SetupPlatform for RecordingPlatform {
         fn install_system_trust(&self, _certificate: &Path) -> Result<()> {
-            self.calls.lock().unwrap().push("trust");
-            Ok(())
+            self.record("trust")
         }
 
-        fn quiesce_runtime(&self, _owner: &SetupOwner) -> Result<Box<dyn RuntimeQuiescence>> {
-            self.calls.lock().unwrap().push("quiesce");
+        fn quiesce_runtime(
+            &self,
+            _owner: &SetupOwner,
+            _launch_agent_plist: &Path,
+        ) -> Result<Box<dyn RuntimeQuiescence>> {
+            self.record("quiesce")?;
             Ok(Box::new(RecordingQuiescence {
                 calls: Arc::clone(&self.calls),
             }))
         }
 
         fn retire_native_host_entries(&self) -> Result<()> {
-            self.calls.lock().unwrap().push("hosts-cleanup");
-            Ok(())
+            self.record("hosts-cleanup")
         }
 
         fn start_launch_agent(&self, _owner: &SetupOwner, _plist: &Path) -> Result<()> {
-            self.calls.lock().unwrap().push("agent");
-            Ok(())
+            self.record("agent")
         }
 
         fn install_helper(&self, _bytes: &[u8], _authority: &HelperAuthority) -> Result<()> {
-            self.calls.lock().unwrap().push("helper");
-            Ok(())
+            self.record("helper")
         }
 
         fn probe_helper(&self) -> Result<()> {
-            self.calls.lock().unwrap().push("probe");
-            Ok(())
+            self.record("probe")
         }
     }
 
@@ -1310,20 +1361,178 @@ mod tests {
             platform.calls.lock().unwrap().as_slice(),
             [
                 "trust",
-                "quiesce",
                 "hosts-cleanup",
+                "quiesce",
                 "helper",
                 "probe",
                 "release",
                 "agent",
                 "trust",
-                "quiesce",
                 "hosts-cleanup",
+                "quiesce",
                 "helper",
                 "probe",
                 "release",
                 "agent"
             ]
+        );
+    }
+
+    #[test]
+    fn hosts_cleanup_failure_returns_before_runtime_quiescence() {
+        let (_root, owner, paths, authority) = fixture();
+        let platform = RecordingPlatform {
+            fail_at: vec!["hosts-cleanup"],
+            ..RecordingPlatform::default()
+        };
+
+        let error = run_setup_with(
+            &owner,
+            &paths,
+            b"agent-v1",
+            b"helper-v1",
+            &authority,
+            &platform,
+        )
+        .expect_err("hosts cleanup failure must stop before quiescence");
+
+        assert!(
+            format!("{error:#}")
+                .contains("could not remove redundant .localhost hosts-file entries")
+        );
+        assert_eq!(
+            platform.calls.lock().unwrap().as_slice(),
+            ["trust", "hosts-cleanup"]
+        );
+        assert!(!paths.agent.exists());
+        assert!(!paths.launch_agent.exists());
+    }
+
+    #[test]
+    fn helper_failure_restarts_the_quiesced_runtime_before_returning() {
+        let (_root, owner, paths, authority) = fixture();
+        let platform = RecordingPlatform {
+            fail_at: vec!["helper"],
+            ..RecordingPlatform::default()
+        };
+
+        let error = run_setup_with(
+            &owner,
+            &paths,
+            b"agent-v1",
+            b"helper-v1",
+            &authority,
+            &platform,
+        )
+        .expect_err("helper failure must be reported after runtime restoration");
+
+        assert!(
+            format!("{error:#}").contains("could not install the privileged helper transaction")
+        );
+        assert_eq!(
+            platform.calls.lock().unwrap().as_slice(),
+            [
+                "trust",
+                "hosts-cleanup",
+                "quiesce",
+                "helper",
+                "release",
+                "agent"
+            ]
+        );
+        assert!(paths.agent.exists());
+        assert!(paths.launch_agent.exists());
+    }
+
+    #[test]
+    fn setup_reports_both_helper_and_runtime_restoration_failures() {
+        let (_root, owner, paths, authority) = fixture();
+        let platform = RecordingPlatform {
+            fail_at: vec!["helper", "agent"],
+            ..RecordingPlatform::default()
+        };
+
+        let error = run_setup_with(
+            &owner,
+            &paths,
+            b"agent-v1",
+            b"helper-v1",
+            &authority,
+            &platform,
+        )
+        .expect_err("both failures must remain visible");
+        let error = format!("{error:#}");
+
+        assert!(error.contains("could not install the privileged helper transaction"));
+        assert!(error.contains("locald LaunchAgent could not be restored"));
+        assert!(error.contains("injected agent failure"));
+        assert_eq!(
+            platform.calls.lock().unwrap().as_slice(),
+            [
+                "trust",
+                "hosts-cleanup",
+                "quiesce",
+                "helper",
+                "release",
+                "agent"
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_runtime_quiescence_restores_the_launch_agent() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let error = quiesce_runtime_transactionally(
+            || {
+                calls.lock().unwrap().push("bootout");
+                Ok(())
+            },
+            || -> Result<RecordingQuiescence> {
+                calls.lock().unwrap().push("stop");
+                anyhow::bail!("injected daemon stop failure")
+            },
+            || {
+                calls.lock().unwrap().push("agent");
+                Ok(())
+            },
+        )
+        .err()
+        .expect("daemon stop failure must be returned after restoration");
+
+        assert!(format!("{error:#}").contains("injected daemon stop failure"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["bootout", "stop", "agent"]
+        );
+    }
+
+    #[test]
+    fn partial_runtime_quiescence_reports_restoration_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let error = quiesce_runtime_transactionally(
+            || {
+                calls.lock().unwrap().push("bootout");
+                Ok(())
+            },
+            || -> Result<RecordingQuiescence> {
+                calls.lock().unwrap().push("stop");
+                anyhow::bail!("injected daemon stop failure")
+            },
+            || {
+                calls.lock().unwrap().push("agent");
+                anyhow::bail!("injected agent restoration failure")
+            },
+        )
+        .err()
+        .expect("both daemon stop and restoration failures must be reported");
+        let error = format!("{error:#}");
+
+        assert!(error.contains("injected daemon stop failure"));
+        assert!(error.contains("locald LaunchAgent could not be restored"));
+        assert!(error.contains("injected agent restoration failure"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["bootout", "stop", "agent"]
         );
     }
 
