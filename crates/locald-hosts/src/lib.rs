@@ -285,11 +285,8 @@ fn parse_managed_section(content: &str) -> Result<ManagedSection, ManagedSection
 
     for (line_index, segment) in content.split_inclusive('\n').enumerate() {
         let line_number = line_index + 1;
-        let line = segment
-            .strip_suffix('\n')
-            .unwrap_or(segment)
-            .strip_suffix('\r')
-            .unwrap_or_else(|| segment.strip_suffix('\n').unwrap_or(segment));
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line == START_MARKER {
             if start.is_some() {
                 return Err(ManagedSectionError::structural(
@@ -1488,6 +1485,28 @@ mod tests {
 
         assert!(rendered.starts_with(prefix));
         assert!(rendered.ends_with(suffix));
+        assert!(rendered.contains("127.0.0.1 new.example.local\n"));
+        assert!(!rendered.contains("old.local"));
+    }
+
+    #[test]
+    fn crlf_markers_are_replaced_without_leaving_a_stale_section() {
+        let prefix = "127.0.0.1 localhost\r\n# an unrelated comment\r\n";
+        let suffix = "::1 localhost\r\n";
+        let current =
+            format!("{prefix}# BEGIN locald\r\n127.0.0.1 old.local\r\n# END locald\r\n{suffix}");
+        let hosts = HostSet::try_from_strings(["new.example.local"]).unwrap();
+
+        assert_eq!(
+            managed_host_set(&current).unwrap().as_strings(),
+            vec!["old.local"]
+        );
+        let rendered = render_hosts_content(&current, &hosts).unwrap();
+
+        assert!(rendered.starts_with(prefix));
+        assert!(rendered.ends_with(suffix));
+        assert_eq!(rendered.matches(START_MARKER).count(), 1);
+        assert_eq!(rendered.matches(END_MARKER).count(), 1);
         assert!(rendered.contains("127.0.0.1 new.example.local\n"));
         assert!(!rendered.contains("old.local"));
     }
