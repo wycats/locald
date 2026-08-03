@@ -1209,11 +1209,6 @@ fn apply_access_control_list(
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn read_access_control_list(_file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
-    Ok(None)
-}
-
 #[cfg(target_os = "macos")]
 fn read_file_flags(file: &std::fs::File) -> std::io::Result<Option<u32>> {
     use std::os::macos::fs::MetadataExt as _;
@@ -1394,8 +1389,11 @@ fn read_snapshot(
     }
     let extended_attributes = read_extended_attributes(&file)
         .map_err(|error| ReplaceHostsError::io(ReplaceStage::Read, error))?;
+    #[cfg(target_os = "macos")]
     let access_control_list = read_access_control_list(&file)
         .map_err(|error| ReplaceHostsError::io(ReplaceStage::Read, error))?;
+    #[cfg(not(target_os = "macos"))]
+    let access_control_list = None;
     let file_flags =
         read_file_flags(&file).map_err(|error| ReplaceHostsError::io(ReplaceStage::Read, error))?;
     let file_flags = normalized_file_flags(file_flags)?;
