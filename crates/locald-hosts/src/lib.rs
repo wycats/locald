@@ -666,6 +666,7 @@ struct TargetSnapshot {
     uid: u32,
     gid: u32,
     extended_attributes: Vec<(std::ffi::OsString, Vec<u8>)>,
+    access_control_list: Option<Vec<u8>>,
     file_flags: Option<u32>,
     bytes: Vec<u8>,
 }
@@ -679,6 +680,7 @@ impl TargetSnapshot {
             && self.uid == other.uid
             && self.gid == other.gid
             && self.extended_attributes == other.extended_attributes
+            && self.access_control_list == other.access_control_list
             && self.file_flags == other.file_flags
             && self.bytes == other.bytes
     }
@@ -853,6 +855,15 @@ fn replace_hosts_file_with_hook(
         hook.check(WriteHookPoint::BeforeRename)
             .map_err(|error| ReplaceHostsError::io(ReplaceStage::Rename, error))?;
         let candidate = read_snapshot(&directory, std::ffi::OsStr::new(&temporary))?;
+        if candidate.access_control_list != original.access_control_list {
+            return Err(ReplaceHostsError::io(
+                ReplaceStage::Write,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "prepared hosts file ACL does not match its captured source ACL",
+                ),
+            ));
+        }
         exchange_entries(&directory, std::ffi::OsStr::new(&temporary), name)
             .map_err(|error| ReplaceHostsError::io(ReplaceStage::Rename, error))?;
         exchange_started = true;
@@ -1086,6 +1097,124 @@ fn replace_extended_attributes(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn read_access_control_list(file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd as _;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_size(acl: *mut c_void) -> libc::ssize_t;
+        fn acl_copy_ext(
+            buffer: *mut c_void,
+            acl: *mut c_void,
+            size: libc::ssize_t,
+        ) -> libc::ssize_t;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+
+    let result = (|| {
+        let size = unsafe { acl_size(acl) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let size = usize::try_from(size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "hosts-file ACL size is outside the supported range",
+            )
+        })?;
+        if size > MAX_HOSTS_FILE_BYTES {
+            return Err(std::io::Error::other("hosts-file ACL exceeds safety bound"));
+        }
+
+        let mut bytes = vec![0_u8; size];
+        let copied = unsafe {
+            acl_copy_ext(
+                bytes.as_mut_ptr().cast::<c_void>(),
+                acl,
+                libc::ssize_t::try_from(size).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "hosts-file ACL size is outside the supported range",
+                    )
+                })?,
+            )
+        };
+        if copied < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if usize::try_from(copied).ok() != Some(size) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "hosts-file ACL serialization was incomplete",
+            ));
+        }
+        Ok(Some(bytes))
+    })();
+
+    let free_result = unsafe { acl_free(acl) };
+    if free_result != 0 && result.is_ok() {
+        return Err(std::io::Error::last_os_error());
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn apply_access_control_list(
+    file: &std::fs::File,
+    serialized: Option<&[u8]>,
+) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd as _;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_copy_int(buffer: *const c_void) -> *mut c_void;
+        fn acl_init(count: libc::c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: libc::c_int, acl: *mut c_void, acl_type: libc::c_int) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    let acl = serialized.map_or_else(
+        || unsafe { acl_init(0) },
+        |serialized| unsafe { acl_copy_int(serialized.as_ptr().cast::<c_void>()) },
+    );
+    if acl.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let set_result = unsafe { acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
+    let set_error = (set_result != 0).then(std::io::Error::last_os_error);
+    let free_result = unsafe { acl_free(acl) };
+    if let Some(error) = set_error {
+        return Err(error);
+    }
+    if free_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_access_control_list(_file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
 fn read_file_flags(file: &std::fs::File) -> std::io::Result<Option<u32>> {
     use std::os::macos::fs::MetadataExt as _;
     Ok(Some(file.metadata()?.st_flags()))
@@ -1161,23 +1290,14 @@ fn normalized_file_flags(flags: Option<u32>) -> Result<Option<u32>, ReplaceHosts
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn copy_platform_metadata(
-    source: &std::fs::File,
+    _source: &std::fs::File,
     destination: &std::fs::File,
     file_flags: Option<u32>,
+    access_control_list: Option<&[u8]>,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
-    let copied = unsafe {
-        libc::fcopyfile(
-            source.as_raw_fd(),
-            destination.as_raw_fd(),
-            std::ptr::null_mut(),
-            libc::COPYFILE_ACL,
-        )
-    };
-    if copied != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    apply_access_control_list(destination, access_control_list)?;
     if let Some(flags) = file_flags {
         let changed = unsafe { libc::fchflags(destination.as_raw_fd(), flags) };
         if changed != 0 {
@@ -1193,6 +1313,7 @@ fn copy_platform_metadata(
     _source: &std::fs::File,
     destination: &std::fs::File,
     file_flags: Option<u32>,
+    _access_control_list: Option<&[u8]>,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
@@ -1209,6 +1330,7 @@ fn copy_platform_metadata(
     _source: &std::fs::File,
     _destination: &std::fs::File,
     _file_flags: Option<u32>,
+    _access_control_list: Option<&[u8]>,
 ) -> std::io::Result<()> {
     Ok(())
 }
@@ -1219,7 +1341,12 @@ fn copy_preserved_metadata(
     destination: &std::fs::File,
 ) -> std::io::Result<()> {
     replace_extended_attributes(destination, &source.extended_attributes)?;
-    copy_platform_metadata(&source.file, destination, source.file_flags)
+    copy_platform_metadata(
+        &source.file,
+        destination,
+        source.file_flags,
+        source.access_control_list.as_deref(),
+    )
 }
 
 #[cfg(unix)]
@@ -1267,6 +1394,8 @@ fn read_snapshot(
     }
     let extended_attributes = read_extended_attributes(&file)
         .map_err(|error| ReplaceHostsError::io(ReplaceStage::Read, error))?;
+    let access_control_list = read_access_control_list(&file)
+        .map_err(|error| ReplaceHostsError::io(ReplaceStage::Read, error))?;
     let file_flags =
         read_file_flags(&file).map_err(|error| ReplaceHostsError::io(ReplaceStage::Read, error))?;
     let file_flags = normalized_file_flags(file_flags)?;
@@ -1278,6 +1407,7 @@ fn read_snapshot(
         uid: metadata.uid(),
         gid: metadata.gid(),
         extended_attributes,
+        access_control_list,
         file_flags,
         bytes,
     })
@@ -1393,6 +1523,32 @@ mod tests {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        fn add_fixture_acl(path: &std::path::Path) -> std::io::Result<()> {
+            let status = std::process::Command::new("/bin/chmod")
+                .args(["+a", "everyone allow read"])
+                .arg(path)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("chmod exited with {status}")))
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn clear_fixture_acl(path: &std::path::Path) -> std::io::Result<()> {
+            let status = std::process::Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(path)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("chmod exited with {status}")))
+            }
+        }
+
         struct TestHook {
             point: WriteHookPoint,
             action: Option<Box<dyn FnOnce() + Send>>,
@@ -1428,6 +1584,31 @@ mod tests {
                     WriteHookPoint::AfterExchange => self.after_initial.take(),
                     WriteHookPoint::AfterRestoreExchange => self.after_restore.take(),
                     _ => None,
+                };
+                if let Some(action) = action {
+                    action();
+                }
+                Ok(())
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        struct TwoStageHook {
+            first_point: WriteHookPoint,
+            first: Option<Box<dyn FnOnce() + Send>>,
+            second_point: WriteHookPoint,
+            second: Option<Box<dyn FnOnce() + Send>>,
+        }
+
+        #[cfg(target_os = "macos")]
+        impl WriteHook for TwoStageHook {
+            fn check(&mut self, point: WriteHookPoint) -> std::io::Result<()> {
+                let action = if point == self.first_point {
+                    self.first.take()
+                } else if point == self.second_point {
+                    self.second.take()
+                } else {
+                    None
                 };
                 if let Some(action) = action {
                     action();
@@ -1480,6 +1661,75 @@ mod tests {
             );
             assert!(content.starts_with("127.0.0.1 localhost\n"));
             assert!(content.contains("127.0.0.1 custom.example.local\n"));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn durable_replace_preserves_access_control_list() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hosts");
+            std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+            add_fixture_acl(&path).unwrap();
+            let before = read_access_control_list(&std::fs::File::open(&path).unwrap()).unwrap();
+            assert!(before.is_some());
+            let hosts = HostSet::try_from_strings(["custom.example.local"]).unwrap();
+
+            replace_hosts_file(&path, &hosts).unwrap();
+
+            let after = read_access_control_list(&std::fs::File::open(&path).unwrap()).unwrap();
+            assert_eq!(after, before);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn applying_an_absent_access_control_list_clears_an_existing_acl() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hosts");
+            std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+            add_fixture_acl(&path).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            assert!(read_access_control_list(&file).unwrap().is_some());
+
+            apply_access_control_list(&file, None).unwrap();
+
+            assert_eq!(read_access_control_list(&file).unwrap(), None);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn prepared_acl_comes_from_the_snapshot_across_an_aba_source_change() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hosts");
+            std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+            let added_path = path.clone();
+            let cleared_path = path.clone();
+            let mut hook = TwoStageHook {
+                first_point: WriteHookPoint::AfterRead,
+                first: Some(Box::new(move || {
+                    add_fixture_acl(&added_path).unwrap();
+                })),
+                second_point: WriteHookPoint::AfterTemporarySync,
+                second: Some(Box::new(move || {
+                    clear_fixture_acl(&cleared_path).unwrap();
+                })),
+            };
+            let hosts = HostSet::try_from_strings(["new.example.local"]).unwrap();
+
+            replace_hosts_file_with_hook(&path, None, &hosts, &mut hook).unwrap();
+
+            assert_eq!(
+                read_access_control_list(&std::fs::File::open(&path).unwrap()).unwrap(),
+                None
+            );
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("new.example.local")
+            );
         }
 
         #[cfg(target_os = "macos")]
@@ -1711,6 +1961,36 @@ mod tests {
             assert_eq!(error.stage(), ReplaceStage::Read);
             assert!(!error.publication_may_be_visible());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn concurrent_acl_change_after_revalidation_is_exchanged_back_without_overwrite() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hosts");
+            let original = "127.0.0.1 localhost\n";
+            std::fs::write(&path, original).unwrap();
+            let changed_path = path.clone();
+            let mut hook = TestHook {
+                point: WriteHookPoint::BeforeRename,
+                action: Some(Box::new(move || {
+                    add_fixture_acl(&changed_path).unwrap();
+                })),
+                fail: false,
+            };
+            let hosts = HostSet::try_from_strings(["new.example.local"]).unwrap();
+
+            let error = replace_hosts_file_with_hook(&path, None, &hosts, &mut hook).unwrap_err();
+
+            assert_eq!(error.stage(), ReplaceStage::Read);
+            assert!(!error.publication_may_be_visible());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(
+                read_access_control_list(&std::fs::File::open(&path).unwrap())
+                    .unwrap()
+                    .is_some()
+            );
             assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         }
 
