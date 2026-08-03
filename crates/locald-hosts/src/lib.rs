@@ -586,7 +586,8 @@ impl Error for ReplaceHostsError {
 /// The writer anchors all target operations to an opened parent directory,
 /// rejects symlinked and non-regular targets, preserves the target's safe
 /// permission bits and ownership, synchronizes a same-directory temporary,
-/// checks for a concurrent target change, renames atomically, and synchronizes
+/// atomically exchanges it with the target, verifies the exact displaced
+/// entry, restores a concurrent writer without overwriting it, and synchronizes
 /// the parent directory.
 ///
 /// # Errors
@@ -606,7 +607,8 @@ pub fn replace_hosts_file(
 /// This variant is intended for read/filter/write operations such as setup
 /// cleanup. It prevents a complete host set derived from an earlier read from
 /// overwriting a concurrent daemon publication. The writer also performs its
-/// normal second snapshot comparison immediately before rename.
+/// normal second snapshot comparison and displaced-entry verification around
+/// the atomic exchange.
 ///
 /// # Errors
 ///
@@ -633,6 +635,8 @@ enum WriteHookPoint {
     AfterRead,
     AfterTemporarySync,
     BeforeRename,
+    AfterExchange,
+    AfterRestoreExchange,
     AfterRename,
 }
 
@@ -802,7 +806,8 @@ fn replace_hosts_file_with_hook(
     )
     .map_err(|error| ReplaceHostsError::io(ReplaceStage::Write, error))?;
     let mut temporary_file = File::from(temporary_fd);
-    let mut renamed = false;
+    let mut exchange_started = false;
+    let mut preserve_temporary = false;
 
     let result = (|| {
         temporary_file
@@ -847,9 +852,84 @@ fn replace_hosts_file_with_hook(
         }
         hook.check(WriteHookPoint::BeforeRename)
             .map_err(|error| ReplaceHostsError::io(ReplaceStage::Rename, error))?;
-        nix::fcntl::renameat(&directory, temporary.as_str(), &directory, name)
+        let candidate = read_snapshot(&directory, std::ffi::OsStr::new(&temporary))?;
+        exchange_entries(&directory, std::ffi::OsStr::new(&temporary), name)
             .map_err(|error| ReplaceHostsError::io(ReplaceStage::Rename, error))?;
-        renamed = true;
+        exchange_started = true;
+        hook.check(WriteHookPoint::AfterExchange).map_err(|error| {
+            preserve_temporary = true;
+            ReplaceHostsError::io(ReplaceStage::ParentSync, error)
+        })?;
+
+        let displaced =
+            read_snapshot(&directory, std::ffi::OsStr::new(&temporary)).map_err(|error| {
+                preserve_temporary = true;
+                ReplaceHostsError::io(ReplaceStage::ParentSync, std::io::Error::other(error))
+            })?;
+        if !original.same_target_and_content(&displaced) {
+            // The atomic exchange captured a writer that landed after our
+            // final snapshot. Restore that exact entry without ever replacing
+            // a still-newer writer: each exchange publishes the most recently
+            // displaced entry and captures the current target for comparison.
+            let mut expected_target = candidate;
+            loop {
+                let about_to_publish = read_snapshot(&directory, std::ffi::OsStr::new(&temporary))
+                    .map_err(|error| {
+                        preserve_temporary = true;
+                        ReplaceHostsError::io(
+                            ReplaceStage::ParentSync,
+                            std::io::Error::other(error),
+                        )
+                    })?;
+                exchange_entries(&directory, std::ffi::OsStr::new(&temporary), name).map_err(
+                    |error| {
+                        preserve_temporary = true;
+                        ReplaceHostsError::io(ReplaceStage::ParentSync, error)
+                    },
+                )?;
+                hook.check(WriteHookPoint::AfterRestoreExchange)
+                    .map_err(|error| {
+                        preserve_temporary = true;
+                        ReplaceHostsError::io(ReplaceStage::ParentSync, error)
+                    })?;
+                let captured = read_snapshot(&directory, std::ffi::OsStr::new(&temporary))
+                    .map_err(|error| {
+                        preserve_temporary = true;
+                        ReplaceHostsError::io(
+                            ReplaceStage::ParentSync,
+                            std::io::Error::other(error),
+                        )
+                    })?;
+                if expected_target.same_target_and_content(&captured) {
+                    nix::unistd::unlinkat(
+                        &directory,
+                        temporary.as_str(),
+                        nix::unistd::UnlinkatFlags::NoRemoveDir,
+                    )
+                    .map_err(|error| {
+                        preserve_temporary = true;
+                        ReplaceHostsError::io(ReplaceStage::ParentSync, error)
+                    })?;
+                    nix::unistd::fsync(&directory)
+                        .map_err(|error| ReplaceHostsError::io(ReplaceStage::ParentSync, error))?;
+                    return Err(ReplaceHostsError::new(
+                        ReplaceStage::Read,
+                        ReplaceHostsErrorKind::ConcurrentModification,
+                    ));
+                }
+                expected_target = about_to_publish;
+            }
+        }
+
+        nix::unistd::unlinkat(
+            &directory,
+            temporary.as_str(),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(|error| {
+            preserve_temporary = true;
+            ReplaceHostsError::io(ReplaceStage::ParentSync, error)
+        })?;
         hook.check(WriteHookPoint::AfterRename)
             .map_err(|error| ReplaceHostsError::io(ReplaceStage::ParentSync, error))?;
         nix::unistd::fsync(&directory)
@@ -857,7 +937,7 @@ fn replace_hosts_file_with_hook(
         Ok(())
     })();
 
-    if !renamed {
+    if !exchange_started && !preserve_temporary {
         let _cleanup_failed = nix::unistd::unlinkat(
             &directory,
             temporary.as_str(),
@@ -870,6 +950,78 @@ fn replace_hosts_file_with_hook(
 
 #[cfg(unix)]
 static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn exchange_entries(
+    directory: &std::os::fd::OwnedFd,
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let left = std::ffi::CString::new(left.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name"))?;
+    let right = std::ffi::CString::new(right.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name"))?;
+    let result = unsafe {
+        nix::libc::renameat2(
+            directory.as_raw_fd(),
+            left.as_ptr(),
+            directory.as_raw_fd(),
+            right.as_ptr(),
+            nix::libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn exchange_entries(
+    directory: &std::os::fd::OwnedFd,
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let left = std::ffi::CString::new(left.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name"))?;
+    let right = std::ffi::CString::new(right.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name"))?;
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            directory.as_raw_fd(),
+            left.as_ptr(),
+            directory.as_raw_fd(),
+            right.as_ptr(),
+            nix::libc::RENAME_SWAP,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn exchange_entries(
+    _directory: &std::os::fd::OwnedFd,
+    _left: &std::ffi::OsStr,
+    _right: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no supported atomic exchange operation",
+    ))
+}
 
 #[cfg(target_os = "linux")]
 nix::ioctl_read!(
@@ -1044,7 +1196,7 @@ fn copy_platform_metadata(
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
-    if let Some(flags) = file_flags {
+    if let Some(flags) = file_flags.filter(|flags| *flags != 0) {
         let flags = nix::libc::c_long::from(flags);
         unsafe { set_file_flags(destination.as_raw_fd(), &raw const flags) }
             .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
@@ -1260,6 +1412,27 @@ mod tests {
                 } else {
                     Ok(())
                 }
+            }
+        }
+
+        struct MultiStageHook {
+            before: Option<Box<dyn FnOnce() + Send>>,
+            after_initial: Option<Box<dyn FnOnce() + Send>>,
+            after_restore: Option<Box<dyn FnOnce() + Send>>,
+        }
+
+        impl WriteHook for MultiStageHook {
+            fn check(&mut self, point: WriteHookPoint) -> std::io::Result<()> {
+                let action = match point {
+                    WriteHookPoint::BeforeRename => self.before.take(),
+                    WriteHookPoint::AfterExchange => self.after_initial.take(),
+                    WriteHookPoint::AfterRestoreExchange => self.after_restore.take(),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    action();
+                }
+                Ok(())
             }
         }
 
@@ -1513,6 +1686,69 @@ mod tests {
                 std::fs::read_to_string(path).unwrap(),
                 "127.0.0.1 localhost\n# concurrent\n"
             );
+        }
+
+        #[test]
+        fn concurrent_change_after_revalidation_is_exchanged_back_without_overwrite() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hosts");
+            std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+            let changed_path = path.clone();
+            let concurrent = "127.0.0.1 localhost\n# concurrent after validation\n";
+            let mut hook = TestHook {
+                point: WriteHookPoint::BeforeRename,
+                action: Some(Box::new(move || {
+                    let replacement = changed_path.with_extension("external");
+                    std::fs::write(&replacement, concurrent).unwrap();
+                    std::fs::rename(replacement, changed_path).unwrap();
+                })),
+                fail: false,
+            };
+            let hosts = HostSet::try_from_strings(["new.example.local"]).unwrap();
+
+            let error = replace_hosts_file_with_hook(&path, None, &hosts, &mut hook).unwrap_err();
+
+            assert_eq!(error.stage(), ReplaceStage::Read);
+            assert!(!error.publication_may_be_visible());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn rollback_exchange_preserves_every_finite_concurrent_replacement() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hosts");
+            std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+            let first_path = path.clone();
+            let second_path = path.clone();
+            let third_path = path.clone();
+            let first = "127.0.0.1 localhost\n# first concurrent writer\n";
+            let second = "127.0.0.1 localhost\n# second concurrent writer\n";
+            let third = "127.0.0.1 localhost\n# third concurrent writer\n";
+            let mut hook = MultiStageHook {
+                before: Some(Box::new(move || {
+                    let replacement = first_path.with_extension("first");
+                    std::fs::write(&replacement, first).unwrap();
+                    std::fs::rename(replacement, first_path).unwrap();
+                })),
+                after_initial: Some(Box::new(move || {
+                    let replacement = second_path.with_extension("second");
+                    std::fs::write(&replacement, second).unwrap();
+                    std::fs::rename(replacement, second_path).unwrap();
+                })),
+                after_restore: Some(Box::new(move || {
+                    let replacement = third_path.with_extension("third");
+                    std::fs::write(&replacement, third).unwrap();
+                    std::fs::rename(replacement, third_path).unwrap();
+                })),
+            };
+            let hosts = HostSet::try_from_strings(["new.example.local"]).unwrap();
+
+            let error = replace_hosts_file_with_hook(&path, None, &hosts, &mut hook).unwrap_err();
+
+            assert_eq!(error.stage(), ReplaceStage::Read);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), third);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         }
 
         #[test]

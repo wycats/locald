@@ -133,6 +133,7 @@ use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -173,6 +174,7 @@ impl CatalogWriterLock {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(path)
             .with_context(|| format!("failed to open catalog writer lock `{}`", path.display()))?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1071,6 +1073,7 @@ mod catalog_writer_lock_tests {
         CatalogWriterLock, INHERITED_CATALOG_WRITER_LOCK_FD, path_entry_exists, restart_environment,
     };
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt as _;
 
     #[allow(unsafe_code)]
     fn close_on_exec(fd: std::os::fd::RawFd) -> bool {
@@ -1084,6 +1087,10 @@ mod catalog_writer_lock_tests {
         let directory = tempfile::tempdir().expect("create lock test directory");
         let path = directory.path().join("catalog.writer.lock");
         let first = CatalogWriterLock::acquire_at(&path).expect("acquire first writer lock");
+        assert_eq!(
+            first.file.metadata().expect("inspect lock").mode() & 0o7777,
+            0o600
+        );
 
         let error =
             CatalogWriterLock::acquire_at(&path).expect_err("second live writer must be rejected");

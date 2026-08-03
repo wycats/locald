@@ -316,8 +316,22 @@ fn try_acquire_catalog_writer_lock(
         .metadata()
         .with_context(|| format!("could not inspect daemon lock at {}", path.display()))?;
     anyhow::ensure!(
-        metadata.is_file() && metadata.uid() == user_uid && metadata.mode() & 0o022 == 0,
+        metadata.is_file() && metadata.uid() == user_uid,
         "daemon lock at {} is not a safe owner-controlled regular file",
+        path.display()
+    );
+    if metadata.mode() & 0o7777 != 0o600 {
+        nix::sys::stat::fchmod(&file, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .with_context(|| format!("could not secure daemon lock at {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not sync daemon lock at {}", path.display()))?;
+    }
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not verify daemon lock at {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.uid() == user_uid && metadata.mode() & 0o7777 == 0o600,
+        "daemon lock at {} could not be secured as an owner-only regular file",
         path.display()
     );
 
@@ -1594,6 +1608,80 @@ mod tests {
         drop(guard);
         release_tx.send(()).expect("release late contender");
         assert_eq!(contender.join().expect("join late contender"), 0);
+    }
+
+    #[test]
+    fn daemon_quiescence_repairs_an_owner_controlled_group_writable_writer_lock() {
+        let root = tempfile::tempdir().expect("create daemon fixture");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonicalize daemon fixture");
+        let socket = root_path.join("locald.sock");
+        let lock = root_path.join("catalog.writer.lock");
+        std::fs::write(&lock, []).expect("create catalog writer lock");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o664))
+            .expect("make legacy lock group-writable");
+
+        let guard = stop_user_daemon_at(
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            &socket,
+            &lock,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(250),
+        )
+        .expect("repair and acquire daemon lock");
+
+        assert_eq!(
+            guard
+                ._catalog_writer_lock
+                .metadata()
+                .expect("inspect repaired lock")
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_quiescence_never_repairs_through_a_writer_lock_symlink() {
+        let root = tempfile::tempdir().expect("create daemon fixture");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonicalize daemon fixture");
+        let socket = root_path.join("locald.sock");
+        let lock = root_path.join("catalog.writer.lock");
+        let target = root_path.join("lock-target");
+        std::fs::write(&target, []).expect("create symlink target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o664))
+            .expect("make symlink target group-writable");
+        std::os::unix::fs::symlink(&target, &lock).expect("create writer-lock symlink");
+
+        let error = match stop_user_daemon_at(
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            &socket,
+            &lock,
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        ) {
+            Ok(_) => panic!("symlinked daemon lock must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("daemon lock"));
+        assert_eq!(
+            std::fs::metadata(target)
+                .expect("inspect untouched symlink target")
+                .mode()
+                & 0o7777,
+            0o664
+        );
     }
 
     #[test]
