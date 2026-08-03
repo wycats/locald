@@ -3354,6 +3354,7 @@ dependencies = [
  "locald-builder",
  "locald-core",
  "locald-helper-protocol",
+ "locald-hosts",
  "locald-server",
  "locald-utils",
  "miette",
@@ -3434,6 +3435,7 @@ dependencies = [
  "anyhow",
  "futures",
  "locald-helper-protocol",
+ "locald-hosts",
  "nix 0.30.1",
  "socket2 0.5.10",
  "tokio",
@@ -3459,6 +3461,12 @@ dependencies = [
 [[package]]
 name = "locald-hosts"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix 0.30.1",
+ "tempfile",
+ "xattr",
+]
 
 [[package]]
 name = "locald-oci"
@@ -3504,6 +3512,7 @@ dependencies = [
  "locald-builder",
  "locald-core",
  "locald-helper-protocol",
+ "locald-hosts",
  "locald-oci",
  "locald-utils",
  "mime_guess",
@@ -3554,6 +3563,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

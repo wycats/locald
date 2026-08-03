@@ -1,7 +1,8 @@
 //! macOS privileged helper daemon for locald.
 //!
-//! Runs as a `LaunchDaemon` and performs the one operation that requires
-//! persistent privilege: binding locald's listeners on ports 80 and 443.
+//! Runs as a `LaunchDaemon` and performs locald's narrowly scoped persistent
+//! privileged operations: binding ports 80/443 and atomically replacing the
+//! complete locald-managed section in `/etc/hosts`.
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,9 +23,11 @@ mod macos {
     use futures::stream::StreamExt;
     use locald_helper_protocol::code_signing;
     use locald_helper_protocol::{
-        AUTHORITY_PATH, AuthorityError, HelperAuthority, HelperCommand, HelperErrorCode,
-        HelperStatus, MACH_SERVICE, PROTOCOL_VERSION, is_supported_bind_port, load_authority,
+        AUTHORITY_PATH, AuthorityError, HOST_SET_MAX_BYTES, HOST_SET_MAX_DOMAINS, HOSTS_PATH,
+        HelperAuthority, HelperCommand, HelperErrorCode, HelperStatus, MACH_SERVICE,
+        PROTOCOL_VERSION, is_supported_bind_port, load_authority, validate_complete_host_set,
     };
+    use locald_hosts::{HostSet, ReplaceStage, replace_hosts_file};
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::os::unix::fs::MetadataExt;
@@ -232,6 +235,7 @@ mod macos {
         match command {
             HelperCommand::Probe => CommandResponse::message(success_response()),
             HelperCommand::Bind => execute_bind(dict),
+            HelperCommand::SyncHosts => execute_sync_hosts(dict),
         }
     }
 
@@ -251,11 +255,17 @@ mod macos {
                 HelperErrorCode::RootBindDenied,
                 "root is not authorized to bind locald listener ports",
             )),
-            HelperCommand::Bind if caller_uid != configured_uid => Err((
-                HelperErrorCode::CallerUserMismatch,
-                "bind caller is not the configured locald user",
+            HelperCommand::SyncHosts if caller_uid == 0 => Err((
+                HelperErrorCode::RootHostsMutationDenied,
+                "root is not authorized to mutate locald's managed hosts section",
             )),
-            HelperCommand::Bind => match console_uid {
+            HelperCommand::Bind | HelperCommand::SyncHosts if caller_uid != configured_uid => {
+                Err((
+                    HelperErrorCode::CallerUserMismatch,
+                    "mutating helper caller is not the configured locald user",
+                ))
+            }
+            HelperCommand::Bind | HelperCommand::SyncHosts => match console_uid {
                 Ok(uid) if *uid == configured_uid => Ok(()),
                 Ok(_) => Err((
                     HelperErrorCode::ConsoleUserMismatch,
@@ -283,6 +293,60 @@ mod macos {
             Some(Message::Int64(value)) => Ok(*value),
             _ => Err(format!("missing or invalid '{name}' field")),
         }
+    }
+
+    fn host_domains_field(
+        dict: &HashMap<CString, Message>,
+        name: &str,
+    ) -> std::result::Result<Vec<String>, (HelperErrorCode, String)> {
+        let key = CString::new(name).map_err(|_| {
+            (
+                HelperErrorCode::InvalidRequest,
+                format!("invalid field name {name}"),
+            )
+        })?;
+        let Some(Message::Array(values)) = dict.get(&key) else {
+            return Err((
+                HelperErrorCode::InvalidRequest,
+                format!("missing or invalid '{name}' field"),
+            ));
+        };
+        if values.len() > HOST_SET_MAX_DOMAINS {
+            return Err((
+                HelperErrorCode::InvalidHostSet,
+                format!(
+                    "host set contains {} domains; at most {HOST_SET_MAX_DOMAINS} are allowed",
+                    values.len()
+                ),
+            ));
+        }
+
+        let mut payload_bytes = 0_usize;
+        let mut domains = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let Message::String(value) = value else {
+                return Err((
+                    HelperErrorCode::InvalidRequest,
+                    format!("invalid '{name}' entry at index {index}"),
+                ));
+            };
+            payload_bytes = payload_bytes
+                .checked_add(value.as_bytes().len())
+                .ok_or_else(|| {
+                    (
+                        HelperErrorCode::InvalidHostSet,
+                        format!("host set exceeds {HOST_SET_MAX_BYTES} bytes"),
+                    )
+                })?;
+            if payload_bytes > HOST_SET_MAX_BYTES {
+                return Err((
+                    HelperErrorCode::InvalidHostSet,
+                    format!("host set exceeds {HOST_SET_MAX_BYTES} bytes"),
+                ));
+            }
+            domains.push(value.to_string_lossy().to_string());
+        }
+        Ok(domains)
     }
 
     fn execute_bind(dict: &HashMap<CString, Message>) -> CommandResponse {
@@ -336,6 +400,65 @@ mod macos {
             .with_context(|| format!("failed to bind port {port}"))?;
         socket.listen(1024).context("failed to listen")?;
         Ok(socket.into_raw_fd())
+    }
+
+    fn execute_sync_hosts(dict: &HashMap<CString, Message>) -> CommandResponse {
+        execute_sync_hosts_with(dict, replace_complete_host_set)
+    }
+
+    fn execute_sync_hosts_with(
+        dict: &HashMap<CString, Message>,
+        replace: impl FnOnce(&HostSet) -> std::result::Result<(), HostsMutationError>,
+    ) -> CommandResponse {
+        let domains = match host_domains_field(dict, "domains") {
+            Ok(domains) => domains,
+            Err((code, message)) => {
+                return CommandResponse::message(error_response(code, &message));
+            }
+        };
+        if let Err(error) = validate_complete_host_set(&domains) {
+            return CommandResponse::message(error_response(
+                HelperErrorCode::InvalidHostSet,
+                &error.to_string(),
+            ));
+        }
+        let host_set = match HostSet::try_from_strings(domains) {
+            Ok(host_set) => host_set,
+            Err(error) => {
+                return CommandResponse::message(error_response(
+                    HelperErrorCode::InvalidHostSet,
+                    &error.to_string(),
+                ));
+            }
+        };
+
+        match replace(&host_set) {
+            Ok(()) => CommandResponse::message(success_response()),
+            Err(HostsMutationError::Read(message)) => {
+                CommandResponse::message(error_response(HelperErrorCode::HostsReadFailed, &message))
+            }
+            Err(HostsMutationError::Write(message)) => CommandResponse::message(error_response(
+                HelperErrorCode::HostsWriteFailed,
+                &message,
+            )),
+        }
+    }
+
+    enum HostsMutationError {
+        Read(String),
+        Write(String),
+    }
+
+    fn replace_complete_host_set(host_set: &HostSet) -> Result<(), HostsMutationError> {
+        replace_hosts_file(Path::new(HOSTS_PATH), host_set).map_err(|error| {
+            let message = error.to_string();
+            match error.stage() {
+                ReplaceStage::Read => HostsMutationError::Read(message),
+                ReplaceStage::Write | ReplaceStage::Rename | ReplaceStage::ParentSync => {
+                    HostsMutationError::Write(message)
+                }
+            }
+        })
     }
 
     fn success_response() -> Message {
@@ -414,6 +537,20 @@ mod macos {
             dict
         }
 
+        fn sync_hosts_dict(domains: &[&str]) -> HashMap<CString, Message> {
+            let mut dict = command_dict("sync_hosts");
+            dict.insert(
+                CString::new("domains").expect("static"),
+                Message::Array(
+                    domains
+                        .iter()
+                        .map(|domain| Message::String(CString::new(*domain).expect("test domain")))
+                        .collect(),
+                ),
+            );
+            dict
+        }
+
         fn response_string(message: &Message, field: &str) -> Option<String> {
             let Message::Dictionary(dict) = message else {
                 return None;
@@ -462,7 +599,11 @@ mod macos {
             );
 
             let mut wrong = command_dict("probe");
-            insert_int(&mut wrong, "protocol_version", 2);
+            insert_int(
+                &mut wrong,
+                "protocol_version",
+                i64::from(PROTOCOL_VERSION + 1),
+            );
             assert_error(
                 &handle_command(&wrong, &authority(), 501, &Ok(501)),
                 HelperErrorCode::ProtocolMismatch,
@@ -491,7 +632,7 @@ mod macos {
         }
 
         #[test]
-        fn root_wrong_user_and_console_mismatch_cannot_bind() {
+        fn root_wrong_user_and_console_mismatch_cannot_mutate() {
             let mut bind = command_dict("bind");
             insert_int(&mut bind, "port", 80);
             assert_error(
@@ -514,6 +655,20 @@ mod macos {
                 response_string(&response.message, "message").as_deref(),
                 Some("could not inspect /dev/console to verify configured-user ownership")
             );
+
+            let sync = sync_hosts_dict(&["api.example.test"]);
+            assert_error(
+                &handle_command(&sync, &authority(), 0, &Ok(501)),
+                HelperErrorCode::RootHostsMutationDenied,
+            );
+            assert_error(
+                &handle_command(&sync, &authority(), 502, &Ok(501)),
+                HelperErrorCode::CallerUserMismatch,
+            );
+            assert_error(
+                &handle_command(&sync, &authority(), 501, &Ok(502)),
+                HelperErrorCode::ConsoleUserMismatch,
+            );
         }
 
         #[test]
@@ -532,6 +687,76 @@ mod macos {
             );
 
             assert!(authorize_command(501, 501, &Ok(501), HelperCommand::Bind).is_ok());
+            assert!(authorize_command(501, 501, &Ok(501), HelperCommand::SyncHosts).is_ok());
+        }
+
+        #[test]
+        fn sync_hosts_validates_complete_set_and_reports_stable_failures() {
+            let missing = command_dict("sync_hosts");
+            assert_error(
+                &execute_sync_hosts_with(&missing, |_| Ok(())),
+                HelperErrorCode::InvalidRequest,
+            );
+
+            let mut wrong_entry = command_dict("sync_hosts");
+            wrong_entry.insert(
+                CString::new("domains").expect("static"),
+                Message::Array(vec![Message::Int64(80)]),
+            );
+            assert_error(
+                &execute_sync_hosts_with(&wrong_entry, |_| Ok(())),
+                HelperErrorCode::InvalidRequest,
+            );
+
+            let mut too_many = command_dict("sync_hosts");
+            too_many.insert(
+                CString::new("domains").expect("static"),
+                Message::Array(
+                    (0..=HOST_SET_MAX_DOMAINS)
+                        .map(|_| {
+                            Message::String(CString::new("a.example.test").expect("test domain"))
+                        })
+                        .collect(),
+                ),
+            );
+            assert_error(
+                &execute_sync_hosts_with(&too_many, |_| Ok(())),
+                HelperErrorCode::InvalidHostSet,
+            );
+
+            let unsorted = sync_hosts_dict(&["z.example.test", "a.example.test"]);
+            assert_error(
+                &execute_sync_hosts_with(&unsorted, |_| Ok(())),
+                HelperErrorCode::InvalidHostSet,
+            );
+
+            let valid = sync_hosts_dict(&["api.example.test", "web.example.test"]);
+            let response = execute_sync_hosts_with(&valid, |host_set| {
+                assert_eq!(
+                    host_set.as_strings(),
+                    vec!["api.example.test".to_owned(), "web.example.test".to_owned()]
+                );
+                Ok(())
+            });
+            assert_eq!(
+                response_string(&response.message, "status").as_deref(),
+                Some("success")
+            );
+
+            assert_error(
+                &execute_sync_hosts_with(&valid, |_| {
+                    Err(HostsMutationError::Read("injected read failure".to_owned()))
+                }),
+                HelperErrorCode::HostsReadFailed,
+            );
+            assert_error(
+                &execute_sync_hosts_with(&valid, |_| {
+                    Err(HostsMutationError::Write(
+                        "injected atomic replace failure".to_owned(),
+                    ))
+                }),
+                HelperErrorCode::HostsWriteFailed,
+            );
         }
 
         #[test]

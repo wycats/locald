@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[test]
-fn admin_sync_hosts_delegates_to_the_daemon_owned_domain_index() -> anyhow::Result<()> {
+fn admin_sync_hosts_requests_daemon_owned_complete_set_publication() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let socket_path = root.path().join("locald.sock");
     let listener = UnixListener::bind(&socket_path)?;

@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use locald_helper_protocol::{
     HelperCommand, HelperErrorCode, HelperStatus, MACH_SERVICE, PROTOCOL_VERSION,
-    is_supported_bind_port,
+    is_supported_bind_port, validate_complete_host_set,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -18,7 +18,7 @@ pub async fn bind_privileged_port(port: u16) -> Result<std::net::TcpListener> {
     }
     info!("Requesting privileged port {port} from helper via XPC...");
 
-    let fd = tokio::task::spawn_blocking(move || xpc_request(HelperCommand::Bind, Some(port)))
+    let fd = tokio::task::spawn_blocking(move || xpc_request(&HelperRequest::Bind(port)))
         .await
         .context("XPC helper task panicked")??
         .context("helper bind response did not include a listener")?;
@@ -38,10 +38,42 @@ pub async fn bind_privileged_port(port: u16) -> Result<std::net::TcpListener> {
 
 /// Verify helper reachability, caller authorization, and protocol agreement.
 pub async fn probe_helper() -> Result<()> {
-    tokio::task::spawn_blocking(|| xpc_request(HelperCommand::Probe, None))
+    tokio::task::spawn_blocking(|| xpc_request(&HelperRequest::Probe))
         .await
         .context("XPC helper probe task panicked")??;
     Ok(())
+}
+
+/// Atomically replace the complete locald-managed hosts-file section.
+///
+/// An empty set removes the managed section. Callers must supply canonical,
+/// sorted, duplicate-free exact hostnames. The helper independently repeats
+/// this validation before performing the privileged mutation.
+pub async fn sync_hosts(domains: Vec<String>) -> Result<()> {
+    validate_complete_host_set(&domains)
+        .context("refused invalid complete host set before contacting privileged helper")?;
+    tokio::task::spawn_blocking(move || xpc_request(&HelperRequest::SyncHosts(domains)))
+        .await
+        .context("XPC helper hosts-sync task panicked")??;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelperRequest {
+    Probe,
+    Bind(u16),
+    SyncHosts(Vec<String>),
+}
+
+impl HelperRequest {
+    #[must_use]
+    const fn command(&self) -> HelperCommand {
+        match self {
+            Self::Probe => HelperCommand::Probe,
+            Self::Bind(_) => HelperCommand::Bind,
+            Self::SyncHosts(_) => HelperCommand::SyncHosts,
+        }
+    }
 }
 
 fn set_cloexec(fd: &OwnedFd) -> Result<()> {
@@ -56,14 +88,15 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-fn xpc_request(command: HelperCommand, port: Option<u16>) -> Result<Option<RawFd>> {
+fn xpc_request(request: &HelperRequest) -> Result<Option<RawFd>> {
     use futures::stream::StreamExt;
     use xpc_connection::XpcClient;
 
     #[allow(clippy::expect_used)]
     let name = CString::new(MACH_SERVICE).expect("static CString");
     let mut client = XpcClient::connect(&name);
-    client.send_message(request_message(command, port));
+    let command = request.command();
+    client.send_message(request_message(request));
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -81,12 +114,16 @@ fn xpc_request(command: HelperCommand, port: Option<u16>) -> Result<Option<RawFd
     parse_response(command, &response)
 }
 
-fn request_message(command: HelperCommand, port: Option<u16>) -> Message {
+fn request_message(request: &HelperRequest) -> Message {
     let mut dict = HashMap::new();
     insert_int(&mut dict, "protocol_version", i64::from(PROTOCOL_VERSION));
-    insert_string(&mut dict, "command", command.as_str());
-    if let Some(port) = port {
-        insert_int(&mut dict, "port", i64::from(port));
+    insert_string(&mut dict, "command", request.command().as_str());
+    match request {
+        HelperRequest::Probe => {}
+        HelperRequest::Bind(port) => insert_int(&mut dict, "port", i64::from(*port)),
+        HelperRequest::SyncHosts(domains) => {
+            insert_strings(&mut dict, "domains", domains);
+        }
     }
     Message::Dictionary(dict)
 }
@@ -120,7 +157,7 @@ fn parse_response(command: HelperCommand, response: &Message) -> Result<Option<R
     }
 
     match command {
-        HelperCommand::Probe => Ok(None),
+        HelperCommand::Probe | HelperCommand::SyncHosts => Ok(None),
         HelperCommand::Bind => response_fd(dict, "fd")
             .map(Some)
             .ok_or_else(|| setup_required("helper bind response omitted fd")),
@@ -151,7 +188,7 @@ fn helper_rejection(
         | HelperErrorCode::AuthorityUnavailable
         | HelperErrorCode::AuthorityInvalid
         | HelperErrorCode::AuthenticationFailed => setup_required(&detail),
-        HelperErrorCode::RootBindDenied => {
+        HelperErrorCode::RootBindDenied | HelperErrorCode::RootHostsMutationDenied => {
             anyhow::anyhow!("{detail}. Run locald without sudo as the configured user.")
         }
         HelperErrorCode::CallerUserMismatch => anyhow::anyhow!(
@@ -164,6 +201,9 @@ fn helper_rejection(
         | HelperErrorCode::UnknownCommand
         | HelperErrorCode::UnsupportedPort
         | HelperErrorCode::BindFailed
+        | HelperErrorCode::InvalidHostSet
+        | HelperErrorCode::HostsReadFailed
+        | HelperErrorCode::HostsWriteFailed
         | HelperErrorCode::InternalError => anyhow::anyhow!(detail),
     }
 }
@@ -181,6 +221,23 @@ fn insert_int(dict: &mut HashMap<CString, Message>, key: &str, value: i64) {
     dict.insert(
         CString::new(key).expect("static CString"),
         Message::Int64(value),
+    );
+}
+
+fn insert_strings(dict: &mut HashMap<CString, Message>, key: &str, values: &[String]) {
+    #[allow(clippy::expect_used)]
+    dict.insert(
+        CString::new(key).expect("static CString"),
+        Message::Array(
+            values
+                .iter()
+                .map(|value| {
+                    Message::String(
+                        CString::new(value.as_str()).expect("validated hostname CString"),
+                    )
+                })
+                .collect(),
+        ),
     );
 }
 
@@ -222,7 +279,7 @@ mod tests {
 
     #[test]
     fn requests_always_include_protocol_and_supported_command() {
-        let Message::Dictionary(probe) = request_message(HelperCommand::Probe, None) else {
+        let Message::Dictionary(probe) = request_message(&HelperRequest::Probe) else {
             panic!("probe request must be a dictionary");
         };
         assert_eq!(
@@ -232,11 +289,27 @@ mod tests {
         assert_eq!(response_string(&probe, "command").as_deref(), Some("probe"));
         assert_eq!(response_int(&probe, "port"), None);
 
-        let Message::Dictionary(bind) = request_message(HelperCommand::Bind, Some(443)) else {
+        let Message::Dictionary(bind) = request_message(&HelperRequest::Bind(443)) else {
             panic!("bind request must be a dictionary");
         };
         assert_eq!(response_string(&bind, "command").as_deref(), Some("bind"));
         assert_eq!(response_int(&bind, "port"), Some(443));
+
+        let Message::Dictionary(sync) = request_message(&HelperRequest::SyncHosts(vec![
+            "api.example.test".to_owned(),
+            "web.example.test".to_owned(),
+        ])) else {
+            panic!("sync-hosts request must be a dictionary");
+        };
+        assert_eq!(
+            response_string(&sync, "command").as_deref(),
+            Some("sync_hosts")
+        );
+        let domains_key = CString::new("domains").expect("static");
+        let Some(Message::Array(domains)) = sync.get(&domains_key) else {
+            panic!("sync-hosts request must carry a domain array");
+        };
+        assert_eq!(domains.len(), 2);
     }
 
     #[test]
@@ -246,12 +319,20 @@ mod tests {
             parse_response(HelperCommand::Probe, &message).expect("probe success"),
             None
         );
+        assert_eq!(
+            parse_response(HelperCommand::SyncHosts, &message).expect("host sync success"),
+            None
+        );
     }
 
     #[test]
     fn wrong_or_missing_protocol_requires_setup() {
         let mut wrong = response(HelperStatus::Success);
-        insert_int(&mut wrong, "protocol_version", 2);
+        insert_int(
+            &mut wrong,
+            "protocol_version",
+            i64::from(PROTOCOL_VERSION + 1),
+        );
         let error = parse_response(HelperCommand::Probe, &Message::Dictionary(wrong))
             .expect_err("wrong protocol must fail");
         assert!(error.to_string().contains("protocol mismatch"));
@@ -303,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_and_bind_errors_have_specific_remediation() {
+    fn policy_and_mutation_errors_have_specific_remediation() {
         for (code, expected, excludes_setup) in [
             (
                 HelperErrorCode::RootBindDenied,
@@ -331,6 +412,43 @@ mod tests {
             if excludes_setup {
                 assert!(!error.to_string().contains("sudo locald admin setup"));
             }
+        }
+    }
+
+    #[test]
+    fn invalid_complete_host_set_is_rejected_before_xpc() {
+        let error =
+            validate_complete_host_set(&["z.example.test".to_owned(), "a.example.test".to_owned()])
+                .expect_err("out-of-order complete set must fail");
+        assert!(error.to_string().contains("sorted and unique"));
+
+        let mut root = response(HelperStatus::Error);
+        insert_string(
+            &mut root,
+            "error_code",
+            HelperErrorCode::RootHostsMutationDenied.as_str(),
+        );
+        insert_string(&mut root, "message", "root cannot mutate managed hosts");
+        let error = parse_response(HelperCommand::SyncHosts, &Message::Dictionary(root))
+            .expect_err("root host mutation must fail");
+        assert!(error.to_string().contains("without sudo"));
+
+        for code in [
+            HelperErrorCode::InvalidHostSet,
+            HelperErrorCode::HostsReadFailed,
+            HelperErrorCode::HostsWriteFailed,
+        ] {
+            let mut dict = response(HelperStatus::Error);
+            insert_string(&mut dict, "error_code", code.as_str());
+            insert_string(&mut dict, "message", "injected host operation failure");
+            let error = parse_response(HelperCommand::SyncHosts, &Message::Dictionary(dict))
+                .expect_err("host operation rejection must fail");
+            assert!(error.to_string().contains(code.as_str()));
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected host operation failure")
+            );
         }
     }
 }
