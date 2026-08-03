@@ -49,6 +49,7 @@ use locald_core::{
     ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock, availability_path,
     sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
+use locald_hosts::HostSet;
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -190,79 +191,77 @@ struct DaemonShuttingDown;
 struct ReentrantAvailabilityTransition;
 
 #[async_trait::async_trait]
-pub trait HostSyncer: Send + Sync + 'static {
-    async fn sync(&self, domains: Vec<String>) -> Result<()>;
+pub trait HostSetWriter: Send + Sync + 'static {
+    async fn replace_complete(&self, hosts: HostSet) -> Result<()>;
 }
 
-struct DefaultHostSyncer;
+struct DefaultHostSetWriter;
 
 #[async_trait::async_trait]
-impl HostSyncer for DefaultHostSyncer {
-    async fn sync(&self, domains: Vec<String>) -> Result<()> {
-        // Try to read hosts file to see if we need to update
-        let hosts = locald_core::HostsFileSection::new();
-        let needs_update = match hosts.read().await {
-            Ok(content) => {
-                let new_content = hosts.update_content(&content, &domains);
-                content != new_content
-            }
-            Err(e) => {
-                warn!("Failed to read hosts file: {}", e);
-                true // Assume update needed
-            }
-        };
+impl HostSetWriter for DefaultHostSetWriter {
+    async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            return crate::helper_client::sync_hosts(hosts.as_strings()).await;
+        }
 
-        if !needs_update {
-            info!("Hosts file is up to date, skipping sync");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let shim_path = match locald_utils::shim::find_privileged()? {
+                Some(path) => path,
+                None => {
+                    anyhow::bail!(
+                        "locald-shim is not installed or not setuid root. Run `sudo locald admin setup` to configure it."
+                    );
+                }
+            };
+
+            info!("Auto-syncing hosts using {}", shim_path.display());
+
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                locald_utils::shim::tokio_command(&shim_path)
+                    .arg("admin")
+                    .arg("sync-hosts")
+                    .args(hosts.iter())
+                    .output(),
+            )
+            .await??;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    anyhow::bail!("Failed to sync hosts");
+                }
+                anyhow::bail!("Failed to sync hosts: {}", stderr);
+            }
+
             return Ok(());
         }
 
-        let shim_path = match locald_utils::shim::find_privileged()? {
-            Some(path) => path,
-            None => {
-                anyhow::bail!(
-                    "locald-shim is not installed or not setuid root. Run `sudo locald admin setup` to configure it."
-                );
-            }
-        };
-
-        info!("Auto-syncing hosts using {}", shim_path.display());
-
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            locald_utils::shim::tokio_command(&shim_path)
-                .arg("admin")
-                .arg("sync-hosts")
-                .args(&domains)
-                .output(),
-        )
-        .await??;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stderr = stderr.trim();
-            if stderr.is_empty() {
-                anyhow::bail!("Failed to sync hosts");
-            }
-            anyhow::bail!("Failed to sync hosts: {}", stderr);
+        #[cfg(not(unix))]
+        {
+            let _ = hosts;
+            anyhow::bail!(
+                "standard-mode hosts publication is unsupported on this platform; use explicit sandbox mode"
+            );
         }
-
-        Ok(())
     }
 }
 
-struct SandboxHostSyncer;
+struct SandboxHostSetWriter;
 
 #[async_trait::async_trait]
-impl HostSyncer for SandboxHostSyncer {
-    async fn sync(&self, _domains: Vec<String>) -> Result<()> {
+impl HostSetWriter for SandboxHostSetWriter {
+    async fn replace_complete(&self, _hosts: HostSet) -> Result<()> {
         Ok(())
     }
 }
 
-impl fmt::Debug for dyn HostSyncer {
+impl fmt::Debug for dyn HostSetWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HostSyncer")
+        write!(f, "HostSetWriter")
     }
 }
 
@@ -768,7 +767,7 @@ pub struct ProcessManager {
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
     hosts_sync_guard: ConcurrencyGuard,
-    host_syncer: Arc<dyn HostSyncer>,
+    host_set_writer: Arc<dyn HostSetWriter>,
     port_allocator: PortAllocator,
     config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     availability_coordinators: Arc<Mutex<HashMap<ProjectInstanceId, Arc<AvailabilityCoordinator>>>>,
@@ -1155,7 +1154,7 @@ impl ProcessManager {
             health_monitor,
             factories,
             hosts_sync_guard: ConcurrencyGuard::new(),
-            host_syncer: Arc::new(DefaultHostSyncer),
+            host_set_writer: Arc::new(DefaultHostSetWriter),
             port_allocator: PortAllocator::new(),
             config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
             availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
@@ -1181,8 +1180,13 @@ impl ProcessManager {
     }
 
     #[cfg(test)]
-    pub fn set_host_syncer(&mut self, syncer: Arc<dyn HostSyncer>) {
-        self.host_syncer = syncer;
+    pub fn set_host_set_writer(&mut self, writer: Arc<dyn HostSetWriter>) {
+        self.host_set_writer = writer;
+    }
+
+    #[cfg(test)]
+    pub fn set_host_syncer(&mut self, writer: Arc<dyn HostSetWriter>) {
+        self.set_host_set_writer(writer);
     }
 
     #[cfg(test)]
@@ -1230,8 +1234,8 @@ impl ProcessManager {
         }
     }
 
-    pub(crate) fn use_sandbox_host_syncer(&mut self) {
-        self.host_syncer = Arc::new(SandboxHostSyncer);
+    pub(crate) fn use_sandbox_host_set_writer(&mut self) {
+        self.host_set_writer = Arc::new(SandboxHostSetWriter);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3039,15 +3043,16 @@ impl ProcessManager {
 
     pub async fn sync_hosts(&self) -> Result<()> {
         let manager = self.clone();
-        let syncer = self.host_syncer.clone();
+        let writer = self.host_set_writer.clone();
 
         self.hosts_sync_guard
             .run(move || {
                 let manager = manager.clone();
-                let syncer = syncer.clone();
+                let writer = writer.clone();
                 async move {
-                    let domains = manager.hosts_domains();
-                    syncer.sync(domains).await
+                    let hosts = HostSet::try_from_strings(manager.hosts_domains())
+                        .context("authoritative domain index produced an invalid hosts set")?;
+                    writer.replace_complete(hosts).await
                 }
             })
             .await
@@ -12185,8 +12190,8 @@ mod tests {
     struct NoopHostSyncer;
 
     #[async_trait]
-    impl HostSyncer for NoopHostSyncer {
-        async fn sync(&self, _domains: Vec<String>) -> Result<()> {
+    impl HostSetWriter for NoopHostSyncer {
+        async fn replace_complete(&self, _hosts: HostSet) -> Result<()> {
             Ok(())
         }
     }
@@ -12196,12 +12201,12 @@ mod tests {
     }
 
     #[async_trait]
-    impl HostSyncer for RecordingHostSyncer {
-        async fn sync(&self, domains: Vec<String>) -> Result<()> {
+    impl HostSetWriter for RecordingHostSyncer {
+        async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
             self.calls
                 .lock()
                 .expect("recording host sync mutex poisoned")
-                .push(domains);
+                .push(hosts.as_strings());
             Ok(())
         }
     }
@@ -12209,8 +12214,8 @@ mod tests {
     struct RejectingHostSyncer;
 
     #[async_trait]
-    impl HostSyncer for RejectingHostSyncer {
-        async fn sync(&self, _domains: Vec<String>) -> Result<()> {
+    impl HostSetWriter for RejectingHostSyncer {
+        async fn replace_complete(&self, _hosts: HostSet) -> Result<()> {
             anyhow::bail!("injected host synchronization failure")
         }
     }

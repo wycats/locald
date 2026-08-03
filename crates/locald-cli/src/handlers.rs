@@ -6,8 +6,6 @@ use locald_core::attachments::{
 };
 use locald_core::ipc::{EnsureProjectResult, EnsureProjectSuperseded};
 use locald_core::{DemandKey, IpcRequest, IpcResponse, LocaldConfig, ProjectAvailabilityStatus};
-#[cfg(target_os = "macos")]
-use locald_core::{DomainName, HostsFileSection};
 use serde::Serialize;
 use std::io::IsTerminal;
 
@@ -1311,15 +1309,10 @@ pub fn run(cli: Cli) -> CliResult<()> {
                         require_root_for_hosts_sync(nix::unistd::geteuid().is_root())?;
                         let sudo_uid = std::env::var("SUDO_UID").ok();
                         let daemon_uid = invoking_user_uid(sudo_uid.as_deref())?;
-                        let response = client::send_request_from_uid(
-                            &IpcRequest::GetHostsDomains,
-                            daemon_uid,
-                        )?;
+                        let response =
+                            client::send_request_from_uid(&IpcRequest::SyncHosts, daemon_uid)?;
                         match response {
-                            IpcResponse::HostsDomains(domains) => {
-                                sync_hosts_file(&HostsFileSection::new(), &domains)?;
-                                println!("Hosts file updated.");
-                            }
+                            IpcResponse::Ok => println!("Hosts file updated."),
                             IpcResponse::Error(message) => {
                                 return Err(CliError::message(message));
                             }
@@ -2367,22 +2360,6 @@ fn invoking_user_uid(sudo_uid: Option<&str>) -> CliResult<u32> {
     Ok(uid)
 }
 
-#[cfg(target_os = "macos")]
-fn sync_hosts_file(hosts: &HostsFileSection, domains: &[DomainName]) -> CliResult<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let content = runtime
-        .block_on(hosts.read())
-        .context("Failed to read hosts file")?;
-    let domains = domains.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let updated = hosts.update_content(&content, &domains);
-    runtime
-        .block_on(hosts.write(&updated))
-        .context("Failed to write hosts file")?;
-    Ok(())
-}
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -2803,32 +2780,6 @@ name = "example"
         assert!(invoking_user_uid(None).is_err());
         assert!(invoking_user_uid(Some("root")).is_err());
         assert!(invoking_user_uid(Some("0")).is_err());
-    }
-
-    #[test]
-    fn hosts_sync_writes_the_daemon_owned_domain_set() {
-        let directory = tempfile::tempdir().expect("create temporary hosts directory");
-        let path = directory.path().join("hosts");
-        std::fs::write(&path, "127.0.0.1 localhost\n").expect("write hosts fixture");
-        let hosts = HostsFileSection::with_path(path.clone());
-
-        sync_hosts_file(
-            &hosts,
-            &[
-                "custom.example.test"
-                    .parse()
-                    .expect("valid custom project domain"),
-                "docs.local"
-                    .parse()
-                    .expect("valid explicit legacy-spelling project domain"),
-            ],
-        )
-        .expect("synchronize hosts fixture");
-
-        let updated = std::fs::read_to_string(path).expect("read synchronized hosts fixture");
-        assert!(updated.contains("127.0.0.1 custom.example.test"));
-        assert!(updated.contains("127.0.0.1 docs.local"));
-        assert_eq!(updated.matches("# BEGIN locald").count(), 1);
     }
 }
 

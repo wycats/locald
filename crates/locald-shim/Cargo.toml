@@ -37,3 +37,6 @@ libcontainer = { version = "0.5.7", default-features = false, features = [
 ] }
 ca_injector = "0.1.2"
 locald-utils = { version = "0.1.0", path = "../locald-utils" }
+
+[dev-dependencies]
+tempfile = "3.23.0"

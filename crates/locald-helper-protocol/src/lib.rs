@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Current helper wire-protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Current helper authority-file schema version.
 pub const AUTHORITY_SCHEMA_VERSION: u32 = 1;
 /// Maximum accepted authority-file size.
@@ -17,6 +17,12 @@ pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.locald.helper"
 pub const HELPER_PLIST_PATH: &str = "/Library/LaunchDaemons/com.locald.helper.plist";
 /// Helper `LaunchDaemon` label and Mach service name.
 pub const MACH_SERVICE: &str = "com.locald.helper";
+/// Fixed hosts file managed by the privileged helper.
+pub const HOSTS_PATH: &str = "/etc/hosts";
+/// Maximum number of exact hostnames accepted in one complete-set request.
+pub const HOST_SET_MAX_DOMAINS: usize = 4096;
+/// Maximum aggregate hostname bytes accepted in one complete-set request.
+pub const HOST_SET_MAX_BYTES: usize = 256 * 1024;
 
 /// Helper request command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +32,8 @@ pub enum HelperCommand {
     Probe,
     /// Bind one of locald's two privileged listener ports.
     Bind,
+    /// Atomically replace locald's complete managed hosts-file section.
+    SyncHosts,
 }
 
 impl HelperCommand {
@@ -34,6 +42,7 @@ impl HelperCommand {
         match self {
             Self::Probe => "probe",
             Self::Bind => "bind",
+            Self::SyncHosts => "sync_hosts",
         }
     }
 
@@ -42,6 +51,7 @@ impl HelperCommand {
         match value {
             "probe" => Some(Self::Probe),
             "bind" => Some(Self::Bind),
+            "sync_hosts" => Some(Self::SyncHosts),
             _ => None,
         }
     }
@@ -93,6 +103,14 @@ pub enum HelperErrorCode {
     RootBindDenied,
     /// Binding the privileged socket failed.
     BindFailed,
+    /// The complete host-set payload is malformed, noncanonical, or exceeds its bound.
+    InvalidHostSet,
+    /// The helper could not safely read the hosts file.
+    HostsReadFailed,
+    /// The helper could not atomically replace the managed hosts-file section.
+    HostsWriteFailed,
+    /// Root attempted to mutate the managed hosts-file section.
+    RootHostsMutationDenied,
     /// An unexpected helper failure occurred.
     InternalError,
 }
@@ -112,6 +130,10 @@ impl HelperErrorCode {
             Self::ConsoleUserMismatch => "console_user_mismatch",
             Self::RootBindDenied => "root_bind_denied",
             Self::BindFailed => "bind_failed",
+            Self::InvalidHostSet => "invalid_host_set",
+            Self::HostsReadFailed => "hosts_read_failed",
+            Self::HostsWriteFailed => "hosts_write_failed",
+            Self::RootHostsMutationDenied => "root_hosts_mutation_denied",
             Self::InternalError => "internal_error",
         }
     }
@@ -130,6 +152,10 @@ impl HelperErrorCode {
             "console_user_mismatch" => Some(Self::ConsoleUserMismatch),
             "root_bind_denied" => Some(Self::RootBindDenied),
             "bind_failed" => Some(Self::BindFailed),
+            "invalid_host_set" => Some(Self::InvalidHostSet),
+            "hosts_read_failed" => Some(Self::HostsReadFailed),
+            "hosts_write_failed" => Some(Self::HostsWriteFailed),
+            "root_hosts_mutation_denied" => Some(Self::RootHostsMutationDenied),
             "internal_error" => Some(Self::InternalError),
             _ => None,
         }
@@ -254,9 +280,113 @@ pub enum AuthorityError {
     InvalidExecutableVersion,
 }
 
+/// Validation failures for a complete managed host-set request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HostSetValidationError {
+    /// The request contains more hostnames than the protocol permits.
+    #[error("host set contains {actual} domains; at most {HOST_SET_MAX_DOMAINS} are allowed")]
+    TooManyDomains {
+        /// Number of hostnames in the request.
+        actual: usize,
+    },
+    /// The aggregate hostname payload exceeds its fixed protocol bound.
+    #[error("host set exceeds {HOST_SET_MAX_BYTES} bytes")]
+    PayloadTooLarge,
+    /// A hostname is not an exact canonical DNS name.
+    #[error("host set domain at index {index} is invalid: {reason}")]
+    InvalidDomain {
+        /// Zero-based position of the invalid hostname.
+        index: usize,
+        /// Stable human-readable validation detail.
+        reason: &'static str,
+    },
+    /// Complete sets must arrive in deterministic strictly increasing order.
+    #[error("host set domains must be sorted and unique (violation at index {index})")]
+    NotSortedUnique {
+        /// Zero-based position of the first out-of-order or duplicate hostname.
+        index: usize,
+    },
+}
+
 /// Return whether a port is part of locald's privileged networking contract.
 pub const fn is_supported_bind_port(port: u16) -> bool {
     port == 80 || port == 443
+}
+
+/// Validate the bounded, canonical complete host set used by helper protocol v2.
+///
+/// The helper calls this independently even when the client already validated
+/// the request. Empty sets are valid and remove locald's managed hosts section.
+///
+/// # Errors
+///
+/// Returns [`HostSetValidationError`] for oversized, noncanonical, duplicate,
+/// or out-of-order hostnames.
+pub fn validate_complete_host_set(domains: &[String]) -> Result<(), HostSetValidationError> {
+    if domains.len() > HOST_SET_MAX_DOMAINS {
+        return Err(HostSetValidationError::TooManyDomains {
+            actual: domains.len(),
+        });
+    }
+
+    let mut payload_bytes = 0_usize;
+    let mut previous: Option<&str> = None;
+    for (index, domain) in domains.iter().enumerate() {
+        payload_bytes = payload_bytes
+            .checked_add(domain.len())
+            .ok_or(HostSetValidationError::PayloadTooLarge)?;
+        if payload_bytes > HOST_SET_MAX_BYTES {
+            return Err(HostSetValidationError::PayloadTooLarge);
+        }
+
+        validate_canonical_domain(domain)
+            .map_err(|reason| HostSetValidationError::InvalidDomain { index, reason })?;
+        if previous.is_some_and(|previous| previous >= domain.as_str()) {
+            return Err(HostSetValidationError::NotSortedUnique { index });
+        }
+        previous = Some(domain);
+    }
+
+    Ok(())
+}
+
+fn validate_canonical_domain(domain: &str) -> Result<(), &'static str> {
+    if domain.is_empty() {
+        return Err("hostname is empty");
+    }
+    if domain.len() > 253 {
+        return Err("hostname exceeds 253 bytes");
+    }
+    if !domain.is_ascii() {
+        return Err("hostname must contain only ASCII characters");
+    }
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return Err("IP literals are not exact hostnames");
+    }
+    if domain.bytes().any(|byte| byte.is_ascii_uppercase()) || domain.ends_with('.') {
+        return Err("hostname must use canonical lowercase form without a trailing dot");
+    }
+
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err("hostname contains an empty DNS label");
+        }
+        if label.len() > 63 {
+            return Err("hostname contains a DNS label longer than 63 bytes");
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return Err("DNS labels must start and end with a letter or digit");
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err("hostname contains an unsupported DNS character");
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse and validate authority JSON.
@@ -477,11 +607,84 @@ mod tests {
     }
 
     #[test]
-    fn protocol_has_only_probe_and_bind() {
+    fn protocol_has_only_probe_bind_and_sync_hosts() {
         assert_eq!(HelperCommand::parse("probe"), Some(HelperCommand::Probe));
         assert_eq!(HelperCommand::parse("bind"), Some(HelperCommand::Bind));
+        assert_eq!(
+            HelperCommand::parse("sync_hosts"),
+            Some(HelperCommand::SyncHosts)
+        );
         assert_eq!(HelperCommand::parse("setup"), None);
         assert_eq!(HelperCommand::parse("trust"), None);
+    }
+
+    #[test]
+    fn complete_host_sets_are_bounded_canonical_sorted_and_unique() {
+        let valid = vec![
+            "api.example.test".to_owned(),
+            "workbench.example.test".to_owned(),
+        ];
+        assert!(validate_complete_host_set(&[]).is_ok());
+        assert!(validate_complete_host_set(&valid).is_ok());
+
+        for invalid in [
+            vec!["API.example.test".to_owned()],
+            vec!["*.example.test".to_owned()],
+            vec!["127.0.0.1".to_owned()],
+            vec!["example.test.".to_owned()],
+            vec!["example.test\n127.0.0.1 injected.test".to_owned()],
+        ] {
+            assert!(matches!(
+                validate_complete_host_set(&invalid),
+                Err(HostSetValidationError::InvalidDomain { .. })
+            ));
+        }
+
+        assert!(matches!(
+            validate_complete_host_set(&["z.example.test".to_owned(), "a.example.test".to_owned()]),
+            Err(HostSetValidationError::NotSortedUnique { index: 1 })
+        ));
+        assert!(matches!(
+            validate_complete_host_set(&["a.example.test".to_owned(), "a.example.test".to_owned()]),
+            Err(HostSetValidationError::NotSortedUnique { index: 1 })
+        ));
+        assert!(matches!(
+            validate_complete_host_set(
+                &(0..=HOST_SET_MAX_DOMAINS)
+                    .map(|index| format!("host-{index:04}.example.test"))
+                    .collect::<Vec<_>>()
+            ),
+            Err(HostSetValidationError::TooManyDomains { .. })
+        ));
+        assert!(matches!(
+            validate_complete_host_set(
+                &(0..1100)
+                    .map(|index| {
+                        format!(
+                            "{index:04}.{}.{}.{}.{}",
+                            "a".repeat(60),
+                            "b".repeat(60),
+                            "c".repeat(60),
+                            "d".repeat(60)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            ),
+            Err(HostSetValidationError::PayloadTooLarge)
+        ));
+    }
+
+    #[test]
+    fn host_sync_error_codes_round_trip_stably() {
+        for code in [
+            HelperErrorCode::RootBindDenied,
+            HelperErrorCode::RootHostsMutationDenied,
+            HelperErrorCode::InvalidHostSet,
+            HelperErrorCode::HostsReadFailed,
+            HelperErrorCode::HostsWriteFailed,
+        ] {
+            assert_eq!(HelperErrorCode::parse(code.as_str()), Some(code));
+        }
     }
 
     #[test]
@@ -502,7 +705,7 @@ mod tests {
 
         let with_unknown = br#"{
             "schema_version":1,
-            "protocol_version":1,
+            "protocol_version":2,
             "console_user_uid":501,
             "designated_requirement":"identifier locald",
             "executable_path":"/usr/local/bin/locald",

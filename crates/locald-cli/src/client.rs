@@ -54,11 +54,89 @@ fn send_request_on_verified_stream(
     })?;
     if peer_uid.as_raw() != expected_uid {
         return Err(CliError::message(format!(
-            "Refusing privileged hosts synchronization: locald at {socket_display} belongs to uid {}, expected uid {expected_uid}.",
+            "Refusing privileged locald operation: daemon at {socket_display} belongs to uid {}, expected uid {expected_uid}.",
             peer_uid.as_raw()
         )));
     }
     send_request_on_stream(stream, request)
+}
+
+#[cfg(target_os = "macos")]
+pub fn send_request_on_verified_stream_with_timeout(
+    stream: &mut UnixStream,
+    request: &IpcRequest,
+    expected_uid: u32,
+    socket_display: &str,
+    timeout: std::time::Duration,
+) -> CliResult<IpcResponse> {
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        CliError::message(format!(
+            "Failed to bound the locald shutdown request at {socket_display}: {error}"
+        ))
+    })?;
+    let (peer_uid, _) = nix::unistd::getpeereid(&*stream).map_err(|error| {
+        CliError::message(format!(
+            "Failed to authenticate locald at {socket_display}: {error}"
+        ))
+    })?;
+    if peer_uid.as_raw() != expected_uid {
+        return Err(CliError::message(format!(
+            "Refusing privileged locald operation: daemon at {socket_display} belongs to uid {}, expected uid {expected_uid}.",
+            peer_uid.as_raw()
+        )));
+    }
+
+    let request_bytes = serialize_request(request)?;
+    stream.write_all(&request_bytes).map_err(|error| {
+        CliError::message(format!(
+            "Failed to send the locald shutdown request at {socket_display}: {error}"
+        ))
+    })?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut response_bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for locald shutdown response",
+            )
+            .into());
+        }
+        stream.set_read_timeout(Some(remaining)).map_err(|error| {
+            CliError::message(format!(
+                "Failed to bound the locald shutdown response at {socket_display}: {error}"
+            ))
+        })?;
+        let mut chunk = [0_u8; 4096];
+        let count = stream.read(&mut chunk).map_err(|error| {
+            CliError::message(format!(
+                "Failed to read the locald shutdown response at {socket_display}: {error}"
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        response_bytes.extend_from_slice(&chunk[..count]);
+        if response_bytes.len() > MAX_IPC_REQUEST_BYTES {
+            return Err(CliError::message(format!(
+                "locald shutdown response is too large (maximum is {MAX_IPC_REQUEST_BYTES} bytes)"
+            )));
+        }
+        match serde_json::from_slice::<IpcResponse>(&response_bytes) {
+            Ok(response) => return Ok(response),
+            Err(error) if error.is_eof() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if response_bytes.is_empty() {
+        return Err(DaemonError::RequestFailed {
+            message: "daemon closed the connection without a response".to_owned(),
+        }
+        .into());
+    }
+    Ok(serde_json::from_slice(&response_bytes)?)
 }
 
 fn send_request_on_stream(stream: &mut UnixStream, request: &IpcRequest) -> CliResult<IpcResponse> {
@@ -193,12 +271,12 @@ fn stream_boot_events_response_on_stream(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use super::send_request_on_verified_stream;
     use super::{
         send_request_on_stream, serialize_request, stream_boot_events_on_stream,
         stream_boot_events_response_on_stream,
     };
+    #[cfg(target_os = "macos")]
+    use super::{send_request_on_verified_stream, send_request_on_verified_stream_with_timeout};
     use locald_core::{
         AvailabilityReason, IpcRequest, IpcResponse, ProjectLifecycleState,
         ipc::{BootEvent, EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded},
@@ -403,5 +481,39 @@ mod tests {
         server_thread.join().unwrap();
 
         assert!(error.to_string().contains("invalid domain"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn privileged_request_times_out_when_an_authenticated_daemon_never_responds() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let server_thread = thread::spawn(move || {
+            let mut request = [0; 1024];
+            let _ = server.read(&mut request).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let started = std::time::Instant::now();
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let error = send_request_on_verified_stream_with_timeout(
+            &mut client,
+            &IpcRequest::Shutdown,
+            current_uid,
+            "test socket",
+            std::time::Duration::from_millis(25),
+        )
+        .expect_err("an authenticated non-responsive daemon must time out");
+        let elapsed = started.elapsed();
+        server_thread.join().unwrap();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "bounded shutdown request took {elapsed:?}"
+        );
+        assert!(
+            error.to_string().contains("timed out")
+                || error.to_string().contains("temporarily unavailable"),
+            "unexpected timeout error: {error}"
+        );
     }
 }

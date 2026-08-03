@@ -644,7 +644,7 @@ async fn async_main(
         Some(log_tx),
     )?;
     if config.server.is_sandbox() {
-        manager.use_sandbox_host_syncer();
+        manager.use_sandbox_host_set_writer();
     }
     manager
         .recover_and_migrate_lifecycle_state()

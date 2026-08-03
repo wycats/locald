@@ -19,6 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const AGENT_LABEL: &str = "com.locald.agent";
 const AGENT_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_AGENT_PATH"));
 const HELPER_BYTES: &[u8] = include_bytes!(env!("LOCALD_EMBEDDED_HELPER_PATH"));
+const DAEMON_QUIESCENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DAEMON_QUIESCENCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+const DAEMON_SHUTDOWN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const DAEMON_QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +64,15 @@ enum ReportCaller {
     SetupRoot,
 }
 
+trait RuntimeQuiescence {}
+
+impl<T> RuntimeQuiescence for T {}
+
 trait SetupPlatform {
     fn install_system_trust(&self, certificate: &Path) -> Result<()>;
-    fn retire_stale_host_aliases(&self) -> Result<()>;
-    fn restart_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()>;
+    fn quiesce_runtime(&self, owner: &SetupOwner) -> Result<Box<dyn RuntimeQuiescence>>;
+    fn retire_native_host_entries(&self) -> Result<()>;
+    fn start_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()>;
     fn install_helper(&self, bytes: &[u8], authority: &HelperAuthority) -> Result<()>;
     fn probe_helper(&self) -> Result<()>;
 }
@@ -75,47 +84,17 @@ impl SetupPlatform for SystemPlatform {
         crate::trust::install_ca_macos(certificate)
     }
 
-    fn retire_stale_host_aliases(&self) -> Result<()> {
-        let hosts = locald_core::HostsFileSection::new();
-        let path = Path::new("/etc/hosts");
-        let current = std::fs::read_to_string(path).context("could not read /etc/hosts")?;
-        let updated = retire_stale_hosts_content(&hosts, &current);
-        if updated != current {
-            let metadata = std::fs::symlink_metadata(path)
-                .context("could not inspect /etc/hosts before synchronization")?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                anyhow::bail!("/etc/hosts is not a regular file");
-            }
-            let directory = open_existing_directory(
-                path.parent()
-                    .context("/etc/hosts has no parent directory")?,
-            )?;
-            atomic_install_file_at(
-                &directory,
-                path,
-                updated.as_bytes(),
-                metadata.mode() & 0o7777,
-                metadata.uid(),
-                metadata.gid(),
-            )
-            .context("could not atomically synchronize /etc/hosts")?;
-        }
-        Ok(())
+    fn quiesce_runtime(&self, owner: &SetupOwner) -> Result<Box<dyn RuntimeQuiescence>> {
+        bootout_launch_agent(owner)?;
+        stop_user_daemon(owner).map(|guard| Box::new(guard) as Box<dyn RuntimeQuiescence>)
     }
 
-    fn restart_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()> {
-        let service = format!("gui/{}/{AGENT_LABEL}", owner.uid);
-        let output = std::process::Command::new("/bin/launchctl")
-            .args(["bootout", &service])
-            .output()
-            .context("failed to run launchctl bootout for menu bar agent")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !launchctl_service_absent(output.status.code(), &stderr) {
-                anyhow::bail!("launchctl bootout {service} failed: {}", stderr.trim());
-            }
-        }
+    fn retire_native_host_entries(&self) -> Result<()> {
+        retire_native_host_entries_at(Path::new("/etc/hosts"))
+    }
 
+    fn start_launch_agent(&self, owner: &SetupOwner, plist: &Path) -> Result<()> {
+        let service = format!("gui/{}/{AGENT_LABEL}", owner.uid);
         let status = std::process::Command::new("/bin/launchctl")
             .args(["enable", &service])
             .status()
@@ -147,6 +126,213 @@ impl SetupPlatform for SystemPlatform {
     }
 }
 
+fn bootout_launch_agent(owner: &SetupOwner) -> Result<()> {
+    let service = format!("gui/{}/{AGENT_LABEL}", owner.uid);
+    let output = std::process::Command::new("/bin/launchctl")
+        .args(["bootout", &service])
+        .output()
+        .context("failed to run launchctl bootout for menu bar agent")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !launchctl_service_absent(output.status.code(), &stderr) {
+            anyhow::bail!("launchctl bootout {service} failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+struct DaemonQuiescence {
+    _catalog_writer_lock: File,
+}
+
+enum CatalogWriterLockProbe {
+    Busy,
+    Acquired(File),
+}
+
+fn stop_user_daemon(owner: &SetupOwner) -> Result<DaemonQuiescence> {
+    let socket = locald_utils::ipc::socket_path().context("could not resolve locald socket")?;
+    let lock = owner
+        .home
+        .join("Library/Application Support/com.locald.locald/catalog.writer.lock");
+    stop_user_daemon_at(
+        owner.uid,
+        owner.gid,
+        &socket,
+        &lock,
+        DAEMON_QUIESCENCE_TIMEOUT,
+        DAEMON_QUIESCENCE_WINDOW,
+        DAEMON_SHUTDOWN_REQUEST_TIMEOUT,
+    )
+}
+
+fn stop_user_daemon_at(
+    user_uid: u32,
+    primary_group: u32,
+    socket: &Path,
+    catalog_writer_lock: &Path,
+    timeout: std::time::Duration,
+    stable_window: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> Result<DaemonQuiescence> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut stable_since = None;
+    let mut acquired_lock = None;
+
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the installed locald daemon to become quiescent"
+        );
+
+        let socket_absent = match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(mut stream) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let bounded_request = request_timeout.min(remaining);
+                match crate::client::send_request_on_verified_stream_with_timeout(
+                    &mut stream,
+                    &locald_core::IpcRequest::Shutdown,
+                    user_uid,
+                    &socket.display().to_string(),
+                    bounded_request,
+                ) {
+                    Ok(locald_core::IpcResponse::Ok) => {}
+                    Ok(response) => anyhow::bail!(
+                        "locald returned an unexpected shutdown response: {response:?}"
+                    ),
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(error)
+                            .context("could not stop the installed locald daemon"));
+                    }
+                }
+                false
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                true
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not verify daemon shutdown at {}", socket.display())
+                });
+            }
+        };
+
+        let lock_available = if acquired_lock.is_some() {
+            true
+        } else {
+            match try_acquire_catalog_writer_lock(catalog_writer_lock, user_uid, primary_group)? {
+                CatalogWriterLockProbe::Busy => false,
+                CatalogWriterLockProbe::Acquired(file) => {
+                    acquired_lock = Some(file);
+                    true
+                }
+            }
+        };
+
+        if socket_absent && lock_available {
+            let stable_since = stable_since.get_or_insert_with(std::time::Instant::now);
+            if stable_since.elapsed() >= stable_window {
+                let catalog_writer_lock = acquired_lock
+                    .take()
+                    .context("daemon quiescence completed without holding the catalog lock")?;
+                return Ok(DaemonQuiescence {
+                    _catalog_writer_lock: catalog_writer_lock,
+                });
+            }
+        } else {
+            stable_since = None;
+        }
+
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(
+            DAEMON_QUIESCENCE_POLL
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+}
+
+#[allow(unsafe_code)]
+fn try_acquire_catalog_writer_lock(
+    path: &Path,
+    user_uid: u32,
+    primary_group: u32,
+) -> Result<CatalogWriterLockProbe> {
+    use std::os::fd::AsRawFd as _;
+
+    let parent = path
+        .parent()
+        .context("daemon lock path has no parent directory")?;
+    let name = path
+        .file_name()
+        .context("daemon lock path has no file name")?;
+    let directory = ensure_directory(parent, user_uid, primary_group, 0o700)
+        .with_context(|| format!("could not secure daemon state at {}", parent.display()))?;
+    let common_flags =
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC;
+    let file = match nix::fcntl::openat(
+        &directory,
+        name,
+        common_flags | nix::fcntl::OFlag::O_CREAT | nix::fcntl::OFlag::O_EXCL,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    ) {
+        Ok(file) => {
+            nix::unistd::fchown(
+                &file,
+                Some(nix::unistd::Uid::from_raw(user_uid)),
+                Some(nix::unistd::Gid::from_raw(primary_group)),
+            )
+            .with_context(|| format!("could not assign daemon lock at {}", path.display()))?;
+            nix::unistd::fsync(&file)
+                .with_context(|| format!("could not sync daemon lock at {}", path.display()))?;
+            nix::unistd::fsync(&directory).with_context(|| {
+                format!(
+                    "could not sync daemon lock directory at {}",
+                    parent.display()
+                )
+            })?;
+            File::from(file)
+        }
+        Err(nix::errno::Errno::EEXIST) => {
+            let file = nix::fcntl::openat(
+                &directory,
+                name,
+                common_flags,
+                nix::sys::stat::Mode::empty(),
+            )
+            .with_context(|| format!("could not open daemon lock at {}", path.display()))?;
+            File::from(file)
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not create daemon lock at {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect daemon lock at {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.uid() == user_uid && metadata.mode() & 0o022 == 0,
+        "daemon lock at {} is not a safe owner-controlled regular file",
+        path.display()
+    );
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(CatalogWriterLockProbe::Acquired(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(CatalogWriterLockProbe::Busy)
+    } else {
+        Err(error).with_context(|| format!("could not lock daemon state at {}", path.display()))
+    }
+}
+
 fn launchctl_service_absent(exit_code: Option<i32>, stderr: &str) -> bool {
     exit_code == Some(113)
         || stderr.contains("No such process")
@@ -154,8 +340,39 @@ fn launchctl_service_absent(exit_code: Option<i32>, stderr: &str) -> bool {
         || stderr.contains("Could not find specified service")
 }
 
-fn retire_stale_hosts_content(hosts: &locald_core::HostsFileSection, current: &str) -> String {
-    hosts.remove_native_macos_domains_from_content(current)
+fn retire_native_host_entries_at(path: &Path) -> Result<()> {
+    let current = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let Some(retained) = retained_macos_host_set(&current)? else {
+        return Ok(());
+    };
+    locald_hosts::replace_hosts_file_if_unchanged(path, &current, &retained)
+        .with_context(|| format!("could not atomically synchronize {}", path.display()))
+}
+
+fn retained_macos_host_set(current: &str) -> Result<Option<locald_hosts::HostSet>> {
+    let managed = locald_hosts::managed_host_set(current)
+        .context("could not parse locald's managed hosts-file section")?;
+    let mut removed = false;
+    let mut retained = Vec::new();
+    for domain in managed.iter() {
+        // The hosts file alone cannot distinguish a historical platform alias
+        // such as `docs.local` from an active service claim with the same
+        // spelling. Setup therefore removes only names macOS resolves natively.
+        // The daemon's next complete-set publication retires stale `.local`
+        // platform aliases while preserving service-owned claims.
+        if domain == "localhost" || domain.ends_with(".localhost") {
+            removed = true;
+        } else {
+            retained.push(domain.to_owned());
+        }
+    }
+    if !removed {
+        return Ok(None);
+    }
+    locald_hosts::HostSet::try_from_strings(retained)
+        .map(Some)
+        .context("retained hosts-file domains became invalid")
 }
 
 /// Resolve and cross-check the non-root console user that owns this setup.
@@ -287,9 +504,12 @@ fn run_setup_with(
     platform
         .install_system_trust(&ca.paths.cert_path)
         .context("could not install Root CA into system trust")?;
+    let runtime_quiescence = platform
+        .quiesce_runtime(owner)
+        .context("could not quiesce the installed locald runtime for repair")?;
     platform
-        .retire_stale_host_aliases()
-        .context("could not retire locald's stale hosts-file aliases")?;
+        .retire_native_host_entries()
+        .context("could not remove redundant .localhost hosts-file entries")?;
 
     let agent_directory = ensure_directory(
         paths.agent.parent().context("agent path has no parent")?,
@@ -328,10 +548,6 @@ fn run_setup_with(
     )
     .context("could not install the locald LaunchAgent plist")?;
     platform
-        .restart_launch_agent(owner, &paths.launch_agent)
-        .context("could not restart the locald menu bar agent")?;
-
-    platform
         .install_helper(helper_bytes, authority)
         .map_err(|error| {
             anyhow::anyhow!("could not install the privileged helper transaction: {error:#}")
@@ -339,6 +555,10 @@ fn run_setup_with(
     platform
         .probe_helper()
         .context("privileged helper postflight probe failed")?;
+    drop(runtime_quiescence);
+    platform
+        .start_launch_agent(owner, &paths.launch_agent)
+        .context("could not start the locald menu bar agent")?;
     Ok(())
 }
 
@@ -887,20 +1107,6 @@ fn ensure_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<OwnedF
     Ok(directory)
 }
 
-fn open_existing_directory(path: &Path) -> Result<OwnedFd> {
-    let canonical = std::fs::canonicalize(path)
-        .with_context(|| format!("could not canonicalize {}", path.display()))?;
-    nix::fcntl::open(
-        &canonical,
-        nix::fcntl::OFlag::O_RDONLY
-            | nix::fcntl::OFlag::O_DIRECTORY
-            | nix::fcntl::OFlag::O_NOFOLLOW
-            | nix::fcntl::OFlag::O_CLOEXEC,
-        nix::sys::stat::Mode::empty(),
-    )
-    .with_context(|| format!("could not open {} safely", path.display()))
-}
-
 fn atomic_install_file_at(
     directory: &OwnedFd,
     path: &Path,
@@ -975,11 +1181,21 @@ fn atomic_install_file_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct RecordingPlatform {
-        calls: Mutex<Vec<&'static str>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    struct RecordingQuiescence {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for RecordingQuiescence {
+        fn drop(&mut self) {
+            self.calls.lock().unwrap().push("release");
+        }
     }
 
     impl SetupPlatform for RecordingPlatform {
@@ -988,12 +1204,19 @@ mod tests {
             Ok(())
         }
 
-        fn retire_stale_host_aliases(&self) -> Result<()> {
+        fn quiesce_runtime(&self, _owner: &SetupOwner) -> Result<Box<dyn RuntimeQuiescence>> {
+            self.calls.lock().unwrap().push("quiesce");
+            Ok(Box::new(RecordingQuiescence {
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+
+        fn retire_native_host_entries(&self) -> Result<()> {
             self.calls.lock().unwrap().push("hosts-cleanup");
             Ok(())
         }
 
-        fn restart_launch_agent(&self, _owner: &SetupOwner, _plist: &Path) -> Result<()> {
+        fn start_launch_agent(&self, _owner: &SetupOwner, _plist: &Path) -> Result<()> {
             self.calls.lock().unwrap().push("agent");
             Ok(())
         }
@@ -1073,15 +1296,19 @@ mod tests {
             platform.calls.lock().unwrap().as_slice(),
             [
                 "trust",
+                "quiesce",
                 "hosts-cleanup",
-                "agent",
                 "helper",
                 "probe",
-                "trust",
-                "hosts-cleanup",
+                "release",
                 "agent",
+                "trust",
+                "quiesce",
+                "hosts-cleanup",
                 "helper",
-                "probe"
+                "probe",
+                "release",
+                "agent"
             ]
         );
     }
@@ -1200,15 +1427,213 @@ mod tests {
     }
 
     #[test]
-    fn setup_retires_native_and_legacy_hosts_aliases() {
-        let hosts = locald_core::HostsFileSection::with_path(PathBuf::from("/etc/hosts"));
-        let current = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local\n127.0.0.1 workbench.localhost\n127.0.0.1 frame.turn.v0.localhost\n127.0.0.1 workbench.example.test\n# END locald\n";
+    #[allow(unsafe_code)]
+    fn daemon_quiescence_catches_a_late_socket_and_holds_the_writer_lock() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd as _;
 
-        let updated = retire_stale_hosts_content(&hosts, current);
-        assert!(!updated.contains("locald.local"));
+        let root = tempfile::tempdir().expect("create daemon fixture");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonicalize daemon fixture");
+        let socket = root_path.join("locald.sock");
+        let lock = root_path.join("catalog.writer.lock");
+        std::fs::write(&lock, []).expect("create catalog writer lock");
+        let socket_for_server = socket.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            let listener = std::os::unix::net::UnixListener::bind(&socket_for_server)
+                .expect("bind late daemon socket");
+            let (mut stream, _) = listener.accept().expect("accept shutdown request");
+            let mut request = [0_u8; 1024];
+            let count = stream.read(&mut request).expect("read shutdown request");
+            let request: locald_core::IpcRequest =
+                serde_json::from_slice(&request[..count]).expect("decode shutdown request");
+            assert_eq!(request, locald_core::IpcRequest::Shutdown);
+            stream
+                .write_all(
+                    &serde_json::to_vec(&locald_core::IpcResponse::Ok)
+                        .expect("encode shutdown response"),
+                )
+                .expect("write shutdown response");
+            drop(stream);
+            drop(listener);
+            std::fs::remove_file(socket_for_server).expect("remove late daemon socket");
+        });
+
+        let guard = stop_user_daemon_at(
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            &socket,
+            &lock,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(250),
+        )
+        .expect("quiesce late daemon");
+        server.join().expect("join late daemon");
+
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .expect("open lock contender");
+        let result = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        drop(guard);
+        let result = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn daemon_quiescence_waits_for_a_pre_ipc_writer_lock() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = tempfile::tempdir().expect("create daemon fixture");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonicalize daemon fixture");
+        let socket = root_path.join("locald.sock");
+        let lock = root_path.join("catalog.writer.lock");
+        std::fs::write(&lock, []).expect("create catalog writer lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .expect("open held writer lock");
+        let result = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(holder);
+        });
+
+        let started = std::time::Instant::now();
+        let guard = stop_user_daemon_at(
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            &socket,
+            &lock,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        )
+        .expect("wait for pre-IPC daemon lock");
+        release.join().expect("release pre-IPC daemon lock");
+
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert!(guard._catalog_writer_lock.metadata().is_ok());
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn daemon_quiescence_creates_and_holds_a_missing_writer_lock() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = tempfile::tempdir().expect("create daemon fixture");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonicalize daemon fixture");
+        let socket = root_path.join("locald.sock");
+        let lock = root_path.join("catalog.writer.lock");
+        assert!(!lock.exists());
+
+        let lock_for_contender = lock.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_for_contender)
+                .expect("open lock contender");
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(result, -1);
+            attempted_tx
+                .send(std::io::Error::last_os_error().kind())
+                .expect("report blocked contender");
+
+            release_rx.recv().expect("wait for setup guard release");
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+        });
+
+        let guard = stop_user_daemon_at(
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            &socket,
+            &lock,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(250),
+        )
+        .expect("quiesce with initially missing daemon lock");
+
+        assert_eq!(
+            attempted_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("late contender attempted the lock"),
+            std::io::ErrorKind::WouldBlock
+        );
+        let metadata = guard
+            ._catalog_writer_lock
+            .metadata()
+            .expect("inspect created daemon lock");
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+
+        drop(guard);
+        release_tx.send(()).expect("release late contender");
+        assert_eq!(contender.join().expect("join late contender"), 0);
+    }
+
+    #[test]
+    fn setup_retires_native_hosts_entries_without_guessing_domain_ownership() {
+        let directory = tempfile::tempdir().expect("create hosts fixture directory");
+        let path = directory.path().join("hosts");
+        let current = "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 locald.local\n127.0.0.1 workbench.localhost\n127.0.0.1 frame.turn.v0.localhost\n127.0.0.1 workbench.example.test\n# END locald\n";
+        std::fs::write(&path, current).expect("write hosts fixture");
+
+        retire_native_host_entries_at(&path).expect("retire native host entries");
+        let updated = std::fs::read_to_string(path).expect("read hosts fixture");
+        assert!(updated.contains("127.0.0.1 locald.local"));
         assert!(!updated.contains("workbench.localhost"));
         assert!(!updated.contains("frame.turn.v0.localhost"));
         assert!(updated.contains("127.0.0.1 workbench.example.test"));
+    }
+
+    #[test]
+    fn setup_leaves_hosts_file_unchanged_without_stale_aliases() {
+        let directory = tempfile::tempdir().expect("create hosts fixture directory");
+        let path = directory.path().join("hosts");
+        let current =
+            "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 workbench.example.test\n# END locald\n";
+        std::fs::write(&path, current).expect("write hosts fixture");
+        let before_inode = std::fs::metadata(&path)
+            .expect("inspect hosts fixture")
+            .ino();
+
+        retire_native_host_entries_at(&path).expect("inspect managed host set");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read hosts fixture"),
+            current
+        );
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("reinspect hosts fixture")
+                .ino(),
+            before_inode
+        );
     }
 
     #[test]

@@ -641,23 +641,15 @@ pub(crate) fn cgroup_kill_and_prune(cgroups_path: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::disallowed_methods)]
 pub(crate) fn update_hosts_file(domains: &[String]) -> Result<()> {
-    let path = if cfg!(windows) {
-        std::path::PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
-    } else {
-        std::path::PathBuf::from("/etc/hosts")
-    };
-
-    let current_content = std::fs::read_to_string(&path).context("Failed to read hosts file")?;
-
-    let new_content = update_hosts_content(&current_content, domains);
-    std::fs::write(&path, new_content).context("Failed to write hosts file")?;
-    Ok(())
+    update_hosts_file_at(Path::new("/etc/hosts"), domains)
 }
 
-fn update_hosts_content(current_content: &str, domains: &[String]) -> String {
-    locald_hosts::update_hosts_content(current_content, domains)
+fn update_hosts_file_at(path: &Path, domains: &[String]) -> Result<()> {
+    let host_set = locald_hosts::HostSet::try_from_strings(domains.iter().map(String::as_str))
+        .context("refusing invalid locald hosts-file domain set")?;
+    locald_hosts::replace_hosts_file(path, &host_set)
+        .with_context(|| format!("Failed to atomically replace {}", path.display()))
 }
 
 fn main() -> Result<()> {
@@ -891,28 +883,65 @@ polkit.addRule(function(action, subject) {
 
 #[cfg(test)]
 mod tests {
-    use super::update_hosts_content;
+    use super::update_hosts_file_at;
 
     #[test]
-    fn empty_host_sync_removes_the_managed_section() {
+    fn empty_host_sync_removes_the_managed_section_atomically() {
+        let directory = tempfile::tempdir().expect("create hosts fixture directory");
+        let path = directory.path().join("hosts");
         let current =
             "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald\n";
+        std::fs::write(&path, current).expect("write hosts fixture");
 
-        let updated = update_hosts_content(current, &[]);
+        update_hosts_file_at(&path, &[]).expect("remove managed host set");
+        let updated = std::fs::read_to_string(&path).expect("read hosts fixture");
 
-        assert_eq!(updated, "127.0.0.1 localhost\n\n");
-        assert_eq!(update_hosts_content(&updated, &[]), updated);
+        assert_eq!(updated, "127.0.0.1 localhost\n");
+        update_hosts_file_at(&path, &[]).expect("empty host sync remains idempotent");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reread hosts fixture"),
+            updated
+        );
     }
 
     #[test]
-    fn nonempty_host_sync_still_replaces_the_managed_section() {
+    fn nonempty_host_sync_replaces_the_complete_managed_set() {
+        let directory = tempfile::tempdir().expect("create hosts fixture directory");
+        let path = directory.path().join("hosts");
         let current =
             "127.0.0.1 localhost\n# BEGIN locald\n127.0.0.1 old.localhost\n# END locald\n";
+        std::fs::write(&path, current).expect("write hosts fixture");
 
-        let updated = update_hosts_content(current, &["custom.example.test".to_owned()]);
+        update_hosts_file_at(&path, &["custom.example.test".to_owned()])
+            .expect("replace complete host set");
+        let updated = std::fs::read_to_string(&path).expect("read hosts fixture");
 
         assert!(!updated.contains("old.localhost"));
         assert!(updated.contains("127.0.0.1 custom.example.test"));
         assert_eq!(updated.matches("# BEGIN locald").count(), 1);
+    }
+
+    #[test]
+    fn host_sync_rejects_malformed_positional_domains_before_writing() {
+        let directory = tempfile::tempdir().expect("create hosts fixture directory");
+        let path = directory.path().join("hosts");
+        let current = "127.0.0.1 localhost\n";
+        std::fs::write(&path, current).expect("write hosts fixture");
+
+        let error = update_hosts_file_at(
+            &path,
+            &["app.localhost\n127.0.0.1 injected.example".to_owned()],
+        )
+        .expect_err("newline injection must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid locald hosts-file domain set")
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read unchanged hosts fixture"),
+            current
+        );
     }
 }

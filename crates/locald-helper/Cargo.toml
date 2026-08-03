@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 locald-helper-protocol = { path = "../locald-helper-protocol" }
+locald-hosts = { path = "../locald-hosts" }
 xpc-connection = { git = "https://github.com/dfrankland/xpc-connection-rs.git", branch = "master", features = [
   "audit_token",
 ] }
