@@ -29,11 +29,11 @@
       },
       {
         "command": "locald.restartServices",
-        "title": "locald: Restart Services"
+        "title": "locald: Restart Managed Services"
       },
       {
         "command": "locald.stopServices",
-        "title": "locald: Stop Services"
+        "title": "locald: Pause Project"
       }
     ],
     "chatInstructions": [
@@ -50,7 +50,7 @@
           "locald"
         ],
         "displayName": "Ensure locald Ready",
-        "modelDescription": "Ensure the current locald project is running and ready, then return semantic service URLs",
+        "modelDescription": "Ensure locald-managed services are ready, then return semantic origins and publication state for externally managed services",
         "canBeReferencedInPrompt": true,
         "icon": "$(run-all)",
         "inputSchema": {
@@ -65,7 +65,7 @@
           "locald"
         ],
         "displayName": "locald Services",
-        "modelDescription": "List all locald-managed services for the current project, including name, status, semantic URL, domain, and health",
+        "modelDescription": "List managed and externally published service identities for the current project, including status, semantic origin, health, and publication guidance",
         "canBeReferencedInPrompt": true,
         "icon": "$(server)",
         "inputSchema": {
@@ -80,7 +80,7 @@
           "locald"
         ],
         "displayName": "locald Restart",
-        "modelDescription": "Restart locald services for the current project and wait for readiness",
+        "modelDescription": "Restart locald-managed services for the current project and wait for readiness; externally published services use their owning workflow",
         "canBeReferencedInPrompt": true,
         "icon": "$(debug-restart)",
         "inputSchema": {
@@ -100,7 +100,7 @@
           "locald"
         ],
         "displayName": "locald Logs",
-        "modelDescription": "Fetch recent log output from locald-managed services",
+        "modelDescription": "Fetch recent log output from locald-managed services; externally published services keep logs in their owning workflow",
         "canBeReferencedInPrompt": true,
         "icon": "$(output)",
         "inputSchema": {
@@ -124,7 +124,7 @@
           "locald"
         ],
         "displayName": "Open in Browser",
-        "modelDescription": "Open a locald service URL in VS Code's Simple Browser for visual verification",
+        "modelDescription": "Open a locald-owned stable service origin in VS Code's Simple Browser, including unavailable published-service guidance",
         "canBeReferencedInPrompt": true,
         "icon": "$(globe)",
         "inputSchema": {

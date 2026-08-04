@@ -5,7 +5,11 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use locald_core::{IpcRequest, IpcResponse, state::ServiceState};
+use locald_core::{
+    IpcRequest, IpcResponse,
+    ipc::{PublicationState, ServiceType},
+    state::ServiceState,
+};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -56,26 +60,70 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             let items: Vec<ListItem> = services
                 .iter()
                 .map(|s| {
-                    let status_style = match s.status {
-                        ServiceState::Running => {
-                            if s.warnings.is_empty() {
-                                Style::default().fg(Color::Green)
-                            } else {
+                    let status_style = s.publication.as_ref().map_or_else(
+                        || match s.status {
+                            ServiceState::Running => {
+                                if s.warnings.is_empty() {
+                                    Style::default().fg(Color::Green)
+                                } else {
+                                    Style::default().fg(Color::Yellow)
+                                }
+                            }
+                            ServiceState::Stopped => Style::default().fg(Color::Red),
+                            ServiceState::Building => Style::default().fg(Color::Blue),
+                            ServiceState::ExternallyManaged => Style::default().fg(Color::Cyan),
+                        },
+                        |publication| match publication.state {
+                            PublicationState::Ready => Style::default().fg(Color::Green),
+                            PublicationState::CheckingEndpoint => Style::default().fg(Color::Blue),
+                            PublicationState::EndpointUnhealthy => {
                                 Style::default().fg(Color::Yellow)
                             }
-                        }
-                        ServiceState::Stopped => Style::default().fg(Color::Red),
-                        ServiceState::Building => Style::default().fg(Color::Blue),
+                            PublicationState::WaitingForPublisher => {
+                                Style::default().fg(Color::Cyan)
+                            }
+                            PublicationState::RoutePaused => Style::default().fg(Color::DarkGray),
+                            PublicationState::InstanceMissing => Style::default().fg(Color::Red),
+                        },
+                    );
+
+                    let mut content = if s.service_type == ServiceType::Published {
+                        s.publication.as_ref().map_or_else(
+                            || {
+                                format!(
+                                    "{:<20} [published] Origin: {}",
+                                    s.name,
+                                    s.url.as_deref().unwrap_or("-")
+                                )
+                            },
+                            |publication| {
+                                format!(
+                                    "{:<20} [published: {}] Origin: {} — {}",
+                                    s.name,
+                                    publication.state,
+                                    publication.origin,
+                                    publication.explanation
+                                )
+                            },
+                        )
+                    } else {
+                        format!(
+                            "{:<20} [{}] PID: {:<6} Port: {:<5} URL: {}",
+                            s.name,
+                            s.status,
+                            s.pid.map_or_else(|| "-".into(), |p| p.to_string()),
+                            s.port.map_or_else(|| "-".into(), |p| p.to_string()),
+                            s.url.as_deref().unwrap_or("-")
+                        )
                     };
 
-                    let mut content = format!(
-                        "{:<20} [{}] PID: {:<6} Port: {:<5} URL: {}",
-                        s.name,
-                        s.status,
-                        s.pid.map_or_else(|| "-".into(), |p| p.to_string()),
-                        s.port.map_or_else(|| "-".into(), |p| p.to_string()),
-                        s.url.as_deref().unwrap_or("-")
-                    );
+                    if let Some(next_step) = s
+                        .publication
+                        .as_ref()
+                        .and_then(|publication| publication.next_step.as_deref())
+                    {
+                        let _ = write!(content, " NEXT: {next_step}");
+                    }
 
                     if !s.warnings.is_empty() {
                         let _ = write!(content, " WARNING: {}", s.warnings.join(", "));

@@ -3,6 +3,7 @@
 	import { projects, services } from '$lib/stores/services';
 	import { restartAllServices } from '$lib/api';
 	import Terminal from './Terminal.svelte';
+	import { managedServices } from '$lib/service-presentation';
 
 	let sseConnected = $state<boolean | null>(null);
 	let restarting = $state(false);
@@ -19,10 +20,11 @@
 	}
 
 	let projectsCount = $derived($projects.length);
-	let servicesCount = $derived($services.length);
-	let runningCount = $derived($services.filter((s) => s.status === 'running').length);
-	let buildingCount = $derived($services.filter((s) => s.status === 'building').length);
-	let stoppedCount = $derived($services.filter((s) => s.status === 'stopped').length);
+	let managed = $derived(managedServices($services));
+	let publishedCount = $derived($services.length - managed.length);
+	let runningCount = $derived(managed.filter((s) => s.status === 'running').length);
+	let buildingCount = $derived(managed.filter((s) => s.status === 'building').length);
+	let stoppedCount = $derived(managed.filter((s) => s.status === 'stopped').length);
 
 	onMount(() => {
 		const tick = () => {
@@ -66,9 +68,9 @@
 					class="restart-btn"
 					onclick={handleRestartAll}
 					disabled={restarting || runningCount === 0}
-					title="Restart all running services"
+					title="Restart all running managed services"
 				>
-					{restarting ? 'Restarting…' : 'Restart All'}
+					{restarting ? 'Restarting…' : 'Restart Managed'}
 				</button>
 			</div>
 			<div class="summary">
@@ -77,8 +79,12 @@
 					<div class="stat-label">Projects</div>
 				</div>
 				<div class="stat">
-					<div class="stat-num">{servicesCount}</div>
-					<div class="stat-label">Services</div>
+					<div class="stat-num">{managed.length}</div>
+					<div class="stat-label">Managed</div>
+				</div>
+				<div class="stat">
+					<div class="stat-num">{publishedCount}</div>
+					<div class="stat-label">Published</div>
 				</div>
 				<div class="stat">
 					<div class="stat-num">{runningCount}</div>

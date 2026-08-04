@@ -41,6 +41,7 @@ const editor_controller_js_1 = require("./editor-controller.js");
 const plumbing_js_1 = require("./plumbing.js");
 const status_bar_js_1 = require("./status-bar.js");
 const tools_js_1 = require("./tools.js");
+const service_presentation_js_1 = require("./service-presentation.js");
 const workspace_project_js_1 = require("./workspace-project.js");
 let statusBar;
 let editorController;
@@ -160,6 +161,7 @@ function registerCommands(context, controller) {
             const picked = await vscode.window.showQuickPick(webServices.map((service) => ({
                 label: service.name.split(":").pop() ?? service.name,
                 description: service.url,
+                detail: service.publication?.explanation,
             })), { placeHolder: "Open web service" });
             if (picked?.description) {
                 openInBrowser(picked.description, `${picked.description}/**`);
@@ -170,14 +172,20 @@ function registerCommands(context, controller) {
         }
     }), vscode.commands.registerCommand("locald.restartServices", async () => {
         try {
-            const restarted = await controller.withCurrentProject("prepare services for restart", async (initial, ensureTarget) => {
-                await (0, plumbing_js_1.stopProject)(initial.project_path);
-                return ensureTarget("wait for restarted services");
-            });
-            if (!restarted) {
-                throw new Error("no locald project is selected");
+            const projectPath = await resolveRequiredProjectPath();
+            const initial = await (0, plumbing_js_1.status)(projectPath);
+            const managed = (0, service_presentation_js_1.managedLifecycleServices)(initial.service_details);
+            if (managed.length === 0) {
+                throw new Error("this project has no locald-managed services to restart; use each published service's owning workflow");
             }
-            vscode.window.showInformationMessage("locald: services restarted");
+            for (const service of managed) {
+                await (0, plumbing_js_1.restartService)(projectPath, service.name);
+            }
+            const final = await (0, plumbing_js_1.status)(projectPath);
+            const published = final.service_details.filter((service) => service.service_type === "published").length;
+            vscode.window.showInformationMessage(published > 0
+                ? `locald: managed services restarted; ${published} published service${published === 1 ? " remains" : "s remain"} externally managed`
+                : "locald: managed services restarted");
         }
         catch (error) {
             vscode.window.showErrorMessage(`locald: restart failed — ${formatError(error)}`);

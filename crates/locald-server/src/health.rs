@@ -57,6 +57,9 @@ pub(crate) enum ReadinessRequirement {
 
 impl ReadinessRequirement {
     pub(crate) fn service_requires_port(config: &ServiceConfig) -> bool {
+        if config.is_published() {
+            return false;
+        }
         let explicit_network_probe = matches!(
             config.health_check(),
             Some(HealthCheckConfig::Probe(probe))
@@ -151,6 +154,9 @@ impl ReadinessRequirement {
                     anyhow::anyhow!("portful service has no assigned port for TCP readiness")
                 })?,
             }),
+            ServiceConfig::Typed(TypedServiceConfig::Published(_)) => {
+                anyhow::bail!("published services have no managed readiness requirement")
+            }
         }
     }
 
@@ -520,7 +526,7 @@ impl HealthMonitor {
                 }) {
                     let _ = self
                         .event_sender
-                        .send(locald_core::ipc::Event::ServiceUpdate(status));
+                        .send(locald_core::ipc::Event::ServiceUpdate(Box::new(status)));
                 }
             }
         }
@@ -626,7 +632,7 @@ impl HealthMonitor {
                 }) {
                     let _ = self
                         .event_sender
-                        .send(locald_core::ipc::Event::ServiceUpdate(status));
+                        .send(locald_core::ipc::Event::ServiceUpdate(Box::new(status)));
                 }
             }
         }
@@ -1025,6 +1031,15 @@ mod tests {
                 .expect("derive portful worker readiness"),
             ReadinessRequirement::AssignedPortTcp { port: 4124 }
         ));
+        let published: ServiceConfig =
+            toml::from_str("type = \"published\"").expect("parse published service");
+        assert!(!ReadinessRequirement::service_requires_port(&published));
+        assert!(
+            ReadinessRequirement::for_service(&published, None)
+                .expect_err("published services have no managed readiness")
+                .to_string()
+                .contains("no managed readiness requirement")
+        );
         assert!(matches!(
             ReadinessRequirement::for_service(
                 &ServiceConfig::Typed(TypedServiceConfig::Site(SiteServiceConfig::default())),

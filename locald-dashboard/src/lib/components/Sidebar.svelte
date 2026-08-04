@@ -21,7 +21,7 @@
 	let contextMenu = $state<{ x: number; y: number; project: ProjectListEntry } | null>(null);
 
 	async function handleStopAll() {
-		if (!confirm('Are you sure you want to stop all services?')) return;
+		if (!confirm('Are you sure you want to stop all managed services?')) return;
 		try {
 			await stopAllServices();
 		} catch (e) {
@@ -30,7 +30,7 @@
 	}
 
 	async function handleRestartAll() {
-		if (!confirm('Are you sure you want to restart all services?')) return;
+		if (!confirm('Are you sure you want to restart all managed services?')) return;
 		try {
 			await restartAllServices();
 		} catch (e) {
@@ -95,10 +95,10 @@
 			<span>locald</span>
 		</div>
 		<div class="global-controls">
-			<button title="Restart All" onclick={handleRestartAll}>
+			<button title="Restart All Managed Services" onclick={handleRestartAll}>
 				<RotateCw size={16} />
 			</button>
-			<button title="Stop All" onclick={handleStopAll}>
+			<button title="Stop All Managed Services" onclick={handleStopAll}>
 				<Square size={16} />
 			</button>
 		</div>
@@ -183,12 +183,13 @@
 </div>
 
 {#if contextMenu}
-	<!-- svelte-ignore a11y_interactive_supports_focus a11y_click_events_have_key_events -->
 	<div
 		class="context-menu"
 		style="left: {contextMenu.x}px; top: {contextMenu.y}px"
 		role="menu"
+		tabindex="-1"
 		onclick={(e) => e.stopPropagation()}
+		onkeydown={(e) => e.stopPropagation()}
 	>
 		<button class="context-menu-item danger" onclick={handleRemove} role="menuitem">
 			Remove Project

@@ -261,6 +261,7 @@ fn classify_service_type(svc: &ServiceConfig) -> &str {
         ServiceConfig::Typed(TypedServiceConfig::Container(_)) => "container",
         ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => "postgres",
         ServiceConfig::Typed(TypedServiceConfig::Site(_)) => "site",
+        ServiceConfig::Typed(TypedServiceConfig::Published(_)) => "published",
     }
 }
 
@@ -1435,6 +1436,46 @@ mod tests {
         let a = allocator();
         let err = apply_plan_to_config(&mut cfg, &plan, &caps(), &a).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("type conflict")));
+    }
+
+    #[test]
+    fn plugin_cannot_turn_a_published_declaration_into_a_managed_runtime() {
+        let mut cfg = base_config();
+        cfg.services.insert(
+            "workbench".to_string(),
+            toml::from_str("type = \"published\"\ndomains = [\"workbench\"]")
+                .expect("parse published declaration"),
+        );
+
+        let plan = Plan {
+            ir_version: 1,
+            requested_capabilities: vec![],
+            steps: vec![Step {
+                id: "s1".to_string(),
+                needs: vec![],
+                op: Op::DeclareService(DeclareServiceOp {
+                    name: "workbench".to_string(),
+                    runtime: "exec".to_string(),
+                    settings: vec![(
+                        "command".to_string(),
+                        Expr::Lit(Value::Text("serve".to_string())),
+                    )],
+                }),
+            }],
+        };
+
+        let a = allocator();
+        let error = apply_plan_to_config(&mut cfg, &plan, &caps(), &a)
+            .expect_err("plugin runtime must not replace published authority");
+        assert!(
+            error.errors.iter().any(|error| {
+                error.contains("user defined as 'published'")
+                    && error.contains("plugin declares as 'exec'")
+            }),
+            "unexpected plugin diagnostics: {:?}",
+            error.errors
+        );
+        assert!(cfg.services["workbench"].is_published());
     }
 
     #[test]

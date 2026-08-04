@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::availability::ProjectAvailabilityStatus;
+use crate::ipc::PublicationStatus;
 use crate::state::ServiceState;
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,13 @@ pub enum DomainResolution {
         /// A replacement controller receives a new generation even when it
         /// reuses the service's sticky internal port.
         runtime_generation: u64,
+    },
+    /// A durable published-service identity that currently has no admitted
+    /// external endpoint lease. The proxy preserves the semantic origin and
+    /// renders the declaration's truthful availability guidance.
+    PublishedUnavailable {
+        name: String,
+        publication: PublicationStatus,
     },
     /// A persisted project claim that cannot currently be mapped to loaded
     /// service context. The domain remains owned and must not fall through to a

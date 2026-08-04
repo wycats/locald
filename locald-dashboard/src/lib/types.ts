@@ -1,4 +1,19 @@
-export type ServiceType = 'exec' | 'postgres' | 'worker' | 'container' | 'site';
+export type ServiceType = 'exec' | 'postgres' | 'worker' | 'container' | 'site' | 'published';
+
+export type PublicationState =
+	| 'waiting_for_publisher'
+	| 'checking_endpoint'
+	| 'endpoint_unhealthy'
+	| 'ready'
+	| 'route_paused'
+	| 'instance_missing';
+
+export interface PublicationStatus {
+	state: PublicationState;
+	origin: string;
+	explanation: string;
+	next_step?: string;
+}
 
 export interface ServiceStatus {
 	name: string;
@@ -7,7 +22,7 @@ export interface ServiceStatus {
 	service_type: ServiceType;
 	pid: number | null;
 	port: number | null;
-	status: 'running' | 'stopped' | 'building';
+	status: 'running' | 'stopped' | 'building' | 'externally_managed';
 	url: string | null;
 	connection_url: string | null;
 	domain: string | null;
@@ -17,6 +32,7 @@ export interface ServiceStatus {
 	workspace: string | null;
 	constellation: string | null;
 	warnings: string[];
+	publication?: PublicationStatus;
 	metrics?: ServiceMetrics;
 	cpu_history?: number[];
 }
@@ -51,6 +67,7 @@ export interface ServiceInspectResponse {
 	path: string | null;
 	container_id: string | null;
 	warnings: string[];
+	publication?: PublicationStatus;
 	config?: unknown;
 }
 

@@ -329,7 +329,8 @@ impl ServiceController for ExecController {
             ServiceConfig::Typed(
                 TypedServiceConfig::Postgres(_)
                 | TypedServiceConfig::Worker(_)
-                | TypedServiceConfig::Site(_),
+                | TypedServiceConfig::Site(_)
+                | TypedServiceConfig::Published(_),
             ) => {}
         }
 
@@ -351,7 +352,8 @@ impl ServiceController for ExecController {
                 ServiceConfig::Typed(
                     TypedServiceConfig::Container(_)
                     | TypedServiceConfig::Postgres(_)
-                    | TypedServiceConfig::Site(_),
+                    | TypedServiceConfig::Site(_)
+                    | TypedServiceConfig::Published(_),
                 ) => anyhow::bail!("Invalid config for ExecController (Host Process)"),
             };
 
@@ -688,6 +690,7 @@ impl ServiceFactory for ExecFactory {
             ServiceConfig::Typed(TypedServiceConfig::Container(_)) => true,
             ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => false,
             ServiceConfig::Typed(TypedServiceConfig::Site(_)) => false,
+            ServiceConfig::Typed(TypedServiceConfig::Published(_)) => false,
         }
     }
 

@@ -572,6 +572,16 @@ async fn handle_connection(
             },
             None => None,
         };
+        if let Some(service_name) = service.as_deref()
+            && let Err(error) = manager
+                .reject_published_service_logs(project_instance_id, service_name)
+                .await
+        {
+            let mut bytes = serde_json::to_vec(&IpcResponse::Error(error.to_string()))?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+            return Ok(());
+        }
         let mut subscription = subscribe_to_logs(
             project_instance_id,
             &manager.log_sender,

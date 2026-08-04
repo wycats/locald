@@ -47,8 +47,9 @@ pub use env_provenance::{
 // pub use loader::{ConfigLoader, Provenance};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// Root configuration for a locald project.
@@ -222,21 +223,45 @@ pub struct ProjectConfig {
 
 /// Configuration for a single service.
 ///
-/// This enum is untagged, so a service entry can be either a typed service
-/// (with a `type = "..."` field) or a legacy exec-style service config.
+/// A service entry can be either a typed service (with a `type = "..."` field)
+/// or a legacy exec-style service config. Deserialization checks the
+/// discriminator first: once `type` is present, an invalid typed declaration
+/// cannot fall through to the permissive legacy exec shape.
 ///
 /// # Example
 /// ```toml
 /// [services.web]
 /// command = "npm start"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ServiceConfig {
     /// A typed service configuration (e.g. Postgres, Worker).
     Typed(TypedServiceConfig),
     /// A legacy or simple exec service configuration.
     Legacy(ExecServiceConfig),
+}
+
+impl<'de> Deserialize<'de> for ServiceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let is_typed = value
+            .as_object()
+            .is_some_and(|service| service.contains_key("type"));
+
+        if is_typed {
+            serde_json::from_value(value)
+                .map(Self::Typed)
+                .map_err(D::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Legacy)
+                .map_err(D::Error::custom)
+        }
+    }
 }
 
 /// Enum of supported typed service configurations.
@@ -260,6 +285,195 @@ pub enum TypedServiceConfig {
     Container(ContainerServiceConfig),
     /// A managed site service.
     Site(SiteServiceConfig),
+    /// A stable service identity fulfilled by an authenticated external publisher.
+    Published(PublishedServiceConfig),
+}
+
+/// Configuration for a service whose runtime is owned by an external publisher.
+///
+/// Published services intentionally expose no process-owned configuration. locald
+/// owns their stable domains, HTTP health policy, status, and eventual proxy route,
+/// while another same-user process owns the application runtime.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedServiceConfig {
+    /// Optional relative domain claims. Omission preserves the conventional
+    /// service-domain mapping; an explicit list must contain an exact claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
+    /// Optional HTTP health policy. Omission uses `GET /` with locald defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<PublishedHealthCheckConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedServiceConfigInput {
+    domains: Option<Vec<String>>,
+    health_check: Option<PublishedHealthCheckConfig>,
+}
+
+impl<'de> Deserialize<'de> for PublishedServiceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = PublishedServiceConfigInput::deserialize(deserializer)?;
+        if let Some(domains) = &input.domains {
+            if domains.is_empty() {
+                return Err(D::Error::custom(
+                    "a published service's explicit `domains` list cannot be empty",
+                ));
+            }
+            if !domains.iter().any(|domain| !domain.starts_with("*.")) {
+                return Err(D::Error::custom(
+                    "a published service's explicit `domains` list must contain at least one exact domain claim",
+                ));
+            }
+        }
+
+        Ok(Self {
+            domains: input.domains,
+            health_check: input.health_check,
+        })
+    }
+}
+
+impl PublishedServiceConfig {
+    /// Return the effective HTTP health policy for the declaration.
+    #[must_use]
+    pub fn normalized_health_check(&self) -> PublishedHealthCheckConfig {
+        self.health_check.clone().unwrap_or_default()
+    }
+}
+
+/// HTTP-only health configuration for one published service.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedHealthCheckConfig {
+    /// The probe protocol. Version 1 accepts only HTTP.
+    #[serde(rename = "type")]
+    pub kind: PublishedProbeType,
+    /// Origin-relative path requested by locald. Defaults to `/`.
+    #[serde(default = "default_published_health_path")]
+    pub path: String,
+    /// Seconds between probes. Defaults to one second.
+    #[serde(default = "default_published_health_interval")]
+    pub interval: u64,
+    /// Per-request timeout in seconds. Defaults to five seconds.
+    #[serde(default = "default_published_health_timeout")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedHealthCheckConfigInput {
+    #[serde(rename = "type")]
+    kind: PublishedProbeType,
+    #[serde(default = "default_published_health_path")]
+    path: String,
+    #[serde(default = "default_published_health_interval")]
+    interval: u64,
+    #[serde(default = "default_published_health_timeout")]
+    timeout: u64,
+}
+
+impl<'de> Deserialize<'de> for PublishedHealthCheckConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = PublishedHealthCheckConfigInput::deserialize(deserializer)?;
+        let path_without_query = input.path.split('?').next().unwrap_or(&input.path);
+        if !input.path.starts_with('/')
+            || input.path.starts_with("//")
+            || input.path.contains('#')
+            || input.path.contains(['\r', '\n'])
+            || path_without_query
+                .split('/')
+                .any(is_published_health_dot_segment)
+        {
+            return Err(D::Error::custom(
+                "a published service health-check path must be origin-relative, begin with one `/`, and contain no authority, fragment, or dot segment",
+            ));
+        }
+        if !(1..=60).contains(&input.interval) {
+            return Err(D::Error::custom(
+                "a published service health-check interval must be between 1 and 60 seconds",
+            ));
+        }
+        if !(1..=10).contains(&input.timeout) {
+            return Err(D::Error::custom(
+                "a published service health-check timeout must be between 1 and 10 seconds",
+            ));
+        }
+
+        Ok(Self {
+            kind: input.kind,
+            path: input.path,
+            interval: input.interval,
+            timeout: input.timeout,
+        })
+    }
+}
+
+fn is_published_health_dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+    )
+}
+
+impl Default for PublishedHealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            kind: PublishedProbeType::Http,
+            path: default_published_health_path(),
+            interval: default_published_health_interval(),
+            timeout: default_published_health_timeout(),
+        }
+    }
+}
+
+impl PublishedHealthCheckConfig {
+    /// Return the validated origin-relative probe path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Return the validated probe interval in seconds.
+    #[must_use]
+    pub const fn interval_secs(&self) -> u64 {
+        self.interval
+    }
+
+    /// Return the validated per-request timeout in seconds.
+    #[must_use]
+    pub const fn timeout_secs(&self) -> u64 {
+        self.timeout
+    }
+}
+
+fn default_published_health_path() -> String {
+    "/".to_owned()
+}
+
+const fn default_published_health_interval() -> u64 {
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECS
+}
+
+const fn default_published_health_timeout() -> u64 {
+    DEFAULT_HEALTH_CHECK_TIMEOUT_SECS
+}
+
+/// Probe type accepted by a published service declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PublishedProbeType {
+    /// An application-level HTTP GET.
+    #[default]
+    Http,
 }
 
 /// Configuration for a container-based service.
@@ -547,26 +761,59 @@ pub struct SiteServiceConfig {
 }
 
 impl ServiceConfig {
-    pub const fn common(&self) -> &CommonServiceConfig {
+    /// Return whether this declaration is fulfilled by an external publisher.
+    #[must_use]
+    pub const fn is_published(&self) -> bool {
+        matches!(self, Self::Typed(TypedServiceConfig::Published(_)))
+    }
+
+    /// Return the published-service declaration, when this is one.
+    #[must_use]
+    pub const fn published(&self) -> Option<&PublishedServiceConfig> {
+        match self {
+            Self::Typed(TypedServiceConfig::Published(config)) => Some(config),
+            _ => None,
+        }
+    }
+
+    /// Return common process configuration for a locald-managed service.
+    ///
+    /// Published services return an immutable empty process configuration so
+    /// read-only compatibility projections remain safe. Runtime dispatch must
+    /// still use [`Self::is_published`] to keep them out of controllers.
+    pub fn common(&self) -> &CommonServiceConfig {
+        static EMPTY: LazyLock<CommonServiceConfig> = LazyLock::new(CommonServiceConfig::default);
         match self {
             Self::Typed(TypedServiceConfig::Exec(c)) | Self::Legacy(c) => &c.common,
             Self::Typed(TypedServiceConfig::Postgres(c)) => &c.common,
             Self::Typed(TypedServiceConfig::Worker(c)) => &c.common,
             Self::Typed(TypedServiceConfig::Container(c)) => &c.common,
             Self::Typed(TypedServiceConfig::Site(c)) => &c.common,
+            Self::Typed(TypedServiceConfig::Published(_)) => &EMPTY,
         }
     }
 
-    pub const fn port(&self) -> Option<u16> {
-        self.common().port
+    pub fn port(&self) -> Option<u16> {
+        match self {
+            Self::Typed(TypedServiceConfig::Published(_)) => None,
+            _ => self.common().port,
+        }
     }
 
-    pub const fn listeners(&self) -> &Vec<String> {
-        &self.common().listeners
+    pub fn listeners(&self) -> &Vec<String> {
+        static EMPTY: Vec<String> = Vec::new();
+        match self {
+            Self::Typed(TypedServiceConfig::Published(_)) => &EMPTY,
+            _ => &self.common().listeners,
+        }
     }
 
-    pub const fn generated(&self) -> &BTreeMap<String, GeneratedFileConfig> {
-        &self.common().generated
+    pub fn generated(&self) -> &BTreeMap<String, GeneratedFileConfig> {
+        static EMPTY: BTreeMap<String, GeneratedFileConfig> = BTreeMap::new();
+        match self {
+            Self::Typed(TypedServiceConfig::Published(_)) => &EMPTY,
+            _ => &self.common().generated,
+        }
     }
 
     /// Whether this service kind can own dynamically allocated listeners.
@@ -592,17 +839,25 @@ impl ServiceConfig {
             Self::Typed(
                 TypedServiceConfig::Postgres(_)
                 | TypedServiceConfig::Container(_)
-                | TypedServiceConfig::Site(_),
+                | TypedServiceConfig::Site(_)
+                | TypedServiceConfig::Published(_),
             ) => false,
         }
     }
 
-    pub const fn env(&self) -> &HashMap<String, String> {
-        &self.common().env
+    pub fn env(&self) -> &HashMap<String, String> {
+        static EMPTY: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+        match self {
+            Self::Typed(TypedServiceConfig::Published(_)) => &EMPTY,
+            _ => &self.common().env,
+        }
     }
 
     pub fn domains(&self) -> Option<&[String]> {
-        self.common().domains.as_deref()
+        match self {
+            Self::Typed(TypedServiceConfig::Published(config)) => config.domains.as_deref(),
+            _ => self.common().domains.as_deref(),
+        }
     }
 
     /// Return whether two service definitions require the same runtime.
@@ -612,28 +867,43 @@ impl ServiceConfig {
     /// environment and is therefore detected separately by the manager.
     #[must_use]
     pub fn runtime_eq(&self, other: &Self) -> bool {
+        if self.is_published() || other.is_published() {
+            return self.is_published() && other.is_published();
+        }
         let mut left = self.clone();
         let mut right = other.clone();
-        left.common_mut().domains = None;
-        right.common_mut().domains = None;
+        if let Some(common) = left.common_mut() {
+            common.domains = None;
+        }
+        if let Some(common) = right.common_mut() {
+            common.domains = None;
+        }
         left == right
     }
 
-    pub const fn depends_on(&self) -> &Vec<String> {
-        &self.common().depends_on
-    }
-
-    pub const fn health_check(&self) -> Option<&HealthCheckConfig> {
-        self.common().health_check.as_ref()
-    }
-
-    const fn common_mut(&mut self) -> &mut CommonServiceConfig {
+    pub fn depends_on(&self) -> &Vec<String> {
+        static EMPTY: Vec<String> = Vec::new();
         match self {
-            Self::Typed(TypedServiceConfig::Exec(c)) | Self::Legacy(c) => &mut c.common,
-            Self::Typed(TypedServiceConfig::Postgres(c)) => &mut c.common,
-            Self::Typed(TypedServiceConfig::Worker(c)) => &mut c.common,
-            Self::Typed(TypedServiceConfig::Container(c)) => &mut c.common,
-            Self::Typed(TypedServiceConfig::Site(c)) => &mut c.common,
+            Self::Typed(TypedServiceConfig::Published(_)) => &EMPTY,
+            _ => &self.common().depends_on,
+        }
+    }
+
+    pub fn health_check(&self) -> Option<&HealthCheckConfig> {
+        match self {
+            Self::Typed(TypedServiceConfig::Published(_)) => None,
+            _ => self.common().health_check.as_ref(),
+        }
+    }
+
+    const fn common_mut(&mut self) -> Option<&mut CommonServiceConfig> {
+        match self {
+            Self::Typed(TypedServiceConfig::Exec(c)) | Self::Legacy(c) => Some(&mut c.common),
+            Self::Typed(TypedServiceConfig::Postgres(c)) => Some(&mut c.common),
+            Self::Typed(TypedServiceConfig::Worker(c)) => Some(&mut c.common),
+            Self::Typed(TypedServiceConfig::Container(c)) => Some(&mut c.common),
+            Self::Typed(TypedServiceConfig::Site(c)) => Some(&mut c.common),
+            Self::Typed(TypedServiceConfig::Published(_)) => None,
         }
     }
 }
@@ -699,7 +969,10 @@ domains = ["frame", "*.frame"]
         )
         .expect("parse current service");
         let mut candidate = current.clone();
-        candidate.common_mut().domains = Some(
+        candidate
+            .common_mut()
+            .expect("managed service common config")
+            .domains = Some(
             ["frame", "preview"]
                 .into_iter()
                 .map(str::to_owned)
@@ -708,9 +981,14 @@ domains = ["frame", "*.frame"]
 
         assert!(current.runtime_eq(&candidate));
 
-        current.common_mut().env.insert("MODE".into(), "old".into());
+        current
+            .common_mut()
+            .expect("managed service common config")
+            .env
+            .insert("MODE".into(), "old".into());
         candidate
             .common_mut()
+            .expect("managed service common config")
             .env
             .insert("MODE".into(), "new".into());
         assert!(!current.runtime_eq(&candidate));
@@ -816,6 +1094,160 @@ source = "chat/microfrontends.jsonc"
                 );
             }
         }
+
+        let published = schema
+            .pointer("/$defs/TypedServiceConfig/oneOf")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|variants| {
+                variants.iter().find(|variant| {
+                    variant.pointer("/properties/type/const")
+                        == Some(&serde_json::Value::String("published".to_owned()))
+                })
+            })
+            .expect("published service schema variant");
+        assert_eq!(
+            published.pointer("/additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            published
+                .pointer("/properties")
+                .and_then(serde_json::Value::as_object)
+                .expect("published properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["domains", "health_check", "type"]
+        );
+
+        let published_health = schema
+            .pointer("/$defs/PublishedHealthCheckConfig")
+            .expect("published health schema");
+        assert_eq!(
+            published_health.pointer("/additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            published_health.pointer("/required"),
+            Some(&serde_json::json!(["type"]))
+        );
+    }
+
+    #[test]
+    fn published_service_round_trips_with_normalized_http_defaults() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "published-app"
+
+[services.workbench]
+type = "published"
+"#,
+        )
+        .expect("parse minimal published service");
+        let service = config.services.get("workbench").expect("workbench");
+        let published = service.published().expect("published declaration");
+        assert_eq!(published.domains, None);
+        assert_eq!(
+            published.normalized_health_check(),
+            PublishedHealthCheckConfig::default()
+        );
+        assert!(service.is_published());
+        assert_eq!(service.port(), None);
+        assert!(service.listeners().is_empty());
+        assert!(service.generated().is_empty());
+        assert!(service.env().is_empty());
+        assert!(service.depends_on().is_empty());
+        assert!(service.health_check().is_none());
+
+        let encoded = toml::to_string(&config).expect("serialize published config");
+        let round_tripped: LocaldConfig =
+            toml::from_str(&encoded).expect("round-trip published config");
+        assert_eq!(round_tripped, config);
+        assert!(encoded.contains("type = \"published\""));
+        assert!(!encoded.contains("health_check"));
+    }
+
+    #[test]
+    fn published_service_accepts_only_normalized_http_health() {
+        let service: ServiceConfig = toml::from_str(
+            r#"
+type = "published"
+domains = ["workbench", "*.workbench"]
+
+[health_check]
+type = "http"
+path = "/ready?full=true"
+interval = 60
+timeout = 10
+"#,
+        )
+        .expect("parse explicit published health policy");
+        let published = service.published().expect("published declaration");
+        assert_eq!(
+            published.domains.as_deref(),
+            Some(["workbench".to_owned(), "*.workbench".to_owned()].as_slice())
+        );
+        let health = published.normalized_health_check();
+        assert_eq!(health.kind, PublishedProbeType::Http);
+        assert_eq!(health.path(), "/ready?full=true");
+        assert_eq!(health.interval_secs(), 60);
+        assert_eq!(health.timeout_secs(), 10);
+
+        for invalid in [
+            "type = \"published\"\ndomains = []",
+            "type = \"published\"\ndomains = [\"*.workbench\"]",
+            "type = \"published\"\nhealth_check = \"curl /\"",
+            "type = \"published\"\nhealth_check = { type = \"tcp\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", path = \"ready\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", path = \"//other.test/ready\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", path = \"/a/../ready\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", path = \"/a/%2E%2e/ready\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", path = \"/ready#fragment\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", path = \"/ready\\nnext\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", command = \"curl /\" }",
+            "type = \"published\"\nhealth_check = { type = \"http\", interval = 0 }",
+            "type = \"published\"\nhealth_check = { type = \"http\", interval = 61 }",
+            "type = \"published\"\nhealth_check = { type = \"http\", timeout = 0 }",
+            "type = \"published\"\nhealth_check = { type = \"http\", timeout = 11 }",
+        ] {
+            assert!(
+                toml::from_str::<ServiceConfig>(invalid).is_err(),
+                "invalid published health/domain config was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn published_service_cannot_fall_through_to_legacy_exec() {
+        for field in [
+            "command = \"serve\"",
+            "workdir = \"app\"",
+            "build = { builder = \"builder\" }",
+            "env = { MODE = \"dev\" }",
+            "port = 3000",
+            "listeners = [\"hmr\"]",
+            "generated = {}",
+            "depends_on = [\"db\"]",
+            "stop_signal = \"SIGINT\"",
+            "unexpected = true",
+        ] {
+            let raw = format!("type = \"published\"\n{field}");
+            let error = toml::from_str::<ServiceConfig>(&raw)
+                .expect_err("published process/unknown field must fail");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_service_errors_never_fall_through_to_legacy_exec() {
+        let error =
+            toml::from_str::<ServiceConfig>("type = \"not-a-runtime\"\ncommand = \"serve\"")
+                .expect_err("unknown typed runtime must fail");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]

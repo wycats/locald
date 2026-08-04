@@ -11,7 +11,7 @@ fn main() {
 #[cfg(target_os = "macos")]
 mod macos {
     use locald_core::state::ServiceState;
-    use locald_core::{IpcRequest, IpcResponse};
+    use locald_core::{IpcRequest, IpcResponse, ipc::ServiceType};
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use objc2_foundation::MainThreadMarker;
@@ -28,7 +28,11 @@ mod macos {
     enum DaemonStatus {
         Checking,
         NotRunning,
-        Running { total: usize, running: usize },
+        Running {
+            total: usize,
+            running: usize,
+            published: usize,
+        },
     }
 
     impl DaemonStatus {
@@ -36,14 +40,26 @@ mod macos {
             match self {
                 DaemonStatus::Checking => "Status: checking...".to_string(),
                 DaemonStatus::NotRunning => "Status: not running".to_string(),
-                DaemonStatus::Running { total, running } => {
-                    if *total == 0 {
+                DaemonStatus::Running {
+                    total,
+                    running,
+                    published,
+                } => {
+                    if *total == 0 && *published == 0 {
                         "Status: running (no services)".to_string()
+                    } else if *total == 0 {
+                        format!("Status: running ({published} published)")
+                    } else if *published == 0 {
+                        format!("Status: {running}/{total} managed running")
                     } else {
-                        format!("Status: {running}/{total} running")
+                        format!("Status: {running}/{total} managed running, {published} published")
                     }
                 }
             }
+        }
+
+        fn can_restart_managed_services(&self) -> bool {
+            matches!(self, Self::Running { total, .. } if *total > 0)
         }
     }
 
@@ -107,7 +123,7 @@ mod macos {
         let open_item = MenuItem::new("Open Dashboard", true, None);
         menu.append(&open_item)?;
 
-        let restart_item = MenuItem::new("Restart All Services", true, None);
+        let restart_item = MenuItem::new("Restart Managed Services", false, None);
         menu.append(&restart_item)?;
 
         // "Run Setup..." — visible only when health checks fail.
@@ -156,6 +172,7 @@ mod macos {
             status_item: MenuItem,
             health_item: MenuItem,
             setup_item: MenuItem,
+            restart_item: MenuItem,
             open_item_id: muda::MenuId,
             restart_item_id: muda::MenuId,
             setup_item_id: muda::MenuId,
@@ -174,6 +191,7 @@ mod macos {
                 status_item,
                 health_item,
                 setup_item: setup_item.clone(),
+                restart_item: restart_item.clone(),
                 open_item_id: open_item.id().clone(),
                 restart_item_id: restart_item.id().clone(),
                 setup_item_id: setup_item.id().clone(),
@@ -195,6 +213,9 @@ mod macos {
                         if update.daemon != state.current_daemon {
                             state.current_daemon = update.daemon.clone();
                             state.status_item.set_text(state.current_daemon.label());
+                            state
+                                .restart_item
+                                .set_enabled(state.current_daemon.can_restart_managed_services());
                         }
                         if update.health != state.current_health {
                             state.current_health = update.health.clone();
@@ -278,13 +299,25 @@ mod macos {
 
         match send_request(&IpcRequest::Status) {
             Ok(IpcResponse::Status(services)) => {
+                let published = services
+                    .iter()
+                    .filter(|service| service.service_type == ServiceType::Published)
+                    .count();
+                let total = services
+                    .iter()
+                    .filter(|service| service.service_type != ServiceType::Published)
+                    .count();
                 let running = services
                     .iter()
-                    .filter(|service| service.status == ServiceState::Running)
+                    .filter(|service| {
+                        service.service_type != ServiceType::Published
+                            && service.status == ServiceState::Running
+                    })
                     .count();
                 DaemonStatus::Running {
-                    total: services.len(),
+                    total,
                     running,
+                    published,
                 }
             }
             _ => DaemonStatus::NotRunning,
@@ -599,18 +632,62 @@ mod macos {
             assert_eq!(
                 DaemonStatus::Running {
                     total: 3,
-                    running: 2
+                    running: 2,
+                    published: 0,
                 }
                 .label(),
-                "Status: 2/3 running"
+                "Status: 2/3 managed running"
             );
             assert_eq!(
                 DaemonStatus::Running {
                     total: 0,
-                    running: 0
+                    running: 0,
+                    published: 0,
                 }
                 .label(),
                 "Status: running (no services)"
+            );
+            assert_eq!(
+                DaemonStatus::Running {
+                    total: 0,
+                    running: 0,
+                    published: 2,
+                }
+                .label(),
+                "Status: running (2 published)"
+            );
+            assert_eq!(
+                DaemonStatus::Running {
+                    total: 3,
+                    running: 2,
+                    published: 1,
+                }
+                .label(),
+                "Status: 2/3 managed running, 1 published"
+            );
+            assert!(
+                DaemonStatus::Running {
+                    total: 3,
+                    running: 2,
+                    published: 1,
+                }
+                .can_restart_managed_services()
+            );
+            assert!(
+                !DaemonStatus::Running {
+                    total: 0,
+                    running: 0,
+                    published: 2,
+                }
+                .can_restart_managed_services()
+            );
+            assert!(
+                DaemonStatus::Running {
+                    total: 1,
+                    running: 0,
+                    published: 2,
+                }
+                .can_restart_managed_services()
             );
         }
 

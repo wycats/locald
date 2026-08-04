@@ -11,11 +11,15 @@ use crate::identity::{
     ResolvedProjectIdentity, WorktreeId, derive_project_id, derive_project_instance_id,
     inspect_git_project_identity, inspect_repository_id, resolve_git_project_identity,
 };
-use crate::{DomainClaim, DomainError, DomainIndex, DomainName, DomainTarget};
+use crate::{
+    DomainClaim, DomainError, DomainIndex, DomainName, DomainPattern, DomainTarget, ServiceKey,
+    ServiceName,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,8 +27,9 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// The current identity, domain-ownership, and ambient-agent binding schema.
-pub const CATALOG_VERSION: u32 = 5;
+/// The current identity, domain-ownership, and published-declaration schema.
+pub const CATALOG_VERSION: u32 = 6;
+const PUBLISHED_DECLARATION_PREDECESSOR_VERSION: u32 = 5;
 const SERVICE_DOMAIN_CATALOG_VERSION: u32 = 4;
 const AGENT_BINDING_CATALOG_VERSION: u32 = 3;
 const LEGACY_CATALOG_VERSION: u32 = 2;
@@ -129,6 +134,151 @@ pub struct ProjectInstanceRecord {
     pub domain_slug: Option<String>,
     #[serde(default)]
     pub domain_claims: BTreeSet<String>,
+    /// The last complete project configuration admitted for this instance.
+    ///
+    /// Zero means that no configuration generation has been admitted yet.
+    #[serde(default)]
+    pub configuration_revision: u64,
+}
+
+/// A validated, absolute HTTPS semantic origin without path, query, or fragment.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SemanticOrigin(String);
+
+impl SemanticOrigin {
+    /// Construct the exact public HTTPS origin for one owned domain.
+    #[must_use]
+    pub fn https(domain: &DomainName, advertised_https_port: u16) -> Self {
+        if advertised_https_port == 443 {
+            Self(format!("https://{domain}"))
+        } else {
+            Self(format!("https://{domain}:{advertised_https_port}"))
+        }
+    }
+
+    /// Return the canonical serialized origin.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Return the exact hostname authorized by this origin.
+    pub fn domain(&self) -> Result<DomainName, CatalogError> {
+        self.parts().map(|(domain, _)| domain).map_err(|reason| {
+            CatalogError::Invariant(format!("invalid durable semantic origin: {reason}"))
+        })
+    }
+
+    /// Return the advertised HTTPS port, including the implicit standard port.
+    pub fn port(&self) -> Result<u16, CatalogError> {
+        self.parts().map(|(_, port)| port).map_err(|reason| {
+            CatalogError::Invariant(format!("invalid durable semantic origin: {reason}"))
+        })
+    }
+
+    fn parts(&self) -> Result<(DomainName, u16), String> {
+        parse_semantic_origin(&self.0)
+    }
+}
+
+impl fmt::Display for SemanticOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for SemanticOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_semantic_origin(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
+
+/// The normalized HTTP health policy persisted for a published service.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedHttpHealthPolicy {
+    pub path: String,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+}
+
+impl PublishedHttpHealthPolicy {
+    /// Construct and validate one normalized HTTP health policy.
+    pub fn new(
+        path: impl Into<String>,
+        interval_secs: u64,
+        timeout_secs: u64,
+    ) -> Result<Self, CatalogError> {
+        let policy = Self {
+            path: path.into(),
+            interval_secs,
+            timeout_secs,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(&self) -> Result<(), CatalogError> {
+        let path_without_query = self.path.split('?').next().unwrap_or(&self.path);
+        if !self.path.starts_with('/')
+            || self.path.starts_with("//")
+            || self.path.contains('#')
+            || self.path.contains(['\r', '\n'])
+            || path_without_query
+                .split('/')
+                .any(is_published_health_dot_segment)
+        {
+            return Err(CatalogError::Invariant(format!(
+                "published HTTP health path `{}` must be origin-relative, begin with one `/`, and contain no authority, fragment, line break, or dot segment",
+                self.path
+            )));
+        }
+        if !(1..=60).contains(&self.interval_secs) {
+            return Err(CatalogError::Invariant(
+                "published HTTP health interval must be between 1 and 60 seconds".to_owned(),
+            ));
+        }
+        if !(1..=10).contains(&self.timeout_secs) {
+            return Err(CatalogError::Invariant(
+                "published HTTP health timeout must be between 1 and 10 seconds".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_published_health_dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+    )
+}
+
+/// One complete durable declaration admitted from `locald.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedServiceDeclaration {
+    pub project_instance_id: ProjectInstanceId,
+    pub service_name: ServiceName,
+    pub configuration_revision: u64,
+    pub origin: SemanticOrigin,
+    pub domain_claims: BTreeSet<DomainPattern>,
+    pub health_policy: PublishedHttpHealthPolicy,
+}
+
+/// A declaration candidate before the catalog assigns its admitted revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedServiceAdmission {
+    pub service_name: ServiceName,
+    pub origin: SemanticOrigin,
+    pub domain_claims: BTreeSet<DomainPattern>,
+    pub health_policy: PublishedHttpHealthPolicy,
 }
 
 /// Legacy stores that supplied a path before it could be assigned an identity.
@@ -224,6 +374,15 @@ pub enum CatalogError {
         expected: u32,
     },
 
+    #[error(
+        "catalog `{path}` requires journaled schema migration from version {found} to {expected}"
+    )]
+    SchemaMigrationRequired {
+        path: PathBuf,
+        found: u64,
+        expected: u32,
+    },
+
     #[error("invalid catalog or legacy state `{path}`: {reason}")]
     InvalidData { path: PathBuf, reason: String },
 
@@ -273,6 +432,18 @@ pub struct ProjectCatalog {
     pub domain_index: DomainIndex,
     #[serde(default)]
     agent_bindings: BTreeMap<AgentConversationKey, ProjectInstanceId>,
+    /// Durable declarations grouped by instance and then by configured name.
+    ///
+    /// The nested representation preserves canonical JSON object keys without
+    /// serializing a compound [`crate::ServiceKey`] as an opaque string.
+    #[serde(default)]
+    published_services:
+        BTreeMap<ProjectInstanceId, BTreeMap<ServiceName, PublishedServiceDeclaration>>,
+    /// Last admitted revision retained after an instance is explicitly
+    /// forgotten, preventing deterministic Git identity reuse from creating
+    /// the same declaration generation again.
+    #[serde(default)]
+    retired_configuration_revisions: BTreeMap<ProjectInstanceId, u64>,
     #[serde(skip, default = "ProjectCatalog::path")]
     storage_path: PathBuf,
 }
@@ -295,6 +466,8 @@ impl ProjectCatalog {
             unresolved_legacy: BTreeMap::new(),
             domain_index: DomainIndex::default(),
             agent_bindings: BTreeMap::new(),
+            published_services: BTreeMap::new(),
+            retired_configuration_revisions: BTreeMap::new(),
             storage_path,
         }
     }
@@ -303,6 +476,12 @@ impl ProjectCatalog {
     #[must_use]
     pub fn with_path(storage_path: PathBuf) -> Self {
         Self::empty_at(storage_path)
+    }
+
+    /// Return this image's serialized schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.version
     }
 
     /// Get the standard identity catalog path.
@@ -441,21 +620,30 @@ impl ProjectCatalog {
     }
 
     async fn load_existing_for_lifecycle_recovery(path: &Path) -> Result<Self, CatalogError> {
-        let content = tokio::fs::read_to_string(path)
+        let content = tokio::fs::read(path)
             .await
             .map_err(|source| CatalogError::Io {
                 operation: "read catalog for lifecycle recovery",
                 path: path.to_path_buf(),
                 source,
             })?;
-        if content.trim().is_empty() {
+        Self::decode_for_lifecycle_recovery(&content, path)
+    }
+
+    /// Decode one exact durable catalog image for journal recovery without
+    /// publishing or reconciling it.
+    pub fn decode_for_lifecycle_recovery(
+        content: &[u8],
+        path: &Path,
+    ) -> Result<Self, CatalogError> {
+        if content.iter().all(u8::is_ascii_whitespace) {
             return Err(CatalogError::InvalidData {
                 path: path.to_path_buf(),
                 reason: "existing catalog is empty".to_owned(),
             });
         }
         let value: Value =
-            serde_json::from_str(&content).map_err(|source| CatalogError::InvalidData {
+            serde_json::from_slice(content).map_err(|source| CatalogError::InvalidData {
                 path: path.to_path_buf(),
                 reason: source.to_string(),
             })?;
@@ -469,6 +657,9 @@ impl ProjectCatalog {
         match version {
             version if version == u64::from(CATALOG_VERSION) => {
                 Self::deserialize_current(value, path)
+            }
+            version if version == u64::from(PUBLISHED_DECLARATION_PREDECESSOR_VERSION) => {
+                Self::migrate_v5(value, path)
             }
             version if version == u64::from(SERVICE_DOMAIN_CATALOG_VERSION) => {
                 Self::migrate_v4(value, path)
@@ -525,6 +716,18 @@ impl ProjectCatalog {
             version if version == u64::from(CATALOG_VERSION) => {
                 Self::deserialize_current(value, path)
             }
+            version if version == u64::from(PUBLISHED_DECLARATION_PREDECESSOR_VERSION) => {
+                // The daemon's catalog/domain/hosts publication transaction
+                // owns v5-to-v6 replacement and its create-once raw backup.
+                // This ordinary loader must not establish a competing commit
+                // point outside that journal.
+                let _ = Self::migrate_v5(value, path)?;
+                Err(CatalogError::SchemaMigrationRequired {
+                    path: path.to_path_buf(),
+                    found: u64::from(PUBLISHED_DECLARATION_PREDECESSOR_VERSION),
+                    expected: CATALOG_VERSION,
+                })
+            }
             version if version == u64::from(SERVICE_DOMAIN_CATALOG_VERSION) => {
                 let catalog = Self::migrate_v4(value, path)?;
                 match replace_catalog_with_parent_sync(&catalog, path, parent_sync).await {
@@ -561,6 +764,38 @@ impl ProjectCatalog {
                 reason: "current catalog is missing `agent_bindings`".to_owned(),
             });
         }
+        if value.get("published_services").is_none() {
+            return Err(CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "current catalog is missing `published_services`".to_owned(),
+            });
+        }
+        if value.get("retired_configuration_revisions").is_none() {
+            return Err(CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "current catalog is missing `retired_configuration_revisions`".to_owned(),
+            });
+        }
+        let instances = value
+            .get("instances")
+            .and_then(Value::as_object)
+            .ok_or_else(|| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "current catalog is missing object `instances`".to_owned(),
+            })?;
+        if let Some(instance_id) = instances.iter().find_map(|(instance_id, record)| {
+            record
+                .get("configuration_revision")
+                .is_none()
+                .then_some(instance_id)
+        }) {
+            return Err(CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "current catalog instance `{instance_id}` is missing `configuration_revision`"
+                ),
+            });
+        }
         let mut catalog: Self =
             serde_json::from_value(value).map_err(|source| CatalogError::InvalidData {
                 path: path.to_path_buf(),
@@ -571,7 +806,14 @@ impl ProjectCatalog {
         Ok(catalog)
     }
 
+    fn migrate_v5(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        reject_predecessor_published_projection(&value, path, 5)?;
+        install_published_projection_defaults(&mut value, path)?;
+        Self::deserialize_current(value, path)
+    }
+
     fn migrate_v4(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        reject_predecessor_published_projection(&value, path, 4)?;
         let object = value
             .as_object_mut()
             .ok_or_else(|| CatalogError::InvalidData {
@@ -579,10 +821,12 @@ impl ProjectCatalog {
                 reason: "catalog must be an object".to_owned(),
             })?;
         object.insert("version".to_owned(), Value::from(CATALOG_VERSION));
+        install_published_projection_defaults(&mut value, path)?;
         Self::deserialize_current(value, path)
     }
 
     fn migrate_v3(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        reject_predecessor_published_projection(&value, path, 3)?;
         let object = value
             .as_object_mut()
             .ok_or_else(|| CatalogError::InvalidData {
@@ -594,10 +838,12 @@ impl ProjectCatalog {
             "agent_bindings".to_owned(),
             Value::Object(serde_json::Map::new()),
         );
+        install_published_projection_defaults(&mut value, path)?;
         Self::deserialize_current(value, path)
     }
 
     fn migrate_v2(mut value: Value, path: &Path) -> Result<Self, CatalogError> {
+        reject_predecessor_published_projection(&value, path, 2)?;
         let had_domain_index = value.get("domain_index").is_some();
         let object = value
             .as_object_mut()
@@ -621,6 +867,8 @@ impl ProjectCatalog {
                 })?,
             );
         }
+
+        install_published_projection_defaults(&mut value, path)?;
 
         let mut catalog: Self =
             serde_json::from_value(value).map_err(|source| CatalogError::InvalidData {
@@ -723,6 +971,174 @@ impl ProjectCatalog {
         &self.domain_index
     }
 
+    /// Return the last admitted configuration revision for one instance.
+    #[must_use]
+    pub fn configuration_revision(&self, instance_id: ProjectInstanceId) -> Option<u64> {
+        self.instances
+            .get(&instance_id)
+            .map(|record| record.configuration_revision)
+    }
+
+    /// Compute the next checked configuration revision without mutating state.
+    pub fn next_configuration_revision(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Result<u64, CatalogError> {
+        let current = self.instances.get(&instance_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "configuration revision references missing project instance {instance_id}"
+            ))
+        })?;
+        current
+            .configuration_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                CatalogError::Invariant(format!(
+                    "project instance {instance_id} exhausted its configuration revisions"
+                ))
+            })
+    }
+
+    /// Return one durable published-service declaration.
+    #[must_use]
+    pub fn published_declaration(
+        &self,
+        instance_id: ProjectInstanceId,
+        service_name: &str,
+    ) -> Option<&PublishedServiceDeclaration> {
+        self.published_services
+            .get(&instance_id)
+            .and_then(|services| {
+                services.iter().find_map(|(name, declaration)| {
+                    (name.as_str() == service_name).then_some(declaration)
+                })
+            })
+    }
+
+    /// Resolve one durable declaration by the normal instance-scoped service key.
+    #[must_use]
+    pub fn published_declaration_by_key(
+        &self,
+        key: &ServiceKey,
+    ) -> Option<&PublishedServiceDeclaration> {
+        self.published_services
+            .get(&key.instance())
+            .and_then(|services| services.get(key.name()))
+    }
+
+    /// Return every durable declaration for one project instance.
+    #[must_use]
+    pub fn published_declarations_for_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> Option<&BTreeMap<ServiceName, PublishedServiceDeclaration>> {
+        self.published_services.get(&instance_id)
+    }
+
+    /// Iterate every durable declaration grouped by its exact project instance.
+    pub fn published_declarations(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ProjectInstanceId,
+            &BTreeMap<ServiceName, PublishedServiceDeclaration>,
+        ),
+    > {
+        self.published_services
+            .iter()
+            .map(|(instance_id, declarations)| (*instance_id, declarations))
+    }
+
+    /// Iterate retired declaration revision high-water marks.
+    pub fn retired_configuration_revisions(
+        &self,
+    ) -> impl Iterator<Item = (ProjectInstanceId, u64)> + '_ {
+        self.retired_configuration_revisions
+            .iter()
+            .map(|(instance_id, revision)| (*instance_id, *revision))
+    }
+
+    /// Admit one complete project configuration generation atomically.
+    ///
+    /// Domain ownership and published declarations are one projection of the
+    /// same `locald.toml`. Advancing them together prevents an origin change,
+    /// managed/published type change, or remove/re-add transition from ever
+    /// exposing a mixed declaration authority. The revision advances even when
+    /// `published` is empty so a later publisher cannot survive an ABA change.
+    pub fn replace_configuration_projection(
+        &mut self,
+        instance_id: ProjectInstanceId,
+        claims: impl IntoIterator<Item = DomainClaim>,
+        published: impl IntoIterator<Item = PublishedServiceAdmission>,
+    ) -> Result<u64, CatalogError> {
+        let revision = self.next_configuration_revision(instance_id)?;
+        let replacement_domain_index = self.domain_index.replacing_instance(instance_id, claims)?;
+        let domains = replacement_domain_index.domains_for_instance(instance_id);
+
+        let mut replacement_declarations = BTreeMap::new();
+        for admission in published {
+            let declaration = PublishedServiceDeclaration {
+                project_instance_id: instance_id,
+                service_name: admission.service_name.clone(),
+                configuration_revision: revision,
+                origin: admission.origin,
+                domain_claims: admission.domain_claims,
+                health_policy: admission.health_policy,
+            };
+            if replacement_declarations
+                .insert(admission.service_name.clone(), declaration)
+                .is_some()
+            {
+                return Err(CatalogError::Invariant(format!(
+                    "configuration declares published service `{}` more than once for instance {instance_id}",
+                    admission.service_name
+                )));
+            }
+        }
+
+        let mut candidate = self.clone();
+        let record = candidate.instances.get_mut(&instance_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "configuration projection references missing project instance {instance_id}"
+            ))
+        })?;
+        record.configuration_revision = revision;
+        record.domain_claims = domains;
+        candidate.domain_index = replacement_domain_index;
+        if replacement_declarations.is_empty() {
+            candidate.published_services.remove(&instance_id);
+        } else {
+            candidate
+                .published_services
+                .insert(instance_id, replacement_declarations);
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(revision)
+    }
+
+    /// Fail closed when durable sandbox origins do not match the listener this
+    /// daemon currently advertises. A subsequent explicit configuration
+    /// admission may intentionally publish a new origin generation.
+    pub fn validate_published_origins_for_https_port(
+        &self,
+        advertised_https_port: u16,
+    ) -> Result<(), CatalogError> {
+        for declarations in self.published_services.values() {
+            for declaration in declarations.values() {
+                if declaration.origin.port()? != advertised_https_port {
+                    return Err(CatalogError::Invariant(format!(
+                        "published service `{}` in instance {} was admitted for {}, but this daemon advertises HTTPS port {advertised_https_port}; explicitly re-admit the project configuration before using this sandbox data directory",
+                        declaration.service_name,
+                        declaration.project_instance_id,
+                        declaration.origin
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Return the durable project-instance binding for one opaque conversation.
     #[must_use]
     pub fn agent_binding(&self, conversation: &AgentConversationKey) -> Option<ProjectInstanceId> {
@@ -736,13 +1152,23 @@ impl ProjectCatalog {
     pub fn upgrade_embedded_schema(&mut self) -> Result<bool, CatalogError> {
         let upgraded = match self.version {
             CATALOG_VERSION => false,
-            SERVICE_DOMAIN_CATALOG_VERSION => {
+            PUBLISHED_DECLARATION_PREDECESSOR_VERSION | SERVICE_DOMAIN_CATALOG_VERSION => {
                 self.version = CATALOG_VERSION;
+                self.published_services.clear();
+                self.retired_configuration_revisions.clear();
+                for instance in self.instances.values_mut() {
+                    instance.configuration_revision = 0;
+                }
                 true
             }
             AGENT_BINDING_CATALOG_VERSION => {
                 self.version = CATALOG_VERSION;
                 self.agent_bindings.clear();
+                self.published_services.clear();
+                self.retired_configuration_revisions.clear();
+                for instance in self.instances.values_mut() {
+                    instance.configuration_revision = 0;
+                }
                 true
             }
             version => {
@@ -799,14 +1225,16 @@ impl ProjectCatalog {
         }
         let replacement = self.domain_index.replacing_instance(instance_id, claims)?;
         let domains = replacement.domains_for_instance(instance_id);
-        let record = self.instances.get_mut(&instance_id).ok_or_else(|| {
+        let mut candidate = self.clone();
+        let record = candidate.instances.get_mut(&instance_id).ok_or_else(|| {
             CatalogError::Invariant(format!(
                 "domain claims reference missing project instance {instance_id}"
             ))
         })?;
         record.domain_claims = domains;
-        self.domain_index = replacement;
-        self.validate()?;
+        candidate.domain_index = replacement;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
@@ -1104,6 +1532,10 @@ impl ProjectCatalog {
             record.pinned |= pinned;
             record.last_seen = last_seen;
         } else {
+            let configuration_revision = self
+                .retired_configuration_revisions
+                .remove(&project_instance_id)
+                .unwrap_or(0);
             self.instances.insert(
                 project_instance_id,
                 ProjectInstanceRecord {
@@ -1118,6 +1550,7 @@ impl ProjectCatalog {
                     last_seen,
                     domain_slug: None,
                     domain_claims: BTreeSet::new(),
+                    configuration_revision,
                 },
             );
         }
@@ -1199,6 +1632,7 @@ impl ProjectCatalog {
                 last_seen,
                 domain_slug: None,
                 domain_claims: BTreeSet::new(),
+                configuration_revision: 0,
             },
         );
         self.legacy_paths.insert(project_root, instance_id);
@@ -1481,9 +1915,20 @@ impl ProjectCatalog {
         self.domain_index = self
             .domain_index
             .replacing_instance(instance_id, std::iter::empty())?;
+        self.published_services.remove(&instance_id);
         let Some(instance) = self.instances.remove(&instance_id) else {
             return Ok(());
         };
+        if instance.configuration_revision > 0
+            && matches!(instance.origin, ProjectInstanceOrigin::Git { .. })
+        {
+            self.retired_configuration_revisions
+                .entry(instance_id)
+                .and_modify(|revision| {
+                    *revision = (*revision).max(instance.configuration_revision);
+                })
+                .or_insert(instance.configuration_revision);
+        }
         self.legacy_paths.retain(|_, id| *id != instance_id);
         self.agent_bindings.retain(|_, id| *id != instance_id);
 
@@ -1682,6 +2127,18 @@ impl ProjectCatalog {
                 ));
             }
         }
+        for (instance_id, revision) in &self.retired_configuration_revisions {
+            if *revision == 0 {
+                return Err(CatalogError::Invariant(format!(
+                    "retired configuration revision for {instance_id} must be nonzero"
+                )));
+            }
+            if self.instances.contains_key(instance_id) {
+                return Err(CatalogError::Invariant(format!(
+                    "retired configuration revision for {instance_id} overlaps a live project instance"
+                )));
+            }
+        }
         for (domain, target) in self
             .domain_index
             .claims()
@@ -1858,6 +2315,7 @@ impl ProjectCatalog {
                 )));
             }
         }
+        self.validate_published_services()?;
         for (path, instance_id) in &self.legacy_paths {
             if !self.instances.contains_key(instance_id) {
                 return Err(CatalogError::Invariant(format!(
@@ -1897,6 +2355,258 @@ impl ProjectCatalog {
         }
         Ok(())
     }
+
+    fn validate_published_services(&self) -> Result<(), CatalogError> {
+        let mut projected_claims =
+            BTreeMap::<DomainPattern, (ProjectInstanceId, ServiceName)>::new();
+        for (instance_id, declarations) in &self.published_services {
+            let instance = self.instances.get(instance_id).ok_or_else(|| {
+                CatalogError::Invariant(format!(
+                    "published declarations reference missing project instance {instance_id}"
+                ))
+            })?;
+            if declarations.is_empty() {
+                return Err(CatalogError::Invariant(format!(
+                    "project instance {instance_id} has an empty published declaration map"
+                )));
+            }
+            for (service_name, declaration) in declarations {
+                if service_name != &declaration.service_name
+                    || declaration.project_instance_id != *instance_id
+                {
+                    return Err(CatalogError::Invariant(format!(
+                        "published declaration key for `{service_name}` does not match its redundant service or project identity"
+                    )));
+                }
+                if declaration.configuration_revision == 0
+                    || declaration.configuration_revision != instance.configuration_revision
+                {
+                    return Err(CatalogError::Invariant(format!(
+                        "published service `{service_name}` in instance {instance_id} has configuration revision {}, but the instance owns revision {}",
+                        declaration.configuration_revision, instance.configuration_revision
+                    )));
+                }
+                declaration.health_policy.validate()?;
+                if declaration.domain_claims.is_empty()
+                    || !declaration
+                        .domain_claims
+                        .iter()
+                        .any(DomainPattern::is_exact)
+                {
+                    return Err(CatalogError::Invariant(format!(
+                        "published service `{service_name}` in instance {instance_id} must own at least one exact domain claim"
+                    )));
+                }
+                let origin_domain = declaration.origin.domain()?;
+                let origin_pattern = DomainPattern::exact(origin_domain.clone());
+                if !declaration.domain_claims.contains(&origin_pattern) {
+                    return Err(CatalogError::Invariant(format!(
+                        "published service `{service_name}` origin `{}` is not in its complete domain claim set",
+                        declaration.origin
+                    )));
+                }
+
+                let mut target_runtime_name = None::<String>;
+                for pattern in &declaration.domain_claims {
+                    if let Some((owner, owner_service)) = projected_claims
+                        .insert(pattern.clone(), (*instance_id, service_name.clone()))
+                    {
+                        return Err(CatalogError::Invariant(format!(
+                            "published services `{owner_service}` in instance {owner} and `{service_name}` in instance {instance_id} both project domain `{pattern}`"
+                        )));
+                    }
+                    let target = match pattern {
+                        DomainPattern::Exact(domain) => self.domain_index.claims().get(domain),
+                        DomainPattern::Wildcard(suffix) => {
+                            self.domain_index.wildcard_claims().get(suffix)
+                        }
+                    }
+                    .ok_or_else(|| {
+                        CatalogError::Invariant(format!(
+                            "published service `{service_name}` projects domain `{pattern}` that is absent from the domain index"
+                        ))
+                    })?;
+                    let DomainTarget::Service {
+                        project_instance_id,
+                        service_name: Some(runtime_name),
+                        primary,
+                    } = target
+                    else {
+                        return Err(CatalogError::Invariant(format!(
+                            "published service `{service_name}` domain `{pattern}` does not target a concrete service"
+                        )));
+                    };
+                    if project_instance_id != instance_id {
+                        return Err(CatalogError::Invariant(format!(
+                            "published service `{service_name}` domain `{pattern}` targets project instance {project_instance_id}, not {instance_id}"
+                        )));
+                    }
+                    if let Some(expected) = &target_runtime_name {
+                        if expected != runtime_name {
+                            return Err(CatalogError::Invariant(format!(
+                                "published service `{service_name}` domain claims target several runtime service names"
+                            )));
+                        }
+                    } else {
+                        target_runtime_name = Some(runtime_name.clone());
+                    }
+                    let is_origin = pattern == &origin_pattern;
+                    if *primary != is_origin {
+                        return Err(CatalogError::Invariant(format!(
+                            "published service `{service_name}` domain `{pattern}` has primary={primary}, but its canonical origin is `{origin_domain}`"
+                        )));
+                    }
+                }
+
+                let runtime_name = target_runtime_name.ok_or_else(|| {
+                    CatalogError::Invariant(format!(
+                        "published service `{service_name}` has no concrete domain target"
+                    ))
+                })?;
+                let indexed_claims = self
+                    .domain_index
+                    .claims()
+                    .iter()
+                    .filter_map(|(domain, target)| match target {
+                        DomainTarget::Service {
+                            project_instance_id,
+                            service_name: Some(candidate),
+                            ..
+                        } if project_instance_id == instance_id && candidate == &runtime_name => {
+                            Some(DomainPattern::exact(domain.clone()))
+                        }
+                        DomainTarget::Platform { .. } | DomainTarget::Service { .. } => None,
+                    })
+                    .chain(self.domain_index.wildcard_claims().iter().filter_map(
+                        |(suffix, target)| match target {
+                            DomainTarget::Service {
+                                project_instance_id,
+                                service_name: Some(candidate),
+                                ..
+                            } if project_instance_id == instance_id
+                                && candidate == &runtime_name =>
+                            {
+                                Some(DomainPattern::wildcard(suffix.clone()))
+                            }
+                            DomainTarget::Platform { .. } | DomainTarget::Service { .. } => None,
+                        },
+                    ))
+                    .collect::<BTreeSet<_>>();
+                if indexed_claims != declaration.domain_claims {
+                    return Err(CatalogError::Invariant(format!(
+                        "published service `{service_name}` domain claims are not the complete domain-index projection for runtime service `{runtime_name}`"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn reject_predecessor_published_projection(
+    value: &Value,
+    path: &Path,
+    version: u32,
+) -> Result<(), CatalogError> {
+    let object = value.as_object().ok_or_else(|| CatalogError::InvalidData {
+        path: path.to_path_buf(),
+        reason: "catalog must be an object".to_owned(),
+    })?;
+    if object.contains_key("published_services")
+        || object.contains_key("retired_configuration_revisions")
+        || object
+            .get("instances")
+            .and_then(Value::as_object)
+            .is_some_and(|instances| {
+                instances
+                    .values()
+                    .any(|record| record.get("configuration_revision").is_some())
+            })
+    {
+        return Err(CatalogError::InvalidData {
+            path: path.to_path_buf(),
+            reason: format!(
+                "version-{version} catalog contains version-{CATALOG_VERSION} published-declaration fields"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn install_published_projection_defaults(
+    value: &mut Value,
+    path: &Path,
+) -> Result<(), CatalogError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| CatalogError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "catalog must be an object".to_owned(),
+        })?;
+    object.insert("version".to_owned(), Value::from(CATALOG_VERSION));
+    object.insert(
+        "published_services".to_owned(),
+        Value::Object(serde_json::Map::new()),
+    );
+    object.insert(
+        "retired_configuration_revisions".to_owned(),
+        Value::Object(serde_json::Map::new()),
+    );
+    let instances = object
+        .get_mut("instances")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| CatalogError::InvalidData {
+            path: path.to_path_buf(),
+            reason: "catalog is missing object `instances`".to_owned(),
+        })?;
+    for record in instances.values_mut() {
+        let record = record
+            .as_object_mut()
+            .ok_or_else(|| CatalogError::InvalidData {
+                path: path.to_path_buf(),
+                reason: "catalog instance record must be an object".to_owned(),
+            })?;
+        record.insert("configuration_revision".to_owned(), Value::from(0_u64));
+    }
+    Ok(())
+}
+
+fn parse_semantic_origin(value: &str) -> Result<(DomainName, u16), String> {
+    let authority = value
+        .strip_prefix("https://")
+        .ok_or_else(|| "semantic origin must use the `https` scheme".to_owned())?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', '\\', '\r', '\n']) {
+        return Err(
+            "semantic origin must contain only an HTTPS hostname and optional decimal port"
+                .to_owned(),
+        );
+    }
+    let (host, port) = authority.rsplit_once(':').map_or_else(
+        || Ok::<_, String>((authority, 443_u16)),
+        |(host, port)| {
+            if host.is_empty() || port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err("semantic origin has an invalid authority".to_owned());
+            }
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "semantic origin port is outside 1..=65535".to_owned())?;
+            if port == 0 {
+                return Err("semantic origin port must be nonzero".to_owned());
+            }
+            Ok((host, port))
+        },
+    )?;
+    let domain = host
+        .parse::<DomainName>()
+        .map_err(|error| format!("semantic origin has an invalid hostname: {error}"))?;
+    let canonical = SemanticOrigin::https(&domain, port);
+    if canonical.as_str() != value {
+        return Err(format!(
+            "semantic origin `{value}` is not canonical; expected `{canonical}`"
+        ));
+    }
+    Ok((domain, port))
 }
 
 fn data_dir() -> PathBuf {
@@ -2652,6 +3362,22 @@ mod tests {
         }
     }
 
+    fn remove_published_projection_fields(value: &mut Value) {
+        let object = value.as_object_mut().expect("catalog fixture object");
+        object.remove("published_services");
+        object.remove("retired_configuration_revisions");
+        for record in object["instances"]
+            .as_object_mut()
+            .expect("catalog fixture instances")
+            .values_mut()
+        {
+            record
+                .as_object_mut()
+                .expect("catalog fixture instance")
+                .remove("configuration_revision");
+        }
+    }
+
     fn catalog_fixture_bytes(
         catalog: &ProjectCatalog,
         version: u32,
@@ -2659,6 +3385,9 @@ mod tests {
     ) -> Vec<u8> {
         let mut value = serde_json::to_value(catalog).expect("serialize catalog fixture");
         value["version"] = Value::from(version);
+        if version < CATALOG_VERSION {
+            remove_published_projection_fields(&mut value);
+        }
         if !include_domain_index {
             value
                 .as_object_mut()
@@ -2701,6 +3430,404 @@ mod tests {
         assert_eq!(
             catalog_fixture_version(&first_bytes),
             u64::from(CATALOG_VERSION)
+        );
+    }
+
+    fn published_admission(
+        instance_id: ProjectInstanceId,
+        domain: &str,
+    ) -> (Vec<DomainClaim>, PublishedServiceAdmission) {
+        let domain = domain.parse::<DomainName>().expect("published test domain");
+        let pattern = DomainPattern::exact(domain.clone());
+        (
+            vec![DomainClaim::service(
+                domain.clone(),
+                instance_id,
+                "app:workbench".to_owned(),
+            )],
+            PublishedServiceAdmission {
+                service_name: ServiceName::new("workbench"),
+                origin: SemanticOrigin::https(&domain, 443),
+                domain_claims: BTreeSet::from([pattern]),
+                health_policy: PublishedHttpHealthPolicy::new("/health", 1, 5)
+                    .expect("published health policy"),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn published_configuration_advances_one_revision_and_round_trips() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("published-round-trip");
+        let mut catalog = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect("initialize catalog");
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover project"),
+                Some("app".to_owned()),
+            )
+            .expect("register project");
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+
+        let revision = catalog
+            .replace_configuration_projection(instance_id, claims, [admission])
+            .expect("admit published configuration");
+        assert_eq!(revision, 1);
+        let declaration = catalog
+            .published_declaration(instance_id, "workbench")
+            .expect("published declaration");
+        assert_eq!(declaration.configuration_revision, revision);
+        assert_eq!(
+            declaration.origin.as_str(),
+            "https://workbench.app.localhost"
+        );
+        assert_eq!(
+            catalog.published_declaration_by_key(&ServiceKey::new(instance_id, "workbench")),
+            Some(declaration)
+        );
+
+        catalog.save().await.expect("persist published catalog");
+        let reopened = ProjectCatalog::load_from_paths(paths)
+            .await
+            .expect("reload published catalog");
+        assert_eq!(reopened, catalog);
+    }
+
+    #[tokio::test]
+    async fn every_configuration_admission_advances_revision_and_can_remove_publication() {
+        let fixture = Fixture::new();
+        let project = fixture.project("published-revision");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover project"),
+                Some("app".to_owned()),
+            )
+            .expect("register project");
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+        assert_eq!(
+            catalog
+                .replace_configuration_projection(instance_id, claims.clone(), [admission])
+                .expect("admit first generation"),
+            1
+        );
+        assert_eq!(
+            catalog
+                .replace_configuration_projection(instance_id, claims, std::iter::empty(),)
+                .expect("admit managed-only generation"),
+            2
+        );
+        assert!(
+            catalog
+                .published_declarations_for_instance(instance_id)
+                .is_none()
+        );
+        assert_eq!(catalog.configuration_revision(instance_id), Some(2));
+    }
+
+    #[tokio::test]
+    async fn published_projection_rejects_mismatched_identity_revision_and_claims() {
+        let fixture = Fixture::new();
+        let project = fixture.project("published-invalid");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover project"),
+                Some("app".to_owned()),
+            )
+            .expect("register project");
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+        catalog
+            .replace_configuration_projection(instance_id, claims, [admission])
+            .expect("admit published configuration");
+
+        let before_legacy_replacement = catalog.clone();
+        let error = catalog
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "other.app.localhost"
+                        .parse()
+                        .expect("replacement test domain"),
+                    instance_id,
+                    "app:workbench".to_owned(),
+                )],
+            )
+            .expect_err("legacy claim replacement must not split the published projection");
+        assert!(error.to_string().contains("published service"));
+        assert_eq!(catalog, before_legacy_replacement);
+
+        let declarations = catalog
+            .published_services
+            .get_mut(&instance_id)
+            .expect("published instance declarations");
+        declarations
+            .get_mut(&ServiceName::new("workbench"))
+            .expect("published declaration")
+            .configuration_revision = 2;
+        let error = catalog
+            .validate()
+            .expect_err("revision mismatch must fail closed");
+        assert!(error.to_string().contains("configuration revision"));
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_instance_removes_its_published_projection() {
+        let fixture = Fixture::new();
+        let project = fixture.project("published-forget");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project.clone())
+                    .await
+                    .expect("discover project"),
+                Some("app".to_owned()),
+            )
+            .expect("register project");
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+        catalog
+            .replace_configuration_projection(instance_id, claims, [admission])
+            .expect("admit published configuration");
+
+        assert!(
+            catalog
+                .unregister_project(&project)
+                .expect("forget project")
+        );
+        assert!(catalog.published_declarations().next().is_none());
+        assert!(
+            catalog
+                .domain_index()
+                .domain_for_service(instance_id, "app:workbench")
+                .is_none()
+        );
+        catalog.validate().expect("validate forgotten catalog");
+    }
+
+    #[tokio::test]
+    async fn forgetting_and_readmitting_same_git_instance_advances_past_retired_revision() {
+        let fixture = Fixture::new();
+        let project = fixture.git_project("published-git-readmit");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project.clone())
+                    .await
+                    .expect("discover Git project"),
+                Some("app".to_owned()),
+            )
+            .expect("register Git project");
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+        assert_eq!(
+            catalog
+                .replace_configuration_projection(instance_id, claims, [admission])
+                .expect("admit first Git declaration"),
+            1
+        );
+
+        assert!(
+            catalog
+                .unregister_project(&project)
+                .expect("forget Git project")
+        );
+        assert_eq!(
+            catalog
+                .retired_configuration_revisions()
+                .collect::<BTreeMap<_, _>>()
+                .get(&instance_id),
+            Some(&1)
+        );
+
+        catalog.save().await.expect("persist retired Git revision");
+        let mut catalog = ProjectCatalog::load_from_paths(fixture.paths())
+            .await
+            .expect("reopen catalog with retired Git revision");
+        assert_eq!(
+            catalog
+                .retired_configuration_revisions()
+                .collect::<BTreeMap<_, _>>()
+                .get(&instance_id),
+            Some(&1)
+        );
+
+        let rediscovered = catalog
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("rediscover same Git project"),
+                Some("app".to_owned()),
+            )
+            .expect("re-register same Git project");
+        assert_eq!(rediscovered, instance_id);
+        assert_eq!(catalog.configuration_revision(instance_id), Some(1));
+        assert!(catalog.retired_configuration_revisions().next().is_none());
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+        assert_eq!(
+            catalog
+                .replace_configuration_projection(instance_id, claims, [admission])
+                .expect("admit post-forget Git declaration"),
+            2
+        );
+        catalog
+            .validate()
+            .expect("validate re-admitted Git catalog");
+    }
+
+    #[tokio::test]
+    async fn sandbox_origin_drift_requires_explicit_readmission() {
+        let fixture = Fixture::new();
+        let project = fixture.project("published-sandbox");
+        let mut catalog = ProjectCatalog::with_path(fixture.paths().catalog);
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover project"),
+                Some("app".to_owned()),
+            )
+            .expect("register project");
+        let (claims, mut admission) = published_admission(instance_id, "workbench.app.localhost");
+        admission.origin = SemanticOrigin::https(
+            &"workbench.app.localhost".parse().expect("sandbox domain"),
+            8443,
+        );
+        catalog
+            .replace_configuration_projection(instance_id, claims, [admission])
+            .expect("admit sandbox configuration");
+
+        catalog
+            .validate_published_origins_for_https_port(8443)
+            .expect("matching sandbox listener");
+        let error = catalog
+            .validate_published_origins_for_https_port(9443)
+            .expect_err("drifted sandbox listener must fail closed");
+        assert!(error.to_string().contains("explicitly re-admit"));
+    }
+
+    #[tokio::test]
+    async fn malformed_current_v6_health_policy_fails_without_rewrite() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let project = fixture.project("published-invalid-health");
+        let mut catalog = ProjectCatalog::with_path(paths.catalog.clone());
+        let instance_id = catalog
+            .register_project(
+                ProjectCatalog::discover(project)
+                    .await
+                    .expect("discover project"),
+                Some("app".to_owned()),
+            )
+            .expect("register project");
+        let (claims, admission) = published_admission(instance_id, "workbench.app.localhost");
+        catalog
+            .replace_configuration_projection(instance_id, claims, [admission])
+            .expect("admit published configuration");
+
+        for (path, interval, timeout) in [
+            ("/a/../ready", 1, 5),
+            ("/a/%2E%2e/ready", 1, 5),
+            ("/ready", 61, 5),
+            ("/ready", 1, 11),
+        ] {
+            let declaration = catalog
+                .published_services
+                .get_mut(&instance_id)
+                .expect("published declarations")
+                .get_mut(&ServiceName::new("workbench"))
+                .expect("published workbench declaration");
+            declaration.health_policy.path = path.to_owned();
+            declaration.health_policy.interval_secs = interval;
+            declaration.health_policy.timeout_secs = timeout;
+            let mut bytes = serde_json::to_vec_pretty(&catalog).expect("encode malformed catalog");
+            bytes.push(b'\n');
+            tokio::fs::write(&paths.catalog, &bytes)
+                .await
+                .expect("write malformed catalog");
+            ProjectCatalog::load_from_paths(paths.clone())
+                .await
+                .expect_err("malformed current-v6 health policy must fail closed");
+            assert_eq!(
+                tokio::fs::read(&paths.catalog)
+                    .await
+                    .expect("read preserved malformed catalog"),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn predecessor_catalogs_with_v6_fields_fail_without_rewrite() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let catalog = ProjectCatalog::with_path(paths.catalog.clone());
+
+        for version in [
+            LEGACY_CATALOG_VERSION,
+            AGENT_BINDING_CATALOG_VERSION,
+            SERVICE_DOMAIN_CATALOG_VERSION,
+            PUBLISHED_DECLARATION_PREDECESSOR_VERSION,
+        ] {
+            let mut value = serde_json::to_value(&catalog).expect("serialize current catalog");
+            value["version"] = Value::from(version);
+            let mut bytes =
+                serde_json::to_vec_pretty(&value).expect("encode predecessor with future fields");
+            bytes.push(b'\n');
+            tokio::fs::write(&paths.catalog, &bytes)
+                .await
+                .expect("write malformed predecessor catalog");
+
+            let error = ProjectCatalog::load_from_paths(paths.clone())
+                .await
+                .expect_err("predecessor with v6 fields must fail closed");
+            assert!(error.to_string().contains("published-declaration fields"));
+            assert_eq!(
+                tokio::fs::read(&paths.catalog)
+                    .await
+                    .expect("read preserved malformed predecessor"),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v5_is_decoded_for_recovery_but_requires_journaled_normal_migration() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let catalog = ProjectCatalog::with_path(paths.catalog.clone());
+        let raw_v5 =
+            catalog_fixture_bytes(&catalog, PUBLISHED_DECLARATION_PREDECESSOR_VERSION, true);
+        tokio::fs::write(&paths.catalog, &raw_v5)
+            .await
+            .expect("write v5 catalog");
+
+        let recovered =
+            ProjectCatalog::load_from_paths_for_lifecycle_recovery(paths.clone(), false)
+                .await
+                .expect("decode v5 recovery image");
+        assert_eq!(
+            recovered.configuration_revision(ProjectInstanceId::random()),
+            None
+        );
+        let error = ProjectCatalog::load_from_paths(paths.clone())
+            .await
+            .expect_err("normal loader must defer to journaled migration");
+        assert!(matches!(
+            error,
+            CatalogError::SchemaMigrationRequired { .. }
+        ));
+        assert_eq!(
+            tokio::fs::read(&paths.catalog)
+                .await
+                .expect("read preserved v5 catalog"),
+            raw_v5
         );
     }
 
@@ -4832,6 +5959,7 @@ mod tests {
             .expect("record v4 domain");
         let mut value = serde_json::to_value(&source).expect("serialize v4 fixture");
         value["version"] = Value::from(SERVICE_DOMAIN_CATALOG_VERSION);
+        remove_published_projection_fields(&mut value);
         value["domain_index"]
             .as_object_mut()
             .expect("domain index object")
@@ -4898,6 +6026,7 @@ mod tests {
             .expect("bind current catalog");
         let mut value = serde_json::to_value(&source).expect("serialize v3 migration fixture");
         value["version"] = Value::from(AGENT_BINDING_CATALOG_VERSION);
+        remove_published_projection_fields(&mut value);
         value
             .as_object_mut()
             .expect("catalog fixture object")
@@ -5316,6 +6445,7 @@ mod tests {
             serde_json::from_slice(&tokio::fs::read(&paths.catalog).await.expect("read catalog"))
                 .expect("parse catalog");
         stored["version"] = Value::from(LEGACY_CATALOG_VERSION);
+        remove_published_projection_fields(&mut stored);
         stored
             .as_object_mut()
             .expect("catalog object")

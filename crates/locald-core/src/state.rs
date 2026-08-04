@@ -83,6 +83,10 @@ pub enum ServiceState {
     Stopped,
     /// The service is preparing or building before start.
     Building,
+    /// The service identity is fulfilled by an external publisher rather than
+    /// a process owned by locald.
+    #[serde(rename = "externally_managed")]
+    ExternallyManaged,
 }
 
 impl std::fmt::Display for ServiceState {
@@ -91,6 +95,7 @@ impl std::fmt::Display for ServiceState {
             Self::Running => write!(f, "running"),
             Self::Stopped => write!(f, "stopped"),
             Self::Building => write!(f, "building"),
+            Self::ExternallyManaged => write!(f, "externally_managed"),
         }
     }
 }

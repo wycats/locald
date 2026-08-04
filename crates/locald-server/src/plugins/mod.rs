@@ -290,6 +290,7 @@ fn classify_service_kind(svc: &locald_core::config::ServiceConfig) -> String {
         ServiceConfig::Typed(TypedServiceConfig::Container(_)) => "container".to_string(),
         ServiceConfig::Typed(TypedServiceConfig::Postgres(_)) => "postgres".to_string(),
         ServiceConfig::Typed(TypedServiceConfig::Site(_)) => "site".to_string(),
+        ServiceConfig::Typed(TypedServiceConfig::Published(_)) => "published".to_string(),
     }
 }
 
@@ -353,6 +354,7 @@ fn extract_service_config_kvs(
                 kvs.push(("path".to_string(), runner::Value::Text(site.path.clone())));
             }
         }
+        ServiceConfig::Typed(TypedServiceConfig::Published(_)) => {}
         ServiceConfig::Legacy(exec) => {
             if let Some(cmd) = &exec.command {
                 kvs.push(("command".to_string(), runner::Value::Text(cmd.clone())));
@@ -513,6 +515,15 @@ mod tests {
         }));
 
         assert_eq!(classify_service_kind(&config), "site");
+    }
+
+    #[test]
+    fn classify_service_kind_published_without_process_config() {
+        let service: ServiceConfig =
+            toml::from_str("type = \"published\"\ndomains = [\"workbench\"]")
+                .expect("parse published service");
+        assert_eq!(classify_service_kind(&service), "published");
+        assert!(extract_service_config_kvs(&service).is_empty());
     }
 
     #[test]

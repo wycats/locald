@@ -47,7 +47,7 @@ export async function resetService(name: string, instanceId: string | null): Pro
 export async function stopAllServices(): Promise<void> {
 	const res = await fetch('/api/services/stop-all', { method: 'POST' });
 	if (!res.ok) {
-		throw new Error('Failed to stop all services');
+		throw new Error('Failed to stop all managed services');
 	}
 }
 

@@ -6,6 +6,7 @@
 	import { cubicOut } from 'svelte/easing';
 	import { services } from '$lib/stores/services';
 	import { serviceIdentity } from '$lib/types';
+	import { publicationStateLabel } from '$lib/service-presentation';
 
 	interface Props {
 		monitored: string[];
@@ -52,6 +53,15 @@
 			<div class="terminal-body">
 				{#if identity === 'locald'}
 					<DaemonControlCenter />
+				{:else if service?.publication}
+					<div class="publication-panel">
+						<span>Externally managed</span>
+						<strong>{publicationStateLabel(service.publication.state)}</strong>
+						<p>{service.publication.explanation}</p>
+						{#if service.publication.next_step}
+							<p class="next-step">{service.publication.next_step}</p>
+						{/if}
+					</div>
 				{:else}
 					<Terminal filter={identity} />
 				{/if}
@@ -153,5 +163,29 @@
 		background: #09090b;
 		min-height: 0;
 		padding: 4px; /* Slight padding for terminal content */
+	}
+
+	.publication-panel {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 24px;
+		color: #a1a1aa;
+	}
+	.publication-panel span {
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: #38bdf8;
+	}
+	.publication-panel strong {
+		color: #e4e4e7;
+	}
+	.publication-panel p {
+		margin: 0;
+	}
+	.publication-panel .next-step {
+		color: #d4d4d8;
 	}
 </style>

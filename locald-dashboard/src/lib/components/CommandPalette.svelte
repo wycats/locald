@@ -4,6 +4,7 @@
 	import { fade, fly } from 'svelte/transition';
 	import { services } from '$lib/stores/services';
 	import { serviceIdentity } from '$lib/types';
+	import { managedServices } from '$lib/service-presentation';
 	import {
 		startService,
 		stopService,
@@ -26,23 +27,26 @@
 
 	let commands = $derived.by(() => {
 		const list: Command[] = [];
+		const managed = managedServices($services);
 
 		// Global commands
-		list.push({
-			id: 'restart-all',
-			title: 'Restart All Services',
-			action: () => restartAllServices(),
-			icon: RotateCw
-		});
-		list.push({
-			id: 'stop-all',
-			title: 'Stop All Services',
-			action: () => stopAllServices(),
-			icon: Square
-		});
+		if (managed.length > 0) {
+			list.push({
+				id: 'restart-all',
+				title: 'Restart All Managed Services',
+				action: () => restartAllServices(),
+				icon: RotateCw
+			});
+			list.push({
+				id: 'stop-all',
+				title: 'Stop All Managed Services',
+				action: () => stopAllServices(),
+				icon: Square
+			});
+		}
 
 		// Service specific commands
-		for (const service of $services) {
+		for (const service of managed) {
 			const name = service.name;
 			const identity = serviceIdentity(service);
 

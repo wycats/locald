@@ -100,8 +100,9 @@ pub use availability::{
 #[doc(inline)]
 pub use catalog::{
     CatalogError, CatalogPaths, CatalogPresence, ProjectCatalog, ProjectDiscovery, ProjectEntry,
-    ProjectInstanceOrigin, ProjectInstanceRecord, ProjectOrigin, ProjectRecord, RepositoryRecord,
-    UnresolvedLegacyProject, WorktreeRecord,
+    ProjectInstanceOrigin, ProjectInstanceRecord, ProjectOrigin, ProjectRecord,
+    PublishedHttpHealthPolicy, PublishedServiceAdmission, PublishedServiceDeclaration,
+    RepositoryRecord, SemanticOrigin, UnresolvedLegacyProject, WorktreeRecord,
 };
 #[doc(inline)]
 pub use domain::{

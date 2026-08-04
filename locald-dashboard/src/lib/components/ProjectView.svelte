@@ -24,6 +24,11 @@
 	import type { ProjectListEntry } from '$lib/api';
 	import { serviceIdentity, type ServiceStatus } from '$lib/types';
 	import {
+		managedServices,
+		serviceDisplayAuthority,
+		serviceLifecycleLabel
+	} from '$lib/service-presentation';
+	import {
 		RotateCw,
 		Square,
 		Play,
@@ -58,6 +63,7 @@
 	);
 
 	let projectServices = $derived($services.filter((s: ServiceStatus) => s.path === projectPath));
+	let managedProjectServices = $derived(managedServices(projectServices));
 	let projectAction = $state<'resume' | 'pause' | 'always-on' | null>(null);
 
 	let displayName = $derived(project?.project_name || projectPath.split('/').pop() || 'Unknown');
@@ -91,19 +97,21 @@
 	});
 
 	let deckCount = $derived(
-		projectServices.filter((service: ServiceStatus) => monitored.includes(serviceIdentity(service)))
-			.length
+		managedProjectServices.filter((service: ServiceStatus) =>
+			monitored.includes(serviceIdentity(service))
+		).length
 	);
 
 	let runningCount = $derived(
-		projectServices.filter((s: ServiceStatus) => s.status === 'running').length
+		managedProjectServices.filter((s: ServiceStatus) => s.status === 'running').length
 	);
 
 	let buildingCount = $derived(
-		projectServices.filter((s: ServiceStatus) => s.status === 'building').length
+		managedProjectServices.filter((s: ServiceStatus) => s.status === 'building').length
 	);
 
-	let stoppedCount = $derived(projectServices.length - runningCount - buildingCount);
+	let stoppedCount = $derived(managedProjectServices.length - runningCount - buildingCount);
+	let publishedCount = $derived(projectServices.length - managedProjectServices.length);
 
 	function isPending(service: ServiceStatus): boolean {
 		return $pendingActions.some(
@@ -119,6 +127,8 @@
 	function getServiceType(service: ServiceStatus): string {
 		if (service.service_type) {
 			switch (service.service_type) {
+				case 'published':
+					return 'published';
 				case 'postgres':
 					return 'db';
 				case 'container':
@@ -165,18 +175,7 @@
 	}
 
 	function displayUrl(service: ServiceStatus): string {
-		if (service.domain) return service.domain;
-		if (!service.url) return '';
-		try {
-			const parsed = new URL(service.url);
-			return parsed.hostname.endsWith('.localhost') ? parsed.hostname : parsed.host;
-		} catch {
-			return service.url.replace(/^https?:\/\//, '');
-		}
-	}
-
-	function lifecycleLabel(status: ServiceStatus['status']): string {
-		return status[0].toUpperCase() + status.slice(1);
+		return serviceDisplayAuthority(service);
 	}
 </script>
 
@@ -296,12 +295,17 @@
 	{:else}
 		<div class="service-summary" aria-label="Service lifecycle summary">
 			<span>{projectServices.length} service{projectServices.length === 1 ? '' : 's'}</span>
-			<span>{runningCount} running</span>
+			{#if managedProjectServices.length > 0}
+				<span>{runningCount} running</span>
+			{/if}
 			{#if buildingCount > 0}
 				<span>{buildingCount} building</span>
 			{/if}
 			{#if stoppedCount > 0}
 				<span>{stoppedCount} stopped</span>
+			{/if}
+			{#if publishedCount > 0}
+				<span>{publishedCount} published</span>
 			{/if}
 		</div>
 		<div class="service-list">
@@ -310,27 +314,30 @@
 				{@const pending = isPending(service)}
 				{@const type = getServiceType(service)}
 				{@const urlLabel = displayUrl(service)}
-				{@const inDeck = monitored.includes(identity)}
+				{@const published = service.service_type === 'published'}
+				{@const inDeck = !published && monitored.includes(identity)}
+				<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 				<div
 					class="service-row"
-					class:disabled={service.status === 'stopped'}
+					class:disabled={!published && service.status === 'stopped'}
+					class:published
 					class:monitored={inDeck}
 					onclick={() => {
-						onToggleMonitor(identity);
+						if (!published) onToggleMonitor(identity);
 					}}
 					onkeydown={(e) => {
-						if (e.key === 'Enter' || e.key === ' ') {
+						if (!published && (e.key === 'Enter' || e.key === ' ')) {
 							e.preventDefault();
 							onToggleMonitor(identity);
 						}
 					}}
-					role="button"
-					tabindex="0"
+					role={published ? undefined : 'button'}
+					tabindex={published ? undefined : 0}
 				>
 					<div class="row-content">
 						<div class="status-dot {service.status}"></div>
 						<span class="service-name">{getDisplayName(service)}</span>
-						<span class="status-chip {service.status}">{lifecycleLabel(service.status)}</span>
+						<span class="status-chip {service.status}">{serviceLifecycleLabel(service)}</span>
 
 						<span class="type-chip {type}">{type}</span>
 
@@ -338,7 +345,7 @@
 							<span class="deck-chip">In Deck</span>
 						{/if}
 
-						{#if service.url && service.status === 'running'}
+						{#if service.url && (service.status === 'running' || published)}
 							<a
 								href={service.url}
 								target="_blank"
@@ -350,55 +357,68 @@
 								<ExternalLink size={11} />
 							</a>
 						{/if}
+
+						{#if service.publication}
+							<span
+								class="publication-guidance"
+								title={service.publication.next_step ?? service.publication.explanation}
+							>
+								{service.publication.explanation}
+							</span>
+						{/if}
 					</div>
 
-					<div class="row-toolbar">
-						<div class="toolbar-bg"></div>
-						<div class="toolbar-actions">
-							{#if service.status === 'running'}
-								<button
-									class="control-btn"
-									title="Restart"
-									disabled={pending}
-									onclick={(e) => handleServiceAction(e, 'restart', service)}
-								>
-									{#if pending}
-										<Spinner size={14} />
-									{:else}
-										<RotateCw size={14} />
-									{/if}
-								</button>
-								<button
-									class="control-btn"
-									title="Stop"
-									disabled={pending}
-									onclick={(e) => handleServiceAction(e, 'stop', service)}
-								>
-									<Square size={14} />
-								</button>
-							{:else}
-								<button
-									class="control-btn"
-									title="Start"
-									disabled={pending}
-									onclick={(e) => handleServiceAction(e, 'start', service)}
-								>
-									{#if pending}
-										<Spinner size={14} />
-									{:else}
-										<Play size={14} />
-									{/if}
-								</button>
-							{/if}
+					{#if !published}
+						<div class="row-toolbar">
+							<div class="toolbar-bg"></div>
+							<div class="toolbar-actions">
+								{#if service.status === 'running'}
+									<button
+										class="control-btn"
+										title="Restart"
+										disabled={pending}
+										onclick={(e) => handleServiceAction(e, 'restart', service)}
+									>
+										{#if pending}
+											<Spinner size={14} />
+										{:else}
+											<RotateCw size={14} />
+										{/if}
+									</button>
+									<button
+										class="control-btn"
+										title="Stop"
+										disabled={pending}
+										onclick={(e) => handleServiceAction(e, 'stop', service)}
+									>
+										<Square size={14} />
+									</button>
+								{:else}
+									<button
+										class="control-btn"
+										title="Start"
+										disabled={pending}
+										onclick={(e) => handleServiceAction(e, 'start', service)}
+									>
+										{#if pending}
+											<Spinner size={14} />
+										{:else}
+											<Play size={14} />
+										{/if}
+									</button>
+								{/if}
+							</div>
 						</div>
-					</div>
+					{/if}
 				</div>
 			{/each}
 		</div>
 
-		<div class="log-area">
-			<Terminal filter={null} />
-		</div>
+		{#if managedProjectServices.length > 0}
+			<div class="log-area">
+				<Terminal filter={null} />
+			</div>
+		{/if}
 	{/if}
 </div>
 
@@ -673,6 +693,12 @@
 		opacity: 0.5;
 		--row-bg: #121214;
 	}
+	.service-row.published {
+		cursor: default;
+	}
+	.service-row.published .row-content {
+		padding-right: 0;
+	}
 	.service-row:hover {
 		--row-bg: #18181b;
 	}
@@ -720,6 +746,10 @@
 	.status-dot.stopped {
 		background: #52525b;
 		box-shadow: none;
+	}
+	.status-dot.externally_managed {
+		background: #60a5fa;
+		box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25);
 	}
 
 	@keyframes pulse {
@@ -784,6 +814,20 @@
 	}
 	.status-chip.stopped {
 		color: #71717a;
+	}
+	.status-chip.externally_managed,
+	.type-chip.published {
+		color: #93c5fd;
+		border-color: rgba(96, 165, 250, 0.22);
+		background: rgba(96, 165, 250, 0.07);
+	}
+	.publication-guidance {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 11px;
+		color: #a1a1aa;
 	}
 	.deck-chip {
 		color: #93c5fd;

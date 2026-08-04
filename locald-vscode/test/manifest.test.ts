@@ -35,4 +35,6 @@ test("instructions reference contributed readiness and browser tools", () => {
   assert.ok(toolNames.has("locald_open"));
   assert.match(instructions, /`locald_ensure`/);
   assert.match(instructions, /`locald_open`/);
+  assert.match(instructions, /Externally published services/);
+  assert.match(instructions, /publication state and next-step guidance/);
 });

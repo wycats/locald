@@ -20,6 +20,9 @@ pub(crate) struct ServiceReference {
 }
 
 fn service_reference_field_exists(service: &ServiceConfig, field: &str) -> bool {
+    if service.is_published() {
+        return field == "origin";
+    }
     match field {
         "host" => return true,
         "port" => return ReadinessRequirement::service_requires_port(service),
@@ -563,7 +566,9 @@ impl ConfigLoader {
                 TypedServiceConfig::Exec(exec) => exec.command.clone(),
                 TypedServiceConfig::Worker(worker) => Some(worker.command.clone()),
                 TypedServiceConfig::Container(container) => container.command.clone(),
-                TypedServiceConfig::Postgres(_) | TypedServiceConfig::Site(_) => None,
+                TypedServiceConfig::Postgres(_)
+                | TypedServiceConfig::Site(_)
+                | TypedServiceConfig::Published(_) => None,
             },
         }
     }
@@ -575,7 +580,9 @@ impl ConfigLoader {
                 TypedServiceConfig::Exec(exec) => exec.workdir.clone(),
                 TypedServiceConfig::Worker(worker) => worker.workdir.clone(),
                 TypedServiceConfig::Container(container) => container.workdir.clone(),
-                TypedServiceConfig::Postgres(_) | TypedServiceConfig::Site(_) => None,
+                TypedServiceConfig::Postgres(_)
+                | TypedServiceConfig::Site(_)
+                | TypedServiceConfig::Published(_) => None,
             },
         }
     }
@@ -916,6 +923,14 @@ impl ConfigLoader {
                     )
                 })?;
 
+                if service.is_published() {
+                    anyhow::ensure!(
+                        field == "origin",
+                        "environment variable `{env_name}` references `{service_name}.{field}`, but published services expose only their stable semantic `origin`"
+                    );
+                    continue;
+                }
+
                 let self_reference = service_name == consumer_name;
                 let listener_reference = ListenerName::from_port_field(field);
                 if let Some(generated_name) =
@@ -1057,9 +1072,13 @@ impl ConfigLoader {
         // Build graph
         for (name, service) in &config.services {
             for dep in service.depends_on() {
-                if !config.services.contains_key(dep) {
-                    anyhow::bail!("Service '{name}' depends on unknown service '{dep}'");
-                }
+                let dependency = config.services.get(dep).ok_or_else(|| {
+                    anyhow::anyhow!("Service '{name}' depends on unknown service '{dep}'")
+                })?;
+                anyhow::ensure!(
+                    !service.is_published() && !dependency.is_published(),
+                    "service dependency `{name}` -> `{dep}` is invalid because dependency edges involving published services are not supported"
+                );
 
                 // dep -> name
                 dependents
@@ -1307,6 +1326,72 @@ depends_on = ["db"]
         let error = ConfigLoader::validate_env_references(&unknown_field, &config, "web")
             .expect_err("unknown service field must fail");
         assert!(error.to_string().contains("unknown field `password`"));
+    }
+
+    #[test]
+    fn published_services_expose_only_semantic_origin_interpolation() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+
+[services.web]
+command = "serve"
+"#,
+        )
+        .expect("parse published interpolation config");
+
+        let origin = HashMap::from([(
+            "WORKBENCH_ORIGIN".to_owned(),
+            "${services.workbench.origin}".to_owned(),
+        )]);
+        ConfigLoader::validate_env_references(&origin, &config, "web")
+            .expect("published semantic origin does not create a runtime dependency");
+
+        for field in ["port", "host", "url", "listeners.hmr.port"] {
+            let env = HashMap::from([(
+                "PRIVATE_ENDPOINT".to_owned(),
+                format!("${{services.workbench.{field}}}"),
+            )]);
+            let error = ConfigLoader::validate_env_references(&env, &config, "web")
+                .expect_err("published private runtime interpolation must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("published services expose only their stable semantic `origin`"),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_order_rejects_dependency_edges_to_published_services() {
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.workbench]
+type = "published"
+
+[services.web]
+command = "serve"
+depends_on = ["workbench"]
+"#,
+        )
+        .expect("parse dependency candidate");
+
+        let error = ConfigLoader::resolve_startup_order(&config)
+            .expect_err("managed service must not depend on published service");
+        assert!(
+            error
+                .to_string()
+                .contains("dependency edges involving published")
+        );
     }
 
     #[test]

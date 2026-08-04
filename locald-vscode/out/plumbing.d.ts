@@ -6,6 +6,13 @@ export interface ServiceStatus {
     health_status: string;
     domain: string | null;
     service_type: string;
+    publication?: PublicationStatus;
+}
+export interface PublicationStatus {
+    state: "waiting_for_publisher" | "checking_endpoint" | "endpoint_unhealthy" | "ready" | "route_paused" | "instance_missing";
+    origin: string;
+    explanation: string;
+    next_step?: string;
 }
 export interface ProjectStatusInfo {
     project_path: string;
@@ -35,6 +42,7 @@ export interface EnsuredServiceStatus {
     status: string;
     health_status: string;
     url?: string;
+    publication?: PublicationStatus;
 }
 export interface EnsureProjectResult {
     project_path: string;
