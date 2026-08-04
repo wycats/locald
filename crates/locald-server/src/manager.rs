@@ -1,6 +1,10 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::option_if_let_else)]
 use crate::agent_context::resolve_agent_workspace;
+use crate::catalog_publication::{
+    CatalogPublicationJournal, CatalogPublicationPhase, CatalogPublicationTransaction,
+    host_set_for_catalog,
+};
 use crate::config_loader::ConfigLoader;
 use crate::generated_files::{GeneratedFileSet, PreparedGeneratedFileSet};
 use crate::health::{HealthMonitor, ReadinessRequirement};
@@ -600,6 +604,29 @@ struct ConfigApplyOutcome {
     pending_initial: Option<PendingInitialAvailabilityGuard>,
 }
 
+/// The result of publishing one catalog target together with the authority to
+/// project that target into runtime state.
+///
+/// A catalog rename can make the target authoritative before a later journal
+/// operation reports an error. Conversely, durable-catalog verification can
+/// deliberately disable routing while the in-memory registry still contains
+/// that target. Callers must therefore consume this explicit outcome instead
+/// of reconstructing publication authority from registry equality.
+struct CatalogPublicationOutcome {
+    completion: Result<()>,
+    published_domain_index: Option<DomainIndex>,
+}
+
+impl CatalogPublicationOutcome {
+    fn into_result(self) -> Result<()> {
+        self.completion
+    }
+
+    fn into_parts(self) -> (Result<()>, Option<DomainIndex>) {
+        (self.completion, self.published_domain_index)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConfigApplyOptions<'a> {
     start_services: bool,
@@ -763,6 +790,7 @@ pub struct ProcessManager {
     attachment_transition_lock: Arc<Mutex<()>>,
     lifecycle_publication_lock: Arc<Mutex<()>>,
     lifecycle_recovery_required: Arc<AtomicBool>,
+    catalog_publication_recovery_required: Arc<AtomicBool>,
     pending_initial_availability: Arc<StdMutex<HashSet<ProjectInstanceId>>>,
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
@@ -782,6 +810,7 @@ pub struct ProcessManager {
     availability_data_dir: PathBuf,
     availability_clock: SharedAvailabilityClock,
     lifecycle_journal: LifecycleJournal,
+    catalog_publication_journal: CatalogPublicationJournal,
     runtime_projection_lock: Arc<Mutex<()>>,
     state_persistence_lock: Arc<Mutex<()>>,
     next_controller_generation: Arc<AtomicU64>,
@@ -789,9 +818,43 @@ pub struct ProcessManager {
     #[cfg(test)]
     config_publication_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
     #[cfg(test)]
+    catalog_verification_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
     readiness_wait_hook: Arc<StdMutex<Option<Arc<Notify>>>>,
     #[cfg(test)]
     readiness_wait_timeout: Arc<StdMutex<Option<std::time::Duration>>>,
+}
+
+async fn load_durable_catalog_image(path: &Path) -> Result<Option<Registry>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(source).with_context(|| {
+                format!("failed to inspect durable catalog `{}`", path.display())
+            });
+        }
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "durable catalog `{}` is not a regular file",
+        path.display()
+    );
+    let parent = path.parent().with_context(|| {
+        format!(
+            "durable catalog `{}` has no parent directory",
+            path.display()
+        )
+    })?;
+    let mut paths = locald_core::CatalogPaths::for_data_dir(parent);
+    paths.catalog = path.to_path_buf();
+    // Recovery compares logical catalog images. Decode supported predecessor
+    // schemas through the same non-publishing migration path used at startup,
+    // so an interrupted upgrade does not introduce a third durable image.
+    let catalog = Registry::load_from_paths_for_lifecycle_recovery(paths, false)
+        .await
+        .with_context(|| format!("failed to load durable catalog `{}`", path.display()))?;
+    Ok(Some(catalog))
 }
 
 impl ProcessManager {
@@ -972,6 +1035,12 @@ impl ProcessManager {
                 .load(AtomicOrdering::Acquire),
             "lifecycle state requires daemon restart so the active transaction can be recovered before more lifecycle changes"
         );
+        anyhow::ensure!(
+            !self
+                .catalog_publication_recovery_required
+                .load(AtomicOrdering::Acquire),
+            "catalog and domain state require daemon restart so the active publication can be recovered before more lifecycle changes"
+        );
         Ok(())
     }
 
@@ -1107,11 +1176,15 @@ impl ProcessManager {
         let proxy_ports = Arc::new(Mutex::new((None, None)));
         let proxy_ports_changed = Arc::new(Notify::new());
 
-        let domain_index = {
+        let (domain_index, catalog_publication_journal) = {
             let registry_snapshot = registry
                 .try_lock()
                 .context("project identity catalog is busy during manager initialization")?;
-            SharedDomainIndex::new(registry_snapshot.domain_index().clone())
+            (
+                SharedDomainIndex::new(registry_snapshot.domain_index().clone()),
+                CatalogPublicationJournal::for_catalog_path(registry_snapshot.storage_path())
+                    .context("failed to initialize catalog publication journal")?,
+            )
         };
 
         let health_monitor = HealthMonitor::new(
@@ -1150,6 +1223,7 @@ impl ProcessManager {
             attachment_transition_lock: Arc::new(Mutex::new(())),
             lifecycle_publication_lock: Arc::new(Mutex::new(())),
             lifecycle_recovery_required: Arc::new(AtomicBool::new(false)),
+            catalog_publication_recovery_required: Arc::new(AtomicBool::new(false)),
             pending_initial_availability: Arc::new(StdMutex::new(HashSet::new())),
             health_monitor,
             factories,
@@ -1166,12 +1240,15 @@ impl ProcessManager {
             availability_data_dir,
             availability_clock,
             lifecycle_journal,
+            catalog_publication_journal,
             runtime_projection_lock: Arc::new(Mutex::new(())),
             state_persistence_lock: Arc::new(Mutex::new(())),
             next_controller_generation: Arc::new(AtomicU64::new(1)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             config_publication_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            catalog_verification_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             readiness_wait_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -1201,6 +1278,27 @@ impl ProcessManager {
     async fn wait_at_config_publication_hook(&self) {
         let hook = self
             .config_publication_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_catalog_verification_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .catalog_verification_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_catalog_verification_hook(&self) {
+        let hook = self
+            .catalog_verification_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -3058,10 +3156,535 @@ impl ProcessManager {
             .await
     }
 
-    async fn sync_hosts_after_catalog_publish(&self) {
-        if let Err(error) = self.sync_hosts().await {
-            warn!("Failed to synchronize published domain claims: {error}");
+    async fn preserve_prepared_catalog_publication_failure_locked(
+        &self,
+        transaction: &CatalogPublicationTransaction,
+        failure: anyhow::Error,
+    ) -> anyhow::Error {
+        self.catalog_publication_recovery_required
+            .store(true, AtomicOrdering::Release);
+        self.domain_index.store(DomainIndex::default());
+        match self.catalog_publication_journal.create(transaction).await {
+            Ok(()) => failure,
+            Err(journal_error) => anyhow::anyhow!(
+                "{failure:#}; failed to preserve prepared catalog publication recovery authority: {journal_error}"
+            ),
         }
+    }
+
+    async fn require_exact_durable_catalog_locked(
+        &self,
+        expected: &Registry,
+        role: &str,
+    ) -> Result<()> {
+        let path = expected.storage_path();
+        let durable = load_durable_catalog_image(path)
+            .await
+            .with_context(|| format!("failed to verify the {role} durable catalog image"))?;
+        let durable = durable.with_context(|| {
+            format!("the {role} durable catalog `{}` is missing", path.display())
+        })?;
+        anyhow::ensure!(
+            durable == *expected,
+            "the {role} durable catalog `{}` does not match its exact journal image",
+            path.display()
+        );
+        Ok(())
+    }
+
+    async fn restore_missing_or_require_exact_durable_catalog_locked(
+        &self,
+        expected: &Registry,
+        role: &str,
+    ) -> Result<()> {
+        let path = expected.storage_path();
+        match load_durable_catalog_image(path)
+            .await
+            .with_context(|| format!("failed to inspect the {role} durable catalog image"))?
+        {
+            Some(durable) => {
+                anyhow::ensure!(
+                    durable == *expected,
+                    "the {role} durable catalog `{}` does not match its exact journal image",
+                    path.display()
+                );
+            }
+            None => {
+                let publication = {
+                    let mut registry = self.registry.lock().await;
+                    anyhow::ensure!(
+                        *registry == *expected,
+                        "the in-memory catalog changed before restoring the missing {role} image"
+                    );
+                    registry.commit_candidate(expected.clone()).await
+                };
+                match publication {
+                    Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to restore the missing {role} image")
+                        });
+                    }
+                }
+                self.require_exact_durable_catalog_locked(expected, role)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_catalog_transition_locked(
+        &self,
+        catalog_base: Registry,
+        catalog_target: Registry,
+    ) -> CatalogPublicationOutcome {
+        let mut published_domain_index = None;
+        let completion: Result<()> = async {
+        let previous_hosts = host_set_for_catalog(&catalog_base)
+            .context("failed to derive the previous complete hosts projection")?;
+        let candidate_hosts = host_set_for_catalog(&catalog_target)
+            .context("failed to derive the candidate complete hosts projection")?;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base.clone(),
+            catalog_target.clone(),
+            &previous_hosts,
+            &candidate_hosts,
+        )?;
+        let generation = transaction.target_generation();
+        let catalog_path = transaction.catalog_path().to_path_buf();
+
+        // The lifecycle publication mutex serializes catalog candidates. The
+        // hosts guard additionally keeps explicit repair calls from observing
+        // or publishing a mixed generation while this transaction is active.
+        let _hosts_guard = self.hosts_sync_guard.lock.lock().await;
+        let current = self.registry.lock().await.clone();
+        anyhow::ensure!(
+            current == catalog_base || current == catalog_target,
+            "catalog publication generation {generation} no longer matches its exact base or target"
+        );
+
+        // An outer lifecycle journal can crash after this complete publication
+        // clears but before it advances its own phase. Its replay is already at
+        // the target, so only the complete HostSet and live projection need to
+        // be reaffirmed.
+        let durable_catalog = load_durable_catalog_image(&catalog_path).await;
+        if current == catalog_target {
+            match durable_catalog {
+                Ok(Some(durable)) if durable == catalog_target => {
+                    self.host_set_writer
+                        .replace_complete(candidate_hosts)
+                        .await
+                        .context("failed to reaffirm the target complete hosts projection")?;
+                    self.domain_index
+                        .store(catalog_target.domain_index().clone());
+                    published_domain_index = Some(catalog_target.domain_index().clone());
+                    return Ok(());
+                }
+                Ok(None) if catalog_base == catalog_target => {
+                    // Cold-v1 recovery still needs the normal journaled path to
+                    // materialize its first durable catalog image.
+                }
+                Ok(None) => {
+                    let failure = anyhow::anyhow!(
+                        "catalog publication generation {generation} has its target only in memory; restart locald to recover the missing durable catalog"
+                    );
+                    return Err(self
+                        .preserve_prepared_catalog_publication_failure_locked(&transaction, failure)
+                        .await);
+                }
+                Ok(Some(_)) => {
+                    let failure = anyhow::anyhow!(
+                        "catalog publication generation {generation} has its target only in memory because the durable catalog does not match its exact target"
+                    );
+                    return Err(self
+                        .preserve_prepared_catalog_publication_failure_locked(&transaction, failure)
+                        .await);
+                }
+                Err(error) => {
+                    let failure = error.context(format!(
+                        "catalog publication generation {generation} cannot verify its durable target"
+                    ));
+                    return Err(self
+                        .preserve_prepared_catalog_publication_failure_locked(&transaction, failure)
+                        .await);
+                }
+            }
+        } else {
+            match durable_catalog {
+                Ok(None) => {
+                    // A prepared outer lifecycle migration can own the first
+                    // publication of a catalog that has no predecessor file.
+                }
+                Ok(Some(durable)) if durable == catalog_base => {}
+                Ok(Some(_)) => {
+                    let failure = anyhow::anyhow!(
+                        "catalog publication generation {generation} cannot begin because the durable catalog does not match its exact base"
+                    );
+                    return Err(self
+                        .preserve_prepared_catalog_publication_failure_locked(&transaction, failure)
+                        .await);
+                }
+                Err(error) => {
+                    let failure = error.context(format!(
+                        "catalog publication generation {generation} cannot verify its durable base"
+                    ));
+                    return Err(self
+                        .preserve_prepared_catalog_publication_failure_locked(&transaction, failure)
+                        .await);
+                }
+            }
+        }
+
+        self.catalog_publication_recovery_required
+            .store(true, AtomicOrdering::Release);
+        self.catalog_publication_journal
+            .create(&transaction)
+            .await
+            .context("failed to prepare catalog publication recovery authority")?;
+
+        if let Err(candidate_error) = self.host_set_writer.replace_complete(candidate_hosts).await {
+            let failure =
+                candidate_error.context("failed to apply the candidate complete hosts projection");
+            return Err(self
+                .fail_catalog_publication_before_state_commit_locked(&transaction, failure)
+                .await);
+        }
+
+        if let Err(error) = self
+            .catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::Prepared,
+                CatalogPublicationPhase::HostsApplied,
+                &catalog_path,
+            )
+            .await
+        {
+            let failure = anyhow::Error::new(error)
+                .context("failed to record the applied complete hosts projection");
+            return Err(self
+                .fail_catalog_publication_before_state_commit_locked(&transaction, failure)
+                .await);
+        }
+
+        if *self.registry.lock().await != catalog_base {
+            let failure = anyhow::anyhow!(
+                "catalog publication generation {generation} base changed before state commit"
+            );
+            return Err(self
+                .fail_catalog_publication_before_state_commit_locked(&transaction, failure)
+                .await);
+        }
+
+        let publication = {
+            let mut registry = self.registry.lock().await;
+            let publication = registry.commit_candidate(catalog_target.clone()).await;
+            if publication.is_ok()
+                || matches!(&publication, Err(CatalogError::PublishedNotDurable { .. }))
+            {
+                self.domain_index.store(registry.domain_index().clone());
+            }
+            publication
+        };
+        match publication {
+            Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => {}
+            Err(error) => {
+                let failure = anyhow::Error::new(error)
+                    .context("failed to publish the candidate catalog and domain projection");
+                return Err(self
+                    .fail_catalog_publication_before_state_commit_locked(&transaction, failure)
+                    .await);
+            }
+        }
+
+        #[cfg(test)]
+        self.wait_at_catalog_verification_hook().await;
+
+        if let Err(error) = self
+            .require_exact_durable_catalog_locked(&catalog_target, "committed target")
+            .await
+        {
+            self.domain_index.store(DomainIndex::default());
+            return Err(error.context(format!(
+                "catalog publication generation {generation} cannot confirm its committed target; project routing is disabled until restart"
+            )));
+        }
+
+        // From this point onward the durable target has been verified. Keep
+        // that explicit authority even if advancing or clearing the recovery
+        // journal reports a later error.
+        published_domain_index = Some(catalog_target.domain_index().clone());
+
+        self.catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::HostsApplied,
+                CatalogPublicationPhase::StateCommitted,
+                &catalog_path,
+            )
+            .await
+            .context("failed to record the committed catalog and domain projection")?;
+        self.catalog_publication_journal
+            .clear(generation, &catalog_path)
+            .await
+            .context("failed to clear the committed catalog publication")?;
+        self.catalog_publication_recovery_required
+            .store(false, AtomicOrdering::Release);
+        Ok(())
+        }
+        .await;
+        CatalogPublicationOutcome {
+            completion,
+            published_domain_index,
+        }
+    }
+
+    async fn fail_catalog_publication_before_state_commit_locked(
+        &self,
+        transaction: &CatalogPublicationTransaction,
+        failure: anyhow::Error,
+    ) -> anyhow::Error {
+        match self
+            .restore_previous_hosts_and_abort_catalog_publication_locked(transaction)
+            .await
+        {
+            Ok(()) => failure,
+            Err(abort_error) => {
+                // The durable journal remains startup authority, but the
+                // running daemon must not keep serving either generation when
+                // it cannot complete that authority's chosen rollback.
+                self.domain_index.store(DomainIndex::default());
+                anyhow::anyhow!(
+                    "{failure:#}; failed to durably abort and restore the pre-catalog publication; project routing is disabled until restart: {abort_error:#}"
+                )
+            }
+        }
+    }
+
+    async fn restore_previous_hosts_and_abort_catalog_publication_locked(
+        &self,
+        transaction: &CatalogPublicationTransaction,
+    ) -> Result<()> {
+        let generation = transaction.target_generation();
+        let catalog_path = transaction.catalog_path();
+        anyhow::ensure!(
+            *self.registry.lock().await == *transaction.catalog_base(),
+            "catalog publication generation {generation} cannot restore previous hosts because the catalog is no longer its exact base"
+        );
+        let current = match self.catalog_publication_journal.load(catalog_path).await {
+            Ok(Some(current)) => current,
+            Ok(None) => anyhow::bail!("catalog publication disappeared while aborting"),
+            Err(load_error) => {
+                // Invalid evidence cannot direct a future roll-forward; keep
+                // it byte-for-byte for diagnosis while restoring the visible
+                // host projection to the still-authoritative catalog base.
+                self.host_set_writer
+                    .replace_complete(transaction.previous_hosts()?)
+                    .await
+                    .context("failed to restore previous hosts after invalid abort authority")?;
+                return Err(load_error)
+                    .context("failed to load the catalog publication while aborting");
+            }
+        };
+        anyhow::ensure!(
+            current.target_generation() == generation,
+            "catalog publication generation {generation} was replaced by {} while aborting",
+            current.target_generation()
+        );
+        let expected = match current.phase() {
+            CatalogPublicationPhase::Prepared => CatalogPublicationPhase::Prepared,
+            CatalogPublicationPhase::HostsApplied => CatalogPublicationPhase::HostsApplied,
+            // Rewriting the same terminal image re-establishes durability
+            // before any host rollback side effect.
+            CatalogPublicationPhase::Aborted => CatalogPublicationPhase::Prepared,
+            CatalogPublicationPhase::StateCommitted => {
+                anyhow::bail!(
+                    "catalog publication generation {generation} reached state_committed before its pre-catalog failure could be aborted"
+                );
+            }
+        };
+        if let Err(first_error) = self
+            .catalog_publication_journal
+            .advance(
+                generation,
+                expected,
+                CatalogPublicationPhase::Aborted,
+                catalog_path,
+            )
+            .await
+        {
+            self.catalog_publication_journal
+                .advance(
+                    generation,
+                    expected,
+                    CatalogPublicationPhase::Aborted,
+                    catalog_path,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed twice to record the aborted catalog publication; first failure: {first_error}"
+                    )
+                })?;
+        }
+        self.host_set_writer
+            .replace_complete(transaction.previous_hosts()?)
+            .await
+            .context("failed to restore the previous complete hosts projection")?;
+        self.restore_missing_or_require_exact_durable_catalog_locked(
+            transaction.catalog_base(),
+            "aborted base",
+        )
+        .await?;
+        self.catalog_publication_journal
+            .clear(generation, catalog_path)
+            .await
+            .context("failed to clear the aborted catalog publication")?;
+        self.catalog_publication_recovery_required
+            .store(false, AtomicOrdering::Release);
+        Ok(())
+    }
+
+    /// Recover catalog/domain/hosts publication before any daemon listener is
+    /// admitted. Malformed or identity-mismatched authority remains intact and
+    /// blocks startup.
+    pub(crate) async fn recover_catalog_publication_state(&self) -> Result<()> {
+        self.catalog_publication_recovery_required
+            .store(true, AtomicOrdering::Release);
+        let result = self.recover_catalog_publication_state_locked().await;
+        self.catalog_publication_recovery_required
+            .store(result.is_err(), AtomicOrdering::Release);
+        if result.is_err() {
+            self.domain_index.store(DomainIndex::default());
+        }
+        result
+    }
+
+    async fn recover_catalog_publication_state_locked(&self) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        let _hosts_guard = self.hosts_sync_guard.lock.lock().await;
+        let catalog_path = self.registry.lock().await.storage_path().to_path_buf();
+        let Some(transaction) = self
+            .catalog_publication_journal
+            .load(&catalog_path)
+            .await
+            .context("failed to load catalog publication recovery authority")?
+        else {
+            return Ok(());
+        };
+        let generation = transaction.target_generation();
+        let current = self.registry.lock().await.clone();
+
+        match transaction.phase() {
+            CatalogPublicationPhase::Prepared | CatalogPublicationPhase::Aborted => {
+                anyhow::ensure!(
+                    current == *transaction.catalog_base(),
+                    "catalog publication generation {generation} must recover its previous hosts from the exact base catalog"
+                );
+                if transaction.phase() == CatalogPublicationPhase::Prepared {
+                    self.catalog_publication_journal
+                        .advance(
+                            generation,
+                            CatalogPublicationPhase::Prepared,
+                            CatalogPublicationPhase::Aborted,
+                            &catalog_path,
+                        )
+                        .await
+                        .context("failed to record recovered catalog publication rollback")?;
+                }
+                self.host_set_writer
+                    .replace_complete(transaction.previous_hosts()?)
+                    .await
+                    .context("failed to restore the previous complete hosts projection")?;
+                self.restore_missing_or_require_exact_durable_catalog_locked(
+                    transaction.catalog_base(),
+                    "recovered base",
+                )
+                .await?;
+                self.domain_index
+                    .store(transaction.catalog_base().domain_index().clone());
+                self.catalog_publication_journal
+                    .clear(generation, &catalog_path)
+                    .await
+                    .context("failed to clear recovered catalog publication rollback")?;
+            }
+            CatalogPublicationPhase::HostsApplied => {
+                anyhow::ensure!(
+                    current == *transaction.catalog_base()
+                        || current == *transaction.catalog_target(),
+                    "catalog publication generation {generation} no longer matches its exact base or target"
+                );
+                if current == *transaction.catalog_base() {
+                    let publication = {
+                        let mut registry = self.registry.lock().await;
+                        let publication = registry
+                            .commit_candidate(transaction.catalog_target().clone())
+                            .await;
+                        if publication.is_ok()
+                            || matches!(&publication, Err(CatalogError::PublishedNotDurable { .. }))
+                        {
+                            self.domain_index.store(registry.domain_index().clone());
+                        }
+                        publication
+                    };
+                    match publication {
+                        Ok(()) | Err(CatalogError::PublishedNotDurable { .. }) => {}
+                        Err(error) => {
+                            return Err(error).context(
+                                "failed to roll the prepared catalog and domain projection forward",
+                            );
+                        }
+                    }
+                } else {
+                    self.domain_index
+                        .store(transaction.catalog_target().domain_index().clone());
+                }
+                self.restore_missing_or_require_exact_durable_catalog_locked(
+                    transaction.catalog_target(),
+                    "recovered target",
+                )
+                .await?;
+                self.catalog_publication_journal
+                    .advance(
+                        generation,
+                        CatalogPublicationPhase::HostsApplied,
+                        CatalogPublicationPhase::StateCommitted,
+                        &catalog_path,
+                    )
+                    .await
+                    .context("failed to record recovered catalog state commit")?;
+                self.host_set_writer
+                    .replace_complete(transaction.candidate_hosts()?)
+                    .await
+                    .context("failed to reaffirm the candidate complete hosts projection")?;
+                self.catalog_publication_journal
+                    .clear(generation, &catalog_path)
+                    .await
+                    .context("failed to clear recovered catalog publication")?;
+            }
+            CatalogPublicationPhase::StateCommitted => {
+                anyhow::ensure!(
+                    current == *transaction.catalog_target(),
+                    "catalog publication generation {generation} is committed, but its exact target catalog is not authoritative"
+                );
+                self.require_exact_durable_catalog_locked(
+                    transaction.catalog_target(),
+                    "committed recovery target",
+                )
+                .await?;
+                self.domain_index
+                    .store(transaction.catalog_target().domain_index().clone());
+                self.host_set_writer
+                    .replace_complete(transaction.candidate_hosts()?)
+                    .await
+                    .context("failed to reaffirm the committed complete hosts projection")?;
+                self.catalog_publication_journal
+                    .clear(generation, &catalog_path)
+                    .await
+                    .context("failed to clear recovered committed catalog publication")?;
+            }
+        }
+        Ok(())
     }
 
     /// Starts a project from the given path.
@@ -3745,7 +4368,7 @@ impl ProcessManager {
             service_activation,
         ) = {
             let is_linked_worktree = discovery.is_linked_worktree();
-            let mut registry = self.registry.lock().await;
+            let registry = self.registry.lock().await;
             let catalog_base = registry.clone();
             let mut candidate = catalog_base.clone();
             let instance_id =
@@ -3916,6 +4539,7 @@ impl ProcessManager {
                 self.stop_service_instance_locked(key).await?;
             }
 
+            drop(registry);
             let (commit_result, published_domain_index) = if initial_registration {
                 // A first registration must not leave a catalogued instance
                 // without availability authority if the daemon exits before
@@ -3925,7 +4549,6 @@ impl ProcessManager {
                 // following lifecycle operation adds the caller's demand. A
                 // deferred legacy project receives its already-planned policy,
                 // live demands, and pause in this same transaction.
-                drop(registry);
                 let attachment_base = self.attachments.lock().await.snapshot();
                 let target = CataloguedLifecycleTarget {
                     instance_id,
@@ -3941,33 +4564,15 @@ impl ProcessManager {
                         attachment_base,
                     )
                     .await?;
-                let commit_result = self
-                    .create_and_apply_lifecycle_transaction_locked(&transaction)
-                    .await;
-                // The catalog rename is the ownership commit point even when
-                // a later journal phase reports incomplete durability or
-                // fails. Observe the authoritative catalog image directly so
-                // hosts and runtime projections converge before the error is
-                // surfaced to the caller.
-                let published_domain_index = {
-                    let registry = self.registry.lock().await;
-                    transaction.catalog().and_then(|images| {
-                        (*registry == *images.target()).then(|| registry.domain_index().clone())
-                    })
-                };
-                (commit_result, published_domain_index)
+                self.create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(
+                    &transaction,
+                )
+                .await
+                .into_parts()
             } else {
-                // `commit_candidate` advances the in-memory catalog at the
-                // atomic rename commit point, including PublishedNotDurable.
-                let commit_result = registry.commit_candidate(candidate).await;
-                let catalog_published = commit_result.is_ok()
-                    || matches!(
-                        &commit_result,
-                        Err(CatalogError::PublishedNotDurable { .. })
-                    );
-                let published_domain_index =
-                    catalog_published.then(|| registry.domain_index().clone());
-                (commit_result.map_err(Into::into), published_domain_index)
+                self.publish_catalog_transition_locked(catalog_base, candidate)
+                    .await
+                    .into_parts()
             };
             (
                 commit_result,
@@ -4036,7 +4641,6 @@ impl ProcessManager {
             }
             drop(lifecycle_publication_guard);
             self.persist_state().await;
-            self.sync_hosts_after_catalog_publish().await;
         } else {
             drop(lifecycle_publication_guard);
         }
@@ -7046,7 +7650,7 @@ impl ProcessManager {
     ) -> Result<()> {
         let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.ensure_lifecycle_publication_available()?;
-        let mut registry = self.registry.lock().await;
+        let registry = self.registry.lock().await;
         match registry.agent_binding(conversation) {
             Some(bound) if bound == instance_id => return Ok(()),
             Some(_) => {
@@ -7056,11 +7660,13 @@ impl ProcessManager {
             }
             None => {}
         }
-        let mut candidate = registry.clone();
+        let catalog_base = registry.clone();
+        let mut candidate = catalog_base.clone();
         candidate.bind_agent_conversation(conversation.clone(), instance_id)?;
-        registry
-            .commit_candidate(candidate)
+        drop(registry);
+        self.publish_catalog_transition_locked(catalog_base, candidate)
             .await
+            .into_result()
             .context("failed to persist the ambient agent conversation binding")
     }
 
@@ -7072,8 +7678,9 @@ impl ProcessManager {
     ) -> Result<bool> {
         let _publication_guard = self.lifecycle_publication_lock.lock().await;
         self.ensure_lifecycle_publication_available()?;
-        let mut registry = self.registry.lock().await;
-        let mut candidate = registry.clone();
+        let registry = self.registry.lock().await;
+        let catalog_base = registry.clone();
+        let mut candidate = catalog_base.clone();
         if !candidate.instances.contains_key(&instance_id) {
             return Ok(false);
         }
@@ -7090,9 +7697,10 @@ impl ProcessManager {
         if candidate == *registry {
             return Ok(true);
         }
-        registry
-            .commit_candidate(candidate)
+        drop(registry);
+        self.publish_catalog_transition_locked(catalog_base, candidate)
             .await
+            .into_result()
             .context("failed to persist ambient project metadata and conversation binding")?;
         Ok(true)
     }
@@ -8222,23 +8830,50 @@ impl ProcessManager {
         &self,
         transaction: &LifecycleTransaction,
     ) -> Result<()> {
+        self.create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(transaction)
+            .await
+            .into_result()
+    }
+
+    async fn create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> CatalogPublicationOutcome {
         if let Err(error) = self.lifecycle_journal.create(transaction).await {
             self.lifecycle_recovery_required
                 .store(true, AtomicOrdering::Release);
-            return Err(error.into());
+            return CatalogPublicationOutcome {
+                completion: Err(error.into()),
+                published_domain_index: None,
+            };
         }
         self.lifecycle_recovery_required
             .store(true, AtomicOrdering::Release);
-        self.apply_lifecycle_transaction_locked(transaction).await?;
-        self.lifecycle_recovery_required
-            .store(false, AtomicOrdering::Release);
-        Ok(())
+        let outcome = self
+            .apply_lifecycle_transaction_with_catalog_outcome_locked(transaction)
+            .await;
+        if outcome.completion.is_ok() {
+            self.lifecycle_recovery_required
+                .store(false, AtomicOrdering::Release);
+        }
+        outcome
     }
 
     async fn apply_lifecycle_transaction_locked(
         &self,
         transaction: &LifecycleTransaction,
     ) -> Result<()> {
+        self.apply_lifecycle_transaction_with_catalog_outcome_locked(transaction)
+            .await
+            .into_result()
+    }
+
+    async fn apply_lifecycle_transaction_with_catalog_outcome_locked(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> CatalogPublicationOutcome {
+        let mut published_domain_index = None;
+        let completion: Result<()> = async {
         let id = transaction.id();
         let mut phase = transaction.phase();
         self.verify_completed_lifecycle_transaction_phases(transaction)
@@ -8246,19 +8881,17 @@ impl ProcessManager {
 
         if phase == LifecycleTransactionPhase::Prepared {
             if let Some(images) = transaction.catalog() {
-                let mut registry = self.registry.lock().await;
-                let current = registry.clone();
-                anyhow::ensure!(
-                    current == *images.base() || current == *images.target(),
-                    "lifecycle transaction {id} catalog base no longer matches authoritative state"
-                );
-                let publication = registry.commit_candidate(images.target().clone()).await;
-                if publication.is_ok()
-                    || matches!(&publication, Err(CatalogError::PublishedNotDurable { .. }))
-                {
-                    self.domain_index.store(registry.domain_index().clone());
-                }
-                publication?;
+                let outcome = self
+                    .publish_catalog_transition_locked(
+                        images.base().clone(),
+                        images.target().clone(),
+                    )
+                    .await;
+                let (catalog_result, published) = outcome.into_parts();
+                published_domain_index = published;
+                catalog_result.with_context(|| {
+                    format!("failed to publish lifecycle transaction {id} catalog and domain state")
+                })?;
             }
             self.lifecycle_journal
                 .advance(
@@ -8328,6 +8961,12 @@ impl ProcessManager {
             self.lifecycle_journal.clear(id).await?;
         }
         Ok(())
+        }
+        .await;
+        CatalogPublicationOutcome {
+            completion,
+            published_domain_index,
+        }
     }
 
     async fn verify_completed_lifecycle_transaction_phases(
@@ -8657,7 +9296,6 @@ impl ProcessManager {
         drop(transition_guards);
         drop(availability_guard);
         drop(lifecycle_guard);
-        self.sync_hosts_after_catalog_publish().await;
         Ok(())
     }
 
@@ -9236,7 +9874,6 @@ impl ProcessManager {
                 .await?;
             drop(publication_guard);
             drop(transition_guard);
-            self.sync_hosts_after_catalog_publish().await;
             return Ok(());
         };
         let publication_guard = self.lifecycle_publication_lock.lock().await;
@@ -9505,7 +10142,6 @@ impl ProcessManager {
         drop(transition_guards);
         drop(availability_guards);
         drop(lifecycle_guard);
-        self.sync_hosts_after_catalog_publish().await;
         Ok(count)
     }
 
@@ -12211,12 +12847,1636 @@ mod tests {
         }
     }
 
-    struct RejectingHostSyncer;
+    struct CatalogObservingHostSyncer {
+        registry: Arc<Mutex<Registry>>,
+        domain: String,
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+        catalog_owned_at_call: Arc<StdMutex<Vec<bool>>>,
+    }
 
     #[async_trait]
-    impl HostSetWriter for RejectingHostSyncer {
-        async fn replace_complete(&self, _hosts: HostSet) -> Result<()> {
-            anyhow::bail!("injected host synchronization failure")
+    impl HostSetWriter for CatalogObservingHostSyncer {
+        async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
+            let catalog_owned = self
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve(&self.domain)
+                .is_some();
+            self.catalog_owned_at_call
+                .lock()
+                .expect("catalog observation mutex poisoned")
+                .push(catalog_owned);
+            self.calls
+                .lock()
+                .expect("catalog observing host sync mutex poisoned")
+                .push(hosts.as_strings());
+            Ok(())
+        }
+    }
+
+    struct ScriptedHostSyncer {
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+        failures: Arc<StdMutex<VecDeque<bool>>>,
+    }
+
+    #[async_trait]
+    impl HostSetWriter for ScriptedHostSyncer {
+        async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("scripted host sync call mutex poisoned")
+                .push(hosts.as_strings());
+            if self
+                .failures
+                .lock()
+                .expect("scripted host sync failure mutex poisoned")
+                .pop_front()
+                .unwrap_or(false)
+            {
+                anyhow::bail!("injected scripted host synchronization failure");
+            }
+            Ok(())
+        }
+    }
+
+    struct JournalCorruptingHostSyncer {
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+        journal_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl HostSetWriter for JournalCorruptingHostSyncer {
+        async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
+            let call_number = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .expect("journal-corrupting host sync mutex poisoned");
+                calls.push(hosts.as_strings());
+                calls.len()
+            };
+            if call_number == 1 {
+                tokio::fs::write(&self.journal_path, b"{malformed")
+                    .await
+                    .context("inject malformed catalog publication journal")?;
+            }
+            Ok(())
+        }
+    }
+
+    struct AbortPhaseObservingHostSyncer {
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+        observed_rollback_phases: Arc<StdMutex<Vec<CatalogPublicationPhase>>>,
+        journal: CatalogPublicationJournal,
+        catalog_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl HostSetWriter for AbortPhaseObservingHostSyncer {
+        async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
+            let call_number = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .expect("abort-observing host sync mutex poisoned");
+                calls.push(hosts.as_strings());
+                calls.len()
+            };
+            if call_number == 1 {
+                tokio::fs::remove_file(&self.catalog_path)
+                    .await
+                    .context("remove catalog before injected commit failure")?;
+                tokio::fs::create_dir(&self.catalog_path)
+                    .await
+                    .context("replace catalog with a directory before commit")?;
+            }
+            if call_number == 2 {
+                let phase = self
+                    .journal
+                    .load(&self.catalog_path)
+                    .await
+                    .context("load journal while observing host rollback")?
+                    .context("journal missing while observing host rollback")?
+                    .phase();
+                self.observed_rollback_phases
+                    .lock()
+                    .expect("abort phase observation mutex poisoned")
+                    .push(phase);
+            }
+            Ok(())
+        }
+    }
+
+    async fn catalog_publication_fixture() -> (
+        tempfile::TempDir,
+        ProcessManager,
+        Registry,
+        Registry,
+        HostSet,
+        HostSet,
+    ) {
+        let directory = tempdir().expect("create catalog publication fixture directory");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create publication fixture project");
+        let mut catalog_base = Registry::with_path(directory.path().join("catalog.json"));
+        let instance_id = catalog_base
+            .register_project(
+                Registry::discover(project_path)
+                    .await
+                    .expect("discover publication fixture project"),
+                Some("publication-fixture".to_owned()),
+            )
+            .expect("register publication fixture project");
+        catalog_base
+            .save()
+            .await
+            .expect("persist publication fixture base catalog");
+        let mut catalog_target = catalog_base.clone();
+        catalog_target
+            .replace_domain_claims(
+                instance_id,
+                [DomainClaim::service(
+                    "publication-fixture.example"
+                        .parse()
+                        .expect("parse publication fixture domain"),
+                    instance_id,
+                    "publication-fixture:web".to_owned(),
+                )],
+            )
+            .expect("build publication fixture target claims");
+        let previous_hosts =
+            host_set_for_catalog(&catalog_base).expect("derive publication fixture previous hosts");
+        let candidate_hosts = host_set_for_catalog(&catalog_target)
+            .expect("derive publication fixture candidate hosts");
+        let registry = Arc::new(Mutex::new(catalog_base.clone()));
+        let state_manager = Arc::new(StateManager::with_path(directory.path().join("state.json")));
+        let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+            directory.path().join("attachments.json"),
+        )));
+        let manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            state_manager,
+            registry,
+            attachments,
+            None,
+        )
+        .expect("create publication fixture manager");
+        (
+            directory,
+            manager,
+            catalog_base.clone(),
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        )
+    }
+
+    fn encode_v3_catalog(catalog: &Registry) -> Vec<u8> {
+        let mut value = serde_json::to_value(catalog).expect("encode catalog as JSON");
+        let object = value
+            .as_object_mut()
+            .expect("catalog JSON must be an object");
+        object.insert("version".to_owned(), serde_json::Value::from(3));
+        object.remove("agent_bindings");
+        let mut content = serde_json::to_vec_pretty(&value).expect("encode v3 catalog fixture");
+        content.push(b'\n');
+        content
+    }
+
+    async fn downgrade_catalog_publication_journal_to_v3(manager: &ProcessManager) {
+        let journal_path = manager.catalog_publication_journal.journal_path();
+        let content = tokio::fs::read(journal_path)
+            .await
+            .expect("read catalog publication journal fixture");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&content).expect("decode catalog publication journal fixture");
+        for field in ["catalog_base", "catalog_target"] {
+            let object = value[field]
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("{field} must be an object"));
+            object.insert("version".to_owned(), serde_json::Value::from(3));
+            object.remove("agent_bindings");
+        }
+        let mut content =
+            serde_json::to_vec_pretty(&value).expect("encode v3 publication journal fixture");
+        content.push(b'\n');
+        tokio::fs::write(journal_path, content)
+            .await
+            .expect("write v3 catalog publication journal fixture");
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_commits_hosts_catalog_and_live_index_as_one_transition() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            _previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+        manager
+            .publish_catalog_transition_locked(catalog_base, catalog_target.clone())
+            .await
+            .into_result()
+            .expect("publish catalog transaction");
+
+        assert_eq!(*manager.registry.lock().await, catalog_target);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            catalog_target.domain_index()
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings()]
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_target.storage_path())
+                .await
+                .expect("load cleared catalog publication journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_target_without_durable_storage_preserves_prepared_recovery_authority() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            _previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        manager
+            .registry
+            .lock()
+            .await
+            .commit_candidate(catalog_target.clone())
+            .await
+            .expect("publish target fixture in memory and storage");
+        tokio::fs::remove_file(catalog_target.storage_path())
+            .await
+            .expect("remove target storage fixture");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let error = manager
+            .publish_catalog_transition_locked(catalog_base, catalog_target.clone())
+            .await
+            .into_result()
+            .expect_err("an in-memory-only target must require startup recovery");
+
+        assert!(error.to_string().contains("target only in memory"));
+        assert!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .is_empty()
+        );
+        let journal = manager
+            .catalog_publication_journal
+            .load(catalog_target.storage_path())
+            .await
+            .expect("load preserved target-only journal")
+            .expect("target-only journal remains");
+        assert_eq!(journal.phase(), CatalogPublicationPhase::Prepared);
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "the config caller must preserve the publication helper's fail-closed routing state"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_config_preserves_fail_closed_routing_after_post_commit_verification_error() {
+        let directory = tempdir().expect("create existing-config verification fixture");
+        let project_path = directory.path().join("project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(directory.path(), &project_path, "existing-post-commit").await;
+        write_availability_worker_config(
+            &project_path,
+            "existing-post-commit",
+            "existing-post-commit.localhost",
+            &["web"],
+        );
+        let catalog_path = manager.registry.lock().await.storage_path().to_path_buf();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_catalog_verification_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let apply = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.apply_config(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("existing config commits its catalog target before verification");
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("existing-post-commit.localhost")
+                .is_some(),
+            "the durable verification hook is reached after the ownership commit"
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("existing-post-commit.localhost")
+                .is_some(),
+            "the committed target is live until exact durable verification fails"
+        );
+        tokio::fs::remove_file(&catalog_path)
+            .await
+            .expect("remove committed catalog before exact verification");
+        resume.notify_one();
+        let error = apply
+            .await
+            .expect("existing config task joins")
+            .expect_err("missing committed catalog fails the existing config publication");
+
+        assert!(format!("{error:#}").contains("cannot confirm its committed target"));
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("existing-post-commit.localhost")
+                .is_some(),
+            "the target remains the in-memory catalog authority"
+        );
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "the existing-config caller must preserve fail-closed live routing"
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_registration_preserves_fail_closed_routing_after_post_commit_verification_error()
+     {
+        let directory = tempdir().expect("create initial-registration verification fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create initial-registration project");
+        write_availability_worker_config(
+            &project_path,
+            "initial-post-commit",
+            "initial-post-commit.localhost",
+            &["web"],
+        );
+        let manager = unregistered_availability_manager(directory.path());
+        let catalog_path = manager.registry.lock().await.storage_path().to_path_buf();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_catalog_verification_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("initial registration commits its catalog target before verification");
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("initial-post-commit.localhost")
+                .is_some(),
+            "the initial-registration hook is reached after the ownership commit"
+        );
+        tokio::fs::remove_file(&catalog_path)
+            .await
+            .expect("remove initial catalog before exact verification");
+        resume.notify_one();
+        let error = start
+            .await
+            .expect("initial registration task joins")
+            .expect_err("missing committed catalog fails initial registration");
+
+        assert!(format!("{error:#}").contains("cannot confirm its committed target"));
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+        assert!(manager.lifecycle_recovery_required.load(Ordering::Acquire));
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("initial-post-commit.localhost")
+                .is_some(),
+            "the initial target remains the in-memory catalog authority"
+        );
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "the initial-registration caller must preserve fail-closed live routing"
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_target_replay_rejects_every_non_exact_durable_entry() {
+        for case in ["directory", "malformed", "wrong-image"] {
+            let (
+                _directory,
+                mut manager,
+                catalog_base,
+                catalog_target,
+                _previous_hosts,
+                _candidate_hosts,
+            ) = catalog_publication_fixture().await;
+            manager
+                .registry
+                .lock()
+                .await
+                .commit_candidate(catalog_target.clone())
+                .await
+                .expect("publish target fixture before replay");
+            let catalog_path = catalog_target.storage_path();
+            match case {
+                "directory" => {
+                    tokio::fs::remove_file(catalog_path)
+                        .await
+                        .expect("remove target catalog before directory replacement");
+                    tokio::fs::create_dir(catalog_path)
+                        .await
+                        .expect("replace target catalog with directory");
+                }
+                "malformed" => {
+                    tokio::fs::write(catalog_path, b"{malformed")
+                        .await
+                        .expect("replace target catalog with malformed bytes");
+                }
+                "wrong-image" => {
+                    tokio::fs::write(
+                        catalog_path,
+                        serde_json::to_vec_pretty(&catalog_base)
+                            .expect("encode wrong durable catalog image"),
+                    )
+                    .await
+                    .expect("replace target catalog with wrong valid image");
+                }
+                _ => unreachable!(),
+            }
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+                calls: calls.clone(),
+            }));
+
+            let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+            let error = match manager
+                .publish_catalog_transition_locked(catalog_base, catalog_target.clone())
+                .await
+                .into_result()
+            {
+                Ok(()) => panic!("{case}: replay must reject non-exact storage"),
+                Err(error) => error,
+            };
+
+            assert!(
+                format!("{error:#}").contains("durable"),
+                "{case}: {error:#}"
+            );
+            assert!(
+                calls
+                    .lock()
+                    .expect("target replay host calls mutex poisoned")
+                    .is_empty(),
+                "{case}: host publication must not begin"
+            );
+            let journal = manager
+                .catalog_publication_journal
+                .load(catalog_target.storage_path())
+                .await
+                .unwrap_or_else(|error| panic!("{case}: load recovery authority: {error}"))
+                .unwrap_or_else(|| panic!("{case}: prepared recovery authority remains"));
+            assert_eq!(journal.phase(), CatalogPublicationPhase::Prepared, "{case}");
+            assert!(
+                manager
+                    .catalog_publication_recovery_required
+                    .load(Ordering::Acquire),
+                "{case}"
+            );
+            assert_eq!(
+                manager.domain_index().snapshot().as_ref(),
+                &DomainIndex::default(),
+                "{case}: unverifiable target storage disables live routing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_recovery_preserves_authority_for_every_non_exact_base_entry() {
+        for case in ["directory", "malformed", "wrong-image"] {
+            let (
+                _directory,
+                mut manager,
+                catalog_base,
+                catalog_target,
+                previous_hosts,
+                candidate_hosts,
+            ) = catalog_publication_fixture().await;
+            let transaction = CatalogPublicationTransaction::new(
+                catalog_base.clone(),
+                catalog_target.clone(),
+                &previous_hosts,
+                &candidate_hosts,
+            )
+            .expect("prepare aborted recovery fixture");
+            manager
+                .catalog_publication_journal
+                .create(&transaction)
+                .await
+                .expect("persist prepared recovery fixture");
+            manager
+                .catalog_publication_journal
+                .advance(
+                    transaction.target_generation(),
+                    CatalogPublicationPhase::Prepared,
+                    CatalogPublicationPhase::Aborted,
+                    catalog_base.storage_path(),
+                )
+                .await
+                .expect("persist aborted recovery fixture");
+            let catalog_path = catalog_base.storage_path();
+            match case {
+                "directory" => {
+                    tokio::fs::remove_file(catalog_path)
+                        .await
+                        .expect("remove base catalog before directory replacement");
+                    tokio::fs::create_dir(catalog_path)
+                        .await
+                        .expect("replace base catalog with directory");
+                }
+                "malformed" => {
+                    tokio::fs::write(catalog_path, b"{malformed")
+                        .await
+                        .expect("replace base catalog with malformed bytes");
+                }
+                "wrong-image" => {
+                    tokio::fs::write(
+                        catalog_path,
+                        serde_json::to_vec_pretty(&catalog_target)
+                            .expect("encode wrong durable base image"),
+                    )
+                    .await
+                    .expect("replace base catalog with wrong valid image");
+                }
+                _ => unreachable!(),
+            }
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+                calls: calls.clone(),
+            }));
+
+            let error = match manager.recover_catalog_publication_state().await {
+                Ok(()) => panic!("{case}: recovery must preserve invalid storage"),
+                Err(error) => error,
+            };
+
+            assert!(
+                format!("{error:#}").contains("durable"),
+                "{case}: {error:#}"
+            );
+            assert_eq!(
+                calls
+                    .lock()
+                    .expect("aborted recovery host calls mutex poisoned")
+                    .as_slice(),
+                &[previous_hosts.as_strings()],
+                "{case}: previous hosts are restored while exact authority remains"
+            );
+            let journal = manager
+                .catalog_publication_journal
+                .load(catalog_base.storage_path())
+                .await
+                .unwrap_or_else(|error| panic!("{case}: load aborted authority: {error}"))
+                .unwrap_or_else(|| panic!("{case}: aborted recovery authority remains"));
+            assert_eq!(journal.phase(), CatalogPublicationPhase::Aborted, "{case}");
+            assert!(
+                manager
+                    .catalog_publication_recovery_required
+                    .load(Ordering::Acquire),
+                "{case}"
+            );
+            assert_eq!(
+                manager.domain_index().snapshot().as_ref(),
+                &DomainIndex::default(),
+                "{case}: failed recovery disables live routing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_hosts_restore_previous_set_without_publishing_catalog() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(ScriptedHostSyncer {
+            calls: calls.clone(),
+            failures: Arc::new(StdMutex::new(VecDeque::from([true, false]))),
+        }));
+
+        let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let error = manager
+            .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
+            .await
+            .into_result()
+            .expect_err("candidate hosts must fail");
+        assert!(error.to_string().contains("candidate complete hosts"));
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        assert_eq!(
+            calls
+                .lock()
+                .expect("scripted host sync call mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings(), previous_hosts.as_strings()]
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_base.storage_path())
+                .await
+                .expect("load cleared aborted journal")
+                .is_none()
+        );
+        assert!(
+            !manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_hosts_phase_persistence_restores_previous_hosts_before_returning() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let journal_path = manager
+            .catalog_publication_journal
+            .journal_path()
+            .to_path_buf();
+        manager.set_host_syncer(Arc::new(JournalCorruptingHostSyncer {
+            calls: calls.clone(),
+            journal_path: journal_path.clone(),
+        }));
+
+        let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let error = manager
+            .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
+            .await
+            .into_result()
+            .expect_err("malformed phase authority must fail publication");
+
+        assert!(error.to_string().contains("applied complete hosts"));
+        assert!(format!("{error:#}").contains("failed to load"));
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            catalog_base.domain_index()
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("journal-corrupting host sync mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings(), previous_hosts.as_strings()]
+        );
+        assert_eq!(
+            tokio::fs::read(&journal_path)
+                .await
+                .expect("read preserved malformed journal"),
+            b"{malformed"
+        );
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_commit_preserves_aborted_authority_when_base_storage_is_invalid() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let observed_rollback_phases = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(AbortPhaseObservingHostSyncer {
+            calls: calls.clone(),
+            observed_rollback_phases: observed_rollback_phases.clone(),
+            journal: manager.catalog_publication_journal.clone(),
+            catalog_path: catalog_base.storage_path().to_path_buf(),
+        }));
+
+        let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let error = manager
+            .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
+            .await
+            .into_result()
+            .expect_err("catalog replacement over a directory must fail");
+
+        assert!(error.to_string().contains("candidate catalog"));
+        assert!(format!("{error:#}").contains("not a regular file"));
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "unverifiable durable rollback disables live routing"
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings(), previous_hosts.as_strings()]
+        );
+        assert_eq!(
+            observed_rollback_phases
+                .lock()
+                .expect("abort phase observation mutex poisoned")
+                .as_slice(),
+            &[CatalogPublicationPhase::Aborted],
+            "rollback becomes visible only after durable abort authority"
+        );
+        let journal = manager
+            .catalog_publication_journal
+            .load(catalog_base.storage_path())
+            .await
+            .expect("load preserved failed catalog publication")
+            .expect("aborted recovery authority remains");
+        assert_eq!(journal.phase(), CatalogPublicationPhase::Aborted);
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_hosts_rollback_preserves_aborted_recovery_authority() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(ScriptedHostSyncer {
+            calls: calls.clone(),
+            failures: Arc::new(StdMutex::new(VecDeque::from([true, true]))),
+        }));
+
+        let _publication_guard = manager.lifecycle_publication_lock.lock().await;
+        let error = manager
+            .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
+            .await
+            .into_result()
+            .expect_err("candidate and rollback must fail");
+        assert!(error.to_string().contains("failed to restore"));
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "failed rollback disables live routing until startup recovery"
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("scripted host sync call mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings(), previous_hosts.as_strings()]
+        );
+        let journal = manager
+            .catalog_publication_journal
+            .load(catalog_base.storage_path())
+            .await
+            .expect("load preserved aborted journal")
+            .expect("aborted journal remains");
+        assert_eq!(journal.phase(), CatalogPublicationPhase::Aborted);
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_rolls_hosts_applied_forward() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base.clone(),
+            catalog_target.clone(),
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build recovery transaction");
+        let generation = transaction.target_generation();
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("prepare recovery journal");
+        tokio::fs::remove_file(catalog_base.storage_path())
+            .await
+            .expect("remove base catalog to model first-publication recovery");
+        manager
+            .catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::Prepared,
+                CatalogPublicationPhase::HostsApplied,
+                transaction.catalog_path(),
+            )
+            .await
+            .expect("record hosts applied");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .recover_catalog_publication_state()
+            .await
+            .expect("recover hosts-applied transaction");
+
+        assert_eq!(*manager.registry.lock().await, catalog_target);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            catalog_target.domain_index()
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings()]
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_target.storage_path())
+                .await
+                .expect("load cleared recovered journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_finishes_hosts_applied_with_durable_target() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base,
+            catalog_target.clone(),
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build post-rename recovery transaction");
+        let generation = transaction.target_generation();
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("prepare post-rename recovery journal");
+        manager
+            .catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::Prepared,
+                CatalogPublicationPhase::HostsApplied,
+                transaction.catalog_path(),
+            )
+            .await
+            .expect("record post-rename hosts phase");
+        manager
+            .registry
+            .lock()
+            .await
+            .commit_candidate(catalog_target.clone())
+            .await
+            .expect("publish target before phase advancement");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .recover_catalog_publication_state()
+            .await
+            .expect("finish post-rename hosts-applied recovery");
+
+        assert_eq!(*manager.registry.lock().await, catalog_target);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            catalog_target.domain_index()
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings()]
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_target.storage_path())
+                .await
+                .expect("load cleared post-rename journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_rolls_prepared_back() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base.clone(),
+            catalog_target,
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build recovery transaction");
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("prepare recovery journal");
+        tokio::fs::remove_file(catalog_base.storage_path())
+            .await
+            .expect("remove base catalog before prepared recovery");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .recover_catalog_publication_state()
+            .await
+            .expect("recover prepared transaction");
+
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        let restored: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(catalog_base.storage_path())
+                .await
+                .expect("read restored base catalog"),
+        )
+        .expect("decode restored base catalog");
+        assert_eq!(
+            restored,
+            serde_json::to_value(&catalog_base).expect("encode expected base catalog")
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[previous_hosts.as_strings()]
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_base.storage_path())
+                .await
+                .expect("load cleared rollback journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_reaffirms_state_committed_hosts() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base,
+            catalog_target.clone(),
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build state-committed recovery transaction");
+        let generation = transaction.target_generation();
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("prepare state-committed recovery journal");
+        manager
+            .catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::Prepared,
+                CatalogPublicationPhase::HostsApplied,
+                transaction.catalog_path(),
+            )
+            .await
+            .expect("record state-committed hosts");
+        manager
+            .registry
+            .lock()
+            .await
+            .commit_candidate(catalog_target.clone())
+            .await
+            .expect("publish state-committed target fixture");
+        manager
+            .catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::HostsApplied,
+                CatalogPublicationPhase::StateCommitted,
+                transaction.catalog_path(),
+            )
+            .await
+            .expect("record state-committed phase");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .recover_catalog_publication_state()
+            .await
+            .expect("recover state-committed transaction");
+
+        assert_eq!(*manager.registry.lock().await, catalog_target);
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            catalog_target.domain_index()
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[candidate_hosts.as_strings()]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_reaffirms_aborted_previous_hosts() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            previous_hosts,
+            candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base.clone(),
+            catalog_target,
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build aborted recovery transaction");
+        let generation = transaction.target_generation();
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("prepare aborted recovery journal");
+        manager
+            .catalog_publication_journal
+            .advance(
+                generation,
+                CatalogPublicationPhase::Prepared,
+                CatalogPublicationPhase::Aborted,
+                transaction.catalog_path(),
+            )
+            .await
+            .expect("record aborted recovery phase");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .recover_catalog_publication_state()
+            .await
+            .expect("recover aborted transaction");
+
+        assert_eq!(*manager.registry.lock().await, catalog_base);
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[previous_hosts.as_strings()]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_compares_supported_v3_catalogs_semantically() {
+        for phase in [
+            CatalogPublicationPhase::Prepared,
+            CatalogPublicationPhase::Aborted,
+            CatalogPublicationPhase::HostsApplied,
+            CatalogPublicationPhase::StateCommitted,
+        ] {
+            let (
+                _directory,
+                mut manager,
+                catalog_base,
+                catalog_target,
+                previous_hosts,
+                candidate_hosts,
+            ) = catalog_publication_fixture().await;
+            let transaction = CatalogPublicationTransaction::new(
+                catalog_base.clone(),
+                catalog_target.clone(),
+                &previous_hosts,
+                &candidate_hosts,
+            )
+            .expect("build v3 recovery transaction");
+            let generation = transaction.target_generation();
+            manager
+                .catalog_publication_journal
+                .create(&transaction)
+                .await
+                .expect("prepare v3 recovery journal");
+
+            match phase {
+                CatalogPublicationPhase::Prepared => {}
+                CatalogPublicationPhase::Aborted => {
+                    manager
+                        .catalog_publication_journal
+                        .advance(
+                            generation,
+                            CatalogPublicationPhase::Prepared,
+                            CatalogPublicationPhase::Aborted,
+                            transaction.catalog_path(),
+                        )
+                        .await
+                        .expect("record aborted v3 recovery phase");
+                }
+                CatalogPublicationPhase::HostsApplied | CatalogPublicationPhase::StateCommitted => {
+                    manager
+                        .catalog_publication_journal
+                        .advance(
+                            generation,
+                            CatalogPublicationPhase::Prepared,
+                            CatalogPublicationPhase::HostsApplied,
+                            transaction.catalog_path(),
+                        )
+                        .await
+                        .expect("record hosts-applied v3 recovery phase");
+                    manager
+                        .registry
+                        .lock()
+                        .await
+                        .commit_candidate(catalog_target.clone())
+                        .await
+                        .expect("publish v3 recovery target fixture");
+                    if phase == CatalogPublicationPhase::StateCommitted {
+                        manager
+                            .catalog_publication_journal
+                            .advance(
+                                generation,
+                                CatalogPublicationPhase::HostsApplied,
+                                CatalogPublicationPhase::StateCommitted,
+                                transaction.catalog_path(),
+                            )
+                            .await
+                            .expect("record state-committed v3 recovery phase");
+                    }
+                }
+            }
+
+            downgrade_catalog_publication_journal_to_v3(&manager).await;
+            let target_is_authoritative = matches!(
+                phase,
+                CatalogPublicationPhase::HostsApplied | CatalogPublicationPhase::StateCommitted
+            );
+            let expected = if target_is_authoritative {
+                &catalog_target
+            } else {
+                &catalog_base
+            };
+            let durable_v3 = encode_v3_catalog(expected);
+            tokio::fs::write(expected.storage_path(), &durable_v3)
+                .await
+                .expect("write durable v3 catalog fixture");
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+                calls: calls.clone(),
+            }));
+
+            manager
+                .recover_catalog_publication_state()
+                .await
+                .unwrap_or_else(|error| panic!("recover {phase:?} v3 publication: {error:#}"));
+
+            assert_eq!(*manager.registry.lock().await, *expected, "{phase:?}");
+            assert_eq!(
+                manager.domain_index().snapshot().as_ref(),
+                expected.domain_index(),
+                "{phase:?}"
+            );
+            let expected_hosts = if target_is_authoritative {
+                candidate_hosts.as_strings()
+            } else {
+                previous_hosts.as_strings()
+            };
+            assert_eq!(
+                calls
+                    .lock()
+                    .expect("recording host sync mutex poisoned")
+                    .as_slice(),
+                &[expected_hosts],
+                "{phase:?}"
+            );
+            assert_eq!(
+                tokio::fs::read(expected.storage_path())
+                    .await
+                    .expect("read recovered durable v3 catalog"),
+                durable_v3,
+                "recovery must not publish a third catalog image for {phase:?}"
+            );
+            assert!(
+                manager
+                    .catalog_publication_journal
+                    .load(expected.storage_path())
+                    .await
+                    .expect("load cleared v3 recovery journal")
+                    .is_none(),
+                "{phase:?}"
+            );
+            assert!(
+                !manager
+                    .catalog_publication_recovery_required
+                    .load(Ordering::Acquire),
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_rejects_an_unrelated_catalog_image() {
+        let (_directory, manager, catalog_base, catalog_target, previous_hosts, candidate_hosts) =
+            catalog_publication_fixture().await;
+        let transaction = CatalogPublicationTransaction::new(
+            catalog_base.clone(),
+            catalog_target,
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build mismatched recovery transaction");
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("prepare mismatched recovery journal");
+        let mut unrelated = catalog_base;
+        unrelated
+            .instances
+            .values_mut()
+            .next()
+            .expect("fixture instance")
+            .display_name = Some("unrelated-catalog-image".to_owned());
+        manager
+            .registry
+            .lock()
+            .await
+            .commit_candidate(unrelated.clone())
+            .await
+            .expect("publish unrelated catalog fixture");
+
+        let error = manager
+            .recover_catalog_publication_state()
+            .await
+            .expect_err("unrelated catalog must block recovery");
+        assert!(error.to_string().contains("exact base catalog"));
+        assert_eq!(*manager.registry.lock().await, unrelated);
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(transaction.catalog_path())
+                .await
+                .expect("load preserved mismatched journal")
+                .is_some()
+        );
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_lifecycle_and_catalog_journals_recover_inner_then_outer_across_crash_phases() {
+        for (label, hosts_applied, publish_target, state_committed) in [
+            ("prepared-base", false, false, false),
+            ("hosts-applied-base", true, false, false),
+            ("hosts-applied-target", true, true, false),
+            ("state-committed-target", true, true, true),
+        ] {
+            let directory = tempdir().expect("create paired recovery directory");
+            let catalog_path = directory.path().join("catalog.json");
+            let catalog_base = Registry::with_path(catalog_path.clone());
+            catalog_base
+                .save()
+                .await
+                .expect("persist paired recovery base catalog");
+            let mut catalog_target = catalog_base.clone();
+            let project_path = directory.path().join("project");
+            std::fs::create_dir(&project_path).expect("create paired recovery project");
+            let instance_id = catalog_target
+                .register_project(
+                    Registry::discover(project_path)
+                        .await
+                        .expect("discover paired recovery project"),
+                    Some(label.to_owned()),
+                )
+                .expect("register paired recovery project");
+            catalog_target
+                .replace_domain_claims(
+                    instance_id,
+                    [DomainClaim::service(
+                        format!("{label}.example")
+                            .parse()
+                            .expect("parse paired recovery domain"),
+                        instance_id,
+                        format!("{label}:web"),
+                    )],
+                )
+                .expect("record paired recovery domain claim");
+
+            let state_manager =
+                Arc::new(StateManager::with_path(directory.path().join("state.json")));
+            let attachments = Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            )));
+            let mut manager = ProcessManager::new(
+                directory.path().join("notify.sock"),
+                state_manager,
+                Arc::new(Mutex::new(catalog_base.clone())),
+                attachments.clone(),
+                None,
+            )
+            .expect("create paired recovery manager");
+            let mut availability =
+                AvailabilityStore::load(&manager.availability_data_dir, instance_id)
+                    .await
+                    .expect("load paired recovery availability");
+            availability
+                .apply_batch(
+                    &AvailabilityBatch::new(SystemTime::now())
+                        .with_operation(AvailabilityBatchOperation::Initialize),
+                )
+                .await
+                .expect("initialize paired recovery availability");
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+                calls: calls.clone(),
+            }));
+            manager
+                .lifecycle_journal
+                .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+                .await
+                .expect("establish completed migration marker");
+
+            let attachment_snapshot = attachments.lock().await.snapshot();
+            let lifecycle = LifecycleTransaction::new(
+                LifecycleTransactionKind::LifecycleMutation,
+                SystemTime::now(),
+                Some(
+                    CatalogTransactionImages::new(catalog_base.clone(), catalog_target.clone())
+                        .expect("build paired lifecycle catalog images"),
+                ),
+                Vec::new(),
+                AttachmentTransactionImages::new(attachment_snapshot.clone(), attachment_snapshot),
+            )
+            .expect("build paired outer lifecycle transaction");
+            manager
+                .lifecycle_journal
+                .create(&lifecycle)
+                .await
+                .expect("prepare paired outer lifecycle journal");
+
+            let previous_hosts =
+                host_set_for_catalog(&catalog_base).expect("derive paired previous hosts");
+            let candidate_hosts =
+                host_set_for_catalog(&catalog_target).expect("derive paired candidate hosts");
+            let publication = CatalogPublicationTransaction::new(
+                catalog_base.clone(),
+                catalog_target.clone(),
+                &previous_hosts,
+                &candidate_hosts,
+            )
+            .expect("build paired inner publication transaction");
+            let generation = publication.target_generation();
+            manager
+                .catalog_publication_journal
+                .create(&publication)
+                .await
+                .expect("prepare paired inner publication journal");
+            if hosts_applied {
+                manager
+                    .catalog_publication_journal
+                    .advance(
+                        generation,
+                        CatalogPublicationPhase::Prepared,
+                        CatalogPublicationPhase::HostsApplied,
+                        &catalog_path,
+                    )
+                    .await
+                    .expect("record paired inner hosts phase");
+            }
+            if publish_target {
+                manager
+                    .registry
+                    .lock()
+                    .await
+                    .commit_candidate(catalog_target.clone())
+                    .await
+                    .expect("publish paired target catalog");
+            }
+            if state_committed {
+                manager
+                    .catalog_publication_journal
+                    .advance(
+                        generation,
+                        CatalogPublicationPhase::HostsApplied,
+                        CatalogPublicationPhase::StateCommitted,
+                        &catalog_path,
+                    )
+                    .await
+                    .expect("record paired state-committed phase");
+            }
+
+            manager
+                .recover_catalog_publication_state()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: recover inner publication: {error:#}"));
+            manager
+                .recover_and_migrate_lifecycle_state()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: recover outer lifecycle: {error:#}"));
+
+            assert_eq!(*manager.registry.lock().await, catalog_target, "{label}");
+            assert_eq!(
+                manager.domain_index().snapshot().as_ref(),
+                catalog_target.domain_index(),
+                "{label}"
+            );
+            let persisted_catalog: serde_json::Value = serde_json::from_slice(
+                &tokio::fs::read(&catalog_path)
+                    .await
+                    .expect("read durable paired catalog"),
+            )
+            .expect("decode durable paired catalog");
+            assert_eq!(
+                persisted_catalog,
+                serde_json::to_value(&catalog_target).expect("encode paired target catalog"),
+                "{label}"
+            );
+            assert!(
+                manager
+                    .catalog_publication_journal
+                    .load(&catalog_path)
+                    .await
+                    .expect("load paired inner journal")
+                    .is_none(),
+                "{label}"
+            );
+            assert!(
+                manager
+                    .lifecycle_journal
+                    .load()
+                    .await
+                    .expect("load paired outer journal")
+                    .is_none(),
+                "{label}"
+            );
+            assert!(
+                !manager
+                    .catalog_publication_recovery_required
+                    .load(Ordering::Acquire),
+                "{label}"
+            );
+            assert!(
+                !manager.lifecycle_recovery_required.load(Ordering::Acquire),
+                "{label}"
+            );
+            let calls = calls.lock().expect("paired host sync mutex poisoned");
+            if hosts_applied {
+                assert!(!calls.is_empty(), "{label}");
+                assert!(
+                    calls
+                        .iter()
+                        .all(|hosts| hosts == &candidate_hosts.as_strings()),
+                    "{label}: every recovery projection must reaffirm the candidate HostSet"
+                );
+            } else {
+                assert!(
+                    calls.len() >= 2,
+                    "{label}: recovery must apply both the inner rollback and outer replay"
+                );
+                assert_eq!(calls[0], previous_hosts.as_strings(), "{label}");
+                assert!(
+                    calls[1..]
+                        .iter()
+                        .all(|hosts| hosts == &candidate_hosts.as_strings()),
+                    "{label}: outer replay and later reconciliation must publish only the candidate HostSet after inner rollback"
+                );
+            }
         }
     }
 
@@ -19581,12 +21841,17 @@ PATH = "/usr/bin:/bin"
         )
         .await
         .expect("discover slow-start project");
-        let second_id = manager
-            .registry
-            .lock()
-            .await
-            .register_project(second_discovery, Some("slow-start".to_owned()))
-            .expect("register slow-start project");
+        let second_id = {
+            let mut registry = manager.registry.lock().await;
+            let second_id = registry
+                .register_project(second_discovery, Some("slow-start".to_owned()))
+                .expect("register slow-start project");
+            registry
+                .save()
+                .await
+                .expect("persist slow-start catalog fixture");
+            second_id
+        };
 
         let mut first_availability = AvailabilityStore::load(&availability_data_dir, first_id)
             .await
@@ -19807,6 +22072,10 @@ PATH = "/usr/bin:/bin"
             registry
                 .legacy_paths
                 .insert(canonical_new.clone(), instance_id);
+            registry
+                .save()
+                .await
+                .expect("persist moved reload catalog fixture");
         }
 
         manager
@@ -19853,6 +22122,10 @@ PATH = "/usr/bin:/bin"
             record.current_path = Some(canonical_new.clone());
             record.last_known_path = canonical_new.clone();
             registry.legacy_paths.insert(canonical_new, instance_id);
+            registry
+                .save()
+                .await
+                .expect("persist removable moved catalog fixture");
         }
 
         manager
@@ -19933,9 +22206,14 @@ PATH = "/usr/bin:/bin"
             registry
                 .legacy_paths
                 .insert(canonical_moved.clone(), moved_id);
-            registry
+            let replacement_id = registry
                 .register_project(replacement_discovery, Some("replacement".to_owned()))
-                .expect("register replacement project")
+                .expect("register replacement project");
+            registry
+                .save()
+                .await
+                .expect("persist reused-path catalog fixture");
+            replacement_id
         };
         assert_ne!(replacement_id, moved_id);
         manager.watch_config(reused_path.clone()).await;
@@ -23930,7 +26208,7 @@ PATH = "/usr/bin:/bin"
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
-        let manager = ProcessManager::new(
+        let mut manager = ProcessManager::new(
             dir.path().join("notify.sock"),
             state_manager,
             registry,
@@ -23938,6 +26216,7 @@ PATH = "/usr/bin:/bin"
             None,
         )
         .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
         std::fs::remove_dir(&project_path).expect("remove pinned project");
 
         assert_eq!(
@@ -24407,7 +26686,7 @@ PATH = "/usr/bin:/bin"
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
-        let manager = ProcessManager::new(
+        let mut manager = ProcessManager::new(
             notify_path,
             state_manager,
             registry,
@@ -24415,6 +26694,7 @@ PATH = "/usr/bin:/bin"
             None,
         )
         .expect("create process manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
         let project_path = dir.path().join("project");
         std::fs::create_dir(&project_path).expect("create project directory");
         let canonical = std::fs::canonicalize(&project_path).expect("canonical project path");
@@ -24489,7 +26769,7 @@ PATH = "/usr/bin:/bin"
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
-        let manager = ProcessManager::new(
+        let mut manager = ProcessManager::new(
             dir.path().join("notify.sock"),
             Arc::new(StateManager::with_path(dir.path().join("state.json"))),
             Arc::new(Mutex::new(Registry::with_path(
@@ -24499,6 +26779,7 @@ PATH = "/usr/bin:/bin"
             None,
         )
         .expect("create unresolved reaper manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
         attachments
             .lock()
             .await
@@ -24625,7 +26906,7 @@ PATH = "/usr/bin:/bin"
         let attachments = Arc::new(Mutex::new(AttachmentStore::new(
             dir.path().join("attachments.json"),
         )));
-        let manager = ProcessManager::new(
+        let mut manager = ProcessManager::new(
             dir.path().join("notify.sock"),
             Arc::new(StateManager::with_path(dir.path().join("state.json"))),
             Arc::new(Mutex::new(Registry::with_path(
@@ -24635,6 +26916,7 @@ PATH = "/usr/bin:/bin"
             None,
         )
         .expect("create unresolved publication-race manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
         attachments
             .lock()
             .await
@@ -24785,7 +27067,7 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
-    async fn first_registration_syncs_hosts_after_catalog_publish_before_later_failure() {
+    async fn first_registration_applies_hosts_before_catalog_and_before_later_failure() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("partial-registration-project");
         std::fs::create_dir(&project_path).expect("create registration project");
@@ -24822,8 +27104,12 @@ command = "sleep 30"
         )
         .expect("create partial registration manager");
         let host_sync_calls = Arc::new(StdMutex::new(Vec::new()));
-        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+        let catalog_owned_at_call = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(CatalogObservingHostSyncer {
+            registry: registry.clone(),
+            domain: "partial-registration.localhost".to_owned(),
             calls: host_sync_calls.clone(),
+            catalog_owned_at_call: catalog_owned_at_call.clone(),
         }));
 
         manager
@@ -24852,6 +27138,14 @@ command = "sleep 30"
                 .expect("recording host sync mutex poisoned")
                 .as_slice(),
             &[expected_hosts(&["partial-registration.localhost"])]
+        );
+        assert_eq!(
+            catalog_owned_at_call
+                .lock()
+                .expect("catalog observation mutex poisoned")
+                .as_slice(),
+            &[false],
+            "candidate hosts are installed before catalog/domain ownership becomes authoritative"
         );
     }
 
@@ -28810,7 +31104,10 @@ PATH = "/usr/bin:/bin"
         )
         .expect("write host-sync EnsureProject config");
         let mut manager = unregistered_availability_manager(dir.path());
-        manager.set_host_syncer(Arc::new(RejectingHostSyncer));
+        manager.set_host_syncer(Arc::new(ScriptedHostSyncer {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            failures: Arc::new(StdMutex::new(VecDeque::from([true, false]))),
+        }));
         manager.set_https_port(Some(443)).await;
         manager.factories.insert(
             0,
@@ -28826,31 +31123,45 @@ PATH = "/usr/bin:/bin"
             .expect_err("host synchronization failure blocks Ready");
         let message = format!("{error:#}");
         assert!(
-            message.contains("failed to synchronize ensured project domain claims"),
+            message.contains("failed to apply the candidate complete hosts projection"),
             "unexpected EnsureProject error: {message}"
         );
         assert!(
-            message.contains("injected host synchronization failure"),
+            message.contains("injected scripted host synchronization failure"),
             "unexpected EnsureProject error: {message}"
         );
 
-        let (instance_id, _) = manager
-            .required_availability_instance_for_path(&project_path)
-            .await
-            .expect("failed Ready result retains the registered project");
-        let snapshot = manager
-            .load_availability(instance_id)
-            .await
-            .expect("load host-sync EnsureProject availability")
-            .snapshot()
-            .await
-            .expect("read host-sync EnsureProject availability");
         assert!(
-            snapshot
-                .demands()
-                .iter()
-                .any(|lease| lease.kind() == DemandKind::ManualCli),
-            "host synchronization failure preserves the requested availability"
+            manager
+                .registry
+                .lock()
+                .await
+                .get_project(&project_path)
+                .is_none(),
+            "failed host publication leaves project registration unpublished"
+        );
+        let catalog_path = manager.registry.lock().await.storage_path().to_path_buf();
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(&catalog_path)
+                .await
+                .expect("inspect aborted catalog publication journal")
+                .is_none(),
+            "durably restored hosts leave no active catalog publication"
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect retryable lifecycle intent")
+                .is_some(),
+            "the outer lifecycle intent remains available for startup recovery"
+        );
+        assert!(
+            manager.lifecycle_recovery_required.load(Ordering::Acquire),
+            "no later lifecycle mutation is admitted before recovery"
         );
     }
 
