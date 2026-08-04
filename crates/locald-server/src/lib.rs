@@ -75,6 +75,7 @@ mod agent_context;
 pub mod api;
 #[doc(hidden)]
 pub mod assets;
+pub(crate) mod catalog_publication;
 #[doc(hidden)]
 // pub mod cert; // Moved to locald-utils
 pub mod config_loader;
@@ -604,26 +605,35 @@ async fn async_main(
         crate::state::StateManager::new().context("Failed to initialize state manager")?,
     );
 
+    let catalog_path = locald_core::registry::Registry::path();
+    let catalog_publication_journal =
+        catalog_publication::CatalogPublicationJournal::for_catalog_path(&catalog_path)
+            .context("Failed to locate catalog publication recovery authority")?;
+    let catalog_publication_preflight = catalog_publication_journal
+        .load(&catalog_path)
+        .await
+        .context("Failed to preflight catalog publication recovery authority")?;
     let lifecycle_preflight =
         lifecycle_transaction::LifecycleJournal::at(&locald_core::storage::data_dir())
             .preflight()
             .await
             .context("Failed to preflight lifecycle recovery authority")?;
-    let allow_legacy_catalog_bootstrap = !lifecycle_preflight.has_v2_authority();
-    let catalog_path = locald_core::registry::Registry::path();
     let catalog_exists = path_entry_exists(&catalog_path).await.with_context(|| {
         format!(
             "Failed to inspect project identity catalog `{}`",
             catalog_path.display()
         )
     })?;
-    let prepared_legacy_catalog = (!catalog_exists)
-        .then(|| lifecycle_preflight.prepared_legacy_catalog_base(&catalog_path))
-        .flatten();
-    let registry = match prepared_legacy_catalog {
+    let startup_authority = select_startup_catalog_authority(
+        &catalog_path,
+        catalog_exists,
+        catalog_publication_preflight.as_ref(),
+        &lifecycle_preflight,
+    )?;
+    let registry = match startup_authority.recovery_catalog {
         Some(catalog) => catalog,
         None => locald_core::registry::Registry::load_for_lifecycle_recovery(
-            allow_legacy_catalog_bootstrap,
+            startup_authority.allow_legacy_bootstrap,
         )
         .await
         .context("Failed to initialize project identity catalog")?,
@@ -648,6 +658,10 @@ async fn async_main(
     if config.server.is_sandbox() {
         manager.use_sandbox_host_set_writer();
     }
+    manager
+        .recover_catalog_publication_state()
+        .await
+        .context("Failed to recover catalog, domain, and hosts publication")?;
     manager
         .recover_and_migrate_lifecycle_state()
         .await
@@ -961,6 +975,63 @@ async fn path_entry_exists(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
+#[derive(Debug)]
+struct StartupCatalogAuthority {
+    allow_legacy_bootstrap: bool,
+    recovery_catalog: Option<locald_core::ProjectCatalog>,
+}
+
+fn select_startup_catalog_authority(
+    catalog_path: &std::path::Path,
+    catalog_exists: bool,
+    publication: Option<&catalog_publication::CatalogPublicationTransaction>,
+    lifecycle: &lifecycle_transaction::LifecycleRecoveryPreflight,
+) -> Result<StartupCatalogAuthority> {
+    if let (Some(publication), Some(lifecycle_txn)) = (publication, lifecycle.transaction()) {
+        anyhow::ensure!(
+            lifecycle_txn.phase() == lifecycle_transaction::LifecycleTransactionPhase::Prepared,
+            "catalog publication generation {} coexists with lifecycle transaction {} after its prepared phase",
+            publication.target_generation(),
+            lifecycle_txn.id()
+        );
+        let images = lifecycle_txn.catalog().with_context(|| {
+            format!(
+                "catalog publication generation {} coexists with lifecycle transaction {} without catalog images",
+                publication.target_generation(),
+                lifecycle_txn.id()
+            )
+        })?;
+        let mut lifecycle_base = images.base().clone();
+        let mut lifecycle_target = images.target().clone();
+        lifecycle_base.set_storage_path(catalog_path.to_path_buf());
+        lifecycle_target.set_storage_path(catalog_path.to_path_buf());
+        anyhow::ensure!(
+            lifecycle_base == *publication.catalog_base()
+                && lifecycle_target == *publication.catalog_target(),
+            "catalog publication generation {} does not match lifecycle transaction {} catalog images",
+            publication.target_generation(),
+            lifecycle_txn.id()
+        );
+    }
+
+    let recovery_catalog = if catalog_exists {
+        None
+    } else if let Some(publication) = publication {
+        Some(
+            publication
+                .catalog_for_missing_storage()
+                .context("Failed to recover the missing catalog from publication authority")?,
+        )
+    } else {
+        lifecycle.prepared_legacy_catalog_base(catalog_path)
+    };
+
+    Ok(StartupCatalogAuthority {
+        allow_legacy_bootstrap: !lifecycle.has_v2_authority() && publication.is_none(),
+        recovery_catalog,
+    })
+}
+
 async fn watch_for_upgrade(
     container_manager: std::sync::Arc<crate::container::ContainerManager>,
     shutdown_tx: tokio::sync::mpsc::Sender<ShutdownReason>,
@@ -1183,7 +1254,8 @@ mod catalog_writer_lock_tests {
 
 #[cfg(test)]
 mod lifecycle_startup_tests {
-    use super::load_attachment_store_for_lifecycle_recovery;
+    use super::{load_attachment_store_for_lifecycle_recovery, select_startup_catalog_authority};
+    use crate::catalog_publication::{CatalogPublicationTransaction, host_set_for_catalog};
     use crate::lifecycle_transaction::{
         AttachmentTransactionImages, CatalogTransactionImages, LifecycleJournal,
         LifecycleTransaction, LifecycleTransactionKind, LifecycleTransactionPhase,
@@ -1193,6 +1265,185 @@ mod lifecycle_startup_tests {
         Attachment, AttachmentSource, AttachmentStore, AttachmentStoreSnapshot,
     };
     use std::time::SystemTime;
+
+    async fn catalog_publication_images(
+        directory: &tempfile::TempDir,
+    ) -> (ProjectCatalog, ProjectCatalog) {
+        let catalog_path = directory.path().join("catalog.json");
+        let catalog_base = ProjectCatalog::with_path(catalog_path);
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create startup publication project");
+        let mut catalog_target = catalog_base.clone();
+        catalog_target
+            .register_project(
+                ProjectCatalog::discover(project_path)
+                    .await
+                    .expect("discover startup publication project"),
+                Some("startup-publication".to_owned()),
+            )
+            .expect("register startup publication project");
+        (catalog_base, catalog_target)
+    }
+
+    fn publication_transaction(
+        catalog_base: ProjectCatalog,
+        catalog_target: ProjectCatalog,
+    ) -> CatalogPublicationTransaction {
+        let previous_hosts =
+            host_set_for_catalog(&catalog_base).expect("derive startup previous hosts");
+        let candidate_hosts =
+            host_set_for_catalog(&catalog_target).expect("derive startup candidate hosts");
+        CatalogPublicationTransaction::new(
+            catalog_base,
+            catalog_target,
+            &previous_hosts,
+            &candidate_hosts,
+        )
+        .expect("build startup publication transaction")
+    }
+
+    fn lifecycle_transaction_with_catalog(
+        catalog_base: ProjectCatalog,
+        catalog_target: ProjectCatalog,
+    ) -> LifecycleTransaction {
+        LifecycleTransaction::new(
+            LifecycleTransactionKind::LifecycleMutation,
+            SystemTime::now(),
+            Some(
+                CatalogTransactionImages::new(catalog_base, catalog_target)
+                    .expect("prepare startup lifecycle catalog images"),
+            ),
+            Vec::new(),
+            AttachmentTransactionImages::new(
+                AttachmentStoreSnapshot::default(),
+                AttachmentStoreSnapshot::default(),
+            ),
+        )
+        .expect("build startup lifecycle transaction")
+    }
+
+    #[tokio::test]
+    async fn publication_authority_seeds_a_missing_catalog_and_disables_legacy_bootstrap() {
+        let directory = tempfile::tempdir().expect("create startup authority fixture");
+        let (catalog_base, catalog_target) = catalog_publication_images(&directory).await;
+        let publication = publication_transaction(catalog_base.clone(), catalog_target);
+        let lifecycle = LifecycleJournal::at(directory.path())
+            .preflight()
+            .await
+            .expect("preflight empty lifecycle authority");
+
+        let authority = select_startup_catalog_authority(
+            catalog_base.storage_path(),
+            false,
+            Some(&publication),
+            &lifecycle,
+        )
+        .expect("select publication startup authority");
+
+        assert!(!authority.allow_legacy_bootstrap);
+        assert_eq!(authority.recovery_catalog, Some(catalog_base));
+    }
+
+    #[tokio::test]
+    async fn matching_prepared_lifecycle_and_catalog_publication_authority_is_accepted() {
+        let directory = tempfile::tempdir().expect("create paired startup authority fixture");
+        let (catalog_base, catalog_target) = catalog_publication_images(&directory).await;
+        let publication = publication_transaction(catalog_base.clone(), catalog_target.clone());
+        let lifecycle_transaction =
+            lifecycle_transaction_with_catalog(catalog_base.clone(), catalog_target);
+        let lifecycle_journal = LifecycleJournal::at(directory.path());
+        lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("establish completed migration authority");
+        lifecycle_journal
+            .create(&lifecycle_transaction)
+            .await
+            .expect("persist paired lifecycle authority");
+        let lifecycle = lifecycle_journal
+            .preflight()
+            .await
+            .expect("preflight paired lifecycle authority");
+
+        let authority = select_startup_catalog_authority(
+            catalog_base.storage_path(),
+            false,
+            Some(&publication),
+            &lifecycle,
+        )
+        .expect("accept matching prepared authorities");
+
+        assert!(!authority.allow_legacy_bootstrap);
+        assert_eq!(authority.recovery_catalog, Some(catalog_base));
+    }
+
+    #[tokio::test]
+    async fn mismatched_or_advanced_lifecycle_authority_rejects_catalog_publication() {
+        let directory = tempfile::tempdir().expect("create conflicting startup authority fixture");
+        let (catalog_base, catalog_target) = catalog_publication_images(&directory).await;
+        let publication = publication_transaction(catalog_base.clone(), catalog_target.clone());
+        let mismatched_lifecycle =
+            lifecycle_transaction_with_catalog(catalog_base.clone(), catalog_base.clone());
+        let lifecycle_journal = LifecycleJournal::at(directory.path());
+        lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("establish mismatched completed migration authority");
+        lifecycle_journal
+            .create(&mismatched_lifecycle)
+            .await
+            .expect("persist mismatched lifecycle authority");
+        let lifecycle = lifecycle_journal
+            .preflight()
+            .await
+            .expect("preflight mismatched lifecycle authority");
+        let error = select_startup_catalog_authority(
+            catalog_base.storage_path(),
+            false,
+            Some(&publication),
+            &lifecycle,
+        )
+        .expect_err("mismatched authorities must block startup");
+        assert!(error.to_string().contains("does not match"));
+
+        let advanced_directory =
+            tempfile::tempdir().expect("create advanced startup authority fixture");
+        let (advanced_base, advanced_target) =
+            catalog_publication_images(&advanced_directory).await;
+        let advanced_publication =
+            publication_transaction(advanced_base.clone(), advanced_target.clone());
+        let matching_lifecycle =
+            lifecycle_transaction_with_catalog(advanced_base.clone(), advanced_target);
+        let advanced_lifecycle_journal = LifecycleJournal::at(advanced_directory.path());
+        advanced_lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("establish advanced completed migration authority");
+        advanced_lifecycle_journal
+            .create(&matching_lifecycle)
+            .await
+            .expect("persist matching lifecycle authority");
+        advanced_lifecycle_journal
+            .advance(
+                matching_lifecycle.id(),
+                LifecycleTransactionPhase::Prepared,
+                LifecycleTransactionPhase::CatalogPublished,
+            )
+            .await
+            .expect("advance lifecycle authority past prepared");
+        let lifecycle = advanced_lifecycle_journal
+            .preflight()
+            .await
+            .expect("preflight advanced lifecycle authority");
+        let error = select_startup_catalog_authority(
+            advanced_base.storage_path(),
+            false,
+            Some(&advanced_publication),
+            &lifecycle,
+        )
+        .expect_err("advanced lifecycle authority must reject an inner publication journal");
+        assert!(error.to_string().contains("after its prepared phase"));
+    }
 
     #[tokio::test]
     async fn availability_published_startup_accepts_only_an_exact_target() {

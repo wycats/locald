@@ -523,6 +523,11 @@ pub(crate) struct LifecycleRecoveryPreflight {
 }
 
 impl LifecycleRecoveryPreflight {
+    #[must_use]
+    pub(crate) const fn transaction(&self) -> Option<&LifecycleTransaction> {
+        self.transaction.as_ref()
+    }
+
     /// Return the exact catalog base recorded by a cold v1 migration that has
     /// not published its catalog yet.
     ///
