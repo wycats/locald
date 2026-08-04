@@ -815,22 +815,20 @@ async fn load_durable_catalog_image(path: &Path) -> Result<Option<Registry>> {
         "durable catalog `{}` is not a regular file",
         path.display()
     );
-    let content = tokio::fs::read(path)
+    let parent = path.parent().with_context(|| {
+        format!(
+            "durable catalog `{}` has no parent directory",
+            path.display()
+        )
+    })?;
+    let mut paths = locald_core::CatalogPaths::for_data_dir(parent);
+    paths.catalog = path.to_path_buf();
+    // Recovery compares logical catalog images. Decode supported predecessor
+    // schemas through the same non-publishing migration path used at startup,
+    // so an interrupted upgrade does not introduce a third durable image.
+    let catalog = Registry::load_from_paths_for_lifecycle_recovery(paths, false)
         .await
-        .with_context(|| format!("failed to read durable catalog `{}`", path.display()))?;
-    let value: serde_json::Value = serde_json::from_slice(&content)
-        .with_context(|| format!("failed to decode durable catalog `{}`", path.display()))?;
-    anyhow::ensure!(
-        value.get("agent_bindings").is_some(),
-        "durable catalog `{}` is missing `agent_bindings`",
-        path.display()
-    );
-    let mut catalog: Registry = serde_json::from_value(value)
-        .with_context(|| format!("failed to decode durable catalog `{}`", path.display()))?;
-    catalog.set_storage_path(path.to_path_buf());
-    catalog
-        .validate()
-        .with_context(|| format!("failed to validate durable catalog `{}`", path.display()))?;
+        .with_context(|| format!("failed to load durable catalog `{}`", path.display()))?;
     Ok(Some(catalog))
 }
 
@@ -12947,6 +12945,40 @@ mod tests {
         )
     }
 
+    fn encode_v3_catalog(catalog: &Registry) -> Vec<u8> {
+        let mut value = serde_json::to_value(catalog).expect("encode catalog as JSON");
+        let object = value
+            .as_object_mut()
+            .expect("catalog JSON must be an object");
+        object.insert("version".to_owned(), serde_json::Value::from(3));
+        object.remove("agent_bindings");
+        let mut content = serde_json::to_vec_pretty(&value).expect("encode v3 catalog fixture");
+        content.push(b'\n');
+        content
+    }
+
+    async fn downgrade_catalog_publication_journal_to_v3(manager: &ProcessManager) {
+        let journal_path = manager.catalog_publication_journal.journal_path();
+        let content = tokio::fs::read(journal_path)
+            .await
+            .expect("read catalog publication journal fixture");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&content).expect("decode catalog publication journal fixture");
+        for field in ["catalog_base", "catalog_target"] {
+            let object = value[field]
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("{field} must be an object"));
+            object.insert("version".to_owned(), serde_json::Value::from(3));
+            object.remove("agent_bindings");
+        }
+        let mut content =
+            serde_json::to_vec_pretty(&value).expect("encode v3 publication journal fixture");
+        content.push(b'\n');
+        tokio::fs::write(journal_path, content)
+            .await
+            .expect("write v3 catalog publication journal fixture");
+    }
+
     #[tokio::test]
     async fn catalog_publication_commits_hosts_catalog_and_live_index_as_one_transition() {
         let (
@@ -13776,6 +13808,151 @@ mod tests {
                 .as_slice(),
             &[previous_hosts.as_strings()]
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_publication_recovery_compares_supported_v3_catalogs_semantically() {
+        for phase in [
+            CatalogPublicationPhase::Prepared,
+            CatalogPublicationPhase::Aborted,
+            CatalogPublicationPhase::HostsApplied,
+            CatalogPublicationPhase::StateCommitted,
+        ] {
+            let (
+                _directory,
+                mut manager,
+                catalog_base,
+                catalog_target,
+                previous_hosts,
+                candidate_hosts,
+            ) = catalog_publication_fixture().await;
+            let transaction = CatalogPublicationTransaction::new(
+                catalog_base.clone(),
+                catalog_target.clone(),
+                &previous_hosts,
+                &candidate_hosts,
+            )
+            .expect("build v3 recovery transaction");
+            let generation = transaction.target_generation();
+            manager
+                .catalog_publication_journal
+                .create(&transaction)
+                .await
+                .expect("prepare v3 recovery journal");
+
+            match phase {
+                CatalogPublicationPhase::Prepared => {}
+                CatalogPublicationPhase::Aborted => {
+                    manager
+                        .catalog_publication_journal
+                        .advance(
+                            generation,
+                            CatalogPublicationPhase::Prepared,
+                            CatalogPublicationPhase::Aborted,
+                            transaction.catalog_path(),
+                        )
+                        .await
+                        .expect("record aborted v3 recovery phase");
+                }
+                CatalogPublicationPhase::HostsApplied | CatalogPublicationPhase::StateCommitted => {
+                    manager
+                        .catalog_publication_journal
+                        .advance(
+                            generation,
+                            CatalogPublicationPhase::Prepared,
+                            CatalogPublicationPhase::HostsApplied,
+                            transaction.catalog_path(),
+                        )
+                        .await
+                        .expect("record hosts-applied v3 recovery phase");
+                    manager
+                        .registry
+                        .lock()
+                        .await
+                        .commit_candidate(catalog_target.clone())
+                        .await
+                        .expect("publish v3 recovery target fixture");
+                    if phase == CatalogPublicationPhase::StateCommitted {
+                        manager
+                            .catalog_publication_journal
+                            .advance(
+                                generation,
+                                CatalogPublicationPhase::HostsApplied,
+                                CatalogPublicationPhase::StateCommitted,
+                                transaction.catalog_path(),
+                            )
+                            .await
+                            .expect("record state-committed v3 recovery phase");
+                    }
+                }
+            }
+
+            downgrade_catalog_publication_journal_to_v3(&manager).await;
+            let target_is_authoritative = matches!(
+                phase,
+                CatalogPublicationPhase::HostsApplied | CatalogPublicationPhase::StateCommitted
+            );
+            let expected = if target_is_authoritative {
+                &catalog_target
+            } else {
+                &catalog_base
+            };
+            let durable_v3 = encode_v3_catalog(expected);
+            tokio::fs::write(expected.storage_path(), &durable_v3)
+                .await
+                .expect("write durable v3 catalog fixture");
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+                calls: calls.clone(),
+            }));
+
+            manager
+                .recover_catalog_publication_state()
+                .await
+                .unwrap_or_else(|error| panic!("recover {phase:?} v3 publication: {error:#}"));
+
+            assert_eq!(*manager.registry.lock().await, *expected, "{phase:?}");
+            assert_eq!(
+                manager.domain_index().snapshot().as_ref(),
+                expected.domain_index(),
+                "{phase:?}"
+            );
+            let expected_hosts = if target_is_authoritative {
+                candidate_hosts.as_strings()
+            } else {
+                previous_hosts.as_strings()
+            };
+            assert_eq!(
+                calls
+                    .lock()
+                    .expect("recording host sync mutex poisoned")
+                    .as_slice(),
+                &[expected_hosts],
+                "{phase:?}"
+            );
+            assert_eq!(
+                tokio::fs::read(expected.storage_path())
+                    .await
+                    .expect("read recovered durable v3 catalog"),
+                durable_v3,
+                "recovery must not publish a third catalog image for {phase:?}"
+            );
+            assert!(
+                manager
+                    .catalog_publication_journal
+                    .load(expected.storage_path())
+                    .await
+                    .expect("load cleared v3 recovery journal")
+                    .is_none(),
+                "{phase:?}"
+            );
+            assert!(
+                !manager
+                    .catalog_publication_recovery_required
+                    .load(Ordering::Acquire),
+                "{phase:?}"
+            );
+        }
     }
 
     #[tokio::test]
