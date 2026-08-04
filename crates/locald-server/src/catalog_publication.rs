@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 pub(crate) const CATALOG_PUBLICATION_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "catalog-publication.json";
+const FIRST_CATALOG_VERSION_REQUIRING_AGENT_BINDINGS: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -567,12 +568,15 @@ fn validate_embedded_catalog_agent_bindings(value: &serde_json::Value) -> Result
         let Some(image) = value.get(image_name) else {
             continue;
         };
-        if image.get("version").and_then(serde_json::Value::as_u64)
-            == Some(u64::from(CATALOG_VERSION))
+        let Some(version) = image.get("version").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if (FIRST_CATALOG_VERSION_REQUIRING_AGENT_BINDINGS..=u64::from(CATALOG_VERSION))
+            .contains(&version)
             && image.get("agent_bindings").is_none()
         {
             return Err(format!(
-                "current embedded {image_name} is missing `agent_bindings`"
+                "embedded {image_name} at catalog schema version {version} is missing `agent_bindings`"
             ));
         }
     }
@@ -733,9 +737,11 @@ async fn sync_parent(path: &Path, operation: &'static str) -> Result<(), Catalog
 mod tests {
     use super::{
         CATALOG_PUBLICATION_VERSION, CatalogPublicationError, CatalogPublicationJournal,
-        CatalogPublicationPhase, CatalogPublicationTransaction, host_set_for_catalog,
+        CatalogPublicationPhase, CatalogPublicationTransaction,
+        FIRST_CATALOG_VERSION_REQUIRING_AGENT_BINDINGS, host_set_for_catalog,
     };
     use locald_core::ProjectCatalog;
+    use locald_core::catalog::CATALOG_VERSION;
     use locald_hosts::HostSet;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -929,31 +935,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_current_catalog_image_is_preserved_and_rejected() {
+    async fn supported_catalog_images_without_agent_bindings_are_preserved_and_rejected() {
         let (_temporary, journal, transaction) = fixture();
         let catalog_path = transaction.catalog_path().to_path_buf();
-        let mut value = serde_json::to_value(&transaction).expect("serialize transaction");
-        value["catalog_base"]
-            .as_object_mut()
-            .expect("catalog base object")
-            .remove("agent_bindings");
-        let bytes = serde_json::to_vec_pretty(&value).expect("encode malformed transaction");
-        tokio::fs::write(journal.journal_path(), &bytes)
-            .await
-            .expect("write malformed journal");
+        for version in [
+            FIRST_CATALOG_VERSION_REQUIRING_AGENT_BINDINGS,
+            u64::from(CATALOG_VERSION),
+        ] {
+            let mut value = serde_json::to_value(&transaction).expect("serialize transaction");
+            let catalog_base = value["catalog_base"]
+                .as_object_mut()
+                .expect("catalog base object");
+            catalog_base.insert("version".to_owned(), Value::from(version));
+            catalog_base.remove("agent_bindings");
+            let bytes = serde_json::to_vec_pretty(&value).expect("encode malformed transaction");
+            tokio::fs::write(journal.journal_path(), &bytes)
+                .await
+                .expect("write malformed journal");
 
-        let before = tokio::fs::read(journal.journal_path())
-            .await
-            .expect("read malformed journal before load");
-        let error = journal
-            .load(&catalog_path)
-            .await
-            .expect_err("reject missing required current field");
-        let after = tokio::fs::read(journal.journal_path())
-            .await
-            .expect("read malformed journal after load");
-        assert_eq!(before, after);
-        assert!(error.to_string().contains("agent_bindings"));
+            let before = tokio::fs::read(journal.journal_path())
+                .await
+                .expect("read malformed journal before load");
+            let error = journal
+                .load(&catalog_path)
+                .await
+                .expect_err("reject missing required binding map");
+            let after = tokio::fs::read(journal.journal_path())
+                .await
+                .expect("read malformed journal after load");
+            assert_eq!(before, after);
+            assert!(error.to_string().contains("agent_bindings"));
+            assert!(error.to_string().contains(&version.to_string()));
+        }
     }
 
     #[tokio::test]

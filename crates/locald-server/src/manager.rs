@@ -604,6 +604,29 @@ struct ConfigApplyOutcome {
     pending_initial: Option<PendingInitialAvailabilityGuard>,
 }
 
+/// The result of publishing one catalog target together with the authority to
+/// project that target into runtime state.
+///
+/// A catalog rename can make the target authoritative before a later journal
+/// operation reports an error. Conversely, durable-catalog verification can
+/// deliberately disable routing while the in-memory registry still contains
+/// that target. Callers must therefore consume this explicit outcome instead
+/// of reconstructing publication authority from registry equality.
+struct CatalogPublicationOutcome {
+    completion: Result<()>,
+    published_domain_index: Option<DomainIndex>,
+}
+
+impl CatalogPublicationOutcome {
+    fn into_result(self) -> Result<()> {
+        self.completion
+    }
+
+    fn into_parts(self) -> (Result<()>, Option<DomainIndex>) {
+        (self.completion, self.published_domain_index)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConfigApplyOptions<'a> {
     start_services: bool,
@@ -794,6 +817,8 @@ pub struct ProcessManager {
     shutting_down: Arc<AtomicBool>,
     #[cfg(test)]
     config_publication_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
+    catalog_verification_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
     #[cfg(test)]
     readiness_wait_hook: Arc<StdMutex<Option<Arc<Notify>>>>,
     #[cfg(test)]
@@ -1223,6 +1248,8 @@ impl ProcessManager {
             #[cfg(test)]
             config_publication_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            catalog_verification_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             readiness_wait_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             readiness_wait_timeout: Arc::new(StdMutex::new(None)),
@@ -1251,6 +1278,27 @@ impl ProcessManager {
     async fn wait_at_config_publication_hook(&self) {
         let hook = self
             .config_publication_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_catalog_verification_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .catalog_verification_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_catalog_verification_hook(&self) {
+        let hook = self
+            .catalog_verification_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -3189,7 +3237,9 @@ impl ProcessManager {
         &self,
         catalog_base: Registry,
         catalog_target: Registry,
-    ) -> Result<()> {
+    ) -> CatalogPublicationOutcome {
+        let mut published_domain_index = None;
+        let completion: Result<()> = async {
         let previous_hosts = host_set_for_catalog(&catalog_base)
             .context("failed to derive the previous complete hosts projection")?;
         let candidate_hosts = host_set_for_catalog(&catalog_target)
@@ -3227,6 +3277,7 @@ impl ProcessManager {
                         .context("failed to reaffirm the target complete hosts projection")?;
                     self.domain_index
                         .store(catalog_target.domain_index().clone());
+                    published_domain_index = Some(catalog_target.domain_index().clone());
                     return Ok(());
                 }
                 Ok(None) if catalog_base == catalog_target => {
@@ -3346,6 +3397,9 @@ impl ProcessManager {
             }
         }
 
+        #[cfg(test)]
+        self.wait_at_catalog_verification_hook().await;
+
         if let Err(error) = self
             .require_exact_durable_catalog_locked(&catalog_target, "committed target")
             .await
@@ -3355,6 +3409,11 @@ impl ProcessManager {
                 "catalog publication generation {generation} cannot confirm its committed target; project routing is disabled until restart"
             )));
         }
+
+        // From this point onward the durable target has been verified. Keep
+        // that explicit authority even if advancing or clearing the recovery
+        // journal reports a later error.
+        published_domain_index = Some(catalog_target.domain_index().clone());
 
         self.catalog_publication_journal
             .advance(
@@ -3372,6 +3431,12 @@ impl ProcessManager {
         self.catalog_publication_recovery_required
             .store(false, AtomicOrdering::Release);
         Ok(())
+        }
+        .await;
+        CatalogPublicationOutcome {
+            completion,
+            published_domain_index,
+        }
     }
 
     async fn fail_catalog_publication_before_state_commit_locked(
@@ -4499,30 +4564,15 @@ impl ProcessManager {
                         attachment_base,
                     )
                     .await?;
-                let commit_result = self
-                    .create_and_apply_lifecycle_transaction_locked(&transaction)
-                    .await;
-                // The catalog rename is the ownership commit point even when
-                // a later journal phase reports incomplete durability or
-                // fails. Observe the authoritative catalog image directly so
-                // hosts and runtime projections converge before the error is
-                // surfaced to the caller.
-                let published_domain_index = {
-                    let registry = self.registry.lock().await;
-                    transaction.catalog().and_then(|images| {
-                        (*registry == *images.target()).then(|| registry.domain_index().clone())
-                    })
-                };
-                (commit_result, published_domain_index)
+                self.create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(
+                    &transaction,
+                )
+                .await
+                .into_parts()
             } else {
-                let commit_result = self
-                    .publish_catalog_transition_locked(catalog_base, candidate.clone())
-                    .await;
-                let published_domain_index = {
-                    let registry = self.registry.lock().await;
-                    (*registry == candidate).then(|| registry.domain_index().clone())
-                };
-                (commit_result, published_domain_index)
+                self.publish_catalog_transition_locked(catalog_base, candidate)
+                    .await
+                    .into_parts()
             };
             (
                 commit_result,
@@ -7616,6 +7666,7 @@ impl ProcessManager {
         drop(registry);
         self.publish_catalog_transition_locked(catalog_base, candidate)
             .await
+            .into_result()
             .context("failed to persist the ambient agent conversation binding")
     }
 
@@ -7649,6 +7700,7 @@ impl ProcessManager {
         drop(registry);
         self.publish_catalog_transition_locked(catalog_base, candidate)
             .await
+            .into_result()
             .context("failed to persist ambient project metadata and conversation binding")?;
         Ok(true)
     }
@@ -8778,23 +8830,50 @@ impl ProcessManager {
         &self,
         transaction: &LifecycleTransaction,
     ) -> Result<()> {
+        self.create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(transaction)
+            .await
+            .into_result()
+    }
+
+    async fn create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> CatalogPublicationOutcome {
         if let Err(error) = self.lifecycle_journal.create(transaction).await {
             self.lifecycle_recovery_required
                 .store(true, AtomicOrdering::Release);
-            return Err(error.into());
+            return CatalogPublicationOutcome {
+                completion: Err(error.into()),
+                published_domain_index: None,
+            };
         }
         self.lifecycle_recovery_required
             .store(true, AtomicOrdering::Release);
-        self.apply_lifecycle_transaction_locked(transaction).await?;
-        self.lifecycle_recovery_required
-            .store(false, AtomicOrdering::Release);
-        Ok(())
+        let outcome = self
+            .apply_lifecycle_transaction_with_catalog_outcome_locked(transaction)
+            .await;
+        if outcome.completion.is_ok() {
+            self.lifecycle_recovery_required
+                .store(false, AtomicOrdering::Release);
+        }
+        outcome
     }
 
     async fn apply_lifecycle_transaction_locked(
         &self,
         transaction: &LifecycleTransaction,
     ) -> Result<()> {
+        self.apply_lifecycle_transaction_with_catalog_outcome_locked(transaction)
+            .await
+            .into_result()
+    }
+
+    async fn apply_lifecycle_transaction_with_catalog_outcome_locked(
+        &self,
+        transaction: &LifecycleTransaction,
+    ) -> CatalogPublicationOutcome {
+        let mut published_domain_index = None;
+        let completion: Result<()> = async {
         let id = transaction.id();
         let mut phase = transaction.phase();
         self.verify_completed_lifecycle_transaction_phases(transaction)
@@ -8802,12 +8881,15 @@ impl ProcessManager {
 
         if phase == LifecycleTransactionPhase::Prepared {
             if let Some(images) = transaction.catalog() {
-                self.publish_catalog_transition_locked(
-                    images.base().clone(),
-                    images.target().clone(),
-                )
-                .await
-                .with_context(|| {
+                let outcome = self
+                    .publish_catalog_transition_locked(
+                        images.base().clone(),
+                        images.target().clone(),
+                    )
+                    .await;
+                let (catalog_result, published) = outcome.into_parts();
+                published_domain_index = published;
+                catalog_result.with_context(|| {
                     format!("failed to publish lifecycle transaction {id} catalog and domain state")
                 })?;
             }
@@ -8879,6 +8961,12 @@ impl ProcessManager {
             self.lifecycle_journal.clear(id).await?;
         }
         Ok(())
+        }
+        .await;
+        CatalogPublicationOutcome {
+            completion,
+            published_domain_index,
+        }
     }
 
     async fn verify_completed_lifecycle_transaction_phases(
@@ -12998,6 +13086,7 @@ mod tests {
         manager
             .publish_catalog_transition_locked(catalog_base, catalog_target.clone())
             .await
+            .into_result()
             .expect("publish catalog transaction");
 
         assert_eq!(*manager.registry.lock().await, catalog_target);
@@ -13056,6 +13145,7 @@ mod tests {
         let error = manager
             .publish_catalog_transition_locked(catalog_base, catalog_target.clone())
             .await
+            .into_result()
             .expect_err("an in-memory-only target must require startup recovery");
 
         assert!(error.to_string().contains("target only in memory"));
@@ -13077,6 +13167,163 @@ mod tests {
                 .catalog_publication_recovery_required
                 .load(Ordering::Acquire)
         );
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "the config caller must preserve the publication helper's fail-closed routing state"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_config_preserves_fail_closed_routing_after_post_commit_verification_error() {
+        let directory = tempdir().expect("create existing-config verification fixture");
+        let project_path = directory.path().join("project");
+        let (manager, _instance_id, _availability_data_dir) =
+            availability_manager(directory.path(), &project_path, "existing-post-commit").await;
+        write_availability_worker_config(
+            &project_path,
+            "existing-post-commit",
+            "existing-post-commit.localhost",
+            &["web"],
+        );
+        let catalog_path = manager.registry.lock().await.storage_path().to_path_buf();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_catalog_verification_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let apply = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.apply_config(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("existing config commits its catalog target before verification");
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("existing-post-commit.localhost")
+                .is_some(),
+            "the durable verification hook is reached after the ownership commit"
+        );
+        assert!(
+            manager
+                .domain_index()
+                .snapshot()
+                .resolve("existing-post-commit.localhost")
+                .is_some(),
+            "the committed target is live until exact durable verification fails"
+        );
+        tokio::fs::remove_file(&catalog_path)
+            .await
+            .expect("remove committed catalog before exact verification");
+        resume.notify_one();
+        let error = apply
+            .await
+            .expect("existing config task joins")
+            .expect_err("missing committed catalog fails the existing config publication");
+
+        assert!(format!("{error:#}").contains("cannot confirm its committed target"));
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("existing-post-commit.localhost")
+                .is_some(),
+            "the target remains the in-memory catalog authority"
+        );
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "the existing-config caller must preserve fail-closed live routing"
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_registration_preserves_fail_closed_routing_after_post_commit_verification_error()
+     {
+        let directory = tempdir().expect("create initial-registration verification fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create initial-registration project");
+        write_availability_worker_config(
+            &project_path,
+            "initial-post-commit",
+            "initial-post-commit.localhost",
+            &["web"],
+        );
+        let manager = unregistered_availability_manager(directory.path());
+        let catalog_path = manager.registry.lock().await.storage_path().to_path_buf();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_catalog_verification_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let start = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.start(project_path, None, false).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("initial registration commits its catalog target before verification");
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("initial-post-commit.localhost")
+                .is_some(),
+            "the initial-registration hook is reached after the ownership commit"
+        );
+        tokio::fs::remove_file(&catalog_path)
+            .await
+            .expect("remove initial catalog before exact verification");
+        resume.notify_one();
+        let error = start
+            .await
+            .expect("initial registration task joins")
+            .expect_err("missing committed catalog fails initial registration");
+
+        assert!(format!("{error:#}").contains("cannot confirm its committed target"));
+        assert!(
+            manager
+                .catalog_publication_recovery_required
+                .load(Ordering::Acquire)
+        );
+        assert!(manager.lifecycle_recovery_required.load(Ordering::Acquire));
+        assert!(
+            manager
+                .registry
+                .lock()
+                .await
+                .domain_index()
+                .resolve("initial-post-commit.localhost")
+                .is_some(),
+            "the initial target remains the in-memory catalog authority"
+        );
+        assert_eq!(
+            manager.domain_index().snapshot().as_ref(),
+            &DomainIndex::default(),
+            "the initial-registration caller must preserve fail-closed live routing"
+        );
+        assert!(manager.services.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -13132,6 +13379,7 @@ mod tests {
             let error = match manager
                 .publish_catalog_transition_locked(catalog_base, catalog_target.clone())
                 .await
+                .into_result()
             {
                 Ok(()) => panic!("{case}: replay must reject non-exact storage"),
                 Err(error) => error,
@@ -13291,6 +13539,7 @@ mod tests {
         let error = manager
             .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
             .await
+            .into_result()
             .expect_err("candidate hosts must fail");
         assert!(error.to_string().contains("candidate complete hosts"));
         assert_eq!(*manager.registry.lock().await, catalog_base);
@@ -13340,6 +13589,7 @@ mod tests {
         let error = manager
             .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
             .await
+            .into_result()
             .expect_err("malformed phase authority must fail publication");
 
         assert!(error.to_string().contains("applied complete hosts"));
@@ -13392,6 +13642,7 @@ mod tests {
         let error = manager
             .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
             .await
+            .into_result()
             .expect_err("catalog replacement over a directory must fail");
 
         assert!(error.to_string().contains("candidate catalog"));
@@ -13451,6 +13702,7 @@ mod tests {
         let error = manager
             .publish_catalog_transition_locked(catalog_base.clone(), catalog_target)
             .await
+            .into_result()
             .expect_err("candidate and rollback must fail");
         assert!(error.to_string().contains("failed to restore"));
         assert_eq!(*manager.registry.lock().await, catalog_base);
