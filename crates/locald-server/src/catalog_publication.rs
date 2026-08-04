@@ -733,7 +733,7 @@ async fn sync_parent(path: &Path, operation: &'static str) -> Result<(), Catalog
 mod tests {
     use super::{
         CATALOG_PUBLICATION_VERSION, CatalogPublicationError, CatalogPublicationJournal,
-        CatalogPublicationPhase, CatalogPublicationTransaction,
+        CatalogPublicationPhase, CatalogPublicationTransaction, host_set_for_catalog,
     };
     use locald_core::ProjectCatalog;
     use locald_hosts::HostSet;
@@ -749,13 +749,15 @@ mod tests {
         let temporary = tempfile::tempdir().expect("create temporary publication directory");
         let catalog_path = temporary.path().join("catalog.json");
         let catalog = ProjectCatalog::with_path(catalog_path.clone());
+        let catalog_hosts =
+            host_set_for_catalog(&catalog).expect("derive platform-specific catalog host set");
         let journal = CatalogPublicationJournal::for_catalog_path(&catalog_path)
             .expect("locate catalog publication journal");
         let transaction = CatalogPublicationTransaction::new(
             catalog.clone(),
             catalog,
-            &HostSet::default(),
-            &HostSet::default(),
+            &catalog_hosts,
+            &catalog_hosts,
         )
         .expect("build publication transaction");
         (temporary, journal, transaction)
@@ -908,12 +910,14 @@ mod tests {
     fn transaction_rejects_host_sets_that_do_not_match_catalog_images() {
         let temporary = tempfile::tempdir().expect("create temporary publication directory");
         let catalog = ProjectCatalog::with_path(temporary.path().join("catalog.json"));
+        let catalog_hosts =
+            host_set_for_catalog(&catalog).expect("derive platform-specific catalog host set");
         let unrelated_hosts =
             HostSet::try_from_strings(["custom.example"]).expect("construct unrelated host set");
         let error = CatalogPublicationTransaction::new(
             catalog.clone(),
             catalog,
-            &HostSet::default(),
+            &catalog_hosts,
             &unrelated_hosts,
         )
         .expect_err("reject host/catalog mismatch");
