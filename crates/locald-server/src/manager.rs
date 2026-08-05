@@ -1753,6 +1753,23 @@ impl ProcessManager {
         Ok(admissions)
     }
 
+    fn admitted_published_service_projection(
+        registry: &Registry,
+        instance_id: ProjectInstanceId,
+    ) -> Vec<PublishedServiceAdmission> {
+        registry
+            .published_declarations_for_instance(instance_id)
+            .into_iter()
+            .flat_map(|declarations| declarations.values())
+            .map(|declaration| PublishedServiceAdmission {
+                service_name: declaration.service_name.clone(),
+                origin: declaration.origin.clone(),
+                domain_claims: declaration.domain_claims.clone(),
+                health_policy: declaration.health_policy.clone(),
+            })
+            .collect()
+    }
+
     fn relative_service_domain(
         instance_root: &DomainName,
         configured: &str,
@@ -4678,6 +4695,7 @@ impl ProcessManager {
             instance_id,
             removed_service_names,
             published_domain_index,
+            published_service_list_changed,
             mut reusable_service_envs,
             stopped_service_projections,
             mut prepared_generated_files,
@@ -4691,6 +4709,16 @@ impl ProcessManager {
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            let previous_published_projection =
+                Self::admitted_published_service_projection(&catalog_base, instance_id);
+            let previous_display_name = catalog_base
+                .instances
+                .get(&instance_id)
+                .and_then(|record| record.display_name.clone());
+            let candidate_display_name = candidate
+                .instances
+                .get(&instance_id)
+                .and_then(|record| record.display_name.clone());
             if let Some(agent_conversation) = agent_conversation {
                 candidate
                     .bind_agent_conversation(agent_conversation.clone(), instance_id)
@@ -4785,12 +4813,18 @@ impl ProcessManager {
                 None
             };
             let claims = Self::build_domain_claims(instance_id, &config, domain_slug.as_deref())?;
-            let published_admissions = match advertised_https_port {
+            let mut published_admissions = match advertised_https_port {
                 Some(port) => {
                     Self::build_published_service_admissions(instance_id, &config, &claims, port)?
                 }
                 None => Vec::new(),
             };
+            published_admissions.sort_by(|left, right| left.service_name.cmp(&right.service_name));
+            let has_published_projection =
+                !previous_published_projection.is_empty() || !published_admissions.is_empty();
+            let published_service_list_changed = previous_published_projection
+                != published_admissions
+                || (has_published_projection && previous_display_name != candidate_display_name);
             if !preserve_configuration_projection
                 || !candidate.configuration_projection_matches(
                     instance_id,
@@ -4919,6 +4953,7 @@ impl ProcessManager {
                 instance_id,
                 removed_service_names,
                 published_domain_index,
+                published_service_list_changed,
                 reusable_service_envs,
                 stopped_service_projections,
                 prepared_generated_files,
@@ -4973,6 +5008,9 @@ impl ProcessManager {
             }
             for key in &published_stopped_service_names {
                 self.broadcast_service_update(key).await;
+            }
+            if published_service_list_changed {
+                let _ = self.event_sender.send(Event::ServiceListChanged);
             }
             if !removed_service_names.is_empty() {
                 let removed_service_names = removed_service_names.iter().cloned().collect();
@@ -9853,6 +9891,9 @@ impl ProcessManager {
             .iter()
             .filter(|service| service.service_type != locald_core::ipc::ServiceType::Published)
             .collect::<Vec<_>>();
+        let has_published_service = services
+            .iter()
+            .any(|service| service.service_type == locald_core::ipc::ServiceType::Published);
         let unsuppressed = managed_services
             .iter()
             .copied()
@@ -9862,6 +9903,7 @@ impl ProcessManager {
             .iter()
             .any(|service| service.status == ServiceState::Running);
         let runtime_ready = suppressed.is_empty()
+            && (!managed_services.is_empty() || has_published_service)
             && managed_services.iter().all(|service| {
                 service.status == ServiceState::Running
                     && service.health_status == HealthStatus::Healthy
@@ -29925,6 +29967,216 @@ health_check = { type = "http", path = "/ready", interval = 2, timeout = 3 }
     }
 
     #[tokio::test]
+    async fn published_projection_changes_invalidate_the_authoritative_service_list() {
+        let directory = tempdir().expect("create published projection fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published projection project");
+        let config_path = project_path.join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "published-events"
+domain = "published-events.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write initial published projection");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published projection manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit initial published projection");
+
+        let mut events = manager.event_sender.subscribe();
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("reapply unchanged published projection");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "published-events"
+domain = "published-events.localhost"
+"#,
+        )
+        .expect("remove published declaration");
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("publish removal of the declared service");
+
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("service-list invalidation arrives within the test boundary")
+                .expect("receive service-list invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_origin_interpolation_resolves_during_mixed_project_apply() {
+        let directory = tempdir().expect("create published interpolation fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create mixed project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "app"
+domain = "app.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+WORKBENCH_ORIGIN = "${services.workbench.origin}"
+"#,
+        )
+        .expect("write mixed interpolation config");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published interpolation manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        let captured_env = Arc::new(StdMutex::new(None));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: captured_env.clone(),
+                bindings: Arc::new(StdMutex::new(None)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+                fail_prepare: false,
+            }),
+        );
+
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("apply mixed project with a published origin reference");
+
+        let env = captured_env
+            .lock()
+            .expect("read captured environment")
+            .clone()
+            .expect("worker factory received an environment");
+        assert_eq!(
+            env.get("WORKBENCH_ORIGIN").map(String::as_str),
+            Some("https://workbench.app.localhost:4443")
+        );
+        let services = manager.services.lock().await;
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services
+                .keys()
+                .next()
+                .expect("managed worker exists")
+                .name()
+                .as_str(),
+            "worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn desired_project_without_services_reports_failed_after_convergence() {
+        let directory = tempdir().expect("create empty project fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create empty project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "empty-project"
+domain = "empty-project.localhost"
+"#,
+        )
+        .expect("write empty project config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry,
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create empty project manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("register empty project config");
+
+        let error = manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect_err("an empty project cannot become ready");
+        assert!(
+            error.to_string().contains("did not become ready"),
+            "unexpected empty-project ensure error: {error:#}"
+        );
+
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read failed empty-project status");
+        let availability = status
+            .availability
+            .expect("empty project has availability state");
+        assert!(availability.desired);
+        assert_eq!(availability.state, ProjectLifecycleState::Failed);
+        assert!(availability.last_error.is_some());
+        assert!(status.service_details.is_empty());
+    }
+
+    #[tokio::test]
     async fn stop_all_preserves_a_published_only_route() {
         let directory = tempdir().expect("create published-only stop-all fixture");
         let project_path = directory.path().join("project");
@@ -29990,6 +30242,17 @@ domains = ["workbench"]
         assert!(snapshot.desired_up_at(manager.availability_now()));
         assert!(!snapshot.is_paused());
         assert!(manager.services.lock().await.is_empty());
+        let project_status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read published-only project status");
+        assert_eq!(
+            project_status
+                .availability
+                .as_ref()
+                .map(|availability| availability.state),
+            Some(ProjectLifecycleState::Ready)
+        );
         let status = manager
             .list()
             .await

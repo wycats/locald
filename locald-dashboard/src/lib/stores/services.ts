@@ -6,27 +6,66 @@ export const servicesLoading = writable<boolean>(true);
 export const servicesError = writable<string | null>(null);
 
 function createServicesStore() {
-	const { subscribe, set, update } = writable<ServiceStatus[]>([]);
+	const { subscribe, set: replace, update: mutate } = writable<ServiceStatus[]>([]);
+	let stateRevision = 0;
+	let refreshRequested = false;
+	let activeRefresh: Promise<void> | null = null;
+
+	function recordStateChange() {
+		stateRevision += 1;
+		if (activeRefresh) {
+			refreshRequested = true;
+		}
+	}
+
+	async function runRefreshes() {
+		servicesLoading.set(true);
+		servicesError.set(null);
+		try {
+			while (refreshRequested) {
+				refreshRequested = false;
+				const revision = stateRevision;
+				try {
+					const nextServices = await getServices();
+					servicesError.set(null);
+					if (revision === stateRevision) {
+						replace(nextServices);
+					} else {
+						refreshRequested = true;
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : 'Failed to load services.';
+					servicesError.set(message);
+				}
+			}
+		} finally {
+			servicesLoading.set(false);
+			activeRefresh = null;
+		}
+	}
+
+	function refresh() {
+		refreshRequested = true;
+		if (!activeRefresh) {
+			activeRefresh = runRefreshes();
+		}
+		return activeRefresh;
+	}
 
 	return {
 		subscribe,
-		set,
-		update,
-		refresh: async () => {
-			servicesLoading.set(true);
-			servicesError.set(null);
-			try {
-				const services = await getServices();
-				set(services);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : 'Failed to load services.';
-				servicesError.set(message);
-			} finally {
-				servicesLoading.set(false);
-			}
+		set: (nextServices: ServiceStatus[]) => {
+			recordStateChange();
+			replace(nextServices);
 		},
+		update: (updater: (services: ServiceStatus[]) => ServiceStatus[]) => {
+			recordStateChange();
+			mutate(updater);
+		},
+		refresh,
 		updateService: (updatedService: ServiceStatus) => {
-			update((services) => {
+			recordStateChange();
+			mutate((services) => {
 				const identity = serviceIdentity(updatedService);
 				const index = services.findIndex((s) => serviceIdentity(s) === identity);
 				if (index !== -1) {
@@ -42,7 +81,8 @@ function createServicesStore() {
 		handleEvent: (event: { type: string; data: unknown }) => {
 			if (event.type === 'ServiceUpdate') {
 				const updatedService = event.data as ServiceStatus;
-				update((services) => {
+				recordStateChange();
+				mutate((services) => {
 					const identity = serviceIdentity(updatedService);
 					const index = services.findIndex((s) => serviceIdentity(s) === identity);
 					if (index !== -1) {
@@ -62,7 +102,8 @@ function createServicesStore() {
 				});
 			} else if (event.type === 'Metrics') {
 				const metrics = event.data as ServiceMetrics;
-				update((services) => {
+				recordStateChange();
+				mutate((services) => {
 					const identity = serviceIdentity(metrics);
 					const index = services.findIndex((s) => serviceIdentity(s) === identity);
 					if (index !== -1) {

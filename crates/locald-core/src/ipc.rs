@@ -733,6 +733,8 @@ pub enum Event {
     Log(LogEntry),
     /// A service status update.
     ServiceUpdate(Box<ServiceStatus>),
+    /// The authoritative service list changed and should be fetched again.
+    ServiceListChanged,
     /// Service metrics update.
     Metrics(ServiceMetrics),
 }
