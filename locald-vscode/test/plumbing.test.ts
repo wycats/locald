@@ -6,6 +6,7 @@ import {
   parseJsonOutput,
   resolveBinaryIdentityFrom,
   restartCommandArgs,
+  restartProjectCommandArgs,
   StreamingLineTail,
   tailLines,
   type ProjectStatusInfo,
@@ -33,6 +34,15 @@ test("restart service names are separated from CLI options", () => {
     "--json",
     "--",
     "--help",
+  ]);
+});
+
+test("project restart targets the exact editor project", () => {
+  assert.deepEqual(restartProjectCommandArgs("/work/project"), [
+    "project",
+    "restart",
+    "/work/project",
+    "--json",
   ]);
 });
 

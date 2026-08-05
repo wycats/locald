@@ -1877,6 +1877,31 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     }
                 }
             }
+            ProjectCommands::Restart { path, json } => {
+                utils::ensure_daemon_running()?;
+                let project_path = resolve_project_locator(path)?;
+                match client::send_request(&IpcRequest::ProjectRestart { project_path }) {
+                    Ok(IpcResponse::Ok) => {
+                        if *json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&JsonProjectAction {
+                                    status: "restarted".to_owned(),
+                                })?
+                            );
+                        }
+                    }
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(CliError::message(message));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             ProjectCommands::Attach {
                 path,
                 source,

@@ -288,6 +288,16 @@ export function restartCommandArgs(serviceName: string): string[] {
   return ["restart", "--json", "--", serviceName];
 }
 
+export async function restartProject(projectPath: string): Promise<void> {
+  await run(restartProjectCommandArgs(projectPath), {
+    timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
+  });
+}
+
+export function restartProjectCommandArgs(projectPath: string): string[] {
+  return ["project", "restart", projectPath, "--json"];
+}
+
 export async function getLogs(
   projectPath: string,
   lines: number = 100,

@@ -91,9 +91,7 @@ function registerTools(context, controller, resolveProject) {
                 if (managed.length === 0) {
                     throw new Error("this project has no locald-managed services to restart; use each published service's owning workflow");
                 }
-                for (const service of managed) {
-                    await (0, plumbing_js_1.restartService)(projectPath, service.name);
-                }
+                await (0, plumbing_js_1.restartProject)(projectPath);
             }
             const final = await (0, plumbing_js_1.status)(projectPath);
             const urls = final.service_details.flatMap((service) => service.url ? [service.url] : []);

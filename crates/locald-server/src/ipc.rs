@@ -855,6 +855,12 @@ async fn handle_connection(
                 Err(e) => IpcResponse::Error(e.to_string()),
             }
         }
+        IpcRequest::ProjectRestart { project_path } => {
+            match manager.restart_project(&project_path).await {
+                Ok(()) => IpcResponse::Ok,
+                Err(e) => IpcResponse::Error(format!("{e:#}")),
+            }
+        }
         IpcRequest::ProjectList { filter } => match manager.project_list(filter).await {
             Ok(entries) => IpcResponse::ProjectList(entries),
             Err(e) => IpcResponse::Error(e.to_string()),

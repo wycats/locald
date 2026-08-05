@@ -875,6 +875,13 @@
                 "subcommands": []
               },
               {
+                "name": "restart",
+                "aliases": [],
+                "hidden": true,
+                "args": [],
+                "subcommands": []
+              },
+              {
                 "name": "start",
                 "aliases": [],
                 "hidden": false,
@@ -1771,6 +1778,13 @@
                 "subcommands": []
               },
               {
+                "name": "restart",
+                "aliases": [],
+                "hidden": true,
+                "args": [],
+                "subcommands": []
+              },
+              {
                 "name": "start",
                 "aliases": [],
                 "hidden": false,
@@ -1829,6 +1843,46 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "restart",
+            "aliases": [],
+            "hidden": true,
+            "args": [
+              {
+                "long": "help",
+                "short": "h",
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "json",
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": null,
+                "short": null,
+                "aliases": [],
+                "global": false,
+                "hidden": false,
+                "positional": true
               }
             ],
             "subcommands": []

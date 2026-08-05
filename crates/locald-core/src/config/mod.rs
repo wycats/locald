@@ -235,6 +235,7 @@ pub struct ProjectConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
+#[schemars(transform = forbid_legacy_service_discriminator)]
 pub enum ServiceConfig {
     /// A typed service configuration (e.g. Postgres, Worker).
     Typed(TypedServiceConfig),
@@ -359,9 +360,11 @@ pub struct PublishedHealthCheckConfig {
     pub path: String,
     /// Seconds between probes. Defaults to one second.
     #[serde(default = "default_published_health_interval")]
+    #[schemars(range(min = 1, max = 60))]
     pub interval: u64,
     /// Per-request timeout in seconds. Defaults to five seconds.
     #[serde(default = "default_published_health_timeout")]
+    #[schemars(range(min = 1, max = 10))]
     pub timeout: u64,
 }
 
@@ -594,6 +597,27 @@ fn remove_process_runtime_properties(schema: &mut schemars::Schema) {
         properties.remove("listeners");
         properties.remove("generated");
     }
+}
+
+fn forbid_legacy_service_discriminator(schema: &mut schemars::Schema) {
+    let Some(variants) = schema
+        .get_mut("anyOf")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let Some(legacy) = variants.iter_mut().find(|variant| {
+        variant.get("$ref").and_then(serde_json::Value::as_str) == Some("#/$defs/ExecServiceConfig")
+    }) else {
+        return;
+    };
+    let Some(legacy) = legacy.as_object_mut() else {
+        return;
+    };
+    legacy.insert(
+        "not".to_owned(),
+        serde_json::json!({ "required": ["type"] }),
+    );
 }
 
 /// Configuration for service health checks.
@@ -1069,6 +1093,39 @@ source = "chat/microfrontends.jsonc"
         let schema =
             serde_json::to_value(schemars::schema_for!(LocaldConfig)).expect("serialize schema");
 
+        let service_variants = schema
+            .pointer("/$defs/ServiceConfig/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("service config variants");
+        let legacy = service_variants
+            .iter()
+            .find(|variant| {
+                variant.pointer("/$ref")
+                    == Some(&serde_json::Value::String(
+                        "#/$defs/ExecServiceConfig".to_owned(),
+                    ))
+            })
+            .expect("legacy exec service schema variant");
+        assert_eq!(
+            legacy.pointer("/not/required"),
+            Some(&serde_json::json!(["type"]))
+        );
+
+        let typed_kinds = schema
+            .pointer("/$defs/TypedServiceConfig/oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("typed service variants")
+            .iter()
+            .filter_map(|variant| variant.pointer("/properties/type/const"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for supported in ["exec", "published"] {
+            assert!(
+                typed_kinds.contains(&serde_json::Value::String(supported.to_owned())),
+                "typed service schema should include {supported}"
+            );
+        }
+
         for supported in ["ExecServiceConfig", "WorkerServiceConfig"] {
             for property in ["listeners", "generated"] {
                 assert!(
@@ -1130,6 +1187,22 @@ source = "chat/microfrontends.jsonc"
         assert_eq!(
             published_health.pointer("/required"),
             Some(&serde_json::json!(["type"]))
+        );
+        assert_eq!(
+            published_health.pointer("/properties/interval/minimum"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            published_health.pointer("/properties/interval/maximum"),
+            Some(&serde_json::json!(60))
+        );
+        assert_eq!(
+            published_health.pointer("/properties/timeout/minimum"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            published_health.pointer("/properties/timeout/maximum"),
+            Some(&serde_json::json!(10))
         );
     }
 

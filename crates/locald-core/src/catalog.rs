@@ -1072,6 +1072,39 @@ impl ProjectCatalog {
         published: impl IntoIterator<Item = PublishedServiceAdmission>,
     ) -> Result<u64, CatalogError> {
         let revision = self.next_configuration_revision(instance_id)?;
+        let candidate =
+            self.configuration_projection_candidate(instance_id, revision, claims, published)?;
+        *self = candidate;
+        Ok(revision)
+    }
+
+    /// Determine whether an already-admitted configuration projection exactly
+    /// matches the supplied domains and published declarations without
+    /// advancing its generation.
+    pub fn configuration_projection_matches(
+        &self,
+        instance_id: ProjectInstanceId,
+        claims: impl IntoIterator<Item = DomainClaim>,
+        published: impl IntoIterator<Item = PublishedServiceAdmission>,
+    ) -> Result<bool, CatalogError> {
+        let revision = self.configuration_revision(instance_id).ok_or_else(|| {
+            CatalogError::Invariant(format!(
+                "configuration projection references missing project instance {instance_id}"
+            ))
+        })?;
+        Ok(
+            self.configuration_projection_candidate(instance_id, revision, claims, published)?
+                == *self,
+        )
+    }
+
+    fn configuration_projection_candidate(
+        &self,
+        instance_id: ProjectInstanceId,
+        revision: u64,
+        claims: impl IntoIterator<Item = DomainClaim>,
+        published: impl IntoIterator<Item = PublishedServiceAdmission>,
+    ) -> Result<Self, CatalogError> {
         let replacement_domain_index = self.domain_index.replacing_instance(instance_id, claims)?;
         let domains = replacement_domain_index.domains_for_instance(instance_id);
 
@@ -1113,8 +1146,7 @@ impl ProjectCatalog {
                 .insert(instance_id, replacement_declarations);
         }
         candidate.validate()?;
-        *self = candidate;
-        Ok(revision)
+        Ok(candidate)
     }
 
     /// Fail closed when durable sandbox origins do not match the listener this
@@ -3489,6 +3521,21 @@ mod tests {
             catalog.published_declaration_by_key(&ServiceKey::new(instance_id, "workbench")),
             Some(declaration)
         );
+        let (same_claims, same_admission) =
+            published_admission(instance_id, "workbench.app.localhost");
+        assert!(
+            catalog
+                .configuration_projection_matches(instance_id, same_claims, [same_admission])
+                .expect("compare unchanged published projection")
+        );
+        let (changed_claims, changed_admission) =
+            published_admission(instance_id, "other.app.localhost");
+        assert!(
+            !catalog
+                .configuration_projection_matches(instance_id, changed_claims, [changed_admission],)
+                .expect("compare changed published projection")
+        );
+        assert_eq!(catalog.configuration_revision(instance_id), Some(revision));
 
         catalog.save().await.expect("persist published catalog");
         let reopened = ProjectCatalog::load_from_paths(paths)

@@ -5,7 +5,7 @@ import {
   formatBinaryIdentity,
   releaseEditorProject,
   renewEditorProject,
-  restartService,
+  restartProject,
   status,
   stopProject,
 } from "./plumbing.js";
@@ -210,9 +210,7 @@ function registerCommands(
             "this project has no locald-managed services to restart; use each published service's owning workflow",
           );
         }
-        for (const service of managed) {
-          await restartService(projectPath, service.name);
-        }
+        await restartProject(projectPath);
         const final = await status(projectPath);
         const published = final.service_details.filter(
           (service) => service.service_type === "published",

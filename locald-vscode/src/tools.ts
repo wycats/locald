@@ -1,6 +1,11 @@
 import * as vscode from "vscode";
 import type { EditorAvailabilityController } from "./editor-controller.js";
-import { getLogs, restartService, status } from "./plumbing.js";
+import {
+  getLogs,
+  restartProject,
+  restartService,
+  status,
+} from "./plumbing.js";
 import { log } from "./extension.js";
 import {
   defaultServiceWithOrigin,
@@ -97,9 +102,7 @@ export function registerTools(
               "this project has no locald-managed services to restart; use each published service's owning workflow",
             );
           }
-          for (const service of managed) {
-            await restartService(projectPath, service.name);
-          }
+          await restartProject(projectPath);
         }
         const final = await status(projectPath);
         const urls = final.service_details.flatMap((service) =>

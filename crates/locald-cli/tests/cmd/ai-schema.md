@@ -510,7 +510,8 @@ $ locald ai schema
           "type": "integer",
           "format": "uint64",
           "default": 1,
-          "minimum": 0
+          "maximum": 60,
+          "minimum": 1
         },
         "path": {
           "description": "Origin-relative path requested by locald. Defaults to `/`.",
@@ -522,7 +523,8 @@ $ locald ai schema
           "type": "integer",
           "format": "uint64",
           "default": 5,
-          "minimum": 0
+          "maximum": 10,
+          "minimum": 1
         },
         "type": {
           "description": "The probe protocol. Version 1 accepts only HTTP.",
@@ -553,7 +555,12 @@ $ locald ai schema
         },
         {
           "description": "A legacy or simple exec service configuration.",
-          "$ref": "#/$defs/ExecServiceConfig"
+          "$ref": "#/$defs/ExecServiceConfig",
+          "not": {
+            "required": [
+              "type"
+            ]
+          }
         }
       ]
     },

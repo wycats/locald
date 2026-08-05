@@ -521,6 +521,14 @@ pub enum IpcRequest {
         /// The path to the project to inspect.
         project_path: PathBuf,
     },
+    /// Stop every locald-managed service in one project, then start them in
+    /// declared dependency order. Externally published services remain untouched.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    ProjectRestart {
+        /// The path to the project to restart.
+        project_path: PathBuf,
+    },
     /// List known projects with attachment state.
     ///
     /// **Response:** `IpcResponse::ProjectList(Vec<ProjectListEntry>)`
@@ -935,6 +943,19 @@ mod tests {
                 serde_json::from_value(encoded).expect("deserialize editor request");
             assert_eq!(decoded, request);
         }
+    }
+
+    #[test]
+    fn project_restart_round_trips_its_exact_locator() {
+        let request = IpcRequest::ProjectRestart {
+            project_path: PathBuf::from("/work/project"),
+        };
+
+        let encoded = serde_json::to_value(&request).expect("serialize project restart");
+        let decoded: IpcRequest =
+            serde_json::from_value(encoded).expect("deserialize project restart");
+
+        assert_eq!(decoded, request);
     }
 
     #[test]
