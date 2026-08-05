@@ -287,6 +287,11 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     // own dashboard and docs through the same managed-domain workflow.
     let resolution = state.resolver.resolve_service_by_domain(&host).await;
     if let Some(resolution) = resolution {
+        if let DomainResolution::PublishedUnavailable { publication, .. } = &resolution {
+            if let Some(response) = published_alias_redirect(req.uri(), &host, publication) {
+                return response;
+            }
+        }
         if domain_resolution_supports_resume(&resolution) && is_resume_api_request(&req) {
             return route_locald_api(&state, req).await;
         }
@@ -600,6 +605,24 @@ fn error_response(status: StatusCode, message: impl std::fmt::Display) -> Respon
         html,
     )
         .into_response()
+}
+
+fn published_alias_redirect(
+    request_uri: &Uri,
+    requested_host: &str,
+    publication: &PublicationStatus,
+) -> Option<Response> {
+    let canonical_origin = publication.origin.parse::<Uri>().ok()?;
+    let canonical_host = canonical_origin.host()?;
+    if canonical_host.eq_ignore_ascii_case(requested_host) {
+        return None;
+    }
+
+    let path_and_query = request_uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    let location = format!("{}{path_and_query}", publication.origin);
+    Some(axum::response::Redirect::temporary(&location).into_response())
 }
 
 fn published_service_response(

@@ -29919,7 +29919,7 @@ domain = "published-app.localhost"
 
 [services.workbench]
 type = "published"
-domains = ["workbench"]
+domains = ["workbench", "alias", "*.preview"]
 health_check = { type = "http", path = "/ready", interval = 2, timeout = 3 }
 "#,
         )
@@ -30023,20 +30023,27 @@ health_check = { type = "http", path = "/ready", interval = 2, timeout = 3 }
             .expect_err("global selector must not cross managed and published namespaces");
         assert!(ambiguity.to_string().contains("ambiguous"));
 
-        let resolution = manager
-            .resolve_service_by_domain("workbench.published-app.localhost")
-            .await
-            .expect("resolve durable published origin");
-        assert!(matches!(
-            resolution,
-            locald_core::resolver::DomainResolution::PublishedUnavailable {
-                publication: PublicationStatus {
-                    state: PublicationState::WaitingForPublisher,
-                    ..
-                },
-                ..
-            }
-        ));
+        for domain in [
+            "workbench.published-app.localhost",
+            "alias.published-app.localhost",
+            "tenant.preview.published-app.localhost",
+        ] {
+            let resolution = manager
+                .resolve_service_by_domain(domain)
+                .await
+                .expect("resolve published domain claim");
+            let locald_core::resolver::DomainResolution::PublishedUnavailable {
+                publication, ..
+            } = resolution
+            else {
+                panic!("published domain must preserve unavailable identity: {domain}");
+            };
+            assert_eq!(publication.state, PublicationState::WaitingForPublisher);
+            assert_eq!(
+                publication.origin,
+                "https://workbench.published-app.localhost:4443"
+            );
+        }
     }
 
     #[tokio::test]

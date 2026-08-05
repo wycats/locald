@@ -195,12 +195,99 @@ async fn published_domain_waiting_for_a_publisher_preserves_identity_without_res
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key(hyper::header::LOCATION));
     let body = response_body(response).await;
     assert!(body.contains("Published service is Waiting for publisher"));
     assert!(body.contains("The owning workflow has not published an endpoint yet."));
     assert!(body.contains("https://workbench.app.localhost"));
     assert!(!body.contains("Resume project"));
     assert!(!body.contains("/api/projects/resume-domain"));
+}
+
+#[tokio::test]
+async fn published_aliases_redirect_to_the_canonical_origin_with_path_and_query() {
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::WaitingForPublisher,
+        }),
+        Router::new(),
+        None,
+    )
+    .make_app();
+
+    for host in ["alias.app.localhost", "tenant.preview.app.localhost"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session%2Ftoken?mode=demo%20value")
+                    .header("Host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{host}");
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://workbench.app.localhost/api/session%2Ftoken?mode=demo%20value"),
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn paused_published_alias_redirects_before_the_resume_api_is_selected() {
+    let api = Router::new().route(
+        "/projects/resume-domain",
+        post(|| async { StatusCode::NO_CONTENT }),
+    );
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::RoutePaused,
+        }),
+        api,
+        None,
+    )
+    .make_app();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(hyper::Method::POST)
+                .uri("/api/projects/resume-domain?source=alias")
+                .header("Host", "alias.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("https://workbench.app.localhost/api/projects/resume-domain?source=alias")
+    );
+
+    let canonical_response = app
+        .oneshot(
+            Request::builder()
+                .method(hyper::Method::POST)
+                .uri("/api/projects/resume-domain")
+                .header("Host", "workbench.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(canonical_response.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
