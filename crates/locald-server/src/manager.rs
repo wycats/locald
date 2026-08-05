@@ -2307,6 +2307,27 @@ impl ProcessManager {
         }
     }
 
+    async fn broadcast_published_service_projection_if_pause_changed(
+        &self,
+        instance_id: ProjectInstanceId,
+        was_paused: bool,
+        is_paused: bool,
+    ) -> bool {
+        if was_paused == is_paused {
+            return false;
+        }
+        let has_published_declarations = self
+            .registry
+            .lock()
+            .await
+            .published_declarations_for_instance(instance_id)
+            .is_some_and(|declarations| !declarations.is_empty());
+        if has_published_declarations {
+            let _ = self.event_sender.send(Event::ServiceListChanged);
+        }
+        has_published_declarations
+    }
+
     fn clear_log_buffer(&self, key: &ServiceKey) {
         #[allow(clippy::expect_used)]
         self.log_buffers
@@ -8600,8 +8621,15 @@ impl ProcessManager {
             batch.push(AvailabilityBatchOperation::EnsureDemand(demand));
             let durability_error = if target.catalog_base == target.catalog_target {
                 let mut availability = self.load_availability(instance_id).await?;
+                let was_paused = availability.snapshot().await?.is_paused();
                 let (_, durability_error) =
                     Self::capture_availability_publication(availability.apply_batch(&batch).await)?;
+                self.broadcast_published_service_projection_if_pause_changed(
+                    instance_id,
+                    was_paused,
+                    false,
+                )
+                .await;
                 durability_error
             } else {
                 // Discovery reactivates a catalogued instance in the target
@@ -8959,8 +8987,15 @@ impl ProcessManager {
                 "project instance {instance_id} is no longer active"
             );
             let mut availability = self.load_availability(instance_id).await?;
+            let was_paused = availability.snapshot().await?.is_paused();
             let (result, durability_error) =
                 Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
+            self.broadcast_published_service_projection_if_pause_changed(
+                instance_id,
+                was_paused,
+                false,
+            )
+            .await;
             drop(publication_guard);
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
@@ -9032,8 +9067,15 @@ impl ProcessManager {
                 "project instance {instance_id} is no longer active"
             );
             let mut availability = self.load_availability(instance_id).await?;
+            let was_paused = availability.snapshot().await?.is_paused();
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.pause_project().await)?;
+            self.broadcast_published_service_projection_if_pause_changed(
+                instance_id,
+                was_paused,
+                true,
+            )
+            .await;
             drop(publication_guard);
             let convergence = self
                 .converge_managed_instance(instance_id, None, false, false)
@@ -9445,11 +9487,35 @@ impl ProcessManager {
         }
 
         if phase == LifecycleTransactionPhase::CatalogPublished {
+            let mut published_projection_changed = false;
             for prepared in transaction.availability() {
+                let was_paused = prepared
+                    .expected()
+                    .availability()
+                    .is_some_and(ProjectAvailability::is_paused);
+                let is_paused = prepared
+                    .target()
+                    .availability()
+                    .is_some_and(ProjectAvailability::is_paused);
                 let mut availability = self
                     .load_availability(prepared.project_instance_id())
                     .await?;
-                availability.apply_prepared_batch(prepared).await?;
+                let publication = availability.apply_prepared_batch(prepared).await;
+                let authoritative = publication.is_ok()
+                    || matches!(
+                        &publication,
+                        Err(AvailabilityError::PublishedNotDurable { .. })
+                    );
+                if authoritative && !published_projection_changed {
+                    published_projection_changed = self
+                        .broadcast_published_service_projection_if_pause_changed(
+                            prepared.project_instance_id(),
+                            was_paused,
+                            is_paused,
+                        )
+                        .await;
+                }
+                publication?;
             }
             self.lifecycle_journal
                 .advance(
@@ -10922,11 +10988,18 @@ impl ProcessManager {
             "project instance {instance_id} is no longer active"
         );
         let mut availability = self.load_availability(instance_id).await?;
+        let was_paused = availability.snapshot().await?.is_paused();
         let (_, durability_error) = Self::capture_availability_publication(
             availability
                 .ensure_demand(DemandKey::stopped_page_resume())
                 .await,
         )?;
+        self.broadcast_published_service_projection_if_pause_changed(
+            instance_id,
+            was_paused,
+            false,
+        )
+        .await;
         Ok(durability_error)
     }
 
@@ -30040,6 +30113,165 @@ domain = "published-events.localhost"
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_only_pause_and_resume_invalidate_service_projection() {
+        let directory = tempdir().expect("create published lifecycle fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published lifecycle project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "published-lifecycle"
+domain = "published-lifecycle.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write published lifecycle config");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published lifecycle manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit published lifecycle declaration");
+        let demand = DemandKey::manual_cli();
+        manager
+            .project_ensure_availability(&project_path, demand.clone())
+            .await
+            .expect("establish initial published availability");
+
+        let mut events = manager.event_sender.subscribe();
+        assert!(
+            manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("pause published route")
+        );
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("pause invalidation arrives within the test boundary")
+                .expect("receive pause invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let paused = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|status| status.name == "published-lifecycle:workbench")
+            .expect("paused published status remains visible");
+        assert_eq!(
+            paused
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::RoutePaused)
+        );
+
+        assert!(
+            !manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("repeating pause is a no-op")
+        );
+        assert!(
+            manager
+                .project_renew_availability(&project_path, &demand)
+                .await
+                .expect("passively renew the suppressed demand")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        manager
+            .project_ensure_availability(&project_path, demand.clone())
+            .await
+            .expect("semantic activity resumes the published route");
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("resume invalidation arrives within the test boundary")
+                .expect("receive resume invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let resumed = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|status| status.name == "published-lifecycle:workbench")
+            .expect("resumed published status remains visible");
+        assert_eq!(
+            resumed
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::WaitingForPublisher)
+        );
+
+        manager
+            .project_ensure_availability(&project_path, demand)
+            .await
+            .expect("a live semantic demand renews without a projection change");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        assert!(
+            manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("pause the published route before enabling Always On")
+        );
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("second pause invalidation arrives within the test boundary")
+                .expect("receive second pause invalidation"),
+            Event::ServiceListChanged
+        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("Always On resumes a paused published route transactionally");
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("Always On invalidation arrives within the test boundary")
+                .expect("receive Always On invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
