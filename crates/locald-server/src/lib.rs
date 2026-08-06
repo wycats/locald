@@ -106,6 +106,7 @@ pub mod port_allocator;
 // pub mod notify; // Moved to locald-utils
 #[doc(hidden)]
 pub mod proxy;
+mod publication;
 #[doc(hidden)]
 pub mod runtime;
 #[doc(hidden)]
