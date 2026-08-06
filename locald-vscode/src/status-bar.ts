@@ -5,6 +5,12 @@ import {
   type ProjectStatusInfo,
   type ServiceStatus,
 } from "./plumbing.js";
+import {
+  managedServiceHealthSummary,
+  serviceDisplayOrigin,
+  serviceTooltipLines,
+  servicesWithStableOrigins,
+} from "./service-presentation.js";
 
 const POLL_INTERVAL = 5_000;
 
@@ -107,26 +113,30 @@ export class StatusBar implements vscode.Disposable {
   private updateDashboard(info: ProjectStatusInfo): void {
     const name = info.project_name ?? "locald";
     const services = info.service_details ?? [];
-    const total = services.length || info.services.length;
-    const healthy = services.filter(
-      (s) => s.health_status === "Healthy",
-    ).length;
+    const summary = managedServiceHealthSummary(services);
+    const total = services.length === 0 ? info.services.length : summary.total;
+    const healthy = summary.healthy;
+    const published = summary.published;
 
-    if (total === 0) {
+    if (total === 0 && published === 0) {
       this.dashboardItem.text = `$(server) ${name}`;
       this.dashboardItem.tooltip = this.withBinaryInfo(`${name} — no services`);
+    } else if (total === 0) {
+      this.dashboardItem.text = `$(server) ${name} · ${published} published`;
+      this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
     } else if (healthy === total) {
-      this.dashboardItem.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
+      const publishedSuffix = published > 0 ? ` · ${published} published` : "";
+      this.dashboardItem.text = `$(server) ${name} · ${total} managed${publishedSuffix}`;
       this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
     } else {
-      this.dashboardItem.text = `$(warning) ${name} · ${healthy}/${total}`;
+      this.dashboardItem.text = `$(warning) ${name} · ${healthy}/${total} managed`;
       this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
     }
   }
 
   private updateWebItem(info: ProjectStatusInfo): void {
     const services = info.service_details ?? [];
-    this.webServices = services.filter((s) => s.url && s.status === "running");
+    this.webServices = servicesWithStableOrigins(services);
 
     if (this.webServices.length === 0) {
       this.webItem.hide();
@@ -137,7 +147,7 @@ export class StatusBar implements vscode.Disposable {
       const svc = this.webServices[0];
       const label = svc.name.split(":").pop() ?? svc.name;
       this.webItem.text = `$(globe) ${label}`;
-      this.webItem.tooltip = svc.domain ?? svc.url ?? label;
+      this.webItem.tooltip = serviceDisplayOrigin(svc) ?? label;
     } else {
       // Multiple web services — show count, click for picker
       this.webItem.text = `$(globe) ${this.webServices.length} sites`;
@@ -163,9 +173,7 @@ export class StatusBar implements vscode.Disposable {
     }
     lines.push("");
     for (const s of services) {
-      const icon = s.status === "running" ? "●" : "○";
-      const url = s.domain ? `  ${s.domain}` : "";
-      lines.push(`${icon} ${s.name}${url}`);
+      lines.push(...serviceTooltipLines(s));
     }
     if (services.length === 0) {
       for (const n of info.services) {

@@ -6,8 +6,10 @@ import {
   parseJsonOutput,
   resolveBinaryIdentityFrom,
   restartCommandArgs,
+  restartProjectCommandArgs,
   StreamingLineTail,
   tailLines,
+  type ProjectStatusInfo,
 } from "../src/plumbing.js";
 
 test("log service names are separated from CLI options", () => {
@@ -35,6 +37,15 @@ test("restart service names are separated from CLI options", () => {
   ]);
 });
 
+test("project restart targets the exact editor project", () => {
+  assert.deepEqual(restartProjectCommandArgs("/work/project"), [
+    "project",
+    "restart",
+    "/work/project",
+    "--json",
+  ]);
+});
+
 test("tailLines keeps the requested final complete lines", () => {
   assert.equal(tailLines("one\ntwo\nthree\n", 2), "two\nthree\n");
   assert.equal(tailLines("one\ntwo\nthree", 2), "two\nthree");
@@ -55,6 +66,40 @@ test("parseJsonOutput accepts machine-clean JSON and legacy startup prefixes", (
       'Starting locald server...\n{\n  "ready": true\n}\n',
     ),
     { ready: true },
+  );
+});
+
+test("parseJsonOutput preserves published service state for editor consumers", () => {
+  const info = parseJsonOutput<ProjectStatusInfo>(
+    JSON.stringify({
+      project_path: "/work/project",
+      project_name: "example",
+      services: ["example:workbench"],
+      service_details: [
+        {
+          name: "example:workbench",
+          url: "https://workbench.example.localhost",
+          port: null,
+          status: "externally_managed",
+          health_status: "Unknown",
+          domain: "workbench.example.localhost",
+          service_type: "published",
+          publication: {
+            state: "waiting_for_publisher",
+            origin: "https://workbench.example.localhost",
+            explanation: "Waiting for an external owner.",
+            next_step: "Start it through the owning workflow.",
+          },
+        },
+      ],
+      attachments: [],
+      is_running: false,
+    }),
+  );
+
+  assert.equal(
+    info.service_details[0]?.publication?.state,
+    "waiting_for_publisher",
   );
 });
 

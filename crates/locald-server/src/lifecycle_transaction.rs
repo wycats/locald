@@ -25,6 +25,7 @@ const JOURNAL_FILE: &str = "lifecycle-transaction.json";
 const MIGRATION_MARKER_FILE: &str = "v1-migration-complete.json";
 const V1_BACKUP_DIRECTORY: &str = "v1-backups";
 const FIRST_CATALOG_VERSION_REQUIRING_AGENT_BINDINGS: u64 = 4;
+const OLDEST_REPLAYABLE_CATALOG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +78,7 @@ impl LifecycleTransactionPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogTransactionImages {
+    catalog_source_version: u32,
     storage_path: PathBuf,
     base: ProjectCatalog,
     target: ProjectCatalog,
@@ -98,10 +100,21 @@ impl CatalogTransactionImages {
         }
         let storage_path = base.storage_path().to_path_buf();
         Ok(Self {
+            catalog_source_version: CATALOG_VERSION,
             storage_path,
             base,
             target,
         })
+    }
+
+    pub(crate) fn new_from_catalog_source(
+        base: ProjectCatalog,
+        target: ProjectCatalog,
+        catalog_source_version: u32,
+    ) -> Result<Self, LifecycleJournalError> {
+        let mut images = Self::new(base, target)?;
+        images.catalog_source_version = catalog_source_version;
+        Ok(images)
     }
 
     #[must_use]
@@ -118,6 +131,16 @@ impl CatalogTransactionImages {
     #[must_use]
     pub(crate) const fn target(&self) -> &ProjectCatalog {
         &self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn source_requires_v5_backup(&self) -> bool {
+        self.catalog_source_version == CATALOG_VERSION - 1
+    }
+
+    #[must_use]
+    pub(crate) const fn catalog_source_version(&self) -> u32 {
+        self.catalog_source_version
     }
 
     pub(crate) fn normalize_storage_path(&mut self, storage_path: &Path) {
@@ -260,6 +283,16 @@ impl LifecycleTransaction {
             });
         }
         if let Some(catalog) = &self.catalog {
+            if !(u64::from(OLDEST_REPLAYABLE_CATALOG_VERSION)..=u64::from(CATALOG_VERSION))
+                .contains(&u64::from(catalog.catalog_source_version))
+            {
+                return Err(LifecycleJournalError::InvalidPlan {
+                    reason: format!(
+                        "catalog source version {} cannot be replayed by schema version {CATALOG_VERSION}",
+                        catalog.catalog_source_version
+                    ),
+                });
+            }
             if catalog.base.storage_path() != catalog.storage_path
                 || catalog.target.storage_path() != catalog.storage_path
             {
@@ -280,6 +313,23 @@ impl LifecycleTransaction {
                 .map_err(|error| LifecycleJournalError::InvalidPlan {
                     reason: format!("invalid catalog target: {error}"),
                 })?;
+            if catalog.catalog_source_version < CATALOG_VERSION {
+                for (name, image) in [("base", &catalog.base), ("target", &catalog.target)] {
+                    if image.published_declarations().next().is_some()
+                        || image.retired_configuration_revisions().next().is_some()
+                        || image
+                            .instances
+                            .values()
+                            .any(|instance| instance.configuration_revision != 0)
+                    {
+                        return Err(LifecycleJournalError::InvalidPlan {
+                            reason: format!(
+                                "predecessor-authored catalog {name} contains version-{CATALOG_VERSION} declaration state"
+                            ),
+                        });
+                    }
+                }
+            }
         }
         let mut availability_instances = BTreeSet::new();
         for batch in &self.availability {
@@ -619,9 +669,16 @@ impl LifecycleJournal {
             "lifecycle transaction",
         )
         .await?;
-        let Some(value) = value else {
+        let Some(mut value) = value else {
             return Ok(None);
         };
+        normalize_embedded_catalog_source_version(&mut value).map_err(|reason| {
+            LifecycleJournalError::InvalidData {
+                entity: "lifecycle transaction",
+                path: self.journal_path.clone(),
+                reason,
+            }
+        })?;
         validate_embedded_catalog_agent_bindings(&value).map_err(|reason| {
             LifecycleJournalError::InvalidData {
                 entity: "lifecycle transaction",
@@ -1139,6 +1196,62 @@ async fn read_versioned_value(
     Ok(Some(value))
 }
 
+fn normalize_embedded_catalog_source_version(value: &mut serde_json::Value) -> Result<(), String> {
+    let Some(catalog) = value
+        .get_mut("catalog")
+        .filter(|catalog| !catalog.is_null())
+    else {
+        return Ok(());
+    };
+    let catalog = catalog
+        .as_object_mut()
+        .ok_or_else(|| "embedded catalog transaction must be an object".to_owned())?;
+    let raw_version = |image_name: &str| -> Result<u64, String> {
+        catalog
+            .get(image_name)
+            .and_then(|image| image.get("version"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                format!("embedded catalog {image_name} is missing unsigned integer `version`")
+            })
+    };
+    let base_version = raw_version("base")?;
+    let target_version = raw_version("target")?;
+    let source_version = match catalog.get("catalog_source_version") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            "embedded catalog `catalog_source_version` must be an unsigned integer".to_owned()
+        })?,
+        None if base_version == target_version => {
+            catalog.insert(
+                "catalog_source_version".to_owned(),
+                serde_json::Value::from(base_version),
+            );
+            base_version
+        }
+        None => {
+            return Err(format!(
+                "embedded catalog omits `catalog_source_version`, but base schema {base_version} does not match target schema {target_version}"
+            ));
+        }
+    };
+    if base_version != target_version {
+        return Err(format!(
+            "embedded catalog base schema {base_version} does not match target schema {target_version}"
+        ));
+    }
+    if base_version != source_version && base_version != u64::from(CATALOG_VERSION) {
+        return Err(format!(
+            "embedded catalog source schema {source_version} cannot own normalized image schema {base_version}; expected {source_version} or {CATALOG_VERSION}"
+        ));
+    }
+    if source_version > u64::from(u32::MAX) {
+        return Err(format!(
+            "embedded catalog source schema {source_version} exceeds the supported integer range"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_embedded_catalog_agent_bindings(value: &serde_json::Value) -> Result<(), String> {
     let Some(catalog) = value.get("catalog").filter(|catalog| !catalog.is_null()) else {
         return Ok(());
@@ -1157,6 +1270,51 @@ fn validate_embedded_catalog_agent_bindings(value: &serde_json::Value) -> Result
             return Err(format!(
                 "embedded catalog {image_name} at schema version {version} is missing `agent_bindings`"
             ));
+        }
+        if (u64::from(OLDEST_REPLAYABLE_CATALOG_VERSION)..u64::from(CATALOG_VERSION))
+            .contains(&version)
+            && (image.get("published_services").is_some()
+                || image.get("retired_configuration_revisions").is_some()
+                || image
+                    .get("instances")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|instances| {
+                        instances
+                            .values()
+                            .any(|record| record.get("configuration_revision").is_some())
+                    }))
+        {
+            return Err(format!(
+                "embedded predecessor catalog {image_name} at schema version {version} contains version-{CATALOG_VERSION} published-declaration fields"
+            ));
+        }
+        if version == u64::from(CATALOG_VERSION) {
+            if image.get("published_services").is_none() {
+                return Err(format!(
+                    "embedded catalog {image_name} at schema version {version} is missing `published_services`"
+                ));
+            }
+            if image.get("retired_configuration_revisions").is_none() {
+                return Err(format!(
+                    "embedded catalog {image_name} at schema version {version} is missing `retired_configuration_revisions`"
+                ));
+            }
+            let instances = image
+                .get("instances")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    format!("embedded catalog {image_name} is missing object `instances`")
+                })?;
+            if let Some(instance_id) = instances.iter().find_map(|(instance_id, record)| {
+                record
+                    .get("configuration_revision")
+                    .is_none()
+                    .then_some(instance_id)
+            }) {
+                return Err(format!(
+                    "embedded catalog {image_name} instance `{instance_id}` is missing `configuration_revision`"
+                ));
+            }
         }
     }
     Ok(())
@@ -1313,7 +1471,7 @@ mod tests {
         JournalClearDisposition, JournalCreateDisposition, LegacyV1File, LifecycleJournal,
         LifecycleJournalError, LifecycleRecoveryPreflight, LifecycleTransaction,
         LifecycleTransactionKind, LifecycleTransactionPhase, MigrationMarkerDisposition,
-        V1BackupDisposition, finish_create_once_publication,
+        OLDEST_REPLAYABLE_CATALOG_VERSION, V1BackupDisposition, finish_create_once_publication,
     };
     use locald_core::attachments::{Attachment, AttachmentSource, AttachmentStoreSnapshot};
     use locald_core::catalog::CATALOG_VERSION;
@@ -1666,6 +1824,10 @@ mod tests {
         let fixture = Fixture::new();
         let transaction = fixture.transaction();
         let mut value = serde_json::to_value(&transaction).expect("serialize lifecycle journal");
+        value["catalog"]
+            .as_object_mut()
+            .expect("embedded catalog transaction")
+            .remove("catalog_source_version");
         for image in ["base", "target"] {
             let catalog = value
                 .get_mut("catalog")
@@ -1678,6 +1840,18 @@ mod tests {
                 serde_json::Value::from(FIRST_CATALOG_VERSION_REQUIRING_AGENT_BINDINGS - 1),
             );
             catalog.remove("agent_bindings");
+            catalog.remove("published_services");
+            catalog.remove("retired_configuration_revisions");
+            for instance in catalog["instances"]
+                .as_object_mut()
+                .expect("embedded catalog instances")
+                .values_mut()
+            {
+                instance
+                    .as_object_mut()
+                    .expect("embedded catalog instance")
+                    .remove("configuration_revision");
+            }
         }
         tokio::fs::write(
             fixture.journal.journal_path(),
@@ -1697,6 +1871,170 @@ mod tests {
             let catalog = &loaded["catalog"][image];
             assert_eq!(catalog["version"], serde_json::Value::from(CATALOG_VERSION));
             assert_eq!(catalog["agent_bindings"], serde_json::json!({}));
+            assert_eq!(catalog["published_services"], serde_json::json!({}));
+        }
+    }
+
+    #[tokio::test]
+    async fn v5_catalog_provenance_survives_normalization_and_journal_advance() {
+        let fixture = Fixture::new();
+        let transaction = fixture.transaction();
+        let transaction_id = transaction.id();
+        let mut value = serde_json::to_value(transaction).expect("serialize lifecycle journal");
+        let catalog = value["catalog"]
+            .as_object_mut()
+            .expect("embedded catalog transaction");
+        catalog.remove("catalog_source_version");
+        for image_name in ["base", "target"] {
+            let image = catalog
+                .get_mut(image_name)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("embedded catalog image");
+            image.insert(
+                "version".to_owned(),
+                serde_json::Value::from(CATALOG_VERSION - 1),
+            );
+            image.remove("published_services");
+            image.remove("retired_configuration_revisions");
+            for instance in image["instances"]
+                .as_object_mut()
+                .expect("embedded catalog instances")
+                .values_mut()
+            {
+                instance
+                    .as_object_mut()
+                    .expect("embedded catalog instance")
+                    .remove("configuration_revision");
+            }
+        }
+        tokio::fs::write(
+            fixture.journal.journal_path(),
+            serde_json::to_vec_pretty(&value).expect("encode v5 lifecycle journal"),
+        )
+        .await
+        .expect("write v5 lifecycle journal");
+
+        let first = fixture
+            .journal
+            .load()
+            .await
+            .expect("load normalized v5 lifecycle journal")
+            .expect("journal remains present");
+        assert!(
+            first
+                .catalog()
+                .expect("catalog images")
+                .source_requires_v5_backup()
+        );
+        assert_eq!(
+            fixture
+                .journal
+                .advance(
+                    transaction_id,
+                    LifecycleTransactionPhase::Prepared,
+                    LifecycleTransactionPhase::CatalogPublished,
+                )
+                .await
+                .expect("advance normalized lifecycle journal"),
+            JournalAdvanceDisposition::Advanced
+        );
+
+        let durable = serde_json::from_slice::<serde_json::Value>(
+            &tokio::fs::read(fixture.journal.journal_path())
+                .await
+                .expect("read advanced lifecycle journal"),
+        )
+        .expect("decode advanced lifecycle journal");
+        assert_eq!(
+            durable["catalog"]["catalog_source_version"],
+            serde_json::Value::from(CATALOG_VERSION - 1)
+        );
+        for image_name in ["base", "target"] {
+            assert_eq!(
+                durable["catalog"][image_name]["version"],
+                serde_json::Value::from(CATALOG_VERSION)
+            );
+        }
+
+        let reloaded = fixture
+            .journal
+            .load()
+            .await
+            .expect("reload advanced lifecycle journal")
+            .expect("advanced journal remains present");
+        assert!(
+            reloaded
+                .catalog()
+                .expect("catalog images")
+                .source_requires_v5_backup()
+        );
+        assert_eq!(
+            fixture
+                .journal
+                .advance(
+                    transaction_id,
+                    LifecycleTransactionPhase::CatalogPublished,
+                    LifecycleTransactionPhase::AvailabilityPublished,
+                )
+                .await
+                .expect("advance normalized lifecycle journal a second time"),
+            JournalAdvanceDisposition::Advanced
+        );
+        let reloaded_again = fixture
+            .journal
+            .load()
+            .await
+            .expect("reload twice-advanced lifecycle journal")
+            .expect("twice-advanced journal remains present");
+        assert!(
+            reloaded_again
+                .catalog()
+                .expect("catalog images")
+                .source_requires_v5_backup()
+        );
+    }
+
+    #[tokio::test]
+    async fn predecessor_catalog_images_with_v6_fields_fail_without_rewriting_the_journal() {
+        let fixture = Fixture::new();
+        let transaction = fixture.transaction();
+        for version in OLDEST_REPLAYABLE_CATALOG_VERSION..CATALOG_VERSION {
+            let mut value =
+                serde_json::to_value(&transaction).expect("serialize lifecycle journal");
+            let catalog = value["catalog"]
+                .as_object_mut()
+                .expect("embedded catalog transaction");
+            catalog.remove("catalog_source_version");
+            for image_name in ["base", "target"] {
+                let image = catalog
+                    .get_mut(image_name)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("embedded catalog image");
+                image.insert("version".to_owned(), serde_json::Value::from(version));
+                image.remove("retired_configuration_revisions");
+                image.insert("published_services".to_owned(), serde_json::json!({}));
+            }
+            let bytes =
+                serde_json::to_vec_pretty(&value).expect("encode malformed predecessor journal");
+            tokio::fs::write(fixture.journal.journal_path(), &bytes)
+                .await
+                .expect("write malformed predecessor lifecycle journal");
+
+            let error = fixture
+                .journal
+                .load()
+                .await
+                .expect_err("predecessor images with v6 fields must fail closed");
+            let after = tokio::fs::read(fixture.journal.journal_path())
+                .await
+                .expect("read preserved malformed journal");
+            assert_eq!(after, bytes);
+            assert!(matches!(
+                error,
+                LifecycleJournalError::InvalidData { reason, .. }
+                    if reason.contains("published-declaration fields")
+                        && reason.contains(&version.to_string())
+            ));
         }
     }
 
@@ -1710,6 +2048,31 @@ mod tests {
         ] {
             let mut value =
                 serde_json::to_value(&transaction).expect("serialize lifecycle journal");
+            if version < u64::from(CATALOG_VERSION) {
+                let catalog = value["catalog"]
+                    .as_object_mut()
+                    .expect("embedded catalog transaction");
+                catalog.remove("catalog_source_version");
+                for image_name in ["base", "target"] {
+                    let image = catalog
+                        .get_mut(image_name)
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("embedded catalog image");
+                    image.insert("version".to_owned(), serde_json::Value::from(version));
+                    image.remove("published_services");
+                    image.remove("retired_configuration_revisions");
+                    for record in image["instances"]
+                        .as_object_mut()
+                        .expect("catalog instances")
+                        .values_mut()
+                    {
+                        record
+                            .as_object_mut()
+                            .expect("catalog instance")
+                            .remove("configuration_revision");
+                    }
+                }
+            }
             let catalog_target = value
                 .get_mut("catalog")
                 .and_then(serde_json::Value::as_object_mut)

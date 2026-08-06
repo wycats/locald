@@ -1,5 +1,7 @@
+import { get } from 'svelte/store';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { connectEvents, reconnect, restartService } from './api';
+import { services } from './stores/services';
 import type { ServiceStatus } from './types';
 
 class FakeEventSource {
@@ -43,6 +45,7 @@ const service: ServiceStatus = {
 
 afterEach(() => {
 	FakeEventSource.instances = [];
+	services.set([]);
 	vi.unstubAllGlobals();
 });
 
@@ -62,6 +65,92 @@ describe('dashboard lifecycle events', () => {
 		);
 
 		expect(lifecycleChange).toHaveBeenCalledOnce();
+		disconnect();
+	});
+
+	it('refreshes the authoritative service list after a published projection change', async () => {
+		vi.stubGlobal('EventSource', FakeEventSource);
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify([]), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
+		vi.stubGlobal('fetch', fetchMock);
+		const lifecycleChange = vi.fn();
+		const disconnect = connectEvents(lifecycleChange);
+
+		FakeEventSource.instances.at(-1)?.onmessage?.(
+			new MessageEvent('message', {
+				data: JSON.stringify({ type: 'ServiceListChanged' })
+			})
+		);
+
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/state'));
+		expect(lifecycleChange).toHaveBeenCalledOnce();
+		disconnect();
+	});
+
+	it('refreshes the authoritative service list when an SSE connection opens', async () => {
+		vi.stubGlobal('EventSource', FakeEventSource);
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify([]), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
+		vi.stubGlobal('fetch', fetchMock);
+		const lifecycleChange = vi.fn();
+		const disconnect = connectEvents(lifecycleChange);
+
+		FakeEventSource.instances.at(-1)?.onopen?.();
+
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/state'));
+		expect(lifecycleChange).toHaveBeenCalledOnce();
+		disconnect();
+	});
+
+	it('applies newer service updates after an in-flight authoritative refresh', async () => {
+		vi.stubGlobal('EventSource', FakeEventSource);
+		let resolveFetch: ((response: Response) => void) | undefined;
+		const fetchMock = vi
+			.fn()
+			.mockImplementationOnce(
+				() =>
+					new Promise<Response>((resolve) => {
+						resolveFetch = resolve;
+					})
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify([service]), {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				})
+			);
+		vi.stubGlobal('fetch', fetchMock);
+		const disconnect = connectEvents();
+		const source = FakeEventSource.instances.at(-1);
+
+		source?.onmessage?.(
+			new MessageEvent('message', {
+				data: JSON.stringify({ type: 'ServiceListChanged' })
+			})
+		);
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/state'));
+		source?.onmessage?.(
+			new MessageEvent('message', {
+				data: JSON.stringify({ type: 'ServiceUpdate', data: service })
+			})
+		);
+		resolveFetch?.(
+			new Response(JSON.stringify([{ ...service, status: 'stopped' }]), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
+
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+		await vi.waitFor(() => expect(get(services)[0]?.status).toBe('running'));
 		disconnect();
 	});
 

@@ -7,6 +7,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
+use locald_core::ipc::{PublicationState, PublicationStatus};
 use locald_core::registry::Registry;
 use locald_core::resolver::DomainResolution;
 use locald_core::state::ServiceState;
@@ -131,6 +132,191 @@ impl locald_core::resolver::ServiceResolver for MockResolver {
     }
     async fn set_http_port(&self, _port: Option<u16>) {}
     async fn set_https_port(&self, _port: Option<u16>) {}
+}
+
+#[derive(Debug)]
+struct PublishedResolver {
+    state: PublicationState,
+}
+
+#[async_trait::async_trait]
+impl locald_core::resolver::ServiceResolver for PublishedResolver {
+    async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
+        Some(DomainResolution::PublishedUnavailable {
+            name: "app:workbench".to_owned(),
+            publication: PublicationStatus {
+                state: self.state,
+                origin: "https://workbench.app.localhost".to_owned(),
+                explanation: match self.state {
+                    PublicationState::WaitingForPublisher => {
+                        "The owning workflow has not published an endpoint yet."
+                    }
+                    PublicationState::RoutePaused => "The project route is paused.",
+                    PublicationState::InstanceMissing => "The owning worktree is missing.",
+                    _ => "The external endpoint is not currently reachable.",
+                }
+                .to_owned(),
+                next_step: Some(
+                    match self.state {
+                        PublicationState::WaitingForPublisher => "Start the owning workflow.",
+                        PublicationState::RoutePaused => "Resume the project.",
+                        PublicationState::InstanceMissing => "Restore or forget the worktree.",
+                        _ => "Inspect the owning workflow.",
+                    }
+                    .to_owned(),
+                ),
+            },
+        })
+    }
+
+    async fn set_http_port(&self, _port: Option<u16>) {}
+    async fn set_https_port(&self, _port: Option<u16>) {}
+}
+
+#[tokio::test]
+async fn published_domain_waiting_for_a_publisher_preserves_identity_without_resume() {
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::WaitingForPublisher,
+        }),
+        Router::new(),
+        None,
+    )
+    .make_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("Host", "workbench.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key(hyper::header::LOCATION));
+    let body = response_body(response).await;
+    assert!(body.contains("Published service is Waiting for publisher"));
+    assert!(body.contains("The owning workflow has not published an endpoint yet."));
+    assert!(body.contains("https://workbench.app.localhost"));
+    assert!(!body.contains("Resume project"));
+    assert!(!body.contains("/api/projects/resume-domain"));
+}
+
+#[tokio::test]
+async fn published_aliases_redirect_to_the_canonical_origin_with_path_and_query() {
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::WaitingForPublisher,
+        }),
+        Router::new(),
+        None,
+    )
+    .make_app();
+
+    for host in ["alias.app.localhost", "tenant.preview.app.localhost"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session%2Ftoken?mode=demo%20value")
+                    .header("Host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{host}");
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://workbench.app.localhost/api/session%2Ftoken?mode=demo%20value"),
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn paused_published_alias_redirects_before_the_resume_api_is_selected() {
+    let api = Router::new().route(
+        "/projects/resume-domain",
+        post(|| async { StatusCode::NO_CONTENT }),
+    );
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::RoutePaused,
+        }),
+        api,
+        None,
+    )
+    .make_app();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(hyper::Method::POST)
+                .uri("/api/projects/resume-domain?source=alias")
+                .header("Host", "alias.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("https://workbench.app.localhost/api/projects/resume-domain?source=alias")
+    );
+
+    let canonical_response = app
+        .oneshot(
+            Request::builder()
+                .method(hyper::Method::POST)
+                .uri("/api/projects/resume-domain")
+                .header("Host", "workbench.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(canonical_response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn paused_published_domain_offers_only_the_project_resume_control() {
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::RoutePaused,
+        }),
+        Router::new(),
+        None,
+    )
+    .make_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("Host", "workbench.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_body(response).await;
+    assert!(body.contains("Published service is Route paused"));
+    assert!(body.contains("Resume project"));
+    assert!(body.contains("/api/projects/resume-domain"));
+    assert!(!body.contains("/api/services/"));
 }
 
 #[derive(Debug)]

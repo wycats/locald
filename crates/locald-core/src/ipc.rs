@@ -50,6 +50,9 @@ pub enum ServiceType {
     Container,
     /// A static site service.
     Site,
+    /// A stable service identity fulfilled by an authenticated external
+    /// publisher rather than a locald-owned process.
+    Published,
 }
 
 impl std::fmt::Display for ServiceType {
@@ -60,6 +63,7 @@ impl std::fmt::Display for ServiceType {
             Self::Worker => write!(f, "worker"),
             Self::Container => write!(f, "container"),
             Self::Site => write!(f, "site"),
+            Self::Published => write!(f, "published"),
         }
     }
 }
@@ -73,10 +77,53 @@ impl From<&ServiceConfig> for ServiceType {
                 TypedServiceConfig::Worker(_) => Self::Worker,
                 TypedServiceConfig::Container(_) => Self::Container,
                 TypedServiceConfig::Site(_) => Self::Site,
+                TypedServiceConfig::Published(_) => Self::Published,
             },
             ServiceConfig::Legacy(_) => Self::Exec,
         }
     }
+}
+
+/// Reachability state for a declared published service.
+///
+/// b.3.3 persists the declaration and can therefore report waiting, paused,
+/// and missing states. The remaining states are part of the stable response
+/// contract and become reachable when publisher leases and health-gated
+/// routing land in the following slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationState {
+    WaitingForPublisher,
+    CheckingEndpoint,
+    EndpointUnhealthy,
+    Ready,
+    RoutePaused,
+    InstanceMissing,
+}
+
+impl std::fmt::Display for PublicationState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::WaitingForPublisher => "waiting_for_publisher",
+            Self::CheckingEndpoint => "checking_endpoint",
+            Self::EndpointUnhealthy => "endpoint_unhealthy",
+            Self::Ready => "ready",
+            Self::RoutePaused => "route_paused",
+            Self::InstanceMissing => "instance_missing",
+        })
+    }
+}
+
+/// Privacy-safe publication status for one externally fulfilled service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PublicationStatus {
+    pub state: PublicationState,
+    /// Stable locald-owned semantic origin. This never contains the private
+    /// upstream endpoint.
+    pub origin: String,
+    pub explanation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
 }
 
 impl std::fmt::Display for LogStream {
@@ -112,6 +159,7 @@ impl std::fmt::Display for LogStream {
 ///     workspace: None,
 ///     constellation: None,
 ///     warnings: vec![],
+///     publication: None,
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -159,6 +207,10 @@ pub struct ServiceStatus {
     /// Any warnings associated with the service (e.g. port mismatch).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// External-fulfillment state for a published service. Managed services
+    /// omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationStatus>,
 }
 
 /// The terminal state returned by a successful project ensure operation.
@@ -186,6 +238,8 @@ pub struct EnsuredServiceStatus {
     pub health_status: HealthStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationStatus>,
 }
 
 /// Final status and routed HTTPS URLs returned after ensuring one project.
@@ -366,7 +420,7 @@ pub enum IpcRequest {
     ///
     /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
     Reset { name: String },
-    /// Stop all running services.
+    /// Stop all locald-managed services without pausing project availability.
     ///
     /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
     StopAll,
@@ -465,6 +519,14 @@ pub enum IpcRequest {
     /// **Response:** `IpcResponse::ProjectStatus(ProjectStatusInfo)`
     ProjectStatus {
         /// The path to the project to inspect.
+        project_path: PathBuf,
+    },
+    /// Stop every locald-managed service in one project, then start them in
+    /// declared dependency order. Externally published services remain untouched.
+    ///
+    /// **Response:** `IpcResponse::Ok` or `IpcResponse::Error`
+    ProjectRestart {
+        /// The path to the project to restart.
         project_path: PathBuf,
     },
     /// List known projects with attachment state.
@@ -670,7 +732,10 @@ pub enum Event {
     /// A new log entry.
     Log(LogEntry),
     /// A service status update.
-    ServiceUpdate(ServiceStatus),
+    ServiceUpdate(Box<ServiceStatus>),
+    /// The authoritative service list or a catalog-backed status projection
+    /// changed and should be fetched again.
+    ServiceListChanged,
     /// Service metrics update.
     Metrics(ServiceMetrics),
 }
@@ -726,6 +791,7 @@ impl ServiceStatus {
             workspace: None,
             constellation: None,
             warnings: Vec::new(),
+            publication: None,
         }
     }
 }
@@ -798,6 +864,7 @@ mod tests {
                 status: ServiceState::Running,
                 health_status: HealthStatus::Healthy,
                 url: Some("https://project.localhost".to_owned()),
+                publication: None,
             }],
             urls: vec!["https://project.localhost".to_owned()],
         });
@@ -882,6 +949,19 @@ mod tests {
     }
 
     #[test]
+    fn project_restart_round_trips_its_exact_locator() {
+        let request = IpcRequest::ProjectRestart {
+            project_path: PathBuf::from("/work/project"),
+        };
+
+        let encoded = serde_json::to_value(&request).expect("serialize project restart");
+        let decoded: IpcRequest =
+            serde_json::from_value(encoded).expect("deserialize project restart");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn agent_requests_and_status_round_trip_without_raw_private_provenance() {
         let private_identity = "issuer=codex;conversation=private-agent-thread";
         let context = AgentWorkspaceContext {
@@ -924,6 +1004,7 @@ mod tests {
                 status: ServiceState::Running,
                 health_status: HealthStatus::Healthy,
                 url: Some("https://workspace.localhost".to_owned()),
+                publication: None,
             }],
             urls: vec!["https://workspace.localhost".to_owned()],
         });

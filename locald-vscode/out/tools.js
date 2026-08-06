@@ -37,6 +37,7 @@ exports.registerTools = registerTools;
 const vscode = __importStar(require("vscode"));
 const plumbing_js_1 = require("./plumbing.js");
 const extension_js_1 = require("./extension.js");
+const service_presentation_js_1 = require("./service-presentation.js");
 function registerTools(context, controller, resolveProject) {
     if (!vscode.lm || typeof vscode.lm.registerTool !== "function") {
         extension_js_1.log.warn("vscode.lm.registerTool not available — tools disabled");
@@ -66,33 +67,47 @@ function registerTools(context, controller, resolveProject) {
                 url: service.url,
                 domain: service.domain,
                 service_type: service.service_type,
+                publication: service.publication,
             }));
             return textResult(JSON.stringify(services, null, 2));
         },
     }), vscode.lm.registerTool("locald_restart", {
         async invoke(options, _token) {
-            const result = await controller.withCurrentProject("language-model restart request", async (initial, ensureTarget) => {
-                if (options.input?.service) {
-                    const service = initial.services.find((candidate) => candidate.name === options.input?.service ||
-                        candidate.name.endsWith(`:${options.input?.service}`));
-                    if (!service) {
-                        throw new Error(`service ${options.input.service} was not found`);
-                    }
-                    await (0, plumbing_js_1.restartService)(initial.project_path, service.name);
+            const projectPath = await resolveRequiredProject(resolveProject);
+            const initial = await (0, plumbing_js_1.status)(projectPath);
+            if (options.input?.service) {
+                const service = initial.service_details.find((candidate) => candidate.name === options.input?.service ||
+                    candidate.name.endsWith(`:${options.input?.service}`));
+                if (!service) {
+                    throw new Error(`service ${options.input.service} was not found`);
                 }
-                else {
-                    await (0, plumbing_js_1.stopProject)(initial.project_path);
+                if (service.service_type === "published") {
+                    throw new Error(`service ${options.input.service} is externally managed; use its owning workflow to restart it`);
                 }
-                return ensureTarget("wait for language-model service restart");
-            });
-            if (!result) {
-                throw new Error("no locald project is selected");
+                await (0, plumbing_js_1.restartService)(projectPath, service.name);
             }
-            return textResult(`Services restarted and ready.${result.urls.length > 0 ? ` ${result.urls.join(" ")}` : ""}`);
+            else {
+                const managed = (0, service_presentation_js_1.managedLifecycleServices)(initial.service_details);
+                if (managed.length === 0) {
+                    throw new Error("this project has no locald-managed services to restart; use each published service's owning workflow");
+                }
+                await (0, plumbing_js_1.restartProject)(projectPath);
+            }
+            const final = await (0, plumbing_js_1.status)(projectPath);
+            const urls = final.service_details.flatMap((service) => service.url ? [service.url] : []);
+            return textResult((0, service_presentation_js_1.restartedServicesMessage)(final.service_details, urls));
         },
     }), vscode.lm.registerTool("locald_logs", {
         async invoke(options, _token) {
             const projectPath = await resolveRequiredProject(resolveProject);
+            if (options.input?.service) {
+                const info = await (0, plumbing_js_1.status)(projectPath);
+                const service = info.service_details.find((candidate) => candidate.name === options.input?.service ||
+                    candidate.name.endsWith(`:${options.input?.service}`));
+                if (service?.service_type === "published") {
+                    throw new Error(`service ${options.input.service} is externally managed; locald does not own its logs`);
+                }
+            }
             const output = await (0, plumbing_js_1.getLogs)(projectPath, options.input?.lines ?? 200, options.input?.service);
             return textResult(output);
         },
@@ -105,12 +120,12 @@ function registerTools(context, controller, resolveProject) {
             const service = options.input?.service
                 ? result.services.find((candidate) => candidate.name === options.input?.service ||
                     candidate.name.endsWith(`:${options.input?.service}`))
-                : result.services.find((candidate) => candidate.url);
+                : (0, service_presentation_js_1.defaultServiceWithOrigin)(result.services);
             if (!service?.url) {
                 return textResult("No service URL available.");
             }
             await vscode.commands.executeCommand("simpleBrowser.show", vscode.Uri.parse(service.url));
-            return textResult(`Opened ${service.url} in Simple Browser.`);
+            return textResult((0, service_presentation_js_1.openedServiceMessage)(service));
         },
     }));
 }

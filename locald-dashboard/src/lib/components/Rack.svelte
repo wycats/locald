@@ -38,6 +38,13 @@
 		Clock
 	} from 'lucide-svelte';
 	import { serviceIdentity, type ServiceStatus } from '$lib/types';
+	import {
+		isPublishedService,
+		managedServices,
+		serviceDisplayAuthority,
+		serviceLifecycleLabel,
+		serviceLifecycleSummary
+	} from '$lib/service-presentation';
 	import Spinner from './Spinner.svelte';
 
 	export let monitored: string[] = [];
@@ -77,7 +84,7 @@
 		}
 	}
 
-	$: allServices = $projects.flatMap((p) => p.services);
+	$: allServices = managedServices($projects.flatMap((p) => p.services));
 
 	type SectionHeader = { kind: 'section'; section: ProjectSection; count: number };
 	type ProjectGroup = {
@@ -248,7 +255,8 @@
 	}
 
 	function toggleMonitorGroup(groupServices: ServiceStatus[]) {
-		const serviceNames = groupServices.map(serviceIdentity);
+		const serviceNames = managedServices(groupServices).map(serviceIdentity);
+		if (serviceNames.length === 0) return;
 		const allMonitored = serviceNames.every((name) => monitored.includes(name));
 		const next = allMonitored
 			? monitored.filter((n) => !serviceNames.includes(n))
@@ -272,9 +280,11 @@
 	}
 
 	async function toggleGroup(groupServices: ServiceStatus[]) {
-		const allStopped = groupServices.every((s) => s.status === 'stopped');
+		const managed = managedServices(groupServices);
+		if (managed.length === 0) return;
+		const allStopped = managed.every((s) => s.status === 'stopped');
 		await Promise.all(
-			groupServices.map((s) => {
+			managed.map((s) => {
 				if (allStopped) return startServiceWithFeedback(s.name, s.instance_id);
 				return stopServiceWithFeedback(s.name, s.instance_id);
 			})
@@ -332,6 +342,8 @@
 		// Use the actual service_type from the API if available
 		if (service.service_type) {
 			switch (service.service_type) {
+				case 'published':
+					return 'published';
 				case 'postgres':
 					return 'db';
 				case 'container':
@@ -370,14 +382,7 @@
 	}
 
 	function displayUrl(service: ServiceStatus): string {
-		if (service.domain) return service.domain;
-		if (!service.url) return '';
-		try {
-			const parsed = new URL(service.url);
-			return parsed.hostname.endsWith('.localhost') ? parsed.hostname : parsed.host;
-		} catch {
-			return service.url.replace(/^https?:\/\//, '');
-		}
+		return serviceDisplayAuthority(service);
 	}
 
 	function projectCountLabel(count: number): string {
@@ -385,25 +390,13 @@
 	}
 
 	function lifecycleSummary(services: ServiceStatus[]): string {
-		if (services.length === 0) return 'No services';
-
-		const running = services.filter((s) => s.status === 'running').length;
-		const building = services.filter((s) => s.status === 'building').length;
-		const stopped = services.length - running - building;
-		const parts = [`${running} running`];
-
-		if (building > 0) parts.push(`${building} building`);
-		if (stopped > 0) parts.push(`${stopped} stopped`);
-
-		return parts.join(' · ');
-	}
-
-	function lifecycleLabel(status: ServiceStatus['status']): string {
-		return status[0].toUpperCase() + status.slice(1);
+		return serviceLifecycleSummary(services);
 	}
 
 	function deckSummary(services: ServiceStatus[]): string | null {
-		const count = services.filter((service) => monitored.includes(serviceIdentity(service))).length;
+		const count = managedServices(services).filter((service) =>
+			monitored.includes(serviceIdentity(service))
+		).length;
 		if (count === 0) return null;
 		return `${count} in Deck`;
 	}
@@ -480,8 +473,10 @@
 				{:else}
 					{@const project = rackEntry}
 					{@const isCollapsed = collapsedGroups.includes(project.name)}
+					{@const projectManagedServices = managedServices(project.services)}
 					{@const isAllStopped =
-						project.services.length === 0 || project.services.every((s) => s.status === 'stopped')}
+						projectManagedServices.length === 0 ||
+						projectManagedServices.every((s) => s.status === 'stopped')}
 					{@const projectLifecycle = lifecycleSummary(project.services)}
 					{@const projectDeck = deckSummary(project.services)}
 					{@const projectDemands = demandSummary(project.entry?.availability)}
@@ -524,12 +519,12 @@
 							</div>
 						</div>
 						{#if project.entry || project.services.length > 0}
-							{@const serviceNames = project.services.map(serviceIdentity)}
+							{@const serviceNames = projectManagedServices.map(serviceIdentity)}
 							{@const allMonitored =
 								serviceNames.length > 0 && serviceNames.every((n) => monitored.includes(n))}
 							{@const someMonitored = serviceNames.some((n) => monitored.includes(n))}
 							<div class="group-actions">
-								{#if project.services.length > 0}
+								{#if projectManagedServices.length > 0}
 									<button
 										class="group-btn monitor-group-btn"
 										class:active={allMonitored}
@@ -546,13 +541,15 @@
 										(project.entry
 											? !projectCanPause(project.entry.availability) &&
 												!projectCanResume(project.entry.availability)
-											: false)}
+											: projectManagedServices.length === 0)}
 									on:click|stopPropagation={() => toggleProject(project)}
 									title={project.entry
 										? projectActionTitle(project.entry)
-										: isAllStopped
-											? 'Start group'
-											: 'Stop group'}
+										: projectManagedServices.length === 0
+											? 'Published services have no local process lifecycle'
+											: isAllStopped
+												? 'Start group'
+												: 'Stop group'}
 								>
 									{#if projectPending}
 										<Spinner size={12} />
@@ -579,35 +576,40 @@
 							{@const type = getServiceType(service)}
 							{@const displayName = getDisplayName(service.name, project.name)}
 							{@const urlLabel = displayUrl(service)}
-							{@const inDeck = monitored.includes(identity)}
+							{@const published = isPublishedService(service)}
+							{@const inDeck = !published && monitored.includes(identity)}
 
+							<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 							<div
 								id="service-{identity}"
 								class="rack-item"
 								class:monitored={inDeck}
+								class:published
 								class:keyboard-focused={keyboardFocus === identity}
-								class:disabled={service.status === 'stopped'}
-								on:click={() => toggleMonitor(identity)}
+								class:disabled={!published && service.status === 'stopped'}
+								on:click={() => {
+									if (!published) toggleMonitor(identity);
+								}}
 								on:keydown={(e) => {
-									if (e.key === 'Enter' || e.key === ' ') {
+									if (!published && (e.key === 'Enter' || e.key === ' ')) {
 										e.preventDefault();
 										toggleMonitor(identity);
 									}
 								}}
-								role="button"
-								tabindex="0"
+								role={published ? undefined : 'button'}
+								tabindex={published ? undefined : 0}
 							>
 								<!-- Layer 1: Content (Left Group) -->
 								<div class="item-content">
 									<div class="status-dot {service.status}"></div>
 									<span class="service-name" title={service.name}>{displayName}</span>
-									<span class="status-chip {service.status}">{lifecycleLabel(service.status)}</span>
+									<span class="status-chip {service.status}">{serviceLifecycleLabel(service)}</span>
 									<span class="type-chip {type}">{type}</span>
 									{#if inDeck}
 										<span class="deck-chip">In Deck</span>
 									{/if}
 
-									{#if service.url && service.status === 'running'}
+									{#if service.url && (service.status === 'running' || published)}
 										<a
 											href={service.url}
 											target="_blank"
@@ -619,101 +621,108 @@
 											<ExternalLink size={10} />
 										</a>
 									{/if}
+									{#if service.publication}
+										<span class="publication-guidance" title={service.publication.next_step}>
+											{service.publication.explanation}
+										</span>
+									{/if}
 								</div>
 
 								<!-- Layer 2: Toolbar Overlay -->
-								<div class="item-toolbar">
-									<div class="toolbar-bg"></div>
-									<div class="toolbar-actions">
-										<button
-											class="control-btn monitor-btn"
-											class:active={inDeck}
-											title={inDeck ? 'Remove from Deck' : 'Add to Deck'}
-											on:click={(e) => toggleMonitor(identity, e)}
-										>
-											<Monitor size={14} />
-										</button>
-										{#if service.status === 'running'}
+								{#if !published}
+									<div class="item-toolbar">
+										<div class="toolbar-bg"></div>
+										<div class="toolbar-actions">
 											<button
-												class="control-btn"
-												title="Restart"
-												disabled={isPending(service)}
-												on:click|stopPropagation={() =>
-													restartServiceWithFeedback(service.name, service.instance_id)}
+												class="control-btn monitor-btn"
+												class:active={inDeck}
+												title={inDeck ? 'Remove from Deck' : 'Add to Deck'}
+												on:click={(e) => toggleMonitor(identity, e)}
 											>
-												{#if isPending(service)}
-													<Spinner size={14} />
-												{:else}
-													<RefreshCw size={14} />
-												{/if}
+												<Monitor size={14} />
 											</button>
-											<div class="menu-wrapper">
+											{#if service.status === 'running'}
 												<button
 													class="control-btn"
-													on:click={(e) => toggleMenu(identity, e)}
-													title="More"
+													title="Restart"
+													disabled={isPending(service)}
+													on:click|stopPropagation={() =>
+														restartServiceWithFeedback(service.name, service.instance_id)}
 												>
-													<MoreHorizontal size={14} />
+													{#if isPending(service)}
+														<Spinner size={14} />
+													{:else}
+														<RefreshCw size={14} />
+													{/if}
 												</button>
-												{#if activeMenu === identity}
-													<!-- Menu container only stops event propagation -->
-													<div
-														class="menu-dropdown"
-														on:click={(e) => e.stopPropagation()}
-														role="menu"
-														tabindex="-1"
+												<div class="menu-wrapper">
+													<button
+														class="control-btn"
+														on:click={(e) => toggleMenu(identity, e)}
+														title="More"
 													>
-														<div class="menu-item info">
-															<span>PID: {service.pid || '-'}</span>
-															<span>Port: {service.port || '-'}</span>
+														<MoreHorizontal size={14} />
+													</button>
+													{#if activeMenu === identity}
+														<!-- Menu container only stops event propagation -->
+														<div
+															class="menu-dropdown"
+															on:click={(e) => e.stopPropagation()}
+															role="menu"
+															tabindex="-1"
+														>
+															<div class="menu-item info">
+																<span>PID: {service.pid || '-'}</span>
+																<span>Port: {service.port || '-'}</span>
+															</div>
+															<div class="menu-separator"></div>
+															<button
+																class="menu-action danger"
+																disabled={isPending(service)}
+																on:click={() =>
+																	resetServiceWithFeedback(service.name, service.instance_id)}
+															>
+																{#if isPending(service)}
+																	<Spinner size={12} />
+																{:else}
+																	<RotateCcw size={12} />
+																{/if}
+																Reset
+															</button>
+															<button
+																class="menu-action danger"
+																disabled={isPending(service)}
+																on:click={() =>
+																	stopServiceWithFeedback(service.name, service.instance_id)}
+															>
+																{#if isPending(service)}
+																	<Spinner size={12} />
+																{:else}
+																	<Power size={12} />
+																{/if}
+																Stop
+															</button>
 														</div>
-														<div class="menu-separator"></div>
-														<button
-															class="menu-action danger"
-															disabled={isPending(service)}
-															on:click={() =>
-																resetServiceWithFeedback(service.name, service.instance_id)}
-														>
-															{#if isPending(service)}
-																<Spinner size={12} />
-															{:else}
-																<RotateCcw size={12} />
-															{/if}
-															Reset
-														</button>
-														<button
-															class="menu-action danger"
-															disabled={isPending(service)}
-															on:click={() =>
-																stopServiceWithFeedback(service.name, service.instance_id)}
-														>
-															{#if isPending(service)}
-																<Spinner size={12} />
-															{:else}
-																<Power size={12} />
-															{/if}
-															Stop
-														</button>
-													</div>
-												{/if}
-											</div>
-										{:else}
-											<button
-												class="control-btn power-btn"
-												disabled={isPending(service)}
-												on:click|stopPropagation={() =>
-													startServiceWithFeedback(service.name, service.instance_id)}
-												title="Start"
-											>
-												{#if isPending(service)}
-													<Spinner size={14} />
-												{:else}
-													<Power size={14} />
-												{/if}
-											</button>
-										{/if}
+													{/if}
+												</div>
+											{:else}
+												<button
+													class="control-btn power-btn"
+													disabled={isPending(service)}
+													on:click|stopPropagation={() =>
+														startServiceWithFeedback(service.name, service.instance_id)}
+													title="Start"
+												>
+													{#if isPending(service)}
+														<Spinner size={14} />
+													{:else}
+														<Power size={14} />
+													{/if}
+												</button>
+											{/if}
+										</div>
 									</div>
-								</div>
+								{/if}
 							</div>
 						{/each}
 					{/if}
@@ -982,6 +991,12 @@
 		opacity: 0.5;
 		--row-bg: #121214;
 	}
+	.rack-item.published {
+		cursor: default;
+	}
+	.rack-item.published .item-content {
+		padding-right: 0;
+	}
 
 	.rack-item:hover {
 		--row-bg: #18181b; /* Zinc-900 (Approx match for 5% white overlay) */
@@ -1033,6 +1048,10 @@
 	.status-dot.stopped {
 		background: #52525b; /* Zinc-600 */
 		box-shadow: none;
+	}
+	.status-dot.externally_managed {
+		background: #38bdf8;
+		box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2);
 	}
 
 	@keyframes pulse {
@@ -1102,6 +1121,12 @@
 	.status-chip.stopped {
 		color: #71717a;
 	}
+	.status-chip.externally_managed,
+	.type-chip.published {
+		color: #7dd3fc;
+		border-color: rgba(56, 189, 248, 0.22);
+		background: rgba(56, 189, 248, 0.07);
+	}
 	.deck-chip {
 		color: #93c5fd;
 		border-color: rgba(96, 165, 250, 0.22);
@@ -1161,6 +1186,14 @@
 		overflow: hidden;
 		white-space: nowrap;
 		text-overflow: ellipsis;
+	}
+	.publication-guidance {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 10px;
+		color: #71717a;
 	}
 
 	/* --- Layer 2: Toolbar Overlay --- */

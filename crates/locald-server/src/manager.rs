@@ -3,7 +3,7 @@
 use crate::agent_context::resolve_agent_workspace;
 use crate::catalog_publication::{
     CatalogPublicationJournal, CatalogPublicationPhase, CatalogPublicationTransaction,
-    host_set_for_catalog,
+    catalog_schema_version, ensure_v5_backup, ensure_v5_recovery_backup, host_set_for_catalog,
 };
 use crate::config_loader::ConfigLoader;
 use crate::generated_files::{GeneratedFileSet, PreparedGeneratedFileSet};
@@ -22,7 +22,7 @@ use crate::port_allocator::{PortAllocator, PortGuard};
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::BoxFuture};
 use locald_core::attachments::{
     Attachment, AttachmentCompatibilityEvidence, AttachmentSource, AttachmentStore,
     AttachmentStoreSnapshot, EditorSession, ManualCliSession, ProjectFilter, ProjectListEntry,
@@ -31,7 +31,7 @@ use locald_core::attachments::{
 use locald_core::config::{LocaldConfig, ServiceConfig, TypedServiceConfig};
 use locald_core::ipc::{
     BootEvent, EnsureProjectResult, EnsureProjectState, EnsureProjectSuperseded,
-    EnsuredServiceStatus, Event, LogEntry, ServiceStatus,
+    EnsuredServiceStatus, Event, LogEntry, PublicationState, PublicationStatus, ServiceStatus,
 };
 use locald_core::registry::Registry;
 use locald_core::resolver::ServiceResolver;
@@ -50,8 +50,9 @@ use locald_core::{
     CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DemandKind, DomainClaim,
     DomainIndex, DomainName, DomainPattern, DomainTarget, EnsureDemandResult, ProjectAvailability,
     ProjectAvailabilityStatus, ProjectDiscovery, ProjectInstanceId, ProjectInstanceOrigin,
-    ProjectLifecycleState, RenewDemandResult, SharedDomainIndex, SystemClock, availability_path,
-    sanitize_project_name_for_dns, sanitize_service_name_for_dns,
+    ProjectLifecycleState, PublishedHttpHealthPolicy, PublishedServiceAdmission,
+    PublishedServiceDeclaration, RenewDemandResult, SemanticOrigin, SharedDomainIndex, SystemClock,
+    availability_path, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
 };
 use locald_hosts::HostSet;
 use nix::sys::signal::Signal;
@@ -633,6 +634,7 @@ struct ConfigApplyOptions<'a> {
     service_activation: Option<&'a str>,
     service_readiness_timeout: std::time::Duration,
     agent_conversation: Option<&'a AgentConversationKey>,
+    preserve_projection_for_config: Option<&'a LocaldConfig>,
 }
 
 impl<'a> ConfigApplyOptions<'a> {
@@ -642,6 +644,7 @@ impl<'a> ConfigApplyOptions<'a> {
             service_activation,
             service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
             agent_conversation: None,
+            preserve_projection_for_config: None,
         }
     }
 
@@ -653,6 +656,7 @@ impl<'a> ConfigApplyOptions<'a> {
             service_activation: None,
             service_readiness_timeout,
             agent_conversation: None,
+            preserve_projection_for_config: None,
         }
     }
 
@@ -661,6 +665,11 @@ impl<'a> ConfigApplyOptions<'a> {
         agent_conversation: &'a AgentConversationKey,
     ) -> Self {
         self.agent_conversation = Some(agent_conversation);
+        self
+    }
+
+    const fn preserving_projection_for(mut self, config: &'a LocaldConfig) -> Self {
+        self.preserve_projection_for_config = Some(config);
         self
     }
 }
@@ -1434,6 +1443,116 @@ impl ProcessManager {
             workspace,
             constellation,
             warnings,
+            publication: None,
+        }
+    }
+
+    async fn published_service_status(
+        &self,
+        record: &locald_core::catalog::ProjectInstanceRecord,
+        declaration: &PublishedServiceDeclaration,
+    ) -> ServiceStatus {
+        use locald_core::ipc::ServiceType;
+
+        let (publication_state, explanation, next_step) = if record.presence
+            == CatalogPresence::Missing
+        {
+            (
+                    PublicationState::InstanceMissing,
+                    "The worktree for this published service is missing; locald is preserving its stable origin without routing it.".to_owned(),
+                    Some(
+                        "Restore the worktree, or explicitly forget the project if this identity is no longer needed."
+                            .to_owned(),
+                    ),
+                )
+        } else {
+            let paused = match self.load_availability(record.id).await {
+                Ok(mut availability) => availability
+                    .snapshot()
+                    .await
+                    .map(|availability| availability.is_paused()),
+                Err(error) => Err(error),
+            };
+            match paused {
+                    Ok(true) => (
+                        PublicationState::RoutePaused,
+                        "The project is paused; locald is preserving this published origin without routing it."
+                            .to_owned(),
+                        Some(
+                            "Resume the project to allow its owning workflow to restore publication."
+                                .to_owned(),
+                        ),
+                    ),
+                    Ok(false) => (
+                        PublicationState::WaitingForPublisher,
+                        "The stable service identity is declared, but no external publisher currently fulfills it."
+                            .to_owned(),
+                        Some("Start the service with its owning workflow.".to_owned()),
+                    ),
+                    Err(error) => {
+                        warn!(
+                            "failed to read availability while projecting published service {} in instance {}: {error}",
+                            declaration.service_name,
+                            declaration.project_instance_id
+                        );
+                        (
+                            PublicationState::WaitingForPublisher,
+                            "The stable service identity is declared, but locald could not verify its lifecycle state."
+                                .to_owned(),
+                            Some(
+                                "Inspect project status, then start the service with its owning workflow."
+                                    .to_owned(),
+                            ),
+                        )
+                    }
+                }
+        };
+        let origin = declaration.origin.to_string();
+        let domain = declaration
+            .origin
+            .domain()
+            .ok()
+            .map(|domain| domain.to_string());
+        let project_name = record.display_name.as_deref();
+        let configured_name = declaration.service_name.as_str().to_owned();
+        let name = project_name.map_or_else(
+            || configured_name.clone(),
+            |project_name| format!("{project_name}:{configured_name}"),
+        );
+
+        ServiceStatus {
+            name,
+            instance_id: Some(record.id),
+            service_name: Some(configured_name),
+            service_type: ServiceType::Published,
+            pid: None,
+            port: None,
+            status: ServiceState::ExternallyManaged,
+            url: Some(origin.clone()),
+            connection_url: None,
+            domain,
+            health_status: match publication_state {
+                PublicationState::CheckingEndpoint => HealthStatus::Starting,
+                PublicationState::EndpointUnhealthy => HealthStatus::Unhealthy,
+                PublicationState::Ready => HealthStatus::Healthy,
+                PublicationState::WaitingForPublisher
+                | PublicationState::RoutePaused
+                | PublicationState::InstanceMissing => HealthStatus::Unknown,
+            },
+            health_source: HealthSource::Http,
+            path: record
+                .current_path
+                .clone()
+                .or_else(|| Some(record.last_known_path.clone())),
+            workspace: None,
+            constellation: None,
+            warnings: Vec::new(),
+            publication: Some(PublicationStatus {
+                state: publication_state,
+                origin,
+                explanation,
+                next_step,
+            }),
         }
     }
 
@@ -1445,6 +1564,27 @@ impl ProcessManager {
     pub async fn set_https_port(&self, port: Option<u16>) {
         self.proxy_ports.lock().await.1 = port;
         self.proxy_ports_changed.notify_waiters();
+    }
+
+    pub(crate) async fn validate_published_origins_for_https_listener(
+        &self,
+        advertised_https_port: Option<u16>,
+    ) -> Result<()> {
+        let registry = self.registry.lock().await;
+        match advertised_https_port {
+            Some(port) => registry
+                .validate_published_origins_for_https_port(port)
+                .context(
+                    "durable published-service origins do not match this daemon's HTTPS listener",
+                ),
+            None => {
+                anyhow::ensure!(
+                    registry.published_declarations().next().is_none(),
+                    "durable published-service origins require a working HTTPS listener; repair sandbox CA material and explicitly re-admit each published project configuration"
+                );
+                Ok(())
+            }
+        }
     }
 
     fn reap_dead_services(_name: &str, _service: &mut Service) {
@@ -1555,6 +1695,81 @@ impl ProcessManager {
         Ok(claims)
     }
 
+    fn build_published_service_admissions(
+        instance_id: ProjectInstanceId,
+        config: &LocaldConfig,
+        claims: &[DomainClaim],
+        advertised_https_port: u16,
+    ) -> Result<Vec<PublishedServiceAdmission>> {
+        let mut admissions = Vec::new();
+        for (configured_name, service_config) in &config.services {
+            let Some(published) = service_config.published() else {
+                continue;
+            };
+            let runtime_name = format!("{}:{configured_name}", config.project.name);
+            let mut domain_claims = BTreeSet::new();
+            let mut primary_domain = None;
+            for claim in claims {
+                let DomainTarget::Service {
+                    project_instance_id,
+                    service_name: Some(service_name),
+                    primary,
+                } = &claim.target
+                else {
+                    continue;
+                };
+                if *project_instance_id != instance_id || service_name != &runtime_name {
+                    continue;
+                }
+                domain_claims.insert(claim.domain.clone());
+                if *primary {
+                    anyhow::ensure!(
+                        primary_domain.is_none(),
+                        "published service `{configured_name}` has more than one primary domain"
+                    );
+                    let DomainPattern::Exact(domain) = &claim.domain else {
+                        anyhow::bail!(
+                            "published service `{configured_name}` has a wildcard primary domain"
+                        );
+                    };
+                    primary_domain = Some(domain.clone());
+                }
+            }
+            let primary_domain = primary_domain.with_context(|| {
+                format!("published service `{configured_name}` has no primary exact domain")
+            })?;
+            let health = published.normalized_health_check();
+            admissions.push(PublishedServiceAdmission {
+                service_name: ServiceName::new(configured_name.clone()),
+                origin: SemanticOrigin::https(&primary_domain, advertised_https_port),
+                domain_claims,
+                health_policy: PublishedHttpHealthPolicy::new(
+                    health.path(),
+                    health.interval_secs(),
+                    health.timeout_secs(),
+                )?,
+            });
+        }
+        Ok(admissions)
+    }
+
+    fn admitted_published_service_projection(
+        registry: &Registry,
+        instance_id: ProjectInstanceId,
+    ) -> Vec<PublishedServiceAdmission> {
+        registry
+            .published_declarations_for_instance(instance_id)
+            .into_iter()
+            .flat_map(|declarations| declarations.values())
+            .map(|declaration| PublishedServiceAdmission {
+                service_name: declaration.service_name.clone(),
+                origin: declaration.origin.clone(),
+                domain_claims: declaration.domain_claims.clone(),
+                health_policy: declaration.health_policy.clone(),
+            })
+            .collect()
+    }
+
     fn relative_service_domain(
         instance_root: &DomainName,
         configured: &str,
@@ -1631,7 +1846,9 @@ impl ProcessManager {
             ServiceConfig::Typed(TypedServiceConfig::Worker(_)) => true,
             ServiceConfig::Typed(TypedServiceConfig::Site(config)) => !config.build.is_empty(),
             ServiceConfig::Typed(
-                TypedServiceConfig::Postgres(_) | TypedServiceConfig::Container(_),
+                TypedServiceConfig::Postgres(_)
+                | TypedServiceConfig::Container(_)
+                | TypedServiceConfig::Published(_),
             ) => false,
         }
     }
@@ -1722,6 +1939,10 @@ impl ProcessManager {
         anyhow::ensure!(
             config.services.contains_key(selected),
             "service `{selected_service}` is not present in the current project configuration"
+        );
+        anyhow::ensure!(
+            !config.services[selected].is_published(),
+            "service `{selected_service}` is externally managed; use its owning workflow to start or resume its publisher"
         );
 
         let mut pending = vec![selected.to_owned()];
@@ -2079,9 +2300,32 @@ impl ProcessManager {
                 .get(key)
                 .is_some_and(|service| projection.matches(service))
             {
-                let _ = self.event_sender.send(Event::ServiceUpdate(status));
+                let _ = self
+                    .event_sender
+                    .send(Event::ServiceUpdate(Box::new(status)));
             }
         }
+    }
+
+    async fn broadcast_published_service_projection_if_pause_changed(
+        &self,
+        instance_id: ProjectInstanceId,
+        was_paused: bool,
+        is_paused: bool,
+    ) -> bool {
+        if was_paused == is_paused {
+            return false;
+        }
+        let has_published_declarations = self
+            .registry
+            .lock()
+            .await
+            .published_declarations_for_instance(instance_id)
+            .is_some_and(|declarations| !declarations.is_empty());
+        if has_published_declarations {
+            let _ = self.event_sender.send(Event::ServiceListChanged);
+        }
+        has_published_declarations
     }
 
     fn clear_log_buffer(&self, key: &ServiceKey) {
@@ -3238,18 +3482,53 @@ impl ProcessManager {
         catalog_base: Registry,
         catalog_target: Registry,
     ) -> CatalogPublicationOutcome {
+        self.publish_catalog_transition_kind_locked(
+            catalog_base,
+            catalog_target,
+            false,
+            locald_core::catalog::CATALOG_VERSION,
+        )
+        .await
+    }
+
+    async fn publish_catalog_transition_kind_locked(
+        &self,
+        catalog_base: Registry,
+        catalog_target: Registry,
+        schema_migration: bool,
+        catalog_source_version: u32,
+    ) -> CatalogPublicationOutcome {
         let mut published_domain_index = None;
         let completion: Result<()> = async {
         let previous_hosts = host_set_for_catalog(&catalog_base)
             .context("failed to derive the previous complete hosts projection")?;
         let candidate_hosts = host_set_for_catalog(&catalog_target)
             .context("failed to derive the candidate complete hosts projection")?;
-        let transaction = CatalogPublicationTransaction::new(
-            catalog_base.clone(),
-            catalog_target.clone(),
-            &previous_hosts,
-            &candidate_hosts,
-        )?;
+        let transaction = if schema_migration {
+            anyhow::ensure!(
+                catalog_base == catalog_target,
+                "catalog schema migration must preserve one equal logical image"
+            );
+            CatalogPublicationTransaction::new_v5_migration(
+                catalog_target.clone(),
+                &candidate_hosts,
+            )?
+        } else if catalog_source_version == locald_core::catalog::CATALOG_VERSION {
+            CatalogPublicationTransaction::new(
+                catalog_base.clone(),
+                catalog_target.clone(),
+                &previous_hosts,
+                &candidate_hosts,
+            )?
+        } else {
+            CatalogPublicationTransaction::new_from_catalog_source(
+                catalog_base.clone(),
+                catalog_target.clone(),
+                &previous_hosts,
+                &candidate_hosts,
+                catalog_source_version,
+            )?
+        };
         let generation = transaction.target_generation();
         let catalog_path = transaction.catalog_path().to_path_buf();
 
@@ -3268,7 +3547,11 @@ impl ProcessManager {
         // the target, so only the complete HostSet and live projection need to
         // be reaffirmed.
         let durable_catalog = load_durable_catalog_image(&catalog_path).await;
-        if current == catalog_target {
+        if current == catalog_target
+            && !transaction.is_schema_migration()
+            && transaction.catalog_source_version()
+                == locald_core::catalog::CATALOG_VERSION
+        {
             match durable_catalog {
                 Ok(Some(durable)) if durable == catalog_target => {
                     self.host_set_writer
@@ -3572,6 +3855,14 @@ impl ProcessManager {
         else {
             return Ok(());
         };
+        if transaction.source_requires_v5_backup() {
+            ensure_v5_recovery_backup(
+                &catalog_path,
+                &[transaction.catalog_base(), transaction.catalog_target()],
+            )
+            .await
+            .context("failed to preserve version-5 catalog evidence before publication recovery")?;
+        }
         let generation = transaction.target_generation();
         let current = self.registry.lock().await.clone();
 
@@ -3685,6 +3976,54 @@ impl ProcessManager {
             }
         }
         Ok(())
+    }
+
+    /// Journal and materialize the v5-to-v6 catalog transition before daemon
+    /// listeners or observational status surfaces become available.
+    ///
+    /// `ProjectCatalog` decodes v5 into an equal logical v6 image for recovery,
+    /// but this explicit transition is the only normal-daemon path allowed to
+    /// replace the raw durable predecessor. Its exact backup is established
+    /// before the prepared publication journal.
+    pub(crate) async fn migrate_catalog_schema_if_needed(&self) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let catalog = self.registry.lock().await.clone();
+        let catalog_path = catalog.storage_path().to_path_buf();
+        match catalog_schema_version(&catalog_path)
+            .await
+            .context("failed to inspect the durable project catalog schema")?
+        {
+            Some(version) if version == u64::from(locald_core::catalog::CATALOG_VERSION) => Ok(()),
+            Some(version) if version == u64::from(locald_core::catalog::CATALOG_VERSION - 1) => {
+                ensure_v5_backup(&catalog_path)
+                    .await
+                    .context("failed to preserve the exact version-5 project catalog")?;
+                self.publish_catalog_transition_kind_locked(
+                    catalog.clone(),
+                    catalog,
+                    true,
+                    locald_core::catalog::CATALOG_VERSION - 1,
+                )
+                .await
+                .into_result()
+                .context("failed to publish the version-6 project catalog")?;
+                let published_version = catalog_schema_version(&catalog_path)
+                    .await
+                    .context("failed to verify the published project catalog schema")?;
+                anyhow::ensure!(
+                    published_version == Some(u64::from(locald_core::catalog::CATALOG_VERSION)),
+                    "catalog schema migration completed without publishing version {}",
+                    locald_core::catalog::CATALOG_VERSION
+                );
+                Ok(())
+            }
+            Some(version) => anyhow::bail!(
+                "durable project catalog uses unsupported schema version {version}; expected {} or its version-5 migration predecessor",
+                locald_core::catalog::CATALOG_VERSION
+            ),
+            None => anyhow::bail!("durable project catalog disappeared before schema migration"),
+        }
     }
 
     /// Starts a project from the given path.
@@ -4286,6 +4625,7 @@ impl ProcessManager {
             service_activation,
             service_readiness_timeout,
             agent_conversation,
+            preserve_projection_for_config,
         } = options;
         self.ensure_accepting_lifecycle_requests()?;
         let discovery_before_config = Registry::discover(path.clone()).await?;
@@ -4327,11 +4667,16 @@ impl ProcessManager {
         for guard in &mut plugin_port_guards {
             guard.release_listener();
         }
+        let preserve_configuration_projection = preserve_projection_for_config
+            .is_some_and(|admitted_config| admitted_config == &config);
 
         // Validate the complete post-plugin configuration before publishing
         // identity or domain ownership.
         ConfigLoader::validate_service_names(&config)?;
-        let sorted_services = ConfigLoader::resolve_startup_order(&config)?;
+        let sorted_services = ConfigLoader::resolve_startup_order(&config)?
+            .into_iter()
+            .filter(|service_name| !config.services[service_name].is_published())
+            .collect::<Vec<_>>();
         ConfigLoader::validate_listener_declarations(&config)?;
         crate::generated_files::validate_declarations(&config)?;
         for (service_name, service_config) in &config.services {
@@ -4343,6 +4688,17 @@ impl ProcessManager {
                 })?;
         }
         let service_stop_suppressions = self.service_stop_suppressions.lock().await.clone();
+        let advertised_https_port = if config.services.values().any(ServiceConfig::is_published) {
+            Some(
+                self.proxy_ports
+                    .lock()
+                    .await
+                    .1
+                    .context("published services require an advertised HTTPS proxy listener")?,
+            )
+        } else {
+            None
+        };
         #[cfg(test)]
         self.wait_at_config_publication_hook().await;
         let lifecycle_publication_guard = self.lifecycle_publication_lock.lock().await;
@@ -4360,6 +4716,7 @@ impl ProcessManager {
             instance_id,
             removed_service_names,
             published_domain_index,
+            published_service_list_changed,
             mut reusable_service_envs,
             stopped_service_projections,
             mut prepared_generated_files,
@@ -4373,6 +4730,16 @@ impl ProcessManager {
             let mut candidate = catalog_base.clone();
             let instance_id =
                 candidate.register_project(discovery, Some(config.project.name.clone()))?;
+            let previous_published_projection =
+                Self::admitted_published_service_projection(&catalog_base, instance_id);
+            let previous_display_name = catalog_base
+                .instances
+                .get(&instance_id)
+                .and_then(|record| record.display_name.clone());
+            let candidate_display_name = candidate
+                .instances
+                .get(&instance_id)
+                .and_then(|record| record.display_name.clone());
             if let Some(agent_conversation) = agent_conversation {
                 candidate
                     .bind_agent_conversation(agent_conversation.clone(), instance_id)
@@ -4398,13 +4765,17 @@ impl ProcessManager {
                 .transpose()?;
             let desired_service_names = config
                 .services
-                .keys()
-                .map(|service_name| Self::service_key(instance_id, service_name.clone()))
+                .iter()
+                .filter(|(_, service_config)| !service_config.is_published())
+                .map(|(service_name, _)| Self::service_key(instance_id, service_name.clone()))
                 .collect::<HashSet<_>>();
             let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
             let mut generated_start_candidates = Vec::new();
             if start_services {
                 for (service_name, service_config) in &config.services {
+                    if service_config.is_published() {
+                        continue;
+                    }
                     let key = Self::service_key(instance_id, service_name.clone());
                     let remains_stopped = service_stop_suppressions.contains(&key)
                         && !service_activation
@@ -4463,7 +4834,31 @@ impl ProcessManager {
                 None
             };
             let claims = Self::build_domain_claims(instance_id, &config, domain_slug.as_deref())?;
-            candidate.replace_domain_claims(instance_id, claims)?;
+            let mut published_admissions = match advertised_https_port {
+                Some(port) => {
+                    Self::build_published_service_admissions(instance_id, &config, &claims, port)?
+                }
+                None => Vec::new(),
+            };
+            published_admissions.sort_by(|left, right| left.service_name.cmp(&right.service_name));
+            let has_published_projection =
+                !previous_published_projection.is_empty() || !published_admissions.is_empty();
+            let published_service_list_changed = previous_published_projection
+                != published_admissions
+                || (has_published_projection && previous_display_name != candidate_display_name);
+            if !preserve_configuration_projection
+                || !candidate.configuration_projection_matches(
+                    instance_id,
+                    claims.clone(),
+                    published_admissions.clone(),
+                )?
+            {
+                candidate.replace_configuration_projection(
+                    instance_id,
+                    claims,
+                    published_admissions,
+                )?;
+            }
             let candidate_domain_index = Arc::new(candidate.domain_index().clone());
 
             // Publish declared generated-source paths to the existing project
@@ -4579,6 +4974,7 @@ impl ProcessManager {
                 instance_id,
                 removed_service_names,
                 published_domain_index,
+                published_service_list_changed,
                 reusable_service_envs,
                 stopped_service_projections,
                 prepared_generated_files,
@@ -4633,6 +5029,9 @@ impl ProcessManager {
             }
             for key in &published_stopped_service_names {
                 self.broadcast_service_update(key).await;
+            }
+            if published_service_list_changed {
+                let _ = self.event_sender.send(Event::ServiceListChanged);
             }
             if !removed_service_names.is_empty() {
                 let removed_service_names = removed_service_names.iter().cloned().collect();
@@ -5171,6 +5570,8 @@ impl ProcessManager {
     ) -> Result<()> {
         loop {
             let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
+                self.reject_published_service_operation(instance_id, name, "stop")
+                    .await?;
                 return Ok(());
             };
             let instance_id = key.instance();
@@ -5221,6 +5622,8 @@ impl ProcessManager {
     ) -> Result<()> {
         loop {
             let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
+                self.reject_published_service_operation(instance_id, name, "start")
+                    .await?;
                 return Err(ServiceNotFoundError.into());
             };
             let instance_id = key.instance();
@@ -5418,58 +5821,20 @@ impl ProcessManager {
 
     pub async fn stop_all(&self) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
-        let catalog_instances = {
-            let registry = self.registry.lock().await;
-            registry
-                .instances
-                .iter()
-                .map(|(instance_id, record)| {
-                    (
-                        *instance_id,
-                        record
-                            .current_path
-                            .clone()
-                            .unwrap_or_else(|| record.last_known_path.clone()),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut managed_instances = Vec::new();
-        let mut managed_ids = HashSet::new();
-        for (instance_id, path) in catalog_instances {
-            if self.availability_is_managed(instance_id).await? {
-                managed_ids.insert(instance_id);
-                managed_instances.push((instance_id, path));
-            }
-        }
-        let mut uncatalogued_paths = {
-            let services = self
-                .services
-                .lock()
-                .await
-                .values()
-                .map(|service| (service.instance_id, service.path.clone()))
-                .collect::<Vec<_>>();
-            let mut uncatalogued_paths = HashSet::new();
-            for (instance_id, path) in services {
-                if !managed_ids.contains(&instance_id) {
-                    uncatalogued_paths.insert(Self::canonicalize_path(&path));
-                }
-            }
-            uncatalogued_paths.into_iter().collect::<Vec<_>>()
-        };
-        managed_instances.sort_by_key(|(instance_id, _)| *instance_id);
-        uncatalogued_paths.sort();
+        let mut managed_services = self
+            .services
+            .lock()
+            .await
+            .keys()
+            .map(|key| (key.instance(), key.name().to_string()))
+            .collect::<Vec<_>>();
+        managed_services.sort();
 
-        for (instance_id, path) in managed_instances {
-            if let Err(error) = self.project_force_stop(path).await {
-                error!("Failed to stop project instance {instance_id}: {error}");
-            }
-        }
-
-        for path in uncatalogued_paths {
-            if let Err(error) = self.stop_project(&path).await {
-                error!("Failed to stop project at {}: {error}", path.display());
+        for (instance_id, service_name) in managed_services {
+            if let Err(error) = self.stop_instance_service(instance_id, &service_name).await {
+                error!(
+                    "Failed to stop managed service {service_name} in project instance {instance_id}: {error}"
+                );
             }
         }
         Ok(())
@@ -5655,6 +6020,8 @@ impl ProcessManager {
     ) -> Result<()> {
         loop {
             let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
+                self.reject_published_service_operation(instance_id, name, "restart")
+                    .await?;
                 return Err(ServiceNotFoundError.into());
             };
             let instance_id = key.instance();
@@ -5668,6 +6035,13 @@ impl ProcessManager {
             if self.get_service_path_by_key(&key).await.is_none() {
                 continue;
             }
+            let admitted_config = self
+                .services
+                .lock()
+                .await
+                .get(&key)
+                .map(|service| service.config.clone())
+                .context("selected service lost its admitted configuration during restart")?;
             self.ensure_accepting_lifecycle_requests()?;
             self.availability_authorizes_start(instance_id).await?;
             self.stop_service_locked(&key, &path).await?;
@@ -5679,22 +6053,44 @@ impl ProcessManager {
                     None,
                     false,
                     Some(ConfigIdentityExpectation::Existing(instance_id)),
-                    ConfigApplyOptions::foreground(true, None),
+                    ConfigApplyOptions::foreground(true, None)
+                        .preserving_projection_for(&admitted_config),
                 )
                 .await
                 .map(|_| ());
         }
     }
 
-    async fn restart_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
-        let coordinator = self.availability_coordinator(instance_id).await;
-        let _availability_guard = coordinator.runtime.lock().await;
+    pub async fn restart_project(&self, project_path: &Path) -> Result<()> {
         self.ensure_accepting_lifecycle_requests()?;
-        self.availability_authorizes_start(instance_id).await?;
+        let canonical = Self::canonicalize_path(project_path);
+        let target = self
+            .resolve_lifecycle_target(&canonical)
+            .await?
+            .into_mutation_target(&canonical, "project restart")?
+            .context("project restart requires a catalogued project instance")?;
+        self.restart_project_instance_at_path(target.instance_id, canonical)
+            .await
+    }
+
+    async fn restart_project_instance(&self, instance_id: ProjectInstanceId) -> Result<()> {
         let project_path = self
             .active_path_for_instance(instance_id)
             .await
             .context("catalogued project instance has no active path")?;
+        self.restart_project_instance_at_path(instance_id, project_path)
+            .await
+    }
+
+    async fn restart_project_instance_at_path(
+        &self,
+        instance_id: ProjectInstanceId,
+        project_path: PathBuf,
+    ) -> Result<()> {
+        let coordinator = self.availability_coordinator(instance_id).await;
+        let _availability_guard = coordinator.runtime.lock().await;
+        self.ensure_accepting_lifecycle_requests()?;
+        self.availability_authorizes_start(instance_id).await?;
         let (project_path, transition_lock) = self.transition_lock_for_path(&project_path).await;
         let _transition_guard = transition_lock.lock().await;
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
@@ -5703,6 +6099,21 @@ impl ProcessManager {
             "project instance {instance_id} changed path during restart"
         );
         self.availability_authorizes_start(instance_id).await?;
+        let admitted_config = {
+            let services = self.services.lock().await;
+            let mut configs = services
+                .values()
+                .filter(|service| service.instance_id == instance_id)
+                .map(|service| service.config.clone());
+            let admitted = configs
+                .next()
+                .context("project restart requires at least one locald-managed service")?;
+            anyhow::ensure!(
+                configs.all(|config| config == admitted),
+                "project instance {instance_id} has inconsistent admitted service configurations"
+            );
+            admitted
+        };
         self.stop_project_instance_locked(instance_id).await?;
         self.clear_service_stop_suppressions(instance_id).await;
         self.watch_config(project_path.clone()).await;
@@ -5711,7 +6122,7 @@ impl ProcessManager {
             None,
             false,
             Some(ConfigIdentityExpectation::Existing(instance_id)),
-            ConfigApplyOptions::foreground(true, None),
+            ConfigApplyOptions::foreground(true, None).preserving_projection_for(&admitted_config),
         )
         .await
         .map(|_| ())
@@ -5771,6 +6182,8 @@ impl ProcessManager {
         info!("Resetting service {}", name);
 
         let Some(key) = self.resolve_selected_service_key(instance_id, name).await? else {
+            self.reject_published_service_operation(instance_id, name, "reset")
+                .await?;
             anyhow::bail!("Service {name} not found");
         };
         let instance_id = key.instance();
@@ -5879,6 +6292,7 @@ impl ProcessManager {
     ) -> Vec<(ProjectInstanceId, ServiceStatus)> {
         let proxy_ports = { *self.proxy_ports.lock().await };
         let mut snapshots = Vec::new();
+        let mut managed_keys = HashSet::new();
 
         {
             let mut services = self.services.lock().await;
@@ -5894,6 +6308,7 @@ impl ProcessManager {
                 if instance_filter.is_some_and(|instance_id| service.instance_id != instance_id) {
                     continue;
                 }
+                managed_keys.insert(key.clone());
                 let snapshot = match &service.runtime_state {
                     ServiceRuntime::Controller(c) => RuntimeSnapshot::Controller(c.clone()),
                     ServiceRuntime::None => RuntimeSnapshot::Static {
@@ -5922,6 +6337,26 @@ impl ProcessManager {
                 ));
             }
         }
+
+        let published = {
+            let registry = self.registry.lock().await;
+            let mut published = Vec::new();
+            for (instance_id, declarations) in registry.published_declarations() {
+                if instance_filter.is_some_and(|filter| filter != instance_id) {
+                    continue;
+                }
+                let Some(record) = registry.instances.get(&instance_id).cloned() else {
+                    continue;
+                };
+                for declaration in declarations.values() {
+                    let key = ServiceKey::new(instance_id, declaration.service_name.clone());
+                    if !managed_keys.contains(&key) {
+                        published.push((record.clone(), declaration.clone()));
+                    }
+                }
+            }
+            published
+        };
 
         let mut results = Vec::new();
         for (
@@ -5959,6 +6394,18 @@ impl ProcessManager {
                 .await,
             ));
         }
+        for (record, declaration) in published {
+            let instance_id = record.id;
+            results.push((
+                instance_id,
+                self.published_service_status(&record, &declaration).await,
+            ));
+        }
+        results.sort_by(|(left_instance, left), (right_instance, right)| {
+            left_instance
+                .cmp(right_instance)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         results
     }
 
@@ -6039,6 +6486,38 @@ impl ProcessManager {
                 Some(DomainTarget::Platform { .. }) | None => return None,
             }
         };
+        let published = {
+            let catalog = self.registry.lock().await;
+            let record = catalog.instances.get(&claimed_instance_id);
+            let declaration = catalog
+                .published_declarations_for_instance(claimed_instance_id)
+                .and_then(|declarations| {
+                    declarations.values().find(|declaration| {
+                        declaration.service_name.as_str() == service_name
+                            || record
+                                .and_then(|record| record.display_name.as_deref())
+                                .is_some_and(|project_name| {
+                                    service_name
+                                        == format!(
+                                            "{project_name}:{}",
+                                            declaration.service_name.as_str()
+                                        )
+                                })
+                    })
+                });
+            record.cloned().zip(declaration.cloned())
+        };
+        if let Some((record, declaration)) = published {
+            let status = self.published_service_status(&record, &declaration).await;
+            if let Some(publication) = status.publication {
+                return Some(
+                    locald_core::resolver::DomainResolution::PublishedUnavailable {
+                        name: status.name,
+                        publication,
+                    },
+                );
+            }
+        }
         let runtime = {
             let services = self.services.lock().await;
             Self::service_key_for_instance(&services, claimed_instance_id, &service_name).and_then(
@@ -7775,12 +8254,20 @@ impl ProcessManager {
         let mut services = config
             .services
             .iter()
-            .map(|(name, service)| AgentServiceStatus {
-                name: name.clone(),
-                service_type: locald_core::ipc::ServiceType::from(service),
-                status: ServiceState::Stopped,
-                health_status: HealthStatus::Unknown,
-                url: None,
+            .map(|(name, service)| {
+                let published = service.is_published();
+                AgentServiceStatus {
+                    name: name.clone(),
+                    service_type: locald_core::ipc::ServiceType::from(service),
+                    status: if published {
+                        ServiceState::ExternallyManaged
+                    } else {
+                        ServiceState::Stopped
+                    },
+                    health_status: HealthStatus::Unknown,
+                    url: None,
+                    publication: None,
+                }
             })
             .collect::<Vec<_>>();
         services.sort_by(|left, right| left.name.cmp(&right.name));
@@ -7906,6 +8393,7 @@ impl ProcessManager {
                         status: status.status,
                         health_status: status.health_status,
                         url,
+                        publication: status.publication,
                     },
                 )
             })
@@ -7940,9 +8428,14 @@ impl ProcessManager {
                     AgentServiceStatus {
                         name,
                         service_type,
-                        status: ServiceState::Stopped,
+                        status: if service_type == locald_core::ipc::ServiceType::Published {
+                            ServiceState::ExternallyManaged
+                        } else {
+                            ServiceState::Stopped
+                        },
                         health_status: HealthStatus::Unknown,
                         url,
+                        publication: None,
                     }
                 });
             }
@@ -8128,8 +8621,15 @@ impl ProcessManager {
             batch.push(AvailabilityBatchOperation::EnsureDemand(demand));
             let durability_error = if target.catalog_base == target.catalog_target {
                 let mut availability = self.load_availability(instance_id).await?;
+                let was_paused = availability.snapshot().await?.is_paused();
                 let (_, durability_error) =
                     Self::capture_availability_publication(availability.apply_batch(&batch).await)?;
+                self.broadcast_published_service_projection_if_pause_changed(
+                    instance_id,
+                    was_paused,
+                    false,
+                )
+                .await;
                 durability_error
             } else {
                 // Discovery reactivates a catalogued instance in the target
@@ -8305,12 +8805,15 @@ impl ProcessManager {
         let mut urls = BTreeSet::new();
         let mut services = Vec::with_capacity(statuses.len());
         for status in statuses {
-            anyhow::ensure!(
-                status.status == ServiceState::Running
-                    && status.health_status == HealthStatus::Healthy,
-                "service `{}` did not remain ready while finalizing EnsureProject",
-                status.name
-            );
+            let is_published = status.service_type == locald_core::ipc::ServiceType::Published;
+            if !is_published {
+                anyhow::ensure!(
+                    status.status == ServiceState::Running
+                        && status.health_status == HealthStatus::Healthy,
+                    "service `{}` did not remain ready while finalizing EnsureProject",
+                    status.name
+                );
+            }
             let routed_url = if status.url.is_some() {
                 status.domain.as_ref().map(|domain| {
                     if advertised_https_port == 443 {
@@ -8331,6 +8834,7 @@ impl ProcessManager {
                 status: status.status,
                 health_status: status.health_status,
                 url: routed_url,
+                publication: status.publication,
             });
         }
 
@@ -8483,8 +8987,15 @@ impl ProcessManager {
                 "project instance {instance_id} is no longer active"
             );
             let mut availability = self.load_availability(instance_id).await?;
+            let was_paused = availability.snapshot().await?.is_paused();
             let (result, durability_error) =
                 Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
+            self.broadcast_published_service_projection_if_pause_changed(
+                instance_id,
+                was_paused,
+                false,
+            )
+            .await;
             drop(publication_guard);
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
@@ -8556,8 +9067,15 @@ impl ProcessManager {
                 "project instance {instance_id} is no longer active"
             );
             let mut availability = self.load_availability(instance_id).await?;
+            let was_paused = availability.snapshot().await?.is_paused();
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.pause_project().await)?;
+            self.broadcast_published_service_projection_if_pause_changed(
+                instance_id,
+                was_paused,
+                true,
+            )
+            .await;
             drop(publication_guard);
             let convergence = self
                 .converge_managed_instance(instance_id, None, false, false)
@@ -8587,6 +9105,16 @@ impl ProcessManager {
         if let Some(mut transaction) = transaction {
             let catalog_path = self.registry.lock().await.storage_path().to_path_buf();
             transaction.normalize_catalog_storage_path(&catalog_path);
+            if let Some(images) = transaction
+                .catalog()
+                .filter(|images| images.source_requires_v5_backup())
+            {
+                ensure_v5_recovery_backup(&catalog_path, &[images.base(), images.target()])
+                    .await
+                    .context(
+                        "failed to preserve version-5 catalog evidence before lifecycle recovery",
+                    )?;
+            }
             self.apply_lifecycle_transaction_locked(&transaction)
                 .await?;
         }
@@ -8610,6 +9138,28 @@ impl ProcessManager {
             let registry = self.registry.lock().await;
             (registry.clone(), registry.storage_path().to_path_buf())
         };
+        let durable_catalog_version = catalog_schema_version(&catalog_path)
+            .await
+            .context("failed to inspect the catalog schema before lifecycle migration")?;
+        let catalog_source_version = match durable_catalog_version {
+            Some(version)
+                if (2..=u64::from(locald_core::catalog::CATALOG_VERSION)).contains(&version) =>
+            {
+                u32::try_from(version)
+                    .context("supported catalog source version does not fit in u32")?
+            }
+            Some(version) => anyhow::bail!(
+                "durable project catalog uses unsupported schema version {version} during initial lifecycle migration"
+            ),
+            None => locald_core::catalog::CATALOG_VERSION,
+        };
+        if catalog_source_version == locald_core::catalog::CATALOG_VERSION - 1 {
+            ensure_v5_recovery_backup(&catalog_path, &[&catalog_base])
+                .await
+                .context(
+                    "failed to preserve version-5 catalog evidence before initial lifecycle migration",
+                )?;
+        }
         let (attachment_base, attachment_path, evidence) = {
             let attachments = self.attachments.lock().await;
             (
@@ -8769,7 +9319,11 @@ impl ProcessManager {
         let transaction = LifecycleTransaction::new(
             LifecycleTransactionKind::LegacyV1Migration,
             effective_at,
-            Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+            Some(CatalogTransactionImages::new_from_catalog_source(
+                catalog_base,
+                catalog_target,
+                catalog_source_version,
+            )?),
             prepared_availability,
             AttachmentTransactionImages::new(attachment_base, attachment_target),
         )?;
@@ -8814,11 +9368,38 @@ impl ProcessManager {
         if catalog_target == catalog_base {
             return Ok(());
         }
+        let catalog_path = catalog_base.storage_path().to_path_buf();
+        let durable_catalog_version = catalog_schema_version(&catalog_path)
+            .await
+            .context("failed to inspect the catalog schema before presence reconciliation")?;
+        let catalog_source_version = match durable_catalog_version {
+            Some(version)
+                if (2..=u64::from(locald_core::catalog::CATALOG_VERSION)).contains(&version) =>
+            {
+                u32::try_from(version)
+                    .context("supported catalog source version does not fit in u32")?
+            }
+            Some(version) => anyhow::bail!(
+                "durable project catalog uses unsupported schema version {version} during presence reconciliation"
+            ),
+            None => locald_core::catalog::CATALOG_VERSION,
+        };
+        if catalog_source_version == locald_core::catalog::CATALOG_VERSION - 1 {
+            ensure_v5_recovery_backup(&catalog_path, &[&catalog_base, &catalog_target])
+                .await
+                .context(
+                    "failed to preserve version-5 catalog evidence before presence reconciliation",
+                )?;
+        }
         let attachments = self.attachments.lock().await.snapshot();
         let transaction = LifecycleTransaction::new(
             LifecycleTransactionKind::LifecycleMutation,
             self.availability_now(),
-            Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+            Some(CatalogTransactionImages::new_from_catalog_source(
+                catalog_base,
+                catalog_target,
+                catalog_source_version,
+            )?),
             Vec::new(),
             AttachmentTransactionImages::new(attachments.clone(), attachments),
         )?;
@@ -8882,9 +9463,11 @@ impl ProcessManager {
         if phase == LifecycleTransactionPhase::Prepared {
             if let Some(images) = transaction.catalog() {
                 let outcome = self
-                    .publish_catalog_transition_locked(
+                    .publish_catalog_transition_kind_locked(
                         images.base().clone(),
                         images.target().clone(),
+                        false,
+                        images.catalog_source_version(),
                     )
                     .await;
                 let (catalog_result, published) = outcome.into_parts();
@@ -8904,11 +9487,35 @@ impl ProcessManager {
         }
 
         if phase == LifecycleTransactionPhase::CatalogPublished {
+            let mut published_projection_changed = false;
             for prepared in transaction.availability() {
+                let was_paused = prepared
+                    .expected()
+                    .availability()
+                    .is_some_and(ProjectAvailability::is_paused);
+                let is_paused = prepared
+                    .target()
+                    .availability()
+                    .is_some_and(ProjectAvailability::is_paused);
                 let mut availability = self
                     .load_availability(prepared.project_instance_id())
                     .await?;
-                availability.apply_prepared_batch(prepared).await?;
+                let publication = availability.apply_prepared_batch(prepared).await;
+                let authoritative = publication.is_ok()
+                    || matches!(
+                        &publication,
+                        Err(AvailabilityError::PublishedNotDurable { .. })
+                    );
+                if authoritative && !published_projection_changed {
+                    published_projection_changed = self
+                        .broadcast_published_service_projection_if_pause_changed(
+                            prepared.project_instance_id(),
+                            was_paused,
+                            is_paused,
+                        )
+                        .await;
+                }
+                publication?;
             }
             self.lifecycle_journal
                 .advance(
@@ -9346,16 +9953,24 @@ impl ProcessManager {
                 })
                 .collect::<HashSet<_>>()
         };
-        let unsuppressed = services
+        let managed_services = services
             .iter()
+            .filter(|service| service.service_type != locald_core::ipc::ServiceType::Published)
+            .collect::<Vec<_>>();
+        let has_published_service = services
+            .iter()
+            .any(|service| service.service_type == locald_core::ipc::ServiceType::Published);
+        let unsuppressed = managed_services
+            .iter()
+            .copied()
             .filter(|service| !suppressed.contains(&service.name))
             .collect::<Vec<_>>();
-        let runtime_running = services
+        let runtime_running = managed_services
             .iter()
             .any(|service| service.status == ServiceState::Running);
         let runtime_ready = suppressed.is_empty()
-            && !services.is_empty()
-            && services.iter().all(|service| {
+            && (!managed_services.is_empty() || has_published_service)
+            && managed_services.iter().all(|service| {
                 service.status == ServiceState::Running
                     && service.health_status == HealthStatus::Healthy
             });
@@ -9816,162 +10431,170 @@ impl ProcessManager {
         self.registry_set_always_on(path, false).await
     }
 
-    async fn registry_set_always_on(&self, path: &Path, enabled: bool) -> Result<()> {
-        self.ensure_accepting_lifecycle_requests()?;
-        let canonical = Self::canonicalize_path(path);
-        let transition_guard = self.attachment_transition_lock.lock().await;
-        self.ensure_accepting_lifecycle_requests()?;
-        let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
-        let expected_resolution = initial_resolution.identity();
-        let initial_target =
-            initial_resolution.into_mutation_target(&canonical, "Always On update")?;
-        let Some(_initial_target) = initial_target else {
+    fn registry_set_always_on<'a>(
+        &'a self,
+        path: &'a Path,
+        enabled: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.ensure_accepting_lifecycle_requests()?;
+            let canonical = Self::canonicalize_path(path);
+            let transition_guard = self.attachment_transition_lock.lock().await;
+            self.ensure_accepting_lifecycle_requests()?;
+            let initial_resolution = self.resolve_lifecycle_target(&canonical).await?;
+            let expected_resolution = initial_resolution.identity();
+            let initial_target =
+                initial_resolution.into_mutation_target(&canonical, "Always On update")?;
+            let Some(_initial_target) = initial_target else {
+                let publication_guard = self.lifecycle_publication_lock.lock().await;
+                self.ensure_lifecycle_publication_available()?;
+                let resolution = self.resolve_lifecycle_target(&canonical).await?;
+                anyhow::ensure!(
+                    resolution.identity() == expected_resolution,
+                    "project identity materialized while Always On was waiting for lifecycle ownership; retry the command"
+                );
+                let confirmed_target =
+                    resolution.into_mutation_target(&canonical, "Always On update")?;
+                anyhow::ensure!(
+                    confirmed_target.is_none(),
+                    "project identity materialized while Always On was waiting for lifecycle ownership; retry the command"
+                );
+                let (catalog_base, mut catalog_target) = {
+                    let registry = self.registry.lock().await;
+                    (registry.clone(), registry.clone())
+                };
+                let changed = if enabled {
+                    catalog_target.pin_project(&canonical)
+                } else {
+                    catalog_target.unpin_project(&canonical)
+                };
+                anyhow::ensure!(changed, "Project not found in registry");
+                let attachment_base = self.attachments.lock().await.snapshot();
+                let mut attachment_target = attachment_base.clone();
+                let compatibility = attachment_target.project(&canonical);
+                attachment_target.replace_project(
+                    &canonical,
+                    compatibility
+                        .attachments
+                        .into_iter()
+                        .filter(|attachment| {
+                            enabled || !matches!(attachment.source, AttachmentSource::Pin)
+                        })
+                        .collect(),
+                    compatibility.manually_stopped && !enabled,
+                );
+                let transaction = LifecycleTransaction::new(
+                    LifecycleTransactionKind::LifecycleMutation,
+                    self.availability_now(),
+                    Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
+                    Vec::new(),
+                    AttachmentTransactionImages::new(attachment_base, attachment_target),
+                )?;
+                self.create_and_apply_lifecycle_transaction_locked(&transaction)
+                    .await?;
+                drop(publication_guard);
+                drop(transition_guard);
+                return Ok(());
+            };
             let publication_guard = self.lifecycle_publication_lock.lock().await;
             self.ensure_lifecycle_publication_available()?;
             let resolution = self.resolve_lifecycle_target(&canonical).await?;
             anyhow::ensure!(
                 resolution.identity() == expected_resolution,
-                "project identity materialized while Always On was waiting for lifecycle ownership; retry the command"
+                "project identity changed during Always On update"
             );
-            let confirmed_target =
-                resolution.into_mutation_target(&canonical, "Always On update")?;
-            anyhow::ensure!(
-                confirmed_target.is_none(),
-                "project identity materialized while Always On was waiting for lifecycle ownership; retry the command"
-            );
-            let (catalog_base, mut catalog_target) = {
-                let registry = self.registry.lock().await;
-                (registry.clone(), registry.clone())
-            };
+            let mut target = resolution
+                .into_mutation_target(&canonical, "Always On update")?
+                .context("Project not found in registry")?;
+            let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
             let changed = if enabled {
-                catalog_target.pin_project(&canonical)
+                target.catalog_target.pin_project(&canonical)
             } else {
-                catalog_target.unpin_project(&canonical)
+                target.catalog_target.unpin_project(&canonical)
             };
             anyhow::ensure!(changed, "Project not found in registry");
+            let instance_id = target.instance_id;
+            let effective_at = self.availability_now();
+            let include_deferred = !self.availability_record_exists(instance_id).await?;
             let attachment_base = self.attachments.lock().await.snapshot();
             let mut attachment_target = attachment_base.clone();
-            let compatibility = attachment_target.project(&canonical);
-            attachment_target.replace_project(
-                &canonical,
-                compatibility
-                    .attachments
-                    .into_iter()
-                    .filter(|attachment| {
-                        enabled || !matches!(attachment.source, AttachmentSource::Pin)
-                    })
-                    .collect(),
-                compatibility.manually_stopped && !enabled,
-            );
-            let transaction = LifecycleTransaction::new(
-                LifecycleTransactionKind::LifecycleMutation,
-                self.availability_now(),
-                Some(CatalogTransactionImages::new(catalog_base, catalog_target)?),
-                Vec::new(),
-                AttachmentTransactionImages::new(attachment_base, attachment_target),
-            )?;
+            if enabled {
+                for path in &lifecycle_paths {
+                    if Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
+                        || (include_deferred
+                            && Self::attachment_path_can_initialize_target(
+                                &attachment_base,
+                                &target,
+                                path,
+                            ))
+                    {
+                        let compatibility = attachment_target.project(path);
+                        attachment_target.replace_project(path, compatibility.attachments, false);
+                    } else if path == &canonical {
+                        attachment_target.replace_project(path, Vec::new(), false);
+                    }
+                }
+            } else {
+                for path in &lifecycle_paths {
+                    if !(Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
+                        || include_deferred
+                            && Self::attachment_path_can_initialize_target(
+                                &attachment_base,
+                                &target,
+                                path,
+                            ))
+                    {
+                        if path == &canonical {
+                            attachment_target.replace_project(path, Vec::new(), false);
+                        }
+                        continue;
+                    }
+                    let compatibility = attachment_target.project(path);
+                    attachment_target.replace_project(
+                        path,
+                        compatibility
+                            .attachments
+                            .into_iter()
+                            .filter(|attachment| {
+                                !matches!(attachment.source, AttachmentSource::Pin)
+                            })
+                            .collect(),
+                        compatibility.manually_stopped,
+                    );
+                }
+            }
+            let batch = AvailabilityBatch::new(effective_at)
+                .with_operation(AvailabilityBatchOperation::SetAlwaysOn(enabled));
+            let transaction = self
+                .prepare_project_lifecycle_transaction(
+                    target,
+                    &batch,
+                    attachment_base,
+                    attachment_target,
+                )
+                .await?;
             self.create_and_apply_lifecycle_transaction_locked(&transaction)
                 .await?;
             drop(publication_guard);
             drop(transition_guard);
-            return Ok(());
-        };
-        let publication_guard = self.lifecycle_publication_lock.lock().await;
-        self.ensure_lifecycle_publication_available()?;
-        let resolution = self.resolve_lifecycle_target(&canonical).await?;
-        anyhow::ensure!(
-            resolution.identity() == expected_resolution,
-            "project identity changed during Always On update"
-        );
-        let mut target = resolution
-            .into_mutation_target(&canonical, "Always On update")?
-            .context("Project not found in registry")?;
-        let lifecycle_paths = Self::catalogued_lifecycle_paths(&target);
-        let changed = if enabled {
-            target.catalog_target.pin_project(&canonical)
-        } else {
-            target.catalog_target.unpin_project(&canonical)
-        };
-        anyhow::ensure!(changed, "Project not found in registry");
-        let instance_id = target.instance_id;
-        let effective_at = self.availability_now();
-        let include_deferred = !self.availability_record_exists(instance_id).await?;
-        let attachment_base = self.attachments.lock().await.snapshot();
-        let mut attachment_target = attachment_base.clone();
-        if enabled {
-            for path in &lifecycle_paths {
-                if Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
-                    || (include_deferred
-                        && Self::attachment_path_can_initialize_target(
-                            &attachment_base,
-                            &target,
-                            path,
-                        ))
-                {
-                    let compatibility = attachment_target.project(path);
-                    attachment_target.replace_project(path, compatibility.attachments, false);
-                } else if path == &canonical {
-                    attachment_target.replace_project(path, Vec::new(), false);
-                }
-            }
-        } else {
-            for path in &lifecycle_paths {
-                if !(Self::attachment_path_is_owned_by_target(&attachment_base, &target, path)
-                    || include_deferred
-                        && Self::attachment_path_can_initialize_target(
-                            &attachment_base,
-                            &target,
-                            path,
-                        ))
-                {
-                    if path == &canonical {
-                        attachment_target.replace_project(path, Vec::new(), false);
-                    }
-                    continue;
-                }
-                let compatibility = attachment_target.project(path);
-                attachment_target.replace_project(
-                    path,
-                    compatibility
-                        .attachments
-                        .into_iter()
-                        .filter(|attachment| !matches!(attachment.source, AttachmentSource::Pin))
-                        .collect(),
-                    compatibility.manually_stopped,
-                );
-            }
-        }
-        let batch = AvailabilityBatch::new(effective_at)
-            .with_operation(AvailabilityBatchOperation::SetAlwaysOn(enabled));
-        let transaction = self
-            .prepare_project_lifecycle_transaction(
-                target,
-                &batch,
-                attachment_base,
-                attachment_target,
-            )
-            .await?;
-        self.create_and_apply_lifecycle_transaction_locked(&transaction)
-            .await?;
-        drop(publication_guard);
-        drop(transition_guard);
-        if enabled {
-            let coordinator = self.availability_coordinator(instance_id).await;
-            let _runtime_guard = coordinator.runtime.lock().await;
-            self.clear_service_stop_suppressions(instance_id).await;
-            self.converge_managed_instance_locked(
-                instance_id,
-                None,
-                false,
-                false,
-                SERVICE_READINESS_TIMEOUT,
-            )
-            .await?;
-        } else {
-            self.converge_managed_instance(instance_id, None, false, false)
+            if enabled {
+                let coordinator = self.availability_coordinator(instance_id).await;
+                let _runtime_guard = coordinator.runtime.lock().await;
+                self.clear_service_stop_suppressions(instance_id).await;
+                self.converge_managed_instance_locked(
+                    instance_id,
+                    None,
+                    false,
+                    false,
+                    SERVICE_READINESS_TIMEOUT,
+                )
                 .await?;
-        }
-        Ok(())
+            } else {
+                self.converge_managed_instance(instance_id, None, false, false)
+                    .await?;
+            }
+            Ok(())
+        })
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -10365,11 +10988,18 @@ impl ProcessManager {
             "project instance {instance_id} is no longer active"
         );
         let mut availability = self.load_availability(instance_id).await?;
+        let was_paused = availability.snapshot().await?.is_paused();
         let (_, durability_error) = Self::capture_availability_publication(
             availability
                 .ensure_demand(DemandKey::stopped_page_resume())
                 .await,
         )?;
+        self.broadcast_published_service_projection_if_pause_changed(
+            instance_id,
+            was_paused,
+            false,
+        )
+        .await;
         Ok(durability_error)
     }
 
@@ -10517,7 +11147,10 @@ impl ProcessManager {
                 .collect::<Vec<_>>()
         };
         if runtimes.is_empty() {
-            return false;
+            let registry = self.registry.lock().await;
+            return registry
+                .published_declarations_for_instance(instance_id)
+                .is_some_and(|declarations| !declarations.is_empty());
         }
 
         for (name, runtime, health_status) in runtimes {
@@ -11289,10 +11922,121 @@ impl ProcessManager {
         instance_id: Option<ProjectInstanceId>,
         name: &str,
     ) -> Result<Option<ServiceKey>> {
-        match instance_id {
+        let managed = match instance_id {
             Some(instance_id) => Ok(self.resolve_instance_service_key(instance_id, name).await),
             None => self.resolve_unique_service_key(name).await,
+        }?;
+        if let Some(managed_key) = &managed
+            && let Some(published_key) = self
+                .resolve_selected_published_service_key(instance_id, name)
+                .await?
+        {
+            anyhow::bail!(
+                "service selector `{name}` is ambiguous between managed instance {} and externally published instance {}; select the intended project instance explicitly",
+                managed_key.instance(),
+                published_key.instance()
+            );
         }
+        Ok(managed)
+    }
+
+    async fn resolve_selected_published_service_key(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<Option<ServiceKey>> {
+        let registry = self.registry.lock().await;
+        let mut matches = Vec::new();
+        for (candidate_instance, declarations) in registry.published_declarations() {
+            if instance_id.is_some_and(|expected| expected != candidate_instance) {
+                continue;
+            }
+            let display_name = registry
+                .instances
+                .get(&candidate_instance)
+                .and_then(|record| record.display_name.as_deref());
+            for service_name in declarations.keys() {
+                let full_name =
+                    display_name.map(|project_name| format!("{project_name}:{service_name}"));
+                if service_name.as_str() == name || full_name.as_deref() == Some(name) {
+                    matches.push(ServiceKey::new(candidate_instance, service_name.clone()));
+                }
+            }
+        }
+        let first = matches.pop();
+        if let Some(other) = matches.pop() {
+            let first = first
+                .as_ref()
+                .expect("second published match requires first");
+            anyhow::bail!(
+                "published service `{name}` is ambiguous across project instances {} and {}",
+                first.instance(),
+                other.instance()
+            );
+        }
+        Ok(first)
+    }
+
+    async fn selected_published_service_status(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<Option<ServiceStatus>> {
+        let Some(key) = self
+            .resolve_selected_published_service_key(instance_id, name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let projection = {
+            let registry = self.registry.lock().await;
+            registry
+                .instances
+                .get(&key.instance())
+                .cloned()
+                .zip(registry.published_declaration_by_key(&key).cloned())
+        };
+        let Some((record, declaration)) = projection else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.published_service_status(&record, &declaration).await,
+        ))
+    }
+
+    async fn reject_published_service_operation(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+        operation: &str,
+    ) -> Result<()> {
+        if self
+            .resolve_selected_published_service_key(instance_id, name)
+            .await?
+            .is_some()
+        {
+            anyhow::bail!(
+                "service `{name}` is externally managed; locald cannot {operation} its process, binding, route, or data. Use the service's owning workflow instead; no lifecycle state was changed"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn reject_published_service_logs(
+        &self,
+        instance_id: Option<ProjectInstanceId>,
+        name: &str,
+    ) -> Result<()> {
+        if self
+            .resolve_selected_published_service_key(instance_id, name)
+            .await?
+            .is_some()
+        {
+            anyhow::bail!(
+                "service `{name}` is externally managed; locald does not own its process logs. Inspect logs through the service's owning workflow"
+            );
+        }
+        Ok(())
     }
 
     async fn get_service_path_by_key(&self, key: &ServiceKey) -> Option<PathBuf> {
@@ -11302,9 +12046,21 @@ impl ProcessManager {
 
     pub async fn get_service_env(&self, name: &str) -> Result<HashMap<String, String>> {
         let key = self
-            .resolve_unique_service_key(name)
+            .resolve_selected_service_key(None, name)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Service {name} not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("Service {name} not found"));
+        let key = match key {
+            Ok(key) => key,
+            Err(error) => {
+                self.reject_published_service_operation(
+                    None,
+                    name,
+                    "provide a runtime environment for",
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let Some((_path, _transition_guard, _runtime_projection_guard)) =
             self.lock_service_runtime_transition(&key).await
         else {
@@ -11410,10 +12166,32 @@ impl ProcessManager {
         instance_id: Option<ProjectInstanceId>,
         name: &str,
     ) -> Result<serde_json::Value> {
-        let key = self
-            .resolve_selected_service_key(instance_id, name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Service not found"))?;
+        let key = self.resolve_selected_service_key(instance_id, name).await?;
+        let Some(key) = key else {
+            if let Some(status) = self
+                .selected_published_service_status(instance_id, name)
+                .await?
+            {
+                return Ok(serde_json::json!({
+                    "name": status.name,
+                    "instance_id": status.instance_id,
+                    "service_type": status.service_type,
+                    "pid": null,
+                    "container_id": null,
+                    "port": null,
+                    "path": status.path,
+                    "status": status.status,
+                    "health_status": status.health_status,
+                    "health_source": status.health_source,
+                    "domain": status.domain,
+                    "url": status.url,
+                    "warnings": status.warnings,
+                    "publication": status.publication,
+                    "config": { "type": "published" },
+                }));
+            }
+            anyhow::bail!("Service not found");
+        };
         let proxy_ports = { *self.proxy_ports.lock().await };
         let (service_config, path, health_status, health_source, runtime_info, domain, warnings) = {
             let services = self.services.lock().await;
@@ -12305,6 +13083,126 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct LifecycleRecordingFactory {
+        events: Arc<StdMutex<Vec<String>>>,
+        creations: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct LifecycleRecordingController {
+        id: String,
+        events: Arc<StdMutex<Vec<String>>>,
+        state: RuntimeState,
+        spawn_pid: u32,
+        spawn_identity: PersistedProcessIdentity,
+        process_identity: Option<PersistedProcessIdentity>,
+    }
+
+    #[async_trait]
+    impl ServiceController for LifecycleRecordingController {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start(&mut self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("record lifecycle start")
+                .push(format!("start:{}", self.id));
+            self.state.pid = Some(self.spawn_pid);
+            self.state.status = ServiceState::Running;
+            self.state.health_status = HealthStatus::Healthy;
+            self.process_identity = Some(self.spawn_identity.clone());
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("record lifecycle stop")
+                .push(format!("stop:{}", self.id));
+            self.state.pid = None;
+            self.state.status = ServiceState::Stopped;
+            self.state.health_status = HealthStatus::Unknown;
+            self.process_identity = None;
+            Ok(())
+        }
+
+        async fn read_state(&self) -> RuntimeState {
+            self.state.clone()
+        }
+
+        fn owned_process_id(&self) -> Option<u32> {
+            self.process_identity.as_ref().and(self.state.pid)
+        }
+
+        fn process_identity(&self) -> Option<PersistedProcessIdentity> {
+            self.process_identity.clone()
+        }
+
+        async fn logs(&self) -> futures::stream::BoxStream<'static, LogEntry> {
+            stream::empty().boxed()
+        }
+
+        fn get_metadata(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn execute_command(&mut self, _cmd: ServiceCommand) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        async fn restore(&mut self, _state: serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn metrics(&self) -> Result<Option<locald_core::ipc::ServiceMetrics>> {
+            Ok(None)
+        }
+    }
+
+    impl ServiceFactory for LifecycleRecordingFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            let creation = self.creations.fetch_add(1, Ordering::SeqCst);
+            let pid = 70 + u32::try_from(creation).expect("recording creation fits in a PID");
+            Arc::new(Mutex::new(LifecycleRecordingController {
+                id: name,
+                events: self.events.clone(),
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Stopped,
+                    health_status: HealthStatus::Unknown,
+                },
+                spawn_pid: pid,
+                spawn_identity: test_process_identity(
+                    2_000 + u64::try_from(creation).expect("recording creation fits in u64"),
+                    i32::try_from(pid).expect("recording PID fits in i32"),
+                    "/test/lifecycle-recording-worker",
+                ),
+                process_identity: None,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
     struct CapturingContextFactory {
         env: Arc<StdMutex<Option<HashMap<String, String>>>>,
         bindings: Arc<StdMutex<Option<ServiceRuntimeBindings>>>,
@@ -13040,7 +13938,51 @@ mod tests {
             .expect("catalog JSON must be an object");
         object.insert("version".to_owned(), serde_json::Value::from(3));
         object.remove("agent_bindings");
+        object.remove("published_services");
+        object.remove("retired_configuration_revisions");
+        for instance in object["instances"]
+            .as_object_mut()
+            .expect("catalog instances must be an object")
+            .values_mut()
+        {
+            instance
+                .as_object_mut()
+                .expect("catalog instance must be an object")
+                .remove("configuration_revision");
+        }
         let mut content = serde_json::to_vec_pretty(&value).expect("encode v3 catalog fixture");
+        content.push(b'\n');
+        content
+    }
+
+    fn encode_v2_catalog(catalog: &Registry) -> Vec<u8> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encode_v3_catalog(catalog)).expect("decode v3 catalog fixture");
+        value["version"] = serde_json::Value::from(2);
+        let mut content = serde_json::to_vec_pretty(&value).expect("encode v2 catalog fixture");
+        content.push(b'\n');
+        content
+    }
+
+    fn encode_v5_catalog(catalog: &Registry) -> Vec<u8> {
+        let mut value = serde_json::to_value(catalog).expect("encode catalog as JSON");
+        let object = value
+            .as_object_mut()
+            .expect("catalog JSON must be an object");
+        object.insert("version".to_owned(), serde_json::Value::from(5));
+        object.remove("published_services");
+        object.remove("retired_configuration_revisions");
+        for instance in object["instances"]
+            .as_object_mut()
+            .expect("catalog instances must be an object")
+            .values_mut()
+        {
+            instance
+                .as_object_mut()
+                .expect("catalog instance must be an object")
+                .remove("configuration_revision");
+        }
+        let mut content = serde_json::to_vec_pretty(&value).expect("encode v5 catalog fixture");
         content.push(b'\n');
         content
     }
@@ -13052,12 +13994,32 @@ mod tests {
             .expect("read catalog publication journal fixture");
         let mut value: serde_json::Value =
             serde_json::from_slice(&content).expect("decode catalog publication journal fixture");
+        value
+            .as_object_mut()
+            .expect("catalog publication journal must be an object")
+            .remove("catalog_source_version");
+        value
+            .as_object_mut()
+            .expect("catalog publication journal must be an object")
+            .remove("schema_migration");
         for field in ["catalog_base", "catalog_target"] {
             let object = value[field]
                 .as_object_mut()
                 .unwrap_or_else(|| panic!("{field} must be an object"));
             object.insert("version".to_owned(), serde_json::Value::from(3));
             object.remove("agent_bindings");
+            object.remove("published_services");
+            object.remove("retired_configuration_revisions");
+            for instance in object["instances"]
+                .as_object_mut()
+                .expect("catalog instances must be an object")
+                .values_mut()
+            {
+                instance
+                    .as_object_mut()
+                    .expect("catalog instance must be an object")
+                    .remove("configuration_revision");
+            }
         }
         let mut content =
             serde_json::to_vec_pretty(&value).expect("encode v3 publication journal fixture");
@@ -13114,6 +14076,297 @@ mod tests {
                 .catalog_publication_recovery_required
                 .load(Ordering::Acquire)
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_v5_migration_backs_up_and_publishes_v6_transactionally() {
+        let (
+            directory,
+            mut manager,
+            catalog_base,
+            _catalog_target,
+            previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let raw_v5 = encode_v5_catalog(&catalog_base);
+        tokio::fs::write(catalog_base.storage_path(), &raw_v5)
+            .await
+            .expect("install v5 migration source");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .migrate_catalog_schema_if_needed()
+            .await
+            .expect("migrate v5 catalog");
+
+        assert_eq!(
+            catalog_schema_version(catalog_base.storage_path())
+                .await
+                .expect("inspect migrated schema"),
+            Some(u64::from(locald_core::catalog::CATALOG_VERSION))
+        );
+        assert_eq!(
+            tokio::fs::read(directory.path().join("catalog-v5.json"))
+                .await
+                .expect("read exact v5 backup"),
+            raw_v5
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recording host sync mutex poisoned")
+                .as_slice(),
+            &[previous_hosts.as_strings()]
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_base.storage_path())
+                .await
+                .expect("load cleared migration journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_lifecycle_migration_preserves_raw_v5_before_catalog_publication() {
+        let (
+            directory,
+            mut manager,
+            catalog_base,
+            _catalog_target,
+            _previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let raw_v5 = encode_v5_catalog(&catalog_base);
+        tokio::fs::write(catalog_base.storage_path(), &raw_v5)
+            .await
+            .expect("install v5 lifecycle migration source");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        assert!(
+            manager
+                .lifecycle_journal
+                .migration_marker()
+                .await
+                .expect("inspect absent lifecycle marker")
+                .is_none()
+        );
+
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("complete initial lifecycle migration from v5");
+
+        assert_eq!(
+            tokio::fs::read(directory.path().join("catalog-v5.json"))
+                .await
+                .expect("read exact v5 lifecycle backup"),
+            raw_v5
+        );
+        assert_eq!(
+            catalog_schema_version(catalog_base.storage_path())
+                .await
+                .expect("inspect lifecycle-migrated catalog"),
+            Some(u64::from(locald_core::catalog::CATALOG_VERSION))
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .migration_marker()
+                .await
+                .expect("load completed lifecycle marker")
+                .is_some()
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect cleared lifecycle journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_lifecycle_migration_preserves_raw_v5_before_presence_reconciliation() {
+        let (
+            directory,
+            mut manager,
+            catalog_base,
+            _catalog_target,
+            _previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let instance_id = *catalog_base
+            .instances
+            .keys()
+            .next()
+            .expect("publication fixture instance");
+        let project_path = catalog_base.instances[&instance_id].last_known_path.clone();
+        let mut availability = AvailabilityStore::load(&manager.availability_data_dir, instance_id)
+            .await
+            .expect("load presence reconciliation availability");
+        availability
+            .apply_batch(
+                &AvailabilityBatch::new(SystemTime::now())
+                    .with_operation(AvailabilityBatchOperation::Initialize),
+            )
+            .await
+            .expect("initialize presence reconciliation availability");
+        manager
+            .lifecycle_journal
+            .mark_migration_complete(uuid::Uuid::new_v4(), SystemTime::now())
+            .await
+            .expect("publish completed lifecycle marker");
+        let raw_v5 = encode_v5_catalog(&catalog_base);
+        tokio::fs::write(catalog_base.storage_path(), &raw_v5)
+            .await
+            .expect("install v5 presence reconciliation source");
+        std::fs::remove_dir(&project_path).expect("remove publication fixture project");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("reconcile v5 catalog presence after completed lifecycle migration");
+
+        assert_eq!(
+            tokio::fs::read(directory.path().join("catalog-v5.json"))
+                .await
+                .expect("read exact v5 presence backup"),
+            raw_v5
+        );
+        assert_eq!(
+            catalog_schema_version(catalog_base.storage_path())
+                .await
+                .expect("inspect presence-reconciled catalog"),
+            Some(u64::from(locald_core::catalog::CATALOG_VERSION))
+        );
+        let in_memory = manager.registry.lock().await.instances[&instance_id].clone();
+        assert_eq!(in_memory.presence, CatalogPresence::Missing);
+        assert!(in_memory.current_path.is_none());
+        let durable =
+            Registry::load_from_paths(locald_core::CatalogPaths::for_data_dir(directory.path()))
+                .await
+                .expect("reload presence-reconciled catalog");
+        assert_eq!(
+            durable.instances[&instance_id].presence,
+            CatalogPresence::Missing
+        );
+        assert!(durable.instances[&instance_id].current_path.is_none());
+        assert!(
+            manager
+                .lifecycle_journal
+                .load()
+                .await
+                .expect("inspect cleared presence lifecycle journal")
+                .is_none()
+        );
+        assert!(
+            manager
+                .catalog_publication_journal
+                .load(catalog_base.storage_path())
+                .await
+                .expect("inspect cleared presence catalog journal")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_lifecycle_migration_still_accepts_a_v2_catalog_source() {
+        let (
+            directory,
+            mut manager,
+            catalog_base,
+            _catalog_target,
+            _previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let raw_v2 = encode_v2_catalog(&catalog_base);
+        tokio::fs::write(catalog_base.storage_path(), &raw_v2)
+            .await
+            .expect("install v2 lifecycle migration source");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+
+        manager
+            .recover_and_migrate_lifecycle_state()
+            .await
+            .expect("complete initial lifecycle migration from v2");
+
+        assert_eq!(
+            catalog_schema_version(catalog_base.storage_path())
+                .await
+                .expect("inspect lifecycle-migrated v2 catalog"),
+            Some(u64::from(locald_core::catalog::CATALOG_VERSION))
+        );
+        assert!(
+            !directory.path().join("catalog-v5.json").exists(),
+            "v2 migration must not fabricate a v5 backup"
+        );
+        assert!(
+            manager
+                .lifecycle_journal
+                .migration_marker()
+                .await
+                .expect("load completed v2 lifecycle marker")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_catalog_v5_migration_recovers_then_retries_from_exact_backup() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            _catalog_target,
+            previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let raw_v5 = encode_v5_catalog(&catalog_base);
+        tokio::fs::write(catalog_base.storage_path(), &raw_v5)
+            .await
+            .expect("install v5 migration source");
+        ensure_v5_backup(catalog_base.storage_path())
+            .await
+            .expect("create v5 backup");
+        let transaction =
+            CatalogPublicationTransaction::new_v5_migration(catalog_base.clone(), &previous_hosts)
+                .expect("prepare migration transaction");
+        manager
+            .catalog_publication_journal
+            .create(&transaction)
+            .await
+            .expect("persist prepared migration");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: calls.clone(),
+        }));
+
+        manager
+            .recover_catalog_publication_state()
+            .await
+            .expect("recover prepared migration rollback");
+        assert_eq!(
+            catalog_schema_version(catalog_base.storage_path())
+                .await
+                .expect("inspect rolled-back schema"),
+            Some(5)
+        );
+        manager
+            .migrate_catalog_schema_if_needed()
+            .await
+            .expect("retry v5 migration");
+        assert_eq!(
+            catalog_schema_version(catalog_base.storage_path())
+                .await
+                .expect("inspect retried schema"),
+            Some(u64::from(locald_core::catalog::CATALOG_VERSION))
+        );
+        assert_eq!(calls.lock().expect("host calls").len(), 2);
     }
 
     #[tokio::test]
@@ -18554,26 +19807,50 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
-    async fn stop_all_pauses_desired_instance_without_runtime_projection() {
+    async fn stop_all_suppresses_managed_services_without_pausing_availability() {
         let dir = tempdir().expect("create temporary directory");
         let project_path = dir.path().join("stop-all-policy-project");
-        let (manager, instance_id, availability_data_dir) =
+        let (mut manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "stop-all-policy").await;
+        write_availability_worker_config(
+            &project_path,
+            "stop-all-policy",
+            "stop-all-policy.localhost",
+            &["web"],
+        );
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("start managed service before stop-all");
+
+        manager
+            .stop_all()
+            .await
+            .expect("stop every managed service");
+
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
             .await
             .expect("load stop-all availability");
-        availability
-            .set_always_on(true)
-            .await
-            .expect("enable policy without runtime");
-        assert!(manager.services.lock().await.is_empty());
-
-        manager.stop_all().await.expect("stop all projects");
-
         let snapshot = availability.snapshot().await.expect("read stop-all result");
-        assert!(snapshot.always_on());
-        assert!(snapshot.is_paused());
-        assert!(manager.attachments.lock().await.is_stopped(&project_path));
+        assert!(snapshot.desired_up_at(manager.availability_now()));
+        assert!(!snapshot.is_paused());
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&ServiceKey::new(instance_id, "web"))
+        );
+        assert!(!manager.attachments.lock().await.is_stopped(&project_path));
     }
 
     #[tokio::test]
@@ -28629,6 +29906,715 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn published_service_is_catalogued_without_a_runtime_controller() {
+        let directory = tempdir().expect("create published service fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "published-app"
+domain = "published-app.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench", "alias", "*.preview"]
+health_check = { type = "http", path = "/ready", interval = 2, timeout = 3 }
+"#,
+        )
+        .expect("write published project config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry,
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published service manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit published service declaration");
+        manager
+            .validate_published_origins_for_https_listener(Some(4443))
+            .await
+            .expect("the admitted sandbox origin matches its listener");
+        let mismatch = manager
+            .validate_published_origins_for_https_listener(Some(5443))
+            .await
+            .expect_err("a changed sandbox listener requires explicit re-admission");
+        assert!(mismatch.to_string().contains("do not match"));
+        let missing_listener = manager
+            .validate_published_origins_for_https_listener(None)
+            .await
+            .expect_err("a durable published origin requires HTTPS");
+        assert!(
+            missing_listener
+                .to_string()
+                .contains("working HTTPS listener")
+        );
+
+        assert!(manager.services.lock().await.is_empty());
+        assert!(manager.listener_runtimes.lock().await.is_empty());
+        let services = manager.list().await;
+        assert_eq!(services.len(), 1);
+        let status = &services[0];
+        assert_eq!(
+            status.service_type,
+            locald_core::ipc::ServiceType::Published
+        );
+        assert_eq!(status.status, ServiceState::ExternallyManaged);
+        assert_eq!(status.pid, None);
+        assert_eq!(status.port, None);
+        assert_eq!(
+            status.url.as_deref(),
+            Some("https://workbench.published-app.localhost:4443")
+        );
+        assert_eq!(
+            status
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::WaitingForPublisher)
+        );
+
+        let inspected = manager
+            .inspect("published-app:workbench")
+            .await
+            .expect("inspect published service");
+        assert_eq!(inspected["service_type"], "published");
+        assert_eq!(inspected["status"], "externally_managed");
+        assert!(inspected["pid"].is_null());
+        assert!(inspected["port"].is_null());
+
+        let error = manager
+            .restart("published-app:workbench")
+            .await
+            .expect_err("published service has no locald-owned runtime to restart");
+        assert!(error.to_string().contains("externally managed"));
+
+        let mut managed_config =
+            test_config_with_domain("published-app", "managed-published-app.localhost");
+        let managed_service_config = ServiceConfig::Legacy(ExecServiceConfig::default());
+        managed_config
+            .services
+            .insert("workbench".to_owned(), managed_service_config.clone());
+        manager.services.lock().await.insert(
+            ServiceKey::new(test_instance_id(), "workbench"),
+            test_service(
+                managed_config,
+                managed_service_config,
+                ServiceRuntime::None,
+                directory.path().join("managed-project"),
+            ),
+        );
+        let ambiguity = manager
+            .restart("published-app:workbench")
+            .await
+            .expect_err("global selector must not cross managed and published namespaces");
+        assert!(ambiguity.to_string().contains("ambiguous"));
+
+        for domain in [
+            "workbench.published-app.localhost",
+            "alias.published-app.localhost",
+            "tenant.preview.published-app.localhost",
+        ] {
+            let resolution = manager
+                .resolve_service_by_domain(domain)
+                .await
+                .expect("resolve published domain claim");
+            let locald_core::resolver::DomainResolution::PublishedUnavailable {
+                publication, ..
+            } = resolution
+            else {
+                panic!("published domain must preserve unavailable identity: {domain}");
+            };
+            assert_eq!(publication.state, PublicationState::WaitingForPublisher);
+            assert_eq!(
+                publication.origin,
+                "https://workbench.published-app.localhost:4443"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_projection_changes_invalidate_the_authoritative_service_list() {
+        let directory = tempdir().expect("create published projection fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published projection project");
+        let config_path = project_path.join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "published-events"
+domain = "published-events.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write initial published projection");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published projection manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit initial published projection");
+
+        let mut events = manager.event_sender.subscribe();
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("reapply unchanged published projection");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "published-events"
+domain = "published-events.localhost"
+"#,
+        )
+        .expect("remove published declaration");
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("publish removal of the declared service");
+
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("service-list invalidation arrives within the test boundary")
+                .expect("receive service-list invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_only_pause_and_resume_invalidate_service_projection() {
+        let directory = tempdir().expect("create published lifecycle fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published lifecycle project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "published-lifecycle"
+domain = "published-lifecycle.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write published lifecycle config");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published lifecycle manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit published lifecycle declaration");
+        let demand = DemandKey::manual_cli();
+        manager
+            .project_ensure_availability(&project_path, demand.clone())
+            .await
+            .expect("establish initial published availability");
+
+        let mut events = manager.event_sender.subscribe();
+        assert!(
+            manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("pause published route")
+        );
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("pause invalidation arrives within the test boundary")
+                .expect("receive pause invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let paused = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|status| status.name == "published-lifecycle:workbench")
+            .expect("paused published status remains visible");
+        assert_eq!(
+            paused
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::RoutePaused)
+        );
+
+        assert!(
+            !manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("repeating pause is a no-op")
+        );
+        assert!(
+            manager
+                .project_renew_availability(&project_path, &demand)
+                .await
+                .expect("passively renew the suppressed demand")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        manager
+            .project_ensure_availability(&project_path, demand.clone())
+            .await
+            .expect("semantic activity resumes the published route");
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("resume invalidation arrives within the test boundary")
+                .expect("receive resume invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let resumed = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|status| status.name == "published-lifecycle:workbench")
+            .expect("resumed published status remains visible");
+        assert_eq!(
+            resumed
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::WaitingForPublisher)
+        );
+
+        manager
+            .project_ensure_availability(&project_path, demand)
+            .await
+            .expect("a live semantic demand renews without a projection change");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        assert!(
+            manager
+                .project_pause_availability(&project_path)
+                .await
+                .expect("pause the published route before enabling Always On")
+        );
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("second pause invalidation arrives within the test boundary")
+                .expect("receive second pause invalidation"),
+            Event::ServiceListChanged
+        );
+        manager
+            .project_set_always_on(&project_path, true)
+            .await
+            .expect("Always On resumes a paused published route transactionally");
+        assert_eq!(
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, events.recv())
+                .await
+                .expect("Always On invalidation arrives within the test boundary")
+                .expect("receive Always On invalidation"),
+            Event::ServiceListChanged
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn published_origin_interpolation_resolves_during_mixed_project_apply() {
+        let directory = tempdir().expect("create published interpolation fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create mixed project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "app"
+domain = "app.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+
+[services.worker]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.worker.env]
+PATH = "/usr/bin:/bin"
+WORKBENCH_ORIGIN = "${services.workbench.origin}"
+"#,
+        )
+        .expect("write mixed interpolation config");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published interpolation manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        let captured_env = Arc::new(StdMutex::new(None));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: captured_env.clone(),
+                bindings: Arc::new(StdMutex::new(None)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+                fail_prepare: false,
+            }),
+        );
+
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("apply mixed project with a published origin reference");
+
+        let env = captured_env
+            .lock()
+            .expect("read captured environment")
+            .clone()
+            .expect("worker factory received an environment");
+        assert_eq!(
+            env.get("WORKBENCH_ORIGIN").map(String::as_str),
+            Some("https://workbench.app.localhost:4443")
+        );
+        let services = manager.services.lock().await;
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services
+                .keys()
+                .next()
+                .expect("managed worker exists")
+                .name()
+                .as_str(),
+            "worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn desired_project_without_services_reports_failed_after_convergence() {
+        let directory = tempdir().expect("create empty project fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create empty project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "empty-project"
+domain = "empty-project.localhost"
+"#,
+        )
+        .expect("write empty project config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry,
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create empty project manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("register empty project config");
+
+        let error = manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect_err("an empty project cannot become ready");
+        assert!(
+            error.to_string().contains("did not become ready"),
+            "unexpected empty-project ensure error: {error:#}"
+        );
+
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read failed empty-project status");
+        let availability = status
+            .availability
+            .expect("empty project has availability state");
+        assert!(availability.desired);
+        assert_eq!(availability.state, ProjectLifecycleState::Failed);
+        assert!(availability.last_error.is_some());
+        assert!(status.service_details.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_all_preserves_a_published_only_route() {
+        let directory = tempdir().expect("create published-only stop-all fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published-only project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "published-only"
+domain = "published-only.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write published-only config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published-only manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit published-only declaration");
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("generic ensure succeeds while a published service waits for its publisher");
+        let instance_id = registry
+            .lock()
+            .await
+            .instances
+            .keys()
+            .copied()
+            .next()
+            .expect("published-only instance is catalogued");
+
+        manager
+            .stop_all()
+            .await
+            .expect("stop-all has no managed runtime to stop");
+
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load published-only availability");
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read published-only availability");
+        assert!(snapshot.desired_up_at(manager.availability_now()));
+        assert!(!snapshot.is_paused());
+        assert!(manager.services.lock().await.is_empty());
+        let project_status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read published-only project status");
+        assert_eq!(
+            project_status
+                .availability
+                .as_ref()
+                .map(|availability| availability.state),
+            Some(ProjectLifecycleState::Ready)
+        );
+        let status = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|status| status.name == "published-only:workbench")
+            .expect("published-only status remains visible");
+        assert_eq!(
+            status
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::WaitingForPublisher)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_stops_managed_runtime_without_pausing_a_mixed_published_route() {
+        let directory = tempdir().expect("create mixed stop-all fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create mixed project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "mixed-app"
+domain = "mixed-app.localhost"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write mixed managed and published config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry,
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create mixed stop-all manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(true)),
+                stop_count: stop_count.clone(),
+            }),
+        );
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit mixed managed and published config");
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("start the mixed project's managed runtime");
+        let managed_key = manager
+            .services
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("mixed project has one managed service");
+
+        manager
+            .stop_all()
+            .await
+            .expect("stop every managed service without pausing routes");
+
+        let mut availability = manager
+            .load_availability(managed_key.instance())
+            .await
+            .expect("load mixed-project availability");
+        let snapshot = availability
+            .snapshot()
+            .await
+            .expect("read mixed-project availability");
+        assert!(snapshot.desired_up_at(manager.availability_now()));
+        assert!(!snapshot.is_paused());
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .service_stop_suppressions
+                .lock()
+                .await
+                .contains(&managed_key)
+        );
+        let statuses = manager.list().await;
+        let managed = statuses
+            .iter()
+            .find(|status| status.name == "mixed-app:web")
+            .expect("managed status remains visible");
+        assert_eq!(managed.status, ServiceState::Stopped);
+        let published = statuses
+            .iter()
+            .find(|status| status.name == "mixed-app:workbench")
+            .expect("published status remains visible");
+        assert_eq!(
+            published
+                .publication
+                .as_ref()
+                .map(|publication| publication.state),
+            Some(PublicationState::WaitingForPublisher)
+        );
+    }
+
+    #[tokio::test]
     async fn named_listener_allocation_is_instance_scoped_sticky_and_releasable() {
         let dir = tempdir().expect("create listener allocation directory");
         let manager = readiness_test_manager(dir.path());
@@ -32056,6 +34042,130 @@ PATH = "/usr/bin:/bin"
                 .last_convergence_error()
                 .is_some_and(|message| message.contains("requires `command`"))
         );
+    }
+
+    #[tokio::test]
+    async fn project_restart_starts_managed_services_in_dependency_order_and_preserves_published() {
+        let dir = tempdir().expect("create project restart directory");
+        let project_path = dir.path().join("project-restart");
+        let (mut manager, instance_id, _availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "project-restart").await;
+        manager.set_https_port(Some(8443)).await;
+        tokio::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "project-restart"
+domain = "project-restart.localhost"
+
+[services.api]
+type = "worker"
+command = "ignored by lifecycle fixture"
+depends_on = ["db"]
+
+[services.api.env]
+PATH = "/usr/bin:/bin"
+
+[services.db]
+type = "worker"
+command = "ignored by lifecycle fixture"
+
+[services.db.env]
+PATH = "/usr/bin:/bin"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .await
+        .expect("write project restart config");
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        manager.factories.insert(
+            0,
+            Arc::new(LifecycleRecordingFactory {
+                events: events.clone(),
+                creations: AtomicUsize::new(0),
+            }),
+        );
+
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("start project restart fixture");
+        let (revision_before, declaration_before) = {
+            let catalog = manager.registry.lock().await;
+            (
+                catalog
+                    .configuration_revision(instance_id)
+                    .expect("admitted project configuration revision"),
+                catalog
+                    .published_declaration(instance_id, "workbench")
+                    .expect("admitted published declaration")
+                    .clone(),
+            )
+        };
+        events
+            .lock()
+            .expect("clear initial lifecycle events")
+            .clear();
+
+        manager
+            .restart_project(&project_path)
+            .await
+            .expect("restart managed project services");
+
+        let events = events
+            .lock()
+            .expect("read restart lifecycle events")
+            .clone();
+        let first_start = events
+            .iter()
+            .position(|event| event.starts_with("start:"))
+            .expect("restart records managed starts");
+        assert_eq!(first_start, 2, "both managed services stop before restart");
+        assert!(
+            events[..first_start]
+                .iter()
+                .all(|event| event.starts_with("stop:")),
+            "restart stop phase must finish before startup: {events:?}"
+        );
+        assert_eq!(
+            &events[first_start..],
+            ["start:project-restart:db", "start:project-restart:api"]
+        );
+
+        assert!(
+            manager
+                .load_availability(instance_id)
+                .await
+                .expect("load restarted project availability")
+                .desired_up()
+                .await
+                .expect("read restarted project desired state")
+        );
+        let catalog = manager.registry.lock().await;
+        assert_eq!(
+            catalog.configuration_revision(instance_id),
+            Some(revision_before)
+        );
+        assert_eq!(
+            catalog.published_declaration(instance_id, "workbench"),
+            Some(&declaration_before)
+        );
+        drop(catalog);
+
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read project status after restart");
+        assert!(status.service_details.iter().any(|service| {
+            service.name == "project-restart:workbench"
+                && service.service_type == locald_core::ipc::ServiceType::Published
+                && service.publication.as_ref().is_some_and(|publication| {
+                    publication.state == locald_core::ipc::PublicationState::WaitingForPublisher
+                })
+        }));
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use crate::assets;
+use locald_core::ipc::{PublicationState, PublicationStatus};
 use locald_core::resolver::{DomainResolution, ServiceResolver};
 use locald_core::state::ServiceState;
 use locald_core::{DomainName, ProjectAvailabilityStatus, ProjectLifecycleState};
@@ -286,7 +287,12 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     // own dashboard and docs through the same managed-domain workflow.
     let resolution = state.resolver.resolve_service_by_domain(&host).await;
     if let Some(resolution) = resolution {
-        if domain_resolution_is_unavailable(&resolution) && is_resume_api_request(&req) {
+        if let DomainResolution::PublishedUnavailable { publication, .. } = &resolution {
+            if let Some(response) = published_alias_redirect(req.uri(), &host, publication) {
+                return response;
+            }
+        }
+        if domain_resolution_supports_resume(&resolution) && is_resume_api_request(&req) {
             return route_locald_api(&state, req).await;
         }
         return proxy_to_domain_resolution(&state, req, &host, resolution).await;
@@ -322,9 +328,12 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     (StatusCode::NOT_FOUND, format!("Domain {host} not found")).into_response()
 }
 
-fn domain_resolution_is_unavailable(resolution: &DomainResolution) -> bool {
+fn domain_resolution_supports_resume(resolution: &DomainResolution) -> bool {
     match resolution {
         DomainResolution::Service { port, .. } => port.is_none(),
+        DomainResolution::PublishedUnavailable { publication, .. } => {
+            publication.state == PublicationState::RoutePaused
+        }
         DomainResolution::OwnershipOnly => true,
     }
 }
@@ -358,6 +367,9 @@ async fn proxy_to_domain_resolution(
     host: &str,
     resolution: DomainResolution,
 ) -> Response {
+    if let DomainResolution::PublishedUnavailable { name, publication } = &resolution {
+        return published_service_response(host, name, publication);
+    }
     let DomainResolution::Service {
         name: service_name,
         port,
@@ -589,6 +601,150 @@ fn error_response(status: StatusCode, message: impl std::fmt::Display) -> Respon
 
     (
         status,
+        [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+fn published_alias_redirect(
+    request_uri: &Uri,
+    requested_host: &str,
+    publication: &PublicationStatus,
+) -> Option<Response> {
+    let canonical_origin = publication.origin.parse::<Uri>().ok()?;
+    let canonical_host = canonical_origin.host()?;
+    if canonical_host.eq_ignore_ascii_case(requested_host) {
+        return None;
+    }
+
+    let path_and_query = request_uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    let location = format!("{}{path_and_query}", publication.origin);
+    Some(axum::response::Redirect::temporary(&location).into_response())
+}
+
+fn published_service_response(
+    host: &str,
+    service_name: &str,
+    publication: &PublicationStatus,
+) -> Response {
+    let status_label = match publication.state {
+        PublicationState::WaitingForPublisher => "Waiting for publisher",
+        PublicationState::CheckingEndpoint => "Checking endpoint",
+        PublicationState::EndpointUnhealthy => "Endpoint unhealthy",
+        PublicationState::Ready => "Ready",
+        PublicationState::RoutePaused => "Route paused",
+        PublicationState::InstanceMissing => "Worktree missing",
+    };
+    let default_next_step = match publication.state {
+        PublicationState::WaitingForPublisher => {
+            "Start this service with the workflow that owns its external runtime."
+        }
+        PublicationState::CheckingEndpoint => {
+            "Wait for the publisher's endpoint health check to finish."
+        }
+        PublicationState::EndpointUnhealthy => {
+            "Inspect the owning workflow and its endpoint health."
+        }
+        PublicationState::Ready => "Reload this page.",
+        PublicationState::RoutePaused => "Resume the project to allow publication.",
+        PublicationState::InstanceMissing => {
+            "Restore the worktree, or forget the project if this identity is no longer needed."
+        }
+    };
+    let next_step = publication
+        .next_step
+        .as_deref()
+        .unwrap_or(default_next_step);
+    let (resume_action, resume_script) = if publication.state == PublicationState::RoutePaused {
+        let domain_js = inline_script_json_string(host);
+        (
+            r#"<button class="btn" id="resume-btn">Resume project</button>"#.to_owned(),
+            format!(
+                r"<script>
+        const domain = {domain_js};
+        const btn = document.getElementById('resume-btn');
+        if (btn) {{
+            btn.addEventListener('click', async () => {{
+                btn.disabled = true;
+                btn.textContent = 'Resuming...';
+                try {{
+                    const res = await fetch('/api/projects/resume-domain', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ domain }})
+                    }});
+                    if (!res.ok) throw new Error(await res.text() || 'Failed to resume project');
+                    window.location.reload();
+                }} catch (err) {{
+                    console.error(err);
+                    btn.disabled = false;
+                    btn.textContent = 'Resume project';
+                }}
+            }});
+        }}
+    </script>"
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let template = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Published service is __STATUS__</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0b0b0f; color:#e4e4e7; display:flex; justify-content:center; align-items:center; min-height:100vh; margin:0; }
+        .card { background:#111827; padding:2rem; border:1px solid #1f2937; border-radius:12px; width:min(560px, 90vw); }
+        h1 { margin:0 0 .75rem; font-size:1.5rem; }
+        p { color:#d4d4d8; line-height:1.5; }
+        .hint { color:#a1a1aa; font-size:.9rem; }
+        code { background:#0f172a; color:#93c5fd; padding:.15rem .35rem; border-radius:6px; }
+        .actions { display:flex; gap:.75rem; margin-top:1.25rem; }
+        .btn { background:#2563eb; color:white; padding:.6rem 1.1rem; border:0; border-radius:8px; text-decoration:none; font-weight:600; cursor:pointer; }
+        .secondary { background:#1f2937; }
+        .btn:disabled { opacity:.6; cursor:not-allowed; }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <h1>Published service is __STATUS__</h1>
+        <p>__EXPLANATION__</p>
+        <p class="hint">Service: <code>__SERVICE__</code></p>
+        <p class="hint">Stable origin: <code>__ORIGIN__</code></p>
+        <p>__NEXT_STEP__</p>
+        <div class="actions">
+            __RESUME_ACTION__
+            <a class="btn secondary" href="https://locald.localhost">Open dashboard</a>
+        </div>
+    </main>
+    __RESUME_SCRIPT__
+</body>
+</html>"#;
+    let escaped_status = escape_html(status_label);
+    let escaped_explanation = escape_html(&publication.explanation);
+    let escaped_service = escape_html(service_name);
+    let escaped_origin = escape_html(&publication.origin);
+    let escaped_next_step = escape_html(next_step);
+    let html = render_template_once(
+        template,
+        &[
+            ("__STATUS__", escaped_status.as_str()),
+            ("__EXPLANATION__", escaped_explanation.as_str()),
+            ("__SERVICE__", escaped_service.as_str()),
+            ("__ORIGIN__", escaped_origin.as_str()),
+            ("__NEXT_STEP__", escaped_next_step.as_str()),
+            ("__RESUME_ACTION__", resume_action.as_str()),
+            ("__RESUME_SCRIPT__", resume_script.as_str()),
+        ],
+    );
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
         [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
     )

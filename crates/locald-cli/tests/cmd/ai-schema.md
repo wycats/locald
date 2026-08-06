@@ -501,8 +501,53 @@ $ locald ai schema
         "name"
       ]
     },
+    "PublishedHealthCheckConfig": {
+      "description": "HTTP-only health configuration for one published service.",
+      "type": "object",
+      "properties": {
+        "interval": {
+          "description": "Seconds between probes. Defaults to one second.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 1,
+          "maximum": 60,
+          "minimum": 1
+        },
+        "path": {
+          "description": "Origin-relative path requested by locald. Defaults to `/`.",
+          "type": "string",
+          "default": "/"
+        },
+        "timeout": {
+          "description": "Per-request timeout in seconds. Defaults to five seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 5,
+          "maximum": 10,
+          "minimum": 1
+        },
+        "type": {
+          "description": "The probe protocol. Version 1 accepts only HTTP.",
+          "$ref": "#/$defs/PublishedProbeType"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
+    "PublishedProbeType": {
+      "description": "Probe type accepted by a published service declaration.",
+      "oneOf": [
+        {
+          "description": "An application-level HTTP GET.",
+          "type": "string",
+          "const": "http"
+        }
+      ]
+    },
     "ServiceConfig": {
-      "description": "Configuration for a single service./n/nThis enum is untagged, so a service entry can be either a typed service/n(with a `type = /".../"` field) or a legacy exec-style service config./n/n# Example/n```toml/n[services.web]/ncommand = /"npm start/"/n```",
+      "description": "Configuration for a single service./n/nA service entry can be either a typed service (with a `type = /".../"` field)/nor a legacy exec-style service config. Deserialization checks the/ndiscriminator first: once `type` is present, an invalid typed declaration/ncannot fall through to the permissive legacy exec shape./n/n# Example/n```toml/n[services.web]/ncommand = /"npm start/"/n```",
       "anyOf": [
         {
           "description": "A typed service configuration (e.g. Postgres, Worker).",
@@ -510,7 +555,12 @@ $ locald ai schema
         },
         {
           "description": "A legacy or simple exec service configuration.",
-          "$ref": "#/$defs/ExecServiceConfig"
+          "$ref": "#/$defs/ExecServiceConfig",
+          "not": {
+            "required": [
+              "type"
+            ]
+          }
         }
       ]
     },
@@ -653,6 +703,41 @@ $ locald ai schema
             }
           },
           "$ref": "#/$defs/SiteServiceConfig",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "A stable service identity fulfilled by an authenticated external publisher.",
+          "type": "object",
+          "properties": {
+            "domains": {
+              "description": "Optional relative domain claims. Omission preserves the conventional/nservice-domain mapping; an explicit list must contain an exact claim.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "health_check": {
+              "description": "Optional HTTP health policy. Omission uses `GET /` with locald defaults.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PublishedHealthCheckConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "published"
+            }
+          },
+          "additionalProperties": false,
           "required": [
             "type"
           ]

@@ -14,6 +14,8 @@ exports.listProjects = listProjects;
 exports.stopProject = stopProject;
 exports.restartService = restartService;
 exports.restartCommandArgs = restartCommandArgs;
+exports.restartProject = restartProject;
+exports.restartProjectCommandArgs = restartProjectCommandArgs;
 exports.getLogs = getLogs;
 exports.logCommandArgs = logCommandArgs;
 exports.parseJsonOutput = parseJsonOutput;
@@ -160,6 +162,14 @@ async function restartService(projectPath, serviceName) {
 }
 function restartCommandArgs(serviceName) {
     return ["restart", "--json", "--", serviceName];
+}
+async function restartProject(projectPath) {
+    await run(restartProjectCommandArgs(projectPath), {
+        timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
+    });
+}
+function restartProjectCommandArgs(projectPath) {
+    return ["project", "restart", projectPath, "--json"];
 }
 async function getLogs(projectPath, lines = 100, service) {
     const args = logCommandArgs(service);

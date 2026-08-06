@@ -5,11 +5,13 @@ import {
   formatBinaryIdentity,
   releaseEditorProject,
   renewEditorProject,
+  restartProject,
   status,
   stopProject,
 } from "./plumbing.js";
 import { StatusBar } from "./status-bar.js";
 import { registerTools } from "./tools.js";
+import { managedLifecycleServices } from "./service-presentation.js";
 import { resolveCurrentProjectPath } from "./workspace-project.js";
 
 let statusBar: StatusBar | undefined;
@@ -185,6 +187,7 @@ function registerCommands(
           webServices.map((service) => ({
             label: service.name.split(":").pop() ?? service.name,
             description: service.url,
+            detail: service.publication?.explanation,
           })),
           { placeHolder: "Open web service" },
         );
@@ -199,17 +202,24 @@ function registerCommands(
     }),
     vscode.commands.registerCommand("locald.restartServices", async () => {
       try {
-        const restarted = await controller.withCurrentProject(
-          "prepare services for restart",
-          async (initial, ensureTarget) => {
-            await stopProject(initial.project_path);
-            return ensureTarget("wait for restarted services");
-          },
-        );
-        if (!restarted) {
-          throw new Error("no locald project is selected");
+        const projectPath = await resolveRequiredProjectPath();
+        const initial = await status(projectPath);
+        const managed = managedLifecycleServices(initial.service_details);
+        if (managed.length === 0) {
+          throw new Error(
+            "this project has no locald-managed services to restart; use each published service's owning workflow",
+          );
         }
-        vscode.window.showInformationMessage("locald: services restarted");
+        await restartProject(projectPath);
+        const final = await status(projectPath);
+        const published = final.service_details.filter(
+          (service) => service.service_type === "published",
+        ).length;
+        vscode.window.showInformationMessage(
+          published > 0
+            ? `locald: managed services restarted; ${published} published service${published === 1 ? " remains" : "s remain"} externally managed`
+            : "locald: managed services restarted",
+        );
       } catch (error) {
         vscode.window.showErrorMessage(
           `locald: restart failed — ${formatError(error)}`,

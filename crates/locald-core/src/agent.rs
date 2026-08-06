@@ -5,7 +5,7 @@
 //! those values as arguments, and the daemon persists only an opaque digest.
 
 use crate::availability::ProjectAvailabilityStatus;
-use crate::ipc::ServiceType;
+use crate::ipc::{PublicationStatus, ServiceType};
 use crate::state::{HealthStatus, ServiceState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -173,6 +173,8 @@ pub struct AgentServiceStatus {
     pub health_status: HealthStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationStatus>,
 }
 
 /// Ambient project state returned by agent-facing daemon APIs.

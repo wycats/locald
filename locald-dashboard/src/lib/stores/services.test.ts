@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import { resolveServiceSelector, type ServiceStatus } from '$lib/types';
 import { projects, services } from './services';
@@ -24,6 +24,10 @@ const base: ServiceStatus = {
 
 beforeEach(() => {
 	services.set([]);
+});
+
+afterEach(() => {
+	vi.unstubAllGlobals();
 });
 
 describe('instance-scoped service projections', () => {
@@ -99,5 +103,66 @@ describe('instance-scoped service projections', () => {
 		};
 
 		expect(resolveServiceSelector(base.name, [base, second])).toBe(base.name);
+	});
+
+	it('refetches a full list when a newer service update races the first response', async () => {
+		let resolveFirstFetch: ((response: Response) => void) | undefined;
+		const fetchMock = vi
+			.fn()
+			.mockImplementationOnce(
+				() =>
+					new Promise<Response>((resolve) => {
+						resolveFirstFetch = resolve;
+					})
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify([base]), {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				})
+			);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const refresh = services.refresh();
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+		services.updateService(base);
+		resolveFirstFetch?.(
+			new Response(JSON.stringify([{ ...base, status: 'stopped' }]), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
+		await refresh;
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(get(services)).toEqual([base]);
+	});
+
+	it('preserves a newer refresh request when the active request fails', async () => {
+		let rejectFirstFetch: ((error: Error) => void) | undefined;
+		const fetchMock = vi
+			.fn()
+			.mockImplementationOnce(
+				() =>
+					new Promise<Response>((_resolve, reject) => {
+						rejectFirstFetch = reject;
+					})
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify([base]), {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				})
+			);
+		vi.stubGlobal('fetch', fetchMock);
+
+		const firstRefresh = services.refresh();
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+		const newerRefresh = services.refresh();
+		rejectFirstFetch?.(new Error('connection lost'));
+		await Promise.all([firstRefresh, newerRefresh]);
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(get(services)).toEqual([base]);
 	});
 });

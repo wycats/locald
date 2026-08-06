@@ -15,6 +15,20 @@ export interface ServiceStatus {
   health_status: string;
   domain: string | null;
   service_type: string;
+  publication?: PublicationStatus;
+}
+
+export interface PublicationStatus {
+  state:
+    | "waiting_for_publisher"
+    | "checking_endpoint"
+    | "endpoint_unhealthy"
+    | "ready"
+    | "route_paused"
+    | "instance_missing";
+  origin: string;
+  explanation: string;
+  next_step?: string;
 }
 
 export interface ProjectStatusInfo {
@@ -46,6 +60,7 @@ export interface EnsuredServiceStatus {
   status: string;
   health_status: string;
   url?: string;
+  publication?: PublicationStatus;
 }
 
 export interface EnsureProjectResult {
@@ -271,6 +286,16 @@ export async function restartService(
 
 export function restartCommandArgs(serviceName: string): string[] {
   return ["restart", "--json", "--", serviceName];
+}
+
+export async function restartProject(projectPath: string): Promise<void> {
+  await run(restartProjectCommandArgs(projectPath), {
+    timeout: LIFECYCLE_COMMAND_TIMEOUT_MS,
+  });
+}
+
+export function restartProjectCommandArgs(projectPath: string): string[] {
+  return ["project", "restart", projectPath, "--json"];
 }
 
 export async function getLogs(

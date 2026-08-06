@@ -666,6 +666,10 @@ async fn async_main(
         .recover_and_migrate_lifecycle_state()
         .await
         .context("Failed to recover or migrate lifecycle authority")?;
+    manager
+        .migrate_catalog_schema_if_needed()
+        .await
+        .context("Failed to migrate the project catalog schema")?;
     manager.spawn_metrics_collector();
 
     // Initialize ContainerManager
@@ -720,53 +724,6 @@ async fn async_main(
         .reconcile_legacy_attachment_owners()
         .await
         .context("Failed to reconcile legacy lifecycle owners")?;
-
-    // Spawn attachment reaper — cleans up stale editor/CLI attachments
-    let manager_reaper = manager.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if manager_reaper.is_shutting_down() {
-                break;
-            }
-            manager_reaper.reap_and_stop_orphans().await;
-            if manager_reaper.is_shutting_down() {
-                break;
-            }
-            manager_reaper.converge_all_project_availability().await;
-        }
-    });
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
-
-    // Run IPC server
-    let manager_clone = manager.clone();
-    let container_manager_clone = container_manager.clone();
-    let version_clone = version.clone();
-    let shutdown_tx_ipc = shutdown_tx.clone();
-    let ipc_handle = tokio::spawn(async move {
-        ipc::run_ipc_server(
-            manager_clone,
-            container_manager_clone,
-            shutdown_tx_ipc,
-            version_clone,
-        )
-        .await
-    });
-
-    let restore_manager = manager.clone();
-    tokio::spawn(async move {
-        restore_manager
-            .restore_policy_owned_projects(restore_plan)
-            .await;
-    });
-
-    // Spawn upgrade watcher
-    let container_manager_clone = container_manager.clone();
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        watch_for_upgrade(container_manager_clone, shutdown_tx_clone).await;
-    });
 
     // Initialize CertManager
     let certificate_domains = manager.domain_index();
@@ -839,21 +796,12 @@ async fn async_main(
     };
 
     let _has_http = listener_http.is_some();
-
-    // Set the advertised HTTP port (always matches the bind port).
-    if let Some(ref l) = listener_http {
-        let port = l.local_addr().map(|a| a.port()).unwrap_or(8080);
-        manager.set_http_port(Some(port)).await;
-    }
-
-    if let Some(l) = listener_http {
-        let proxy_clone = proxy.clone();
-        tokio::spawn(async move {
-            if let Err(e) = proxy_clone.serve_http(l).await {
-                error!("HTTP proxy server error: {e}");
-            }
-        });
-    }
+    let advertised_http_port = listener_http.as_ref().map(|listener| {
+        listener
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(8080)
+    });
 
     // A bound socket is advertised only when TLS can actually serve it. In
     // sandbox mode certificate initialization may be unavailable; leave HTTPS
@@ -892,9 +840,24 @@ async fn async_main(
         }
     };
 
-    // Set the advertised HTTPS port (always matches the bind port).
-    if let Some(ref l) = listener_https {
-        let port = l.local_addr().map(|a| a.port()).unwrap_or(8443);
+    // A durable published origin is useful only when this daemon can serve the
+    // exact HTTPS listener recorded at admission time.
+    let advertised_https_port = listener_https.as_ref().map(|listener| {
+        listener
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(8443)
+    });
+    manager
+        .validate_published_origins_for_https_listener(advertised_https_port)
+        .await?;
+
+    // Publish listener identity only after every durable published origin has
+    // been validated against the complete bound listener set.
+    if let Some(port) = advertised_http_port {
+        manager.set_http_port(Some(port)).await;
+    }
+    if let Some(port) = advertised_https_port {
         manager.set_https_port(Some(port)).await;
     }
 
@@ -906,6 +869,60 @@ async fn async_main(
             }
         });
     }
+
+    if let Some(l) = listener_http {
+        let proxy_clone = proxy.clone();
+        tokio::spawn(async move {
+            if let Err(e) = proxy_clone.serve_http(l).await {
+                error!("HTTP proxy server error: {e}");
+            }
+        });
+    }
+
+    // Only after catalogued origins agree with the bound listeners may any
+    // lifecycle request, policy restoration, or background convergence run.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
+    let manager_clone = manager.clone();
+    let container_manager_clone = container_manager.clone();
+    let version_clone = version.clone();
+    let shutdown_tx_ipc = shutdown_tx.clone();
+    let ipc_handle = tokio::spawn(async move {
+        ipc::run_ipc_server(
+            manager_clone,
+            container_manager_clone,
+            shutdown_tx_ipc,
+            version_clone,
+        )
+        .await
+    });
+
+    let restore_manager = manager.clone();
+    tokio::spawn(async move {
+        restore_manager
+            .restore_policy_owned_projects(restore_plan)
+            .await;
+    });
+
+    let manager_reaper = manager.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if manager_reaper.is_shutting_down() {
+                break;
+            }
+            manager_reaper.reap_and_stop_orphans().await;
+            if manager_reaper.is_shutting_down() {
+                break;
+            }
+            manager_reaper.converge_all_project_availability().await;
+        }
+    });
+
+    let container_manager_clone = container_manager.clone();
+    let shutdown_tx_clone = shutdown_tx.clone();
+    tokio::spawn(async move {
+        watch_for_upgrade(container_manager_clone, shutdown_tx_clone).await;
+    });
 
     let reason = tokio::select! {
         _ = tokio::signal::ctrl_c() => {

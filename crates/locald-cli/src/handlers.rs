@@ -4,7 +4,7 @@ use locald_core::attachments::{
     AttachmentSource, EditorSession, ProjectFilter, ProjectListEntry, ProjectSection,
     ProjectStatusInfo,
 };
-use locald_core::ipc::{EnsureProjectResult, EnsureProjectSuperseded};
+use locald_core::ipc::{EnsureProjectResult, EnsureProjectSuperseded, PublicationState};
 use locald_core::{DemandKey, IpcRequest, IpcResponse, LocaldConfig, ProjectAvailabilityStatus};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -55,10 +55,15 @@ fn project_stop_json_actions(config_path: &std::path::Path) -> CliResult<JsonSer
         toml::from_str(&config_content).context("Failed to parse locald.toml")?;
     let services = config
         .services
-        .keys()
-        .map(|service_name| JsonServiceAction {
+        .iter()
+        .map(|(service_name, service)| JsonServiceAction {
             service: format!("{}:{}", config.project.name, service_name),
-            status: "stopped".to_owned(),
+            status: if service.is_published() {
+                "route_paused"
+            } else {
+                "stopped"
+            }
+            .to_owned(),
         })
         .collect();
     Ok(JsonServiceActions { services })
@@ -244,16 +249,63 @@ fn print_ensure_result(result: &EnsureProjectResult, verbose: bool) -> CliResult
         .project_name
         .as_deref()
         .unwrap_or_else(|| result.project_path.to_str().unwrap_or("project"));
-    cliclack::outro(format!("{project} is Ready"))?;
+    let pending_publications = result
+        .services
+        .iter()
+        .filter_map(|service| {
+            service
+                .publication
+                .as_ref()
+                .filter(|publication| publication.state != PublicationState::Ready)
+                .map(|publication| (service, publication))
+        })
+        .collect::<Vec<_>>();
+    let managed_services = result
+        .services
+        .iter()
+        .filter(|service| service.publication.is_none())
+        .count();
+    if pending_publications.is_empty() {
+        cliclack::outro(format!("{project} is Ready"))?;
+    } else {
+        let count = pending_publications.len();
+        let noun = if count == 1 { "service" } else { "services" };
+        let verb = if count == 1 { "requires" } else { "require" };
+        let owner = if count == 1 { "its" } else { "their" };
+        let readiness = if managed_services == 0 {
+            format!("{project} is registered")
+        } else {
+            format!("{project}'s locald-managed services are Ready")
+        };
+        cliclack::outro(format!(
+            "{readiness}; {count} published {noun} still {verb} {owner} owning workflow"
+        ))?;
+    }
     for url in &result.urls {
         println!("  {url}");
     }
+    for (service, publication) in pending_publications {
+        println!(
+            "  {}: {} — {}",
+            service.name, publication.state, publication.explanation
+        );
+        if let Some(next_step) = &publication.next_step {
+            println!("    {next_step}");
+        }
+    }
     if verbose {
         for service in &result.services {
-            println!(
-                "  {}: {} ({})",
-                service.name, service.status, service.health_status
-            );
+            if let Some(publication) = &service.publication {
+                println!(
+                    "  {}: externally managed ({})",
+                    service.name, publication.state
+                );
+            } else {
+                println!(
+                    "  {}: {} ({})",
+                    service.name, service.status, service.health_status
+                );
+            }
         }
     }
     Ok(())
@@ -310,10 +362,22 @@ fn print_project_status(info: &ProjectStatusInfo) {
     if !info.service_details.is_empty() {
         println!("Services:");
         for service in &info.service_details {
-            println!(
-                "  {}: {} ({})",
-                service.name, service.status, service.health_status
-            );
+            if let Some(publication) = &service.publication {
+                println!(
+                    "  {}: externally managed ({})",
+                    service.name, publication.state
+                );
+                println!("    Origin: {}", publication.origin);
+                println!("    {}", publication.explanation);
+                if let Some(next_step) = &publication.next_step {
+                    println!("    Next: {next_step}");
+                }
+            } else {
+                println!(
+                    "  {}: {} ({})",
+                    service.name, service.status, service.health_status
+                );
+            }
         }
     }
 }
@@ -1813,6 +1877,31 @@ pub fn run(cli: Cli) -> CliResult<()> {
                     }
                 }
             }
+            ProjectCommands::Restart { path, json } => {
+                utils::ensure_daemon_running()?;
+                let project_path = resolve_project_locator(path)?;
+                match client::send_request(&IpcRequest::ProjectRestart { project_path }) {
+                    Ok(IpcResponse::Ok) => {
+                        if *json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&JsonProjectAction {
+                                    status: "restarted".to_owned(),
+                                })?
+                            );
+                        }
+                    }
+                    Ok(IpcResponse::Error(message)) => {
+                        return Err(CliError::message(message));
+                    }
+                    Ok(response) => {
+                        return Err(CliError::message(format!(
+                            "Unexpected response: {response:?}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             ProjectCommands::Attach {
                 path,
                 source,
@@ -2713,6 +2802,37 @@ name = "example"
             .expect_err("malformed config must fail before project stop is sent");
 
         assert!(error.to_string().contains("Failed to parse locald.toml"));
+    }
+
+    #[test]
+    fn project_stop_json_distinguishes_managed_stop_from_published_route_pause() {
+        let directory = tempfile::tempdir().expect("create stop JSON directory");
+        let config_path = directory.path().join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "example"
+
+[services.web]
+command = "npm start"
+
+[services.workbench]
+type = "published"
+"#,
+        )
+        .expect("write mixed service config");
+
+        let mut actions = project_stop_json_actions(&config_path)
+            .expect("describe project pause")
+            .services;
+        actions.sort_by(|left, right| left.service.cmp(&right.service));
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].service, "example:web");
+        assert_eq!(actions[0].status, "stopped");
+        assert_eq!(actions[1].service, "example:workbench");
+        assert_eq!(actions[1].status, "route_paused");
     }
 
     #[test]

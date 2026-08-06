@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.StatusBar = void 0;
 const vscode = __importStar(require("vscode"));
 const plumbing_js_1 = require("./plumbing.js");
+const service_presentation_js_1 = require("./service-presentation.js");
 const POLL_INTERVAL = 5_000;
 class StatusBar {
     dashboardItem;
@@ -114,24 +115,31 @@ class StatusBar {
     updateDashboard(info) {
         const name = info.project_name ?? "locald";
         const services = info.service_details ?? [];
-        const total = services.length || info.services.length;
-        const healthy = services.filter((s) => s.health_status === "Healthy").length;
-        if (total === 0) {
+        const summary = (0, service_presentation_js_1.managedServiceHealthSummary)(services);
+        const total = services.length === 0 ? info.services.length : summary.total;
+        const healthy = summary.healthy;
+        const published = summary.published;
+        if (total === 0 && published === 0) {
             this.dashboardItem.text = `$(server) ${name}`;
             this.dashboardItem.tooltip = this.withBinaryInfo(`${name} — no services`);
         }
+        else if (total === 0) {
+            this.dashboardItem.text = `$(server) ${name} · ${published} published`;
+            this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
+        }
         else if (healthy === total) {
-            this.dashboardItem.text = `$(server) ${name} · ${total} service${total !== 1 ? "s" : ""}`;
+            const publishedSuffix = published > 0 ? ` · ${published} published` : "";
+            this.dashboardItem.text = `$(server) ${name} · ${total} managed${publishedSuffix}`;
             this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
         }
         else {
-            this.dashboardItem.text = `$(warning) ${name} · ${healthy}/${total}`;
+            this.dashboardItem.text = `$(warning) ${name} · ${healthy}/${total} managed`;
             this.dashboardItem.tooltip = this.buildTooltip(name, services, info);
         }
     }
     updateWebItem(info) {
         const services = info.service_details ?? [];
-        this.webServices = services.filter((s) => s.url && s.status === "running");
+        this.webServices = (0, service_presentation_js_1.servicesWithStableOrigins)(services);
         if (this.webServices.length === 0) {
             this.webItem.hide();
             return;
@@ -140,7 +148,7 @@ class StatusBar {
             const svc = this.webServices[0];
             const label = svc.name.split(":").pop() ?? svc.name;
             this.webItem.text = `$(globe) ${label}`;
-            this.webItem.tooltip = svc.domain ?? svc.url ?? label;
+            this.webItem.tooltip = (0, service_presentation_js_1.serviceDisplayOrigin)(svc) ?? label;
         }
         else {
             // Multiple web services — show count, click for picker
@@ -164,9 +172,7 @@ class StatusBar {
         }
         lines.push("");
         for (const s of services) {
-            const icon = s.status === "running" ? "●" : "○";
-            const url = s.domain ? `  ${s.domain}` : "";
-            lines.push(`${icon} ${s.name}${url}`);
+            lines.push(...(0, service_presentation_js_1.serviceTooltipLines)(s));
         }
         if (services.length === 0) {
             for (const n of info.services) {

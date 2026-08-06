@@ -47,7 +47,7 @@ export async function resetService(name: string, instanceId: string | null): Pro
 export async function stopAllServices(): Promise<void> {
 	const res = await fetch('/api/services/stop-all', { method: 'POST' });
 	if (!res.ok) {
-		throw new Error('Failed to stop all services');
+		throw new Error('Failed to stop all managed services');
 	}
 }
 
@@ -187,6 +187,9 @@ function openEventSource() {
 				console.log('Received ServiceUpdate:', msg.data.name, msg.data.status);
 				services.updateService(msg.data);
 				lifecycleChangeCallback?.();
+			} else if (msg.type === 'ServiceListChanged') {
+				void services.refresh();
+				lifecycleChangeCallback?.();
 			}
 		} catch (e) {
 			console.error('Failed to parse event', e);
@@ -197,6 +200,8 @@ function openEventSource() {
 		console.log('EventSource connected');
 		resetReconnectDelay();
 		connection.setConnected();
+		void services.refresh();
+		lifecycleChangeCallback?.();
 		if (typeof document !== 'undefined') {
 			document.body.setAttribute('data-sse-connected', 'true');
 		}

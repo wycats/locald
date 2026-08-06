@@ -9,6 +9,8 @@
 			| 'unhealthy'
 			| 'connected'
 			| 'disconnected'
+			| 'waiting'
+			| 'paused'
 			| 'unknown';
 		size?: 'sm' | 'md';
 	}
@@ -61,9 +63,15 @@
 		animation: pulse 1.5s ease-in-out infinite;
 	}
 
+	.status-dot.waiting,
 	.status-dot.unknown {
 		background: #71717a;
 		box-shadow: 0 0 6px rgba(113, 113, 122, 0.4);
+	}
+
+	.status-dot.paused {
+		background: #f59e0b;
+		box-shadow: 0 0 6px rgba(245, 158, 11, 0.4);
 	}
 
 	@keyframes pulse {

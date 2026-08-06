@@ -10,6 +10,7 @@
 	} from 'lucide-svelte';
 	import { getServiceInspect } from '$lib/api';
 	import { serviceIdentity, type ServiceInspectResponse } from '$lib/types';
+	import { publicationStateLabel } from '$lib/service-presentation';
 	import { copyToClipboard } from '$lib/utils/clipboard';
 	import Terminal from './Terminal.svelte';
 	import InteractiveTerminal from './InteractiveTerminal.svelte';
@@ -89,22 +90,24 @@
 				{/if}
 			</div>
 			<div class="header-controls">
-				<div class="view-toggle">
-					<button
-						class:active={viewMode === 'logs'}
-						onclick={() => (viewMode = 'logs')}
-						title="Logs"
-					>
-						<FileText size={16} />
-					</button>
-					<button
-						class:active={viewMode === 'terminal'}
-						onclick={() => (viewMode = 'terminal')}
-						title="Terminal"
-					>
-						<TerminalIcon size={16} />
-					</button>
-				</div>
+				{#if !info?.publication}
+					<div class="view-toggle">
+						<button
+							class:active={viewMode === 'logs'}
+							onclick={() => (viewMode = 'logs')}
+							title="Logs"
+						>
+							<FileText size={16} />
+						</button>
+						<button
+							class:active={viewMode === 'terminal'}
+							onclick={() => (viewMode = 'terminal')}
+							title="Terminal"
+						>
+							<TerminalIcon size={16} />
+						</button>
+					</div>
+				{/if}
 				<button onclick={onClose} aria-label="Close"><X size={20} /></button>
 			</div>
 		</div>
@@ -150,15 +153,33 @@
 			{:else if error}
 				<div class="error">{error}</div>
 			{:else if info}
-				<div class="terminal-section">
-					<div class="terminal-wrapper">
-						{#if viewMode === 'logs'}
-							<Terminal filter={serviceIdentity({ name: serviceName, instance_id: instanceId })} />
-						{:else if instanceId}
-							<InteractiveTerminal {serviceName} {instanceId} />
+				{#if info.publication}
+					<div class="publication-panel">
+						<span class="publication-kind">Externally managed</span>
+						<h3>{publicationStateLabel(info.publication.state)}</h3>
+						<p>{info.publication.explanation}</p>
+						{#if info.publication.next_step}
+							<p class="next-step">{info.publication.next_step}</p>
 						{/if}
+						<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
+						<a href={info.publication.origin} target="_blank" class="publication-origin">
+							<ExternalLink size={14} />
+							{info.publication.origin}
+						</a>
 					</div>
-				</div>
+				{:else}
+					<div class="terminal-section">
+						<div class="terminal-wrapper">
+							{#if viewMode === 'logs'}
+								<Terminal
+									filter={serviceIdentity({ name: serviceName, instance_id: instanceId })}
+								/>
+							{:else if instanceId}
+								<InteractiveTerminal {serviceName} {instanceId} />
+							{/if}
+						</div>
+					</div>
+				{/if}
 			{/if}
 		</div>
 	</div>
@@ -315,6 +336,48 @@
 		display: flex;
 		flex-direction: column;
 		background: #1e1e1e;
+	}
+
+	.publication-panel {
+		margin: 24px;
+		max-width: 680px;
+		padding: 20px;
+		border: 1px solid #3f3f46;
+		border-radius: 8px;
+		background: #18181b;
+		color: #d4d4d8;
+	}
+
+	.publication-panel h3 {
+		margin: 8px 0;
+		font-size: 1.1rem;
+		color: #f4f4f5;
+	}
+
+	.publication-panel p {
+		margin: 8px 0;
+		line-height: 1.5;
+	}
+
+	.publication-kind {
+		font-size: 0.75rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: #93c5fd;
+	}
+
+	.publication-panel .next-step {
+		color: #a1a1aa;
+	}
+
+	.publication-origin {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 10px;
+		color: #93c5fd;
+		text-decoration: none;
 	}
 
 	.terminal-wrapper {

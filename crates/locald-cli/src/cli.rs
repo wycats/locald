@@ -549,6 +549,13 @@ pub enum ProjectCommands {
     Start { path: std::path::PathBuf },
     /// Force-stop services (emergency override).
     Stop { path: std::path::PathBuf },
+    /// Restart this project's locald-managed services as one lifecycle operation.
+    #[command(hide = true)]
+    Restart {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show project status.
     Status {
         path: std::path::PathBuf,
@@ -798,6 +805,22 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected editor ensure command"),
+        }
+    }
+
+    #[test]
+    fn parse_hidden_project_restart_captures_project_locator() {
+        let cli = Cli::try_parse_from(["locald", "project", "restart", "/project", "--json"])
+            .expect("parse project restart");
+
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommands::Restart { path, json },
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("/project"));
+                assert!(json);
+            }
+            _ => panic!("expected editor restart command"),
         }
     }
 }

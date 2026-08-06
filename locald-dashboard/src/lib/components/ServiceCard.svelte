@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { serviceIdentity, type ServiceStatus } from '$lib/types';
+	import { publicationStateLabel, serviceDisplayAuthority } from '$lib/service-presentation';
 	import { logs } from '$lib/stores/logs';
 	import { pendingActions } from '$lib/stores/actions';
 	import { RotateCw, Square, Play, ExternalLink, Settings } from 'lucide-svelte';
@@ -28,6 +29,8 @@
 		| 'unhealthy'
 		| 'connected'
 		| 'disconnected'
+		| 'waiting'
+		| 'paused'
 		| 'unknown';
 
 	let { service, onSelect, onConfig }: Props = $props();
@@ -46,6 +49,16 @@
 		)
 	);
 	let status = $derived.by((): StatusDotStatus => {
+		if (service.publication?.state === 'ready') return 'healthy';
+		if (service.publication?.state === 'checking_endpoint') return 'starting';
+		if (service.publication?.state === 'endpoint_unhealthy') return 'unhealthy';
+		if (service.publication?.state === 'route_paused') return 'paused';
+		if (
+			service.publication?.state === 'waiting_for_publisher' ||
+			service.publication?.state === 'instance_missing'
+		)
+			return 'waiting';
+		if (service.service_type === 'published') return 'unknown';
 		if (service.status === 'building') return 'building';
 		if (service.health_status === 'Healthy') return 'healthy';
 		if (service.health_status === 'Starting') return 'starting';
@@ -71,23 +84,7 @@
 	}
 
 	function getDisplayUrl(service: ServiceStatus) {
-		if (service.domain) return service.domain;
-		if (service.url) {
-			try {
-				const url = new URL(service.url);
-				if (url.hostname.endsWith('.localhost')) {
-					return url.hostname;
-				}
-				// If it's localhost, just return the host:port
-				if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
-					return url.host;
-				}
-			} catch {
-				/* empty */
-			}
-			return service.url.replace(/^https?:\/\//, '');
-		}
-		return '';
+		return serviceDisplayAuthority(service);
 	}
 </script>
 
@@ -120,18 +117,30 @@
 	</div>
 
 	<div class="body">
-		{#each lastLogs as log (log.timestamp + '-' + log.message)}
-			<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-			<div class="log-line">{@html converter.toHtml(cleanLog(log.message))}</div>
-		{/each}
-		{#if lastLogs.length === 0}
-			<div class="log-line empty">No logs yet...</div>
+		{#if service.publication}
+			<div class="publication-state">
+				{publicationStateLabel(service.publication.state)}
+			</div>
+			<div class="publication-copy">{service.publication.explanation}</div>
+			{#if service.publication.next_step}
+				<div class="publication-next">{service.publication.next_step}</div>
+			{/if}
+		{:else}
+			{#each lastLogs as log (log.timestamp + '-' + log.message)}
+				<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+				<div class="log-line">{@html converter.toHtml(cleanLog(log.message))}</div>
+			{/each}
+			{#if lastLogs.length === 0}
+				<div class="log-line empty">No logs yet...</div>
+			{/if}
 		{/if}
 	</div>
 
 	<div class="footer">
 		<div class="actions">
-			{#if service.status === 'running'}
+			{#if service.service_type === 'published'}
+				<span class="external-label">Externally managed</span>
+			{:else if service.status === 'running'}
 				<button title="Restart" onclick={handleRestart} disabled={isPending}>
 					{#if isPending}
 						<Spinner size={14} />
@@ -241,6 +250,29 @@
 	.log-line.empty {
 		color: #52525b; /* Zinc-600 */
 		font-style: italic;
+	}
+
+	.publication-state {
+		color: #93c5fd;
+		font-weight: 600;
+		line-height: 1.35;
+	}
+
+	.publication-copy,
+	.publication-next {
+		font-family: var(--font-sans, sans-serif);
+		font-size: 0.75rem;
+		line-height: 1.35;
+		white-space: normal;
+	}
+
+	.publication-next {
+		color: #71717a;
+	}
+
+	.external-label {
+		font-size: 0.75rem;
+		color: #71717a;
 	}
 
 	.footer {
