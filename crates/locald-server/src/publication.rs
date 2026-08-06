@@ -1772,7 +1772,7 @@ impl PublicationRegistry {
             }
             slot.paused = paused;
             if let SlotState::Live(lease) = &mut slot.state {
-                Self::clear_rebind(lease);
+                Self::retire_uncommitted_rebind(lease);
                 effects.probe_required.insert(key.clone());
             }
             effects.projection_changed.insert(key.clone());
@@ -1877,7 +1877,7 @@ impl PublicationRegistry {
             }
             match &mut slot.state {
                 SlotState::Live(lease) => {
-                    Self::clear_rebind(lease);
+                    Self::retire_uncommitted_rebind(lease);
                     effects.probe_required.insert(key.clone());
                 }
                 SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => {}
@@ -2030,6 +2030,21 @@ impl PublicationRegistry {
     fn clear_rebind(lease: &mut LiveLease) {
         if let Some(attempt) = lease.rebind.take() {
             Self::cancel_rebind_if_in_flight(&attempt);
+        }
+    }
+
+    fn retire_uncommitted_rebind(lease: &mut LiveLease) {
+        let committed_binding_is_current = lease.rebind.as_ref().is_some_and(|attempt| {
+            matches!(
+                &attempt.phase,
+                RebindPhase::TerminalSuccess {
+                    installed_binding_revision,
+                    ..
+                } if *installed_binding_revision == lease.binding_revision
+            )
+        });
+        if !committed_binding_is_current {
+            Self::clear_rebind(lease);
         }
     }
 
@@ -3208,6 +3223,143 @@ mod tests {
                 .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(25))
                 .result
                 .expect_err("bounded replay expires at its original deadline"),
+            PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn committed_rebind_replay_survives_pause_resume_and_wake_until_deadline() {
+        let declaration = declaration(instance(26), 1, "twenty-six.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, first) = publish(&mut registry, &key, &owner, 26, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&first.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let BeginRebindCandidate::Started(candidate) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(27))
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected fresh candidate");
+        };
+        registry
+            .commit_rebind(&candidate, capability(27, &drops))
+            .result
+            .expect("commit candidate");
+
+        registry
+            .set_paused(key.instance(), true)
+            .result
+            .expect("pause route");
+        assert!(matches!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(27))
+                .result
+                .expect("replay while paused"),
+            BeginRebindCandidate::Replay(LeaseGrant {
+                binding_revision: 2,
+                ..
+            })
+        ));
+
+        registry
+            .set_paused(key.instance(), false)
+            .result
+            .expect("resume route");
+        registry
+            .wake_barrier(true)
+            .result
+            .expect("trustworthy wake");
+        assert!(matches!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(27))
+                .result
+                .expect("replay after resume and wake"),
+            BeginRebindCandidate::Replay(LeaseGrant {
+                binding_revision: 2,
+                ..
+            })
+        ));
+
+        clock.advance(REBIND_ATTEMPT_TTL);
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(27))
+                .result
+                .expect_err("bounded replay expires at its original deadline"),
+            PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn pause_and_wake_retire_uncommitted_rebind_work() {
+        let declaration = declaration(instance(27), 1, "twenty-seven.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, grant) = publish(&mut registry, &key, &owner, 27, &drops);
+        let BeginRebind::Started {
+            handle: pending,
+            origin,
+            ..
+        } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin pending rebind")
+        else {
+            panic!("expected pending rebind");
+        };
+
+        registry
+            .set_paused(key.instance(), true)
+            .result
+            .expect("pause route");
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&pending, &owner, &origin, &ListenerIdentity::Test(28),)
+                .result
+                .expect_err("pause retires pending candidate"),
+            PublicationRegistryError::AttemptStale
+        );
+        registry
+            .set_paused(key.instance(), false)
+            .result
+            .expect("resume route");
+
+        let BeginRebind::Started {
+            handle: in_flight, ..
+        } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin in-flight rebind")
+        else {
+            panic!("expected successor rebind");
+        };
+        let BeginRebindCandidate::Started(candidate) = registry
+            .begin_rebind_candidate(&in_flight, &owner, &origin, &ListenerIdentity::Test(29))
+            .result
+            .expect("begin in-flight candidate")
+        else {
+            panic!("expected in-flight candidate");
+        };
+        assert!(!candidate.cancellation.is_cancelled());
+
+        registry
+            .wake_barrier(true)
+            .result
+            .expect("trustworthy wake");
+        assert!(candidate.cancellation.is_cancelled());
+        assert_eq!(
+            registry
+                .commit_rebind(&candidate, capability(29, &drops))
+                .result
+                .expect_err("wake-canceled candidate cannot replace the binding"),
             PublicationRegistryError::AttemptStale
         );
     }
