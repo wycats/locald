@@ -322,8 +322,10 @@ struct LeaseSchedule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparationFence {
+    epoch: DaemonEpoch,
     service: ServiceKey,
     generation: u64,
+    token: AuthorityToken,
     principal: PublisherPrincipal,
     configuration_revision: u64,
     deadline: PublicationInstant,
@@ -362,6 +364,10 @@ struct ExpiryFence {
 enum BeginPreparation {
     Started(PreparationFence),
     Joined(PreparationFence),
+    Terminal {
+        fence: PreparationFence,
+        failure: TerminalAttemptFailure,
+    },
     ExistingAttempt {
         handle: AcquisitionAttemptHandle,
         state: AttemptState,
@@ -501,8 +507,15 @@ impl DeclarationAuthority {
 }
 
 #[derive(Debug)]
+enum PreparationPhase {
+    InFlight,
+    Terminal(TerminalAttemptFailure),
+}
+
+#[derive(Debug)]
 struct Preparation {
     fence: PreparationFence,
+    phase: PreparationPhase,
 }
 
 #[derive(Debug)]
@@ -624,6 +637,8 @@ struct PublicationRegistry {
     epoch: DaemonEpoch,
     last_now: Option<PublicationInstant>,
     configuration_revisions: BTreeMap<ProjectInstanceId, u64>,
+    /// Current project-level route policy, retained across declaration changes.
+    paused_instances: BTreeSet<ProjectInstanceId>,
     slots: BTreeMap<ServiceKey, PublicationSlot>,
 }
 
@@ -644,6 +659,7 @@ impl PublicationRegistry {
             epoch: DaemonEpoch::random(),
             last_now: None,
             configuration_revisions: BTreeMap::new(),
+            paused_instances: BTreeSet::new(),
             slots: BTreeMap::new(),
         }
     }
@@ -655,6 +671,7 @@ impl PublicationRegistry {
             epoch,
             last_now: None,
             configuration_revisions: BTreeMap::new(),
+            paused_instances: BTreeSet::new(),
             slots: BTreeMap::new(),
         }
     }
@@ -765,7 +782,7 @@ impl PublicationRegistry {
                     key.clone(),
                     PublicationSlot {
                         declaration: candidate,
-                        paused: false,
+                        paused: self.paused_instances.contains(&instance),
                         missing: false,
                         last_generation: 0,
                         state: SlotState::Vacant,
@@ -832,8 +849,10 @@ impl PublicationRegistry {
                     Err(error) => return PublicationOutcome::err(error, effects),
                 };
                 let fence = PreparationFence {
+                    epoch: self.epoch.clone(),
                     service: key.clone(),
                     generation,
+                    token: AuthorityToken::random(),
                     principal,
                     configuration_revision: slot.declaration.0.configuration_revision,
                     deadline,
@@ -841,11 +860,20 @@ impl PublicationRegistry {
                 slot.last_generation = generation;
                 slot.state = SlotState::Preparing(Preparation {
                     fence: fence.clone(),
+                    phase: PreparationPhase::InFlight,
                 });
                 BeginPreparation::Started(fence)
             }
             SlotState::Preparing(preparation) if preparation.fence.principal == principal => {
-                BeginPreparation::Joined(preparation.fence.clone())
+                match preparation.phase {
+                    PreparationPhase::InFlight => {
+                        BeginPreparation::Joined(preparation.fence.clone())
+                    }
+                    PreparationPhase::Terminal(failure) => BeginPreparation::Terminal {
+                        fence: preparation.fence.clone(),
+                        failure,
+                    },
+                }
             }
             SlotState::Preparing(_) => {
                 return PublicationOutcome::err(
@@ -893,6 +921,7 @@ impl PublicationRegistry {
         };
         if current.fence != *fence
             || current.fence.configuration_revision != slot.declaration.0.configuration_revision
+            || !matches!(current.phase, PreparationPhase::InFlight)
         {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         }
@@ -921,19 +950,79 @@ impl PublicationRegistry {
         PublicationOutcome::ok(handle, effects)
     }
 
-    fn fail_preparation(&mut self, fence: &PreparationFence) -> PublicationOutcome<()> {
-        let (_, effects) = match self.begin_transition() {
+    fn fail_preparation(
+        &mut self,
+        fence: &PreparationFence,
+        failure: TerminalAttemptFailure,
+    ) -> PublicationOutcome<()> {
+        let (now, effects) = match self.begin_transition_except(&fence.service) {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
         let Some(slot) = self.slots.get_mut(&fence.service) else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
-        if !matches!(&slot.state, SlotState::Preparing(current) if current.fence == *fence) {
+        let SlotState::Preparing(current) = &mut slot.state else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        if current.fence != *fence || !matches!(current.phase, PreparationPhase::InFlight) {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         }
-        slot.state = SlotState::Vacant;
+        if current.fence.deadline <= now {
+            slot.state = SlotState::Vacant;
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        current.phase = PreparationPhase::Terminal(failure);
         PublicationOutcome::ok((), effects)
+    }
+
+    fn replace_terminal_preparation(
+        &mut self,
+        current: &PreparationFence,
+        principal: &PublisherPrincipal,
+    ) -> PublicationOutcome<PreparationFence> {
+        let (now, effects) = match self.begin_transition_except(&current.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(slot) = self.slots.get_mut(&current.service) else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        let SlotState::Preparing(preparation) = &slot.state else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        if preparation.fence != *current
+            || preparation.fence.principal != *principal
+            || !matches!(preparation.phase, PreparationPhase::Terminal(_))
+        {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        }
+        if preparation.fence.deadline <= now {
+            slot.state = SlotState::Vacant;
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        let Some(generation) = slot.last_generation.checked_add(1) else {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        };
+        let deadline = match now.checked_add(PREPARATION_TTL) {
+            Ok(deadline) => deadline,
+            Err(error) => return PublicationOutcome::err(error, effects),
+        };
+        let replacement = PreparationFence {
+            epoch: self.epoch.clone(),
+            service: current.service.clone(),
+            generation,
+            token: AuthorityToken::random(),
+            principal: principal.clone(),
+            configuration_revision: slot.declaration.0.configuration_revision,
+            deadline,
+        };
+        slot.last_generation = generation;
+        slot.state = SlotState::Preparing(Preparation {
+            fence: replacement.clone(),
+            phase: PreparationPhase::InFlight,
+        });
+        PublicationOutcome::ok(replacement, effects)
     }
 
     fn begin_acquire(
@@ -1236,10 +1325,16 @@ impl PublicationRegistry {
         let SlotState::Live(lease) = &slot.state else {
             return PublicationOutcome::ok(false, effects);
         };
-        let matches_lease = lease.handle == fence.lease;
+        if lease.handle != fence.lease {
+            return PublicationOutcome::ok(false, effects);
+        }
+        if lease.deadline <= now {
+            Self::retire_slot_state(&fence.lease.service, slot, &mut effects);
+            return PublicationOutcome::ok(true, effects);
+        }
         let matches_renewal = lease.renewal_revision == fence.renewal_revision;
         let matches_deadline = lease.deadline == fence.deadline;
-        if !(matches_lease && matches_renewal && matches_deadline) {
+        if !(matches_renewal && matches_deadline) {
             return PublicationOutcome::ok(false, effects);
         }
         if fence.deadline > now {
@@ -1546,6 +1641,11 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        if paused {
+            self.paused_instances.insert(instance);
+        } else {
+            self.paused_instances.remove(&instance);
+        }
         for (key, slot) in &mut self.slots {
             if key.instance() != instance || slot.paused == paused {
                 continue;
@@ -1587,6 +1687,7 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        self.paused_instances.remove(&instance);
         let keys = self
             .slots
             .keys()
@@ -1974,6 +2075,99 @@ mod tests {
     }
 
     #[test]
+    fn preparation_failure_replays_until_exact_compare_and_swap_replacement() {
+        let declaration = declaration(instance(18), 1, "eighteen.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+
+        let BeginPreparation::Started(first) = registry
+            .begin_preparation(&key, owner.clone())
+            .result
+            .expect("begin preparation")
+        else {
+            panic!("expected started preparation");
+        };
+        registry
+            .fail_preparation(&first, TerminalAttemptFailure::Internal)
+            .result
+            .expect("record terminal preparation failure");
+        assert_eq!(
+            registry
+                .begin_preparation(&key, owner.clone())
+                .result
+                .expect("replay terminal preparation failure"),
+            BeginPreparation::Terminal {
+                fence: first.clone(),
+                failure: TerminalAttemptFailure::Internal,
+            }
+        );
+        assert_eq!(
+            registry
+                .begin_preparation(&key, principal(2))
+                .result
+                .expect_err("terminal slot remains owned by its exact principal"),
+            PublicationRegistryError::AcquisitionInProgress
+        );
+
+        let replacement = registry
+            .replace_terminal_preparation(&first, &owner)
+            .result
+            .expect("replace exact terminal preparation");
+        assert_eq!(replacement.generation, first.generation + 1);
+        assert_eq!(
+            registry
+                .replace_terminal_preparation(&first, &owner)
+                .result
+                .expect_err("stale replacement cannot replace its successor"),
+            PublicationRegistryError::AttemptStale
+        );
+        registry
+            .complete_preparation(&replacement)
+            .result
+            .expect("replacement preparation can complete");
+    }
+
+    #[test]
+    fn terminal_preparation_failure_keeps_its_original_deadline() {
+        let declaration = declaration(instance(21), 1, "twenty-one.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+
+        let BeginPreparation::Started(first) = registry
+            .begin_preparation(&key, owner.clone())
+            .result
+            .expect("begin preparation")
+        else {
+            panic!("expected started preparation");
+        };
+        registry
+            .fail_preparation(&first, TerminalAttemptFailure::Internal)
+            .result
+            .expect("record terminal preparation failure");
+        clock.advance(PREPARATION_TTL - Duration::from_secs(1));
+        assert_eq!(
+            registry
+                .begin_preparation(&key, owner.clone())
+                .result
+                .expect("replay before original deadline"),
+            BeginPreparation::Terminal {
+                fence: first.clone(),
+                failure: TerminalAttemptFailure::Internal,
+            }
+        );
+
+        clock.advance(Duration::from_secs(1));
+        let BeginPreparation::Started(successor) = registry
+            .begin_preparation(&key, owner)
+            .result
+            .expect("original terminal deadline vacates the bounded slot")
+        else {
+            panic!("expected successor preparation");
+        };
+        assert_eq!(successor.generation, first.generation + 1);
+    }
+
+    #[test]
     fn terminal_acquisition_replays_and_replacement_is_compare_and_swap() {
         let declaration = declaration(instance(2), 1, "two.localhost");
         let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
@@ -2014,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn renewal_uses_commit_time_and_stale_expiry_cannot_retire_successor_deadline() {
+    fn renewal_uses_commit_time_and_stale_expiry_enforces_the_current_deadline() {
         let declaration = declaration(instance(3), 1, "three.localhost");
         let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
         let owner = principal(1);
@@ -2042,6 +2236,18 @@ mod tests {
         );
 
         clock.advance(Duration::from_secs(20));
+        let expired = registry.expire(&first.expiry_fence);
+        assert!(
+            expired
+                .result
+                .expect("late stale expiry retires elapsed current lease")
+        );
+        drop(expired.effects);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.projection(&key).expect("projection").state,
+            PublicationState::WaitingForPublisher
+        );
         assert_eq!(
             registry
                 .renew(&renewed.lease, &owner)
@@ -2050,6 +2256,38 @@ mod tests {
             PublicationRegistryError::LeaseLost
         );
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_expiry_from_retired_lease_cannot_retire_a_successor_generation() {
+        let declaration = declaration(instance(20), 1, "twenty.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_first_attempt, first) = publish(&mut registry, &key, &owner, 20, &drops);
+        let released = registry.release(&first.lease, &owner);
+        released.result.expect("release first lease");
+        drop(released.effects);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let (_second_attempt, second) = publish(&mut registry, &key, &owner, 21, &drops);
+        clock.advance(LEASE_TTL);
+        assert!(
+            !registry
+                .expire(&first.expiry_fence)
+                .result
+                .expect("old lease callback is fenced from successor")
+        );
+        assert_eq!(
+            registry.projection(&key).expect("projection").state,
+            PublicationState::CheckingEndpoint
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let expired = registry.expire(&second.expiry_fence);
+        assert!(expired.result.expect("successor expiry is authoritative"));
+        drop(expired.effects);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2143,6 +2381,55 @@ mod tests {
         let wake = registry.wake_barrier(true);
         wake.result.expect("trustworthy wake");
         assert!(wake.effects.probe_required.contains(&key));
+    }
+
+    #[test]
+    fn pause_policy_applies_to_declarations_added_after_the_pause() {
+        let first = declaration(instance(19), 1, "nineteen.localhost");
+        let (mut registry, _clock, first_key) = registry(Duration::ZERO, first.clone());
+        registry
+            .set_paused(first_key.instance(), true)
+            .result
+            .expect("pause project routes");
+
+        let mut retained = first;
+        retained.configuration_revision = 2;
+        let mut added = declaration(instance(19), 2, "preview.nineteen.localhost");
+        added.service_name = "preview".into();
+        let added_key = ServiceKey::new(added.project_instance_id, added.service_name.clone());
+        registry
+            .reconcile_declarations(first_key.instance(), 2, [retained, added])
+            .result
+            .expect("add declaration while project is paused");
+        assert_eq!(
+            registry
+                .projection(&added_key)
+                .expect("added projection")
+                .state,
+            PublicationState::RoutePaused
+        );
+
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, _grant) = publish(&mut registry, &added_key, &owner, 19, &drops);
+        assert_eq!(
+            registry
+                .projection(&added_key)
+                .expect("published projection")
+                .state,
+            PublicationState::RoutePaused
+        );
+
+        let resumed = registry.set_paused(first_key.instance(), false);
+        resumed.result.expect("resume project routes");
+        assert!(resumed.effects.probe_required.contains(&added_key));
+        assert_eq!(
+            registry
+                .projection(&added_key)
+                .expect("resumed projection")
+                .state,
+            PublicationState::CheckingEndpoint
+        );
     }
 
     #[test]
