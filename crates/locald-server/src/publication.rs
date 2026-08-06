@@ -18,6 +18,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
 
 const LEASE_TTL: Duration = Duration::from_secs(30);
 const RENEW_AFTER: Duration = Duration::from_secs(10);
@@ -241,6 +242,86 @@ struct RetainedListenerCapability {
     guard: Arc<dyn Send + Sync>,
 }
 
+/// Registry-owned cancellation for one currently executing operation.
+///
+/// The controller never leaves the registry. The worker receives only an
+/// observer, so cancellation remains a consequence of serialized authority
+/// transitions rather than a caller-controlled mutation.
+struct OperationCancellationController {
+    sender: watch::Sender<bool>,
+}
+
+impl OperationCancellationController {
+    fn pair() -> (Self, OperationCancellationObserver) {
+        let (sender, receiver) = watch::channel(false);
+        (
+            Self { sender },
+            OperationCancellationObserver {
+                identity: AuthorityToken::random(),
+                receiver,
+            },
+        )
+    }
+
+    fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
+}
+
+impl fmt::Debug for OperationCancellationController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OperationCancellationController(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+struct OperationCancellationObserver {
+    identity: AuthorityToken,
+    receiver: watch::Receiver<bool>,
+}
+
+impl OperationCancellationObserver {
+    fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    async fn cancelled(&mut self) {
+        while !self.is_cancelled() {
+            if self.receiver.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+impl PartialEq for OperationCancellationObserver {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for OperationCancellationObserver {}
+
+impl fmt::Debug for OperationCancellationObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OperationCancellationObserver(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperationPermit<F> {
+    fence: F,
+    cancellation: OperationCancellationObserver,
+}
+
+impl<F> std::ops::Deref for OperationPermit<F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fence
+    }
+}
+
 impl RetainedListenerCapability {
     fn new(identity: ListenerIdentity, guard: Arc<dyn Send + Sync>) -> Self {
         Self { identity, guard }
@@ -362,7 +443,7 @@ struct ExpiryFence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BeginPreparation {
-    Started(PreparationFence),
+    Started(OperationPermit<PreparationFence>),
     Joined(PreparationFence),
     Terminal {
         fence: PreparationFence,
@@ -378,7 +459,7 @@ enum BeginPreparation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BeginAcquire {
-    Started(AcquisitionFence),
+    Started(OperationPermit<AcquisitionFence>),
     Joined(AcquisitionFence),
     Terminal(TerminalAttemptFailure),
     Replay(LeaseGrant),
@@ -401,7 +482,7 @@ enum BeginRebind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BeginRebindCandidate {
-    Started(RebindFence),
+    Started(OperationPermit<RebindFence>),
     Joined(RebindFence),
     Terminal(TerminalAttemptFailure),
     Replay(LeaseGrant),
@@ -508,7 +589,7 @@ impl DeclarationAuthority {
 
 #[derive(Debug)]
 enum PreparationPhase {
-    InFlight,
+    InFlight(OperationCancellationController),
     Terminal(TerminalAttemptFailure),
 }
 
@@ -526,7 +607,10 @@ struct AcquisitionRequest {
 #[derive(Debug)]
 enum AcquisitionPhase {
     Pending,
-    InFlight(AcquisitionRequest),
+    InFlight {
+        request: AcquisitionRequest,
+        cancellation: OperationCancellationController,
+    },
     Terminal {
         request: AcquisitionRequest,
         failure: TerminalAttemptFailure,
@@ -547,7 +631,7 @@ impl AcquisitionAttempt {
     fn state(&self) -> AttemptState {
         match self.phase {
             AcquisitionPhase::Pending => AttemptState::Pending,
-            AcquisitionPhase::InFlight(_) => AttemptState::InFlight,
+            AcquisitionPhase::InFlight { .. } => AttemptState::InFlight,
             AcquisitionPhase::Terminal { .. } => AttemptState::Terminal,
         }
     }
@@ -568,7 +652,10 @@ struct RebindRequest {
 #[derive(Debug)]
 enum RebindPhase {
     Pending,
-    InFlight(RebindRequest),
+    InFlight {
+        request: RebindRequest,
+        cancellation: OperationCancellationController,
+    },
     TerminalFailure {
         request: RebindRequest,
         failure: TerminalAttemptFailure,
@@ -592,7 +679,7 @@ impl RebindAttempt {
     fn state(&self) -> AttemptState {
         match self.phase {
             RebindPhase::Pending => AttemptState::Pending,
-            RebindPhase::InFlight(_) => AttemptState::InFlight,
+            RebindPhase::InFlight { .. } => AttemptState::InFlight,
             RebindPhase::TerminalFailure { .. } | RebindPhase::TerminalSuccess { .. } => {
                 AttemptState::Terminal
             }
@@ -639,6 +726,8 @@ struct PublicationRegistry {
     configuration_revisions: BTreeMap<ProjectInstanceId, u64>,
     /// Current project-level route policy, retained across declaration changes.
     paused_instances: BTreeSet<ProjectInstanceId>,
+    /// Current project-instance presence policy, retained across declarations.
+    missing_instances: BTreeSet<ProjectInstanceId>,
     slots: BTreeMap<ServiceKey, PublicationSlot>,
 }
 
@@ -660,6 +749,7 @@ impl PublicationRegistry {
             last_now: None,
             configuration_revisions: BTreeMap::new(),
             paused_instances: BTreeSet::new(),
+            missing_instances: BTreeSet::new(),
             slots: BTreeMap::new(),
         }
     }
@@ -672,6 +762,7 @@ impl PublicationRegistry {
             last_now: None,
             configuration_revisions: BTreeMap::new(),
             paused_instances: BTreeSet::new(),
+            missing_instances: BTreeSet::new(),
             slots: BTreeMap::new(),
         }
     }
@@ -783,7 +874,7 @@ impl PublicationRegistry {
                     PublicationSlot {
                         declaration: candidate,
                         paused: self.paused_instances.contains(&instance),
-                        missing: false,
+                        missing: self.missing_instances.contains(&instance),
                         last_generation: 0,
                         state: SlotState::Vacant,
                     },
@@ -800,7 +891,10 @@ impl PublicationRegistry {
             let health_equivalent = slot.declaration.health_equivalent(&candidate);
             match &mut slot.state {
                 SlotState::Live(lease) if may_transfer_authority && routing_equivalent => {
-                    lease.rebind = None;
+                    Self::transfer_committed_rebind_replay(
+                        lease,
+                        candidate.0.configuration_revision,
+                    );
                     if !health_equivalent {
                         effects.probe_required.insert(key.clone());
                     }
@@ -857,21 +951,25 @@ impl PublicationRegistry {
                     configuration_revision: slot.declaration.0.configuration_revision,
                     deadline,
                 };
+                let (cancellation, cancellation_observer) = OperationCancellationController::pair();
                 slot.last_generation = generation;
                 slot.state = SlotState::Preparing(Preparation {
                     fence: fence.clone(),
-                    phase: PreparationPhase::InFlight,
+                    phase: PreparationPhase::InFlight(cancellation),
                 });
-                BeginPreparation::Started(fence)
+                BeginPreparation::Started(OperationPermit {
+                    fence,
+                    cancellation: cancellation_observer,
+                })
             }
             SlotState::Preparing(preparation) if preparation.fence.principal == principal => {
-                match preparation.phase {
-                    PreparationPhase::InFlight => {
+                match &preparation.phase {
+                    PreparationPhase::InFlight(_) => {
                         BeginPreparation::Joined(preparation.fence.clone())
                     }
                     PreparationPhase::Terminal(failure) => BeginPreparation::Terminal {
                         fence: preparation.fence.clone(),
-                        failure,
+                        failure: *failure,
                     },
                 }
             }
@@ -909,7 +1007,7 @@ impl PublicationRegistry {
         &mut self,
         fence: &PreparationFence,
     ) -> PublicationOutcome<AcquisitionAttemptHandle> {
-        let (now, effects) = match self.begin_transition_except(&fence.service) {
+        let (now, mut effects) = match self.begin_transition_except(&fence.service) {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
@@ -919,15 +1017,15 @@ impl PublicationRegistry {
         let SlotState::Preparing(current) = &slot.state else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
+        if current.fence.deadline <= now {
+            Self::retire_slot_state(&fence.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
         if current.fence != *fence
             || current.fence.configuration_revision != slot.declaration.0.configuration_revision
-            || !matches!(current.phase, PreparationPhase::InFlight)
+            || !matches!(current.phase, PreparationPhase::InFlight(_))
         {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
-        }
-        if current.fence.deadline <= now {
-            slot.state = SlotState::Vacant;
-            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
         }
         let deadline = match now.checked_add(ACQUISITION_ATTEMPT_TTL) {
             Ok(deadline) => deadline,
@@ -955,7 +1053,7 @@ impl PublicationRegistry {
         fence: &PreparationFence,
         failure: TerminalAttemptFailure,
     ) -> PublicationOutcome<()> {
-        let (now, effects) = match self.begin_transition_except(&fence.service) {
+        let (now, mut effects) = match self.begin_transition_except(&fence.service) {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
@@ -965,12 +1063,12 @@ impl PublicationRegistry {
         let SlotState::Preparing(current) = &mut slot.state else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
-        if current.fence != *fence || !matches!(current.phase, PreparationPhase::InFlight) {
-            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
-        }
         if current.fence.deadline <= now {
-            slot.state = SlotState::Vacant;
+            Self::retire_slot_state(&fence.service, slot, &mut effects);
             return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        if current.fence != *fence || !matches!(current.phase, PreparationPhase::InFlight(_)) {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         }
         current.phase = PreparationPhase::Terminal(failure);
         PublicationOutcome::ok((), effects)
@@ -980,8 +1078,8 @@ impl PublicationRegistry {
         &mut self,
         current: &PreparationFence,
         principal: &PublisherPrincipal,
-    ) -> PublicationOutcome<PreparationFence> {
-        let (now, effects) = match self.begin_transition_except(&current.service) {
+    ) -> PublicationOutcome<OperationPermit<PreparationFence>> {
+        let (now, mut effects) = match self.begin_transition_except(&current.service) {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
@@ -991,15 +1089,15 @@ impl PublicationRegistry {
         let SlotState::Preparing(preparation) = &slot.state else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
+        if preparation.fence.deadline <= now {
+            Self::retire_slot_state(&current.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
         if preparation.fence != *current
             || preparation.fence.principal != *principal
             || !matches!(preparation.phase, PreparationPhase::Terminal(_))
         {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
-        }
-        if preparation.fence.deadline <= now {
-            slot.state = SlotState::Vacant;
-            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
         }
         let Some(generation) = slot.last_generation.checked_add(1) else {
             return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
@@ -1017,12 +1115,19 @@ impl PublicationRegistry {
             configuration_revision: slot.declaration.0.configuration_revision,
             deadline,
         };
+        let (cancellation, cancellation_observer) = OperationCancellationController::pair();
         slot.last_generation = generation;
         slot.state = SlotState::Preparing(Preparation {
             fence: replacement.clone(),
-            phase: PreparationPhase::InFlight,
+            phase: PreparationPhase::InFlight(cancellation),
         });
-        PublicationOutcome::ok(replacement, effects)
+        PublicationOutcome::ok(
+            OperationPermit {
+                fence: replacement,
+                cancellation: cancellation_observer,
+            },
+            effects,
+        )
     }
 
     fn begin_acquire(
@@ -1075,12 +1180,12 @@ impl PublicationRegistry {
         let SlotState::Attempt(attempt) = &mut slot.state else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
+        if attempt.deadline <= now {
+            Self::retire_slot_state(&handle.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
         if attempt.handle != *handle || attempt.principal != *principal {
             return PublicationOutcome::err(PublicationRegistryError::AttemptMismatch, effects);
-        }
-        if attempt.deadline <= now {
-            slot.state = SlotState::Vacant;
-            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
         }
         let fence = AcquisitionFence {
             handle: handle.clone(),
@@ -1092,18 +1197,25 @@ impl PublicationRegistry {
         };
         let result = match &attempt.phase {
             AcquisitionPhase::Pending => {
-                attempt.phase = AcquisitionPhase::InFlight(AcquisitionRequest {
-                    fence: fence.clone(),
-                });
-                BeginAcquire::Started(fence)
+                let (cancellation, cancellation_observer) = OperationCancellationController::pair();
+                attempt.phase = AcquisitionPhase::InFlight {
+                    request: AcquisitionRequest {
+                        fence: fence.clone(),
+                    },
+                    cancellation,
+                };
+                BeginAcquire::Started(OperationPermit {
+                    fence,
+                    cancellation: cancellation_observer,
+                })
             }
-            AcquisitionPhase::InFlight(request) if request.fence == fence => {
+            AcquisitionPhase::InFlight { request, .. } if request.fence == fence => {
                 BeginAcquire::Joined(request.fence.clone())
             }
             AcquisitionPhase::Terminal { request, failure } if request.fence == fence => {
                 BeginAcquire::Terminal(*failure)
             }
-            AcquisitionPhase::InFlight(_) | AcquisitionPhase::Terminal { .. } => {
+            AcquisitionPhase::InFlight { .. } | AcquisitionPhase::Terminal { .. } => {
                 return PublicationOutcome::err(PublicationRegistryError::AttemptMismatch, effects);
             }
         };
@@ -1128,19 +1240,19 @@ impl PublicationRegistry {
         let SlotState::Attempt(attempt) = &slot.state else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
+        if attempt.deadline <= now {
+            Self::retire_slot_state(&fence.handle.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
         if attempt.handle != fence.handle
             || attempt.principal != fence.principal
             || attempt.deadline != fence.deadline
             || attempt.configuration_revision != fence.configuration_revision
             || slot.declaration.0.configuration_revision != fence.configuration_revision
             || slot.declaration.0.origin != fence.acknowledged_origin
-            || !matches!(&attempt.phase, AcquisitionPhase::InFlight(request) if request.fence == *fence)
+            || !matches!(&attempt.phase, AcquisitionPhase::InFlight { request, .. } if request.fence == *fence)
         {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
-        }
-        if attempt.deadline <= now {
-            slot.state = SlotState::Vacant;
-            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
         }
         let deadline = match now.checked_add(LEASE_TTL) {
             Ok(deadline) => deadline,
@@ -1186,7 +1298,7 @@ impl PublicationRegistry {
         fence: &AcquisitionFence,
         failure: TerminalAttemptFailure,
     ) -> PublicationOutcome<()> {
-        let (now, effects) = match self.begin_transition_except(&fence.handle.service) {
+        let (now, mut effects) = match self.begin_transition_except(&fence.handle.service) {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
@@ -1196,13 +1308,13 @@ impl PublicationRegistry {
         let SlotState::Attempt(attempt) = &mut slot.state else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
-        if !matches!(&attempt.phase, AcquisitionPhase::InFlight(request) if request.fence == *fence)
+        if attempt.deadline <= now {
+            Self::retire_slot_state(&fence.handle.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        if !matches!(&attempt.phase, AcquisitionPhase::InFlight { request, .. } if request.fence == *fence)
         {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
-        }
-        if attempt.deadline <= now {
-            slot.state = SlotState::Vacant;
-            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
         }
         attempt.phase = AcquisitionPhase::Terminal {
             request: AcquisitionRequest {
@@ -1456,12 +1568,19 @@ impl PublicationRegistry {
         };
         let result = match &attempt.phase {
             RebindPhase::Pending => {
-                attempt.phase = RebindPhase::InFlight(RebindRequest {
-                    fence: fence.clone(),
-                });
-                BeginRebindCandidate::Started(fence)
+                let (cancellation, cancellation_observer) = OperationCancellationController::pair();
+                attempt.phase = RebindPhase::InFlight {
+                    request: RebindRequest {
+                        fence: fence.clone(),
+                    },
+                    cancellation,
+                };
+                BeginRebindCandidate::Started(OperationPermit {
+                    fence,
+                    cancellation: cancellation_observer,
+                })
             }
-            RebindPhase::InFlight(request) if request.fence == fence => {
+            RebindPhase::InFlight { request, .. } if request.fence == fence => {
                 BeginRebindCandidate::Joined(request.fence.clone())
             }
             RebindPhase::TerminalFailure { request, failure } if request.fence == fence => {
@@ -1475,7 +1594,7 @@ impl PublicationRegistry {
             {
                 BeginRebindCandidate::Replay(Self::lease_grant(lease, now))
             }
-            RebindPhase::InFlight(_)
+            RebindPhase::InFlight { .. }
             | RebindPhase::TerminalFailure { .. }
             | RebindPhase::TerminalSuccess { .. } => {
                 return PublicationOutcome::err(PublicationRegistryError::AttemptMismatch, effects);
@@ -1514,7 +1633,7 @@ impl PublicationRegistry {
                 if attempt.handle == fence.handle
                     && matches!(
                         &attempt.phase,
-                        RebindPhase::InFlight(request) if request.fence == *fence
+                        RebindPhase::InFlight { request, .. } if request.fence == *fence
                     )
         );
         if !(matches_lease
@@ -1568,7 +1687,8 @@ impl PublicationRegistry {
         let Some(attempt) = &mut lease.rebind else {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         };
-        if !matches!(&attempt.phase, RebindPhase::InFlight(request) if request.fence == *fence) {
+        if !matches!(&attempt.phase, RebindPhase::InFlight { request, .. } if request.fence == *fence)
+        {
             return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
         }
         attempt.phase = RebindPhase::TerminalFailure {
@@ -1652,7 +1772,7 @@ impl PublicationRegistry {
             }
             slot.paused = paused;
             if let SlotState::Live(lease) = &mut slot.state {
-                lease.rebind = None;
+                Self::clear_rebind(lease);
                 effects.probe_required.insert(key.clone());
             }
             effects.projection_changed.insert(key.clone());
@@ -1669,6 +1789,11 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        if missing {
+            self.missing_instances.insert(instance);
+        } else {
+            self.missing_instances.remove(&instance);
+        }
         for (key, slot) in &mut self.slots {
             if key.instance() != instance || slot.missing == missing {
                 continue;
@@ -1688,6 +1813,7 @@ impl PublicationRegistry {
             Err(outcome) => return outcome,
         };
         self.paused_instances.remove(&instance);
+        self.missing_instances.remove(&instance);
         let keys = self
             .slots
             .keys()
@@ -1733,17 +1859,25 @@ impl PublicationRegistry {
             Err(outcome) => return outcome,
         };
         for (key, slot) in &mut self.slots {
-            if matches!(
+            let preparation_in_flight = matches!(
+                &slot.state,
+                SlotState::Preparing(Preparation {
+                    phase: PreparationPhase::InFlight(_),
+                    ..
+                })
+            );
+            let acquisition_in_flight = matches!(
                 &slot.state,
                 SlotState::Attempt(attempt)
-                    if matches!(attempt.phase, AcquisitionPhase::InFlight(_))
-            ) {
-                slot.state = SlotState::Vacant;
+                    if matches!(attempt.phase, AcquisitionPhase::InFlight { .. })
+            );
+            if preparation_in_flight || acquisition_in_flight {
+                Self::retire_slot_state(key, slot, &mut effects);
                 continue;
             }
             match &mut slot.state {
                 SlotState::Live(lease) => {
-                    lease.rebind = None;
+                    Self::clear_rebind(lease);
                     effects.probe_required.insert(key.clone());
                 }
                 SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => {}
@@ -1845,7 +1979,7 @@ impl PublicationRegistry {
                     .as_ref()
                     .is_some_and(|attempt| attempt.deadline <= now)
                 {
-                    lease.rebind = None;
+                    Self::clear_rebind(lease);
                 }
             }
         }
@@ -1858,10 +1992,68 @@ impl PublicationRegistry {
         effects: &mut PublicationEffects,
     ) {
         let previous = std::mem::replace(&mut slot.state, SlotState::Vacant);
-        if let SlotState::Live(lease) = previous {
-            let lease = *lease;
-            effects.retired_capabilities.push(lease.capability);
-            effects.projection_changed.insert(key.clone());
+        match previous {
+            SlotState::Preparing(preparation) => {
+                Self::cancel_preparation_if_in_flight(&preparation);
+            }
+            SlotState::Attempt(attempt) => {
+                Self::cancel_acquisition_if_in_flight(&attempt);
+            }
+            SlotState::Live(lease) => {
+                let mut lease = *lease;
+                Self::clear_rebind(&mut lease);
+                effects.retired_capabilities.push(lease.capability);
+                effects.projection_changed.insert(key.clone());
+            }
+            SlotState::Vacant => {}
+        }
+    }
+
+    fn cancel_preparation_if_in_flight(preparation: &Preparation) {
+        if let PreparationPhase::InFlight(cancellation) = &preparation.phase {
+            cancellation.cancel();
+        }
+    }
+
+    fn cancel_acquisition_if_in_flight(attempt: &AcquisitionAttempt) {
+        if let AcquisitionPhase::InFlight { cancellation, .. } = &attempt.phase {
+            cancellation.cancel();
+        }
+    }
+
+    fn cancel_rebind_if_in_flight(attempt: &RebindAttempt) {
+        if let RebindPhase::InFlight { cancellation, .. } = &attempt.phase {
+            cancellation.cancel();
+        }
+    }
+
+    fn clear_rebind(lease: &mut LiveLease) {
+        if let Some(attempt) = lease.rebind.take() {
+            Self::cancel_rebind_if_in_flight(&attempt);
+        }
+    }
+
+    fn transfer_committed_rebind_replay(lease: &mut LiveLease, configuration_revision: u64) {
+        let Some(mut attempt) = lease.rebind.take() else {
+            return;
+        };
+        let preserve = match &mut attempt.phase {
+            RebindPhase::TerminalSuccess {
+                request,
+                installed_binding_revision,
+            } if *installed_binding_revision == lease.binding_revision => {
+                request.fence.configuration_revision = configuration_revision;
+                true
+            }
+            RebindPhase::Pending
+            | RebindPhase::InFlight { .. }
+            | RebindPhase::TerminalFailure { .. }
+            | RebindPhase::TerminalSuccess { .. } => false,
+        };
+        if preserve {
+            lease.rebind = Some(attempt);
+        } else {
+            Self::cancel_rebind_if_in_flight(&attempt);
         }
     }
 
@@ -2053,7 +2245,7 @@ mod tests {
                 .begin_preparation(&key, owner.clone())
                 .result
                 .expect("joined preparation"),
-            BeginPreparation::Joined(first.clone())
+            BeginPreparation::Joined(first.fence.clone())
         );
         assert_eq!(
             registry
@@ -2062,6 +2254,7 @@ mod tests {
                 .expect_err("competing principal must fail"),
             PublicationRegistryError::AcquisitionInProgress
         );
+        assert!(!first.cancellation.is_cancelled());
 
         clock.advance(PREPARATION_TTL);
         let BeginPreparation::Started(successor) = registry
@@ -2071,6 +2264,8 @@ mod tests {
         else {
             panic!("expected successor preparation");
         };
+        assert!(first.cancellation.is_cancelled());
+        assert!(!successor.cancellation.is_cancelled());
         assert_eq!(successor.generation, first.generation + 1);
     }
 
@@ -2097,7 +2292,7 @@ mod tests {
                 .result
                 .expect("replay terminal preparation failure"),
             BeginPreparation::Terminal {
-                fence: first.clone(),
+                fence: first.fence.clone(),
                 failure: TerminalAttemptFailure::Internal,
             }
         );
@@ -2151,7 +2346,7 @@ mod tests {
                 .result
                 .expect("replay before original deadline"),
             BeginPreparation::Terminal {
-                fence: first.clone(),
+                fence: first.fence.clone(),
                 failure: TerminalAttemptFailure::Internal,
             }
         );
@@ -2433,6 +2628,82 @@ mod tests {
     }
 
     #[test]
+    fn missing_policy_applies_to_future_declarations_until_instance_retirement() {
+        let project_instance = instance(22);
+        let clock = FakePublicationClock::new(Duration::ZERO);
+        let mut registry = PublicationRegistry::with_epoch(
+            Arc::new(clock),
+            DaemonEpoch(AuthorityToken::from_byte(22)),
+        );
+        registry
+            .set_missing(project_instance, true)
+            .result
+            .expect("mark instance missing before discovery");
+
+        let first = declaration(project_instance, 1, "twenty-two.localhost");
+        let first_key = ServiceKey::new(project_instance, first.service_name.clone());
+        registry
+            .reconcile_declarations(project_instance, 1, [first.clone()])
+            .result
+            .expect("admit declaration for missing instance");
+        assert_eq!(
+            registry
+                .projection(&first_key)
+                .expect("first projection")
+                .state,
+            PublicationState::InstanceMissing
+        );
+        assert_eq!(
+            registry
+                .begin_preparation(&first_key, principal(1))
+                .result
+                .expect_err("missing instance cannot prepare publication"),
+            PublicationRegistryError::InstanceMissing
+        );
+
+        let mut retained = first;
+        retained.configuration_revision = 2;
+        let mut added = declaration(project_instance, 2, "preview.twenty-two.localhost");
+        added.service_name = "preview".into();
+        let added_key = ServiceKey::new(project_instance, added.service_name.clone());
+        registry
+            .reconcile_declarations(project_instance, 2, [retained, added])
+            .result
+            .expect("add declaration while instance remains missing");
+        assert_eq!(
+            registry
+                .projection(&added_key)
+                .expect("added projection")
+                .state,
+            PublicationState::InstanceMissing
+        );
+        assert_eq!(
+            registry
+                .begin_preparation(&added_key, principal(1))
+                .result
+                .expect_err("later declaration inherits missing policy"),
+            PublicationRegistryError::InstanceMissing
+        );
+
+        registry
+            .retire_instance(project_instance)
+            .result
+            .expect("retire missing instance");
+        let replacement = declaration(project_instance, 3, "twenty-two.localhost");
+        registry
+            .reconcile_declarations(project_instance, 3, [replacement])
+            .result
+            .expect("re-admit retired instance at a newer revision");
+        assert_eq!(
+            registry
+                .projection(&first_key)
+                .expect("replacement projection")
+                .state,
+            PublicationState::WaitingForPublisher
+        );
+    }
+
+    #[test]
     fn wake_retires_in_flight_attempt_and_fences_its_work_against_a_successor() {
         let declaration = declaration(instance(14), 1, "fourteen.localhost");
         let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
@@ -2452,6 +2723,7 @@ mod tests {
             .wake_barrier(true)
             .result
             .expect("trustworthy wake barrier");
+        assert!(stale_fence.cancellation.is_cancelled());
         assert_eq!(
             registry
                 .begin_acquire(&attempt, &owner, &origin, &ListenerIdentity::Test(15),)
@@ -2468,6 +2740,7 @@ mod tests {
         else {
             panic!("expected successor acquisition");
         };
+        assert!(!successor_fence.cancellation.is_cancelled());
         assert_eq!(
             registry
                 .commit_acquire(&stale_fence, capability(14, &drops))
@@ -2476,12 +2749,62 @@ mod tests {
             PublicationRegistryError::AttemptStale
         );
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!successor_fence.cancellation.is_cancelled());
         assert!(
             registry
                 .commit_acquire(&successor_fence, capability(15, &drops))
                 .result
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn acquisition_deadline_cancels_in_flight_work_without_touching_a_successor() {
+        let declaration = declaration(instance(23), 1, "twenty-three.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let attempt = begin_attempt(&mut registry, &key, &owner);
+        let origin = registry.projection(&key).expect("projection").origin;
+        let BeginAcquire::Started(stale) = registry
+            .begin_acquire(&attempt, &owner, &origin, &ListenerIdentity::Test(23))
+            .result
+            .expect("begin acquisition work")
+        else {
+            panic!("expected in-flight acquisition");
+        };
+        assert!(!stale.cancellation.is_cancelled());
+
+        clock.advance(ACQUISITION_ATTEMPT_TTL);
+        registry
+            .snapshot(&key)
+            .result
+            .expect("sweep exact deadline");
+        assert!(stale.cancellation.is_cancelled());
+
+        let successor_attempt = begin_attempt(&mut registry, &key, &owner);
+        let BeginAcquire::Started(successor) = registry
+            .begin_acquire(
+                &successor_attempt,
+                &owner,
+                &origin,
+                &ListenerIdentity::Test(24),
+            )
+            .result
+            .expect("begin successor acquisition")
+        else {
+            panic!("expected successor acquisition");
+        };
+        assert!(!successor.cancellation.is_cancelled());
+        assert_eq!(
+            registry
+                .commit_acquire(&stale, capability(23, &drops))
+                .result
+                .expect_err("expired work cannot commit"),
+            PublicationRegistryError::AttemptStale
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!successor.cancellation.is_cancelled());
     }
 
     #[test]
@@ -2816,6 +3139,158 @@ mod tests {
             .result
             .expect("replace terminal rebind");
         assert_ne!(successor, handle);
+    }
+
+    #[test]
+    fn committed_rebind_replay_survives_compatible_declaration_transfers() {
+        let first_declaration = declaration(instance(24), 1, "twenty-four.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, first_declaration.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, first) = publish(&mut registry, &key, &owner, 24, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&first.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let BeginRebindCandidate::Started(candidate) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(25))
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected fresh candidate");
+        };
+        registry
+            .commit_rebind(&candidate, capability(25, &drops))
+            .result
+            .expect("commit candidate");
+
+        let mut alias_only = first_declaration.clone();
+        alias_only.configuration_revision = 2;
+        registry
+            .reconcile_declarations(key.instance(), 2, [alias_only.clone()])
+            .result
+            .expect("transfer alias-only declaration");
+        assert!(matches!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(25))
+                .result
+                .expect("replay after alias-only transfer"),
+            BeginRebindCandidate::Replay(LeaseGrant {
+                binding_revision: 2,
+                ..
+            })
+        ));
+
+        let mut health_reload = alias_only;
+        health_reload.configuration_revision = 3;
+        health_reload.health_policy =
+            PublishedHttpHealthPolicy::new("/ready", 2, 5).expect("valid health policy");
+        let transferred = registry.reconcile_declarations(key.instance(), 3, [health_reload]);
+        transferred.result.expect("transfer health policy");
+        assert!(transferred.effects.probe_required.contains(&key));
+        assert!(matches!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(25))
+                .result
+                .expect("replay after health-policy transfer"),
+            BeginRebindCandidate::Replay(LeaseGrant {
+                binding_revision: 2,
+                ..
+            })
+        ));
+
+        clock.advance(REBIND_ATTEMPT_TTL);
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(25))
+                .result
+                .expect_err("bounded replay expires at its original deadline"),
+            PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn rebind_retirement_cancels_only_the_candidate_and_preserves_the_live_binding() {
+        let declaration = declaration(instance(25), 1, "twenty-five.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, grant) = publish(&mut registry, &key, &owner, 25, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let BeginRebindCandidate::Started(stale) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(26))
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected in-flight candidate");
+        };
+        assert!(!stale.cancellation.is_cancelled());
+
+        clock.advance(REBIND_ATTEMPT_TTL);
+        registry
+            .snapshot(&key)
+            .result
+            .expect("sweep rebind deadline");
+        assert!(stale.cancellation.is_cancelled());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(registry.renew(&grant.lease, &owner).result.is_ok());
+
+        let BeginRebind::Started {
+            handle: successor_handle,
+            ..
+        } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin successor rebind")
+        else {
+            panic!("expected successor rebind");
+        };
+        let BeginRebindCandidate::Started(successor) = registry
+            .begin_rebind_candidate(
+                &successor_handle,
+                &owner,
+                &origin,
+                &ListenerIdentity::Test(27),
+            )
+            .result
+            .expect("begin successor candidate")
+        else {
+            panic!("expected successor candidate");
+        };
+        assert!(!successor.cancellation.is_cancelled());
+        let mut compatible_reload = declaration;
+        compatible_reload.configuration_revision = 2;
+        registry
+            .reconcile_declarations(key.instance(), 2, [compatible_reload])
+            .result
+            .expect("compatible reload preserves the binding");
+        assert!(successor.cancellation.is_cancelled());
+        assert_eq!(
+            registry
+                .commit_rebind(&stale, capability(26, &drops))
+                .result
+                .expect_err("expired candidate cannot replace the binding"),
+            PublicationRegistryError::AttemptStale
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry
+                .commit_rebind(&successor, capability(27, &drops))
+                .result
+                .expect_err("reload-canceled candidate cannot replace the binding"),
+            PublicationRegistryError::AttemptStale
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(registry.renew(&grant.lease, &owner).result.is_ok());
     }
 
     #[test]
