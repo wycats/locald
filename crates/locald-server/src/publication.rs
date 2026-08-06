@@ -158,11 +158,18 @@ impl fmt::Debug for AuthorityToken {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct DaemonEpoch(AuthorityToken);
+struct DaemonEpoch([u8; 16]);
 
 impl DaemonEpoch {
     fn random() -> Self {
-        Self(AuthorityToken::random())
+        let mut bytes = [0_u8; 16];
+        OsRng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
+    #[cfg(test)]
+    const fn from_byte(byte: u8) -> Self {
+        Self([byte; 16])
     }
 }
 
@@ -1772,7 +1779,7 @@ impl PublicationRegistry {
             }
             slot.paused = paused;
             if let SlotState::Live(lease) = &mut slot.state {
-                Self::retire_uncommitted_rebind(lease);
+                Self::retire_nonreplayable_rebind(lease);
                 effects.probe_required.insert(key.clone());
             }
             effects.projection_changed.insert(key.clone());
@@ -1877,7 +1884,7 @@ impl PublicationRegistry {
             }
             match &mut slot.state {
                 SlotState::Live(lease) => {
-                    Self::retire_uncommitted_rebind(lease);
+                    Self::retire_nonreplayable_rebind(lease);
                     effects.probe_required.insert(key.clone());
                 }
                 SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => {}
@@ -2033,17 +2040,20 @@ impl PublicationRegistry {
         }
     }
 
-    fn retire_uncommitted_rebind(lease: &mut LiveLease) {
-        let committed_binding_is_current = lease.rebind.as_ref().is_some_and(|attempt| {
-            matches!(
-                &attempt.phase,
-                RebindPhase::TerminalSuccess {
-                    installed_binding_revision,
-                    ..
-                } if *installed_binding_revision == lease.binding_revision
-            )
-        });
-        if !committed_binding_is_current {
+    fn retire_nonreplayable_rebind(lease: &mut LiveLease) {
+        let terminal_replay_is_current =
+            lease
+                .rebind
+                .as_ref()
+                .is_some_and(|attempt| match &attempt.phase {
+                    RebindPhase::TerminalFailure { .. } => true,
+                    RebindPhase::TerminalSuccess {
+                        installed_binding_revision,
+                        ..
+                    } => *installed_binding_revision == lease.binding_revision,
+                    RebindPhase::Pending | RebindPhase::InFlight { .. } => false,
+                });
+        if !terminal_replay_is_current {
             Self::clear_rebind(lease);
         }
     }
@@ -2168,10 +2178,8 @@ mod tests {
             declaration.service_name.clone(),
         );
         let configuration_revision = declaration.configuration_revision;
-        let mut registry = PublicationRegistry::with_epoch(
-            Arc::new(clock.clone()),
-            DaemonEpoch(AuthorityToken::from_byte(7)),
-        );
+        let mut registry =
+            PublicationRegistry::with_epoch(Arc::new(clock.clone()), DaemonEpoch::from_byte(7));
         registry
             .reconcile_declarations(key.instance(), configuration_revision, [declaration])
             .result
@@ -2646,10 +2654,8 @@ mod tests {
     fn missing_policy_applies_to_future_declarations_until_instance_retirement() {
         let project_instance = instance(22);
         let clock = FakePublicationClock::new(Duration::ZERO);
-        let mut registry = PublicationRegistry::with_epoch(
-            Arc::new(clock),
-            DaemonEpoch(AuthorityToken::from_byte(22)),
-        );
+        let mut registry =
+            PublicationRegistry::with_epoch(Arc::new(clock), DaemonEpoch::from_byte(22));
         registry
             .set_missing(project_instance, true)
             .result
@@ -3048,10 +3054,8 @@ mod tests {
         let first = declaration(instance(9), 1, "nine.localhost");
         let second = declaration(instance(10), 1, "ten.localhost");
         let clock = FakePublicationClock::new(Duration::ZERO);
-        let mut registry = PublicationRegistry::with_epoch(
-            Arc::new(clock),
-            DaemonEpoch(AuthorityToken::from_byte(3)),
-        );
+        let mut registry =
+            PublicationRegistry::with_epoch(Arc::new(clock), DaemonEpoch::from_byte(3));
         registry
             .reconcile_declarations(first.project_instance_id, 1, [first.clone()])
             .result
@@ -3298,7 +3302,71 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_wake_retire_uncommitted_rebind_work() {
+    fn failed_rebind_replay_survives_pause_resume_and_wake_until_deadline() {
+        let declaration = declaration(instance(28), 1, "twenty-eight.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, grant) = publish(&mut registry, &key, &owner, 28, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let BeginRebindCandidate::Started(candidate) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(29))
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected fresh candidate");
+        };
+        registry
+            .fail_rebind(&candidate, TerminalAttemptFailure::EndpointUnhealthy)
+            .result
+            .expect("record failed rebind");
+
+        registry
+            .set_paused(key.instance(), true)
+            .result
+            .expect("pause route");
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(29))
+                .result
+                .expect("replay failure while paused"),
+            BeginRebindCandidate::Terminal(TerminalAttemptFailure::EndpointUnhealthy)
+        );
+
+        registry
+            .set_paused(key.instance(), false)
+            .result
+            .expect("resume route");
+        registry
+            .wake_barrier(true)
+            .result
+            .expect("trustworthy wake");
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(29))
+                .result
+                .expect("replay failure after resume and wake"),
+            BeginRebindCandidate::Terminal(TerminalAttemptFailure::EndpointUnhealthy)
+        );
+
+        clock.advance(REBIND_ATTEMPT_TTL);
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &ListenerIdentity::Test(29))
+                .result
+                .expect_err("bounded replay expires at its original deadline"),
+            PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn pause_and_wake_retire_pending_and_in_flight_rebind_work() {
         let declaration = declaration(instance(27), 1, "twenty-seven.localhost");
         let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
         let owner = principal(1);
@@ -3469,10 +3537,8 @@ mod tests {
         }
         assert_eq!(drops.load(Ordering::SeqCst), 100);
 
-        let mut restarted = PublicationRegistry::with_epoch(
-            Arc::new(clock),
-            DaemonEpoch(AuthorityToken::from_byte(99)),
-        );
+        let mut restarted =
+            PublicationRegistry::with_epoch(Arc::new(clock), DaemonEpoch::from_byte(99));
         restarted
             .reconcile_declarations(key.instance(), 1, [declaration])
             .result
@@ -3491,9 +3557,16 @@ mod tests {
     }
 
     #[test]
+    fn daemon_epoch_is_128_bits_and_redacted() {
+        let epoch = DaemonEpoch::from_byte(1);
+        assert_eq!(epoch.0.len(), 16);
+        assert_eq!(format!("{epoch:?}"), "DaemonEpoch(<redacted>)");
+    }
+
+    #[test]
     fn debug_output_redacts_every_private_authority_type() {
         let principal = principal(42);
-        let epoch = DaemonEpoch(AuthorityToken::from_byte(1));
+        let epoch = DaemonEpoch::from_byte(1);
         let key = ServiceKey::new(instance(13), "workbench");
         let attempt = AcquisitionAttemptHandle {
             epoch: epoch.clone(),
