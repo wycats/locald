@@ -18,11 +18,24 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc::Sender};
 use tracing::{error, info, warn};
 
-pub async fn run_ipc_server(
+/// Discovery state for the dedicated publisher transport.
+///
+/// PR 1 installs the authenticated discovery shape while production remains
+/// inactive. The secure-socket slice supplies `Active` only after binding and
+/// validating the dedicated listener.
+#[derive(Debug, Clone)]
+pub(crate) enum PublisherTransportDiscovery {
+    Inactive,
+    #[allow(dead_code)]
+    Active(locald_publisher_protocol::PublishedEndpointProtocolInfo),
+}
+
+pub(crate) async fn run_ipc_server(
     manager: ProcessManager,
     container_manager: Arc<ContainerManager>,
     shutdown_tx: Sender<ShutdownReason>,
     version: String,
+    publisher_transport: PublisherTransportDiscovery,
 ) -> Result<()> {
     let socket_path = locald_utils::ipc::socket_path()?;
 
@@ -48,12 +61,14 @@ pub async fn run_ipc_server(
                 let container_manager = container_manager.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 let version = version.clone();
+                let publisher_transport = publisher_transport.clone();
                 tokio::spawn(handle_connection_task(
                     stream,
                     manager,
                     container_manager,
                     shutdown_tx,
                     version,
+                    publisher_transport,
                 ));
             }
             Err(e) => {
@@ -72,9 +87,17 @@ async fn handle_connection_task(
     container_manager: Arc<ContainerManager>,
     shutdown_tx: Sender<ShutdownReason>,
     version: String,
+    publisher_transport: PublisherTransportDiscovery,
 ) {
-    if let Err(error) =
-        handle_connection(stream, manager, container_manager, shutdown_tx, version).await
+    if let Err(error) = handle_connection(
+        stream,
+        manager,
+        container_manager,
+        shutdown_tx,
+        version,
+        publisher_transport,
+    )
+    .await
     {
         error!("Error handling connection: {}", error);
     }
@@ -90,6 +113,30 @@ fn authenticated_peer_pid(stream: &UnixStream) -> Result<u32> {
     let pid = u32::try_from(pid).context("kernel-authenticated IPC peer process ID was invalid")?;
     anyhow::ensure!(pid > 0, "kernel-authenticated IPC peer process ID was zero");
     Ok(pid)
+}
+
+fn ensure_peer_uid_matches_daemon(peer_uid: u32, daemon_uid: u32) -> Result<()> {
+    anyhow::ensure!(
+        peer_uid == daemon_uid,
+        "local IPC peer UID {peer_uid} does not match locald daemon UID {daemon_uid}"
+    );
+    Ok(())
+}
+
+fn authenticate_same_daemon_user(stream: &UnixStream) -> Result<()> {
+    let credentials = stream
+        .peer_cred()
+        .context("failed to read kernel-authenticated local IPC peer credentials")?;
+    ensure_peer_uid_matches_daemon(credentials.uid(), nix::unistd::geteuid().as_raw())
+}
+
+fn publisher_protocol_info_response(discovery: &PublisherTransportDiscovery) -> IpcResponse {
+    match discovery {
+        PublisherTransportDiscovery::Inactive => IpcResponse::PublishedEndpointProtocolUnavailable,
+        PublisherTransportDiscovery::Active(info) => {
+            IpcResponse::PublishedEndpointProtocolInfo(info.clone())
+        }
+    }
 }
 
 async fn ensure_project_response(
@@ -488,6 +535,7 @@ async fn handle_connection(
     container_manager: Arc<ContainerManager>,
     shutdown_tx: Sender<ShutdownReason>,
     version: String,
+    publisher_transport: PublisherTransportDiscovery,
 ) -> Result<()> {
     let Some(request) = read_request(&mut stream).await? else {
         return Ok(());
@@ -920,6 +968,24 @@ async fn handle_connection(
             },
             Err(error) => agent_authentication_error(&error),
         },
+        IpcRequest::ResolvePublishedEndpointProject { project_locator } => {
+            match authenticate_same_daemon_user(&stream) {
+                Ok(()) => match manager
+                    .resolve_published_endpoint_project_instance(&project_locator)
+                    .await
+                {
+                    Ok(instance_id) => IpcResponse::PublishedEndpointProject(instance_id),
+                    Err(error) => IpcResponse::Error(format!("{error:#}")),
+                },
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            }
+        }
+        IpcRequest::GetPublishedEndpointProtocolInfo => {
+            match authenticate_same_daemon_user(&stream) {
+                Ok(()) => publisher_protocol_info_response(&publisher_transport),
+                Err(error) => IpcResponse::Error(format!("{error:#}")),
+            }
+        }
         IpcRequest::EnsureProject {
             project_path,
             demand,
@@ -1000,6 +1066,7 @@ async fn handle_connection(
 mod tests {
     use super::*;
     use locald_core::{AGENT_ADAPTER_PROTOCOL_VERSION, AgentConversationKey};
+    use locald_publisher_protocol::{AbsolutePath, DaemonEpoch, PublishedEndpointProtocolInfo};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
 
@@ -1018,6 +1085,14 @@ mod tests {
         }
     }
 
+    fn publisher_protocol_info() -> PublishedEndpointProtocolInfo {
+        PublishedEndpointProtocolInfo::v1(
+            DaemonEpoch::from_bytes([7; 16]),
+            AbsolutePath::parse("/tmp/locald-data/run/publisher-v1.sock")
+                .expect("parse publisher socket path"),
+        )
+    }
+
     #[tokio::test]
     async fn unix_stream_peer_pid_is_kernel_authenticated() {
         let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
@@ -1025,6 +1100,49 @@ mod tests {
         assert_eq!(
             authenticated_peer_pid(&server).expect("authenticate IPC peer PID"),
             std::process::id()
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_discovery_accepts_the_same_kernel_authenticated_uid() {
+        let (_client, server) = UnixStream::pair().expect("create connected IPC pair");
+
+        authenticate_same_daemon_user(&server)
+            .expect("same-user publisher discovery peer authenticates");
+    }
+
+    #[test]
+    fn publisher_discovery_rejects_a_foreign_uid() {
+        let daemon_uid = nix::unistd::geteuid().as_raw();
+        let foreign_uid = daemon_uid.wrapping_add(1);
+
+        let error = ensure_peer_uid_matches_daemon(foreign_uid, daemon_uid)
+            .expect_err("foreign UID must fail publisher discovery authentication");
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn inactive_publisher_discovery_never_advertises_socket_or_epoch() {
+        let response = publisher_protocol_info_response(&PublisherTransportDiscovery::Inactive);
+        let encoded = serde_json::to_string(&response).expect("serialize inactive discovery");
+
+        assert_eq!(response, IpcResponse::PublishedEndpointProtocolUnavailable);
+        assert!(!encoded.contains("publisher-v1.sock"));
+        assert!(!encoded.contains("daemon_epoch"));
+    }
+
+    #[test]
+    fn active_publisher_discovery_returns_the_exact_bound_transport() {
+        let expected = publisher_protocol_info();
+
+        let response = publisher_protocol_info_response(&PublisherTransportDiscovery::Active(
+            expected.clone(),
+        ));
+
+        assert_eq!(
+            response,
+            IpcResponse::PublishedEndpointProtocolInfo(expected)
         );
     }
 

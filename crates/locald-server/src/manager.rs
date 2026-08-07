@@ -2432,6 +2432,34 @@ impl ProcessManager {
             .map(|(instance_id, _)| instance_id)
     }
 
+    /// Resolve the stable project-instance identity fenced into publisher
+    /// acquisition requests without registering, starting, or attaching to
+    /// the project.
+    pub(crate) async fn resolve_published_endpoint_project_instance(
+        &self,
+        project_locator: &Path,
+    ) -> Result<ProjectInstanceId> {
+        anyhow::ensure!(
+            project_locator.is_absolute(),
+            "published endpoint project locator must be an absolute path"
+        );
+        anyhow::ensure!(
+            project_locator.to_str().is_some(),
+            "published endpoint project locator must be valid UTF-8"
+        );
+
+        match self.resolve_lifecycle_target(project_locator).await? {
+            LifecycleTargetResolution::Catalogued(target) => Ok(target.instance_id),
+            LifecycleTargetResolution::UnregisteredPhysical { instance_id } => Ok(instance_id),
+            LifecycleTargetResolution::UnresolvedLegacy => anyhow::bail!(
+                "published endpoint project identity is not stable yet; run `locald up` once from this non-Git project before publishing it"
+            ),
+            LifecycleTargetResolution::Ambiguous => anyhow::bail!(
+                "published endpoint project locator matches multiple catalogued project instances"
+            ),
+        }
+    }
+
     async fn persist_state_checked(&self) -> Result<()> {
         let _persistence_guard = self.state_persistence_lock.lock().await;
         let mut services_data = Vec::new();
@@ -15869,6 +15897,109 @@ mod tests {
             sandbox_cwd: Some(project_path.to_path_buf()),
             process_cwd: None,
         }
+    }
+
+    #[tokio::test]
+    async fn publisher_resolution_returns_unregistered_git_identity_without_catalog_mutation() {
+        let directory = tempdir().expect("create publisher resolution directory");
+        let project_path = directory.path().join("git-project");
+        std::fs::create_dir(&project_path).expect("create Git project");
+        git(&project_path, &["init", "-b", "main"]);
+        std::fs::write(
+            project_path.join("locald.toml"),
+            "[project]\nname = \"git\"\n",
+        )
+        .expect("write Git project config");
+        let manager = unregistered_availability_manager(directory.path());
+        let catalog_before = manager.registry.lock().await.clone();
+
+        let resolved = manager
+            .resolve_published_endpoint_project_instance(&project_path)
+            .await
+            .expect("bootstrap and resolve unregistered physical Git identity");
+        let expected = Registry::discover(project_path.clone())
+            .await
+            .expect("inspect bootstrapped stable Git identity")
+            .git_project_instance_id()
+            .expect("Git discovery has a project instance identity");
+        let repeated = manager
+            .resolve_published_endpoint_project_instance(&project_path)
+            .await
+            .expect("repeat stable unregistered Git identity resolution");
+        let catalog_after = manager.registry.lock().await.clone();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(repeated, expected);
+        assert_eq!(catalog_after, catalog_before);
+        assert!(!directory.path().join("catalog.json").exists());
+    }
+
+    #[tokio::test]
+    async fn publisher_resolution_requires_catalog_identity_for_non_git_projects() {
+        let directory = tempdir().expect("create publisher resolution directory");
+        let project_path = directory.path().join("non-git-project");
+        std::fs::create_dir(&project_path).expect("create non-Git project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            "[project]\nname = \"non-git\"\n",
+        )
+        .expect("write non-Git project config");
+        let manager = unregistered_availability_manager(directory.path());
+
+        let error = manager
+            .resolve_published_endpoint_project_instance(&project_path)
+            .await
+            .expect_err("unregistered non-Git identity must not be synthesized");
+
+        assert!(format!("{error:#}").contains("run `locald up` once"));
+        assert!(manager.registry.lock().await.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publisher_resolution_accepts_registered_non_git_identity() {
+        let directory = tempdir().expect("create publisher resolution directory");
+        let project_path = directory.path().join("registered-non-git-project");
+        let (manager, expected, _) =
+            availability_manager(directory.path(), &project_path, "registered-non-git").await;
+
+        let resolved = manager
+            .resolve_published_endpoint_project_instance(&project_path)
+            .await
+            .expect("resolve registered non-Git identity");
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
+    async fn publisher_resolution_rejects_relative_project_locators() {
+        let directory = tempdir().expect("create publisher resolution directory");
+        let manager = unregistered_availability_manager(directory.path());
+
+        let error = manager
+            .resolve_published_endpoint_project_instance(Path::new("relative/project"))
+            .await
+            .expect_err("relative publisher locator must fail");
+
+        assert!(format!("{error:#}").contains("must be an absolute path"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publisher_resolution_rejects_non_utf8_project_locators() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let directory = tempdir().expect("create publisher resolution directory");
+        let manager = unregistered_availability_manager(directory.path());
+        let locator = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/locald-publisher-\xff".to_vec(),
+        ));
+
+        let error = manager
+            .resolve_published_endpoint_project_instance(&locator)
+            .await
+            .expect_err("non-UTF-8 publisher locator must fail");
+
+        assert!(format!("{error:#}").contains("must be valid UTF-8"));
     }
 
     async fn availability_manager_with_clock(

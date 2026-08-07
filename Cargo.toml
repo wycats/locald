@@ -17,6 +17,8 @@ members = [
     "crates/locald-helper",
     "crates/locald-helper-protocol",
     "crates/locald-hosts",
+    "crates/locald-publisher-protocol",
+    "crates/locald-publisher-client",
     "tools/fetch-kernel",
 ]
 # Cross-platform crates. Platform-specific crates (locald-shim, locald-vmm,
@@ -32,6 +34,8 @@ default-members = [
     "crates/locald-utils",
     "crates/locald-oci",
     "crates/locald-hosts",
+    "crates/locald-publisher-protocol",
+    "crates/locald-publisher-client",
     "crates/cnb-client",
     "crates/xtask",
     "tools/fetch-kernel",

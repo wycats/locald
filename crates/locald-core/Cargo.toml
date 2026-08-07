@@ -12,6 +12,7 @@ futures = "0.3.31"
 git2 = { version = "0.20", default-features = false }
 libc = "0.2.178"
 locald-hosts = { version = "0.1.0", path = "../locald-hosts" }
+locald-publisher-protocol = { version = "0.1.0", path = "../locald-publisher-protocol" }
 oci-distribution = "0.11.0"
 portable-pty = "0.9.0"
 schemars = "1.1.0"
