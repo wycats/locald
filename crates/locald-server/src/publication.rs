@@ -226,6 +226,9 @@ enum ListenerIdentity {
     MacOsIpv4 {
         address: [u8; 4],
         port: u16,
+        /// Darwin `in_sockinfo.insi_gencnt`, obtained with
+        /// `PROC_PIDFDSOCKETINFO` from the received descriptor.
+        pcb_generation: u64,
     },
     LinuxIpv4 {
         address: [u8; 4],
@@ -725,12 +728,24 @@ struct PublicationSlot {
     state: SlotState,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstanceConfigurationState {
+    Active(u64),
+    Retired(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeclarationAdmission {
+    Ordinary,
+    AdmittedReregistration,
+}
+
 /// Pure, synchronous, constant-space publication authority registry.
 struct PublicationRegistry {
     clock: SharedPublicationClock,
     epoch: DaemonEpoch,
     last_now: Option<PublicationInstant>,
-    configuration_revisions: BTreeMap<ProjectInstanceId, u64>,
+    configuration_states: BTreeMap<ProjectInstanceId, InstanceConfigurationState>,
     /// Current project-level route policy, retained across declaration changes.
     paused_instances: BTreeSet<ProjectInstanceId>,
     /// Current project-instance presence policy, retained across declarations.
@@ -754,7 +769,7 @@ impl PublicationRegistry {
             clock,
             epoch: DaemonEpoch::random(),
             last_now: None,
-            configuration_revisions: BTreeMap::new(),
+            configuration_states: BTreeMap::new(),
             paused_instances: BTreeSet::new(),
             missing_instances: BTreeSet::new(),
             slots: BTreeMap::new(),
@@ -767,7 +782,7 @@ impl PublicationRegistry {
             clock,
             epoch,
             last_now: None,
-            configuration_revisions: BTreeMap::new(),
+            configuration_states: BTreeMap::new(),
             paused_instances: BTreeSet::new(),
             missing_instances: BTreeSet::new(),
             slots: BTreeMap::new(),
@@ -812,6 +827,37 @@ impl PublicationRegistry {
         configuration_revision: u64,
         declarations: impl IntoIterator<Item = PublishedServiceDeclaration>,
     ) -> PublicationOutcome<()> {
+        self.reconcile_declarations_with_admission(
+            instance,
+            configuration_revision,
+            declarations,
+            DeclarationAdmission::Ordinary,
+        )
+    }
+
+    /// Registry half of the outer catalog transition that atomically admits
+    /// this exact retired project instance and its complete declaration set.
+    fn reconcile_admitted_reregistration(
+        &mut self,
+        instance: ProjectInstanceId,
+        configuration_revision: u64,
+        declarations: impl IntoIterator<Item = PublishedServiceDeclaration>,
+    ) -> PublicationOutcome<()> {
+        self.reconcile_declarations_with_admission(
+            instance,
+            configuration_revision,
+            declarations,
+            DeclarationAdmission::AdmittedReregistration,
+        )
+    }
+
+    fn reconcile_declarations_with_admission(
+        &mut self,
+        instance: ProjectInstanceId,
+        configuration_revision: u64,
+        declarations: impl IntoIterator<Item = PublishedServiceDeclaration>,
+        admission: DeclarationAdmission,
+    ) -> PublicationOutcome<()> {
         let (_, mut effects) = match self.begin_transition() {
             Ok(value) => value,
             Err(outcome) => return outcome,
@@ -839,7 +885,36 @@ impl PublicationRegistry {
             }
         }
 
-        let current_revision = self.configuration_revisions.get(&instance).copied();
+        let current_state = self.configuration_states.get(&instance).copied();
+        let current_revision = match (current_state, admission) {
+            (Some(InstanceConfigurationState::Active(current)), DeclarationAdmission::Ordinary) => {
+                Some(current)
+            }
+            (
+                Some(InstanceConfigurationState::Retired(current)),
+                DeclarationAdmission::AdmittedReregistration,
+            ) if configuration_revision > current => Some(current),
+            (None, DeclarationAdmission::Ordinary) => None,
+            (Some(InstanceConfigurationState::Retired(_)), DeclarationAdmission::Ordinary)
+            | (
+                Some(InstanceConfigurationState::Active(_)) | None,
+                DeclarationAdmission::AdmittedReregistration,
+            ) => {
+                return PublicationOutcome::err(
+                    PublicationRegistryError::DeclarationConflict,
+                    effects,
+                );
+            }
+            (
+                Some(InstanceConfigurationState::Retired(_)),
+                DeclarationAdmission::AdmittedReregistration,
+            ) => {
+                return PublicationOutcome::err(
+                    PublicationRegistryError::DeclarationConflict,
+                    effects,
+                );
+            }
+        };
         if current_revision.is_some_and(|current| configuration_revision < current) {
             return PublicationOutcome::err(PublicationRegistryError::DeclarationConflict, effects);
         }
@@ -858,8 +933,9 @@ impl PublicationRegistry {
             }
             return PublicationOutcome::ok((), effects);
         }
-        let may_transfer_authority = current_revision.and_then(|current| current.checked_add(1))
-            == Some(configuration_revision);
+        let may_transfer_authority = admission == DeclarationAdmission::Ordinary
+            && current_revision.and_then(|current| current.checked_add(1))
+                == Some(configuration_revision);
 
         let removed = self
             .slots
@@ -917,8 +993,10 @@ impl PublicationRegistry {
             effects.projection_changed.insert(key);
         }
 
-        self.configuration_revisions
-            .insert(instance, configuration_revision);
+        self.configuration_states.insert(
+            instance,
+            InstanceConfigurationState::Active(configuration_revision),
+        );
 
         PublicationOutcome::ok((), effects)
     }
@@ -1822,6 +1900,17 @@ impl PublicationRegistry {
         };
         self.paused_instances.remove(&instance);
         self.missing_instances.remove(&instance);
+        let high_water_revision = match self.configuration_states.get(&instance).copied() {
+            Some(
+                InstanceConfigurationState::Active(revision)
+                | InstanceConfigurationState::Retired(revision),
+            ) => revision,
+            None => 0,
+        };
+        self.configuration_states.insert(
+            instance,
+            InstanceConfigurationState::Retired(high_water_revision),
+        );
         let keys = self
             .slots
             .keys()
@@ -2180,6 +2269,14 @@ mod tests {
         PublisherPrincipal::new(501, 42, PublisherProcessBirth::Test(birth))
     }
 
+    fn macos_listener(pcb_generation: u64) -> ListenerIdentity {
+        ListenerIdentity::MacOsIpv4 {
+            address: [127, 0, 0, 1],
+            port: 41_555,
+            pcb_generation,
+        }
+    }
+
     fn registry(
         now: Duration,
         declaration: PublishedServiceDeclaration,
@@ -2434,6 +2531,42 @@ mod tests {
                 .result
                 .expect_err("stale replacement must fail"),
             PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn terminal_acquisition_replay_rejects_a_replacement_macos_listener() {
+        let declaration = declaration(instance(31), 1, "thirty-one.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let attempt = begin_attempt(&mut registry, &key, &owner);
+        let origin = registry.projection(&key).expect("projection").origin;
+        let original_listener = macos_listener(1);
+        let BeginAcquire::Started(fence) = registry
+            .begin_acquire(&attempt, &owner, &origin, &original_listener)
+            .result
+            .expect("begin acquisition")
+        else {
+            panic!("expected started acquisition");
+        };
+        registry
+            .fail_acquire(&fence, TerminalAttemptFailure::EndpointUnhealthy)
+            .result
+            .expect("record terminal result");
+
+        assert_eq!(
+            registry
+                .begin_acquire(&attempt, &owner, &origin, &original_listener)
+                .result
+                .expect("exact listener replays terminal result"),
+            BeginAcquire::Terminal(TerminalAttemptFailure::EndpointUnhealthy)
+        );
+        assert_eq!(
+            registry
+                .begin_acquire(&attempt, &owner, &origin, &macos_listener(2))
+                .result
+                .expect_err("replacement listener must not inherit terminal replay"),
+            PublicationRegistryError::AttemptMismatch
         );
     }
 
@@ -2724,7 +2857,7 @@ mod tests {
             .expect("retire missing instance");
         let replacement = declaration(project_instance, 3, "twenty-two.localhost");
         registry
-            .reconcile_declarations(project_instance, 3, [replacement])
+            .reconcile_admitted_reregistration(project_instance, 3, [replacement])
             .result
             .expect("re-admit retired instance at a newer revision");
         assert_eq!(
@@ -3035,6 +3168,68 @@ mod tests {
     }
 
     #[test]
+    fn retirement_fences_delayed_newer_reconciliation_until_atomic_reregistration() {
+        let instance = instance(32);
+        let first = declaration(instance, 1, "thirty-two.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, first.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 32, &drops);
+        let mut delayed = first.clone();
+        delayed.configuration_revision = 2;
+
+        let retired = registry.retire_instance(instance);
+        retired.result.expect("retire exact instance");
+        drop(retired.effects);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(registry.projection(&key).is_none());
+        assert_eq!(
+            registry
+                .renew(&grant.lease, &owner)
+                .result
+                .expect_err("retirement revokes the prior lease"),
+            PublicationRegistryError::LeaseLost
+        );
+
+        assert_eq!(
+            registry
+                .reconcile_declarations(instance, 2, [delayed.clone()])
+                .result
+                .expect_err("delayed newer reconciliation remains fenced"),
+            PublicationRegistryError::DeclarationConflict
+        );
+        assert!(registry.projection(&key).is_none());
+
+        assert_eq!(
+            registry
+                .reconcile_admitted_reregistration(instance, 1, [first])
+                .result
+                .expect_err("re-registration must advance the retired high-water revision"),
+            PublicationRegistryError::DeclarationConflict
+        );
+        assert!(registry.projection(&key).is_none());
+        assert_eq!(
+            registry
+                .reconcile_declarations(instance, 2, [delayed.clone()])
+                .result
+                .expect_err("failed admission leaves the retirement fence intact"),
+            PublicationRegistryError::DeclarationConflict
+        );
+
+        registry
+            .reconcile_admitted_reregistration(instance, 2, [delayed])
+            .result
+            .expect("atomic re-registration admits the newer declaration");
+        assert_eq!(
+            registry
+                .projection(&key)
+                .expect("re-registered projection")
+                .state,
+            PublicationState::WaitingForPublisher
+        );
+    }
+
+    #[test]
     fn skipped_instance_revision_applies_latest_declaration_but_retires_authority() {
         let current = declaration(instance(17), 2, "seventeen.localhost");
         let (mut registry, _clock, key) = registry(Duration::ZERO, current.clone());
@@ -3170,6 +3365,49 @@ mod tests {
             .result
             .expect("replace terminal rebind");
         assert_ne!(successor, handle);
+    }
+
+    #[test]
+    fn terminal_rebind_replay_rejects_a_replacement_macos_listener() {
+        let declaration = declaration(instance(33), 1, "thirty-three.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, grant) = publish(&mut registry, &key, &owner, 33, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let original_listener = macos_listener(3);
+        let BeginRebindCandidate::Started(fence) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &original_listener)
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected fresh candidate");
+        };
+        registry
+            .fail_rebind(&fence, TerminalAttemptFailure::EndpointUnhealthy)
+            .result
+            .expect("record terminal rebind failure");
+
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &original_listener)
+                .result
+                .expect("exact listener replays terminal result"),
+            BeginRebindCandidate::Terminal(TerminalAttemptFailure::EndpointUnhealthy)
+        );
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &macos_listener(4))
+                .result
+                .expect_err("replacement listener must not inherit terminal replay"),
+            PublicationRegistryError::AttemptMismatch
+        );
     }
 
     #[test]
