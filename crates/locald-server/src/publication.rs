@@ -898,9 +898,10 @@ impl PublicationRegistry {
             let health_equivalent = slot.declaration.health_equivalent(&candidate);
             match &mut slot.state {
                 SlotState::Live(lease) if may_transfer_authority && routing_equivalent => {
-                    Self::transfer_committed_rebind_replay(
+                    Self::transfer_compatible_rebind_replay(
                         lease,
                         candidate.0.configuration_revision,
+                        health_equivalent,
                     );
                     if !health_equivalent {
                         effects.probe_required.insert(key.clone());
@@ -2058,15 +2059,26 @@ impl PublicationRegistry {
         }
     }
 
-    fn transfer_committed_rebind_replay(lease: &mut LiveLease, configuration_revision: u64) {
+    fn transfer_compatible_rebind_replay(
+        lease: &mut LiveLease,
+        configuration_revision: u64,
+        health_equivalent: bool,
+    ) {
         let Some(mut attempt) = lease.rebind.take() else {
             return;
         };
+        let targets_current_binding = attempt.expected_binding_revision == lease.binding_revision;
         let preserve = match &mut attempt.phase {
             RebindPhase::TerminalSuccess {
                 request,
                 installed_binding_revision,
             } if *installed_binding_revision == lease.binding_revision => {
+                request.fence.configuration_revision = configuration_revision;
+                true
+            }
+            RebindPhase::TerminalFailure { request, .. }
+                if health_equivalent && targets_current_binding =>
+            {
                 request.fence.configuration_revision = configuration_revision;
                 true
             }
@@ -2094,7 +2106,7 @@ impl PublicationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use locald_core::{DomainName, PublishedHttpHealthPolicy};
+    use locald_core::{DomainName, DomainPattern, PublishedHttpHealthPolicy};
     use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3229,6 +3241,123 @@ mod tests {
                 .expect_err("bounded replay expires at its original deadline"),
             PublicationRegistryError::AttemptStale
         );
+    }
+
+    #[test]
+    fn failed_rebind_replay_survives_alias_transfer_until_original_deadline() {
+        let first_declaration = declaration(instance(30), 1, "thirty.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, first_declaration.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, grant) = publish(&mut registry, &key, &owner, 30, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let listener = ListenerIdentity::Test(31);
+        let BeginRebindCandidate::Started(candidate) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &listener)
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected fresh candidate");
+        };
+        registry
+            .fail_rebind(&candidate, TerminalAttemptFailure::EndpointUnhealthy)
+            .result
+            .expect("record failed rebind");
+
+        let mut alias_only = first_declaration;
+        alias_only.configuration_revision = 2;
+        alias_only.domain_claims.insert(DomainPattern::exact(
+            "alias.thirty.localhost"
+                .parse()
+                .expect("valid alias domain"),
+        ));
+        let transferred = registry.reconcile_declarations(key.instance(), 2, [alias_only]);
+        transferred.result.expect("transfer alias-only declaration");
+        assert!(!transferred.effects.probe_required.contains(&key));
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &listener)
+                .result
+                .expect("replay failure after alias-only transfer"),
+            BeginRebindCandidate::Terminal(TerminalAttemptFailure::EndpointUnhealthy)
+        );
+
+        clock.advance(REBIND_ATTEMPT_TTL - Duration::from_nanos(1));
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &listener)
+                .result
+                .expect("replay failure before original deadline"),
+            BeginRebindCandidate::Terminal(TerminalAttemptFailure::EndpointUnhealthy)
+        );
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &listener)
+                .result
+                .expect_err("bounded replay expires at its original deadline"),
+            PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn health_policy_change_invalidates_failed_rebind_replay() {
+        let first_declaration = declaration(instance(31), 1, "thirty-one.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, first_declaration.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_acquisition, grant) = publish(&mut registry, &key, &owner, 31, &drops);
+        let BeginRebind::Started { handle, origin, .. } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("expected fresh rebind");
+        };
+        let listener = ListenerIdentity::Test(32);
+        let BeginRebindCandidate::Started(candidate) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &listener)
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("expected fresh candidate");
+        };
+        registry
+            .fail_rebind(&candidate, TerminalAttemptFailure::EndpointUnhealthy)
+            .result
+            .expect("record failed rebind");
+
+        let mut changed_policy = first_declaration;
+        changed_policy.configuration_revision = 2;
+        changed_policy.health_policy =
+            PublishedHttpHealthPolicy::new("/ready", 2, 5).expect("valid health policy");
+        let transferred = registry.reconcile_declarations(key.instance(), 2, [changed_policy]);
+        transferred.result.expect("transfer changed health policy");
+        assert!(transferred.effects.probe_required.contains(&key));
+        assert_eq!(
+            registry
+                .begin_rebind_candidate(&handle, &owner, &origin, &listener)
+                .result
+                .expect_err("old failure does not replay under a new health policy"),
+            PublicationRegistryError::AttemptStale
+        );
+
+        let BeginRebind::Started {
+            handle: successor, ..
+        } = registry
+            .begin_rebind(&grant.lease, &owner, 1)
+            .result
+            .expect("begin replacement rebind")
+        else {
+            panic!("expected replacement rebind");
+        };
+        assert_ne!(successor, handle);
     }
 
     #[test]
