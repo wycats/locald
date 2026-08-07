@@ -13284,12 +13284,12 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct RetryingTcpReadinessFactory {
+    struct RetryingReadinessFactory {
         creates: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
     }
 
-    impl ServiceFactory for RetryingTcpReadinessFactory {
+    impl ServiceFactory for RetryingReadinessFactory {
         fn can_handle(&self, config: &ServiceConfig) -> bool {
             matches!(
                 config,
@@ -13304,34 +13304,30 @@ mod tests {
             ctx: &ServiceContext,
         ) -> Arc<Mutex<dyn ServiceController>> {
             let creation = self.creates.fetch_add(1, Ordering::SeqCst);
-            Arc::new(Mutex::new(RetryingTcpReadinessController {
+            Arc::new(Mutex::new(RetryingReadinessController {
                 id: name,
                 port: ctx
                     .bindings
                     .primary_port()
                     .expect("portful readiness fixture receives a port"),
                 pid: 50 + u32::try_from(creation).expect("creation count fits in PID"),
-                bind_on_start: creation > 0,
                 running: false,
-                listener: None,
                 stops: self.stops.clone(),
             }))
         }
     }
 
     #[derive(Debug)]
-    struct RetryingTcpReadinessController {
+    struct RetryingReadinessController {
         id: String,
         port: u16,
         pid: u32,
-        bind_on_start: bool,
         running: bool,
-        listener: Option<tokio::net::TcpListener>,
         stops: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl ServiceController for RetryingTcpReadinessController {
+    impl ServiceController for RetryingReadinessController {
         fn id(&self) -> &str {
             &self.id
         }
@@ -13342,19 +13338,11 @@ mod tests {
 
         async fn start(&mut self) -> Result<()> {
             self.running = true;
-            if self.bind_on_start {
-                self.listener = Some(
-                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.port))
-                        .await
-                        .with_context(|| format!("bind readiness fixture on {}", self.port))?,
-                );
-            }
             Ok(())
         }
 
         async fn stop(&mut self) -> Result<()> {
             self.stops.fetch_add(1, Ordering::SeqCst);
-            self.listener = None;
             self.running = false;
             Ok(())
         }
@@ -32410,6 +32398,7 @@ domain = "ensure-project.localhost"
 
 [services.web]
 command = "unused-by-test-factory"
+health_check = "true"
 
 [services.web.env]
 PATH = "/usr/bin:/bin"
@@ -32420,7 +32409,7 @@ PATH = "/usr/bin:/bin"
         let creates = Arc::new(AtomicUsize::new(1));
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: creates.clone(),
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
@@ -32882,13 +32871,14 @@ domain = "agent-ensure.localhost"
 
 [services.web]
 command = "unused-by-test-factory"
+health_check = "true"
 "#,
         )
         .expect("write agent ensure config");
         let mut manager = unregistered_availability_manager(dir.path());
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: Arc::new(AtomicUsize::new(1)),
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
@@ -33083,6 +33073,7 @@ domain = "host-sync-ensure.test"
 
 [services.web]
 command = "unused-by-test-factory"
+health_check = "true"
 
 [services.web.env]
 PATH = "/usr/bin:/bin"
@@ -33097,7 +33088,7 @@ PATH = "/usr/bin:/bin"
         manager.set_https_port(Some(443)).await;
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: Arc::new(AtomicUsize::new(1)),
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
@@ -33191,6 +33182,11 @@ PATH = "/usr/bin:/bin"
             (slow_path, "background-slow"),
             (later_path, "background-later"),
         ] {
+            let health_check = if name == "background-slow" {
+                "false"
+            } else {
+                "true"
+            };
             std::fs::write(
                 path.join("locald.toml"),
                 format!(
@@ -33201,6 +33197,7 @@ domain = "{name}.localhost"
 
 [services.web]
 command = "unused-by-test-factory"
+health_check = "{health_check}"
 
 [services.web.env]
 PATH = "/usr/bin:/bin"
@@ -33238,7 +33235,7 @@ PATH = "/usr/bin:/bin"
         manager.set_readiness_wait_hook(readiness_observed.clone());
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: creates.clone(),
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
@@ -33709,6 +33706,7 @@ domain = "timed-ensure.localhost"
 
 [services.web]
 command = "unused-by-test-factory"
+health_check = "false"
 
 [services.web.env]
 PATH = "/usr/bin:/bin"
@@ -33718,7 +33716,7 @@ PATH = "/usr/bin:/bin"
         let creates = Arc::new(AtomicUsize::new(0));
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: creates.clone(),
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
@@ -33811,17 +33809,20 @@ PATH = "/usr/bin:/bin"
     async fn readiness_timeout_preserves_demand_and_retry_clears_the_convergence_error() {
         let dir = tempdir().expect("create retry readiness directory");
         let project_path = dir.path().join("retry-readiness-project");
+        let readiness_marker = dir.path().join("retry-readiness-ready");
         let (mut manager, instance_id, availability_data_dir) =
             availability_manager(dir.path(), &project_path, "retry-readiness").await;
         tokio::fs::write(
             project_path.join("locald.toml"),
-            r#"
+            format!(
+                r#"
 [project]
 name = "retry-readiness"
 domain = "retry-readiness.localhost"
 
 [services.db]
 command = "ignored by readiness fixture"
+health_check = "test -f {readiness_marker}"
 
 [services.db.env]
 PATH = "/usr/bin:/bin"
@@ -33829,10 +33830,13 @@ PATH = "/usr/bin:/bin"
 [services.web]
 command = "ignored by readiness fixture"
 depends_on = ["db"]
+health_check = "test -f {readiness_marker}"
 
 [services.web.env]
 PATH = "/usr/bin:/bin"
 "#,
+                readiness_marker = readiness_marker.display()
+            ),
         )
         .await
         .expect("write retry readiness config");
@@ -33840,7 +33844,7 @@ PATH = "/usr/bin:/bin"
         let stops = Arc::new(AtomicUsize::new(0));
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: creates.clone(),
                 stops: stops.clone(),
             }),
@@ -33891,7 +33895,7 @@ PATH = "/usr/bin:/bin"
         let error = first_ensure
             .await
             .expect("first ensure task joins")
-            .expect_err("first controller never binds its assigned port");
+            .expect_err("first controller never satisfies its readiness probe");
         assert!(format!("{error:#}").contains("timed out after 300s"));
 
         let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
@@ -33924,31 +33928,32 @@ PATH = "/usr/bin:/bin"
             HealthStatus::Starting
         );
 
-        let assigned_port = manager
-            .services
-            .lock()
-            .await
-            .get_display("retry-readiness:db")
-            .expect("test service")
-            .sticky_port
-            .expect("timed-out endpoint retains its assigned port");
-        let listener =
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, assigned_port))
+        assert!(
+            manager
+                .services
+                .lock()
                 .await
-                .expect("make the original owned runtime endpoint ready");
+                .get_display("retry-readiness:db")
+                .expect("test service")
+                .sticky_port
+                .is_some(),
+            "timed-out endpoint retains its assigned port"
+        );
+        tokio::fs::write(&readiness_marker, b"ready")
+            .await
+            .expect("make the original owned runtime ready");
         let retry = tokio::spawn({
             let manager = manager.clone();
             let project_path = project_path.clone();
             async move { manager.converge_project_availability(&project_path).await }
         });
-        tokio::task::yield_now().await;
-        tokio::time::advance(SERVICE_READINESS_POLL_INTERVAL).await;
-        retry
+        tokio::time::resume();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, retry)
             .await
+            .expect("readiness retry completes after the configured probe becomes true")
             .expect("retry readiness task joins")
             .expect("automatic retry waits for the original runtime and becomes ready")
             .expect("project remains availability-managed");
-        drop(listener);
         assert_eq!(
             creates.load(Ordering::SeqCst),
             2,
@@ -34001,7 +34006,7 @@ PATH = "/usr/bin:/bin"
         let creates = Arc::new(AtomicUsize::new(0));
         manager.factories.insert(
             0,
-            Arc::new(RetryingTcpReadinessFactory {
+            Arc::new(RetryingReadinessFactory {
                 creates: creates.clone(),
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
