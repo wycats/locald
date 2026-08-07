@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+const MAX_UNSENT_RENEWAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MIN_UNSENT_RENEWAL_RETRY_WINDOW: Duration = Duration::from_millis(10);
+
 /// Suspend-inclusive monotonic client instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SuspendInstant(Duration);
@@ -176,6 +179,27 @@ impl RenewalSchedule {
         Ok(self.renew_at.0.saturating_sub(now.0))
     }
 
+    /// Choose a bounded local retry target without changing lease expiry.
+    ///
+    /// A definitively unsent renewal preserves the prior lease authority, but
+    /// its already-due normal target cannot be reused without creating a hot
+    /// loop. The retry remains strictly before expiry whenever enough useful
+    /// time remains; the final tiny window waits for the expiry fence instead.
+    pub(crate) fn unsent_retry_not_before(self, now: SuspendInstant) -> Option<SuspendInstant> {
+        if self.expired(now) {
+            return None;
+        }
+        let remaining = self.expires_at.0.saturating_sub(now.0);
+        let delay = if remaining <= MIN_UNSENT_RENEWAL_RETRY_WINDOW {
+            remaining
+        } else {
+            MAX_UNSENT_RENEWAL_RETRY_DELAY
+                .min(remaining / 2)
+                .max(MIN_UNSENT_RENEWAL_RETRY_WINDOW)
+        };
+        Some(SuspendInstant(now.0.saturating_add(delay)))
+    }
+
     /// Whether the conservative local expiry bound has elapsed.
     #[must_use]
     pub fn expired(self, now: SuspendInstant) -> bool {
@@ -219,5 +243,28 @@ mod tests {
             RenewalSchedule::from_response(started, 1, 1),
             Err(ClockError::Overflow)
         ));
+    }
+
+    #[test]
+    fn definitively_unsent_retry_stays_bounded_by_original_expiry() {
+        let started = SuspendInstant::from_duration(Duration::from_secs(100));
+        let schedule = RenewalSchedule::from_response(started, 10_000, 30_000).expect("schedule");
+
+        assert_eq!(
+            schedule
+                .unsent_retry_not_before(SuspendInstant::from_duration(Duration::from_secs(110))),
+            Some(SuspendInstant::from_duration(Duration::from_secs(111)))
+        );
+        assert_eq!(
+            schedule.unsent_retry_not_before(SuspendInstant::from_duration(Duration::from_millis(
+                129_995
+            ))),
+            Some(SuspendInstant::from_duration(Duration::from_secs(130)))
+        );
+        assert_eq!(
+            schedule
+                .unsent_retry_not_before(SuspendInstant::from_duration(Duration::from_secs(130))),
+            None
+        );
     }
 }

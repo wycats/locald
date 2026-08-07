@@ -674,6 +674,7 @@ impl InstalledOrigin {
             binding_revision: response.value.binding_revision(),
             origin: response.value.origin().clone(),
             schedule,
+            renewal_retry_not_before: None,
             listener: retained_listener,
             shared: Arc::clone(&shared),
         };
@@ -972,6 +973,7 @@ struct LeaseDriver {
     binding_revision: BindingRevision,
     origin: SemanticOrigin,
     schedule: RenewalSchedule,
+    renewal_retry_not_before: Option<SuspendInstant>,
     listener: TcpListener,
     shared: Arc<SupervisorShared>,
 }
@@ -981,6 +983,11 @@ impl SupervisorDriver for LeaseDriver {
         let now = self.project.inner.now().map_err(ClientError::Clock)?;
         if self.schedule.expired(now) {
             return Err(ClientError::LeaseExpired);
+        }
+        if let Some(retry_not_before) = self.renewal_retry_not_before {
+            return Ok(retry_not_before
+                .as_duration()
+                .saturating_sub(now.as_duration()));
         }
         self.schedule.renew_in(now).map_err(ClientError::Clock)
     }
@@ -1000,7 +1007,24 @@ impl SupervisorDriver for LeaseDriver {
             }),
             None,
             Some(self.schedule),
-        )?;
+        );
+        let response = match response {
+            Ok(response) => response,
+            Err(
+                error @ ClientError::Transport(TransportFailure {
+                    certainty: DeliveryCertainty::NotSent,
+                    ..
+                }),
+            ) => {
+                let now = self.project.inner.now().map_err(ClientError::Clock)?;
+                self.renewal_retry_not_before = self.schedule.unsent_retry_not_before(now);
+                if self.renewal_retry_not_before.is_none() {
+                    return Err(ClientError::LeaseExpired);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let timing = response
             .timing
             .ok_or(ClientError::Clock(ClockError::Unavailable))?;
@@ -1025,6 +1049,7 @@ impl SupervisorDriver for LeaseDriver {
             return Err(ClientError::LeaseInactive);
         }
         self.schedule = schedule;
+        self.renewal_retry_not_before = None;
         Ok(())
     }
 
@@ -1123,6 +1148,7 @@ impl SupervisorDriver for LeaseDriver {
         self.binding_revision = response.value.binding_revision();
         self.origin = response.value.origin().clone();
         self.schedule = schedule;
+        self.renewal_retry_not_before = None;
         self.listener = listener;
         Ok(())
     }
@@ -2413,6 +2439,94 @@ mod tests {
         );
         release_success(&fixture);
         lease.release().expect("release");
+    }
+
+    #[test]
+    fn definitively_unsent_renewal_stays_active_and_retries_before_expiry() {
+        let fixture = fixture();
+        enqueue_acquisition(&fixture, 10_000);
+        let lease = acquire_lease(&fixture, "workbench");
+        fixture
+            .transport
+            .push_error("renew", transport_failure(DeliveryCertainty::NotSent));
+        fixture
+            .transport
+            .push_error("renew", transport_failure(DeliveryCertainty::NotSent));
+
+        fixture.wakes.resume(0);
+        fixture.transport.wait_for_requests("renew", 2);
+        lease.supervisor.synchronize().expect("renewal settled");
+        assert_eq!(lease.snapshot().state(), LeaseState::Active);
+
+        fixture.transport.push(
+            "renew",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                renew_result(PublicationState::Ready),
+            ),
+        );
+        fixture.clock.set_millis(1_000);
+        lease.supervisor.synchronize().expect("scheduled retry");
+
+        let renew_frames = fixture.transport.frames("renew");
+        assert_eq!(renew_frames.len(), 3);
+        assert_eq!(renew_frames[0], renew_frames[1]);
+        assert_eq!(renew_frames[1], renew_frames[2]);
+        assert_eq!(lease.snapshot().state(), LeaseState::Active);
+        assert_eq!(
+            lease.snapshot().publication_state(),
+            PublicationState::Ready
+        );
+        release_success(&fixture);
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn definitively_unsent_renewal_keeps_only_the_original_expiry() {
+        let fixture = fixture();
+        enqueue_acquisition(&fixture, 10_000);
+        let lease = acquire_lease(&fixture, "workbench");
+        fixture
+            .transport
+            .push_error("renew", transport_failure(DeliveryCertainty::NotSent));
+        fixture
+            .transport
+            .push_error("renew", transport_failure(DeliveryCertainty::NotSent));
+
+        fixture.wakes.resume(0);
+        fixture.transport.wait_for_requests("renew", 2);
+        lease.supervisor.synchronize().expect("renewal settled");
+        assert_eq!(lease.snapshot().state(), LeaseState::Active);
+
+        fixture.clock.set_millis(30_001);
+        fixture.wakes.resume(0);
+        assert_eq!(
+            lease.wait_for_change(0, Duration::from_secs(2)).state(),
+            LeaseState::ReacquisitionRequired(ReacquisitionReason::LeaseLost)
+        );
+        assert_eq!(fixture.transport.frames("renew").len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_renewal_still_makes_authority_uncertain() {
+        let fixture = fixture();
+        enqueue_acquisition(&fixture, 10_000);
+        let lease = acquire_lease(&fixture, "workbench");
+        fixture.transport.push_error(
+            "renew",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        fixture.transport.push_error(
+            "renew",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+
+        fixture.wakes.resume(0);
+        assert_eq!(
+            lease.wait_for_change(0, Duration::from_secs(2)).state(),
+            LeaseState::AuthorityUncertain
+        );
+        assert_eq!(fixture.transport.frames("renew").len(), 2);
     }
 
     #[test]

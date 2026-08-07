@@ -947,7 +947,13 @@ fn finish_call_result<T>(
         return true;
     }
     let uncertain = match operation {
-        MaintenanceOperation::Renew => true,
+        MaintenanceOperation::Renew => !matches!(
+            error,
+            ClientError::Transport(crate::backend::TransportFailure {
+                certainty: crate::backend::DeliveryCertainty::NotSent,
+                ..
+            })
+        ),
         MaintenanceOperation::BeginRebind => matches!(error, ClientError::RebindResultMismatch),
         MaintenanceOperation::Rebind => mutation_outcome_is_uncertain(error),
     };
