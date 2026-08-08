@@ -3394,6 +3394,7 @@ dependencies = [
  "git2",
  "libc",
  "locald-hosts",
+ "locald-publisher-protocol",
  "oci-distribution",
  "portable-pty",
  "schemars",
@@ -3487,6 +3488,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "locald-publisher-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "locald-core",
+ "locald-publisher-protocol",
+ "nix 0.30.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "locald-publisher-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "uuid",
+]
+
+[[package]]
 name = "locald-server"
 version = "0.1.2"
 dependencies = [
@@ -3514,6 +3541,7 @@ dependencies = [
  "locald-helper-protocol",
  "locald-hosts",
  "locald-oci",
+ "locald-publisher-protocol",
  "locald-utils",
  "mime_guess",
  "nix 0.30.1",

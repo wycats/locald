@@ -588,6 +588,26 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_path: Option<String>,
     },
+    /// Resolve the stable physical project identity fenced into publisher
+    /// operations without registering, starting, or attaching to the project.
+    ///
+    /// The daemon authenticates this ordinary local IPC request as the same
+    /// operating-system user. Git-backed projects can resolve before their
+    /// first catalog registration because their identity lives in Git
+    /// administrative metadata.
+    ///
+    /// **Response:** `IpcResponse::PublishedEndpointProject(ProjectInstanceId)`
+    ResolvePublishedEndpointProject {
+        /// Absolute UTF-8 path used only as a server-side project locator.
+        project_locator: PathBuf,
+    },
+    /// Discover the dedicated versioned publisher transport through the
+    /// authenticated ordinary daemon socket.
+    ///
+    /// **Response:** `IpcResponse::PublishedEndpointProtocolInfo` when the
+    /// transport is active, or `IpcResponse::PublishedEndpointProtocolUnavailable`
+    /// while it is not being advertised.
+    GetPublishedEndpointProtocolInfo,
     /// Acquire or renew one semantic demand, converge the project, and wait
     /// until every required service is ready.
     ///
@@ -705,6 +725,16 @@ pub enum IpcResponse {
     ProjectList(Vec<ProjectListEntry>),
     /// Privacy-safe project state for an ambient agent conversation.
     AgentProject(crate::AgentProjectStatus),
+    /// Stable physical identity resolved for an authenticated endpoint
+    /// publisher. The caller carries this value as a fence; it never selects
+    /// project authority by itself.
+    PublishedEndpointProject(#[schemars(with = "String")] ProjectInstanceId),
+    /// Exact dedicated-transport discovery information. This response is
+    /// reachable only after the publisher listener has been activated.
+    PublishedEndpointProtocolInfo(locald_publisher_protocol::PublishedEndpointProtocolInfo),
+    /// The daemon is reachable but is not advertising a complete publisher
+    /// transport. This response intentionally carries no socket or epoch.
+    PublishedEndpointProtocolUnavailable,
     /// Response to EnsureProject request.
     ProjectEnsured(EnsureProjectResult),
     /// A later lifecycle decision prevented EnsureProject from reaching Ready.
@@ -959,6 +989,95 @@ mod tests {
             serde_json::from_value(encoded).expect("deserialize project restart");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn published_endpoint_project_resolution_round_trips_its_identity_fence() {
+        let request = IpcRequest::ResolvePublishedEndpointProject {
+            project_locator: PathBuf::from("/work/project"),
+        };
+        let response = IpcResponse::PublishedEndpointProject(
+            "2f94e30c-f910-4f44-9bd3-e62a0b339ea5"
+                .parse()
+                .expect("parse project instance identity"),
+        );
+
+        let encoded_request = serde_json::to_value(&request).expect("serialize resolution");
+        assert_eq!(
+            encoded_request,
+            serde_json::json!({
+                "ResolvePublishedEndpointProject": {
+                    "project_locator": "/work/project"
+                }
+            })
+        );
+        let decoded_request: IpcRequest =
+            serde_json::from_value(encoded_request).expect("deserialize resolution");
+        let encoded_response = serde_json::to_value(&response).expect("serialize identity");
+        assert_eq!(
+            encoded_response,
+            serde_json::json!({
+                "PublishedEndpointProject": "2f94e30c-f910-4f44-9bd3-e62a0b339ea5"
+            })
+        );
+        let decoded_response: IpcResponse =
+            serde_json::from_value(encoded_response).expect("deserialize identity");
+
+        assert_eq!(decoded_request, request);
+        assert_eq!(decoded_response, response);
+    }
+
+    #[test]
+    fn publisher_protocol_discovery_round_trips_active_and_inactive_states() {
+        use locald_publisher_protocol::{AbsolutePath, DaemonEpoch, PublishedEndpointProtocolInfo};
+
+        let request = IpcRequest::GetPublishedEndpointProtocolInfo;
+        let info = PublishedEndpointProtocolInfo::v1(
+            DaemonEpoch::from_bytes([3; 16]),
+            AbsolutePath::parse("/tmp/locald-data/run/publisher-v1.sock")
+                .expect("parse publisher socket"),
+        );
+        let encoded_request = serde_json::to_value(&request).expect("serialize discovery");
+        assert_eq!(
+            encoded_request,
+            serde_json::json!("GetPublishedEndpointProtocolInfo")
+        );
+        let decoded_request: IpcRequest =
+            serde_json::from_value(encoded_request).expect("deserialize discovery");
+        assert_eq!(decoded_request, request);
+
+        let active = IpcResponse::PublishedEndpointProtocolInfo(info.clone());
+        let encoded_active = serde_json::to_value(&active).expect("serialize active discovery");
+        assert_eq!(
+            encoded_active,
+            serde_json::json!({
+                "PublishedEndpointProtocolInfo": {
+                    "protocol_version": 1,
+                    "daemon_epoch": info.daemon_epoch().expose_secret(),
+                    "publisher_socket": "/tmp/locald-data/run/publisher-v1.sock",
+                    "preparation_timeout_ms": 60_000,
+                    "attempt_ttl_ms": 15_000,
+                    "lease_ttl_ms": 30_000,
+                    "renew_target_ms": 10_000,
+                    "wait_timeout_ms": 30_000,
+                    "frame_timeout_ms": 5_000
+                }
+            })
+        );
+        let decoded_active: IpcResponse =
+            serde_json::from_value(encoded_active).expect("deserialize active discovery");
+        assert_eq!(decoded_active, active);
+
+        let inactive = IpcResponse::PublishedEndpointProtocolUnavailable;
+        let encoded_inactive =
+            serde_json::to_value(&inactive).expect("serialize inactive discovery");
+        assert_eq!(
+            encoded_inactive,
+            serde_json::json!("PublishedEndpointProtocolUnavailable")
+        );
+        let decoded_inactive: IpcResponse =
+            serde_json::from_value(encoded_inactive).expect("deserialize inactive discovery");
+        assert_eq!(decoded_inactive, inactive);
     }
 
     #[test]

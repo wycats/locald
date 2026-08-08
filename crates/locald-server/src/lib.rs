@@ -893,6 +893,7 @@ async fn async_main(
             container_manager_clone,
             shutdown_tx_ipc,
             version_clone,
+            ipc::PublisherTransportDiscovery::Inactive,
         )
         .await
     });

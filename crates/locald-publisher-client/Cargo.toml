@@ -1,0 +1,19 @@
+[package]
+name = "locald-publisher-client"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+libc = "0.2"
+locald-core = { path = "../locald-core" }
+locald-publisher-protocol = { path = "../locald-publisher-protocol" }
+nix = { version = "0.30", features = ["fs", "poll", "socket", "user"] }
+serde = "1.0"
+serde_json = "1.0"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
