@@ -34,7 +34,8 @@ pub use clock::{
     ClockError, RenewalSchedule, SuspendAwareClock, SuspendInstant, SystemSuspendAwareClock,
 };
 pub use installation::{
-    InstallationError, InstallationEvidence, InstalledPublisher, probe_installation,
+    InstallationError, InstallationEvidence, InstalledPublisher, SandboxProbeError,
+    SandboxPublisherContext, probe_installation, probe_sandbox_publisher,
 };
 pub use supervisor::{LeaseSnapshot, LeaseState};
 pub use wake::{

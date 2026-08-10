@@ -198,12 +198,12 @@ impl PublisherClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let resolved = self
             .discovery
-            .resolve_project(installation.record().command_socket(), &project_locator)
+            .resolve_project(installation.command_socket(), &project_locator)
             .map_err(ClientError::Backend)?;
         self.validate_peer_uid(resolved.peer_uid)?;
         let protocol_info = self
             .discovery
-            .protocol_info(installation.record().command_socket())
+            .protocol_info(installation.command_socket())
             .map_err(ClientError::Backend)?;
         self.validate_peer_uid(protocol_info.peer_uid)?;
         protocol_info.value.validate().map_err(|error| {
@@ -229,9 +229,11 @@ impl PublisherClient {
     }
 
     fn validate_installed(&self, installed: &InstalledPublisher) -> Result<(), ClientError> {
-        installed.record().validate().map_err(|error| {
-            ClientError::InvalidDiscovery(format!("invalid installation record: {error}"))
-        })?;
+        if let Some(record) = installed.standard_record() {
+            record.validate().map_err(|error| {
+                ClientError::InvalidDiscovery(format!("invalid installation record: {error}"))
+            })?;
+        }
         installed.protocol_info().validate().map_err(|error| {
             ClientError::InvalidDiscovery(format!("invalid publisher protocol info: {error}"))
         })?;
@@ -1584,6 +1586,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{AuthenticatedValue, BackendErrorKind, TransportReply};
+    use crate::installation::SandboxPublisherContext;
     use crate::wake::{WakeRegistration, WakeSink};
 
     const ATTEMPT_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1596,6 +1599,7 @@ mod tests {
         project_instance_id: ProjectInstanceId,
         protocol_info: Mutex<PublishedEndpointProtocolInfo>,
         blocked_protocol_info: Mutex<Option<(SyncSender<()>, Arc<BlockGate>)>>,
+        command_sockets: Mutex<Vec<AbsolutePath>>,
     }
 
     impl FakeDiscovery {
@@ -1612,13 +1616,26 @@ mod tests {
                 .expect("blocked protocol info") = Some((entered, Arc::clone(&gate)));
             (receiver, gate)
         }
+
+        fn take_command_sockets(&self) -> Vec<AbsolutePath> {
+            std::mem::take(
+                &mut *self
+                    .command_sockets
+                    .lock()
+                    .expect("recorded command sockets"),
+            )
+        }
     }
 
     impl AuthenticatedDaemonDiscovery for FakeDiscovery {
         fn protocol_info(
             &self,
-            _command_socket: &AbsolutePath,
+            command_socket: &AbsolutePath,
         ) -> Result<AuthenticatedValue<PublishedEndpointProtocolInfo>, BackendError> {
+            self.command_sockets
+                .lock()
+                .expect("recorded command sockets")
+                .push(command_socket.clone());
             let value = self.protocol_info.lock().expect("protocol info").clone();
             let blocked = self
                 .blocked_protocol_info
@@ -1637,9 +1654,13 @@ mod tests {
 
         fn resolve_project(
             &self,
-            _command_socket: &AbsolutePath,
+            command_socket: &AbsolutePath,
             _project_locator: &AbsolutePath,
         ) -> Result<AuthenticatedValue<ProjectInstanceId>, BackendError> {
+            self.command_sockets
+                .lock()
+                .expect("recorded command sockets")
+                .push(command_socket.clone());
             Ok(AuthenticatedValue {
                 peer_uid: self.uid,
                 value: self.project_instance_id,
@@ -1963,6 +1984,7 @@ mod tests {
             project_instance_id: instance,
             protocol_info: Mutex::new(protocol_info),
             blocked_protocol_info: Mutex::new(None),
+            command_sockets: Mutex::new(Vec::new()),
         });
         let transport = Arc::new(FakeTransport::default());
         let clock = Arc::new(FakeClock::default());
@@ -1983,6 +2005,45 @@ mod tests {
             instance,
             epoch,
         }
+    }
+
+    #[test]
+    fn explicit_sandbox_command_socket_drives_project_discovery() {
+        let fixture = fixture();
+        let command_socket = AbsolutePath::parse("/tmp/locald-explicit-sandbox/locald.sock")
+            .expect("command socket");
+        let context = SandboxPublisherContext::new(
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald")
+                .expect("data directory"),
+            command_socket.clone(),
+        )
+        .expect("sandbox context");
+        let protocol_info = PublishedEndpointProtocolInfo::v1(
+            fixture.epoch.clone(),
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald/run/publisher-v1.sock")
+                .expect("publisher socket"),
+        );
+        fixture.discovery.set_protocol_info(protocol_info.clone());
+        let installed = InstalledPublisher::from_verified_sandbox(
+            context,
+            Uid::effective().as_raw(),
+            protocol_info,
+        );
+
+        let project = fixture
+            .client
+            .for_project(
+                &installed,
+                AbsolutePath::parse("/work/project").expect("locator"),
+            )
+            .expect("sandbox project");
+
+        assert!(project.fence.is_current());
+        assert_eq!(installed.standard_record(), None);
+        assert_eq!(
+            fixture.discovery.take_command_sockets(),
+            vec![command_socket.clone(), command_socket]
+        );
     }
 
     fn origin() -> SemanticOrigin {
@@ -2103,7 +2164,10 @@ mod tests {
             .discovery
             .set_protocol_info(current_protocol_info.clone());
         let current_installation = InstalledPublisher::from_verified(
-            stale_installation.record().clone(),
+            stale_installation
+                .standard_record()
+                .expect("standard installation record")
+                .clone(),
             stale_installation.daemon_uid(),
             current_protocol_info,
         );
@@ -2154,7 +2218,11 @@ mod tests {
             .discovery
             .set_protocol_info(current_protocol_info.clone());
         let current_installation = InstalledPublisher::from_verified(
-            fixture.installed.record().clone(),
+            fixture
+                .installed
+                .standard_record()
+                .expect("standard installation record")
+                .clone(),
             fixture.installed.daemon_uid(),
             current_protocol_info,
         );
@@ -2223,7 +2291,11 @@ mod tests {
             .discovery
             .set_protocol_info(current_protocol_info.clone());
         let current_installation = InstalledPublisher::from_verified(
-            fixture.installed.record().clone(),
+            fixture
+                .installed
+                .standard_record()
+                .expect("standard installation record")
+                .clone(),
             fixture.installed.daemon_uid(),
             current_protocol_info,
         );
