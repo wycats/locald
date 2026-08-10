@@ -9,16 +9,25 @@
     dead_code,
     reason = "b.3.4 builds the authority engine before b.3.5 exposes authenticated transport"
 )]
+#![allow(clippy::redundant_pub_crate)] // Sibling modules share this crate-internal authority API.
 
 use locald_core::ipc::PublicationState;
-use locald_core::{ProjectInstanceId, PublishedServiceDeclaration, SemanticOrigin, ServiceKey};
+use locald_core::{
+    CatalogPresence, ProjectInstanceId, PublishedServiceDeclaration, Registry, SemanticOrigin,
+    ServiceKey,
+};
+use locald_publisher_client::{
+    SystemWakeMonitor, WakeError, WakeMonitor, WakeRegistration, WakeSink,
+};
+use locald_publisher_protocol as protocol;
 use rand::{RngCore as _, rngs::OsRng};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, mpsc, watch};
 
 const LEASE_TTL: Duration = Duration::from_secs(30);
 const RENEW_AFTER: Duration = Duration::from_secs(10);
@@ -31,6 +40,13 @@ const FRAME_DELIVERY_TTL: Duration = Duration::from_secs(5);
 /// One daemon-lifetime, suspend-inclusive monotonic clock reading.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PublicationInstant(Duration);
+
+#[derive(Clone, Copy)]
+struct ReadinessWaitFence {
+    deadline: PublicationInstant,
+    pause_generation: u64,
+    paused_at_capture: bool,
+}
 
 impl PublicationInstant {
     #[cfg(test)]
@@ -135,7 +151,7 @@ impl PublicationClock for SystemPublicationClock {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct AuthorityToken([u8; 32]);
 
 impl AuthorityToken {
@@ -181,7 +197,7 @@ impl fmt::Debug for DaemonEpoch {
 
 /// Kernel-observed process birth evidence. This is never persisted.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum PublisherProcessBirth {
+pub(crate) enum PublisherProcessBirth {
     MacOs {
         start_seconds: u64,
         start_microseconds: u64,
@@ -202,14 +218,14 @@ impl fmt::Debug for PublisherProcessBirth {
 
 /// Exact same-user publisher authority obtained from kernel credentials.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct PublisherPrincipal {
+pub(crate) struct PublisherPrincipal {
     uid: u32,
     pid: u32,
     birth: PublisherProcessBirth,
 }
 
 impl PublisherPrincipal {
-    fn new(uid: u32, pid: u32, birth: PublisherProcessBirth) -> Self {
+    pub(crate) fn new(uid: u32, pid: u32, birth: PublisherProcessBirth) -> Self {
         Self { uid, pid, birth }
     }
 }
@@ -222,7 +238,7 @@ impl fmt::Debug for PublisherPrincipal {
 
 /// Kernel identity of one retained listener capability.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum ListenerIdentity {
+pub(crate) enum ListenerIdentity {
     MacOsIpv4 {
         address: [u8; 4],
         port: u16,
@@ -247,7 +263,7 @@ impl fmt::Debug for ListenerIdentity {
 }
 
 /// Owned guard that preserves one validated listener's address authority.
-struct RetainedListenerCapability {
+pub(crate) struct RetainedListenerCapability {
     identity: ListenerIdentity,
     guard: Arc<dyn Send + Sync>,
 }
@@ -333,11 +349,11 @@ impl<F> std::ops::Deref for OperationPermit<F> {
 }
 
 impl RetainedListenerCapability {
-    fn new(identity: ListenerIdentity, guard: Arc<dyn Send + Sync>) -> Self {
+    pub(crate) fn new(identity: ListenerIdentity, guard: Arc<dyn Send + Sync>) -> Self {
         Self { identity, guard }
     }
 
-    const fn identity(&self) -> &ListenerIdentity {
+    pub(crate) const fn identity(&self) -> &ListenerIdentity {
         &self.identity
     }
 }
@@ -357,6 +373,12 @@ struct AcquisitionAttemptHandle {
     token: AuthorityToken,
 }
 
+impl AcquisitionAttemptHandle {
+    fn wire(&self) -> locald_publisher_protocol::AcquisitionAttemptHandle {
+        locald_publisher_protocol::AcquisitionAttemptHandle::from_bytes(self.token.0)
+    }
+}
+
 impl fmt::Debug for AcquisitionAttemptHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AcquisitionAttemptHandle(<redacted>)")
@@ -371,6 +393,12 @@ struct RebindAttemptHandle {
     token: AuthorityToken,
 }
 
+impl RebindAttemptHandle {
+    fn wire(&self) -> locald_publisher_protocol::RebindAttemptHandle {
+        locald_publisher_protocol::RebindAttemptHandle::from_bytes(self.token.0)
+    }
+}
+
 impl fmt::Debug for RebindAttemptHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RebindAttemptHandle(<redacted>)")
@@ -383,6 +411,12 @@ struct LeaseHandle {
     service: ServiceKey,
     generation: u64,
     token: AuthorityToken,
+}
+
+impl LeaseHandle {
+    fn wire(&self) -> locald_publisher_protocol::LeaseHandle {
+        locald_publisher_protocol::LeaseHandle::from_bytes(self.token.0)
+    }
 }
 
 impl fmt::Debug for LeaseHandle {
@@ -419,6 +453,49 @@ struct PreparationFence {
     token: AuthorityToken,
     principal: PublisherPrincipal,
     configuration_revision: u64,
+    deadline: PublicationInstant,
+}
+
+/// Opaque authority clock fence minted when the manager admits a Begin
+/// request. Candidate reservation must carry this exact value so cold config
+/// loading and host convergence consume the same 60-second preparation
+/// budget instead of starting a fresh clock after validation.
+#[derive(Debug, Clone)]
+pub(crate) struct PublisherPreparationDeadline {
+    epoch: DaemonEpoch,
+    deadline: PublicationInstant,
+    #[cfg(test)]
+    forced_expired: Arc<AtomicBool>,
+}
+
+impl PublisherPreparationDeadline {
+    fn is_forced_expired(&self) -> bool {
+        #[cfg(test)]
+        {
+            return self.forced_expired.load(Ordering::Acquire);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+            false
+        }
+    }
+}
+
+/// Authority reserved from a fully validated catalog candidate before that
+/// candidate's hosts projection or durable catalog image is installed.
+///
+/// Candidate preparation deliberately lives outside `PublicationSlot`: the
+/// currently published declaration must retain its lease/attempt authority
+/// until the journaled catalog transition reaches its commit point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidatePreparationFence {
+    epoch: DaemonEpoch,
+    service: ServiceKey,
+    token: AuthorityToken,
+    principal: PublisherPrincipal,
+    declaration: DeclarationAuthority,
+    replacement: Option<locald_publisher_protocol::AcquisitionAttemptHandle>,
     deadline: PublicationInstant,
 }
 
@@ -465,6 +542,12 @@ enum BeginPreparation {
         origin: SemanticOrigin,
         expires_in: Duration,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BeginCandidatePreparation {
+    Started(OperationPermit<CandidatePreparationFence>),
+    Joined(CandidatePreparationFence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +601,30 @@ struct PublicationEffects {
     projection_changed: BTreeSet<ServiceKey>,
     probe_required: BTreeSet<ServiceKey>,
     retired_capabilities: Vec<RetainedListenerCapability>,
+    retired_preparations: BTreeSet<AuthorityToken>,
+    timed_out_preparations: BTreeSet<AuthorityToken>,
+}
+
+impl PublicationEffects {
+    fn has_changes(&self) -> bool {
+        !self.projection_changed.is_empty()
+            || !self.probe_required.is_empty()
+            || !self.retired_capabilities.is_empty()
+            || !self.retired_preparations.is_empty()
+            || !self.timed_out_preparations.is_empty()
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.projection_changed
+            .append(&mut other.projection_changed);
+        self.probe_required.append(&mut other.probe_required);
+        self.retired_capabilities
+            .append(&mut other.retired_capabilities);
+        self.retired_preparations
+            .append(&mut other.retired_preparations);
+        self.timed_out_preparations
+            .append(&mut other.timed_out_preparations);
+    }
 }
 
 #[derive(Debug)]
@@ -578,6 +685,8 @@ enum PublicationRegistryError {
     GenerationOverflow,
     #[error("the deadline has not elapsed")]
     DeadlineNotElapsed,
+    #[error("the readiness wait reached its deadline")]
+    WaitDeadlineElapsed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,9 +832,18 @@ enum SlotState {
 struct PublicationSlot {
     declaration: DeclarationAuthority,
     paused: bool,
+    /// Monotonic fence for exact readiness waits. Resume clears current policy
+    /// but never erases the fact that a wait crossed a pause transition.
+    pause_generation: u64,
     missing: bool,
     last_generation: u64,
     state: SlotState,
+}
+
+#[derive(Debug)]
+struct CandidatePreparation {
+    fence: CandidatePreparationFence,
+    cancellation: OperationCancellationController,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -750,6 +868,7 @@ struct PublicationRegistry {
     paused_instances: BTreeSet<ProjectInstanceId>,
     /// Current project-instance presence policy, retained across declarations.
     missing_instances: BTreeSet<ProjectInstanceId>,
+    candidate_preparations: BTreeMap<ServiceKey, CandidatePreparation>,
     slots: BTreeMap<ServiceKey, PublicationSlot>,
 }
 
@@ -772,6 +891,7 @@ impl PublicationRegistry {
             configuration_states: BTreeMap::new(),
             paused_instances: BTreeSet::new(),
             missing_instances: BTreeSet::new(),
+            candidate_preparations: BTreeMap::new(),
             slots: BTreeMap::new(),
         }
     }
@@ -785,6 +905,7 @@ impl PublicationRegistry {
             configuration_states: BTreeMap::new(),
             paused_instances: BTreeSet::new(),
             missing_instances: BTreeSet::new(),
+            candidate_preparations: BTreeMap::new(),
             slots: BTreeMap::new(),
         }
     }
@@ -809,6 +930,51 @@ impl PublicationRegistry {
                 PublicationState::WaitingForPublisher
             },
             origin: slot.declaration.0.origin.clone(),
+        })
+    }
+
+    fn acquisition_handle_for_wire(
+        &self,
+        wire: &locald_publisher_protocol::AcquisitionAttemptHandle,
+    ) -> Option<AcquisitionAttemptHandle> {
+        self.slots.values().find_map(|slot| match &slot.state {
+            SlotState::Attempt(attempt) if attempt.handle.wire() == *wire => {
+                Some(attempt.handle.clone())
+            }
+            SlotState::Live(lease) if lease.acquisition_replay.handle.wire() == *wire => {
+                Some(lease.acquisition_replay.handle.clone())
+            }
+            SlotState::Vacant
+            | SlotState::Preparing(_)
+            | SlotState::Attempt(_)
+            | SlotState::Live(_) => None,
+        })
+    }
+
+    fn rebind_handle_for_wire(
+        &self,
+        wire: &locald_publisher_protocol::RebindAttemptHandle,
+    ) -> Option<RebindAttemptHandle> {
+        self.slots.values().find_map(|slot| match &slot.state {
+            SlotState::Live(lease) => lease
+                .rebind
+                .as_ref()
+                .filter(|attempt| attempt.handle.wire() == *wire)
+                .map(|attempt| attempt.handle.clone()),
+            SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => None,
+        })
+    }
+
+    fn lease_handle_for_wire(
+        &self,
+        wire: &locald_publisher_protocol::LeaseHandle,
+    ) -> Option<LeaseHandle> {
+        self.slots.values().find_map(|slot| match &slot.state {
+            SlotState::Live(lease) if lease.handle.wire() == *wire => Some(lease.handle.clone()),
+            SlotState::Vacant
+            | SlotState::Preparing(_)
+            | SlotState::Attempt(_)
+            | SlotState::Live(_) => None,
         })
     }
 
@@ -931,11 +1097,17 @@ impl PublicationRegistry {
                     effects,
                 );
             }
+            self.retain_exact_candidate_preparations(instance, &candidates, &mut effects);
             return PublicationOutcome::ok((), effects);
         }
         let may_transfer_authority = admission == DeclarationAdmission::Ordinary
             && current_revision.and_then(|current| current.checked_add(1))
                 == Some(configuration_revision);
+
+        // A Begin operation may have reserved the exact validated candidate
+        // before journaled hosts/catalog convergence. Preserve only that exact
+        // declaration; every older or divergent candidate loses authority.
+        self.retain_exact_candidate_preparations(instance, &candidates, &mut effects);
 
         let removed = self
             .slots
@@ -957,6 +1129,7 @@ impl PublicationRegistry {
                     PublicationSlot {
                         declaration: candidate,
                         paused: self.paused_instances.contains(&instance),
+                        pause_generation: 0,
                         missing: self.missing_instances.contains(&instance),
                         last_generation: 0,
                         state: SlotState::Vacant,
@@ -999,6 +1172,226 @@ impl PublicationRegistry {
         );
 
         PublicationOutcome::ok((), effects)
+    }
+
+    fn begin_candidate_preparation(
+        &mut self,
+        admission_deadline: &PublisherPreparationDeadline,
+        declaration: PublishedServiceDeclaration,
+        principal: PublisherPrincipal,
+        replacement: Option<locald_publisher_protocol::AcquisitionAttemptHandle>,
+    ) -> PublicationOutcome<BeginCandidatePreparation> {
+        let (now, effects) = match self.begin_transition() {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        if admission_deadline.epoch != self.epoch {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        }
+        if admission_deadline.is_forced_expired() || admission_deadline.deadline <= now {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        let declaration = DeclarationAuthority(declaration);
+        let key = declaration.key();
+        if declaration.0.configuration_revision == 0 {
+            return PublicationOutcome::err(PublicationRegistryError::DeclarationConflict, effects);
+        }
+        if let Some(current) = self.candidate_preparations.get(&key) {
+            if current.fence.principal == principal
+                && current.fence.declaration == declaration
+                && current.fence.replacement == replacement
+            {
+                return PublicationOutcome::ok(
+                    BeginCandidatePreparation::Joined(current.fence.clone()),
+                    effects,
+                );
+            }
+            return PublicationOutcome::err(
+                PublicationRegistryError::AcquisitionInProgress,
+                effects,
+            );
+        }
+        if let Some(replacement) = &replacement {
+            let Some(current) = self.acquisition_handle_for_wire(replacement) else {
+                return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+            };
+            if current.service != key {
+                return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+            }
+        }
+        if let Some(slot) = self
+            .slots
+            .get(&key)
+            .filter(|slot| slot.declaration == declaration)
+        {
+            match &slot.state {
+                SlotState::Preparing(preparation) if preparation.fence.principal != principal => {
+                    return PublicationOutcome::err(
+                        PublicationRegistryError::AcquisitionInProgress,
+                        effects,
+                    );
+                }
+                SlotState::Attempt(attempt) if attempt.principal != principal => {
+                    return PublicationOutcome::err(
+                        PublicationRegistryError::AcquisitionInProgress,
+                        effects,
+                    );
+                }
+                SlotState::Live(_) => {
+                    return PublicationOutcome::err(
+                        PublicationRegistryError::AlreadyPublished,
+                        effects,
+                    );
+                }
+                SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => {}
+            }
+        }
+        let fence = CandidatePreparationFence {
+            epoch: self.epoch.clone(),
+            service: key.clone(),
+            token: AuthorityToken::random(),
+            principal,
+            declaration,
+            replacement,
+            deadline: admission_deadline.deadline,
+        };
+        let (cancellation, cancellation_observer) = OperationCancellationController::pair();
+        self.candidate_preparations.insert(
+            key,
+            CandidatePreparation {
+                fence: fence.clone(),
+                cancellation,
+            },
+        );
+        PublicationOutcome::ok(
+            BeginCandidatePreparation::Started(OperationPermit {
+                fence,
+                cancellation: cancellation_observer,
+            }),
+            effects,
+        )
+    }
+
+    fn begin_candidate_preparation_deadline(
+        &mut self,
+    ) -> PublicationOutcome<PublisherPreparationDeadline> {
+        let (now, effects) = match self.begin_transition() {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let deadline = match now.checked_add(PREPARATION_TTL) {
+            Ok(deadline) => deadline,
+            Err(error) => return PublicationOutcome::err(error, effects),
+        };
+        PublicationOutcome::ok(
+            PublisherPreparationDeadline {
+                epoch: self.epoch.clone(),
+                deadline,
+                #[cfg(test)]
+                forced_expired: Arc::new(AtomicBool::new(false)),
+            },
+            effects,
+        )
+    }
+
+    fn candidate_preparation_deadline_remaining(
+        &mut self,
+        deadline: &PublisherPreparationDeadline,
+    ) -> PublicationOutcome<Duration> {
+        let (now, effects) = match self.begin_transition() {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        if deadline.epoch != self.epoch {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        }
+        if deadline.is_forced_expired() {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        let Some(remaining) = deadline.deadline.duration_since(now) else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        };
+        if remaining.is_zero() {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        PublicationOutcome::ok(remaining, effects)
+    }
+
+    fn take_candidate_preparation(
+        &mut self,
+        fence: &CandidatePreparationFence,
+    ) -> PublicationOutcome<()> {
+        let (now, mut effects) = match self.begin_transition_except(&fence.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(current) = self.candidate_preparations.get(&fence.service) else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        if current.fence.deadline <= now {
+            let current = self
+                .candidate_preparations
+                .remove(&fence.service)
+                .expect("candidate preparation exists");
+            current.cancellation.cancel();
+            effects.timed_out_preparations.insert(current.fence.token);
+            return PublicationOutcome::err(PublicationRegistryError::AttemptExpired, effects);
+        }
+        let declaration_is_current = self
+            .slots
+            .get(&fence.service)
+            .is_some_and(|slot| !slot.missing && slot.declaration == fence.declaration);
+        let revision_is_current = matches!(
+            self.configuration_states.get(&fence.service.instance()),
+            Some(InstanceConfigurationState::Active(revision))
+                if *revision == fence.declaration.0.configuration_revision
+        );
+        if current.fence != *fence || !declaration_is_current || !revision_is_current {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        }
+        self.candidate_preparations.remove(&fence.service);
+        PublicationOutcome::ok((), effects)
+    }
+
+    fn fail_candidate_preparation(
+        &mut self,
+        fence: &CandidatePreparationFence,
+    ) -> PublicationOutcome<()> {
+        let (_, effects) = match self.begin_transition_except(&fence.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(current) = self.candidate_preparations.get(&fence.service) else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        if current.fence != *fence {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        }
+        self.candidate_preparations.remove(&fence.service);
+        PublicationOutcome::ok((), effects)
+    }
+
+    fn retain_exact_candidate_preparations(
+        &mut self,
+        instance: ProjectInstanceId,
+        declarations: &BTreeMap<ServiceKey, DeclarationAuthority>,
+        effects: &mut PublicationEffects,
+    ) {
+        let retired = self
+            .candidate_preparations
+            .iter()
+            .filter(|(key, preparation)| {
+                key.instance() == instance
+                    && declarations.get(*key) != Some(&preparation.fence.declaration)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in retired {
+            if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                preparation.cancellation.cancel();
+                effects.retired_preparations.insert(preparation.fence.token);
+            }
+        }
     }
 
     fn begin_preparation(
@@ -1512,6 +1905,107 @@ impl PublicationRegistry {
         PublicationOutcome::ok((), effects)
     }
 
+    fn begin_wait_ready(
+        &mut self,
+        handle: &LeaseHandle,
+        principal: &PublisherPrincipal,
+        expected_binding_revision: u64,
+    ) -> PublicationOutcome<ReadinessWaitFence> {
+        let (now, mut effects) = match self.begin_transition_except(&handle.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(slot) = self.slots.get_mut(&handle.service) else {
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        };
+        if matches!(&slot.state, SlotState::Live(lease) if lease.deadline <= now) {
+            Self::retire_slot_state(&handle.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        }
+        let SlotState::Live(lease) = &slot.state else {
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        };
+        if lease.handle != *handle || lease.principal != *principal {
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        }
+        if lease.binding_revision != expected_binding_revision {
+            return PublicationOutcome::err(PublicationRegistryError::BindingReplaced, effects);
+        }
+        match now.checked_add(WAIT_READY_TTL) {
+            Ok(deadline) => PublicationOutcome::ok(
+                ReadinessWaitFence {
+                    deadline,
+                    pause_generation: slot.pause_generation,
+                    paused_at_capture: slot.paused,
+                },
+                effects,
+            ),
+            Err(error) => PublicationOutcome::err(error, effects),
+        }
+    }
+
+    fn wait_projection(
+        &mut self,
+        handle: &LeaseHandle,
+        principal: &PublisherPrincipal,
+        expected_binding_revision: u64,
+        wait_fence: &ReadinessWaitFence,
+    ) -> PublicationOutcome<(PublicationProjection, Duration)> {
+        let (now, mut effects) = match self.begin_transition_except(&handle.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(slot) = self.slots.get_mut(&handle.service) else {
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        };
+        if matches!(&slot.state, SlotState::Live(lease) if lease.deadline <= now) {
+            Self::retire_slot_state(&handle.service, slot, &mut effects);
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        }
+        let SlotState::Live(lease) = &slot.state else {
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        };
+        if lease.handle != *handle || lease.principal != *principal {
+            return PublicationOutcome::err(PublicationRegistryError::LeaseLost, effects);
+        }
+        if lease.binding_revision != expected_binding_revision {
+            return PublicationOutcome::err(PublicationRegistryError::BindingReplaced, effects);
+        }
+        let pause_generation_changed = slot.pause_generation != wait_fence.pause_generation;
+        let pause_observed =
+            wait_fence.paused_at_capture || slot.paused || pause_generation_changed;
+        let wait_remaining = if pause_observed {
+            Duration::ZERO
+        } else {
+            let Some(wait_remaining) = wait_fence.deadline.duration_since(now) else {
+                return PublicationOutcome::err(
+                    PublicationRegistryError::WaitDeadlineElapsed,
+                    effects,
+                );
+            };
+            if wait_remaining.is_zero() {
+                return PublicationOutcome::err(
+                    PublicationRegistryError::WaitDeadlineElapsed,
+                    effects,
+                );
+            }
+            wait_remaining
+        };
+        let projection = PublicationProjection {
+            state: if slot.missing {
+                PublicationState::InstanceMissing
+            } else if pause_observed {
+                PublicationState::RoutePaused
+            } else {
+                // b.3.5 deliberately installs no route authorization. b.3.6
+                // replaces this with exact health- and route-scoped state.
+                PublicationState::CheckingEndpoint
+            },
+            origin: slot.declaration.0.origin.clone(),
+        };
+        PublicationOutcome::ok((projection, wait_remaining), effects)
+    }
+
     fn expire(&mut self, fence: &ExpiryFence) -> PublicationOutcome<bool> {
         let (now, mut effects) = match self.begin_transition_except(&fence.lease.service) {
             Ok(value) => value,
@@ -1847,6 +2341,13 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        if paused
+            && self.slots.iter().any(|(key, slot)| {
+                key.instance() == instance && !slot.paused && slot.pause_generation == u64::MAX
+            })
+        {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        }
         if paused {
             self.paused_instances.insert(instance);
         } else {
@@ -1855,6 +2356,12 @@ impl PublicationRegistry {
         for (key, slot) in &mut self.slots {
             if key.instance() != instance || slot.paused == paused {
                 continue;
+            }
+            if paused {
+                slot.pause_generation = slot
+                    .pause_generation
+                    .checked_add(1)
+                    .expect("pause generation was preflighted");
             }
             slot.paused = paused;
             if let SlotState::Live(lease) = &mut slot.state {
@@ -1877,6 +2384,18 @@ impl PublicationRegistry {
         };
         if missing {
             self.missing_instances.insert(instance);
+            let candidate_keys = self
+                .candidate_preparations
+                .keys()
+                .filter(|key| key.instance() == instance)
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in candidate_keys {
+                if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                    preparation.cancellation.cancel();
+                    effects.retired_preparations.insert(preparation.fence.token);
+                }
+            }
         } else {
             self.missing_instances.remove(&instance);
         }
@@ -1911,6 +2430,18 @@ impl PublicationRegistry {
             instance,
             InstanceConfigurationState::Retired(high_water_revision),
         );
+        let candidate_keys = self
+            .candidate_preparations
+            .keys()
+            .filter(|key| key.instance() == instance)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in candidate_keys {
+            if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                preparation.cancellation.cancel();
+                effects.retired_preparations.insert(preparation.fence.token);
+            }
+        }
         let keys = self
             .slots
             .keys()
@@ -1931,6 +2462,18 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        let candidate_keys = self
+            .candidate_preparations
+            .iter()
+            .filter(|(_, preparation)| preparation.fence.principal == *principal)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in candidate_keys {
+            if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                preparation.cancellation.cancel();
+                effects.retired_preparations.insert(preparation.fence.token);
+            }
+        }
         for (key, slot) in &mut self.slots {
             let owned = match &slot.state {
                 SlotState::Preparing(preparation) => preparation.fence.principal == *principal,
@@ -1955,6 +2498,17 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        let candidate_keys = self
+            .candidate_preparations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in candidate_keys {
+            if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                preparation.cancellation.cancel();
+                effects.retired_preparations.insert(preparation.fence.token);
+            }
+        }
         for (key, slot) in &mut self.slots {
             let preparation_in_flight = matches!(
                 &slot.state,
@@ -1985,6 +2539,98 @@ impl PublicationRegistry {
 
     fn shutdown(&mut self) -> PublicationEffects {
         self.retire_all_authority()
+    }
+
+    fn preparation_tokens(&self) -> BTreeSet<AuthorityToken> {
+        self.slots
+            .values()
+            .filter_map(|slot| match &slot.state {
+                SlotState::Preparing(preparation) => Some(preparation.fence.token.clone()),
+                SlotState::Vacant | SlotState::Attempt(_) | SlotState::Live(_) => None,
+            })
+            .chain(
+                self.candidate_preparations
+                    .values()
+                    .map(|preparation| preparation.fence.token.clone()),
+            )
+            .collect()
+    }
+
+    fn next_deadline(&mut self) -> PublicationOutcome<Option<Duration>> {
+        let now = match self.observe_now() {
+            Ok(now) => now,
+            Err(failure) => {
+                let (error, effects) = *failure;
+                return PublicationOutcome::err(error, effects);
+            }
+        };
+        let deadline = self
+            .slots
+            .values()
+            .filter_map(|slot| match &slot.state {
+                SlotState::Vacant => None,
+                SlotState::Preparing(preparation) => Some(preparation.fence.deadline),
+                SlotState::Attempt(attempt) => Some(attempt.deadline),
+                SlotState::Live(lease) => {
+                    Some(lease.rebind.as_ref().map_or(lease.deadline, |attempt| {
+                        lease.deadline.min(attempt.deadline)
+                    }))
+                }
+            })
+            .chain(
+                self.candidate_preparations
+                    .values()
+                    .map(|preparation| preparation.fence.deadline),
+            )
+            .min();
+        PublicationOutcome::ok(
+            deadline.map(|deadline| deadline.duration_since(now).unwrap_or_default()),
+            PublicationEffects::default(),
+        )
+    }
+
+    fn sweep_deadlines(&mut self) -> PublicationOutcome<()> {
+        let (_, effects) = match self.begin_transition() {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        PublicationOutcome::ok((), effects)
+    }
+
+    #[cfg(test)]
+    fn timeout_candidate_preparation(&mut self, key: &ServiceKey) -> PublicationOutcome<bool> {
+        let (_, mut effects) = match self.begin_transition_except(key) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(preparation) = self.candidate_preparations.remove(key) else {
+            return PublicationOutcome::ok(false, effects);
+        };
+        preparation.cancellation.cancel();
+        effects
+            .timed_out_preparations
+            .insert(preparation.fence.token);
+        PublicationOutcome::ok(true, effects)
+    }
+
+    fn vacate_terminal_preparation(&mut self, fence: &PreparationFence) -> PublicationOutcome<()> {
+        let (_, effects) = match self.begin_transition_except(&fence.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(slot) = self.slots.get_mut(&fence.service) else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        let SlotState::Preparing(preparation) = &slot.state else {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        };
+        if preparation.fence != *fence
+            || !matches!(preparation.phase, PreparationPhase::Terminal(_))
+        {
+            return PublicationOutcome::err(PublicationRegistryError::AttemptStale, effects);
+        }
+        slot.state = SlotState::Vacant;
+        PublicationOutcome::ok((), effects)
     }
 
     fn lease_grant(lease: &LiveLease, now: PublicationInstant) -> LeaseGrant {
@@ -2028,25 +2674,34 @@ impl PublicationRegistry {
     ) -> Result<(PublicationInstant, PublicationEffects), PublicationOutcome<T>> {
         match self.observe_now() {
             Ok(now) => Ok((now, self.expire_elapsed(now, excluded))),
-            Err((error, effects)) => Err(PublicationOutcome::err(error, effects)),
+            Err(failure) => {
+                let (error, effects) = *failure;
+                Err(PublicationOutcome::err(error, effects))
+            }
         }
     }
 
     fn observe_now(
         &mut self,
-    ) -> Result<PublicationInstant, (PublicationRegistryError, PublicationEffects)> {
+    ) -> Result<PublicationInstant, Box<(PublicationRegistryError, PublicationEffects)>> {
         let now = match self.clock.now() {
             Ok(now) => now,
             Err(PublicationClockError::Unavailable) => {
                 let effects = self.retire_all_authority();
                 self.last_now = None;
-                return Err((PublicationRegistryError::ClockUnavailable, effects));
+                return Err(Box::new((
+                    PublicationRegistryError::ClockUnavailable,
+                    effects,
+                )));
             }
         };
         if self.last_now.is_some_and(|last| now < last) {
             let effects = self.retire_all_authority();
             self.last_now = Some(now);
-            return Err((PublicationRegistryError::ClockRegressed, effects));
+            return Err(Box::new((
+                PublicationRegistryError::ClockRegressed,
+                effects,
+            )));
         }
         self.last_now = Some(now);
         Ok(now)
@@ -2058,6 +2713,22 @@ impl PublicationRegistry {
         excluded: Option<&ServiceKey>,
     ) -> PublicationEffects {
         let mut effects = PublicationEffects::default();
+        let expired_candidates = self
+            .candidate_preparations
+            .iter()
+            .filter(|(key, preparation)| {
+                excluded != Some(*key) && preparation.fence.deadline <= now
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_candidates {
+            if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                preparation.cancellation.cancel();
+                effects
+                    .timed_out_preparations
+                    .insert(preparation.fence.token);
+            }
+        }
         for (key, slot) in &mut self.slots {
             if excluded == Some(key) {
                 continue;
@@ -2069,7 +2740,15 @@ impl PublicationRegistry {
                 SlotState::Vacant => false,
             };
             if elapsed {
+                let timed_out_preparation = match &slot.state {
+                    SlotState::Preparing(preparation) => Some(preparation.fence.token.clone()),
+                    SlotState::Vacant | SlotState::Attempt(_) | SlotState::Live(_) => None,
+                };
                 Self::retire_slot_state(key, slot, &mut effects);
+                if let Some(token) = timed_out_preparation {
+                    effects.retired_preparations.remove(&token);
+                    effects.timed_out_preparations.insert(token);
+                }
             } else if let SlotState::Live(lease) = &mut slot.state {
                 if lease
                     .rebind
@@ -2091,6 +2770,9 @@ impl PublicationRegistry {
         let previous = std::mem::replace(&mut slot.state, SlotState::Vacant);
         match previous {
             SlotState::Preparing(preparation) => {
+                effects
+                    .retired_preparations
+                    .insert(preparation.fence.token.clone());
                 Self::cancel_preparation_if_in_flight(&preparation);
             }
             SlotState::Attempt(attempt) => {
@@ -2185,10 +2867,1872 @@ impl PublicationRegistry {
 
     fn retire_all_authority(&mut self) -> PublicationEffects {
         let mut effects = PublicationEffects::default();
+        let candidate_keys = self
+            .candidate_preparations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in candidate_keys {
+            if let Some(preparation) = self.candidate_preparations.remove(&key) {
+                preparation.cancellation.cancel();
+                effects.retired_preparations.insert(preparation.fence.token);
+            }
+        }
         for (key, slot) in &mut self.slots {
             Self::retire_slot_state(key, slot, &mut effects);
         }
         effects
+    }
+}
+
+/// Daemon-owned publication authority exposed by the dedicated publisher
+/// transport. Durable declarations remain in the catalog; this value owns only
+/// daemon-lifetime handles, leases, listener guards, and change observation.
+#[derive(Clone)]
+pub(crate) struct PublisherAuthority {
+    inner: Arc<PublisherAuthorityInner>,
+}
+
+#[derive(Debug)]
+enum PublisherWakeObservation {
+    Inactive,
+    Registering { resumed: bool },
+    Active(Box<dyn WakeRegistration>),
+    BarrierPending(Box<dyn WakeRegistration>),
+    Failed(WakeError),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublisherWakeSignal {
+    Resumed,
+    Failed,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct WaitReadyCaptureHook {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+struct PublisherAuthorityInner {
+    registry: Arc<Mutex<PublicationRegistry>>,
+    changes: watch::Sender<u64>,
+    preparation_waiters: std::sync::Mutex<HashMap<AuthorityToken, PreparationSender>>,
+    wake_activation: std::sync::Mutex<()>,
+    wake_barrier_gate: std::sync::RwLock<()>,
+    wake_observation: std::sync::Mutex<PublisherWakeObservation>,
+    wake_signals: mpsc::UnboundedSender<PublisherWakeSignal>,
+    wake_receiver: std::sync::Mutex<Option<mpsc::UnboundedReceiver<PublisherWakeSignal>>>,
+    deadline_driver_started: AtomicBool,
+    shutdown: AtomicBool,
+    #[cfg(test)]
+    wait_ready_capture_hook: std::sync::Mutex<Option<WaitReadyCaptureHook>>,
+}
+
+#[derive(Debug)]
+struct PublisherAuthorityWakeSink {
+    inner: Weak<PublisherAuthorityInner>,
+}
+
+impl PublisherAuthorityWakeSink {
+    fn signal(&self, signal: PublisherWakeSignal) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.wake_signals.send(signal).is_err() {
+            let _barrier = inner
+                .wake_barrier_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut observation = inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *observation = PublisherWakeObservation::Failed(WakeError::Failed(
+                "server wake barrier is unavailable".to_owned(),
+            ));
+        }
+        inner.changes.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+}
+
+impl WakeSink for PublisherAuthorityWakeSink {
+    fn resumed(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let signal = {
+            let _barrier = inner
+                .wake_barrier_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut observation = inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::mem::replace(&mut *observation, PublisherWakeObservation::Inactive);
+            match previous {
+                PublisherWakeObservation::Active(registration) => {
+                    *observation = PublisherWakeObservation::BarrierPending(registration);
+                    true
+                }
+                PublisherWakeObservation::BarrierPending(registration) => {
+                    *observation = PublisherWakeObservation::BarrierPending(registration);
+                    false
+                }
+                PublisherWakeObservation::Registering { .. } => {
+                    *observation = PublisherWakeObservation::Registering { resumed: true };
+                    false
+                }
+                PublisherWakeObservation::Inactive => {
+                    *observation = PublisherWakeObservation::Inactive;
+                    false
+                }
+                PublisherWakeObservation::Failed(error) => {
+                    *observation = PublisherWakeObservation::Failed(error);
+                    false
+                }
+            }
+        };
+        if signal {
+            drop(inner);
+            self.signal(PublisherWakeSignal::Resumed);
+        }
+    }
+
+    fn failed(&self, error: WakeError) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        {
+            let _barrier = inner
+                .wake_barrier_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut observation = inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *observation = PublisherWakeObservation::Failed(error);
+        }
+        drop(inner);
+        self.signal(PublisherWakeSignal::Failed);
+    }
+}
+
+pub(crate) type PreparationCompletion =
+    Result<protocol::BeginAcquisitionResult, protocol::ProtocolError>;
+type PreparationSender = watch::Sender<Option<PreparationCompletion>>;
+
+/// Outcome of reserving one acquisition preparation slot.
+#[derive(Debug)]
+pub(crate) enum PublisherAcquisitionPreparation {
+    /// The caller owns host convergence for this exact reservation.
+    Required(PublisherPreparationPermit),
+    /// Preparation already completed for this principal and attempt.
+    Ready(protocol::BeginAcquisitionResult),
+}
+
+/// Outcome of reserving authority for an exact validated catalog candidate.
+#[derive(Debug)]
+pub(crate) enum PublisherCandidateAcquisitionPreparation {
+    /// The caller owns the candidate's journaled hosts/catalog convergence.
+    Required(Box<PublisherCandidatePreparationPermit>),
+    /// Another exact request already owns convergence; observe its result.
+    Joined(PublisherPreparationWaiter),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PublisherPreparationWaiter {
+    receiver: watch::Receiver<Option<PreparationCompletion>>,
+}
+
+/// Single-use candidate authority fenced by declaration, principal, token,
+/// replacement request, daemon epoch, and suspend-inclusive deadline.
+#[derive(Debug)]
+pub(crate) struct PublisherCandidatePreparationPermit {
+    permit: OperationPermit<CandidatePreparationFence>,
+    waiter: PublisherPreparationWaiter,
+}
+
+impl PublisherCandidatePreparationPermit {
+    #[must_use]
+    pub(crate) fn completion_waiter(&self) -> PublisherPreparationWaiter {
+        self.waiter.clone()
+    }
+
+    /// Whether this exact candidate generation was retired by expiry,
+    /// catalog reconciliation, wake fencing, or shutdown.
+    #[must_use]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.permit.cancellation.is_cancelled()
+    }
+
+    /// Wait until this exact candidate generation is no longer authorized to
+    /// continue cold convergence.
+    pub(crate) async fn cancelled(&mut self) {
+        self.permit.cancellation.cancelled().await;
+    }
+}
+
+/// Single-use authority to complete or fail one acquisition preparation.
+#[derive(Debug)]
+pub(crate) struct PublisherPreparationPermit {
+    permit: OperationPermit<PreparationFence>,
+}
+
+impl PublisherPreparationPermit {
+    /// Whether catalog reconciliation, expiry, wake, or shutdown canceled this
+    /// preparation while the manager was converging hosts.
+    #[must_use]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.permit.cancellation.is_cancelled()
+    }
+
+    /// Wait until this exact preparation is canceled.
+    pub(crate) async fn cancelled(&mut self) {
+        self.permit.cancellation.cancelled().await;
+    }
+}
+
+impl fmt::Debug for PublisherAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublisherAuthority")
+            .field("registry", &"<redacted authority registry>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublisherAuthority {
+    pub(crate) fn new(catalog: &Registry) -> Result<Self, protocol::ProtocolError> {
+        let mut registry = PublicationRegistry::new(Arc::new(SystemPublicationClock));
+        Self::registry_outcome(Self::reconcile_catalog_locked(&mut registry, catalog))?;
+        let (changes, _) = watch::channel(0_u64);
+        let (wake_signals, wake_receiver) = mpsc::unbounded_channel();
+        Ok(Self {
+            inner: Arc::new(PublisherAuthorityInner {
+                registry: Arc::new(Mutex::new(registry)),
+                changes,
+                preparation_waiters: std::sync::Mutex::new(HashMap::new()),
+                wake_activation: std::sync::Mutex::new(()),
+                wake_barrier_gate: std::sync::RwLock::new(()),
+                wake_observation: std::sync::Mutex::new(PublisherWakeObservation::Inactive),
+                wake_signals,
+                wake_receiver: std::sync::Mutex::new(Some(wake_receiver)),
+                deadline_driver_started: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+                #[cfg(test)]
+                wait_ready_capture_hook: std::sync::Mutex::new(None),
+            }),
+        })
+    }
+
+    /// Establish production wake observation before publisher discovery is
+    /// advertised. A registration failure leaves ordinary locald service and
+    /// status behavior available, but the publisher socket must remain
+    /// undiscoverable for this daemon lifetime.
+    pub(crate) fn activate_system_wake_monitor(&self) -> Result<(), protocol::ProtocolError> {
+        self.activate_wake_monitor(&SystemWakeMonitor)
+    }
+
+    fn activate_wake_monitor(
+        &self,
+        monitor: &dyn WakeMonitor,
+    ) -> Result<(), protocol::ProtocolError> {
+        self.ensure_active()?;
+        let _activation = self
+            .inner
+            .wake_activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let mut observation = self
+                .inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*observation {
+                PublisherWakeObservation::Active(_) => return Ok(()),
+                PublisherWakeObservation::Registering { .. }
+                | PublisherWakeObservation::BarrierPending(_) => {
+                    return Err(Self::wake_barrier_pending());
+                }
+                PublisherWakeObservation::Failed(error) => {
+                    return Err(Self::wake_unavailable(error));
+                }
+                PublisherWakeObservation::Inactive => {}
+            }
+            *observation = PublisherWakeObservation::Registering { resumed: false };
+        }
+        let sink = Arc::new(PublisherAuthorityWakeSink {
+            inner: Arc::downgrade(&self.inner),
+        });
+        let registration = match monitor.register(Arc::clone(&sink) as Arc<dyn WakeSink>) {
+            Ok(registration) => registration,
+            Err(error) => {
+                let mut observation = self
+                    .inner
+                    .wake_observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if matches!(&*observation, PublisherWakeObservation::Registering { .. }) {
+                    *observation = PublisherWakeObservation::Inactive;
+                }
+                return Err(match &*observation {
+                    PublisherWakeObservation::Failed(observed) => Self::wake_unavailable(observed),
+                    PublisherWakeObservation::Inactive
+                    | PublisherWakeObservation::Registering { .. }
+                    | PublisherWakeObservation::Active(_)
+                    | PublisherWakeObservation::BarrierPending(_) => Self::wake_unavailable(&error),
+                });
+            }
+        };
+        let mut signal_resume = false;
+        let mut registration = Some(registration);
+        let activation_result = {
+            let mut observation = self
+                .inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*observation {
+                PublisherWakeObservation::Registering { resumed } => {
+                    signal_resume = *resumed;
+                    let registration = registration.take().expect("wake registration present");
+                    *observation = if signal_resume {
+                        PublisherWakeObservation::BarrierPending(registration)
+                    } else {
+                        PublisherWakeObservation::Active(registration)
+                    };
+                    Ok(())
+                }
+                PublisherWakeObservation::Failed(error) => Err(Self::wake_unavailable(error)),
+                PublisherWakeObservation::Inactive
+                | PublisherWakeObservation::Active(_)
+                | PublisherWakeObservation::BarrierPending(_) => Err(Self::internal(
+                    "publisher wake registration changed state unexpectedly",
+                )),
+            }
+        };
+        drop(registration);
+        activation_result?;
+        // Release any registry transition that observed the synchronous
+        // `Registering` fence while the platform monitor was being installed.
+        // A resume edge publishes its own pending-barrier notification.
+        self.notify_change();
+        self.ensure_deadline_driver();
+        if signal_resume {
+            sink.signal(PublisherWakeSignal::Resumed);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.inner.changes.subscribe()
+    }
+
+    pub(crate) async fn protocol_info(
+        &self,
+        publisher_socket: protocol::AbsolutePath,
+    ) -> protocol::PublishedEndpointProtocolInfo {
+        let epoch = self.inner.registry.lock().await.epoch();
+        protocol::PublishedEndpointProtocolInfo::v1(
+            protocol::DaemonEpoch::from_bytes(epoch.0),
+            publisher_socket,
+        )
+    }
+
+    pub(crate) async fn epoch(&self) -> protocol::DaemonEpoch {
+        let epoch = self.inner.registry.lock().await.epoch();
+        protocol::DaemonEpoch::from_bytes(epoch.0)
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        if self.inner.shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut registry = self.inner.registry.lock().await;
+        let wake_barrier = self
+            .inner
+            .wake_barrier_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let registration = {
+            let mut observation = self
+                .inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *observation, PublisherWakeObservation::Inactive)
+        };
+        let effects = registry.shutdown();
+        drop(effects);
+        drop(wake_barrier);
+        drop(registry);
+        drop(registration);
+        self.finish_all_preparations(&Err(Self::inactive_error()));
+        self.notify_change();
+    }
+
+    pub(crate) async fn reconcile_catalog(
+        &self,
+        catalog: &Registry,
+    ) -> Result<(), protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut changes = self.subscribe_changes();
+        loop {
+            let mut registry = self.inner.registry.lock().await;
+            self.ensure_active()?;
+            let Some(wake_barrier) = self.try_enter_registry_transition() else {
+                drop(registry);
+                changes
+                    .changed()
+                    .await
+                    .map_err(|_| Self::inactive_error())?;
+                continue;
+            };
+            let before = registry.preparation_tokens();
+            let result = self.outcome_with_preparation_error(
+                Self::reconcile_catalog_locked(&mut registry, catalog),
+                &Self::operation_canceled(),
+            );
+            let after = registry.preparation_tokens();
+            drop(registry);
+            drop(wake_barrier);
+            self.finish_removed_preparations(&before, &after, &Self::operation_canceled());
+            self.notify_change();
+            return result;
+        }
+    }
+
+    /// Publish one project's durable availability pause policy into the
+    /// daemon-lifetime endpoint authority.
+    ///
+    /// The manager calls this only while it owns the lifecycle/publication
+    /// serialization boundary. Keeping the policy in the authority as well as
+    /// the durable availability store makes acquisition, renewal, and
+    /// readiness observation agree with ordinary locald lifecycle state.
+    pub(crate) async fn set_project_paused(
+        &self,
+        instance: ProjectInstanceId,
+        paused: bool,
+    ) -> Result<(), protocol::ProtocolError> {
+        let mut changes = self.subscribe_changes();
+        loop {
+            let mut registry = self.inner.registry.lock().await;
+            self.ensure_active()?;
+            let Some(wake_barrier) = self.try_enter_registry_transition() else {
+                drop(registry);
+                changes
+                    .changed()
+                    .await
+                    .map_err(|_| Self::inactive_error())?;
+                continue;
+            };
+            let result = self.outcome(registry.set_paused(instance, paused));
+            drop(registry);
+            drop(wake_barrier);
+            return result;
+        }
+    }
+
+    fn reconcile_catalog_locked(
+        registry: &mut PublicationRegistry,
+        catalog: &Registry,
+    ) -> PublicationOutcome<()> {
+        let mut effects = PublicationEffects::default();
+        let active_instances = catalog.instances.keys().copied().collect::<BTreeSet<_>>();
+        let known_instances = registry
+            .configuration_states
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for instance in known_instances {
+            if !active_instances.contains(&instance) {
+                if let Err(error) = Self::accumulate_registry_outcome(
+                    &mut effects,
+                    registry.retire_instance(instance),
+                ) {
+                    return PublicationOutcome::err(error, effects);
+                }
+            }
+        }
+
+        for (instance, record) in &catalog.instances {
+            if record.configuration_revision == 0 {
+                continue;
+            }
+            let declarations = catalog
+                .published_declarations_for_instance(*instance)
+                .into_iter()
+                .flat_map(|declarations| declarations.values().cloned())
+                .collect::<Vec<_>>();
+            let outcome = if matches!(
+                registry.configuration_states.get(instance),
+                Some(InstanceConfigurationState::Retired(_))
+            ) {
+                registry.reconcile_admitted_reregistration(
+                    *instance,
+                    record.configuration_revision,
+                    declarations,
+                )
+            } else {
+                registry.reconcile_declarations(
+                    *instance,
+                    record.configuration_revision,
+                    declarations,
+                )
+            };
+            if let Err(error) = Self::accumulate_registry_outcome(&mut effects, outcome) {
+                return PublicationOutcome::err(error, effects);
+            }
+            if let Err(error) = Self::accumulate_registry_outcome(
+                &mut effects,
+                registry.set_missing(*instance, record.presence == CatalogPresence::Missing),
+            ) {
+                return PublicationOutcome::err(error, effects);
+            }
+        }
+
+        for (instance, revision) in catalog.retired_configuration_revisions() {
+            if registry.configuration_states.contains_key(&instance) || revision == 0 {
+                continue;
+            }
+            if let Err(error) = Self::accumulate_registry_outcome(
+                &mut effects,
+                registry.reconcile_declarations(instance, revision, []),
+            ) {
+                return PublicationOutcome::err(error, effects);
+            }
+            if let Err(error) =
+                Self::accumulate_registry_outcome(&mut effects, registry.retire_instance(instance))
+            {
+                return PublicationOutcome::err(error, effects);
+            }
+        }
+        PublicationOutcome::ok((), effects)
+    }
+
+    /// Reserve an exact, fully validated catalog candidate before its
+    /// journaled hosts/catalog transition begins. The current published slot
+    /// remains untouched until `reconcile_catalog` commits that candidate.
+    pub(crate) async fn begin_candidate_preparation_deadline(
+        &self,
+    ) -> Result<PublisherPreparationDeadline, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let wake_barrier = self.enter_publisher_transition()?;
+        let deadline = self.outcome(registry.begin_candidate_preparation_deadline())?;
+        drop(registry);
+        drop(wake_barrier);
+        self.notify_change();
+        Ok(deadline)
+    }
+
+    /// Wait for the exact manager-admission deadline to expire or for daemon
+    /// authority to become unusable. The deadline is intentionally not a
+    /// replayable registry slot: the manager's bounded coordinator owns the
+    /// provisional service name until declaration validation succeeds.
+    pub(crate) async fn wait_for_candidate_preparation_deadline(
+        &self,
+        deadline: PublisherPreparationDeadline,
+    ) -> protocol::ProtocolError {
+        self.ensure_deadline_driver();
+        let mut changes = self.subscribe_changes();
+        loop {
+            let remaining = loop {
+                let mut registry = self.inner.registry.lock().await;
+                if let Err(error) = self.ensure_active() {
+                    return error;
+                }
+                let Some(wake_barrier) = self.try_enter_registry_transition() else {
+                    drop(registry);
+                    if changes.changed().await.is_err() {
+                        return Self::inactive_error();
+                    }
+                    continue;
+                };
+                if let Err(error) = self.ensure_wake_trustworthy() {
+                    drop(registry);
+                    drop(wake_barrier);
+                    return error;
+                }
+                let result =
+                    self.outcome(registry.candidate_preparation_deadline_remaining(&deadline));
+                drop(registry);
+                drop(wake_barrier);
+                break match result {
+                    Ok(remaining) => remaining,
+                    Err(error) if error.code() == protocol::StableErrorCode::AttemptExpired => {
+                        return Self::preparation_timed_out();
+                    }
+                    Err(error) if error.code() == protocol::StableErrorCode::AttemptStale => {
+                        return Self::operation_canceled();
+                    }
+                    Err(error) => return error,
+                };
+            };
+            tokio::select! {
+                () = tokio::time::sleep(remaining) => {}
+                change = changes.changed() => {
+                    if change.is_err() {
+                        return Self::inactive_error();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn reserve_candidate_acquisition(
+        &self,
+        admission_deadline: &PublisherPreparationDeadline,
+        declaration: PublishedServiceDeclaration,
+        principal: PublisherPrincipal,
+        replacement: Option<&protocol::AcquisitionAttemptHandle>,
+    ) -> Result<PublisherCandidateAcquisitionPreparation, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let wake_barrier = self.enter_publisher_transition()?;
+        let preparation = match self.outcome(registry.begin_candidate_preparation(
+            admission_deadline,
+            declaration,
+            principal,
+            replacement.cloned(),
+        )) {
+            Ok(preparation) => preparation,
+            Err(error) if error.code() == protocol::StableErrorCode::AttemptExpired => {
+                return Err(Self::preparation_timed_out());
+            }
+            Err(error) => return Err(error),
+        };
+        let result = match preparation {
+            BeginCandidatePreparation::Started(permit) => {
+                let (sender, receiver) = watch::channel(None);
+                let previous = self
+                    .inner
+                    .preparation_waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(permit.fence.token.clone(), sender);
+                if previous.is_some() {
+                    return Err(Self::internal(
+                        "publisher candidate preparation authority unexpectedly collided",
+                    ));
+                }
+                PublisherCandidateAcquisitionPreparation::Required(Box::new(
+                    PublisherCandidatePreparationPermit {
+                        permit,
+                        waiter: PublisherPreparationWaiter { receiver },
+                    },
+                ))
+            }
+            BeginCandidatePreparation::Joined(fence) => {
+                let receiver = self
+                    .inner
+                    .preparation_waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&fence.token)
+                    .map(watch::Sender::subscribe)
+                    .ok_or_else(|| {
+                        Self::internal(
+                            "joined publisher candidate preparation has no completion channel",
+                        )
+                    })?;
+                PublisherCandidateAcquisitionPreparation::Joined(PublisherPreparationWaiter {
+                    receiver,
+                })
+            }
+        };
+        drop(registry);
+        drop(wake_barrier);
+        self.notify_change();
+        Ok(result)
+    }
+
+    pub(crate) async fn complete_candidate_acquisition_preparation(
+        &self,
+        permit: PublisherCandidatePreparationPermit,
+    ) -> Result<protocol::BeginAcquisitionResult, protocol::ProtocolError> {
+        let token = permit.permit.fence.token.clone();
+        let fence = permit.permit.fence;
+        let mut registry = self.inner.registry.lock().await;
+        if let Err(error) = self.ensure_active() {
+            drop(registry);
+            self.finish_preparation(&token, Err(error.clone()));
+            return Err(error);
+        }
+        let wake_barrier = match self.enter_publisher_transition() {
+            Ok(barrier) => barrier,
+            Err(error) => {
+                drop(registry);
+                self.finish_preparation(&token, Err(error.clone()));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.outcome(registry.take_candidate_preparation(&fence)) {
+            let error = if error.code() == protocol::StableErrorCode::AttemptExpired {
+                Self::preparation_timed_out()
+            } else {
+                error
+            };
+            drop(registry);
+            drop(wake_barrier);
+            self.finish_preparation(&token, Err(error.clone()));
+            return Err(error);
+        }
+
+        if let Some(replacement) = &fence.replacement {
+            let current = match registry.acquisition_handle_for_wire(replacement) {
+                Some(current) if current.service == fence.service => current,
+                Some(_) | None => {
+                    let error = Self::error(&PublicationRegistryError::AttemptStale);
+                    drop(registry);
+                    drop(wake_barrier);
+                    self.finish_preparation(&token, Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            if let Err(error) =
+                self.outcome(registry.replace_terminal_acquisition(&current, &fence.principal))
+            {
+                drop(registry);
+                drop(wake_barrier);
+                self.finish_preparation(&token, Err(error.clone()));
+                return Err(error);
+            }
+        }
+
+        let begun = match self
+            .outcome(registry.begin_preparation(&fence.service, fence.principal.clone()))
+        {
+            Ok(begun) => begun,
+            Err(error) => {
+                drop(registry);
+                drop(wake_barrier);
+                self.finish_preparation(&token, Err(error.clone()));
+                return Err(error);
+            }
+        };
+        let result = match begun {
+            BeginPreparation::Started(preparation) => {
+                let handle = match self.outcome(registry.complete_preparation(&preparation.fence)) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        drop(registry);
+                        drop(wake_barrier);
+                        self.finish_preparation(&token, Err(error.clone()));
+                        return Err(error);
+                    }
+                };
+                Self::origin_for(&registry, &handle.service).and_then(|origin| {
+                    Self::begin_acquisition_result(
+                        &handle,
+                        AttemptState::Pending,
+                        &origin,
+                        ACQUISITION_ATTEMPT_TTL,
+                    )
+                })
+            }
+            BeginPreparation::ExistingAttempt {
+                handle,
+                state,
+                origin,
+                expires_in,
+            } => Self::begin_acquisition_result(&handle, state, &origin, expires_in),
+            BeginPreparation::Joined(joined) => {
+                let receiver = self
+                    .inner
+                    .preparation_waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&joined.token)
+                    .map(watch::Sender::subscribe)
+                    .ok_or_else(|| {
+                        Self::internal("joined publisher preparation has no completion channel")
+                    });
+                drop(registry);
+                drop(wake_barrier);
+                let result = match receiver {
+                    Ok(receiver) => self.wait_for_preparation(receiver).await,
+                    Err(error) => Err(error),
+                };
+                self.finish_preparation(&token, result.clone());
+                return result;
+            }
+            BeginPreparation::Terminal { failure, .. } => Err(Self::terminal_error(failure)),
+        };
+        drop(registry);
+        drop(wake_barrier);
+        self.finish_preparation(&token, result.clone());
+        self.notify_change();
+        result
+    }
+
+    pub(crate) async fn fail_candidate_acquisition_preparation(
+        &self,
+        permit: PublisherCandidatePreparationPermit,
+        error: protocol::ProtocolError,
+    ) -> Result<(), protocol::ProtocolError> {
+        let token = permit.permit.fence.token.clone();
+        let mut registry = self.inner.registry.lock().await;
+        let result = match self
+            .ensure_active()
+            .and_then(|()| self.enter_publisher_transition())
+        {
+            Ok(_wake_barrier) => {
+                self.outcome(registry.fail_candidate_preparation(&permit.permit.fence))
+            }
+            Err(registry_error) => Err(registry_error),
+        };
+        drop(registry);
+        let completion = match &result {
+            Ok(()) => error,
+            Err(registry_error) => registry_error.clone(),
+        };
+        self.finish_preparation(&token, Err(completion));
+        self.notify_change();
+        result
+    }
+
+    pub(crate) async fn wait_for_candidate_preparation(
+        &self,
+        waiter: PublisherPreparationWaiter,
+    ) -> PreparationCompletion {
+        self.wait_for_preparation(waiter.receiver).await
+    }
+
+    pub(crate) async fn reserve_acquisition(
+        &self,
+        key: ServiceKey,
+        principal: PublisherPrincipal,
+        replacement: Option<&protocol::AcquisitionAttemptHandle>,
+    ) -> Result<PublisherAcquisitionPreparation, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let wake_barrier = self.enter_publisher_transition()?;
+        let before = registry.preparation_tokens();
+        if let Some(replacement) = replacement {
+            let current = registry
+                .acquisition_handle_for_wire(replacement)
+                .ok_or_else(|| Self::error(&PublicationRegistryError::AttemptStale))?;
+            if current.service != key {
+                return Err(Self::error(&PublicationRegistryError::AttemptStale));
+            }
+            self.outcome(registry.replace_terminal_acquisition(&current, &principal))?;
+        }
+
+        let preparation = self.outcome(registry.begin_preparation(&key, principal.clone()))?;
+        let result = match preparation {
+            BeginPreparation::Started(permit) => {
+                let (sender, _) = watch::channel(None);
+                let previous = self
+                    .inner
+                    .preparation_waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(permit.fence.token.clone(), sender);
+                if previous.is_some() {
+                    return Err(Self::internal(
+                        "publisher preparation authority unexpectedly collided",
+                    ));
+                }
+                PublisherAcquisitionPreparation::Required(PublisherPreparationPermit { permit })
+            }
+            BeginPreparation::Joined(fence) => {
+                let receiver = self
+                    .inner
+                    .preparation_waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&fence.token)
+                    .map(watch::Sender::subscribe)
+                    .ok_or_else(|| {
+                        Self::internal("joined publisher preparation has no completion channel")
+                    })?;
+                let after = registry.preparation_tokens();
+                drop(registry);
+                drop(wake_barrier);
+                self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+                return self
+                    .wait_for_preparation(receiver)
+                    .await
+                    .map(PublisherAcquisitionPreparation::Ready);
+            }
+            BeginPreparation::ExistingAttempt {
+                handle,
+                state,
+                origin,
+                expires_in,
+            } => PublisherAcquisitionPreparation::Ready(Self::begin_acquisition_result(
+                &handle, state, &origin, expires_in,
+            )?),
+            BeginPreparation::Terminal { failure, .. } => {
+                return Err(Self::terminal_error(failure));
+            }
+        };
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        Ok(result)
+    }
+
+    pub(crate) async fn complete_acquisition_preparation(
+        &self,
+        permit: PublisherPreparationPermit,
+    ) -> Result<protocol::BeginAcquisitionResult, protocol::ProtocolError> {
+        let token = permit.permit.fence.token.clone();
+        let mut registry = self.inner.registry.lock().await;
+        if let Err(error) = self.ensure_active() {
+            drop(registry);
+            self.finish_preparation(&token, Err(error.clone()));
+            return Err(error);
+        }
+        let _wake_barrier = match self.enter_publisher_transition() {
+            Ok(barrier) => barrier,
+            Err(error) => {
+                drop(registry);
+                self.finish_preparation(&token, Err(error.clone()));
+                return Err(error);
+            }
+        };
+        let handle = match self.outcome(registry.complete_preparation(&permit.permit.fence)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(registry);
+                self.finish_preparation(&token, Err(error.clone()));
+                return Err(error);
+            }
+        };
+        let result = Self::begin_acquisition_result(
+            &handle,
+            AttemptState::Pending,
+            &Self::origin_for(&registry, &handle.service)?,
+            ACQUISITION_ATTEMPT_TTL,
+        );
+        drop(registry);
+        match result {
+            Ok(result) => {
+                self.finish_preparation(&token, Ok(result.clone()));
+                self.notify_change();
+                Ok(result)
+            }
+            Err(error) => {
+                self.finish_preparation(&token, Err(error.clone()));
+                self.notify_change();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn fail_acquisition_preparation(
+        &self,
+        permit: PublisherPreparationPermit,
+        error: protocol::ProtocolError,
+    ) -> Result<(), protocol::ProtocolError> {
+        let token = permit.permit.fence.token.clone();
+        let mut registry = self.inner.registry.lock().await;
+        if let Err(registry_error) = self.ensure_active() {
+            drop(registry);
+            self.finish_preparation(&token, Err(registry_error.clone()));
+            return Err(registry_error);
+        }
+        let _wake_barrier = match self.enter_publisher_transition() {
+            Ok(barrier) => barrier,
+            Err(registry_error) => {
+                drop(registry);
+                self.finish_preparation(&token, Err(registry_error.clone()));
+                return Err(registry_error);
+            }
+        };
+        let failure = if error.code() == protocol::StableErrorCode::OperationCanceled {
+            TerminalAttemptFailure::OperationCanceled
+        } else {
+            TerminalAttemptFailure::Internal
+        };
+        let failed = self.outcome(registry.fail_preparation(&permit.permit.fence, failure));
+        let result = match failed {
+            Ok(()) => self.outcome(registry.vacate_terminal_preparation(&permit.permit.fence)),
+            Err(registry_error) => Err(registry_error),
+        };
+        drop(registry);
+        let completion = match &result {
+            Ok(()) => error,
+            Err(registry_error) => registry_error.clone(),
+        };
+        self.finish_preparation(&token, Err(completion));
+        self.notify_change();
+        result
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        handle: &protocol::AcquisitionAttemptHandle,
+        principal: &PublisherPrincipal,
+        acknowledged_origin: &protocol::SemanticOrigin,
+        capability: RetainedListenerCapability,
+    ) -> Result<protocol::AcquireResult, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_publisher_transition()?;
+        let before = registry.preparation_tokens();
+        let handle = registry
+            .acquisition_handle_for_wire(handle)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::AttemptStale))?;
+        let origin = SemanticOrigin::parse(acknowledged_origin.as_str())
+            .map_err(|error| Self::internal(error.to_string()))?;
+        let listener = capability.identity().clone();
+        let grant =
+            match self.outcome(registry.begin_acquire(&handle, principal, &origin, &listener))? {
+                BeginAcquire::Started(permit) => {
+                    self.outcome(registry.commit_acquire(&permit.fence, capability))?
+                }
+                BeginAcquire::Replay(grant) => grant,
+                BeginAcquire::Terminal(failure) => return Err(Self::terminal_error(failure)),
+                BeginAcquire::Joined(_) => {
+                    return Err(Self::error(
+                        &PublicationRegistryError::AcquisitionInProgress,
+                    ));
+                }
+            };
+        let state = Self::state_for(&registry, &grant.lease.service)?;
+        let result = protocol::AcquireResult::new(
+            grant.lease.wire(),
+            protocol::BindingRevision::new(grant.binding_revision)
+                .map_err(|error| Self::internal(error.to_string()))?,
+            Self::wire_origin(&grant.origin)?,
+            Self::duration_ms(grant.schedule.renew_after)?,
+            Self::duration_ms(grant.schedule.expires_in)?,
+            Self::wire_publication_state(state),
+        )
+        .map_err(|error| Self::internal(error.to_string()))?;
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        Ok(result)
+    }
+
+    pub(crate) async fn renew(
+        &self,
+        handle: &protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+    ) -> Result<protocol::RenewResult, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_publisher_transition()?;
+        let before = registry.preparation_tokens();
+        let handle = registry
+            .lease_handle_for_wire(handle)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::LeaseLost))?;
+        let grant = self.outcome(registry.renew(&handle, principal))?;
+        let state = Self::state_for(&registry, &grant.lease.service)?;
+        let result = protocol::RenewResult::new(
+            protocol::BindingRevision::new(grant.binding_revision)
+                .map_err(|error| Self::internal(error.to_string()))?,
+            Self::duration_ms(grant.schedule.renew_after)?,
+            Self::duration_ms(grant.schedule.expires_in)?,
+            Self::wire_publication_state(state),
+        )
+        .map_err(|error| Self::internal(error.to_string()))?;
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        Ok(result)
+    }
+
+    pub(crate) async fn begin_rebind(
+        &self,
+        lease: &protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+        expected_binding_revision: protocol::BindingRevision,
+        replacement: Option<&protocol::RebindAttemptHandle>,
+    ) -> Result<protocol::BeginRebindResult, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_publisher_transition()?;
+        let before = registry.preparation_tokens();
+        let lease = registry
+            .lease_handle_for_wire(lease)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::LeaseLost))?;
+        if let Some(replacement) = replacement {
+            let current = registry
+                .rebind_handle_for_wire(replacement)
+                .ok_or_else(|| Self::error(&PublicationRegistryError::AttemptStale))?;
+            self.outcome(registry.replace_terminal_rebind(
+                &lease,
+                principal,
+                &current,
+                expected_binding_revision.get(),
+            ))?;
+        }
+        let begin = self.outcome(registry.begin_rebind(
+            &lease,
+            principal,
+            expected_binding_revision.get(),
+        ))?;
+        let (handle, state, origin, expires_in) = match begin {
+            BeginRebind::Started {
+                handle,
+                origin,
+                expires_in,
+            } => (handle, AttemptState::Pending, origin, expires_in),
+            BeginRebind::Existing {
+                handle,
+                state,
+                origin,
+                expires_in,
+            } => (handle, state, origin, expires_in),
+        };
+        let result = protocol::BeginRebindResult::new(
+            handle.wire(),
+            Self::wire_origin(&origin)?,
+            Self::duration_ms(expires_in)?,
+            Self::wire_attempt_state(state),
+        )
+        .map_err(|error| Self::internal(error.to_string()))?;
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        Ok(result)
+    }
+
+    pub(crate) async fn rebind(
+        &self,
+        handle: &protocol::RebindAttemptHandle,
+        principal: &PublisherPrincipal,
+        acknowledged_origin: &protocol::SemanticOrigin,
+        capability: RetainedListenerCapability,
+    ) -> Result<protocol::RebindResult, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_publisher_transition()?;
+        let before = registry.preparation_tokens();
+        let handle = registry
+            .rebind_handle_for_wire(handle)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::AttemptStale))?;
+        let origin = SemanticOrigin::parse(acknowledged_origin.as_str())
+            .map_err(|error| Self::internal(error.to_string()))?;
+        let listener = capability.identity().clone();
+        let grant = match self
+            .outcome(registry.begin_rebind_candidate(&handle, principal, &origin, &listener))?
+        {
+            BeginRebindCandidate::Started(permit) => {
+                self.outcome(registry.commit_rebind(&permit.fence, capability))?
+            }
+            BeginRebindCandidate::Replay(grant) => grant,
+            BeginRebindCandidate::Terminal(failure) => return Err(Self::terminal_error(failure)),
+            BeginRebindCandidate::Joined(_) => {
+                return Err(Self::error(&PublicationRegistryError::RebindInProgress));
+            }
+        };
+        let state = Self::state_for(&registry, &grant.lease.service)?;
+        let result = protocol::RebindResult::new(
+            grant.lease.wire(),
+            protocol::BindingRevision::new(grant.binding_revision)
+                .map_err(|error| Self::internal(error.to_string()))?,
+            Self::wire_origin(&grant.origin)?,
+            Self::duration_ms(grant.schedule.renew_after)?,
+            Self::duration_ms(grant.schedule.expires_in)?,
+            Self::wire_publication_state(state),
+        )
+        .map_err(|error| Self::internal(error.to_string()))?;
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        Ok(result)
+    }
+
+    pub(crate) async fn wait_ready(
+        &self,
+        handle: &protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+        expected_binding_revision: protocol::BindingRevision,
+    ) -> Result<protocol::WaitReadyResult, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let (handle, wait_fence) = {
+            let mut registry = self.inner.registry.lock().await;
+            self.ensure_active()?;
+            let _wake_barrier = self.enter_publisher_transition()?;
+            let handle = registry
+                .lease_handle_for_wire(handle)
+                .ok_or_else(|| Self::error(&PublicationRegistryError::LeaseLost))?;
+            let wait_fence = self.outcome(registry.begin_wait_ready(
+                &handle,
+                principal,
+                expected_binding_revision.get(),
+            ))?;
+            (handle, wait_fence)
+        };
+        #[cfg(test)]
+        self.wait_at_wait_ready_capture_hook().await;
+        let mut changes = self.subscribe_changes();
+        loop {
+            let (projection, wait_remaining) = {
+                let mut registry = self.inner.registry.lock().await;
+                self.ensure_active()?;
+                let _wake_barrier = self.enter_publisher_transition()?;
+                self.outcome(registry.wait_projection(
+                    &handle,
+                    principal,
+                    expected_binding_revision.get(),
+                    &wait_fence,
+                ))?
+            };
+            match projection.state {
+                PublicationState::Ready => {
+                    return Ok(protocol::WaitReadyResult {
+                        binding_revision: expected_binding_revision,
+                        origin: Self::wire_origin(&projection.origin)?,
+                        publication_state: protocol::ReadyState::Ready,
+                    });
+                }
+                PublicationState::RoutePaused => {
+                    return Err(protocol::ProtocolError::new(
+                        protocol::StableErrorCode::ProjectPaused,
+                        "the project route is paused; resume the project before waiting again",
+                        Some("run `locald up` to resume this project".to_owned()),
+                    ));
+                }
+                PublicationState::WaitingForPublisher | PublicationState::InstanceMissing => {
+                    return Err(Self::error(&PublicationRegistryError::LeaseLost));
+                }
+                PublicationState::CheckingEndpoint | PublicationState::EndpointUnhealthy => {}
+            }
+            match tokio::time::timeout(wait_remaining, changes.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(Self::operation_canceled()),
+                Err(_) => {
+                    return Err(protocol::ProtocolError::new(
+                        protocol::StableErrorCode::WaitTimedOut,
+                        "the exact binding did not become routable before the readiness deadline",
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_wait_ready_capture_hook(&self, hook: WaitReadyCaptureHook) {
+        *self
+            .inner
+            .wait_ready_capture_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_wait_ready_capture_hook(&self) {
+        let hook = self
+            .inner
+            .wait_ready_capture_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    pub(crate) async fn release(
+        &self,
+        handle: &protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+    ) -> Result<protocol::ReleaseResult, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_publisher_transition()?;
+        let before = registry.preparation_tokens();
+        let handle = registry
+            .lease_handle_for_wire(handle)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::LeaseLost))?;
+        self.outcome(registry.release(&handle, principal))?;
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        Ok(protocol::ReleaseResult::released())
+    }
+
+    pub(crate) async fn projection(
+        &self,
+        key: &ServiceKey,
+    ) -> Result<Option<(PublicationState, SemanticOrigin)>, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_registry_transition()?;
+        let before = registry.preparation_tokens();
+        let projection = self.outcome(registry.snapshot(key))?;
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        Ok(projection.map(|projection| (projection.state, projection.origin)))
+    }
+
+    pub(crate) async fn sweep_deadlines(&self) -> Result<(), protocol::ProtocolError> {
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_registry_transition()?;
+        let before = registry.preparation_tokens();
+        let result = self.outcome_with_preparation_error(
+            registry.sweep_deadlines(),
+            &Self::preparation_timed_out(),
+        );
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
+        self.notify_change();
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn timeout_candidate_preparation_for_test(
+        &self,
+        key: &ServiceKey,
+    ) -> Result<bool, protocol::ProtocolError> {
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_registry_transition()?;
+        let timed_out = self.outcome(registry.timeout_candidate_preparation(key))?;
+        drop(registry);
+        self.notify_change();
+        Ok(timed_out)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeout_candidate_preparation_deadline_for_test(
+        &self,
+        deadline: &PublisherPreparationDeadline,
+    ) {
+        deadline.forced_expired.store(true, Ordering::Release);
+        self.notify_change();
+    }
+
+    fn notify_change(&self) {
+        self.inner.changes.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+
+    fn ensure_active(&self) -> Result<(), protocol::ProtocolError> {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            Err(Self::inactive_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_wake_trustworthy(&self) -> Result<(), protocol::ProtocolError> {
+        let observation = self
+            .inner
+            .wake_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*observation {
+            PublisherWakeObservation::Failed(error) => Err(Self::wake_unavailable(error)),
+            PublisherWakeObservation::Registering { .. }
+            | PublisherWakeObservation::BarrierPending(_) => Err(Self::wake_barrier_pending()),
+            PublisherWakeObservation::Inactive | PublisherWakeObservation::Active(_) => Ok(()),
+        }
+    }
+
+    fn enter_publisher_transition(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, ()>, protocol::ProtocolError> {
+        let barrier = self
+            .inner
+            .wake_barrier_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_wake_trustworthy()?;
+        Ok(barrier)
+    }
+
+    fn enter_registry_transition(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, ()>, protocol::ProtocolError> {
+        self.try_enter_registry_transition()
+            .ok_or_else(Self::wake_barrier_pending)
+    }
+
+    fn try_enter_registry_transition(&self) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+        let barrier = self
+            .inner
+            .wake_barrier_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observation = self
+            .inner
+            .wake_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            &*observation,
+            PublisherWakeObservation::Registering { .. }
+                | PublisherWakeObservation::BarrierPending(_)
+        ) {
+            return None;
+        }
+        drop(observation);
+        Some(barrier)
+    }
+
+    fn ensure_deadline_driver(&self) {
+        if self
+            .inner
+            .deadline_driver_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(wake_signals) = self
+            .inner
+            .wake_receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            self.inner
+                .deadline_driver_started
+                .store(false, Ordering::Release);
+            return;
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let changes = self.subscribe_changes();
+        tokio::spawn(Self::deadline_driver(weak, changes, wake_signals));
+    }
+
+    async fn deadline_driver(
+        weak: Weak<PublisherAuthorityInner>,
+        mut changes: watch::Receiver<u64>,
+        mut wake_signals: mpsc::UnboundedReceiver<PublisherWakeSignal>,
+    ) {
+        loop {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let authority = Self { inner };
+            let deadline = authority.next_deadline().await;
+            drop(authority);
+            match deadline {
+                Ok(None) => {
+                    tokio::select! {
+                        signal = wake_signals.recv() => {
+                            if !Self::handle_wake_signal(&weak, signal).await {
+                                return;
+                            }
+                        }
+                        change_notification = changes.changed() => {
+                            if change_notification.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(duration)) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(duration) => {
+                            let Some(inner) = weak.upgrade() else {
+                                return;
+                            };
+                            let authority = Self { inner };
+                            let _ = authority.sweep_deadlines().await;
+                        }
+                        change_notification = changes.changed() => {
+                            if change_notification.is_err() {
+                                return;
+                            }
+                        }
+                        signal = wake_signals.recv() => {
+                            if !Self::handle_wake_signal(&weak, signal).await {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        change_notification = changes.changed() => {
+                            if change_notification.is_err() {
+                                return;
+                            }
+                        }
+                        signal = wake_signals.recv() => {
+                            if !Self::handle_wake_signal(&weak, signal).await {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_wake_signal(
+        weak: &Weak<PublisherAuthorityInner>,
+        signal: Option<PublisherWakeSignal>,
+    ) -> bool {
+        let Some(signal) = signal else {
+            return false;
+        };
+        let Some(inner) = weak.upgrade() else {
+            return false;
+        };
+        let authority = Self { inner };
+        let trustworthy = matches!(signal, PublisherWakeSignal::Resumed);
+        let result = authority.apply_wake_barrier(trustworthy).await;
+        !matches!(signal, PublisherWakeSignal::Failed) && result.is_ok()
+    }
+
+    async fn apply_wake_barrier(&self, trustworthy: bool) -> Result<(), protocol::ProtocolError> {
+        let mut registry = self.inner.registry.lock().await;
+        let wake_barrier = self
+            .inner
+            .wake_barrier_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_active()?;
+        let effective_trustworthy = trustworthy
+            && matches!(
+                &*self
+                    .inner
+                    .wake_observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                PublisherWakeObservation::BarrierPending(_)
+            );
+        let before = registry.preparation_tokens();
+        let result = self.outcome_with_preparation_error(
+            registry.wake_barrier(effective_trustworthy),
+            &Self::operation_canceled(),
+        );
+        let after = registry.preparation_tokens();
+        let mut retired_registration = None;
+        if effective_trustworthy {
+            let mut observation = self
+                .inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::mem::replace(&mut *observation, PublisherWakeObservation::Inactive);
+            match (previous, result.is_ok()) {
+                (PublisherWakeObservation::BarrierPending(registration), true) => {
+                    *observation = PublisherWakeObservation::Active(registration);
+                }
+                (PublisherWakeObservation::BarrierPending(registration), false) => {
+                    retired_registration = Some(registration);
+                    *observation = PublisherWakeObservation::Failed(WakeError::Failed(
+                        "the suspend-inclusive server clock failed during resume".to_owned(),
+                    ));
+                }
+                (other, _) => *observation = other,
+            }
+        }
+        drop(registry);
+        drop(wake_barrier);
+        drop(retired_registration);
+        self.finish_removed_preparations(&before, &after, &Self::operation_canceled());
+        // The synchronous wake callback already nudged observers so an exact
+        // wait can enforce its suspend-clock deadline even if it wins the
+        // registry race. This second edge publishes the completed barrier.
+        self.notify_change();
+        result
+    }
+
+    async fn next_deadline(&self) -> Result<Option<Duration>, protocol::ProtocolError> {
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_registry_transition()?;
+        let before = registry.preparation_tokens();
+        let result = self.outcome(registry.next_deadline());
+        let after = registry.preparation_tokens();
+        drop(registry);
+        self.finish_removed_preparations(&before, &after, &Self::operation_canceled());
+        result
+    }
+
+    async fn wait_for_preparation(
+        &self,
+        mut receiver: watch::Receiver<Option<PreparationCompletion>>,
+    ) -> PreparationCompletion {
+        loop {
+            let completion = receiver.borrow().clone();
+            if let Some(result) = completion {
+                return result;
+            }
+            if receiver.changed().await.is_err() {
+                return Err(Self::operation_canceled());
+            }
+        }
+    }
+
+    fn finish_preparation(&self, token: &AuthorityToken, completion: PreparationCompletion) {
+        let sender = self
+            .inner
+            .preparation_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(token);
+        if let Some(sender) = sender {
+            sender.send_replace(Some(completion));
+        }
+    }
+
+    fn finish_removed_preparations(
+        &self,
+        before: &BTreeSet<AuthorityToken>,
+        after: &BTreeSet<AuthorityToken>,
+        error: &protocol::ProtocolError,
+    ) {
+        for token in before.difference(after) {
+            self.finish_preparation(token, Err(error.clone()));
+        }
+    }
+
+    fn finish_all_preparations(&self, completion: &PreparationCompletion) {
+        let senders = self
+            .inner
+            .preparation_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, sender)| sender)
+            .collect::<Vec<_>>();
+        for sender in senders {
+            sender.send_replace(Some(completion.clone()));
+        }
+    }
+
+    fn begin_acquisition_result(
+        handle: &AcquisitionAttemptHandle,
+        state: AttemptState,
+        origin: &SemanticOrigin,
+        expires_in: Duration,
+    ) -> Result<protocol::BeginAcquisitionResult, protocol::ProtocolError> {
+        protocol::BeginAcquisitionResult::new(
+            handle.wire(),
+            protocol::ProjectInstanceId::parse(&handle.service.instance().to_string())
+                .map_err(|error| Self::internal(error.to_string()))?,
+            Self::wire_origin(origin)?,
+            Self::duration_ms(expires_in)?,
+            Self::wire_attempt_state(state),
+        )
+        .map_err(|error| Self::internal(error.to_string()))
+    }
+
+    fn origin_for(
+        registry: &PublicationRegistry,
+        key: &ServiceKey,
+    ) -> Result<SemanticOrigin, protocol::ProtocolError> {
+        registry
+            .projection(key)
+            .map(|projection| projection.origin)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::ServiceNotDeclared))
+    }
+
+    fn state_for(
+        registry: &PublicationRegistry,
+        key: &ServiceKey,
+    ) -> Result<PublicationState, protocol::ProtocolError> {
+        registry
+            .projection(key)
+            .map(|projection| projection.state)
+            .ok_or_else(|| Self::error(&PublicationRegistryError::LeaseLost))
+    }
+
+    fn duration_ms(duration: Duration) -> Result<u64, protocol::ProtocolError> {
+        let milliseconds = duration.as_nanos().div_ceil(1_000_000);
+        u64::try_from(milliseconds)
+            .map_err(|_| Self::internal("publication duration exceeds the wire range"))
+    }
+
+    fn wire_origin(
+        origin: &SemanticOrigin,
+    ) -> Result<protocol::SemanticOrigin, protocol::ProtocolError> {
+        protocol::SemanticOrigin::parse(origin.as_str())
+            .map_err(|error| Self::internal(error.to_string()))
+    }
+
+    const fn wire_attempt_state(state: AttemptState) -> protocol::AttemptState {
+        match state {
+            AttemptState::Pending => protocol::AttemptState::Pending,
+            AttemptState::InFlight => protocol::AttemptState::InFlight,
+            AttemptState::Terminal => protocol::AttemptState::Terminal,
+        }
+    }
+
+    const fn wire_publication_state(state: PublicationState) -> protocol::PublicationState {
+        match state {
+            PublicationState::WaitingForPublisher => {
+                protocol::PublicationState::WaitingForPublisher
+            }
+            PublicationState::CheckingEndpoint => protocol::PublicationState::CheckingEndpoint,
+            PublicationState::EndpointUnhealthy => protocol::PublicationState::EndpointUnhealthy,
+            PublicationState::Ready => protocol::PublicationState::Ready,
+            PublicationState::RoutePaused => protocol::PublicationState::RoutePaused,
+            PublicationState::InstanceMissing => protocol::PublicationState::InstanceMissing,
+        }
+    }
+
+    fn outcome<T>(&self, outcome: PublicationOutcome<T>) -> Result<T, protocol::ProtocolError> {
+        self.outcome_with_preparation_error(outcome, &Self::operation_canceled())
+    }
+
+    fn outcome_with_preparation_error<T>(
+        &self,
+        outcome: PublicationOutcome<T>,
+        preparation_error: &protocol::ProtocolError,
+    ) -> Result<T, protocol::ProtocolError> {
+        let PublicationOutcome { result, effects } = outcome;
+        let changed = effects.has_changes();
+        let retired_preparations = effects.retired_preparations.clone();
+        let timed_out_preparations = effects.timed_out_preparations.clone();
+        let result = result.map_err(|error| Self::error(&error));
+        drop(effects);
+        for token in retired_preparations {
+            self.finish_preparation(&token, Err(preparation_error.clone()));
+        }
+        for token in timed_out_preparations {
+            self.finish_preparation(&token, Err(Self::preparation_timed_out()));
+        }
+        if changed {
+            self.notify_change();
+        }
+        result
+    }
+
+    fn registry_outcome<T>(outcome: PublicationOutcome<T>) -> Result<T, protocol::ProtocolError> {
+        outcome.result.map_err(|error| Self::error(&error))
+    }
+
+    fn accumulate_registry_outcome<T>(
+        effects: &mut PublicationEffects,
+        outcome: PublicationOutcome<T>,
+    ) -> Result<T, PublicationRegistryError> {
+        let PublicationOutcome {
+            result,
+            effects: outcome_effects,
+        } = outcome;
+        effects.merge(outcome_effects);
+        result
+    }
+
+    fn terminal_error(failure: TerminalAttemptFailure) -> protocol::ProtocolError {
+        match failure {
+            TerminalAttemptFailure::EndpointUnhealthy => protocol::ProtocolError::new(
+                protocol::StableErrorCode::EndpointUnhealthy,
+                "the candidate endpoint did not satisfy its health policy",
+                None,
+            ),
+            TerminalAttemptFailure::OperationCanceled => protocol::ProtocolError::new(
+                protocol::StableErrorCode::OperationCanceled,
+                "the publication operation was canceled",
+                None,
+            ),
+            TerminalAttemptFailure::Internal => Self::internal("publication operation failed"),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> protocol::ProtocolError {
+        protocol::ProtocolError::new(protocol::StableErrorCode::Internal, message, None)
+    }
+
+    fn preparation_timed_out() -> protocol::ProtocolError {
+        protocol::ProtocolError::new(
+            protocol::StableErrorCode::PreparationTimedOut,
+            "publisher preparation did not finish before its deadline",
+            None,
+        )
+    }
+
+    fn operation_canceled() -> protocol::ProtocolError {
+        protocol::ProtocolError::new(
+            protocol::StableErrorCode::OperationCanceled,
+            "publisher preparation was canceled",
+            None,
+        )
+    }
+
+    fn inactive_error() -> protocol::ProtocolError {
+        protocol::ProtocolError::new(
+            protocol::StableErrorCode::OperationCanceled,
+            "the publisher authority is shutting down",
+            None,
+        )
+    }
+
+    fn wake_unavailable(error: &WakeError) -> protocol::ProtocolError {
+        protocol::ProtocolError::new(
+            protocol::StableErrorCode::Internal,
+            format!("published endpoint wake safety is unavailable: {error}"),
+            Some("restart locald before publishing this endpoint again".to_owned()),
+        )
+    }
+
+    fn wake_barrier_pending() -> protocol::ProtocolError {
+        protocol::ProtocolError::new(
+            protocol::StableErrorCode::OperationCanceled,
+            "the publisher wake barrier is still being applied",
+            None,
+        )
+    }
+
+    fn error(error: &PublicationRegistryError) -> protocol::ProtocolError {
+        let code = match error {
+            PublicationRegistryError::ServiceNotDeclared => {
+                protocol::StableErrorCode::ServiceNotPublished
+            }
+            PublicationRegistryError::InstanceMissing => protocol::StableErrorCode::ProjectNotFound,
+            PublicationRegistryError::AlreadyPublished => {
+                protocol::StableErrorCode::AlreadyPublished
+            }
+            PublicationRegistryError::AcquisitionInProgress => {
+                protocol::StableErrorCode::AcquisitionInProgress
+            }
+            PublicationRegistryError::RebindInProgress => {
+                protocol::StableErrorCode::RebindInProgress
+            }
+            PublicationRegistryError::AttemptStale => protocol::StableErrorCode::AttemptStale,
+            PublicationRegistryError::AttemptExpired => protocol::StableErrorCode::AttemptExpired,
+            PublicationRegistryError::AttemptMismatch => protocol::StableErrorCode::AttemptMismatch,
+            PublicationRegistryError::LeaseLost => protocol::StableErrorCode::LeaseLost,
+            PublicationRegistryError::BindingReplaced => protocol::StableErrorCode::BindingReplaced,
+            PublicationRegistryError::OriginMismatch => protocol::StableErrorCode::OriginMismatch,
+            PublicationRegistryError::ClockUnavailable
+            | PublicationRegistryError::ClockRegressed
+            | PublicationRegistryError::ClockOverflow
+            | PublicationRegistryError::DeclarationConflict
+            | PublicationRegistryError::GenerationOverflow
+            | PublicationRegistryError::DeadlineNotElapsed => protocol::StableErrorCode::Internal,
+            PublicationRegistryError::WaitDeadlineElapsed => {
+                protocol::StableErrorCode::WaitTimedOut
+            }
+        };
+        protocol::ProtocolError::new(code, error.to_string(), None)
     }
 }
 
@@ -2240,6 +4784,55 @@ mod tests {
     impl Drop for DropCounter {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeWakeMonitor {
+        sink: StdMutex<Option<Arc<dyn WakeSink>>>,
+        registration_error: StdMutex<Option<WakeError>>,
+    }
+
+    impl FakeWakeMonitor {
+        fn resume(&self) {
+            self.sink
+                .lock()
+                .expect("fake wake sink lock")
+                .clone()
+                .expect("registered wake sink")
+                .resumed();
+        }
+
+        fn fail(&self, error: WakeError) {
+            self.sink
+                .lock()
+                .expect("fake wake sink lock")
+                .clone()
+                .expect("registered wake sink")
+                .failed(error);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeWakeRegistration;
+
+    impl WakeRegistration for FakeWakeRegistration {}
+
+    impl WakeMonitor for FakeWakeMonitor {
+        fn register(
+            &self,
+            sink: Arc<dyn WakeSink>,
+        ) -> Result<Box<dyn WakeRegistration>, WakeError> {
+            if let Some(error) = self
+                .registration_error
+                .lock()
+                .expect("fake wake registration error lock")
+                .clone()
+            {
+                return Err(error);
+            }
+            *self.sink.lock().expect("fake wake sink lock") = Some(sink);
+            Ok(Box::new(FakeWakeRegistration))
         }
     }
 
@@ -2296,6 +4889,26 @@ mod tests {
         (registry, clock, key)
     }
 
+    fn authority(registry: PublicationRegistry) -> PublisherAuthority {
+        let (changes, _) = watch::channel(0_u64);
+        let (wake_signals, wake_receiver) = mpsc::unbounded_channel();
+        PublisherAuthority {
+            inner: Arc::new(PublisherAuthorityInner {
+                registry: Arc::new(Mutex::new(registry)),
+                changes,
+                preparation_waiters: std::sync::Mutex::new(HashMap::new()),
+                wake_activation: std::sync::Mutex::new(()),
+                wake_barrier_gate: std::sync::RwLock::new(()),
+                wake_observation: std::sync::Mutex::new(PublisherWakeObservation::Inactive),
+                wake_signals,
+                wake_receiver: std::sync::Mutex::new(Some(wake_receiver)),
+                deadline_driver_started: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+                wait_ready_capture_hook: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
     fn begin_attempt(
         registry: &mut PublicationRegistry,
         key: &ServiceKey,
@@ -2350,6 +4963,628 @@ mod tests {
             .result
             .expect("commit acquisition");
         (attempt, grant)
+    }
+
+    #[test]
+    fn positive_wire_durations_never_collapse_to_zero() {
+        assert_eq!(
+            PublisherAuthority::duration_ms(Duration::from_nanos(1)).expect("positive duration"),
+            1
+        );
+        assert_eq!(
+            PublisherAuthority::duration_ms(Duration::from_micros(1_001))
+                .expect("fractional millisecond duration"),
+            2
+        );
+        assert_eq!(
+            PublisherAuthority::duration_ms(Duration::ZERO).expect("zero duration"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_preparation_join_waits_for_the_owner_completion() {
+        let declaration = declaration(instance(22), 1, "twenty-two.localhost");
+        let (registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let owner = principal(1);
+
+        let PublisherAcquisitionPreparation::Required(owner_permit) = authority
+            .reserve_acquisition(key.clone(), owner.clone(), None)
+            .await
+            .expect("reserve owner preparation")
+        else {
+            panic!("expected preparation owner");
+        };
+
+        let joined_authority = authority.clone();
+        let joined_key = key.clone();
+        let joined_owner = owner.clone();
+        let joined = tokio::spawn(async move {
+            joined_authority
+                .reserve_acquisition(joined_key, joined_owner, None)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!joined.is_finished());
+
+        let completed = authority
+            .complete_acquisition_preparation(owner_permit)
+            .await
+            .expect("complete owner preparation");
+        let PublisherAcquisitionPreparation::Ready(joined_result) = joined
+            .await
+            .expect("joined task")
+            .expect("joined preparation")
+        else {
+            panic!("joined caller must observe the owner's result");
+        };
+        assert_eq!(
+            joined_result.acquisition_attempt_handle(),
+            completed.acquisition_attempt_handle()
+        );
+    }
+
+    #[test]
+    fn candidate_preparation_survives_only_its_exact_catalog_candidate() {
+        let initial = declaration(instance(24), 1, "twenty-four.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, initial);
+        let candidate = declaration(instance(24), 2, "next-twenty-four.localhost");
+        let owner = principal(1);
+        let deadline = registry
+            .begin_candidate_preparation_deadline()
+            .result
+            .expect("start manager admission deadline");
+        let BeginCandidatePreparation::Started(permit) = registry
+            .begin_candidate_preparation(&deadline, candidate.clone(), owner.clone(), None)
+            .result
+            .expect("reserve exact candidate")
+        else {
+            panic!("expected candidate preparation owner");
+        };
+
+        let BeginCandidatePreparation::Joined(joined) = registry
+            .begin_candidate_preparation(&deadline, candidate.clone(), owner, None)
+            .result
+            .expect("join exact candidate")
+        else {
+            panic!("expected exact candidate join");
+        };
+        assert_eq!(joined, permit.fence);
+        assert_eq!(
+            registry
+                .begin_candidate_preparation(&deadline, candidate.clone(), principal(2), None)
+                .result
+                .expect_err("competing principal must fail promptly"),
+            PublicationRegistryError::AcquisitionInProgress
+        );
+
+        registry
+            .reconcile_declarations(key.instance(), 2, [candidate])
+            .result
+            .expect("publish exact candidate");
+        assert!(!permit.cancellation.is_cancelled());
+        registry
+            .take_candidate_preparation(&permit.fence)
+            .result
+            .expect("exact candidate permit remains current");
+    }
+
+    #[test]
+    fn changed_catalog_candidate_cancels_and_fences_stale_preparation() {
+        let initial = declaration(instance(25), 1, "twenty-five.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, initial);
+        let stale_candidate = declaration(instance(25), 2, "stale-twenty-five.localhost");
+        let actual_candidate = declaration(instance(25), 2, "actual-twenty-five.localhost");
+        let deadline = registry
+            .begin_candidate_preparation_deadline()
+            .result
+            .expect("start manager admission deadline");
+        let BeginCandidatePreparation::Started(stale) = registry
+            .begin_candidate_preparation(&deadline, stale_candidate, principal(1), None)
+            .result
+            .expect("reserve stale candidate")
+        else {
+            panic!("expected candidate preparation owner");
+        };
+
+        registry
+            .reconcile_declarations(key.instance(), 2, [actual_candidate])
+            .result
+            .expect("publish changed candidate");
+        assert!(stale.cancellation.is_cancelled());
+        assert_eq!(
+            registry
+                .take_candidate_preparation(&stale.fence)
+                .result
+                .expect_err("changed candidate fences stale permit"),
+            PublicationRegistryError::AttemptStale
+        );
+    }
+
+    #[test]
+    fn candidate_preparation_carries_manager_deadline_and_fences_late_work() {
+        let initial = declaration(instance(26), 1, "twenty-six.localhost");
+        let (mut registry, clock, _key) = registry(Duration::ZERO, initial);
+        let candidate = declaration(instance(26), 2, "next-twenty-six.localhost");
+        let deadline = registry
+            .begin_candidate_preparation_deadline()
+            .result
+            .expect("start manager admission deadline");
+        clock.advance(Duration::from_secs(45));
+        let BeginCandidatePreparation::Started(permit) = registry
+            .begin_candidate_preparation(&deadline, candidate.clone(), principal(1), None)
+            .result
+            .expect("reserve candidate")
+        else {
+            panic!("expected candidate preparation owner");
+        };
+        assert_eq!(permit.fence.deadline, deadline.deadline);
+
+        clock.advance(Duration::from_secs(15));
+        let effects = registry.sweep_deadlines().effects;
+        assert!(permit.cancellation.is_cancelled());
+        assert!(effects.timed_out_preparations.contains(&permit.fence.token));
+        assert_eq!(
+            registry
+                .take_candidate_preparation(&permit.fence)
+                .result
+                .expect_err("elapsed permit cannot issue an attempt"),
+            PublicationRegistryError::AttemptStale
+        );
+        assert_eq!(
+            registry
+                .begin_candidate_preparation(&deadline, candidate, principal(1), None)
+                .result
+                .expect_err("late worker cannot restart the admission clock"),
+            PublicationRegistryError::AttemptExpired
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_waiter_reports_suspend_inclusive_timeout_promptly() {
+        let initial = declaration(instance(27), 1, "twenty-seven.localhost");
+        let (registry, clock, _key) = registry(Duration::ZERO, initial);
+        let authority = authority(registry);
+        let candidate = declaration(instance(27), 2, "next-twenty-seven.localhost");
+        let deadline = authority
+            .begin_candidate_preparation_deadline()
+            .await
+            .expect("start manager admission deadline");
+        let PublisherCandidateAcquisitionPreparation::Required(permit) = authority
+            .reserve_candidate_acquisition(&deadline, candidate, principal(1), None)
+            .await
+            .expect("reserve candidate")
+        else {
+            panic!("expected candidate preparation owner");
+        };
+        let waiter = permit.completion_waiter();
+
+        clock.advance(PREPARATION_TTL);
+        authority
+            .sweep_deadlines()
+            .await
+            .expect("sweep candidate deadline");
+        assert_eq!(
+            authority
+                .wait_for_candidate_preparation(waiter)
+                .await
+                .expect_err("candidate waiter observes timeout")
+                .code(),
+            protocol::StableErrorCode::PreparationTimedOut
+        );
+        assert_eq!(
+            authority
+                .complete_candidate_acquisition_preparation(*permit)
+                .await
+                .expect_err("timed-out permit cannot issue an attempt")
+                .code(),
+            protocol::StableErrorCode::AttemptStale
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_admission_deadline_waiter_uses_fake_clock_and_shutdown_fails_closed() {
+        let initial = declaration(instance(28), 1, "twenty-eight.localhost");
+        let (registry, clock, _key) = registry(Duration::ZERO, initial);
+        let authority = authority(registry);
+        let deadline = authority
+            .begin_candidate_preparation_deadline()
+            .await
+            .expect("start manager admission deadline");
+        let waiting_authority = authority.clone();
+        let timeout = tokio::spawn(async move {
+            waiting_authority
+                .wait_for_candidate_preparation_deadline(deadline)
+                .await
+        });
+        tokio::task::yield_now().await;
+        clock.advance(PREPARATION_TTL);
+        authority
+            .sweep_deadlines()
+            .await
+            .expect("publish fake-clock advancement");
+        assert_eq!(
+            timeout.await.expect("join deadline waiter").code(),
+            protocol::StableErrorCode::PreparationTimedOut
+        );
+
+        let shutdown_deadline = authority
+            .begin_candidate_preparation_deadline()
+            .await
+            .expect("start shutdown deadline");
+        let waiting_authority = authority.clone();
+        let shutdown_waiter = tokio::spawn(async move {
+            waiting_authority
+                .wait_for_candidate_preparation_deadline(shutdown_deadline)
+                .await
+        });
+        tokio::task::yield_now().await;
+        authority.shutdown().await;
+        assert_eq!(
+            shutdown_waiter
+                .await
+                .expect("join shutdown deadline waiter")
+                .code(),
+            protocol::StableErrorCode::OperationCanceled
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_shutdown_cancels_preparation_and_rejects_successors() {
+        let declaration = declaration(instance(23), 1, "twenty-three.localhost");
+        let (registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let owner = principal(1);
+        let PublisherAcquisitionPreparation::Required(permit) = authority
+            .reserve_acquisition(key.clone(), owner.clone(), None)
+            .await
+            .expect("reserve preparation")
+        else {
+            panic!("expected preparation owner");
+        };
+
+        authority.shutdown().await;
+        assert!(permit.is_cancelled());
+        assert_eq!(
+            authority
+                .reserve_acquisition(key, owner, None)
+                .await
+                .expect_err("shutdown authority rejects successors")
+                .code(),
+            protocol::StableErrorCode::OperationCanceled
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_wake_sweeps_expired_authority_and_releases_exact_wait() {
+        let declaration = declaration(instance(31), 1, "thirty-one.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 31, &drops);
+        let authority = authority(registry);
+        let monitor = FakeWakeMonitor::default();
+        authority
+            .activate_wake_monitor(&monitor)
+            .expect("activate fake wake monitor");
+
+        let waiting_authority = authority.clone();
+        let waiting_owner = owner.clone();
+        let lease = grant.lease.wire();
+        let binding_revision =
+            protocol::BindingRevision::new(grant.binding_revision).expect("valid binding revision");
+        let waiter = tokio::spawn(async move {
+            waiting_authority
+                .wait_ready(&lease, &waiting_owner, binding_revision)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        clock.advance(LEASE_TTL);
+        monitor.resume();
+        assert_eq!(
+            authority
+                .ensure_wake_trustworthy()
+                .expect_err("wake callback closes the operation gate synchronously")
+                .code(),
+            protocol::StableErrorCode::OperationCanceled
+        );
+        for _ in 0..32 {
+            if waiter.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            waiter.is_finished(),
+            "resume must wake the exact readiness wait"
+        );
+        assert_eq!(
+            waiter
+                .await
+                .expect("join readiness waiter")
+                .expect_err("expired authority cannot become ready")
+                .code(),
+            protocol::StableErrorCode::LeaseLost
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_observes_pause_generation_across_coalesced_resume() {
+        let declaration = declaration(instance(36), 1, "thirty-six.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 36, &drops);
+        let authority = authority(registry);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        authority.set_wait_ready_capture_hook(WaitReadyCaptureHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let waiting_authority = authority.clone();
+        let waiting_owner = owner.clone();
+        let lease = grant.lease.wire();
+        let binding_revision =
+            protocol::BindingRevision::new(grant.binding_revision).expect("valid binding revision");
+        let waiter = tokio::spawn(async move {
+            waiting_authority
+                .wait_ready(&lease, &waiting_owner, binding_revision)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), reached.notified())
+            .await
+            .expect("readiness wait captures its exact pause generation");
+
+        authority
+            .renew(&grant.lease.wire(), &owner)
+            .await
+            .expect("ordinary renewal preserves the readiness fence");
+        authority
+            .set_project_paused(key.instance(), true)
+            .await
+            .expect("pause route after wait capture");
+        authority
+            .set_project_paused(key.instance(), false)
+            .await
+            .expect("resume before the waiter rereads authority");
+        resume.notify_one();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("coalesced pause and resume terminate the exact wait")
+            .expect("join readiness waiter")
+            .expect_err("a later pause must not be erased by resume");
+        assert_eq!(error.code(), protocol::StableErrorCode::ProjectPaused);
+
+        authority
+            .set_project_paused(key.instance(), true)
+            .await
+            .expect("pause before the second readiness capture");
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        authority.set_wait_ready_capture_hook(WaitReadyCaptureHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let waiting_authority = authority.clone();
+        let waiting_owner = owner.clone();
+        let lease = grant.lease.wire();
+        let binding_revision =
+            protocol::BindingRevision::new(grant.binding_revision).expect("valid binding revision");
+        let waiter = tokio::spawn(async move {
+            waiting_authority
+                .wait_ready(&lease, &waiting_owner, binding_revision)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), reached.notified())
+            .await
+            .expect("readiness wait captures the already-paused policy");
+        authority
+            .set_project_paused(key.instance(), false)
+            .await
+            .expect("resume before the already-paused waiter rereads authority");
+        resume.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("paused-at-capture wait terminates after coalesced resume")
+            .expect("join paused-at-capture waiter")
+            .expect_err("resume must not erase pause observed at wait capture");
+        assert_eq!(error.code(), protocol::StableErrorCode::ProjectPaused);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_policy_transition_waits_for_pending_wake_barrier() {
+        let declaration = declaration(instance(35), 1, "thirty-five.localhost");
+        let (registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let monitor = FakeWakeMonitor::default();
+        authority
+            .activate_wake_monitor(&monitor)
+            .expect("activate fake wake monitor");
+
+        let registry_guard = authority.inner.registry.lock().await;
+        monitor.resume();
+        let policy_authority = authority.clone();
+        let policy = tokio::spawn(async move {
+            policy_authority
+                .set_project_paused(instance(35), true)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !policy.is_finished(),
+            "pause publication must not overtake the pending wake barrier"
+        );
+
+        drop(registry_guard);
+        policy
+            .await
+            .expect("join pause publication")
+            .expect("publish pause after wake barrier");
+        assert_eq!(
+            authority
+                .projection(&key)
+                .await
+                .expect("read post-barrier projection")
+                .map(|(state, _)| state),
+            Some(PublicationState::RoutePaused)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_wake_observation_retires_authority_and_rejects_successors() {
+        let declaration = declaration(instance(32), 1, "thirty-two.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 32, &drops);
+        let authority = authority(registry);
+        let monitor = FakeWakeMonitor::default();
+        authority
+            .activate_wake_monitor(&monitor)
+            .expect("activate fake wake monitor");
+
+        monitor.fail(WakeError::Failed("scripted wake failure".to_owned()));
+        for _ in 0..32 {
+            if drops.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            authority
+                .renew(&grant.lease.wire(), &owner)
+                .await
+                .expect_err("failed wake observation blocks new authority")
+                .code(),
+            protocol::StableErrorCode::Internal
+        );
+        assert_eq!(
+            authority
+                .projection(&key)
+                .await
+                .expect("status projection remains available")
+                .expect("declared projection")
+                .0,
+            PublicationState::WaitingForPublisher
+        );
+    }
+
+    #[test]
+    fn readiness_deadline_uses_suspend_clock_even_when_renewal_extends_the_lease() {
+        let declaration = declaration(instance(33), 1, "thirty-three.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 33, &drops);
+        let wait_fence = registry
+            .begin_wait_ready(&grant.lease, &owner, grant.binding_revision)
+            .result
+            .expect("begin readiness wait");
+
+        clock.advance(Duration::from_secs(10));
+        registry
+            .renew(&grant.lease, &owner)
+            .result
+            .expect("renew lease independently");
+        clock.advance(Duration::from_secs(20));
+        assert_eq!(
+            registry
+                .wait_projection(&grant.lease, &owner, grant.binding_revision, &wait_fence)
+                .result
+                .expect_err("suspend-inclusive wait deadline elapsed"),
+            PublicationRegistryError::WaitDeadlineElapsed
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(registry.renew(&grant.lease, &owner).result.is_ok());
+    }
+
+    #[test]
+    fn observed_pause_precedes_elapsed_wait_after_renewal_and_config_transfer() {
+        let initial_declaration = declaration(instance(37), 1, "thirty-seven.localhost");
+        let (mut registry, clock, key) = registry(Duration::ZERO, initial_declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 37, &drops);
+        let wait_fence = registry
+            .begin_wait_ready(&grant.lease, &owner, grant.binding_revision)
+            .result
+            .expect("capture readiness fence");
+
+        registry
+            .reconcile_declarations(
+                key.instance(),
+                2,
+                [declaration(instance(37), 2, "thirty-seven.localhost")],
+            )
+            .result
+            .expect("compatible config transfer preserves live authority");
+        clock.advance(Duration::from_secs(10));
+        registry
+            .renew(&grant.lease, &owner)
+            .result
+            .expect("renew lease beyond the readiness deadline");
+        registry
+            .set_paused(key.instance(), true)
+            .result
+            .expect("pause after readiness capture");
+        registry
+            .set_paused(key.instance(), false)
+            .result
+            .expect("resume before readiness reread");
+        clock.advance(Duration::from_secs(20));
+
+        let (projection, wait_remaining) = registry
+            .wait_projection(&grant.lease, &owner, grant.binding_revision, &wait_fence)
+            .result
+            .expect("observed pause wins over the coincident wait deadline");
+        assert_eq!(projection.state, PublicationState::RoutePaused);
+        assert_eq!(wait_remaining, Duration::ZERO);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn elapsed_preparation_reports_timeout_during_an_unrelated_transition() {
+        let declaration = declaration(instance(34), 1, "thirty-four.localhost");
+        let (registry, clock, key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let owner = principal(1);
+        let PublisherAcquisitionPreparation::Required(_permit) = authority
+            .reserve_acquisition(key.clone(), owner.clone(), None)
+            .await
+            .expect("reserve preparation")
+        else {
+            panic!("expected preparation owner");
+        };
+        let joined_authority = authority.clone();
+        let joined_key = key.clone();
+        let joined = tokio::spawn(async move {
+            joined_authority
+                .reserve_acquisition(joined_key, owner, None)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        clock.advance(PREPARATION_TTL);
+        authority
+            .projection(&key)
+            .await
+            .expect("unrelated projection sweeps elapsed preparation");
+        assert_eq!(
+            joined
+                .await
+                .expect("join preparation waiter")
+                .expect_err("joined preparation times out")
+                .code(),
+            protocol::StableErrorCode::PreparationTimedOut
+        );
     }
 
     #[test]

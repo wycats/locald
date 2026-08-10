@@ -18,17 +18,19 @@ use thiserror::Error;
 
 use crate::backend::{
     AuthenticatedDaemonDiscovery, BackendError, DeliveryCertainty, PublisherTransport,
-    TransportFailure,
+    TransportFailure, UnixCommandSocketDiscovery, UnixPublisherTransport,
 };
-use crate::clock::{ClockError, RenewalSchedule, SuspendAwareClock, SuspendInstant};
+use crate::clock::{
+    ClockError, RenewalSchedule, SuspendAwareClock, SuspendInstant, SystemSuspendAwareClock,
+};
 use crate::installation::InstalledPublisher;
 use crate::supervisor::{
     LeaseSnapshot, LeaseState, PendingSupervisor, RenewalCause, SessionFence, SharedSession,
     SupervisorCallError, SupervisorDriver, SupervisorHandle, SupervisorShared,
 };
-use crate::wake::{InactiveWakeMonitor, WakeError, WakeMonitor};
+use crate::wake::{InactiveWakeMonitor, SystemWakeMonitor, WakeError, WakeMonitor};
 
-const SUPERVISOR_TIMEOUT_FRAME_MULTIPLIER: u32 = 3;
+const EXACT_MUTATION_ATTEMPTS: u32 = 2;
 const SUPERVISOR_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
 
 /// Supported publisher client.
@@ -123,9 +125,23 @@ impl fmt::Debug for PublisherClient {
 }
 
 impl PublisherClient {
-    /// Construct the production client while publisher discovery remains
-    /// inactive. An advertised production transport must install a conforming
-    /// wake monitor and use [`Self::with_wake_monitor`].
+    /// Construct the supported production client with authenticated ordinary
+    /// discovery, the dedicated Unix publisher transport, a
+    /// suspend-inclusive clock, and platform wake observation.
+    #[must_use]
+    pub fn production() -> Self {
+        Self::with_wake_monitor(
+            Arc::new(UnixCommandSocketDiscovery),
+            Arc::new(UnixPublisherTransport),
+            Arc::new(SystemSuspendAwareClock),
+            Arc::new(SystemWakeMonitor),
+        )
+    }
+
+    /// Construct an injected client with wake observation disabled.
+    /// Production callers should use [`Self::production`]; deterministic
+    /// tests and alternate contexts may supply an explicit wake monitor with
+    /// [`Self::with_wake_monitor`].
     #[must_use]
     pub fn new(
         discovery: Arc<dyn AuthenticatedDaemonDiscovery>,
@@ -417,9 +433,17 @@ impl ProjectPublisher {
     }
 
     const fn command_timeout(&self) -> Duration {
-        Duration::from_millis(self.protocol_info.frame_timeout_ms())
-            .saturating_mul(SUPERVISOR_TIMEOUT_FRAME_MULTIPLIER)
-            .saturating_add(SUPERVISOR_TIMEOUT_MARGIN)
+        // Each exact mutation attempt has an independently bounded request
+        // phase, semantic attempt lifetime, and response-framing phase. The
+        // supervisor must outlive both the first exchange and its one exact
+        // automatic replay before it can classify the outcome as uncertain.
+        Duration::from_millis(
+            self.protocol_info
+                .attempt_ttl_ms()
+                .saturating_add(self.protocol_info.frame_timeout_ms().saturating_mul(2)),
+        )
+        .saturating_mul(EXACT_MUTATION_ATTEMPTS)
+        .saturating_add(SUPERVISOR_TIMEOUT_MARGIN)
     }
 
     fn best_effort_release(&self, lease_handle: LeaseHandle) {
@@ -2031,6 +2055,12 @@ mod tests {
                 AbsolutePath::parse("/work/project").expect("locator"),
             )
             .expect("project")
+    }
+
+    #[test]
+    fn supervisor_timeout_covers_two_complete_rebind_exchanges() {
+        let fixture = fixture();
+        assert_eq!(project(&fixture).command_timeout(), Duration::from_secs(51));
     }
 
     #[test]

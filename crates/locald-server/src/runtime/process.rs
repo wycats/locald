@@ -678,10 +678,12 @@ impl ProcessRuntime {
         // failed spawn drops this guard, cancels the waiter, and closes every
         // local PTY handle without leaving a blocking reader thread behind.
         let log_streamer = Self::prepare_log_streamer(name)?;
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn process")?;
+        drop(spawn_permit);
         let (rx, pty_tx) = log_streamer.activate(reader);
 
         let master = pair.master;
@@ -733,10 +735,12 @@ impl ProcessRuntime {
         // reader only after the child exists. Dropping an unactivated guard
         // cancels and joins the waiting thread.
         let log_streamer = Self::prepare_log_streamer(name)?;
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn process")?;
+        drop(spawn_permit);
         let (rx, pty_tx) = log_streamer.activate(reader);
 
         let master = pair.master;

@@ -147,6 +147,17 @@ pub struct ProjectInstanceRecord {
 pub struct SemanticOrigin(String);
 
 impl SemanticOrigin {
+    /// Parse one canonical absolute HTTPS origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Invariant`] when `value` is not the canonical
+    /// serialized origin accepted by the durable catalog.
+    pub fn parse(value: &str) -> Result<Self, CatalogError> {
+        let (domain, port) = parse_semantic_origin(value).map_err(CatalogError::Invariant)?;
+        Ok(Self::https(&domain, port))
+    }
+
     /// Construct the exact public HTTPS origin for one owned domain.
     #[must_use]
     pub fn https(domain: &DomainName, advertised_https_port: u16) -> Self {

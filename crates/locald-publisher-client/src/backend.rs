@@ -1,4 +1,5 @@
-use std::io::{Read as _, Write as _};
+use std::io::{IoSlice, Read as _, Write as _};
+use std::mem::{size_of, zeroed};
 use std::net::Shutdown;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::os::unix::net::UnixStream;
@@ -6,18 +7,25 @@ use std::time::{Duration, Instant};
 
 use locald_core::{IpcRequest, IpcResponse};
 use locald_publisher_protocol::{
-    AbsolutePath, EncodedRequestFrame, ProjectInstanceId, PublishedEndpointProtocolInfo,
+    AbsolutePath, DescriptorPrelude, EncodedRequestFrame, FRAME_TIMEOUT_MS, MAX_FRAME_JSON_BYTES,
+    ProjectInstanceId, PublishedEndpointProtocolInfo,
 };
 use nix::errno::Errno;
+#[cfg(target_os = "macos")]
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{
-    AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket, sockopt::SocketError,
+    AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, connect, getsockopt,
+    sendmsg, socket, sockopt::SocketError,
 };
+use nix::unistd::Uid;
 use thiserror::Error;
 
 const COMMAND_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLISHER_REQUEST_TIMEOUT: Duration = Duration::from_millis(FRAME_TIMEOUT_MS);
 const MAX_COMMAND_RESPONSE_BYTES: usize = locald_core::ipc::MAX_IPC_REQUEST_BYTES;
+const MAX_PUBLISHER_RESPONSE_BYTES: usize = 4 + MAX_FRAME_JSON_BYTES;
+const RESPONSE_CONTROL_WORDS: usize = 512;
 
 /// Coarse backend failure class retained across discovery implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,28 +277,10 @@ fn connect_before(
     command_socket: &AbsolutePath,
     deadline: Instant,
 ) -> Result<UnixStream, BackendError> {
-    let descriptor = socket(
-        AddressFamily::Unix,
-        SockType::Stream,
-        SockFlag::empty(),
-        None,
-    )
-    .map_err(|error| {
+    let descriptor = create_nonblocking_unix_socket().map_err(|error| {
         BackendError::new(
             BackendErrorKind::Io,
             format!("cannot create locald command socket: {error}"),
-        )
-    })?;
-    fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|error| {
-        BackendError::new(
-            BackendErrorKind::Io,
-            format!("cannot make locald command socket close-on-exec: {error}"),
-        )
-    })?;
-    fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|error| {
-        BackendError::new(
-            BackendErrorKind::Io,
-            format!("cannot make locald command socket nonblocking: {error}"),
         )
     })?;
     let address = UnixAddr::new(command_socket.as_path()).map_err(|error| {
@@ -478,4 +468,800 @@ pub trait PublisherTransport: Send + Sync + std::fmt::Debug {
         request: &EncodedRequestFrame,
         listener: Option<BorrowedFd<'_>>,
     ) -> Result<TransportReply, TransportFailure>;
+}
+
+/// Strict production transport for locald's dedicated Unix publisher socket.
+///
+/// Every exchange uses a fresh close-on-exec, nonblocking connection and one
+/// absolute deadline. The first request byte carries the complete
+/// `SCM_RIGHTS` contract; response ancillary data is never accepted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnixPublisherTransport;
+
+impl PublisherTransport for UnixPublisherTransport {
+    fn exchange(
+        &self,
+        publisher_socket: &AbsolutePath,
+        request: &EncodedRequestFrame,
+        listener: Option<BorrowedFd<'_>>,
+    ) -> Result<TransportReply, TransportFailure> {
+        validate_listener_contract(request, listener)?;
+        let request_deadline = Instant::now()
+            .checked_add(PUBLISHER_REQUEST_TIMEOUT)
+            .ok_or_else(|| {
+                publisher_failure(
+                    DeliveryCertainty::NotSent,
+                    BackendErrorKind::Io,
+                    "publisher transport deadline overflowed",
+                )
+            })?;
+        let mut stream =
+            connect_publisher_before(publisher_socket, request_deadline).map_err(|error| {
+                let certainty = if error.kind == BackendErrorKind::Protocol {
+                    DeliveryCertainty::Fatal
+                } else {
+                    DeliveryCertainty::NotSent
+                };
+                TransportFailure::new(certainty, error)
+            })?;
+        let peer_uid = authenticate_publisher_peer(&stream)?;
+
+        send_request_before(&mut stream, request, listener, request_deadline)?;
+        stream.shutdown(Shutdown::Write).map_err(|error| {
+            publisher_failure(
+                DeliveryCertainty::OutcomeUnknown,
+                BackendErrorKind::Unreachable,
+                format!("cannot finish locald publisher request: {error}"),
+            )
+        })?;
+        let response_deadline = Instant::now()
+            .checked_add(Duration::from_millis(request.response_timeout_ms()))
+            .ok_or_else(|| {
+                publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Io,
+                    "publisher response deadline overflowed",
+                )
+            })?;
+        let response_frame = receive_response_before(&stream, response_deadline)?;
+
+        Ok(TransportReply {
+            peer_uid,
+            response_frame,
+        })
+    }
+}
+
+fn validate_listener_contract(
+    request: &EncodedRequestFrame,
+    listener: Option<BorrowedFd<'_>>,
+) -> Result<(), TransportFailure> {
+    let valid = matches!(
+        (request.descriptor(), listener),
+        (DescriptorPrelude::None, None) | (DescriptorPrelude::Listener, Some(_))
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(publisher_failure(
+            DeliveryCertainty::Fatal,
+            BackendErrorKind::Protocol,
+            "publisher listener descriptor does not match the encoded request contract",
+        ))
+    }
+}
+
+fn connect_publisher_before(
+    publisher_socket: &AbsolutePath,
+    deadline: Instant,
+) -> Result<UnixStream, BackendError> {
+    let descriptor = create_nonblocking_unix_socket().map_err(|error| {
+        BackendError::new(
+            BackendErrorKind::Io,
+            format!("cannot create locald publisher socket: {error}"),
+        )
+    })?;
+    let address = UnixAddr::new(publisher_socket.as_path()).map_err(|error| {
+        BackendError::new(
+            BackendErrorKind::Protocol,
+            format!("invalid locald publisher socket path: {error}"),
+        )
+    })?;
+    match connect(descriptor.as_raw_fd(), &address) {
+        Ok(()) | Err(Errno::EISCONN) => {}
+        Err(Errno::EINPROGRESS | Errno::EALREADY | Errno::EAGAIN) => {
+            wait_for_publisher(descriptor.as_fd(), PollFlags::POLLOUT, deadline)?;
+            let socket_error = getsockopt(&descriptor, SocketError).map_err(|error| {
+                BackendError::new(
+                    BackendErrorKind::Unreachable,
+                    format!("cannot inspect locald publisher connection: {error}"),
+                )
+            })?;
+            if socket_error != 0 {
+                return Err(BackendError::new(
+                    BackendErrorKind::Unreachable,
+                    format!(
+                        "cannot connect to locald publisher socket: {}",
+                        std::io::Error::from_raw_os_error(socket_error)
+                    ),
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(BackendError::new(
+                BackendErrorKind::Unreachable,
+                format!("cannot connect to locald publisher socket: {error}"),
+            ));
+        }
+    }
+    Ok(UnixStream::from(descriptor))
+}
+
+#[cfg(target_os = "linux")]
+fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
+    socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
+    // Darwin has no SOCK_CLOEXEC/SOCK_NONBLOCK creation flags. Set both
+    // properties before the descriptor can enter any connect or I/O path.
+    let descriptor = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )?;
+    fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    Ok(descriptor)
+}
+
+fn authenticate_publisher_peer(stream: &UnixStream) -> Result<u32, TransportFailure> {
+    let peer_uid = authenticate_peer_uid(stream).map_err(|error| {
+        TransportFailure::new(
+            DeliveryCertainty::Fatal,
+            BackendError {
+                message: error.message.replace("command peer", "publisher peer"),
+                ..error
+            },
+        )
+    })?;
+    let expected_uid = Uid::effective().as_raw();
+    if peer_uid == expected_uid {
+        Ok(peer_uid)
+    } else {
+        Err(publisher_failure(
+            DeliveryCertainty::Fatal,
+            BackendErrorKind::Authentication,
+            format!("locald publisher peer UID {peer_uid} differs from client UID {expected_uid}"),
+        ))
+    }
+}
+
+fn send_request_before(
+    stream: &mut UnixStream,
+    request: &EncodedRequestFrame,
+    listener: Option<BorrowedFd<'_>>,
+    deadline: Instant,
+) -> Result<(), TransportFailure> {
+    let bytes = request.as_bytes();
+    let Some(first_byte) = bytes.first() else {
+        return Err(publisher_failure(
+            DeliveryCertainty::Fatal,
+            BackendErrorKind::Protocol,
+            "publisher request frame is empty",
+        ));
+    };
+    let first = [*first_byte];
+
+    loop {
+        let iov = [IoSlice::new(&first)];
+        let sent = listener.map_or_else(
+            || sendmsg::<UnixAddr>(stream.as_raw_fd(), &iov, &[], MsgFlags::MSG_DONTWAIT, None),
+            |listener| {
+                let descriptors = [listener.as_raw_fd()];
+                let control = [ControlMessage::ScmRights(&descriptors)];
+                sendmsg::<UnixAddr>(
+                    stream.as_raw_fd(),
+                    &iov,
+                    &control,
+                    MsgFlags::MSG_DONTWAIT,
+                    None,
+                )
+            },
+        );
+        match sent {
+            Ok(1) => break,
+            Ok(_) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::NotSent,
+                    BackendErrorKind::Unreachable,
+                    "locald publisher closed before receiving the first request byte",
+                ));
+            }
+            Err(Errno::EINTR) => {}
+            Err(Errno::EAGAIN) => {
+                wait_for_publisher(stream.as_fd(), PollFlags::POLLOUT, deadline)
+                    .map_err(|error| TransportFailure::new(DeliveryCertainty::NotSent, error))?;
+            }
+            Err(error) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::NotSent,
+                    BackendErrorKind::Unreachable,
+                    format!("cannot send first locald publisher request byte: {error}"),
+                ));
+            }
+        }
+    }
+
+    let mut written = 1;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Unreachable,
+                    "locald publisher closed while receiving the request",
+                ));
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_publisher(stream.as_fd(), PollFlags::POLLOUT, deadline).map_err(
+                    |error| TransportFailure::new(DeliveryCertainty::OutcomeUnknown, error),
+                )?;
+            }
+            Err(error) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Unreachable,
+                    format!("cannot send locald publisher request: {error}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn receive_response_before(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, TransportFailure> {
+    let mut response = Vec::new();
+    let mut expected = None;
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let received = receive_publisher_chunk(stream.as_raw_fd(), &mut chunk);
+        let (count, flags, had_control) = match received {
+            Ok(message) => message,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => {
+                wait_for_publisher(stream.as_fd(), PollFlags::POLLIN, deadline).map_err(
+                    |error| TransportFailure::new(DeliveryCertainty::OutcomeUnknown, error),
+                )?;
+                continue;
+            }
+            Err(error) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Unreachable,
+                    format!("cannot receive locald publisher response: {error}"),
+                ));
+            }
+        };
+        if had_control || flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
+            return Err(publisher_failure(
+                DeliveryCertainty::OutcomeUnknown,
+                BackendErrorKind::Protocol,
+                "locald publisher response carried ancillary data or was truncated",
+            ));
+        }
+        if count == 0 {
+            return finish_publisher_response(response, expected);
+        }
+        response.extend_from_slice(&chunk[..count]);
+
+        if response.len() > MAX_PUBLISHER_RESPONSE_BYTES {
+            return Err(publisher_failure(
+                DeliveryCertainty::OutcomeUnknown,
+                BackendErrorKind::Protocol,
+                "locald publisher response exceeds the protocol frame bound",
+            ));
+        }
+        if expected.is_none() && response.len() >= 4 {
+            let body_length = u32::from_be_bytes(response[..4].try_into().map_err(|_| {
+                publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Protocol,
+                    "locald publisher response has an invalid length prefix",
+                )
+            })?) as usize;
+            if body_length > MAX_FRAME_JSON_BYTES {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Protocol,
+                    "locald publisher response exceeds the protocol JSON bound",
+                ));
+            }
+            expected = Some(4 + body_length);
+        }
+        if expected.is_some_and(|expected| response.len() > expected) {
+            return Err(publisher_failure(
+                DeliveryCertainty::OutcomeUnknown,
+                BackendErrorKind::Protocol,
+                "locald publisher response contains trailing bytes",
+            ));
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "recvmsg response control data must be inspected so every unexpected SCM_RIGHTS descriptor is closed even when ancillary data is truncated"
+)]
+fn receive_publisher_chunk(
+    descriptor: std::os::fd::RawFd,
+    chunk: &mut [u8],
+) -> Result<(usize, MsgFlags, bool), Errno> {
+    let mut control = [0_usize; RESPONSE_CONTROL_WORDS];
+    let mut iov = libc::iovec {
+        iov_base: chunk.as_mut_ptr().cast(),
+        iov_len: chunk.len(),
+    };
+    // SAFETY: Every pointer in the message references a live, correctly
+    // aligned stack allocation for the duration of recvmsg.
+    let mut message = unsafe { zeroed::<libc::msghdr>() };
+    message.msg_iov = &raw mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = size_of::<[usize; RESPONSE_CONTROL_WORDS]>() as _;
+
+    // SAFETY: `message` names initialized writable buffers and the borrowed
+    // socket remains live for this call.
+    let received =
+        unsafe { libc::recvmsg(descriptor, &raw mut message, publisher_recv_flags().bits()) };
+    if received < 0 {
+        return Err(Errno::last());
+    }
+    let had_control = close_response_control_messages(&message);
+    Ok((
+        received as usize,
+        MsgFlags::from_bits_truncate(message.msg_flags),
+        had_control,
+    ))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "kernel-produced cmsghdr records must be walked to close all unexpected response descriptors before rejecting the response"
+)]
+fn close_response_control_messages(message: &libc::msghdr) -> bool {
+    let control_start = message.msg_control as usize;
+    let control_end = control_start.saturating_add(message.msg_controllen as usize);
+    let mut had_control = false;
+    // SAFETY: recvmsg initialized the control buffer described by `message`.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    while !header.is_null() {
+        had_control = true;
+        let header_address = header as usize;
+        if header_address < control_start
+            || header_address.saturating_add(size_of::<libc::cmsghdr>()) > control_end
+        {
+            break;
+        }
+        // SAFETY: The complete header was bounds-checked against the control
+        // buffer that recvmsg initialized.
+        let header_value = unsafe { &*header };
+        let header_length = header_value.cmsg_len as usize;
+        // SAFETY: CMSG_LEN only computes the platform-aligned fixed header
+        // size for an empty payload.
+        let data_offset = unsafe { libc::CMSG_LEN(0) as usize };
+        if header_length < data_offset || header_address.saturating_add(header_length) > control_end
+        {
+            break;
+        }
+        if header_value.cmsg_level == libc::SOL_SOCKET && header_value.cmsg_type == libc::SCM_RIGHTS
+        {
+            let descriptor_bytes = header_length - data_offset;
+            let descriptor_count = descriptor_bytes / size_of::<std::os::fd::RawFd>();
+            // SAFETY: CMSG_DATA points into the checked header payload. The
+            // kernel encodes SCM_RIGHTS as an array of RawFd values.
+            let descriptors = unsafe {
+                std::slice::from_raw_parts(
+                    libc::CMSG_DATA(header).cast::<std::os::fd::RawFd>(),
+                    descriptor_count,
+                )
+            };
+            for &descriptor in descriptors {
+                // Mark the descriptor close-on-exec before any further
+                // interpretation, then close it unconditionally. Failures do
+                // not change the protocol rejection disposition.
+                // SAFETY: Each value is an owned descriptor installed by
+                // recvmsg for this process.
+                unsafe {
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                    libc::close(descriptor);
+                }
+            }
+        }
+        // SAFETY: The current header is complete and lies inside the live
+        // control buffer, as established above.
+        header = unsafe { libc::CMSG_NXTHDR(message, header) };
+    }
+    had_control
+}
+
+fn finish_publisher_response(
+    response: Vec<u8>,
+    expected: Option<usize>,
+) -> Result<Vec<u8>, TransportFailure> {
+    let Some(expected) = expected else {
+        return Err(publisher_failure(
+            DeliveryCertainty::OutcomeUnknown,
+            BackendErrorKind::Protocol,
+            "locald publisher closed with a truncated response header",
+        ));
+    };
+    if response.len() == expected {
+        Ok(response)
+    } else {
+        Err(publisher_failure(
+            DeliveryCertainty::OutcomeUnknown,
+            BackendErrorKind::Protocol,
+            "locald publisher closed with a truncated response body",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn publisher_recv_flags() -> MsgFlags {
+    MsgFlags::MSG_DONTWAIT.union(MsgFlags::MSG_CMSG_CLOEXEC)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn publisher_recv_flags() -> MsgFlags {
+    MsgFlags::MSG_DONTWAIT
+}
+
+fn wait_for_publisher(
+    descriptor: BorrowedFd<'_>,
+    events: PollFlags,
+    deadline: Instant,
+) -> Result<(), BackendError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorKind::Unreachable,
+                    "locald publisher I/O exceeded its operation deadline",
+                )
+            })?;
+        let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+        let mut descriptors = [PollFd::new(descriptor, events)];
+        match poll(&mut descriptors, timeout) {
+            Ok(0) => {
+                return Err(BackendError::new(
+                    BackendErrorKind::Unreachable,
+                    "locald publisher I/O exceeded its operation deadline",
+                ));
+            }
+            Ok(_) => {
+                let revents = descriptors[0].revents().unwrap_or(PollFlags::POLLNVAL);
+                if revents.contains(PollFlags::POLLNVAL) {
+                    return Err(BackendError::new(
+                        BackendErrorKind::Io,
+                        "locald publisher descriptor became invalid",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(Errno::EINTR) => {}
+            Err(error) => {
+                return Err(BackendError::new(
+                    BackendErrorKind::Io,
+                    format!("cannot wait for locald publisher I/O: {error}"),
+                ));
+            }
+        }
+    }
+}
+
+fn publisher_failure(
+    certainty: DeliveryCertainty,
+    kind: BackendErrorKind,
+    message: impl Into<String>,
+) -> TransportFailure {
+    TransportFailure::new(certainty, BackendError::new(kind, message))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "socket fixtures fail immediately when their deterministic transport script is invalid"
+)]
+mod tests {
+    use std::fs::File;
+    use std::io::{IoSliceMut, Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::thread;
+
+    use locald_publisher_protocol::{
+        AcquireArguments, AcquisitionAttemptHandle, DaemonEpoch, LeaseHandle, PublisherRequest,
+        ReleaseArguments, ReleaseResult, RequestEnvelope, ResponseEnvelope, SemanticOrigin,
+        encode_request_frame, encode_response_frame,
+    };
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, UnixAddr, recvmsg, sendmsg};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn epoch() -> DaemonEpoch {
+        DaemonEpoch::from_bytes([1; 16])
+    }
+
+    fn release_frame() -> EncodedRequestFrame {
+        encode_request_frame(&RequestEnvelope::v1(
+            epoch(),
+            PublisherRequest::Release(ReleaseArguments {
+                lease_handle: LeaseHandle::from_bytes([2; 32]),
+            }),
+        ))
+        .expect("encode release frame")
+    }
+
+    fn acquire_frame() -> EncodedRequestFrame {
+        encode_request_frame(&RequestEnvelope::v1(
+            epoch(),
+            PublisherRequest::Acquire(AcquireArguments {
+                acquisition_attempt_handle: AcquisitionAttemptHandle::from_bytes([3; 32]),
+                acknowledged_origin: SemanticOrigin::parse("https://workbench.example.localhost")
+                    .expect("semantic origin"),
+            }),
+        ))
+        .expect("encode acquire frame")
+    }
+
+    fn release_response() -> Vec<u8> {
+        encode_response_frame(&ResponseEnvelope::success(
+            epoch(),
+            ReleaseResult::released(),
+        ))
+        .expect("encode release response")
+    }
+
+    fn publisher_listener() -> (TempDir, AbsolutePath, UnixListener) {
+        let directory = tempfile::tempdir().expect("publisher tempdir");
+        let path = directory.path().join("publisher-v1.sock");
+        let listener = UnixListener::bind(&path).expect("bind publisher socket");
+        let path = AbsolutePath::parse(path.to_str().expect("UTF-8 publisher path"))
+            .expect("absolute publisher path");
+        (directory, path, listener)
+    }
+
+    #[test]
+    fn created_unix_transport_socket_is_nonblocking_and_close_on_exec() {
+        let descriptor = create_nonblocking_unix_socket().expect("create Unix transport socket");
+        let descriptor_flags = FdFlag::from_bits_truncate(
+            fcntl(&descriptor, FcntlArg::F_GETFD).expect("read descriptor flags"),
+        );
+        let status_flags = OFlag::from_bits_truncate(
+            fcntl(&descriptor, FcntlArg::F_GETFL).expect("read socket status flags"),
+        );
+
+        assert!(descriptor_flags.contains(FdFlag::FD_CLOEXEC));
+        assert!(status_flags.contains(OFlag::O_NONBLOCK));
+    }
+
+    fn receive_request(mut stream: UnixStream) -> (Vec<u8>, Vec<RawFd>) {
+        let mut first = [0_u8; 1];
+        let descriptors = {
+            let mut iov = [IoSliceMut::new(&mut first)];
+            let mut control = nix::cmsg_space!([RawFd; 2]);
+            let message = recvmsg::<UnixAddr>(
+                stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut control),
+                MsgFlags::empty(),
+            )
+            .expect("receive first request byte");
+            assert_eq!(message.bytes, 1);
+            assert!(!message.flags.contains(MsgFlags::MSG_CTRUNC));
+            let mut descriptors = Vec::new();
+            for message in message.cmsgs().expect("decode request control messages") {
+                match message {
+                    ControlMessageOwned::ScmRights(received) => descriptors.extend(received),
+                    other => panic!("unexpected request control message: {other:?}"),
+                }
+            }
+            descriptors
+        };
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).expect("read request frame");
+        let mut frame = first.to_vec();
+        frame.extend(rest);
+        (frame, descriptors)
+    }
+
+    fn send_response(mut stream: UnixStream, response: &[u8]) {
+        stream
+            .write_all(response)
+            .expect("write publisher response");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish publisher response");
+    }
+
+    #[test]
+    fn unix_transport_preserves_exact_request_bytes_without_a_descriptor() {
+        let (_directory, socket, listener) = publisher_listener();
+        let request = release_frame();
+        let expected_request = request.as_bytes().to_vec();
+        let response = release_response();
+        let expected_response = response.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept publisher connection");
+            let (actual_request, descriptors) = receive_request(stream.try_clone().expect("clone"));
+            assert_eq!(actual_request, expected_request);
+            assert!(descriptors.is_empty());
+            send_response(stream, &response);
+        });
+
+        let reply = UnixPublisherTransport
+            .exchange(&socket, &request, None)
+            .expect("publisher exchange");
+        assert_eq!(reply.peer_uid, Uid::effective().as_raw());
+        assert_eq!(reply.response_frame, expected_response);
+        server.join().expect("publisher server");
+    }
+
+    #[test]
+    fn unix_transport_transfers_exactly_one_listener_with_the_first_byte() {
+        let (_directory, socket, listener) = publisher_listener();
+        let request = acquire_frame();
+        let expected_request = request.as_bytes().to_vec();
+        let response = release_response();
+        let published_listener = TcpListener::bind("127.0.0.1:0").expect("published listener");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept publisher connection");
+            let (actual_request, descriptors) = receive_request(stream.try_clone().expect("clone"));
+            assert_eq!(actual_request, expected_request);
+            assert_eq!(descriptors.len(), 1);
+            nix::unistd::close(descriptors[0]).expect("close received listener");
+            send_response(stream, &response);
+        });
+
+        UnixPublisherTransport
+            .exchange(&socket, &request, Some(published_listener.as_fd()))
+            .expect("publisher exchange");
+        server.join().expect("publisher server");
+    }
+
+    #[test]
+    fn unix_transport_classifies_pre_send_and_post_send_failures_conservatively() {
+        let directory = tempfile::tempdir().expect("publisher tempdir");
+        let missing = AbsolutePath::parse(
+            directory
+                .path()
+                .join("missing.sock")
+                .to_str()
+                .expect("UTF-8 publisher path"),
+        )
+        .expect("absolute publisher path");
+        let request = release_frame();
+        let failure = UnixPublisherTransport
+            .exchange(&missing, &request, None)
+            .expect_err("missing publisher socket");
+        assert_eq!(failure.certainty, DeliveryCertainty::NotSent);
+
+        let (_directory, socket, listener) = publisher_listener();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept publisher connection");
+            let (actual_request, descriptors) = receive_request(stream);
+            assert_eq!(actual_request, request.as_bytes());
+            assert!(descriptors.is_empty());
+        });
+        let failure = UnixPublisherTransport
+            .exchange(&socket, &release_frame(), None)
+            .expect_err("publisher closed without response");
+        assert_eq!(failure.certainty, DeliveryCertainty::OutcomeUnknown);
+        server.join().expect("publisher server");
+    }
+
+    #[test]
+    fn unix_transport_rejects_listener_contract_mismatch_before_connecting() {
+        let directory = tempfile::tempdir().expect("publisher tempdir");
+        let missing = AbsolutePath::parse(
+            directory
+                .path()
+                .join("missing.sock")
+                .to_str()
+                .expect("UTF-8 publisher path"),
+        )
+        .expect("absolute publisher path");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("published listener");
+
+        for failure in [
+            UnixPublisherTransport
+                .exchange(&missing, &acquire_frame(), None)
+                .expect_err("missing required listener"),
+            UnixPublisherTransport
+                .exchange(&missing, &release_frame(), Some(listener.as_fd()))
+                .expect_err("surplus listener"),
+        ] {
+            assert_eq!(failure.certainty, DeliveryCertainty::Fatal);
+            assert_eq!(failure.error.kind, BackendErrorKind::Protocol);
+        }
+    }
+
+    #[test]
+    fn unix_transport_rejects_response_descriptors_and_trailing_bytes() {
+        let (_directory, socket, listener) = publisher_listener();
+        let response = release_response();
+        let file = File::open("/dev/null").expect("open descriptor fixture");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept publisher connection");
+            let (request, descriptors) = receive_request(stream.try_clone().expect("clone"));
+            assert_eq!(request, release_frame().as_bytes());
+            assert!(descriptors.is_empty());
+
+            let descriptors = [file.as_raw_fd()];
+            let control = [ControlMessage::ScmRights(&descriptors)];
+            let first = [IoSlice::new(&response[..1])];
+            assert_eq!(
+                sendmsg::<UnixAddr>(
+                    stream.as_raw_fd(),
+                    &first,
+                    &control,
+                    MsgFlags::empty(),
+                    None,
+                )
+                .expect("send unexpected response descriptor"),
+                1
+            );
+            let mut stream = stream;
+            if let Err(error) = stream.write_all(&response[1..]) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "only the client's expected early rejection may stop the fixture write"
+                );
+            }
+        });
+        let failure = UnixPublisherTransport
+            .exchange(&socket, &release_frame(), None)
+            .expect_err("unexpected response descriptor");
+        assert_eq!(failure.certainty, DeliveryCertainty::OutcomeUnknown);
+        assert_eq!(failure.error.kind, BackendErrorKind::Protocol);
+        server.join().expect("publisher server");
+
+        let (_directory, socket, listener) = publisher_listener();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept publisher connection");
+            let (_request, descriptors) = receive_request(stream.try_clone().expect("clone"));
+            assert!(descriptors.is_empty());
+            let mut response = release_response();
+            response.push(0);
+            send_response(stream, &response);
+        });
+        let failure = UnixPublisherTransport
+            .exchange(&socket, &release_frame(), None)
+            .expect_err("trailing response byte");
+        assert_eq!(failure.certainty, DeliveryCertainty::OutcomeUnknown);
+        assert_eq!(failure.error.kind, BackendErrorKind::Protocol);
+        server.join().expect("publisher server");
+    }
 }

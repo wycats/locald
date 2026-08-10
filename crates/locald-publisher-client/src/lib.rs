@@ -1,9 +1,9 @@
 //! Supported Rust client for locald's version-1 published-service protocol.
 //!
 //! The client owns strict discovery interpretation, origin-ordering typestate,
-//! frame construction, conservative renewal scheduling, and typed authority
-//! loss. Socket authentication and descriptor transfer are injected backend
-//! boundaries in this slice; the dedicated Unix transport activates later.
+//! frame construction, conservative renewal scheduling, typed authority loss,
+//! and the authenticated one-shot Unix transport used by production
+//! publishers.
 
 mod backend;
 #[allow(
@@ -23,7 +23,7 @@ mod wake;
 pub use backend::{
     AuthenticatedDaemonDiscovery, AuthenticatedValue, BackendError, BackendErrorKind,
     DeliveryCertainty, PublisherTransport, TransportFailure, TransportReply,
-    UnixCommandSocketDiscovery,
+    UnixCommandSocketDiscovery, UnixPublisherTransport,
 };
 pub use client::{
     ClientError, InstalledOrigin, Lease, OriginInstallError, PreparedPublication, PreparedRebind,
@@ -37,6 +37,8 @@ pub use installation::{
     InstallationError, InstallationEvidence, InstalledPublisher, probe_installation,
 };
 pub use supervisor::{LeaseSnapshot, LeaseState};
-pub use wake::{InactiveWakeMonitor, WakeError, WakeMonitor, WakeRegistration, WakeSink};
+pub use wake::{
+    InactiveWakeMonitor, SystemWakeMonitor, WakeError, WakeMonitor, WakeRegistration, WakeSink,
+};
 
 pub use locald_publisher_protocol as protocol;

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use postgresql_embedded::{PostgreSQL, Settings};
 use semver::VersionReq;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +9,100 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast};
 use tracing::{info, warn};
+
+const POSTGRES_SETUP_COMMAND: &str = "__postgres-setup";
+const MAX_POSTGRES_VERSION_LENGTH: usize = 128;
+
+/// Nonsecret settings passed to the isolated Postgres setup helper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostgresSetup {
+    version: String,
+    port: u16,
+    data_dir: PathBuf,
+    installation_dir: PathBuf,
+}
+
+impl PostgresSetup {
+    /// Validate one bounded Postgres setup request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the version exceeds the command-line bound or
+    /// either filesystem path is not absolute.
+    pub fn new(
+        version: String,
+        port: u16,
+        data_dir: PathBuf,
+        installation_dir: PathBuf,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            version.len() <= MAX_POSTGRES_VERSION_LENGTH,
+            "Postgres version exceeds {MAX_POSTGRES_VERSION_LENGTH} bytes"
+        );
+        anyhow::ensure!(
+            data_dir.is_absolute(),
+            "Postgres data directory must be absolute: {}",
+            data_dir.display()
+        );
+        anyhow::ensure!(
+            installation_dir.is_absolute(),
+            "Postgres installation directory must be absolute: {}",
+            installation_dir.display()
+        );
+
+        Ok(Self {
+            version,
+            port,
+            data_dir,
+            installation_dir,
+        })
+    }
+
+    fn command(&self, executable: &Path) -> Result<Command> {
+        anyhow::ensure!(
+            executable.is_absolute(),
+            "Postgres setup executable must be absolute: {}",
+            executable.display()
+        );
+
+        let mut command = Command::new(executable);
+        command
+            .arg(POSTGRES_SETUP_COMMAND)
+            .arg("--version")
+            .arg(&self.version)
+            .arg("--port")
+            .arg(self.port.to_string())
+            .arg("--data-dir")
+            .arg(&self.data_dir)
+            .arg("--installation-dir")
+            .arg(&self.installation_dir)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        Ok(command)
+    }
+}
+
+/// Perform opaque `postgresql_embedded` setup inside an isolated helper process.
+///
+/// # Errors
+///
+/// Returns an error if installation, extraction, or database initialization fails.
+pub async fn setup_postgres(request: PostgresSetup) -> Result<()> {
+    let version_req = VersionReq::from_str(&request.version).unwrap_or(VersionReq::STAR);
+    let settings = Settings {
+        port: request.port,
+        version: version_req,
+        data_dir: request.data_dir,
+        installation_dir: request.installation_dir,
+        temporary: false,
+        ..Default::default()
+    };
+
+    let mut postgres = PostgreSQL::new(settings);
+    let setup_result = postgres.setup().await.context("Failed to setup Postgres");
+    drop(postgres);
+    setup_result
+}
 
 /// Manages a `PostgreSQL` service instance.
 #[derive(Debug)]
@@ -63,33 +157,47 @@ impl PostgresRunner {
             self.name, self.version, self.port, self.data_dir
         );
 
+        let data_dir = absolute_path(&self.data_dir)?;
+
         // Ensure data directory exists (Async)
-        if !self.data_dir.exists() {
-            tokio::fs::create_dir_all(&self.data_dir)
+        if !data_dir.exists() {
+            tokio::fs::create_dir_all(&data_dir)
                 .await
                 .context("Failed to create data directory")?;
         }
 
         // Define installation directory
-        let install_dir = directories::ProjectDirs::from("com", "locald", "locald").map_or_else(
-            || PathBuf::from(".locald/postgres-dist"),
-            |d| d.data_dir().join("postgres-dist"),
+        let install_dir = absolute_path(
+            &directories::ProjectDirs::from("com", "locald", "locald").map_or_else(
+                || PathBuf::from(".locald/postgres-dist"),
+                |d| d.data_dir().join("postgres-dist"),
+            ),
+        )?;
+
+        let setup = PostgresSetup::new(
+            self.version.clone(),
+            self.port,
+            data_dir.clone(),
+            install_dir.clone(),
+        )?;
+        let executable = std::env::current_exe().context("Failed to locate locald executable")?;
+        let mut setup_command = setup.command(&executable)?;
+
+        // The helper starts without any daemon-owned publisher descriptor. Its
+        // later opaque extraction and initdb children therefore cannot inherit
+        // descriptors received by this process after the helper was created.
+        let setup_permit = crate::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+        let setup_spawn = setup_command.spawn();
+        drop(setup_permit);
+        let mut setup_child = setup_spawn.context("Failed to spawn Postgres setup helper")?;
+        let setup_status = setup_child
+            .wait()
+            .await
+            .context("Failed to wait for Postgres setup helper")?;
+        anyhow::ensure!(
+            setup_status.success(),
+            "Failed to setup Postgres: helper exited with {setup_status}"
         );
-
-        let version_req = VersionReq::from_str(&self.version).unwrap_or(VersionReq::STAR);
-
-        let settings = Settings {
-            port: self.port,
-            version: version_req,
-            data_dir: self.data_dir.clone(),
-            installation_dir: install_dir.clone(),
-            temporary: false,
-            ..Default::default()
-        };
-
-        // Use postgresql_embedded to install and initdb
-        let mut postgres = PostgreSQL::new(settings);
-        postgres.setup().await.context("Failed to setup Postgres")?;
 
         // Find the binary
         let binary_path = self.find_postgres_binary(&install_dir).await?;
@@ -97,7 +205,7 @@ impl PostgresRunner {
 
         // Run postgres manually
         let mut cmd = Command::new(&binary_path);
-        cmd.arg("-D").arg(&self.data_dir);
+        cmd.arg("-D").arg(&data_dir);
         cmd.arg("-p").arg(self.port.to_string());
         cmd.arg("-h").arg("127.0.0.1"); // Bind to localhost only
 
@@ -108,7 +216,10 @@ impl PostgresRunner {
         // Ensure it dies when we die (best effort)
         cmd.kill_on_drop(true);
 
-        let mut child = cmd.spawn().context("Failed to spawn postgres")?;
+        let spawn_permit = crate::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+        let spawn_result = cmd.spawn();
+        drop(spawn_permit);
+        let mut child = spawn_result.context("Failed to spawn postgres")?;
 
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
@@ -218,5 +329,76 @@ impl PostgresRunner {
     /// Get the port number.
     pub const fn port(&self) -> u16 {
         self.port
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("Failed to resolve current directory")?
+        .join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_command_contains_only_the_bounded_setup_request() {
+        let request = PostgresSetup::new(
+            "15.3".to_string(),
+            54321,
+            PathBuf::from("/data/postgres"),
+            PathBuf::from("/data/postgres-dist"),
+        )
+        .expect("valid setup request");
+
+        let command = request
+            .command(Path::new("/opt/locald/bin/locald"))
+            .expect("valid helper command");
+        let command = command.as_std();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "/opt/locald/bin/locald");
+        assert_eq!(
+            args,
+            [
+                "__postgres-setup",
+                "--version",
+                "15.3",
+                "--port",
+                "54321",
+                "--data-dir",
+                "/data/postgres",
+                "--installation-dir",
+                "/data/postgres-dist",
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_request_rejects_relative_paths_and_unbounded_versions() {
+        let relative_data = PostgresSetup::new(
+            "15".to_string(),
+            5432,
+            PathBuf::from("postgres"),
+            PathBuf::from("/data/postgres-dist"),
+        )
+        .expect_err("relative data path must fail");
+        assert!(relative_data.to_string().contains("must be absolute"));
+
+        let long_version = PostgresSetup::new(
+            "1".repeat(MAX_POSTGRES_VERSION_LENGTH + 1),
+            5432,
+            PathBuf::from("/data/postgres"),
+            PathBuf::from("/data/postgres-dist"),
+        )
+        .expect_err("unbounded version must fail");
+        assert!(long_version.to_string().contains("exceeds"));
     }
 }

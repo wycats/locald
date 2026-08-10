@@ -32,6 +32,62 @@
     ],
     "subcommands": [
       {
+        "name": "__postgres-setup",
+        "aliases": [],
+        "hidden": true,
+        "args": [
+          {
+            "long": "data-dir",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": true,
+            "positional": false
+          },
+          {
+            "long": "help",
+            "short": "h",
+            "aliases": [],
+            "global": false,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "installation-dir",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": true,
+            "positional": false
+          },
+          {
+            "long": "port",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": true,
+            "positional": false
+          },
+          {
+            "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "version",
+            "short": null,
+            "aliases": [],
+            "global": false,
+            "hidden": true,
+            "positional": false
+          }
+        ],
+        "subcommands": []
+      },
+      {
         "name": "__surface",
         "aliases": [],
         "hidden": true,
@@ -652,6 +708,13 @@
         "hidden": false,
         "args": [],
         "subcommands": [
+          {
+            "name": "__postgres-setup",
+            "aliases": [],
+            "hidden": true,
+            "args": [],
+            "subcommands": []
+          },
           {
             "name": "__surface",
             "aliases": [],

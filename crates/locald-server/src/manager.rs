@@ -19,6 +19,12 @@ use crate::lifecycle_transaction::{
 };
 use crate::plugins;
 use crate::port_allocator::{PortAllocator, PortGuard};
+#[cfg(test)]
+use crate::publication::PublisherAcquisitionPreparation;
+use crate::publication::{
+    PublisherAuthority, PublisherCandidateAcquisitionPreparation, PublisherPreparationDeadline,
+    PublisherPreparationWaiter, PublisherPrincipal, RetainedListenerCapability,
+};
 use crate::runtime::Runtime;
 use crate::state::StateManager;
 use anyhow::{Context, Result};
@@ -48,22 +54,25 @@ use locald_core::{
     AgentWorkspaceContext, AgentWorktreeStatus, AvailabilityBatch, AvailabilityBatchOperation,
     AvailabilityDemandStatus, AvailabilityError, AvailabilityReason, AvailabilityStore,
     CatalogError, CatalogPresence, Clock, ConvergenceDecision, DemandKey, DemandKind, DomainClaim,
-    DomainIndex, DomainName, DomainPattern, DomainTarget, EnsureDemandResult, ProjectAvailability,
-    ProjectAvailabilityStatus, ProjectDiscovery, ProjectInstanceId, ProjectInstanceOrigin,
-    ProjectLifecycleState, PublishedHttpHealthPolicy, PublishedServiceAdmission,
-    PublishedServiceDeclaration, RenewDemandResult, SemanticOrigin, SharedDomainIndex, SystemClock,
-    availability_path, sanitize_project_name_for_dns, sanitize_service_name_for_dns,
+    DomainError, DomainIndex, DomainName, DomainPattern, DomainTarget, EnsureDemandResult,
+    ProjectAvailability, ProjectAvailabilityStatus, ProjectDiscovery, ProjectInstanceId,
+    ProjectInstanceOrigin, ProjectLifecycleState, PublishedHttpHealthPolicy,
+    PublishedServiceAdmission, PublishedServiceDeclaration, RenewDemandResult, SemanticOrigin,
+    SharedDomainIndex, SystemClock, availability_path, sanitize_project_name_for_dns,
+    sanitize_service_name_for_dns,
 };
 use locald_hosts::HostSet;
+use locald_publisher_protocol as publisher_protocol;
 use nix::sys::signal::Signal;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, watch};
 use tracing::{error, info, warn};
 
 const LOG_BUFFER_SIZE: usize = 2000;
@@ -78,6 +87,7 @@ const BACKGROUND_SERVICE_READINESS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const PROXY_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVICE_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const MAX_PUBLISHER_BEGIN_OPERATIONS: usize = 256;
 
 fn domain_target_remains_compatible(
     index: &DomainIndex,
@@ -199,6 +209,10 @@ struct ReentrantAvailabilityTransition;
 pub trait HostSetWriter: Send + Sync + 'static {
     async fn replace_complete(&self, hosts: HostSet) -> Result<()>;
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("complete hosts synchronization failed")]
+struct CompleteHostSetSyncFailure;
 
 struct DefaultHostSetWriter;
 
@@ -600,9 +614,281 @@ struct PendingInitialAvailabilityGuard {
     pending: Arc<StdMutex<HashSet<ProjectInstanceId>>>,
 }
 
+struct AtomicPublicationInFlightGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for AtomicPublicationInFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, AtomicOrdering::Release);
+    }
+}
+
 struct ConfigApplyOutcome {
     instance_id: ProjectInstanceId,
     pending_initial: Option<PendingInitialAvailabilityGuard>,
+    publisher_preparation: Option<PublisherCandidateAcquisitionPreparation>,
+}
+
+type PublisherBeginCompletion =
+    Result<publisher_protocol::BeginAcquisitionResult, publisher_protocol::ProtocolError>;
+type PublisherBeginSender = watch::Sender<Option<PublisherBeginCompletion>>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct PublisherBeginRequest {
+    principal: PublisherPrincipal,
+    replacement: Option<publisher_protocol::AcquisitionAttemptHandle>,
+}
+
+struct PublisherBeginOperation {
+    id: u64,
+    request: PublisherBeginRequest,
+    sender: PublisherBeginSender,
+    validated: bool,
+    deadline: Option<PublisherPreparationDeadline>,
+}
+
+#[derive(Default)]
+struct PublisherBeginOperationState {
+    entries: HashMap<ServiceKey, PublisherBeginOperation>,
+    unvalidated_by_instance: HashMap<ProjectInstanceId, ServiceKey>,
+}
+
+#[derive(Clone)]
+struct PublisherBeginOperations {
+    state: Arc<StdMutex<PublisherBeginOperationState>>,
+    next_id: Arc<AtomicU64>,
+    max_operations: usize,
+}
+
+impl fmt::Debug for PublisherBeginOperations {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublisherBeginOperations")
+            .field("state", &"<redacted publisher operations>")
+            .finish_non_exhaustive()
+    }
+}
+
+enum PublisherBeginAdmission {
+    Owner {
+        id: u64,
+        receiver: watch::Receiver<Option<PublisherBeginCompletion>>,
+    },
+    Joined(watch::Receiver<Option<PublisherBeginCompletion>>),
+}
+
+struct PublisherBeginOwnerAdmissionGuard {
+    operations: PublisherBeginOperations,
+    key: ServiceKey,
+    id: u64,
+    armed: bool,
+}
+
+impl PublisherBeginOwnerAdmissionGuard {
+    fn new(operations: PublisherBeginOperations, key: ServiceKey, id: u64) -> Self {
+        Self {
+            operations,
+            key,
+            id,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublisherBeginOwnerAdmissionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.operations.finish(
+                &self.key,
+                self.id,
+                Err(publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::OperationCanceled,
+                    "publisher preparation admission was canceled",
+                    None,
+                )),
+            );
+        }
+    }
+}
+
+impl PublisherBeginOperations {
+    fn new() -> Self {
+        Self::with_max_operations(MAX_PUBLISHER_BEGIN_OPERATIONS)
+    }
+
+    fn with_max_operations(max_operations: usize) -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(PublisherBeginOperationState::default())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            max_operations,
+        }
+    }
+
+    fn admit(
+        &self,
+        key: &ServiceKey,
+        request: PublisherBeginRequest,
+    ) -> Result<PublisherBeginAdmission, publisher_protocol::ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = state.entries.get(key) {
+            if current.request == request {
+                return Ok(PublisherBeginAdmission::Joined(current.sender.subscribe()));
+            }
+            return Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::AcquisitionInProgress,
+                "another publisher request owns preparation for this service",
+                Some("wait for the current preparation to finish, then retry".to_owned()),
+            ));
+        }
+        if state.unvalidated_by_instance.contains_key(&key.instance()) {
+            return Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::AcquisitionInProgress,
+                "another unvalidated publisher request is being admitted for this project instance",
+                Some("wait for declaration validation to finish, then retry".to_owned()),
+            ));
+        }
+        if state.entries.len() >= self.max_operations {
+            return Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::Internal,
+                "publisher preparation capacity is temporarily exhausted",
+                Some(
+                    "wait for an in-flight publisher preparation to finish, then retry".to_owned(),
+                ),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, AtomicOrdering::Relaxed);
+        let (sender, receiver) = watch::channel(None);
+        state
+            .unvalidated_by_instance
+            .insert(key.instance(), key.clone());
+        state.entries.insert(
+            key.clone(),
+            PublisherBeginOperation {
+                id,
+                request,
+                sender,
+                validated: false,
+                deadline: None,
+            },
+        );
+        Ok(PublisherBeginAdmission::Owner { id, receiver })
+    }
+
+    /// Convert the project-level provisional slot into the exact validated
+    /// service slot. The operation ID fences a timed-out predecessor from
+    /// validating or reserving authority after a successor was admitted.
+    fn mark_validated(&self, key: &ServiceKey, id: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(operation) = state.entries.get_mut(key) else {
+            return false;
+        };
+        if operation.id != id {
+            return false;
+        }
+        operation.validated = true;
+        if state.unvalidated_by_instance.get(&key.instance()) == Some(key) {
+            state.unvalidated_by_instance.remove(&key.instance());
+        }
+        true
+    }
+
+    fn set_deadline(
+        &self,
+        key: &ServiceKey,
+        id: u64,
+        deadline: PublisherPreparationDeadline,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(operation) = state.entries.get_mut(key) else {
+            return false;
+        };
+        if operation.id != id {
+            return false;
+        }
+        operation.deadline = Some(deadline);
+        true
+    }
+
+    #[cfg(test)]
+    fn deadline(&self, key: &ServiceKey) -> Option<PublisherPreparationDeadline> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(key)
+            .and_then(|operation| operation.deadline.clone())
+    }
+
+    fn is_current(&self, key: &ServiceKey, id: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(key)
+            .is_some_and(|operation| operation.id == id)
+    }
+
+    fn finish(&self, key: &ServiceKey, id: u64, completion: PublisherBeginCompletion) {
+        let sender = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .entries
+                .get(key)
+                .is_none_or(|operation| operation.id != id)
+            {
+                return;
+            }
+            let operation = state
+                .entries
+                .remove(key)
+                .expect("publisher operation was just fenced by ID");
+            if !operation.validated
+                && state.unvalidated_by_instance.get(&key.instance()) == Some(key)
+            {
+                state.unvalidated_by_instance.remove(&key.instance());
+            }
+            Some(operation.sender)
+        };
+        if let Some(sender) = sender {
+            sender.send_replace(Some(completion));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublisherColdAdmission<'a> {
+    operation_id: u64,
+    key: &'a ServiceKey,
+    deadline: &'a PublisherPreparationDeadline,
+    principal: &'a PublisherPrincipal,
+    replacement: Option<&'a publisher_protocol::AcquisitionAttemptHandle>,
+}
+
+struct PublisherAcquisitionOperation {
+    arguments: publisher_protocol::BeginAcquisitionArguments,
+    principal: PublisherPrincipal,
+    project_locator: PathBuf,
+    resolved: ProjectInstanceId,
+    key: ServiceKey,
+    operation_id: u64,
+    deadline: PublisherPreparationDeadline,
 }
 
 /// The result of publishing one catalog target together with the authority to
@@ -635,6 +921,7 @@ struct ConfigApplyOptions<'a> {
     service_readiness_timeout: std::time::Duration,
     agent_conversation: Option<&'a AgentConversationKey>,
     preserve_projection_for_config: Option<&'a LocaldConfig>,
+    publisher_cold_admission: Option<PublisherColdAdmission<'a>>,
 }
 
 impl<'a> ConfigApplyOptions<'a> {
@@ -645,6 +932,7 @@ impl<'a> ConfigApplyOptions<'a> {
             service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
             agent_conversation: None,
             preserve_projection_for_config: None,
+            publisher_cold_admission: None,
         }
     }
 
@@ -657,6 +945,7 @@ impl<'a> ConfigApplyOptions<'a> {
             service_readiness_timeout,
             agent_conversation: None,
             preserve_projection_for_config: None,
+            publisher_cold_admission: None,
         }
     }
 
@@ -670,6 +959,14 @@ impl<'a> ConfigApplyOptions<'a> {
 
     const fn preserving_projection_for(mut self, config: &'a LocaldConfig) -> Self {
         self.preserve_projection_for_config = Some(config);
+        self
+    }
+
+    const fn with_publisher_cold_admission(
+        mut self,
+        admission: PublisherColdAdmission<'a>,
+    ) -> Self {
+        self.publisher_cold_admission = Some(admission);
         self
     }
 }
@@ -795,11 +1092,15 @@ pub struct ProcessManager {
     watchers: Arc<Mutex<HashMap<PathBuf, ConfigWatcher>>>,
     registry: Arc<Mutex<Registry>>,
     domain_index: SharedDomainIndex,
+    publisher_authority: PublisherAuthority,
+    publisher_begin_operations: PublisherBeginOperations,
+    publisher_transition_lock: Arc<Mutex<()>>,
     attachments: Arc<Mutex<AttachmentStore>>,
     attachment_transition_lock: Arc<Mutex<()>>,
     lifecycle_publication_lock: Arc<Mutex<()>>,
     lifecycle_recovery_required: Arc<AtomicBool>,
     catalog_publication_recovery_required: Arc<AtomicBool>,
+    catalog_publication_in_flight: Arc<AtomicBool>,
     pending_initial_availability: Arc<StdMutex<HashSet<ProjectInstanceId>>>,
     health_monitor: HealthMonitor,
     factories: Vec<Arc<dyn ServiceFactory>>,
@@ -826,6 +1127,18 @@ pub struct ProcessManager {
     shutting_down: Arc<AtomicBool>,
     #[cfg(test)]
     config_publication_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
+    publisher_candidate_convergence_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
+    publisher_post_admission_revalidation_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
+    publisher_final_transition_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
+    #[cfg(test)]
+    publisher_prevalidation_work_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    publisher_post_admission_revalidation_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    publisher_final_transition_wait_count: Arc<AtomicU64>,
     #[cfg(test)]
     catalog_verification_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
     #[cfg(test)]
@@ -1185,12 +1498,15 @@ impl ProcessManager {
         let proxy_ports = Arc::new(Mutex::new((None, None)));
         let proxy_ports_changed = Arc::new(Notify::new());
 
-        let (domain_index, catalog_publication_journal) = {
+        let (domain_index, publisher_authority, catalog_publication_journal) = {
             let registry_snapshot = registry
                 .try_lock()
                 .context("project identity catalog is busy during manager initialization")?;
             (
                 SharedDomainIndex::new(registry_snapshot.domain_index().clone()),
+                PublisherAuthority::new(&registry_snapshot)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+                    .context("failed to initialize published endpoint authority")?,
                 CatalogPublicationJournal::for_catalog_path(registry_snapshot.storage_path())
                     .context("failed to initialize catalog publication journal")?,
             )
@@ -1228,11 +1544,15 @@ impl ProcessManager {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             registry,
             domain_index,
+            publisher_authority,
+            publisher_begin_operations: PublisherBeginOperations::new(),
+            publisher_transition_lock: Arc::new(Mutex::new(())),
             attachments,
             attachment_transition_lock: Arc::new(Mutex::new(())),
             lifecycle_publication_lock: Arc::new(Mutex::new(())),
             lifecycle_recovery_required: Arc::new(AtomicBool::new(false)),
             catalog_publication_recovery_required: Arc::new(AtomicBool::new(false)),
+            catalog_publication_in_flight: Arc::new(AtomicBool::new(false)),
             pending_initial_availability: Arc::new(StdMutex::new(HashSet::new())),
             health_monitor,
             factories,
@@ -1256,6 +1576,18 @@ impl ProcessManager {
             shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             config_publication_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            publisher_candidate_convergence_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            publisher_post_admission_revalidation_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            publisher_final_transition_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            publisher_prevalidation_work_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            publisher_post_admission_revalidation_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            publisher_final_transition_wait_count: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             catalog_verification_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -1287,6 +1619,69 @@ impl ProcessManager {
     async fn wait_at_config_publication_hook(&self) {
         let hook = self
             .config_publication_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_publisher_candidate_convergence_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .publisher_candidate_convergence_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_publisher_candidate_convergence_hook(&self) {
+        let hook = self
+            .publisher_candidate_convergence_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_publisher_post_admission_revalidation_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .publisher_post_admission_revalidation_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_publisher_post_admission_revalidation_hook(&self) {
+        let hook = self
+            .publisher_post_admission_revalidation_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_publisher_final_transition_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .publisher_final_transition_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_publisher_final_transition_hook(&self) {
+        let hook = self
+            .publisher_final_transition_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -1483,12 +1878,78 @@ impl ProcessManager {
                                 .to_owned(),
                         ),
                     ),
-                    Ok(false) => (
-                        PublicationState::WaitingForPublisher,
-                        "The stable service identity is declared, but no external publisher currently fulfills it."
-                            .to_owned(),
-                        Some("Start the service with its owning workflow.".to_owned()),
-                    ),
+                    Ok(false) => {
+                        let key = ServiceKey::new(
+                            record.id,
+                            ServiceName::new(declaration.service_name.as_str()),
+                        );
+                        match self.publisher_authority.projection(&key).await {
+                            Ok(Some((PublicationState::CheckingEndpoint, _))) => (
+                                PublicationState::CheckingEndpoint,
+                                "The owning workflow has published an exact endpoint, but locald has not authorized it for routing yet."
+                                    .to_owned(),
+                                Some(
+                                    "Wait for locald to verify the published endpoint."
+                                        .to_owned(),
+                                ),
+                            ),
+                            Ok(Some((PublicationState::EndpointUnhealthy, _))) => (
+                                PublicationState::EndpointUnhealthy,
+                                "The owning workflow is publishing this service, but its exact endpoint is unhealthy."
+                                    .to_owned(),
+                                Some(
+                                    "Inspect the owning workflow and its `/api/health` endpoint."
+                                        .to_owned(),
+                                ),
+                            ),
+                            Ok(Some((PublicationState::Ready, _))) => (
+                                PublicationState::Ready,
+                                "The owning workflow is publishing a healthy endpoint through this stable origin."
+                                    .to_owned(),
+                                None,
+                            ),
+                            Ok(Some((PublicationState::RoutePaused, _))) => (
+                                PublicationState::RoutePaused,
+                                "The project route is paused; locald is preserving this published origin without routing it."
+                                    .to_owned(),
+                                Some(
+                                    "Resume the project to allow its owning workflow to restore publication."
+                                        .to_owned(),
+                                ),
+                            ),
+                            Ok(Some((PublicationState::InstanceMissing, _))) => (
+                                PublicationState::InstanceMissing,
+                                "The worktree for this published service is missing; locald is preserving its stable origin without routing it."
+                                    .to_owned(),
+                                Some(
+                                    "Restore the worktree, or explicitly forget the project if this identity is no longer needed."
+                                        .to_owned(),
+                                ),
+                            ),
+                            Ok(Some((PublicationState::WaitingForPublisher, _)) | None) => (
+                                PublicationState::WaitingForPublisher,
+                                "The stable service identity is declared, but no external publisher currently fulfills it."
+                                    .to_owned(),
+                                Some("Start the service with its owning workflow.".to_owned()),
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    "failed to read publication authority for service {} in instance {}: {error}",
+                                    declaration.service_name,
+                                    declaration.project_instance_id
+                                );
+                                (
+                                    PublicationState::WaitingForPublisher,
+                                    "The stable service identity is declared, but locald could not verify its publisher authority."
+                                        .to_owned(),
+                                    Some(
+                                        "Inspect locald status, then retry from the owning workflow."
+                                            .to_owned(),
+                                    ),
+                                )
+                            }
+                        }
+                    }
                     Err(error) => {
                         warn!(
                             "failed to read availability while projecting published service {} in instance {}: {error}",
@@ -2307,25 +2768,33 @@ impl ProcessManager {
         }
     }
 
-    async fn broadcast_published_service_projection_if_pause_changed(
+    async fn publish_publisher_pause_transition(
         &self,
         instance_id: ProjectInstanceId,
         was_paused: bool,
         is_paused: bool,
-    ) -> bool {
-        if was_paused == is_paused {
-            return false;
-        }
+    ) -> Result<bool> {
+        let changed = was_paused != is_paused;
+        // Always reaffirm the durable value. A prior lifecycle transaction can
+        // have committed while a resume barrier was pending; retrying the
+        // idempotent lifecycle operation must heal endpoint authority rather
+        // than returning early from the durable no-op.
+        let _publisher_transition = self.publisher_transition_lock.lock().await;
+        self.publisher_authority
+            .set_project_paused(instance_id, is_paused)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("failed to publish project pause policy to endpoint authority")?;
         let has_published_declarations = self
             .registry
             .lock()
             .await
             .published_declarations_for_instance(instance_id)
             .is_some_and(|declarations| !declarations.is_empty());
-        if has_published_declarations {
+        if changed && has_published_declarations {
             let _ = self.event_sender.send(Event::ServiceListChanged);
         }
-        has_published_declarations
+        Ok(changed && has_published_declarations)
     }
 
     fn clear_log_buffer(&self, key: &ServiceKey) {
@@ -2458,6 +2927,761 @@ impl ProcessManager {
                 "published endpoint project locator matches multiple catalogued project instances"
             ),
         }
+    }
+
+    /// Return the daemon-lifetime authority used by the dedicated publisher
+    /// transport after a request has crossed the manager's preparation gate.
+    #[must_use]
+    pub(crate) fn publisher_authority(&self) -> PublisherAuthority {
+        self.publisher_authority.clone()
+    }
+
+    /// Reconcile durable catalog identity and availability pause policy into
+    /// the daemon-lifetime publisher authority before transport discovery is
+    /// advertised.
+    pub(crate) async fn hydrate_publisher_availability_state(&self) -> Result<()> {
+        let _publication_guard = self.lifecycle_publication_lock.lock().await;
+        let _publisher_transition = self.publisher_transition_lock.lock().await;
+        self.ensure_lifecycle_publication_available()?;
+        let catalog = self.registry.lock().await.clone();
+        self.publisher_authority
+            .reconcile_catalog(&catalog)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("failed to reconcile publisher declarations during startup")?;
+
+        for instance_id in catalog.instances.keys().copied() {
+            let paused = if self.availability_record_exists(instance_id).await? {
+                self.load_availability(instance_id)
+                    .await?
+                    .snapshot()
+                    .await?
+                    .is_paused()
+            } else {
+                false
+            };
+            self.publisher_authority
+                .set_project_paused(instance_id, paused)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .with_context(|| {
+                    format!(
+                        "failed to hydrate publisher pause policy for project instance {instance_id}"
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Resolve and prepare one declared published service under the same
+    /// lifecycle/domain/hosts serialization boundary as configuration
+    /// publication.
+    pub(crate) async fn begin_published_endpoint_acquisition(
+        &self,
+        arguments: publisher_protocol::BeginAcquisitionArguments,
+        principal: PublisherPrincipal,
+    ) -> Result<publisher_protocol::BeginAcquisitionResult, publisher_protocol::ProtocolError> {
+        self.ensure_accepting_new_lifecycle_request()
+            .map_err(|error| {
+                publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::Internal,
+                    error.to_string(),
+                    Some("restart locald so lifecycle recovery can finish".to_owned()),
+                )
+            })?;
+        let project_locator = arguments.project_locator.as_path().to_path_buf();
+
+        let resolved = self
+            .resolve_published_endpoint_project_instance(&project_locator)
+            .await
+            .map_err(|error| {
+                publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::ProjectNotFound,
+                    error.to_string(),
+                    Some("run `locald up` once from this project, then retry".to_owned()),
+                )
+            })?;
+        if resolved.as_uuid() != arguments.expected_project_instance_id.as_uuid() {
+            return Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::ProjectInstanceMismatch,
+                "the project locator no longer resolves to the expected physical worktree",
+                Some("resolve the project through locald again before retrying".to_owned()),
+            ));
+        }
+        let key = ServiceKey::new(resolved, ServiceName::new(arguments.service_name.as_str()));
+        let lifecycle_availability = self
+            .ensure_publisher_lifecycle_available()
+            .map_err(|error| {
+                publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::Internal,
+                    error.to_string(),
+                    Some("restart locald so lifecycle recovery can finish".to_owned()),
+                )
+            });
+        let request = PublisherBeginRequest {
+            principal: principal.clone(),
+            replacement: arguments.replace_terminal_attempt_handle.clone(),
+        };
+        let admission = self.publisher_begin_operations.admit(&key, request)?;
+        let receiver = match admission {
+            PublisherBeginAdmission::Joined(receiver) => receiver,
+            PublisherBeginAdmission::Owner { id, receiver } => {
+                if let Err(error) = lifecycle_availability {
+                    self.publisher_begin_operations.finish(&key, id, Err(error));
+                    return Self::wait_for_publisher_begin(receiver).await;
+                }
+                let admission_guard = PublisherBeginOwnerAdmissionGuard::new(
+                    self.publisher_begin_operations.clone(),
+                    key.clone(),
+                    id,
+                );
+                let deadline = match self
+                    .publisher_authority
+                    .begin_candidate_preparation_deadline()
+                    .await
+                {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        self.publisher_begin_operations.finish(&key, id, Err(error));
+                        admission_guard.disarm();
+                        return Self::wait_for_publisher_begin(receiver).await;
+                    }
+                };
+                if !self
+                    .publisher_begin_operations
+                    .set_deadline(&key, id, deadline.clone())
+                {
+                    admission_guard.disarm();
+                    return Self::wait_for_publisher_begin(receiver).await;
+                }
+                self.monitor_publisher_admission_deadline(
+                    key.clone(),
+                    id,
+                    deadline.clone(),
+                    receiver.clone(),
+                );
+                let worker_manager = self.clone();
+                let completion_manager = self.clone();
+                let worker_key = key.clone();
+                let completion_key = key.clone();
+                let worker = tokio::spawn(async move {
+                    worker_manager
+                        .execute_published_endpoint_acquisition(PublisherAcquisitionOperation {
+                            arguments,
+                            principal,
+                            project_locator,
+                            resolved,
+                            key: worker_key,
+                            operation_id: id,
+                            deadline,
+                        })
+                        .await
+                });
+                tokio::spawn(async move {
+                    let completion = match worker.await {
+                        Ok(completion) => completion,
+                        Err(error) => Err(publisher_protocol::ProtocolError::new(
+                            publisher_protocol::StableErrorCode::Internal,
+                            format!("publisher preparation worker failed: {error}"),
+                            Some("retry publication after locald recovers".to_owned()),
+                        )),
+                    };
+                    completion_manager.publisher_begin_operations.finish(
+                        &completion_key,
+                        id,
+                        completion,
+                    );
+                });
+                admission_guard.disarm();
+                receiver
+            }
+        };
+        Self::wait_for_publisher_begin(receiver).await
+    }
+
+    async fn execute_published_endpoint_acquisition(
+        &self,
+        operation: PublisherAcquisitionOperation,
+    ) -> PublisherBeginCompletion {
+        let PublisherAcquisitionOperation {
+            arguments,
+            principal,
+            project_locator,
+            resolved,
+            key,
+            operation_id,
+            deadline,
+        } = operation;
+        // The manager operation is already visible to same-request joiners and
+        // competing principals before any cold config or hosts work begins.
+        let publisher_cold_admission = PublisherColdAdmission {
+            operation_id,
+            key: &key,
+            deadline: &deadline,
+            principal: &principal,
+            replacement: arguments.replace_terminal_attempt_handle.as_ref(),
+        };
+        let mut preparation = Some(
+            self.admit_published_endpoint_config_if_needed(
+                &project_locator,
+                resolved,
+                publisher_cold_admission,
+            )
+            .await
+            .map_err(|error| Self::publisher_config_admission_error(&error))?,
+        );
+
+        // An exact authority join observes the owner's already-running
+        // convergence. It must not repeat post-admission Git discovery or wait
+        // behind manager locks after that owner has completed or been fenced.
+        if matches!(
+            preparation.as_ref(),
+            Some(PublisherCandidateAcquisitionPreparation::Joined(_))
+        ) {
+            let Some(PublisherCandidateAcquisitionPreparation::Joined(waiter)) = preparation.take()
+            else {
+                unreachable!("joined preparation was just matched");
+            };
+            return self
+                .publisher_authority
+                .wait_for_candidate_preparation(waiter)
+                .await;
+        }
+
+        let revalidated = match self
+            .await_publisher_candidate_convergence(
+                Some(publisher_cold_admission),
+                &mut preparation,
+                async {
+                    #[cfg(test)]
+                    {
+                        self.wait_at_publisher_post_admission_revalidation_hook()
+                            .await;
+                        self.publisher_post_admission_revalidation_count
+                            .fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    self.resolve_published_endpoint_project_instance(&project_locator)
+                        .await
+                },
+            )
+            .await
+        {
+            Ok(Ok(revalidated)) => revalidated,
+            Ok(Err(error)) => {
+                let protocol_error = publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::ProjectNotFound,
+                    error.to_string(),
+                    Some("resolve the project through locald again before retrying".to_owned()),
+                );
+                self.fail_publisher_candidate_with_protocol_error(
+                    &mut preparation,
+                    protocol_error.clone(),
+                )
+                .await;
+                return Err(protocol_error);
+            }
+            Err(error) => {
+                let protocol_error = Self::publisher_config_admission_error(&error);
+                self.fail_publisher_candidate_with_protocol_error(
+                    &mut preparation,
+                    protocol_error.clone(),
+                )
+                .await;
+                return Err(protocol_error);
+            }
+        };
+        if revalidated != resolved {
+            let error = publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::ProjectInstanceMismatch,
+                "the project identity changed while its published declaration was being admitted",
+                Some("resolve the project through locald again before retrying".to_owned()),
+            );
+            self.fail_publisher_candidate_with_protocol_error(&mut preparation, error.clone())
+                .await;
+            return Err(error);
+        }
+
+        let _transition = match self
+            .await_publisher_candidate_convergence(
+                Some(publisher_cold_admission),
+                &mut preparation,
+                async {
+                    #[cfg(test)]
+                    {
+                        self.wait_at_publisher_final_transition_hook().await;
+                        self.publisher_final_transition_wait_count
+                            .fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    self.publisher_transition_lock.lock().await
+                },
+            )
+            .await
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let protocol_error = Self::publisher_config_admission_error(&error);
+                self.fail_publisher_candidate_with_protocol_error(
+                    &mut preparation,
+                    protocol_error.clone(),
+                )
+                .await;
+                return Err(protocol_error);
+            }
+        };
+        let Some(PublisherCandidateAcquisitionPreparation::Required(permit)) = preparation.take()
+        else {
+            unreachable!("joined preparation returned before post-admission convergence");
+        };
+        self.publisher_authority
+            .complete_candidate_acquisition_preparation(*permit)
+            .await
+    }
+
+    async fn wait_for_publisher_begin(
+        mut receiver: watch::Receiver<Option<PublisherBeginCompletion>>,
+    ) -> PublisherBeginCompletion {
+        loop {
+            let completion = receiver.borrow().clone();
+            if let Some(completion) = completion {
+                return completion;
+            }
+            if receiver.changed().await.is_err() {
+                return Err(publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::OperationCanceled,
+                    "publisher preparation coordination ended before completion",
+                    None,
+                ));
+            }
+        }
+    }
+
+    fn monitor_publisher_candidate_preparation(
+        &self,
+        key: ServiceKey,
+        operation_id: u64,
+        waiter: PublisherPreparationWaiter,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let completion = manager
+                .publisher_authority
+                .wait_for_candidate_preparation(waiter)
+                .await;
+            manager
+                .publisher_begin_operations
+                .finish(&key, operation_id, completion);
+        });
+    }
+
+    fn monitor_publisher_admission_deadline(
+        &self,
+        key: ServiceKey,
+        operation_id: u64,
+        deadline: PublisherPreparationDeadline,
+        completion: watch::Receiver<Option<PublisherBeginCompletion>>,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                error = manager
+                    .publisher_authority
+                    .wait_for_candidate_preparation_deadline(deadline) => {
+                    manager.publisher_begin_operations.finish(
+                        &key,
+                        operation_id,
+                        Err(error),
+                    );
+                }
+                _ = Self::wait_for_publisher_begin(completion) => {}
+            }
+        });
+    }
+
+    fn publisher_candidate_canceled_protocol_error() -> publisher_protocol::ProtocolError {
+        publisher_protocol::ProtocolError::new(
+            publisher_protocol::StableErrorCode::OperationCanceled,
+            "publisher candidate convergence is no longer current",
+            None,
+        )
+    }
+
+    fn publisher_candidate_canceled_error() -> anyhow::Error {
+        anyhow::Error::new(Self::publisher_candidate_canceled_protocol_error())
+    }
+
+    fn ensure_publisher_cold_admission_current(
+        &self,
+        admission: Option<PublisherColdAdmission<'_>>,
+    ) -> Result<()> {
+        if let Some(admission) = admission {
+            if !self
+                .publisher_begin_operations
+                .is_current(admission.key, admission.operation_id)
+            {
+                return Err(Self::publisher_candidate_canceled_error());
+            }
+        }
+        Ok(())
+    }
+
+    async fn await_publisher_cold_admission<T, F>(
+        &self,
+        admission: Option<PublisherColdAdmission<'_>>,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = T>,
+    {
+        self.ensure_publisher_cold_admission_current(admission)?;
+        let output = if let Some(admission) = admission {
+            tokio::select! {
+                biased;
+                error = self.publisher_authority.wait_for_candidate_preparation_deadline(
+                    admission.deadline.clone(),
+                ) => {
+                    return Err(anyhow::Error::new(error));
+                }
+                output = future => output,
+            }
+        } else {
+            future.await
+        };
+        self.ensure_publisher_cold_admission_current(admission)?;
+        Ok(output)
+    }
+
+    fn ensure_publisher_candidate_convergence_current(
+        &self,
+        admission: Option<PublisherColdAdmission<'_>>,
+        preparation: Option<&PublisherCandidateAcquisitionPreparation>,
+    ) -> Result<()> {
+        let Some(admission) = admission else {
+            return Ok(());
+        };
+        if !self
+            .publisher_begin_operations
+            .is_current(admission.key, admission.operation_id)
+        {
+            return Err(Self::publisher_candidate_canceled_error());
+        }
+        if preparation.is_some_and(|preparation| {
+            matches!(
+                preparation,
+                PublisherCandidateAcquisitionPreparation::Required(permit)
+                    if permit.is_cancelled()
+            )
+        }) {
+            return Err(Self::publisher_candidate_canceled_error());
+        }
+        Ok(())
+    }
+
+    async fn await_publisher_candidate_convergence<T, F>(
+        &self,
+        admission: Option<PublisherColdAdmission<'_>>,
+        preparation: &mut Option<PublisherCandidateAcquisitionPreparation>,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = T>,
+    {
+        self.ensure_publisher_candidate_convergence_current(admission, preparation.as_ref())?;
+        let output = match (admission, preparation.as_mut()) {
+            (Some(admission), Some(PublisherCandidateAcquisitionPreparation::Required(permit))) => {
+                tokio::select! {
+                    biased;
+                    () = permit.cancelled() => {
+                        return Err(Self::publisher_candidate_canceled_error());
+                    }
+                    error = self.publisher_authority.wait_for_candidate_preparation_deadline(
+                        admission.deadline.clone(),
+                    ) => {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    output = future => output,
+                }
+            }
+            (Some(admission), _) => {
+                tokio::select! {
+                    biased;
+                    error = self.publisher_authority.wait_for_candidate_preparation_deadline(
+                        admission.deadline.clone(),
+                    ) => {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    output = future => output,
+                }
+            }
+            (None, Some(PublisherCandidateAcquisitionPreparation::Required(permit))) => {
+                tokio::select! {
+                    biased;
+                    () = permit.cancelled() => {
+                        return Err(Self::publisher_candidate_canceled_error());
+                    }
+                    output = future => output,
+                }
+            }
+            (None, _) => future.await,
+        };
+        self.ensure_publisher_candidate_convergence_current(admission, preparation.as_ref())?;
+        Ok(output)
+    }
+
+    async fn fail_publisher_candidate_after_config_error(
+        &self,
+        preparation: &mut Option<PublisherCandidateAcquisitionPreparation>,
+        error: &anyhow::Error,
+    ) {
+        self.fail_publisher_candidate_with_protocol_error(
+            preparation,
+            Self::publisher_config_admission_error(error),
+        )
+        .await;
+    }
+
+    async fn fail_publisher_candidate_with_protocol_error(
+        &self,
+        preparation: &mut Option<PublisherCandidateAcquisitionPreparation>,
+        protocol_error: publisher_protocol::ProtocolError,
+    ) {
+        let Some(PublisherCandidateAcquisitionPreparation::Required(permit)) = preparation.take()
+        else {
+            return;
+        };
+        let _ = self
+            .publisher_authority
+            .fail_candidate_acquisition_preparation(*permit, protocol_error)
+            .await;
+    }
+
+    fn publisher_config_admission_error(
+        error: &anyhow::Error,
+    ) -> publisher_protocol::ProtocolError {
+        if let Some(protocol_error) = error.downcast_ref::<publisher_protocol::ProtocolError>() {
+            return protocol_error.clone();
+        }
+        if error.downcast_ref::<CompleteHostSetSyncFailure>().is_some() {
+            return publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::HostsSyncFailed,
+                format!("could not synchronize the complete locald hosts set: {error}"),
+                Some(
+                    "repair `sudo locald admin setup` and hosts synchronization, then retry"
+                        .to_owned(),
+                ),
+            );
+        }
+        if let Some(domain_error) = error
+            .downcast_ref::<DomainError>()
+            .filter(|domain_error| Self::is_cross_instance_domain_conflict(domain_error))
+        {
+            return publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::DomainConflict,
+                domain_error.to_string(),
+                Some(
+                    "choose a domain not claimed by another project instance, then retry"
+                        .to_owned(),
+                ),
+            );
+        }
+        publisher_protocol::ProtocolError::new(
+            publisher_protocol::StableErrorCode::Internal,
+            format!("locald could not finish publisher declaration admission: {error}"),
+            Some(
+                "retry after locald state changes; restart locald if the error persists".to_owned(),
+            ),
+        )
+    }
+
+    fn is_cross_instance_domain_conflict(error: &DomainError) -> bool {
+        let DomainError::Conflict {
+            existing,
+            requested,
+            ..
+        } = error
+        else {
+            return false;
+        };
+        let DomainTarget::Service {
+            project_instance_id: existing_instance,
+            ..
+        } = existing.as_ref()
+        else {
+            return false;
+        };
+        let DomainTarget::Service {
+            project_instance_id: requested_instance,
+            ..
+        } = requested.as_ref()
+        else {
+            return false;
+        };
+        existing_instance != requested_instance
+    }
+
+    pub(crate) async fn acquire_published_endpoint(
+        &self,
+        handle: &publisher_protocol::AcquisitionAttemptHandle,
+        principal: &PublisherPrincipal,
+        acknowledged_origin: &publisher_protocol::SemanticOrigin,
+        capability: RetainedListenerCapability,
+    ) -> Result<publisher_protocol::AcquireResult, publisher_protocol::ProtocolError> {
+        let _publication_guard = self.publisher_transition_lock.lock().await;
+        self.ensure_publisher_mutation_available()?;
+        self.publisher_authority
+            .acquire(handle, principal, acknowledged_origin, capability)
+            .await
+    }
+
+    pub(crate) async fn renew_published_endpoint(
+        &self,
+        handle: &publisher_protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+    ) -> Result<publisher_protocol::RenewResult, publisher_protocol::ProtocolError> {
+        let _publication_guard = self.publisher_transition_lock.lock().await;
+        self.ensure_publisher_mutation_available()?;
+        self.publisher_authority.renew(handle, principal).await
+    }
+
+    pub(crate) async fn begin_published_endpoint_rebind(
+        &self,
+        handle: &publisher_protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+        expected_binding_revision: publisher_protocol::BindingRevision,
+        replacement: Option<&publisher_protocol::RebindAttemptHandle>,
+    ) -> Result<publisher_protocol::BeginRebindResult, publisher_protocol::ProtocolError> {
+        let _publication_guard = self.publisher_transition_lock.lock().await;
+        self.ensure_publisher_mutation_available()?;
+        self.publisher_authority
+            .begin_rebind(handle, principal, expected_binding_revision, replacement)
+            .await
+    }
+
+    pub(crate) async fn rebind_published_endpoint(
+        &self,
+        handle: &publisher_protocol::RebindAttemptHandle,
+        principal: &PublisherPrincipal,
+        acknowledged_origin: &publisher_protocol::SemanticOrigin,
+        capability: RetainedListenerCapability,
+    ) -> Result<publisher_protocol::RebindResult, publisher_protocol::ProtocolError> {
+        let _publication_guard = self.publisher_transition_lock.lock().await;
+        self.ensure_publisher_mutation_available()?;
+        self.publisher_authority
+            .rebind(handle, principal, acknowledged_origin, capability)
+            .await
+    }
+
+    pub(crate) async fn release_published_endpoint(
+        &self,
+        handle: &publisher_protocol::LeaseHandle,
+        principal: &PublisherPrincipal,
+    ) -> Result<publisher_protocol::ReleaseResult, publisher_protocol::ProtocolError> {
+        let _publication_guard = self.publisher_transition_lock.lock().await;
+        self.ensure_publisher_mutation_available()?;
+        self.publisher_authority.release(handle, principal).await
+    }
+
+    fn ensure_publisher_mutation_available(&self) -> Result<(), publisher_protocol::ProtocolError> {
+        self.ensure_accepting_new_lifecycle_request()
+            .and_then(|()| self.ensure_publisher_lifecycle_available())
+            .map_err(|error| {
+                publisher_protocol::ProtocolError::new(
+                    publisher_protocol::StableErrorCode::Internal,
+                    error.to_string(),
+                    Some("restart locald so lifecycle recovery can finish".to_owned()),
+                )
+            })
+    }
+
+    fn ensure_publisher_lifecycle_available(&self) -> Result<()> {
+        let healthy_publication_in_flight = self
+            .catalog_publication_in_flight
+            .load(AtomicOrdering::Acquire);
+        let lifecycle_recovery_required = self
+            .lifecycle_recovery_required
+            .load(AtomicOrdering::Acquire);
+        anyhow::ensure!(
+            !lifecycle_recovery_required || healthy_publication_in_flight,
+            "lifecycle state requires daemon restart before publisher operations"
+        );
+        let catalog_recovery_required = self
+            .catalog_publication_recovery_required
+            .load(AtomicOrdering::Acquire);
+        anyhow::ensure!(
+            !catalog_recovery_required || healthy_publication_in_flight,
+            "catalog publication requires daemon restart before publisher operations"
+        );
+        Ok(())
+    }
+
+    async fn admit_published_endpoint_config_if_needed(
+        &self,
+        project_locator: &Path,
+        expected_instance: ProjectInstanceId,
+        publisher_admission: PublisherColdAdmission<'_>,
+    ) -> Result<PublisherCandidateAcquisitionPreparation> {
+        let (project_path, transition_lock) = self
+            .await_publisher_cold_admission(
+                Some(publisher_admission),
+                self.transition_lock_for_path(project_locator),
+            )
+            .await?;
+        let _transition_guard = self
+            .await_publisher_cold_admission(Some(publisher_admission), transition_lock.lock())
+            .await?;
+        let _runtime_projection_guard = self
+            .await_publisher_cold_admission(
+                Some(publisher_admission),
+                self.runtime_projection_lock.lock(),
+            )
+            .await?;
+
+        let resolution = self
+            .await_publisher_cold_admission(
+                Some(publisher_admission),
+                self.resolve_lifecycle_target(&project_path),
+            )
+            .await??;
+        let expectation = match resolution {
+            LifecycleTargetResolution::Catalogued(target) => {
+                anyhow::ensure!(
+                    target.instance_id == expected_instance,
+                    "project identity changed before published declaration admission"
+                );
+                ConfigIdentityExpectation::Existing(expected_instance)
+            }
+            LifecycleTargetResolution::UnregisteredPhysical { instance_id } => {
+                anyhow::ensure!(
+                    instance_id == expected_instance,
+                    "project identity changed before published declaration admission"
+                );
+                ConfigIdentityExpectation::Initial(ConfigPhysicalIdentity::Git(expected_instance))
+            }
+            LifecycleTargetResolution::UnresolvedLegacy => anyhow::bail!(
+                "non-Git projects require one ordinary locald registration before publication"
+            ),
+            LifecycleTargetResolution::Ambiguous => {
+                anyhow::bail!("project locator matches multiple catalogued project instances")
+            }
+        };
+
+        let outcome = self
+            .apply_config_locked(
+                project_path,
+                None,
+                false,
+                Some(expectation),
+                ConfigApplyOptions::foreground(false, None)
+                    .with_publisher_cold_admission(publisher_admission),
+            )
+            .await?;
+        anyhow::ensure!(
+            outcome.instance_id == expected_instance,
+            "project identity changed while admitting published configuration"
+        );
+        drop(outcome.pending_initial);
+        outcome
+            .publisher_preparation
+            .context("published config admission completed without candidate preparation authority")
     }
 
     async fn persist_state_checked(&self) -> Result<()> {
@@ -3528,6 +4752,18 @@ impl ProcessManager {
     ) -> CatalogPublicationOutcome {
         let mut published_domain_index = None;
         let completion: Result<()> = async {
+        self
+            .catalog_publication_in_flight
+            .compare_exchange(
+                false,
+                true,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map_err(|_| anyhow::anyhow!("another catalog publication is already in flight"))?;
+        let _in_flight_guard = AtomicPublicationInFlightGuard {
+            flag: Arc::clone(&self.catalog_publication_in_flight),
+        };
         let previous_hosts = host_set_for_catalog(&catalog_base)
             .context("failed to derive the previous complete hosts projection")?;
         let candidate_hosts = host_set_for_catalog(&catalog_target)
@@ -3586,6 +4822,14 @@ impl ProcessManager {
                         .replace_complete(candidate_hosts)
                         .await
                         .context("failed to reaffirm the target complete hosts projection")?;
+                    let _publisher_transition = self.publisher_transition_lock.lock().await;
+                    self.catalog_publication_in_flight
+                        .store(false, AtomicOrdering::Release);
+                    self.publisher_authority
+                        .reconcile_catalog(&catalog_target)
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                        .context("failed to reaffirm published endpoint authority")?;
                     self.domain_index
                         .store(catalog_target.domain_index().clone());
                     published_domain_index = Some(catalog_target.domain_index().clone());
@@ -3654,8 +4898,9 @@ impl ProcessManager {
             .context("failed to prepare catalog publication recovery authority")?;
 
         if let Err(candidate_error) = self.host_set_writer.replace_complete(candidate_hosts).await {
-            let failure =
-                candidate_error.context("failed to apply the candidate complete hosts projection");
+            let failure = candidate_error
+                .context(CompleteHostSetSyncFailure)
+                .context("failed to apply the candidate complete hosts projection");
             return Err(self
                 .fail_catalog_publication_before_state_commit_locked(&transaction, failure)
                 .await);
@@ -3687,6 +4932,12 @@ impl ProcessManager {
                 .await);
         }
 
+        // Active lease operations continue against the prior authority while
+        // hosts convergence is blocked. Serialize only the catalog commit,
+        // exact durable verification, and authority reconciliation boundary.
+        let publisher_transition = self.publisher_transition_lock.lock().await;
+        self.catalog_publication_in_flight
+            .store(false, AtomicOrdering::Release);
         let publication = {
             let mut registry = self.registry.lock().await;
             let publication = registry.commit_candidate(catalog_target.clone()).await;
@@ -3721,6 +4972,12 @@ impl ProcessManager {
             )));
         }
 
+        self.publisher_authority
+            .reconcile_catalog(&catalog_target)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("failed to publish the committed endpoint authority")?;
+
         // From this point onward the durable target has been verified. Keep
         // that explicit authority even if advancing or clearing the recovery
         // journal reports a later error.
@@ -3741,6 +4998,7 @@ impl ProcessManager {
             .context("failed to clear the committed catalog publication")?;
         self.catalog_publication_recovery_required
             .store(false, AtomicOrdering::Release);
+        drop(publisher_transition);
         Ok(())
         }
         .await;
@@ -3765,9 +5023,10 @@ impl ProcessManager {
                 // running daemon must not keep serving either generation when
                 // it cannot complete that authority's chosen rollback.
                 self.domain_index.store(DomainIndex::default());
-                anyhow::anyhow!(
-                    "{failure:#}; failed to durably abort and restore the pre-catalog publication; project routing is disabled until restart: {abort_error:#}"
-                )
+                let failure_summary = failure.to_string();
+                failure.context(format!(
+                    "{failure_summary}; failed to durably abort and restore the pre-catalog publication; project routing is disabled until restart: {abort_error:#}"
+                ))
             }
         }
     }
@@ -3862,7 +5121,16 @@ impl ProcessManager {
     pub(crate) async fn recover_catalog_publication_state(&self) -> Result<()> {
         self.catalog_publication_recovery_required
             .store(true, AtomicOrdering::Release);
-        let result = self.recover_catalog_publication_state_locked().await;
+        let mut result = self.recover_catalog_publication_state_locked().await;
+        if result.is_ok() {
+            let catalog = self.registry.lock().await.clone();
+            result = self
+                .publisher_authority
+                .reconcile_catalog(&catalog)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .context("failed to recover published endpoint authority");
+        }
         self.catalog_publication_recovery_required
             .store(result.is_err(), AtomicOrdering::Release);
         if result.is_err() {
@@ -4654,9 +5922,16 @@ impl ProcessManager {
             service_readiness_timeout,
             agent_conversation,
             preserve_projection_for_config,
+            publisher_cold_admission,
         } = options;
         self.ensure_accepting_lifecycle_requests()?;
-        let discovery_before_config = Registry::discover(path.clone()).await?;
+        self.ensure_publisher_cold_admission_current(publisher_cold_admission)?;
+        let discovery_before_config = self
+            .await_publisher_cold_admission(
+                publisher_cold_admission,
+                Registry::discover(path.clone()),
+            )
+            .await??;
         let physical_identity_before_config =
             ConfigPhysicalIdentity::from_discovery(&discovery_before_config);
         if let Some(expected_initial) =
@@ -4676,11 +5951,22 @@ impl ProcessManager {
                 .await;
         }
 
-        let (mut config, dot_env_vars) = ConfigLoader::load_project_config(&path).await?;
+        #[cfg(test)]
+        if publisher_cold_admission.is_some() {
+            self.publisher_prevalidation_work_count
+                .fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        let (mut config, dot_env_vars) = self
+            .await_publisher_cold_admission(
+                publisher_cold_admission,
+                ConfigLoader::load_project_config(&path),
+            )
+            .await??;
 
         // Apply plugins to configuration
         // Plugin discovery and application failures are logged but do not fail startup
         // The returned guards keep plugin-allocated ports reserved until services bind
+        self.ensure_publisher_cold_admission_current(publisher_cold_admission)?;
         let mut plugin_port_guards =
             match plugins::apply_plugins_to_config(&mut config, &path, &self.port_allocator) {
                 Ok(guards) => guards,
@@ -4689,6 +5975,7 @@ impl ProcessManager {
                     Vec::new()
                 }
             };
+        self.ensure_publisher_cold_admission_current(publisher_cold_admission)?;
 
         // Release plugin guard listeners so services can bind to their allocated ports.
         // Guards still track ports as pending until they drop at end of scope.
@@ -4715,23 +6002,45 @@ impl ProcessManager {
                     format!("service `{service_name}` contains an invalid environment reference")
                 })?;
         }
-        let service_stop_suppressions = self.service_stop_suppressions.lock().await.clone();
+        let service_stop_suppressions = self
+            .await_publisher_cold_admission(
+                publisher_cold_admission,
+                self.service_stop_suppressions.lock(),
+            )
+            .await?
+            .clone();
         let advertised_https_port = if config.services.values().any(ServiceConfig::is_published) {
             Some(
-                self.proxy_ports
-                    .lock()
-                    .await
-                    .1
-                    .context("published services require an advertised HTTPS proxy listener")?,
+                self.await_publisher_cold_admission(
+                    publisher_cold_admission,
+                    self.proxy_ports.lock(),
+                )
+                .await?
+                .1
+                .context("published services require an advertised HTTPS proxy listener")?,
             )
         } else {
             None
         };
         #[cfg(test)]
-        self.wait_at_config_publication_hook().await;
-        let lifecycle_publication_guard = self.lifecycle_publication_lock.lock().await;
+        self.await_publisher_cold_admission(
+            publisher_cold_admission,
+            self.wait_at_config_publication_hook(),
+        )
+        .await?;
+        let lifecycle_publication_guard = self
+            .await_publisher_cold_admission(
+                publisher_cold_admission,
+                self.lifecycle_publication_lock.lock(),
+            )
+            .await?;
         self.ensure_lifecycle_publication_available()?;
-        let discovery = Registry::discover(path.clone()).await?;
+        let discovery = self
+            .await_publisher_cold_admission(
+                publisher_cold_admission,
+                Registry::discover(path.clone()),
+            )
+            .await??;
         let physical_identity_at_publication = ConfigPhysicalIdentity::from_discovery(&discovery);
         anyhow::ensure!(
             physical_identity_at_publication == physical_identity_before_config,
@@ -4751,9 +6060,12 @@ impl ProcessManager {
             pending_initial,
             trusted_launch_path,
             service_activation,
+            mut publisher_preparation,
         ) = {
             let is_linked_worktree = discovery.is_linked_worktree();
-            let registry = self.registry.lock().await;
+            let registry = self
+                .await_publisher_cold_admission(publisher_cold_admission, self.registry.lock())
+                .await?;
             let catalog_base = registry.clone();
             let mut candidate = catalog_base.clone();
             let instance_id =
@@ -4797,7 +6109,12 @@ impl ProcessManager {
                 .filter(|(_, service_config)| !service_config.is_published())
                 .map(|(service_name, _)| Self::service_key(instance_id, service_name.clone()))
                 .collect::<HashSet<_>>();
-            let trusted_launch_path = self.trusted_launch_path_if_present(instance_id).await?;
+            let trusted_launch_path = self
+                .await_publisher_cold_admission(
+                    publisher_cold_admission,
+                    self.trusted_launch_path_if_present(instance_id),
+                )
+                .await??;
             let mut generated_start_candidates = Vec::new();
             if start_services {
                 for (service_name, service_config) in &config.services {
@@ -4887,13 +6204,125 @@ impl ProcessManager {
                     published_admissions,
                 )?;
             }
+            let mut publisher_preparation = if let Some(admission) = publisher_cold_admission {
+                if admission.key.instance() != instance_id {
+                    return Err(anyhow::Error::new(publisher_protocol::ProtocolError::new(
+                        publisher_protocol::StableErrorCode::ProjectInstanceMismatch,
+                        "the validated catalog candidate belongs to a different project instance",
+                        Some("resolve the project through locald again before retrying".to_owned()),
+                    )));
+                }
+                let declaration = match candidate
+                    .published_declaration_by_key(admission.key)
+                    .cloned()
+                {
+                    Some(declaration) => declaration,
+                    None => {
+                        let service_exists = config.services.keys().any(|service_name| {
+                            service_name.as_str() == admission.key.name().as_str()
+                        });
+                        let (code, message, action) = if service_exists {
+                            (
+                                publisher_protocol::StableErrorCode::ServiceNotPublished,
+                                format!(
+                                    "service `{}` is managed by locald but has no published declaration",
+                                    admission.key.name()
+                                ),
+                                Some(
+                                    "mark the service as published in locald.toml, then retry"
+                                        .to_owned(),
+                                ),
+                            )
+                        } else {
+                            (
+                                publisher_protocol::StableErrorCode::ServiceNotFound,
+                                format!(
+                                    "service `{}` does not exist in the validated project configuration",
+                                    admission.key.name()
+                                ),
+                                Some(
+                                    "use an exact service name from the project's locald.toml"
+                                        .to_owned(),
+                                ),
+                            )
+                        };
+                        return Err(anyhow::Error::new(publisher_protocol::ProtocolError::new(
+                            code, message, action,
+                        )));
+                    }
+                };
+                if !self
+                    .publisher_begin_operations
+                    .mark_validated(admission.key, admission.operation_id)
+                {
+                    return Err(anyhow::Error::new(publisher_protocol::ProtocolError::new(
+                        publisher_protocol::StableErrorCode::OperationCanceled,
+                        "publisher preparation is no longer current after declaration validation",
+                        None,
+                    )));
+                }
+                let preparation = self
+                    .publisher_authority
+                    .reserve_candidate_acquisition(
+                        admission.deadline,
+                        declaration,
+                        admission.principal.clone(),
+                        admission.replacement,
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                let waiter = match &preparation {
+                    PublisherCandidateAcquisitionPreparation::Required(permit) => {
+                        permit.completion_waiter()
+                    }
+                    PublisherCandidateAcquisitionPreparation::Joined(waiter) => waiter.clone(),
+                };
+                self.monitor_publisher_candidate_preparation(
+                    admission.key.clone(),
+                    admission.operation_id,
+                    waiter,
+                );
+                Some(preparation)
+            } else {
+                None
+            };
+
+            if publisher_preparation.as_ref().is_some_and(|preparation| {
+                matches!(
+                    preparation,
+                    PublisherCandidateAcquisitionPreparation::Joined(_)
+                )
+            }) {
+                drop(registry);
+                return Ok(ConfigApplyOutcome {
+                    instance_id,
+                    pending_initial,
+                    publisher_preparation,
+                });
+            }
+
+            let post_reservation = Box::pin(async {
+            #[cfg(test)]
+            if publisher_preparation.is_some() {
+                self.await_publisher_candidate_convergence(
+                    publisher_cold_admission,
+                    &mut publisher_preparation,
+                    self.wait_at_publisher_candidate_convergence_hook(),
+                )
+                .await?;
+            }
             let candidate_domain_index = Arc::new(candidate.domain_index().clone());
 
             // Publish declared generated-source paths to the existing project
             // watcher before source preparation can reject this transition.
             // Correcting a malformed or newly created nested source must be
             // enough to retry convergence without another locald.toml edit.
-            self.update_generated_source_watches(&path, &config).await;
+            self.await_publisher_candidate_convergence(
+                publisher_cold_admission,
+                &mut publisher_preparation,
+                self.update_generated_source_watches(&path, &config),
+            )
+            .await?;
 
             let mut prepared_start_generated_files = HashMap::new();
             for (key, service_name) in generated_start_candidates {
@@ -4901,14 +6330,21 @@ impl ProcessManager {
                     .services
                     .get(&service_name)
                     .expect("generated start candidate belongs to the loaded config");
-                if let Some(prepared) =
-                    crate::generated_files::prepare(&path, &key, service_config)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to prepare generated files for service `{service_name}` before the runtime transition"
-                            )
-                        })?
+                if let Some(prepared) = self
+                    .await_publisher_candidate_convergence(
+                        publisher_cold_admission,
+                        &mut publisher_preparation,
+                        async {
+                            crate::generated_files::prepare(&path, &key, service_config)
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to prepare generated files for service `{service_name}` before the runtime transition"
+                                    )
+                                })
+                        },
+                    )
+                    .await??
                 {
                     prepared_start_generated_files.insert(key, prepared);
                 }
@@ -4924,42 +6360,69 @@ impl ProcessManager {
                 stopped_service_projections,
                 prepared_generated_files: planned_generated_files,
             } = self
-                .prepublication_stop_plan(
-                    instance_id,
-                    &config,
-                    candidate_domain_index,
-                    &dot_env_vars,
-                    trusted_launch_path.as_deref(),
-                    PrepublicationStopOptions {
-                        sorted_services: &sorted_services,
-                        desired_service_names: &desired_service_names,
-                        readiness_probe_budget: service_readiness_timeout,
-                        project_path: &path,
-                    },
+                .await_publisher_candidate_convergence(
+                    publisher_cold_admission,
+                    &mut publisher_preparation,
+                    self.prepublication_stop_plan(
+                        instance_id,
+                        &config,
+                        candidate_domain_index,
+                        &dot_env_vars,
+                        trusted_launch_path.as_deref(),
+                        PrepublicationStopOptions {
+                            sorted_services: &sorted_services,
+                            desired_service_names: &desired_service_names,
+                            readiness_probe_budget: service_readiness_timeout,
+                            project_path: &path,
+                        },
+                    ),
                 )
-                .await?;
+                .await??;
             // Every service that will start was validated before any healthy
             // dependent can be stopped. Active-controller planning may have
             // observed a newer source snapshot, so its preparation wins.
             prepared_start_generated_files.extend(planned_generated_files);
             let prepared_generated_files = prepared_start_generated_files;
-            if expected_instance.is_some_and(ConfigIdentityExpectation::requires_existing_catalog) {
-                self.availability_authorizes_start_locked(instance_id)
-                    .await?;
+            if start_services
+                && expected_instance
+                    .is_some_and(ConfigIdentityExpectation::requires_existing_catalog)
+            {
+                self.await_publisher_candidate_convergence(
+                    publisher_cold_admission,
+                    &mut publisher_preparation,
+                    self.availability_authorizes_start_locked(instance_id),
+                )
+                .await??;
             }
             for key in &removed_service_names {
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
                 info!(
                     "Service {} removed from config, stopping before domain publication...",
                     key.display_name(&config.project.name)
                 );
                 self.stop_service_instance_locked(key).await?;
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
             }
             for key in &restart_service_names {
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
                 info!(
                     "Service {} changed, stopping before domain publication...",
                     key.display_name(&config.project.name)
                 );
                 self.stop_service_instance_locked(key).await?;
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
             }
 
             drop(registry);
@@ -4980,24 +6443,43 @@ impl ProcessManager {
                     catalog_target: candidate,
                 };
                 let transaction = self
-                    .prepare_project_lifecycle_transaction(
-                        target,
-                        &AvailabilityBatch::new(self.availability_now()),
-                        attachment_base.clone(),
-                        attachment_base,
+                    .await_publisher_candidate_convergence(
+                        publisher_cold_admission,
+                        &mut publisher_preparation,
+                        self.prepare_project_lifecycle_transaction(
+                            target,
+                            &AvailabilityBatch::new(self.availability_now()),
+                            attachment_base.clone(),
+                            attachment_base,
+                        ),
                     )
-                    .await?;
+                    .await??;
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
+                // Once the journaled transition starts, it must finish or
+                // roll back without task cancellation. A timeout observed
+                // during this await fences authority completion below and any
+                // successor remains ordered behind this path transition.
                 self.create_and_apply_lifecycle_transaction_with_catalog_outcome_locked(
                     &transaction,
                 )
                 .await
                 .into_parts()
             } else {
+                self.ensure_publisher_candidate_convergence_current(
+                    publisher_cold_admission,
+                    publisher_preparation.as_ref(),
+                )?;
+                // Catalog/hosts publication is similarly indivisible once
+                // entered; cancellation is checked again by the caller before
+                // candidate authority can become an acquisition attempt.
                 self.publish_catalog_transition_locked(catalog_base, candidate)
                     .await
                     .into_parts()
             };
-            (
+            Ok::<_, anyhow::Error>((
                 commit_result,
                 instance_id,
                 removed_service_names,
@@ -5009,7 +6491,45 @@ impl ProcessManager {
                 pending_initial,
                 trusted_launch_path,
                 service_activation,
-            )
+            ))
+            })
+            .await;
+            match post_reservation {
+                Ok((
+                    commit_result,
+                    instance_id,
+                    removed_service_names,
+                    published_domain_index,
+                    published_service_list_changed,
+                    reusable_service_envs,
+                    stopped_service_projections,
+                    prepared_generated_files,
+                    pending_initial,
+                    trusted_launch_path,
+                    service_activation,
+                )) => (
+                    commit_result,
+                    instance_id,
+                    removed_service_names,
+                    published_domain_index,
+                    published_service_list_changed,
+                    reusable_service_envs,
+                    stopped_service_projections,
+                    prepared_generated_files,
+                    pending_initial,
+                    trusted_launch_path,
+                    service_activation,
+                    publisher_preparation,
+                ),
+                Err(error) => {
+                    self.fail_publisher_candidate_after_config_error(
+                        &mut publisher_preparation,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
         };
 
         // The catalog rename is the ownership commit point. Synchronize hosts
@@ -5071,7 +6591,11 @@ impl ProcessManager {
         } else {
             drop(lifecycle_publication_guard);
         }
-        commit_result?;
+        if let Err(error) = commit_result {
+            self.fail_publisher_candidate_after_config_error(&mut publisher_preparation, &error)
+                .await;
+            return Err(error);
+        }
 
         // Runtime logs begin only after the project instance is resolved and
         // its ownership is published. Bind verbose boot output to that exact
@@ -5102,6 +6626,7 @@ impl ProcessManager {
             return Ok(ConfigApplyOutcome {
                 instance_id,
                 pending_initial,
+                publisher_preparation,
             });
         }
 
@@ -5564,6 +7089,7 @@ impl ProcessManager {
         Ok(ConfigApplyOutcome {
             instance_id,
             pending_initial,
+            publisher_preparation,
         })
     }
 
@@ -8652,12 +10178,8 @@ impl ProcessManager {
                 let was_paused = availability.snapshot().await?.is_paused();
                 let (_, durability_error) =
                     Self::capture_availability_publication(availability.apply_batch(&batch).await)?;
-                self.broadcast_published_service_projection_if_pause_changed(
-                    instance_id,
-                    was_paused,
-                    false,
-                )
-                .await;
+                self.publish_publisher_pause_transition(instance_id, was_paused, false)
+                    .await?;
                 durability_error
             } else {
                 // Discovery reactivates a catalogued instance in the target
@@ -9018,12 +10540,8 @@ impl ProcessManager {
             let was_paused = availability.snapshot().await?.is_paused();
             let (result, durability_error) =
                 Self::capture_availability_publication(availability.ensure_demand(demand).await)?;
-            self.broadcast_published_service_projection_if_pause_changed(
-                instance_id,
-                was_paused,
-                false,
-            )
-            .await;
+            self.publish_publisher_pause_transition(instance_id, was_paused, false)
+                .await?;
             drop(publication_guard);
             let coordinator = self.availability_coordinator(instance_id).await;
             let _runtime_guard = coordinator.runtime.lock().await;
@@ -9098,12 +10616,8 @@ impl ProcessManager {
             let was_paused = availability.snapshot().await?.is_paused();
             let (changed, durability_error) =
                 Self::capture_availability_publication(availability.pause_project().await)?;
-            self.broadcast_published_service_projection_if_pause_changed(
-                instance_id,
-                was_paused,
-                true,
-            )
-            .await;
+            self.publish_publisher_pause_transition(instance_id, was_paused, true)
+                .await?;
             drop(publication_guard);
             let convergence = self
                 .converge_managed_instance(instance_id, None, false, false)
@@ -9515,7 +11029,6 @@ impl ProcessManager {
         }
 
         if phase == LifecycleTransactionPhase::CatalogPublished {
-            let mut published_projection_changed = false;
             for prepared in transaction.availability() {
                 let was_paused = prepared
                     .expected()
@@ -9534,14 +11047,13 @@ impl ProcessManager {
                         &publication,
                         Err(AvailabilityError::PublishedNotDurable { .. })
                     );
-                if authoritative && !published_projection_changed {
-                    published_projection_changed = self
-                        .broadcast_published_service_projection_if_pause_changed(
+                if authoritative {
+                    self.publish_publisher_pause_transition(
                             prepared.project_instance_id(),
                             was_paused,
                             is_paused,
                         )
-                        .await;
+                        .await?;
                 }
                 publication?;
             }
@@ -11022,12 +12534,8 @@ impl ProcessManager {
                 .ensure_demand(DemandKey::stopped_page_resume())
                 .await,
         )?;
-        self.broadcast_published_service_projection_if_pause_changed(
-            instance_id,
-            was_paused,
-            false,
-        )
-        .await;
+        self.publish_publisher_pause_transition(instance_id, was_paused, false)
+            .await?;
         Ok(durability_error)
     }
 
@@ -12442,6 +13950,275 @@ mod tests {
         }
     }
 
+    fn publisher_begin_test_key() -> ServiceKey {
+        ServiceKey::new(
+            "00000000-0000-4000-8000-000000000155"
+                .parse()
+                .expect("valid publisher Begin test instance"),
+            "workbench",
+        )
+    }
+
+    fn publisher_begin_test_request(birth: u64) -> PublisherBeginRequest {
+        PublisherBeginRequest {
+            principal: PublisherPrincipal::new(
+                501,
+                42,
+                crate::publication::PublisherProcessBirth::Test(birth),
+            ),
+            replacement: None,
+        }
+    }
+
+    #[test]
+    fn publisher_begin_operations_join_exact_request_and_reject_competitor() {
+        let operations = PublisherBeginOperations::new();
+        let key = publisher_begin_test_key();
+        let request = publisher_begin_test_request(1);
+        let PublisherBeginAdmission::Owner {
+            id,
+            receiver: owner,
+        } = operations
+            .admit(&key, request.clone())
+            .expect("admit owner")
+        else {
+            panic!("first Begin must own preparation");
+        };
+        let PublisherBeginAdmission::Joined(joined) =
+            operations.admit(&key, request).expect("join exact Begin")
+        else {
+            panic!("same request must join");
+        };
+        let competitor = match operations.admit(&key, publisher_begin_test_request(2)) {
+            Ok(_) => panic!("competing principal must fail promptly"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            competitor.code(),
+            publisher_protocol::StableErrorCode::AcquisitionInProgress
+        );
+
+        let completion: PublisherBeginCompletion = Err(publisher_protocol::ProtocolError::new(
+            publisher_protocol::StableErrorCode::PreparationTimedOut,
+            "test timeout",
+            None,
+        ));
+        drop(owner);
+        operations.finish(&key, id, completion.clone());
+        assert_eq!(joined.borrow().clone(), Some(completion));
+    }
+
+    #[test]
+    fn publisher_begin_operations_bound_unvalidated_instances_and_global_capacity() {
+        let operations = PublisherBeginOperations::with_max_operations(2);
+        let first = publisher_begin_test_key();
+        let second = ServiceKey::new(first.instance(), "other-published-service");
+        let PublisherBeginAdmission::Owner { id: first_id, .. } = operations
+            .admit(&first, publisher_begin_test_request(1))
+            .expect("admit first provisional service")
+        else {
+            panic!("first service owns provisional project slot");
+        };
+        let same_instance = match operations.admit(&second, publisher_begin_test_request(2)) {
+            Ok(_) => panic!("another unvalidated name cannot allocate project state"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            same_instance.code(),
+            publisher_protocol::StableErrorCode::AcquisitionInProgress
+        );
+
+        assert!(operations.mark_validated(&first, first_id));
+        let PublisherBeginAdmission::Owner { id: second_id, .. } = operations
+            .admit(&second, publisher_begin_test_request(2))
+            .expect("validated service releases the provisional project slot")
+        else {
+            panic!("second exact service owns its operation");
+        };
+        let third = ServiceKey::new(
+            "00000000-0000-4000-8000-000000000157"
+                .parse()
+                .expect("valid capacity test instance"),
+            "workbench",
+        );
+        let capacity = match operations.admit(&third, publisher_begin_test_request(3)) {
+            Ok(_) => panic!("global coordinator capacity must be bounded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            capacity.code(),
+            publisher_protocol::StableErrorCode::Internal
+        );
+        assert_eq!(
+            capacity.retry(),
+            publisher_protocol::RetryClass::AfterExternalChange
+        );
+
+        let completion = Err(publisher_protocol::ProtocolError::new(
+            publisher_protocol::StableErrorCode::OperationCanceled,
+            "test cleanup",
+            None,
+        ));
+        operations.finish(&first, first_id, completion.clone());
+        operations.finish(&second, second_id, completion);
+    }
+
+    #[test]
+    fn publisher_begin_completion_is_fenced_from_a_successor() {
+        let operations = PublisherBeginOperations::new();
+        let key = publisher_begin_test_key();
+        let PublisherBeginAdmission::Owner { id: stale_id, .. } = operations
+            .admit(&key, publisher_begin_test_request(1))
+            .expect("admit first owner")
+        else {
+            panic!("first Begin must own preparation");
+        };
+        operations.finish(
+            &key,
+            stale_id,
+            Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::PreparationTimedOut,
+                "first operation timed out",
+                None,
+            )),
+        );
+        let PublisherBeginAdmission::Owner {
+            id: successor_id,
+            receiver: successor,
+        } = operations
+            .admit(&key, publisher_begin_test_request(1))
+            .expect("admit successor")
+        else {
+            panic!("successor must own fresh preparation");
+        };
+
+        operations.finish(
+            &key,
+            stale_id,
+            Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::AttemptStale,
+                "late stale completion",
+                None,
+            )),
+        );
+        assert!(successor.borrow().is_none());
+        operations.finish(
+            &key,
+            successor_id,
+            Err(publisher_protocol::ProtocolError::new(
+                publisher_protocol::StableErrorCode::OperationCanceled,
+                "successor completion",
+                None,
+            )),
+        );
+        assert_eq!(
+            successor
+                .borrow()
+                .as_ref()
+                .expect("successor completion")
+                .as_ref()
+                .expect_err("test completion is an error")
+                .code(),
+            publisher_protocol::StableErrorCode::OperationCanceled
+        );
+    }
+
+    #[test]
+    fn publisher_config_admission_maps_only_cross_instance_domain_conflicts() {
+        let existing_instance = publisher_begin_test_key().instance();
+        let requested_instance: ProjectInstanceId = "00000000-0000-4000-8000-000000000156"
+            .parse()
+            .expect("valid conflicting project instance");
+        let conflict = DomainError::Conflict {
+            domain: DomainPattern::Exact(
+                "shared.localhost"
+                    .parse()
+                    .expect("valid shared domain name"),
+            ),
+            existing: Box::new(DomainTarget::Service {
+                project_instance_id: existing_instance,
+                service_name: Some("existing".to_owned()),
+                primary: true,
+            }),
+            requested: Box::new(DomainTarget::Service {
+                project_instance_id: requested_instance,
+                service_name: Some("workbench".to_owned()),
+                primary: true,
+            }),
+        };
+        let error = anyhow::Error::new(conflict.clone())
+            .context("failed to build the candidate domain projection");
+        let mapped = ProcessManager::publisher_config_admission_error(&error);
+        assert_eq!(
+            mapped.code(),
+            publisher_protocol::StableErrorCode::DomainConflict
+        );
+        assert_eq!(
+            mapped.retry(),
+            publisher_protocol::RetryClass::AfterExternalChange
+        );
+
+        let DomainError::Conflict {
+            domain,
+            existing,
+            mut requested,
+        } = conflict
+        else {
+            unreachable!("constructed a domain conflict")
+        };
+        let DomainTarget::Service {
+            project_instance_id,
+            ..
+        } = requested.as_mut()
+        else {
+            unreachable!("constructed a service target")
+        };
+        *project_instance_id = existing_instance;
+        let same_instance = anyhow::Error::new(DomainError::Conflict {
+            domain,
+            existing,
+            requested,
+        });
+        assert_eq!(
+            ProcessManager::publisher_config_admission_error(&same_instance).code(),
+            publisher_protocol::StableErrorCode::Internal
+        );
+        assert_eq!(
+            ProcessManager::publisher_config_admission_error(&same_instance).retry(),
+            publisher_protocol::RetryClass::AfterExternalChange
+        );
+    }
+
+    #[test]
+    fn publisher_config_admission_untyped_fallback_is_retryable_internal() {
+        let error = anyhow::anyhow!("unexpected cold-admission invariant")
+            .context("publisher config application failed");
+        let mapped = ProcessManager::publisher_config_admission_error(&error);
+        assert_eq!(mapped.code(), publisher_protocol::StableErrorCode::Internal);
+        assert_eq!(
+            mapped.retry(),
+            publisher_protocol::RetryClass::AfterExternalChange
+        );
+        assert!(mapped.action().is_some());
+    }
+
+    #[test]
+    fn publisher_config_admission_preserves_hosts_sync_failure_through_rollback_context() {
+        let error = anyhow::anyhow!("privileged helper rejected the complete host set")
+            .context(CompleteHostSetSyncFailure)
+            .context("failed to apply the candidate complete hosts projection")
+            .context("rollback also required recovery");
+        let mapped = ProcessManager::publisher_config_admission_error(&error);
+        assert_eq!(
+            mapped.code(),
+            publisher_protocol::StableErrorCode::HostsSyncFailed
+        );
+        assert_eq!(
+            mapped.retry(),
+            publisher_protocol::RetryClass::AfterExternalChange
+        );
+    }
+
     #[test]
     fn compatibility_status_keeps_manual_cli_session_identity_private() {
         let project_path = PathBuf::from("/tmp/manual-cli-status");
@@ -13795,6 +15572,20 @@ mod tests {
         failures: Arc<StdMutex<VecDeque<bool>>>,
     }
 
+    struct BlockingHostSyncer {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl HostSetWriter for BlockingHostSyncer {
+        async fn replace_complete(&self, _hosts: HostSet) -> Result<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl HostSetWriter for ScriptedHostSyncer {
         async fn replace_complete(&self, hosts: HostSet) -> Result<()> {
@@ -14091,6 +15882,62 @@ mod tests {
             !manager
                 .catalog_publication_recovery_required
                 .load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_hosts_convergence_does_not_own_publisher_transition_boundary() {
+        let (
+            _directory,
+            mut manager,
+            catalog_base,
+            catalog_target,
+            _previous_hosts,
+            _candidate_hosts,
+        ) = catalog_publication_fixture().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        manager.set_host_syncer(Arc::new(BlockingHostSyncer {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        // Initial registration nests catalog publication inside a healthy
+        // lifecycle journal transaction; that healthy outer marker must not
+        // turn a blocked hosts writer into lease-operation starvation.
+        manager
+            .lifecycle_recovery_required
+            .store(true, AtomicOrdering::Release);
+
+        let publishing_manager = manager.clone();
+        let publication = tokio::spawn(async move {
+            let _publication_guard = publishing_manager.lifecycle_publication_lock.lock().await;
+            publishing_manager
+                .publish_catalog_transition_locked(catalog_base, catalog_target)
+                .await
+                .into_result()
+        });
+        entered.notified().await;
+
+        assert!(
+            manager
+                .catalog_publication_in_flight
+                .load(AtomicOrdering::Acquire)
+        );
+        assert!(manager.publisher_transition_lock.try_lock().is_ok());
+        assert!(manager.ensure_publisher_mutation_available().is_ok());
+
+        release.notify_one();
+        publication
+            .await
+            .expect("catalog publication task")
+            .expect("catalog publication completes");
+        manager
+            .lifecycle_recovery_required
+            .store(false, AtomicOrdering::Release);
+        assert!(
+            !manager
+                .catalog_publication_in_flight
+                .load(AtomicOrdering::Acquire)
         );
     }
 
@@ -14441,6 +16288,133 @@ mod tests {
             &DomainIndex::default(),
             "the config caller must preserve the publication helper's fail-closed routing state"
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_commit_serializes_publisher_renew_until_declaration_retirement() {
+        let directory = tempdir().expect("create publisher serialization fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create publisher serialization project");
+        let config_path = project_path.join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "publisher-serialization"
+domain = "publisher-serialization.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+
+[services.retained]
+type = "published"
+domains = ["retained"]
+"#,
+        )
+        .expect("write publisher serialization config");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create publisher serialization manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit publisher serialization config");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve publisher serialization instance");
+        let authority = manager.publisher_authority();
+        let principal =
+            PublisherPrincipal::new(501, 45, crate::publication::PublisherProcessBirth::Test(4));
+        let PublisherAcquisitionPreparation::Required(permit) = authority
+            .reserve_acquisition(
+                ServiceKey::new(instance_id, ServiceName::new("workbench")),
+                principal.clone(),
+                None,
+            )
+            .await
+            .expect("reserve serialized publication")
+        else {
+            panic!("fresh serialized publication requires preparation");
+        };
+        let prepared = authority
+            .complete_acquisition_preparation(permit)
+            .await
+            .expect("complete serialized publication preparation");
+        let acquired = manager
+            .acquire_published_endpoint(
+                prepared.acquisition_attempt_handle(),
+                &principal,
+                prepared.origin(),
+                RetainedListenerCapability::new(
+                    crate::publication::ListenerIdentity::Test(4),
+                    Arc::new(()),
+                ),
+            )
+            .await
+            .expect("acquire serialized publication");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "publisher-serialization"
+domain = "publisher-serialization.localhost"
+
+[services.retained]
+type = "published"
+domains = ["retained"]
+"#,
+        )
+        .expect("remove the live published declaration");
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        manager.set_catalog_verification_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let apply = tokio::spawn({
+            let manager = manager.clone();
+            let project_path = project_path.clone();
+            async move { manager.apply_config(project_path, None, false).await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, reached.notified())
+            .await
+            .expect("removal commits catalog before authority reconciliation");
+
+        let renew = tokio::spawn({
+            let manager = manager.clone();
+            let principal = principal.clone();
+            let lease = acquired.lease_handle().clone();
+            async move { manager.renew_published_endpoint(&lease, &principal).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !renew.is_finished(),
+            "publisher renewal waits on the catalog/authority publication boundary"
+        );
+        resume.notify_one();
+        apply
+            .await
+            .expect("join declaration removal")
+            .expect("publish declaration removal");
+        let error = renew
+            .await
+            .expect("join fenced publisher renewal")
+            .expect_err("removed declaration retires the old lease");
+        assert_eq!(error.code(), publisher_protocol::StableErrorCode::LeaseLost);
     }
 
     #[tokio::test]
@@ -30166,6 +32140,670 @@ health_check = { type = "http", path = "/ready", interval = 2, timeout = 3 }
     }
 
     #[tokio::test]
+    async fn publisher_begin_admits_a_new_declaration_for_an_existing_catalog_instance() {
+        let directory = tempdir().expect("create catalogued publisher fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create catalogued publisher project");
+        let config_path = project_path.join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "catalogued-publisher"
+domain = "catalogued-publisher.localhost"
+
+[services.existing]
+type = "published"
+domains = ["existing"]
+"#,
+        )
+        .expect("write initial catalogued configuration");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create catalogued publisher manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("catalogue the initial declaration");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve catalogued instance");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "catalogued-publisher"
+domain = "catalogued-publisher.localhost"
+
+[services.existing]
+type = "published"
+domains = ["existing"]
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+health_check = { type = "http", path = "/api/health" }
+
+[services.managed]
+type = "worker"
+command = "unused-by-publisher-admission-test"
+"#,
+        )
+        .expect("add a published declaration after catalog registration");
+
+        let prepared = manager
+            .begin_published_endpoint_acquisition(
+                publisher_protocol::BeginAcquisitionArguments {
+                    expected_project_instance_id: publisher_protocol::ProjectInstanceId::parse(
+                        &instance_id.to_string(),
+                    )
+                    .expect("wire project instance"),
+                    project_locator: publisher_protocol::AbsolutePath::try_from(
+                        project_path.clone(),
+                    )
+                    .expect("wire project locator"),
+                    service_name: publisher_protocol::ServiceName::parse("workbench")
+                        .expect("wire service name"),
+                    replace_terminal_attempt_handle: None,
+                },
+                PublisherPrincipal::new(
+                    501,
+                    44,
+                    crate::publication::PublisherProcessBirth::Test(3),
+                ),
+            )
+            .await
+            .expect("publisher begin admits the current catalogued declaration");
+
+        assert_eq!(
+            prepared.origin().as_str(),
+            "https://workbench.catalogued-publisher.localhost:4443"
+        );
+        assert!(
+            registry
+                .lock()
+                .await
+                .published_declarations_for_instance(instance_id)
+                .is_some_and(|declarations| {
+                    declarations.contains_key(&ServiceName::new("workbench"))
+                }),
+            "the current declaration is durably catalogued before Begin returns"
+        );
+
+        for (service_name, expected_code) in [
+            (
+                "managed",
+                publisher_protocol::StableErrorCode::ServiceNotPublished,
+            ),
+            (
+                "missing",
+                publisher_protocol::StableErrorCode::ServiceNotFound,
+            ),
+        ] {
+            let error = manager
+                .begin_published_endpoint_acquisition(
+                    publisher_protocol::BeginAcquisitionArguments {
+                        expected_project_instance_id: publisher_protocol::ProjectInstanceId::parse(
+                            &instance_id.to_string(),
+                        )
+                        .expect("wire project instance"),
+                        project_locator: publisher_protocol::AbsolutePath::try_from(
+                            project_path.clone(),
+                        )
+                        .expect("wire project locator"),
+                        service_name: publisher_protocol::ServiceName::parse(service_name)
+                            .expect("wire service name"),
+                        replace_terminal_attempt_handle: None,
+                    },
+                    PublisherPrincipal::new(
+                        501,
+                        44,
+                        crate::publication::PublisherProcessBirth::Test(3),
+                    ),
+                )
+                .await
+                .expect_err("invalid candidate service must retain its exact protocol code");
+            assert_eq!(error.code(), expected_code);
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_candidate_releases_convergence_without_publishing_stale_state() {
+        let directory = tempdir().expect("create timed-out publisher fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create timed-out publisher project");
+        let config_path = project_path.join("locald.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "timed-out-publisher"
+domain = "timed-out-publisher.localhost"
+
+[services.existing]
+type = "published"
+domains = ["existing"]
+"#,
+        )
+        .expect("write initial timed-out publisher configuration");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create timed-out publisher manager");
+        let host_calls = Arc::new(StdMutex::new(Vec::new()));
+        manager.set_host_syncer(Arc::new(RecordingHostSyncer {
+            calls: host_calls.clone(),
+        }));
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("catalogue initial timed-out publisher declaration");
+        host_calls.lock().expect("host calls").clear();
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve timed-out publisher instance");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "timed-out-publisher"
+domain = "timed-out-publisher.localhost"
+
+[services.existing]
+type = "published"
+domains = ["existing"]
+
+[services.workbench]
+type = "published"
+domains = ["stale"]
+"#,
+        )
+        .expect("write stale candidate configuration");
+        let convergence_reached = Arc::new(Notify::new());
+        manager.set_publisher_candidate_convergence_hook(ConfigPublicationHook {
+            reached: convergence_reached.clone(),
+            resume: Arc::new(Notify::new()),
+        });
+        let principal =
+            PublisherPrincipal::new(501, 45, crate::publication::PublisherProcessBirth::Test(4));
+        let begin_arguments = || publisher_protocol::BeginAcquisitionArguments {
+            expected_project_instance_id: publisher_protocol::ProjectInstanceId::parse(
+                &instance_id.to_string(),
+            )
+            .expect("wire project instance"),
+            project_locator: publisher_protocol::AbsolutePath::try_from(project_path.clone())
+                .expect("wire project locator"),
+            service_name: publisher_protocol::ServiceName::parse("workbench")
+                .expect("wire service name"),
+            replace_terminal_attempt_handle: None,
+        };
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let principal = principal.clone();
+            let arguments = begin_arguments();
+            async move {
+                manager
+                    .begin_published_endpoint_acquisition(arguments, principal)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            convergence_reached.notified(),
+        )
+        .await
+        .expect("first candidate reaches the safe convergence stall");
+
+        let key = ServiceKey::new(instance_id, ServiceName::new("workbench"));
+        assert!(
+            manager
+                .publisher_authority
+                .timeout_candidate_preparation_for_test(&key)
+                .await
+                .expect("expire the exact stalled candidate")
+        );
+        let timeout = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, first)
+            .await
+            .expect("timed-out Begin returns promptly")
+            .expect("join timed-out Begin")
+            .expect_err("the first candidate times out");
+        assert_eq!(
+            timeout.code(),
+            publisher_protocol::StableErrorCode::PreparationTimedOut
+        );
+
+        let (_, transition_lock) = manager.transition_lock_for_path(&project_path).await;
+        let transition_guard =
+            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, transition_lock.lock())
+                .await
+                .expect("canceled cold work releases the project transition");
+        assert!(
+            registry
+                .lock()
+                .await
+                .published_declarations_for_instance(instance_id)
+                .is_none_or(|declarations| {
+                    !declarations.contains_key(&ServiceName::new("workbench"))
+                }),
+            "the timed-out candidate cannot publish its stale catalog declaration"
+        );
+        assert!(
+            host_calls.lock().expect("host calls").is_empty(),
+            "the timed-out candidate cannot write the complete host set"
+        );
+        drop(transition_guard);
+
+        std::fs::write(
+            &config_path,
+            r#"
+[project]
+name = "timed-out-publisher"
+domain = "timed-out-publisher.localhost"
+
+[services.existing]
+type = "published"
+domains = ["existing"]
+
+[services.workbench]
+type = "published"
+domains = ["fresh"]
+"#,
+        )
+        .expect("write successor candidate configuration");
+        let prepared = tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            manager.begin_published_endpoint_acquisition(begin_arguments(), principal),
+        )
+        .await
+        .expect("successor Begin proceeds after canceled convergence")
+        .expect("successor candidate is admitted");
+        assert_eq!(
+            prepared.origin().as_str(),
+            "https://fresh.timed-out-publisher.localhost:4443"
+        );
+        let catalog = registry.lock().await;
+        let declaration = catalog
+            .published_declarations_for_instance(instance_id)
+            .and_then(|declarations| declarations.get(&ServiceName::new("workbench")))
+            .expect("successor declaration is catalogued");
+        assert_eq!(
+            declaration.origin.as_str(),
+            "https://fresh.timed-out-publisher.localhost:4443"
+        );
+        let expected_hosts = host_set_for_catalog(&catalog)
+            .expect("derive successor complete host set")
+            .as_strings();
+        drop(catalog);
+        let host_calls = host_calls.lock().expect("host calls");
+        assert!(!host_calls.is_empty());
+        assert!(host_calls.iter().all(|hosts| hosts == &expected_hosts));
+        assert!(
+            host_calls
+                .iter()
+                .flatten()
+                .all(|host| host != "stale.timed-out-publisher.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_queued_publisher_workers_vacate_before_prevalidation_work() {
+        let directory = tempdir().expect("create queued publisher fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create queued publisher project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "queued-publisher"
+domain = "queued-publisher.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write queued publisher configuration");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry,
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create queued publisher manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("catalogue queued publisher declaration");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve queued publisher instance");
+        let key = ServiceKey::new(instance_id, ServiceName::new("workbench"));
+        let begin_arguments = || publisher_protocol::BeginAcquisitionArguments {
+            expected_project_instance_id: publisher_protocol::ProjectInstanceId::parse(
+                &instance_id.to_string(),
+            )
+            .expect("wire project instance"),
+            project_locator: publisher_protocol::AbsolutePath::try_from(project_path.clone())
+                .expect("wire project locator"),
+            service_name: publisher_protocol::ServiceName::parse("workbench")
+                .expect("wire service name"),
+            replace_terminal_attempt_handle: None,
+        };
+        let principal =
+            PublisherPrincipal::new(501, 46, crate::publication::PublisherProcessBirth::Test(5));
+        let (_, transition_lock) = manager.transition_lock_for_path(&project_path).await;
+        let transition_guard = transition_lock.lock().await;
+
+        for _ in 0..3 {
+            let queued = tokio::spawn({
+                let manager = manager.clone();
+                let principal = principal.clone();
+                let arguments = begin_arguments();
+                async move {
+                    manager
+                        .begin_published_endpoint_acquisition(arguments, principal)
+                        .await
+                }
+            });
+            let deadline = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+                loop {
+                    if let Some(deadline) = manager.publisher_begin_operations.deadline(&key) {
+                        break deadline;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("queued Begin publishes its admission deadline");
+            manager
+                .publisher_authority
+                .timeout_candidate_preparation_deadline_for_test(&deadline);
+            let error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, queued)
+                .await
+                .expect("expired queued Begin returns")
+                .expect("join expired queued Begin")
+                .expect_err("queued Begin cannot outlive its deadline");
+            assert_eq!(
+                error.code(),
+                publisher_protocol::StableErrorCode::PreparationTimedOut
+            );
+        }
+        assert_eq!(
+            manager
+                .publisher_prevalidation_work_count
+                .load(AtomicOrdering::SeqCst),
+            0,
+            "expired lock waiters must not reach config or plugin loading"
+        );
+
+        let successor = tokio::spawn({
+            let manager = manager.clone();
+            let arguments = begin_arguments();
+            async move {
+                manager
+                    .begin_published_endpoint_acquisition(arguments, principal)
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if manager.publisher_begin_operations.deadline(&key).is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successor queues behind the held transition");
+        drop(transition_guard);
+        let prepared = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, successor)
+            .await
+            .expect("successor proceeds after the transition is released")
+            .expect("join queued successor")
+            .expect("queued successor acquires a fresh attempt");
+        assert_eq!(
+            prepared.origin().as_str(),
+            "https://workbench.queued-publisher.localhost:4443"
+        );
+        assert_eq!(
+            manager
+                .publisher_prevalidation_work_count
+                .load(AtomicOrdering::SeqCst),
+            1,
+            "only the live successor may perform config and plugin work"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_post_admission_waits_vacate_before_revalidation_and_final_transition() {
+        let directory = tempdir().expect("create post-admission publisher fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create post-admission publisher project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "post-admission-publisher"
+domain = "post-admission-publisher.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write post-admission publisher configuration");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create post-admission publisher manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("catalogue post-admission publisher declaration");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve post-admission publisher instance");
+        let key = ServiceKey::new(instance_id, ServiceName::new("workbench"));
+        let begin_arguments = || publisher_protocol::BeginAcquisitionArguments {
+            expected_project_instance_id: publisher_protocol::ProjectInstanceId::parse(
+                &instance_id.to_string(),
+            )
+            .expect("wire project instance"),
+            project_locator: publisher_protocol::AbsolutePath::try_from(project_path.clone())
+                .expect("wire project locator"),
+            service_name: publisher_protocol::ServiceName::parse("workbench")
+                .expect("wire service name"),
+            replace_terminal_attempt_handle: None,
+        };
+        let principal =
+            PublisherPrincipal::new(501, 47, crate::publication::PublisherProcessBirth::Test(6));
+
+        let revalidation_reached = Arc::new(Notify::new());
+        manager.set_publisher_post_admission_revalidation_hook(ConfigPublicationHook {
+            reached: revalidation_reached.clone(),
+            resume: Arc::new(Notify::new()),
+        });
+        let revalidation_waiter = tokio::spawn({
+            let manager = manager.clone();
+            let principal = principal.clone();
+            let arguments = begin_arguments();
+            async move {
+                manager
+                    .begin_published_endpoint_acquisition(arguments, principal)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            revalidation_reached.notified(),
+        )
+        .await
+        .expect("first Begin reaches post-admission identity revalidation");
+        let deadline = manager
+            .publisher_begin_operations
+            .deadline(&key)
+            .expect("post-admission Begin retains its original deadline");
+        manager
+            .publisher_authority
+            .timeout_candidate_preparation_deadline_for_test(&deadline);
+        let error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, revalidation_waiter)
+            .await
+            .expect("expired revalidation returns without releasing its gate")
+            .expect("join expired revalidation")
+            .expect_err("expired revalidation cannot complete Begin");
+        assert_eq!(
+            error.code(),
+            publisher_protocol::StableErrorCode::PreparationTimedOut
+        );
+        let _ = manager
+            .publisher_authority
+            .timeout_candidate_preparation_for_test(&key)
+            .await
+            .expect("retire the post-admission candidate if still present");
+        assert_eq!(
+            manager
+                .publisher_post_admission_revalidation_count
+                .load(AtomicOrdering::SeqCst),
+            0,
+            "expired work must not start the post-admission Git identity lookup"
+        );
+
+        let final_transition_reached = Arc::new(Notify::new());
+        let final_transition_resume = Arc::new(Notify::new());
+        manager.set_publisher_final_transition_hook(ConfigPublicationHook {
+            reached: final_transition_reached.clone(),
+            resume: final_transition_resume.clone(),
+        });
+        let final_transition_waiter = tokio::spawn({
+            let manager = manager.clone();
+            let principal = principal.clone();
+            let arguments = begin_arguments();
+            async move {
+                manager
+                    .begin_published_endpoint_acquisition(arguments, principal)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            final_transition_reached.notified(),
+        )
+        .await
+        .expect("second Begin reaches the final publisher transition boundary");
+        let transition_guard = manager.publisher_transition_lock.lock().await;
+        final_transition_resume.notify_one();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                if manager
+                    .publisher_final_transition_wait_count
+                    .load(AtomicOrdering::SeqCst)
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second Begin queues on the held final transition lock");
+        assert!(!final_transition_waiter.is_finished());
+        let deadline = manager
+            .publisher_begin_operations
+            .deadline(&key)
+            .expect("final-transition Begin retains its original deadline");
+        manager
+            .publisher_authority
+            .timeout_candidate_preparation_deadline_for_test(&deadline);
+        let error = tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, final_transition_waiter)
+            .await
+            .expect("expired final transition returns while its lock remains held")
+            .expect("join expired final transition")
+            .expect_err("expired final transition cannot commit authority");
+        assert_eq!(
+            error.code(),
+            publisher_protocol::StableErrorCode::PreparationTimedOut
+        );
+        let _ = manager
+            .publisher_authority
+            .timeout_candidate_preparation_for_test(&key)
+            .await
+            .expect("retire the final-transition candidate if still present");
+        drop(transition_guard);
+
+        let prepared = tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            manager.begin_published_endpoint_acquisition(begin_arguments(), principal),
+        )
+        .await
+        .expect("successor proceeds after both expired post-admission waits vacate")
+        .expect("successor acquires a fresh attempt");
+        assert_eq!(
+            prepared.origin().as_str(),
+            "https://workbench.post-admission-publisher.localhost:4443"
+        );
+        assert_eq!(
+            manager
+                .publisher_post_admission_revalidation_count
+                .load(AtomicOrdering::SeqCst),
+            2,
+            "only the final-transition attempt and successor perform revalidation"
+        );
+        assert_eq!(
+            manager
+                .publisher_final_transition_wait_count
+                .load(AtomicOrdering::SeqCst),
+            2,
+            "the expired lock waiter vacates and the successor enters once"
+        );
+    }
+
+    #[tokio::test]
     async fn published_projection_changes_invalidate_the_authoritative_service_list() {
         let directory = tempdir().expect("create published projection fixture");
         let project_path = directory.path().join("project");
@@ -30283,6 +32921,45 @@ domains = ["workbench"]
             .await
             .expect("establish initial published availability");
 
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve published lifecycle instance");
+        let authority = manager.publisher_authority();
+        let principal =
+            PublisherPrincipal::new(501, 42, crate::publication::PublisherProcessBirth::Test(1));
+        let preparation = authority
+            .reserve_acquisition(
+                ServiceKey::new(instance_id, ServiceName::new("workbench")),
+                principal.clone(),
+                None,
+            )
+            .await
+            .expect("reserve published lifecycle acquisition");
+        let PublisherAcquisitionPreparation::Required(permit) = preparation else {
+            panic!("fresh publication requires preparation");
+        };
+        let prepared = authority
+            .complete_acquisition_preparation(permit)
+            .await
+            .expect("complete published lifecycle preparation");
+        let acquired = manager
+            .acquire_published_endpoint(
+                prepared.acquisition_attempt_handle(),
+                &principal,
+                prepared.origin(),
+                RetainedListenerCapability::new(
+                    crate::publication::ListenerIdentity::Test(1),
+                    Arc::new(()),
+                ),
+            )
+            .await
+            .expect("acquire published lifecycle lease");
+        assert_eq!(
+            acquired.publication_state(),
+            publisher_protocol::PublicationState::CheckingEndpoint
+        );
+
         let mut events = manager.event_sender.subscribe();
         assert!(
             manager
@@ -30313,6 +32990,46 @@ domains = ["workbench"]
                 .as_ref()
                 .map(|publication| publication.state),
             Some(PublicationState::RoutePaused)
+        );
+        let renewed_while_paused = manager
+            .renew_published_endpoint(acquired.lease_handle(), &principal)
+            .await
+            .expect("passive publisher renewal remains authorized while paused");
+        assert_eq!(
+            renewed_while_paused.publication_state(),
+            publisher_protocol::PublicationState::RoutePaused
+        );
+        // An idempotent lifecycle retry must repair endpoint authority if a
+        // prior durable pause committed immediately before a wake barrier.
+        authority
+            .set_project_paused(instance_id, false)
+            .await
+            .expect("inject stale endpoint pause projection");
+        assert!(
+            !manager
+                .publish_publisher_pause_transition(instance_id, true, true)
+                .await
+                .expect("idempotent pause repairs endpoint authority")
+        );
+        assert_eq!(
+            manager
+                .renew_published_endpoint(acquired.lease_handle(), &principal)
+                .await
+                .expect("repaired pause remains passively renewable")
+                .publication_state(),
+            publisher_protocol::PublicationState::RoutePaused
+        );
+        let wait_error = authority
+            .wait_ready(
+                acquired.lease_handle(),
+                &principal,
+                acquired.binding_revision(),
+            )
+            .await
+            .expect_err("a paused route cannot become ready");
+        assert_eq!(
+            wait_error.code(),
+            publisher_protocol::StableErrorCode::ProjectPaused
         );
 
         assert!(
@@ -30358,7 +33075,15 @@ domains = ["workbench"]
                 .publication
                 .as_ref()
                 .map(|publication| publication.state),
-            Some(PublicationState::WaitingForPublisher)
+            Some(PublicationState::CheckingEndpoint)
+        );
+        let renewed_after_resume = manager
+            .renew_published_endpoint(acquired.lease_handle(), &principal)
+            .await
+            .expect("publisher lease remains live after resume");
+        assert_eq!(
+            renewed_after_resume.publication_state(),
+            publisher_protocol::PublicationState::CheckingEndpoint
         );
 
         manager
@@ -30398,6 +33123,122 @@ domains = ["workbench"]
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn publisher_authority_hydrates_persisted_pause_before_first_acquisition() {
+        let directory = tempdir().expect("create publisher pause restart fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create publisher pause project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "publisher-pause-restart"
+domain = "publisher-pause-restart.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write publisher pause config");
+        let state_path = directory.path().join("state.json");
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(state_path.clone())),
+            Arc::new(Mutex::new(Registry::with_path(
+                directory.path().join("catalog.json"),
+            ))),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create publisher pause manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path.clone(), None, false)
+            .await
+            .expect("admit publisher pause declaration");
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect("establish publisher pause availability");
+        manager
+            .project_pause_availability(&project_path)
+            .await
+            .expect("persist publisher pause");
+        let (instance_id, _) = manager
+            .required_availability_instance_for_path(&project_path)
+            .await
+            .expect("resolve publisher pause instance");
+        let catalog = manager.registry.lock().await.clone();
+        drop(manager);
+
+        let mut restarted = ProcessManager::new(
+            directory.path().join("restart-notify.sock"),
+            Arc::new(StateManager::with_path(state_path)),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("restart-attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create restarted publisher pause manager");
+        restarted.use_sandbox_host_set_writer();
+        restarted
+            .hydrate_publisher_availability_state()
+            .await
+            .expect("hydrate persisted publisher pause");
+
+        let authority = restarted.publisher_authority();
+        let principal =
+            PublisherPrincipal::new(501, 43, crate::publication::PublisherProcessBirth::Test(2));
+        let preparation = authority
+            .reserve_acquisition(
+                ServiceKey::new(instance_id, ServiceName::new("workbench")),
+                principal.clone(),
+                None,
+            )
+            .await
+            .expect("reserve acquisition after restart");
+        let PublisherAcquisitionPreparation::Required(permit) = preparation else {
+            panic!("fresh restart acquisition requires preparation");
+        };
+        let prepared = authority
+            .complete_acquisition_preparation(permit)
+            .await
+            .expect("complete restart acquisition preparation");
+        let acquired = restarted
+            .acquire_published_endpoint(
+                prepared.acquisition_attempt_handle(),
+                &principal,
+                prepared.origin(),
+                RetainedListenerCapability::new(
+                    crate::publication::ListenerIdentity::Test(2),
+                    Arc::new(()),
+                ),
+            )
+            .await
+            .expect("acquire paused publication after restart");
+        assert_eq!(
+            acquired.publication_state(),
+            publisher_protocol::PublicationState::RoutePaused
+        );
+        let wait_error = authority
+            .wait_ready(
+                acquired.lease_handle(),
+                &principal,
+                acquired.binding_revision(),
+            )
+            .await
+            .expect_err("hydrated pause blocks readiness");
+        assert_eq!(
+            wait_error.code(),
+            publisher_protocol::StableErrorCode::ProjectPaused
+        );
     }
 
     #[tokio::test]

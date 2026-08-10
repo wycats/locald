@@ -62,7 +62,11 @@ pub async fn check_command_with_env<S: BuildHasher + Sync>(
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
 
-    let mut child = match command.spawn() {
+    let spawn_permit = crate::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+    let spawn_result = command.spawn();
+    drop(spawn_permit);
+
+    let mut child = match spawn_result {
         Ok(child) => child,
         Err(e) => {
             debug!("Command probe failed for '{}': {}", cmd, e);

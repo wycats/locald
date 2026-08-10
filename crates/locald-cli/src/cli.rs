@@ -304,6 +304,19 @@ pub enum Commands {
         bind: String,
     },
 
+    /// Isolated child-process entry point for embedded Postgres setup.
+    #[command(name = "__postgres-setup", hide = true)]
+    PostgresSetup {
+        #[arg(long, hide = true)]
+        version: String,
+        #[arg(long, hide = true)]
+        port: u16,
+        #[arg(long, hide = true)]
+        data_dir: std::path::PathBuf,
+        #[arg(long, hide = true)]
+        installation_dir: std::path::PathBuf,
+    },
+
     /// Internal tooling commands (not part of the taught surface)
     #[command(name = "__surface", hide = true)]
     Surface {
@@ -821,6 +834,41 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected editor restart command"),
+        }
+    }
+
+    #[test]
+    fn parse_hidden_postgres_setup_captures_the_bounded_request() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "__postgres-setup",
+            "--version",
+            "15.3",
+            "--port",
+            "54321",
+            "--data-dir",
+            "/data/postgres",
+            "--installation-dir",
+            "/data/postgres-dist",
+        ])
+        .expect("parse Postgres setup helper");
+
+        match cli.command {
+            Commands::PostgresSetup {
+                version,
+                port,
+                data_dir,
+                installation_dir,
+            } => {
+                assert_eq!(version, "15.3");
+                assert_eq!(port, 54321);
+                assert_eq!(data_dir, std::path::PathBuf::from("/data/postgres"));
+                assert_eq!(
+                    installation_dir,
+                    std::path::PathBuf::from("/data/postgres-dist")
+                );
+            }
+            _ => panic!("expected Postgres setup helper command"),
         }
     }
 }

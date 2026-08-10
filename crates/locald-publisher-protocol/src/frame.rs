@@ -4,7 +4,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::{MAX_FRAME_JSON_BYTES, PublisherRequest, RequestEnvelope, ResponseEnvelope};
+use crate::{
+    ATTEMPT_TTL_MS, FRAME_TIMEOUT_MS, MAX_FRAME_JSON_BYTES, PREPARATION_TIMEOUT_MS,
+    PublisherRequest, RequestEnvelope, ResponseEnvelope, WAIT_TIMEOUT_MS,
+};
 
 const REQUEST_HEADER_BYTES: usize = 5;
 const RESPONSE_HEADER_BYTES: usize = 4;
@@ -48,6 +51,7 @@ impl DescriptorPrelude {
 pub struct EncodedRequestFrame {
     bytes: Vec<u8>,
     descriptor: DescriptorPrelude,
+    response_timeout_ms: u64,
 }
 
 impl EncodedRequestFrame {
@@ -68,6 +72,16 @@ impl EncodedRequestFrame {
     pub const fn descriptor(&self) -> DescriptorPrelude {
         self.descriptor
     }
+
+    /// Return the complete version-1 response wait budget for this operation.
+    ///
+    /// The transport independently bounds connect and request transmission by
+    /// the framing timeout. This budget covers the semantic operation plus
+    /// response framing after the complete request has been sent.
+    #[must_use]
+    pub const fn response_timeout_ms(&self) -> u64 {
+        self.response_timeout_ms
+    }
 }
 
 impl fmt::Debug for EncodedRequestFrame {
@@ -79,6 +93,7 @@ impl fmt::Debug for EncodedRequestFrame {
                 &format_args!("<redacted; {} bytes>", self.bytes.len()),
             )
             .field("descriptor", &self.descriptor)
+            .field("response_timeout_ms", &self.response_timeout_ms)
             .finish()
     }
 }
@@ -136,11 +151,23 @@ pub fn encode_request_frame(request: &RequestEnvelope) -> Result<EncodedRequestF
     let body = serde_json::to_vec(request).map_err(FrameError::Serialize)?;
     ensure_body_bound(body.len())?;
     let descriptor = DescriptorPrelude::for_request(request.request());
+    let response_timeout_ms = match request.request() {
+        PublisherRequest::BeginAcquisition(_) => PREPARATION_TIMEOUT_MS + FRAME_TIMEOUT_MS,
+        // Rebind may spend most of its attempt lifetime in the exact-binding
+        // health probe before the response itself is framed.
+        PublisherRequest::Rebind(_) => ATTEMPT_TTL_MS + FRAME_TIMEOUT_MS,
+        PublisherRequest::WaitReady(_) => WAIT_TIMEOUT_MS + FRAME_TIMEOUT_MS,
+        _ => FRAME_TIMEOUT_MS,
+    };
     let mut bytes = Vec::with_capacity(REQUEST_HEADER_BYTES + body.len());
     bytes.push(descriptor as u8);
     bytes.extend_from_slice(&body_length(body.len())?);
     bytes.extend_from_slice(&body);
-    Ok(EncodedRequestFrame { bytes, descriptor })
+    Ok(EncodedRequestFrame {
+        bytes,
+        descriptor,
+        response_timeout_ms,
+    })
 }
 
 /// Decode one complete request frame and enforce operation/prelude parity.
@@ -256,8 +283,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        AcquireArguments, AcquisitionAttemptHandle, DaemonEpoch, ProtocolError, ReleaseArguments,
-        ReleaseResult, StableErrorCode,
+        AbsolutePath, AcquireArguments, AcquisitionAttemptHandle, BeginAcquisitionArguments,
+        BindingRevision, DaemonEpoch, LeaseHandle, ProjectInstanceId, ProtocolError,
+        RebindArguments, RebindAttemptHandle, ReleaseArguments, ReleaseResult, SemanticOrigin,
+        ServiceName, StableErrorCode, WaitReadyArguments,
     };
 
     fn epoch() -> DaemonEpoch {
@@ -280,6 +309,7 @@ mod tests {
         );
         let encoded = encode_request_frame(&acquire)?;
         assert_eq!(encoded.descriptor(), DescriptorPrelude::Listener);
+        assert_eq!(encoded.response_timeout_ms(), FRAME_TIMEOUT_MS);
         assert_eq!(decode_request_frame(encoded.as_bytes())?, acquire);
 
         let release = RequestEnvelope::v1(
@@ -290,7 +320,53 @@ mod tests {
         );
         let encoded = encode_request_frame(&release)?;
         assert_eq!(encoded.descriptor(), DescriptorPrelude::None);
+        assert_eq!(encoded.response_timeout_ms(), FRAME_TIMEOUT_MS);
         assert_eq!(decode_request_frame(encoded.as_bytes())?, release);
+        Ok(())
+    }
+
+    #[test]
+    fn encoded_requests_preserve_long_operation_response_budgets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let begin = RequestEnvelope::v1(
+            epoch(),
+            PublisherRequest::BeginAcquisition(BeginAcquisitionArguments {
+                expected_project_instance_id: ProjectInstanceId::parse(
+                    "550e8400-e29b-41d4-a716-446655440000",
+                )?,
+                project_locator: AbsolutePath::parse("/tmp/publisher-project")?,
+                service_name: ServiceName::parse("workbench")?,
+                replace_terminal_attempt_handle: None,
+            }),
+        );
+        assert_eq!(
+            encode_request_frame(&begin)?.response_timeout_ms(),
+            PREPARATION_TIMEOUT_MS + FRAME_TIMEOUT_MS
+        );
+
+        let rebind = RequestEnvelope::v1(
+            epoch(),
+            PublisherRequest::Rebind(RebindArguments {
+                rebind_attempt_handle: RebindAttemptHandle::from_bytes([5; 32]),
+                acknowledged_origin: SemanticOrigin::parse("https://workbench.exo.localhost")?,
+            }),
+        );
+        assert_eq!(
+            encode_request_frame(&rebind)?.response_timeout_ms(),
+            ATTEMPT_TTL_MS + FRAME_TIMEOUT_MS
+        );
+
+        let wait = RequestEnvelope::v1(
+            epoch(),
+            PublisherRequest::WaitReady(WaitReadyArguments {
+                lease_handle: LeaseHandle::from_bytes([4; 32]),
+                expected_binding_revision: BindingRevision::new(1)?,
+            }),
+        );
+        assert_eq!(
+            encode_request_frame(&wait)?.response_timeout_ms(),
+            WAIT_TIMEOUT_MS + FRAME_TIMEOUT_MS
+        );
         Ok(())
     }
 

@@ -75,6 +75,7 @@ locald-builder = { version = "0.1.0", path = "../locald-builder" }
 locald-core = { version = "0.1.0", path = "../locald-core" }
 locald-helper-protocol = { version = "0.1.0", path = "../locald-helper-protocol" }
 locald-hosts = { version = "0.1.0", path = "../locald-hosts" }
+locald-publisher-protocol = { version = "0.1.0", path = "../locald-publisher-protocol" }
 locald-server = { version = "0.1.0", path = "../locald-server", default-features = false }
 locald-utils = { version = "0.1.0", path = "../locald-utils" }
 miette = { version = "7", features = ["fancy"] }
