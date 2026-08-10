@@ -993,9 +993,17 @@ fn receive_owned_chunk(
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = size_of::<[usize; RECEIVE_CONTROL_WORDS]>()
+    #[cfg_attr(
+        target_os = "linux",
+        allow(
+            clippy::useless_conversion,
+            reason = "libc::msghdr::msg_controllen uses target-specific integer types"
+        )
+    )]
+    let control_length = size_of::<[usize; RECEIVE_CONTROL_WORDS]>()
         .try_into()
         .map_err(|_| nix::errno::Errno::EINVAL)?;
+    message.msg_controllen = control_length;
 
     // SAFETY: `message` describes initialized writable storage and `stream`
     // remains borrowed for the complete syscall.
@@ -1018,6 +1026,13 @@ fn receive_owned_chunk(
 )]
 fn own_received_control_messages(message: &libc::msghdr) -> (Vec<OwnedFd>, bool) {
     let control_start = message.msg_control as usize;
+    #[cfg_attr(
+        target_os = "linux",
+        allow(
+            clippy::unnecessary_cast,
+            reason = "libc::msghdr::msg_controllen uses target-specific integer types"
+        )
+    )]
     let control_end = control_start.saturating_add(message.msg_controllen as usize);
     let mut descriptors = Vec::new();
     let mut unexpected_control = false;
@@ -1205,6 +1220,10 @@ fn peer_uid_pid(_stream: &UnixStream) -> Result<(u32, u32), PublisherSocketError
 }
 
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "peer authentication requires one synchronous snapshot of the Linux procfs birth identifiers"
+)]
 fn process_birth(pid: u32) -> Result<PublisherProcessBirthEvidence, PublisherSocketError> {
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
@@ -1353,7 +1372,12 @@ fn linux_socket_cookie(
     option: libc::c_int,
 ) -> io::Result<u64> {
     let mut value = 0_u64;
-    let mut length = std::mem::size_of::<u64>() as libc::socklen_t;
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<u64>()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket-cookie storage length does not fit socklen_t",
+        )
+    })?;
     // SAFETY: the descriptor is borrowed for the syscall and the output points
     // to initialized, correctly sized writable storage.
     #[allow(unsafe_code)]
@@ -1612,6 +1636,10 @@ async fn remove_safe_stale_socket(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(
+    clippy::unused_async,
+    reason = "the shared platform call site awaits the macOS spawn barrier while non-macOS deliberately performs the same blocking connect inline"
+)]
 async fn connect_for_stale_check(
     path: &Path,
     _spawn_barrier: Option<&Arc<dyn PublisherSpawnBarrier>>,
@@ -2126,16 +2154,24 @@ mod tests {
             .iter()
             .map(AsRawFd::as_raw_fd)
             .collect::<Vec<_>>();
-        for descriptor in &installed {
-            let flags = nix::fcntl::fcntl(*descriptor, FcntlArg::F_GETFD)
+        for descriptor in &received.descriptors {
+            let flags = nix::fcntl::fcntl(descriptor, FcntlArg::F_GETFD)
                 .expect("installed descriptor remains owned");
             assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
         }
         drop(received);
         for descriptor in installed {
+            // SAFETY: querying an invalid raw descriptor is defined to fail
+            // with EBADF and does not dereference user memory.
+            #[allow(unsafe_code)]
+            let result = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
             assert_eq!(
-                nix::fcntl::fcntl(descriptor, FcntlArg::F_GETFD),
-                Err(nix::errno::Errno::EBADF),
+                result, -1,
+                "installed descriptor unexpectedly remained open"
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF),
                 "every installed descriptor closes on rejection"
             );
         }
