@@ -318,13 +318,19 @@ impl ProjectPublisher {
         if !self.fence.is_current() {
             return Err(ClientError::DaemonEpochChanged);
         }
-        let exact_replay = matches!(
-            &request,
+        let (retry_not_sent, retry_outcome_unknown) = match &request {
+            PublisherRequest::BeginAcquisition(arguments) => {
+                (true, arguments.replace_terminal_attempt_handle.is_none())
+            }
+            PublisherRequest::BeginRebind(arguments) => {
+                (true, arguments.replace_terminal_attempt_handle.is_none())
+            }
             PublisherRequest::Acquire(_)
-                | PublisherRequest::Renew(_)
-                | PublisherRequest::Rebind(_)
-                | PublisherRequest::Release(_)
-        );
+            | PublisherRequest::Renew(_)
+            | PublisherRequest::Rebind(_)
+            | PublisherRequest::Release(_) => (true, true),
+            PublisherRequest::WaitReady(_) => (false, false),
+        };
         let schedule_bearing = matches!(
             &request,
             PublisherRequest::Acquire(_) | PublisherRequest::Renew(_) | PublisherRequest::Rebind(_)
@@ -353,17 +359,20 @@ impl ProjectPublisher {
         ) {
             Ok(reply) => reply,
             Err(first_failure)
-                if exact_replay
-                    && matches!(
-                        first_failure.certainty,
-                        DeliveryCertainty::NotSent | DeliveryCertainty::OutcomeUnknown
-                    ) =>
+                if match first_failure.certainty {
+                    DeliveryCertainty::NotSent => retry_not_sent,
+                    DeliveryCertainty::OutcomeUnknown => retry_outcome_unknown,
+                    DeliveryCertainty::Fatal => false,
+                } =>
             {
-                // These mutation phases have a protocol-defined convergence rule:
-                // acquire/rebind replay their exact terminal request, renew
-                // repeats on the same live lease, and release converges on the
-                // exact handle. The encoded frame and borrowed listener are
-                // reused unchanged.
+                // These operations have a protocol-defined convergence rule:
+                // ordinary begins return the current attempt for the same
+                // exact authority, while compare-and-swap begin replacements
+                // enter only after definitively unsent delivery. Acquire and
+                // rebind replay their exact terminal request, renew repeats on
+                // the same live lease, and release converges on the exact
+                // handle. The encoded frame and borrowed listener are reused
+                // unchanged.
                 match self.inner.transport.exchange(
                     self.protocol_info.publisher_socket(),
                     &frame,
@@ -2035,6 +2044,27 @@ mod tests {
         .expect("valid begin rebind")
     }
 
+    fn replacement_begin_acquisition(fixture: &Fixture) -> PublisherRequest {
+        PublisherRequest::BeginAcquisition(BeginAcquisitionArguments {
+            expected_project_instance_id: fixture.instance,
+            project_locator: AbsolutePath::parse("/work/project").expect("locator"),
+            service_name: ServiceName::parse("workbench").expect("service"),
+            replace_terminal_attempt_handle: Some(
+                AcquisitionAttemptHandle::parse(ATTEMPT_A).expect("acquisition attempt"),
+            ),
+        })
+    }
+
+    fn replacement_begin_rebind() -> PublisherRequest {
+        PublisherRequest::BeginRebind(BeginRebindArguments {
+            lease_handle: LeaseHandle::parse(LEASE).expect("lease"),
+            expected_binding_revision: BindingRevision::new(1).expect("revision"),
+            replace_terminal_attempt_handle: Some(
+                RebindAttemptHandle::parse(ATTEMPT_A).expect("rebind attempt"),
+            ),
+        })
+    }
+
     fn rebind_result() -> RebindResult {
         RebindResult::new(
             LeaseHandle::parse(LEASE).expect("lease"),
@@ -2630,6 +2660,192 @@ mod tests {
         assert_eq!(operations, ["renew".to_owned(), "wait_ready".to_owned()]);
         release_success(&fixture);
         lease.release().expect("release");
+    }
+
+    #[test]
+    fn begin_operations_replay_byte_identical_ambiguous_requests() {
+        let fixture = fixture();
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        fixture.transport.push(
+            "begin_acquisition",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_result(&fixture, ATTEMPT_A, AttemptState::Pending),
+            ),
+        );
+        let prepared = project(&fixture)
+            .prepare(ServiceName::parse("workbench").expect("service"))
+            .expect("prepare after ambiguous delivery");
+        let begin_acquisition = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(begin_acquisition.len(), 2);
+        assert_eq!(begin_acquisition[0].frame, begin_acquisition[1].frame);
+        assert!(
+            begin_acquisition
+                .iter()
+                .all(|request| request.listener_fd.is_none())
+        );
+
+        fixture.transport.push(
+            "acquire",
+            &ResponseEnvelope::success(fixture.epoch.clone(), acquire_result(10_000)),
+        );
+        let installed = prepared
+            .confirm_origin_installed(&origin())
+            .expect("origin installed");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let lease = installed.acquire(&listener).expect("acquire");
+
+        fixture.transport.push_error(
+            "begin_rebind",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        fixture.transport.push(
+            "begin_rebind",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_rebind_result(AttemptState::Pending, ATTEMPT_B),
+            ),
+        );
+        lease
+            .prepare_rebind()
+            .expect("prepare rebind after ambiguous delivery");
+        let begin_rebind = fixture.transport.recorded("begin_rebind");
+        assert_eq!(begin_rebind.len(), 2);
+        assert_eq!(begin_rebind[0].frame, begin_rebind[1].frame);
+        assert!(
+            begin_rebind
+                .iter()
+                .all(|request| request.listener_fd.is_none())
+        );
+
+        release_success(&fixture);
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn begin_replay_preserves_delivery_certainty_and_stops_on_fatal_failure() {
+        let ambiguous_fixture = fixture();
+        ambiguous_fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        ambiguous_fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::NotSent),
+        );
+        assert!(matches!(
+            project(&ambiguous_fixture).prepare(ServiceName::parse("workbench").expect("service")),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let ambiguous_frames = ambiguous_fixture.transport.frames("begin_acquisition");
+        assert_eq!(ambiguous_frames.len(), 2);
+        assert_eq!(ambiguous_frames[0], ambiguous_frames[1]);
+
+        let fatal_fixture = fixture();
+        fatal_fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::Fatal),
+        );
+        assert!(matches!(
+            project(&fatal_fixture).prepare(ServiceName::parse("workbench").expect("service")),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::Fatal,
+                ..
+            }))
+        ));
+        assert_eq!(fatal_fixture.transport.frames("begin_acquisition").len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_begin_replacements_are_not_replayed() {
+        let fixture = fixture();
+        let project = project(&fixture);
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        assert!(matches!(
+            project.exchange::<BeginAcquisitionResult>(
+                replacement_begin_acquisition(&fixture),
+                None,
+                None,
+            ),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let acquisition = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(acquisition.len(), 1);
+        assert!(acquisition[0].listener_fd.is_none());
+
+        fixture.transport.push_error(
+            "begin_rebind",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        assert!(matches!(
+            project.exchange::<BeginRebindResult>(replacement_begin_rebind(), None, None),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let rebind = fixture.transport.recorded("begin_rebind");
+        assert_eq!(rebind.len(), 1);
+        assert!(rebind[0].listener_fd.is_none());
+    }
+
+    #[test]
+    fn definitively_unsent_begin_replacements_retry_byte_identically() {
+        let fixture = fixture();
+        let project = project(&fixture);
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::NotSent),
+        );
+        fixture.transport.push(
+            "begin_acquisition",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_result(&fixture, ATTEMPT_B, AttemptState::Pending),
+            ),
+        );
+        project
+            .exchange::<BeginAcquisitionResult>(replacement_begin_acquisition(&fixture), None, None)
+            .expect("retry definitively unsent acquisition replacement");
+        let acquisition = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(acquisition.len(), 2);
+        assert_eq!(acquisition[0].frame, acquisition[1].frame);
+        assert!(
+            acquisition
+                .iter()
+                .all(|request| request.listener_fd.is_none())
+        );
+
+        fixture.transport.push_error(
+            "begin_rebind",
+            transport_failure(DeliveryCertainty::NotSent),
+        );
+        fixture.transport.push(
+            "begin_rebind",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_rebind_result(AttemptState::Pending, ATTEMPT_B),
+            ),
+        );
+        project
+            .exchange::<BeginRebindResult>(replacement_begin_rebind(), None, None)
+            .expect("retry definitively unsent rebind replacement");
+        let rebind = fixture.transport.recorded("begin_rebind");
+        assert_eq!(rebind.len(), 2);
+        assert_eq!(rebind[0].frame, rebind[1].frame);
+        assert!(rebind.iter().all(|request| request.listener_fd.is_none()));
     }
 
     #[test]

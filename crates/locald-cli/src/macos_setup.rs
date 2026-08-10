@@ -16,7 +16,7 @@ use locald_utils::privileged::{
     Severity, Status, StrategyReport,
 };
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -765,6 +765,17 @@ fn collect_report_for(caller: ReportCaller, _verbose: bool) -> Result<DoctorRepo
         Ok(paths) => {
             push_check(
                 &mut problems,
+                "macos.publisher.installation",
+                "Publisher installation record is valid and securely installed",
+                owner_result.as_ref().map_or_else(
+                    |error| Err(anyhow::anyhow!("setup owner unavailable: {error}")),
+                    |owner| {
+                        validate_publisher_installation_record(&paths.publisher_installation, owner)
+                    },
+                ),
+            );
+            push_check(
+                &mut problems,
                 "macos.ca.material",
                 "Root CA certificate and key are valid and matched",
                 locald_utils::cert::validate_root_ca_material_in_dir(&paths.certs).map(|_| ()),
@@ -824,6 +835,10 @@ fn collect_report_for(caller: ReportCaller, _verbose: bool) -> Result<DoctorRepo
         }
         Err(error) => {
             for (id, summary) in [
+                (
+                    "macos.publisher.installation",
+                    "Publisher installation record is valid and securely installed",
+                ),
                 (
                     "macos.ca.material",
                     "Root CA certificate and key are valid and matched",
@@ -1048,6 +1063,107 @@ fn validate_file(path: &Path, expected: &[u8], owner: Option<(u32, u32)>, mode: 
     Ok(())
 }
 
+fn validate_publisher_installation_record(path: &Path, owner: &SetupOwner) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("publisher installation record has no parent directory")?;
+    let directory = open_existing_directory(parent)?.with_context(|| {
+        format!(
+            "publisher installation record directory is missing at {}",
+            parent.display()
+        )
+    })?;
+    let directory_metadata = nix::sys::stat::fstat(&directory)
+        .with_context(|| format!("could not inspect {}", parent.display()))?;
+    let directory_mode = directory_metadata.st_mode & 0o7777;
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(directory_metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFDIR,
+        "publisher installation record directory at {} is not a real directory",
+        parent.display()
+    );
+    anyhow::ensure!(
+        directory_metadata.st_uid == owner.uid && directory_metadata.st_gid == owner.gid,
+        "publisher installation record directory at {} is owned by {}:{}, expected {}:{}",
+        parent.display(),
+        directory_metadata.st_uid,
+        directory_metadata.st_gid,
+        owner.uid,
+        owner.gid
+    );
+    anyhow::ensure!(
+        directory_mode == 0o700,
+        "publisher installation record directory at {} has mode {directory_mode:04o}, expected 0700",
+        parent.display()
+    );
+
+    let name = path
+        .file_name()
+        .context("publisher installation record has no file name")?;
+    let descriptor = match nix::fcntl::openat(
+        &directory,
+        name,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC
+            | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(nix::errno::Errno::ENOENT) => {
+            anyhow::bail!(
+                "publisher installation record is missing at {}",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not open {} safely", path.display()));
+        }
+    };
+    let metadata = nix::sys::stat::fstat(&descriptor)
+        .with_context(|| format!("could not inspect {}", path.display()))?;
+    let mode = metadata.st_mode & 0o7777;
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFREG,
+        "publisher installation record at {} is not a regular non-symlink file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.st_uid == owner.uid && metadata.st_gid == owner.gid,
+        "publisher installation record at {} is owned by {}:{}, expected {}:{}",
+        path.display(),
+        metadata.st_uid,
+        metadata.st_gid,
+        owner.uid,
+        owner.gid
+    );
+    anyhow::ensure!(
+        mode == 0o600,
+        "publisher installation record at {} has mode {mode:04o}, expected 0600",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.st_size >= 0 && metadata.st_size as usize <= INSTALLATION_RECORD_MAX_BYTES,
+        "publisher installation record exceeds {INSTALLATION_RECORD_MAX_BYTES} bytes"
+    );
+
+    let mut bytes = Vec::new();
+    File::from(descriptor)
+        .take((INSTALLATION_RECORD_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= INSTALLATION_RECORD_MAX_BYTES,
+        "publisher installation record exceeds {INSTALLATION_RECORD_MAX_BYTES} bytes"
+    );
+    let record = serde_json::from_slice::<InstallationRecord>(&bytes)
+        .context("publisher installation record is malformed or incompatible")?;
+    record
+        .validate()
+        .context("publisher installation record is incompatible")
+}
+
 fn validate_launch_agent(
     path: &Path,
     paths: &InstallationPaths,
@@ -1120,6 +1236,10 @@ fn report_from_problems(problems: Vec<Problem>) -> DoctorReport {
 fn sandbox_report() -> DoctorReport {
     let problems = [
         ("macos.console_user", "Console-user identity"),
+        (
+            "macos.publisher.installation",
+            "Publisher installation record",
+        ),
         ("macos.ca.material", "Root CA material"),
         ("macos.ca.permissions", "Root CA permissions"),
         ("macos.ca.trust", "System Root CA trust"),
@@ -1679,6 +1799,73 @@ mod tests {
             .unwrap(),
             InstallationRecord::v1().unwrap()
         );
+    }
+
+    #[test]
+    fn publisher_record_readiness_accepts_the_setup_owned_v1_record() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+
+        validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect("the setup-owned record must satisfy readiness");
+    }
+
+    #[test]
+    fn publisher_record_readiness_rejects_a_missing_record() {
+        let (_root, owner, paths, _authority) = fixture();
+
+        let error = validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect_err("a missing publisher record must fail readiness");
+
+        assert!(format!("{error:#}").contains("record directory is missing"));
+    }
+
+    #[test]
+    fn publisher_record_readiness_rejects_malformed_content() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        std::fs::write(&paths.publisher_installation, b"not-json").unwrap();
+
+        let error = validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect_err("a malformed publisher record must fail readiness");
+
+        assert!(format!("{error:#}").contains("malformed or incompatible"));
+    }
+
+    #[test]
+    fn publisher_record_readiness_rejects_unsafe_mode() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        std::fs::set_permissions(
+            &paths.publisher_installation,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let error = validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect_err("a group-readable publisher record must fail readiness");
+
+        assert!(format!("{error:#}").contains("mode 0644, expected 0600"));
+    }
+
+    #[test]
+    fn publisher_record_readiness_uses_the_resolved_setup_owner() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let different_owner = SetupOwner {
+            uid: owner.uid.wrapping_add(1),
+            gid: owner.gid,
+            home: owner.home.clone(),
+        };
+
+        let error =
+            validate_publisher_installation_record(&paths.publisher_installation, &different_owner)
+                .expect_err(
+                    "a record outside the resolved setup owner's authority must fail readiness",
+                );
+
+        assert!(format!("{error:#}").contains("expected"));
+        assert!(format!("{error:#}").contains(&different_owner.uid.to_string()));
     }
 
     #[test]
@@ -2545,6 +2732,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "macos.console_user",
+                "macos.publisher.installation",
                 "macos.ca.material",
                 "macos.ca.permissions",
                 "macos.ca.trust",

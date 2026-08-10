@@ -650,7 +650,7 @@ mod platform {
             let api = match SystemdApi::load() {
                 Ok(api) => api,
                 Err(error) => {
-                    let _ = ready.send(Err(error));
+                    drop(ready.send(Err(error)));
                     return;
                 }
             };
@@ -659,7 +659,7 @@ mod platform {
             if unsafe { (api.bus_default_system)(&raw mut bus_pointer) } < 0
                 || bus_pointer.is_null()
             {
-                let _ = ready.send(Err(WakeError::Unavailable));
+                drop(ready.send(Err(WakeError::Unavailable)));
                 return;
             }
             let bus = BusGuard {
@@ -688,7 +688,7 @@ mod platform {
                 )
             };
             if match_status < 0 || slot_pointer.is_null() {
-                let _ = ready.send(Err(WakeError::Unavailable));
+                drop(ready.send(Err(WakeError::Unavailable)));
                 return;
             }
             let _slot = SlotGuard {
@@ -697,20 +697,16 @@ mod platform {
             };
             let mut inhibitor = match acquire_inhibitor(&api, bus.pointer) {
                 Ok(inhibitor) => Some(inhibitor),
-                Err(_) => {
-                    let _ = ready.send(Err(WakeError::Unavailable));
+                Err(()) => {
+                    drop(ready.send(Err(WakeError::Unavailable)));
                     return;
                 }
             };
 
             match process_one(&api, bus.pointer, &mut signal_state) {
                 Ok(false) if signal_state.pending.is_none() => {}
-                Ok(_) => {
-                    let _ = ready.send(Err(WakeError::Unavailable));
-                    return;
-                }
-                Err(_) => {
-                    let _ = ready.send(Err(WakeError::Unavailable));
+                Ok(_) | Err(()) => {
+                    drop(ready.send(Err(WakeError::Unavailable)));
                     return;
                 }
             }
@@ -767,7 +763,7 @@ mod platform {
                             }
                             match acquire_inhibitor(&api, bus.pointer) {
                                 Ok(replacement) => inhibitor = Some(replacement),
-                                Err(_) => {
+                                Err(()) => {
                                     notify_failed(
                                         &sink,
                                         WakeError::Failed(

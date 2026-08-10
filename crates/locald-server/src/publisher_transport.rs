@@ -59,12 +59,26 @@ const RECEIVE_CONTROL_WORDS: usize = (size_of::<libc::cmsghdr>()
 pub(crate) trait PublisherSpawnBarrier: Send + Sync + fmt::Debug {
     /// Hold process spawning until every descriptor received by one `recvmsg`
     /// call has been made close-on-exec.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Linux receives descriptors atomically with MSG_CMSG_CLOEXEC"
+        )
+    )]
     fn enter_descriptor_receipt(
         &self,
     ) -> Result<Box<dyn PublisherSpawnBarrierGuard + '_>, PublisherSocketError>;
 }
 
 /// Type-erased lifetime guard returned by [`PublisherSpawnBarrier`].
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "Linux receives descriptors atomically with MSG_CMSG_CLOEXEC"
+    )
+)]
 pub(crate) trait PublisherSpawnBarrierGuard: Send {}
 
 impl PublisherSpawnBarrierGuard for locald_utils::process_spawn::DescriptorReceiptGuard {}
@@ -532,8 +546,22 @@ pub(crate) enum PublisherSocketError {
     #[cfg(target_os = "linux")]
     NetworkNamespaceUnverifiable(String),
     #[error("macOS descriptor receipt requires the daemon process-spawn barrier")]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "the descriptor receipt barrier is required only on macOS"
+        )
+    )]
     SpawnBarrierUnavailable,
     #[error("publisher descriptor receipt collided with process creation; retry the request")]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "the descriptor receipt barrier is required only on macOS"
+        )
+    )]
     SpawnBarrierBusy,
     #[error("publisher response frame is invalid")]
     InvalidResponseFrame,
@@ -840,6 +868,8 @@ fn recv_one_chunk(
     deadline: Instant,
     config: &PublisherSocketConfig,
 ) -> Result<(Vec<u8>, Vec<OwnedFd>), PublisherSocketError> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = config;
     if maximum == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -894,6 +924,8 @@ fn require_request_eof(
     deadline: Instant,
     config: &PublisherSocketConfig,
 ) -> Result<(), PublisherSocketError> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = config;
     set_remaining_read_timeout(stream, deadline)?;
     let mut byte = [0_u8; 1];
 
@@ -1669,6 +1701,8 @@ mod tests {
     };
     use nix::sys::socket::{ControlMessage, sendmsg};
     use std::io::{IoSlice, Read as _};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 

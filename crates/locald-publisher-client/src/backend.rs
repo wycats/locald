@@ -843,6 +843,10 @@ fn receive_publisher_chunk(
 )]
 fn close_response_control_messages(message: &libc::msghdr) -> bool {
     let control_start = message.msg_control as usize;
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "libc::msghdr::msg_controllen uses target-specific integer types"
+    )]
     let control_end = control_start.saturating_add(message.msg_controllen as usize);
     let mut had_control = false;
     // SAFETY: recvmsg initialized the control buffer described by `message`.
