@@ -8,6 +8,8 @@
 #![allow(clippy::redundant_pub_crate)] // Sibling modules consume the private transport boundary.
 
 use async_trait::async_trait;
+#[cfg(any(target_os = "macos", test))]
+use locald_publisher_protocol::MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES;
 use locald_publisher_protocol::{
     DaemonEpoch, DescriptorPrelude, FRAME_TIMEOUT_MS, FrameError, MAX_FRAME_JSON_BYTES,
     ProtocolError, RequestEnvelope, ResponseEnvelope, StableErrorCode, decode_request_frame,
@@ -55,6 +57,61 @@ const MAX_RECEIVED_DESCRIPTORS: usize = 16;
 const RECEIVE_CONTROL_WORDS: usize = (size_of::<libc::cmsghdr>()
     + MAX_RECEIVED_DESCRIPTORS * size_of::<RawFd>())
 .div_ceil(size_of::<usize>());
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MacOsAuditToken([u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES]);
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MacOsPeerIdentity {
+    user_id: u32,
+    process_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+const _: [(); MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES] =
+    [(); size_of::<nix::sys::socket::audit_token_t>()];
+
+#[cfg(any(target_os = "macos", test))]
+impl MacOsAuditToken {
+    fn parse(bytes: &[u8]) -> Result<Self, PublisherSocketError> {
+        bytes.try_into().map(Self).map_err(|_| {
+            PublisherSocketError::PeerIdentityUnavailable(
+                "macOS publisher audit proof has an invalid length".to_owned(),
+            )
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn from_native(token: nix::sys::socket::audit_token_t) -> Self {
+        let mut bytes = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
+        for (bytes, word) in bytes.chunks_exact_mut(size_of::<u32>()).zip(token.val) {
+            bytes.copy_from_slice(&word.to_ne_bytes());
+        }
+        Self(bytes)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn into_native(self) -> nix::sys::socket::audit_token_t {
+        let mut words = [0_u32; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES / size_of::<u32>()];
+        for (word, bytes) in words.iter_mut().zip(self.0.chunks_exact(size_of::<u32>())) {
+            *word = u32::from_ne_bytes(
+                bytes
+                    .try_into()
+                    .expect("audit-token chunks have one native word"),
+            );
+        }
+        nix::sys::socket::audit_token_t { val: words }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl fmt::Debug for MacOsAuditToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MacOsAuditToken(<redacted>)")
+    }
+}
 
 /// A daemon-wide exclusion entered around descriptor receipt on macOS.
 ///
@@ -562,6 +619,13 @@ impl Drop for PublisherSocketServer {
 #[derive(Debug, Error)]
 pub(crate) enum PublisherSocketError {
     #[error("publisher socket is unsupported on this platform")]
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "the shared error vocabulary is emitted by Linux capability activation and unsupported targets"
+        )
+    )]
     UnsupportedPlatform,
     #[error("publisher socket path must have an absolute parent directory")]
     InvalidSocketPath,
@@ -790,6 +854,7 @@ fn receive_request(
     config: &PublisherSocketConfig,
 ) -> Result<ReceivedRequest, PublisherSocketError> {
     let deadline = Instant::now() + Duration::from_millis(FRAME_TIMEOUT_MS);
+    #[cfg(not(target_os = "macos"))]
     let principal = observe_peer_principal(&stream, config.expected_uid)?;
     let mut frame = Vec::with_capacity(REQUEST_FIXED_BYTES + MAX_FRAME_JSON_BYTES);
 
@@ -806,6 +871,22 @@ fn receive_request(
         (DescriptorPrelude::None | DescriptorPrelude::Listener, _) => {
             return Err(PublisherSocketError::InvalidDescriptorTransfer);
         }
+    };
+
+    #[cfg(target_os = "macos")]
+    let (macos_audit_proof, principal) = {
+        let (proof, late_descriptors) = recv_exact_chunks(
+            &stream,
+            MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES,
+            deadline,
+            config,
+        )?;
+        if !late_descriptors.is_empty() {
+            return Err(PublisherSocketError::InvalidDescriptorTransfer);
+        }
+        let proof = MacOsAuditToken::parse(&proof)?;
+        let principal = observe_macos_peer_principal(&stream, config.expected_uid, proof)?;
+        (proof, principal)
     };
 
     let (header, late_descriptors) =
@@ -829,6 +910,15 @@ fn receive_request(
     }
     frame.extend_from_slice(&body);
     require_request_eof(&stream, deadline, config)?;
+    #[cfg(target_os = "macos")]
+    validate_current_macos_peer(
+        &stream,
+        macos_audit_proof,
+        MacOsPeerIdentity {
+            user_id: principal.uid,
+            process_id: principal.pid,
+        },
+    )?;
     let request = match decode_request_frame(&frame) {
         Ok(request) => request,
         Err(error) => {
@@ -1291,6 +1381,7 @@ fn set_remaining_write_timeout(
         .map_err(PublisherSocketError::Io)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn observe_peer_principal(
     stream: &UnixStream,
     expected_uid: u32,
@@ -1302,7 +1393,7 @@ fn observe_peer_principal(
             actual: uid,
         });
     }
-    let birth = process_birth(pid)?;
+    let birth = process_birth_for_peer(stream, pid)?;
     Ok(PublisherPrincipalEvidence { uid, pid, birth })
 }
 
@@ -1310,10 +1401,18 @@ fn observe_peer_principal(
 fn peer_uid_pid(stream: &UnixStream) -> Result<(u32, u32), PublisherSocketError> {
     let credentials = getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
         .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
-    let pid = u32::try_from(credentials.pid()).map_err(|_| {
-        PublisherSocketError::PeerIdentityUnavailable("peer PID is not positive".to_owned())
-    })?;
+    let pid = positive_linux_peer_pid(credentials.pid())?;
     Ok((credentials.uid(), pid))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn positive_linux_peer_pid(pid: libc::pid_t) -> Result<u32, PublisherSocketError> {
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            PublisherSocketError::PeerIdentityUnavailable("peer PID is not positive".to_owned())
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -1322,15 +1421,215 @@ fn peer_uid_pid(stream: &UnixStream) -> Result<(u32, u32), PublisherSocketError>
         .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
     let pid = getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
         .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
-    let pid = u32::try_from(pid).map_err(|_| {
-        PublisherSocketError::PeerIdentityUnavailable("peer PID is not positive".to_owned())
-    })?;
+    let pid = u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            PublisherSocketError::PeerIdentityUnavailable("peer PID is not positive".to_owned())
+        })?;
     Ok((uid.as_raw(), pid))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn peer_uid_pid(_stream: &UnixStream) -> Result<(u32, u32), PublisherSocketError> {
     Err(PublisherSocketError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "macos")]
+fn observe_macos_peer_principal(
+    stream: &UnixStream,
+    expected_uid: u32,
+    audit_proof: MacOsAuditToken,
+) -> Result<PublisherPrincipalEvidence, PublisherSocketError> {
+    let (user_id, process_id) = peer_uid_pid(stream)?;
+    let identity = MacOsPeerIdentity {
+        user_id,
+        process_id,
+    };
+    if identity.user_id != expected_uid {
+        return Err(PublisherSocketError::PeerUidMismatch {
+            expected: expected_uid,
+            actual: identity.user_id,
+        });
+    }
+    let birth = capture_macos_process_birth_while_proof_matches(
+        || validate_current_macos_peer(stream, audit_proof, identity),
+        || process_birth(identity.process_id),
+    )?;
+    Ok(PublisherPrincipalEvidence {
+        uid: identity.user_id,
+        pid: identity.process_id,
+        birth,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn capture_macos_process_birth_while_proof_matches<Birth>(
+    mut validate_peer: impl FnMut() -> Result<(), PublisherSocketError>,
+    capture_birth: impl FnOnce() -> Result<Birth, PublisherSocketError>,
+) -> Result<Birth, PublisherSocketError> {
+    validate_peer()?;
+    let birth = capture_birth()?;
+    validate_peer()?;
+    Ok(birth)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_current_macos_peer(
+    stream: &UnixStream,
+    audit_proof: MacOsAuditToken,
+    credentials: MacOsPeerIdentity,
+) -> Result<(), PublisherSocketError> {
+    let (user_id, process_id) = peer_uid_pid(stream)?;
+    let current = MacOsPeerIdentity {
+        user_id,
+        process_id,
+    };
+    let socket_token = getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
+        .map(MacOsAuditToken::from_native)
+        .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
+    let proof_identity = macos_audit_token_identity(audit_proof)?;
+    validate_macos_peer_proof_values(
+        audit_proof,
+        socket_token,
+        credentials,
+        current,
+        proof_identity,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_peer_proof_values(
+    audit_proof: MacOsAuditToken,
+    socket_token: MacOsAuditToken,
+    credentials: MacOsPeerIdentity,
+    current: MacOsPeerIdentity,
+    proof_identity: MacOsPeerIdentity,
+) -> Result<(), PublisherSocketError> {
+    if audit_proof != socket_token {
+        return Err(PublisherSocketError::PeerIdentityUnavailable(
+            "macOS socket peer audit token does not match the request proof".to_owned(),
+        ));
+    }
+    if current != credentials || proof_identity != credentials {
+        return Err(PublisherSocketError::PeerIdentityUnavailable(
+            "macOS publisher audit proof does not match the socket credentials".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "bsm")]
+#[allow(
+    unsafe_code,
+    reason = "public libbsm audit-token accessors are not exposed by libc or nix"
+)]
+unsafe extern "C" {
+    fn audit_token_to_euid(token: nix::sys::socket::audit_token_t) -> libc::uid_t;
+    fn audit_token_to_pid(token: nix::sys::socket::audit_token_t) -> libc::pid_t;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_audit_token_identity(
+    token: MacOsAuditToken,
+) -> Result<MacOsPeerIdentity, PublisherSocketError> {
+    let native = token.into_native();
+    // SAFETY: these public libbsm accessors accept one complete audit_token_t
+    // value and do not retain references to caller memory.
+    #[allow(unsafe_code)]
+    let (uid, pid) = unsafe { (audit_token_to_euid(native), audit_token_to_pid(native)) };
+    let pid = u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            PublisherSocketError::PeerIdentityUnavailable(
+                "macOS publisher audit proof has no positive PID".to_owned(),
+            )
+        })?;
+    Ok(MacOsPeerIdentity {
+        user_id: uid,
+        process_id: pid,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn capture_process_birth_while_same_peer<Peer: PartialEq, Birth>(
+    mut observe_peer: impl FnMut() -> Result<Peer, PublisherSocketError>,
+    capture_birth: impl FnOnce(&Peer) -> Result<Birth, PublisherSocketError>,
+) -> Result<Birth, PublisherSocketError> {
+    let peer_before = observe_peer()?;
+    let birth = capture_birth(&peer_before)?;
+    let peer_after = observe_peer()?;
+    if peer_before != peer_after {
+        return Err(PublisherSocketError::PeerIdentityUnavailable(
+            "peer process changed during identity capture".to_owned(),
+        ));
+    }
+    Ok(birth)
+}
+
+#[cfg(target_os = "linux")]
+fn process_birth_for_peer(
+    stream: &UnixStream,
+    _credential_pid: u32,
+) -> Result<PublisherProcessBirthEvidence, PublisherSocketError> {
+    let peer_pidfd = getsockopt(stream, nix::sys::socket::sockopt::PeerPidfd)
+        .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
+    // pidfd fdinfo renders `Pid` in the procfs mount's PID namespace. Use
+    // that value for `/proc/<pid>/stat` rather than assuming that the numeric
+    // SO_PEERCRED PID resolves through the same procfs mount.
+    capture_process_birth_while_same_peer(
+        || linux_pidfd_proc_pid(&peer_pidfd),
+        |proc_pid| process_birth(*proc_pid),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_birth_for_peer(
+    _stream: &UnixStream,
+    pid: u32,
+) -> Result<PublisherProcessBirthEvidence, PublisherSocketError> {
+    process_birth(pid)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "peer authentication requires synchronous pidfd state from the daemon's procfs namespace"
+)]
+fn linux_pidfd_proc_pid(peer_pidfd: &OwnedFd) -> Result<u32, PublisherSocketError> {
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", peer_pidfd.as_raw_fd()))
+        .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
+    parse_linux_pidfd_proc_pid(&fdinfo)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_pidfd_proc_pid(fdinfo: &str) -> Result<u32, PublisherSocketError> {
+    let mut pid_values = fdinfo.lines().filter_map(|line| line.strip_prefix("Pid:"));
+    let pid = pid_values
+        .next()
+        .ok_or_else(|| {
+            PublisherSocketError::PeerIdentityUnavailable(
+                "peer pidfd has no process identity".to_owned(),
+            )
+        })?
+        .trim()
+        .parse::<i64>()
+        .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
+    if pid_values.next().is_some() {
+        return Err(PublisherSocketError::PeerIdentityUnavailable(
+            "peer pidfd has ambiguous process identity".to_owned(),
+        ));
+    }
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            PublisherSocketError::PeerIdentityUnavailable(
+                "peer pidfd process is no longer live".to_owned(),
+            )
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1795,11 +2094,38 @@ fn remove_owned_socket(path: &Path, identity: SocketFileIdentity) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_supported_platform() -> Result<(), PublisherSocketError> {
+    require_linux_peer_identity_capability(|| {
+        let (_publisher, daemon) = UnixStream::pair()
+            .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
+        let peer_pidfd = getsockopt(&daemon, nix::sys::socket::sockopt::PeerPidfd)
+            .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
+        linux_pidfd_proc_pid(&peer_pidfd)
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the shared platform-activation signature lets bind fail closed before socket creation"
+)]
 const fn ensure_supported_platform() -> Result<(), PublisherSocketError> {
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
-        Ok(())
-    } else {
-        Err(PublisherSocketError::UnsupportedPlatform)
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn ensure_supported_platform() -> Result<(), PublisherSocketError> {
+    Err(PublisherSocketError::UnsupportedPlatform)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn require_linux_peer_identity_capability(
+    observe_peer: impl FnOnce() -> Result<u32, PublisherSocketError>,
+) -> Result<(), PublisherSocketError> {
+    match observe_peer() {
+        Ok(pid) if pid > 0 => Ok(()),
+        Ok(_) | Err(_) => Err(PublisherSocketError::UnsupportedPlatform),
     }
 }
 
@@ -2036,9 +2362,46 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    fn current_macos_audit_proof() -> MacOsAuditToken {
+        const TASK_AUDIT_TOKEN: libc::task_flavor_t = 15;
+        const TASK_AUDIT_TOKEN_WORDS: usize =
+            MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES / size_of::<u32>();
+
+        let mut words = [0_u32; TASK_AUDIT_TOKEN_WORDS];
+        let mut word_count = libc::mach_msg_type_number_t::try_from(words.len())
+            .expect("audit-token word count fits the Mach ABI");
+        // SAFETY: `words` is writable storage for exactly `word_count` Mach
+        // natural words, and the current task port remains valid for the call.
+        #[allow(unsafe_code, deprecated)]
+        let result = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                TASK_AUDIT_TOKEN,
+                words.as_mut_ptr().cast(),
+                &raw mut word_count,
+            )
+        };
+        assert_eq!(result, libc::KERN_SUCCESS, "obtain current audit token");
+        assert_eq!(
+            usize::try_from(word_count).ok(),
+            Some(words.len()),
+            "current audit token has the expected length"
+        );
+
+        let mut bytes = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
+        for (bytes, word) in bytes.chunks_exact_mut(size_of::<u32>()).zip(words) {
+            bytes.copy_from_slice(&word.to_ne_bytes());
+        }
+        MacOsAuditToken(bytes)
+    }
+
     fn write_frame(stream: &mut UnixStream, request: &RequestEnvelope, descriptor: Option<RawFd>) {
         let frame = encode_request_frame(request).expect("test request encodes");
-        let first = [IoSlice::new(&frame.as_bytes()[..1])];
+        let mut request_start = vec![frame.as_bytes()[0]];
+        #[cfg(target_os = "macos")]
+        request_start.extend_from_slice(&current_macos_audit_proof().0);
+        let first = [IoSlice::new(&request_start)];
         let sent = match descriptor {
             Some(descriptor) => sendmsg::<nix::sys::socket::UnixAddr>(
                 stream.as_raw_fd(),
@@ -2057,7 +2420,7 @@ mod tests {
             )
             .expect("frame send succeeds"),
         };
-        assert_eq!(sent, 1);
+        assert_eq!(sent, request_start.len());
         stream
             .write_all(&frame.as_bytes()[1..])
             .expect("frame body writes");
@@ -2078,6 +2441,10 @@ mod tests {
         publisher
             .write_all(&[prelude as u8])
             .expect("write descriptor prelude");
+        #[cfg(target_os = "macos")]
+        publisher
+            .write_all(&current_macos_audit_proof().0)
+            .expect("write publisher audit proof");
         publisher.write_all(&length).expect("write body length");
         publisher.write_all(body).expect("write request body");
         publisher
@@ -2374,6 +2741,275 @@ mod tests {
     }
 
     #[test]
+    fn macos_audit_proof_parser_and_socket_binding_fail_closed() {
+        let proof = MacOsAuditToken([7; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES]);
+        let replacement = MacOsAuditToken([8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES]);
+        let expected_identity = MacOsPeerIdentity {
+            user_id: 501,
+            process_id: 41,
+        };
+        let other_user = MacOsPeerIdentity {
+            user_id: 502,
+            process_id: 41,
+        };
+        let other_process = MacOsPeerIdentity {
+            user_id: 501,
+            process_id: 42,
+        };
+        assert_eq!(
+            MacOsAuditToken::parse(&proof.0).expect("exact audit proof"),
+            proof
+        );
+        assert!(
+            MacOsAuditToken::parse(&proof.0[..MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES - 1])
+                .is_err()
+        );
+        assert!(
+            validate_macos_peer_proof_values(
+                proof,
+                proof,
+                expected_identity,
+                expected_identity,
+                expected_identity,
+            )
+            .is_ok()
+        );
+
+        for result in [
+            validate_macos_peer_proof_values(
+                proof,
+                replacement,
+                expected_identity,
+                expected_identity,
+                expected_identity,
+            ),
+            validate_macos_peer_proof_values(
+                proof,
+                proof,
+                expected_identity,
+                other_user,
+                expected_identity,
+            ),
+            validate_macos_peer_proof_values(
+                proof,
+                proof,
+                expected_identity,
+                other_process,
+                expected_identity,
+            ),
+            validate_macos_peer_proof_values(
+                proof,
+                proof,
+                expected_identity,
+                expected_identity,
+                other_user,
+            ),
+            validate_macos_peer_proof_values(
+                proof,
+                proof,
+                expected_identity,
+                expected_identity,
+                other_process,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(PublisherSocketError::PeerIdentityUnavailable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn macos_audit_proof_rejects_pid_reuse_during_birth_capture() {
+        let checks = std::cell::Cell::new(0);
+        let captures = std::cell::Cell::new(0);
+        let result = capture_macos_process_birth_while_proof_matches(
+            || {
+                let check = checks.get();
+                checks.set(check + 1);
+                if check == 0 {
+                    Ok(())
+                } else {
+                    Err(PublisherSocketError::PeerIdentityUnavailable(
+                        "simulated replacement audit token".to_owned(),
+                    ))
+                }
+            },
+            || {
+                captures.set(captures.get() + 1);
+                Ok(42_u64)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PublisherSocketError::PeerIdentityUnavailable(message))
+                if message == "simulated replacement audit token"
+        ));
+        assert_eq!(checks.get(), 2);
+        assert_eq!(captures.get(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_real_socket_rejects_a_forged_audit_proof() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        let frame = encode_request_frame(&release_request()).expect("encode release frame");
+        let mut proof = current_macos_audit_proof();
+        proof.0[0] ^= 1;
+        let mut request_start = vec![frame.as_bytes()[0]];
+        request_start.extend_from_slice(&proof.0);
+        assert_eq!(
+            sendmsg::<nix::sys::socket::UnixAddr>(
+                sender.as_raw_fd(),
+                &[IoSlice::new(&request_start)],
+                &[],
+                MsgFlags::empty(),
+                None,
+            )
+            .expect("send forged audit proof"),
+            request_start.len()
+        );
+        sender
+            .write_all(&frame.as_bytes()[1..])
+            .expect("write request body");
+        sender
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish publisher request");
+
+        let config = PublisherSocketConfig::for_test(PathBuf::from("/tmp/unused"), []);
+        assert!(matches!(
+            receive_request(receiver, &config),
+            Err(PublisherSocketError::PeerIdentityUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn process_birth_capture_rejects_a_peer_that_exits_after_lookup() {
+        let checks = std::cell::Cell::new(0);
+        let captures = std::cell::Cell::new(0);
+        let result = capture_process_birth_while_same_peer(
+            || {
+                let check = checks.get();
+                checks.set(check + 1);
+                if check == 0 {
+                    Ok(41_u32)
+                } else {
+                    Err(PublisherSocketError::PeerIdentityUnavailable(
+                        "simulated peer exit".to_owned(),
+                    ))
+                }
+            },
+            |peer_pid| {
+                assert_eq!(*peer_pid, 41);
+                captures.set(captures.get() + 1);
+                Ok(42_u64)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PublisherSocketError::PeerIdentityUnavailable(message))
+                if message == "simulated peer exit"
+        ));
+        assert_eq!(checks.get(), 2);
+        assert_eq!(captures.get(), 1);
+    }
+
+    #[test]
+    fn process_birth_capture_rejects_a_changed_peer_pid() {
+        let checks = std::cell::Cell::new(0);
+        let result = capture_process_birth_while_same_peer(
+            || {
+                let check = checks.get();
+                checks.set(check + 1);
+                Ok(if check == 0 { 41_u32 } else { 42_u32 })
+            },
+            |peer_pid| {
+                assert_eq!(*peer_pid, 41);
+                Ok(17_u64)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PublisherSocketError::PeerIdentityUnavailable(message))
+                if message == "peer process changed during identity capture"
+        ));
+        assert_eq!(checks.get(), 2);
+    }
+
+    #[test]
+    fn process_birth_capture_skips_lookup_for_an_already_stale_peer() {
+        let captures = std::cell::Cell::new(0);
+        let result = capture_process_birth_while_same_peer(
+            || {
+                Err::<u32, _>(PublisherSocketError::PeerIdentityUnavailable(
+                    "simulated stale peer".to_owned(),
+                ))
+            },
+            |_| {
+                captures.set(captures.get() + 1);
+                Ok(42_u64)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PublisherSocketError::PeerIdentityUnavailable(message))
+                if message == "simulated stale peer"
+        ));
+        assert_eq!(captures.get(), 0);
+    }
+
+    #[test]
+    fn linux_pidfd_process_identity_parser_rejects_stale_or_ambiguous_values() {
+        assert_eq!(
+            parse_linux_pidfd_proc_pid("pos:\t0\nflags:\t02\nPid:\t41\nNSpid:\t41\n")
+                .expect("live pidfd process identity"),
+            41
+        );
+        for invalid in [
+            "",
+            "Pid:\t-1\n",
+            "Pid:\t0\n",
+            "Pid:\tnot-a-pid\n",
+            "Pid:\t41\nPid:\t42\n",
+        ] {
+            assert!(
+                parse_linux_pidfd_proc_pid(invalid).is_err(),
+                "invalid fdinfo must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_peer_credential_pid_must_be_positive() {
+        assert_eq!(positive_linux_peer_pid(41).expect("positive peer PID"), 41);
+        for invalid in [0, -1] {
+            assert!(matches!(
+                positive_linux_peer_pid(invalid),
+                Err(PublisherSocketError::PeerIdentityUnavailable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn linux_peer_identity_capability_fails_closed_when_unavailable_or_malformed() {
+        assert!(require_linux_peer_identity_capability(|| Ok(41)).is_ok());
+        for result in [
+            require_linux_peer_identity_capability(|| Ok(0)),
+            require_linux_peer_identity_capability(|| {
+                Err(PublisherSocketError::PeerIdentityUnavailable(
+                    "simulated missing SO_PEERPIDFD".to_owned(),
+                ))
+            }),
+            require_linux_peer_identity_capability(|| parse_linux_pidfd_proc_pid("Pid:\t-1\n")),
+        ] {
+            assert!(matches!(
+                result,
+                Err(PublisherSocketError::UnsupportedPlatform)
+            ));
+        }
+    }
+
+    #[test]
     fn real_socket_frame_receives_and_validates_exact_listener_capability() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback listener");
         let port = listener.local_addr().expect("listener address").port();
@@ -2557,28 +3193,53 @@ mod tests {
     async fn stale_socket_cleanup_rejects_active_and_removes_inactive_occupants() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let run = temporary.path().join("run");
-        let socket = run.join("publisher-v1.sock");
+        let active_socket = run.join("active.sock");
+        let stale_socket = run.join("stale.sock");
         prepare_run_directory(&run, nix::unistd::geteuid().as_raw()).expect("secure run dir");
-        let listener = StdUnixListener::bind(&socket).expect("active socket");
-        let spawn_barrier = test_spawn_barrier();
+        let spawn_barrier = publisher_spawn_barrier();
+        let active_config = PublisherSocketConfig::for_current_user(
+            active_socket.clone(),
+            [],
+            spawn_barrier.clone(),
+        );
+        let (listener, identity) = bind_socket(&active_config).await.expect("active socket");
         assert!(matches!(
             remove_safe_stale_socket(
-                &socket,
+                &active_socket,
                 nix::unistd::geteuid().as_raw(),
                 spawn_barrier.as_ref(),
             )
             .await,
             Err(PublisherSocketError::UnsafeSocketOccupant(_))
         ));
+        assert!(active_socket.exists());
         drop(listener);
+        remove_owned_socket(&active_socket, identity);
+
+        // A bound stream socket that was never placed into listening state is
+        // the same refused-connect stale occupant left by a dead listener, but
+        // cannot remain active if a parallel test child inherited its fd.
+        let stale_descriptor = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Unix,
+            SockType::Stream,
+            nix::sys::socket::SockFlag::empty(),
+            None::<nix::sys::socket::SockProtocol>,
+        )
+        .expect("create stale socket fixture");
+        make_close_on_exec(&stale_descriptor).expect("secure stale socket fixture");
+        let stale_address = nix::sys::socket::UnixAddr::new(stale_socket.as_path())
+            .expect("create stale socket address");
+        nix::sys::socket::bind(stale_descriptor.as_raw_fd(), &stale_address)
+            .expect("bind stale socket fixture");
+        drop(stale_descriptor);
         remove_safe_stale_socket(
-            &socket,
+            &stale_socket,
             nix::unistd::geteuid().as_raw(),
             spawn_barrier.as_ref(),
         )
         .await
         .expect("stale socket removed");
-        assert!(!socket.exists());
+        assert!(!stale_socket.exists());
     }
 
     #[test]

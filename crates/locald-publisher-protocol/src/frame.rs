@@ -46,7 +46,12 @@ impl DescriptorPrelude {
     }
 }
 
-/// An encoded request plus its exact ancillary-descriptor contract.
+/// An encoded semantic request plus its exact ancillary-descriptor contract.
+///
+/// These bytes are `[descriptor prelude][JSON length][JSON]`. The production
+/// Unix transport inserts the fixed macOS audit-token proof immediately after
+/// the prelude; that platform proof is deliberately not part of this reusable
+/// semantic frame or the public JSON schema.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncodedRequestFrame {
     bytes: Vec<u8>,
@@ -55,13 +60,19 @@ pub struct EncodedRequestFrame {
 }
 
 impl EncodedRequestFrame {
-    /// Return the complete request bytes, including the descriptor prelude.
+    /// Return the complete semantic frame, including the descriptor prelude.
+    ///
+    /// The Unix transport augments these bytes with its fixed audit-token proof
+    /// after the prelude on macOS.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Consume the frame into its bytes.
+    /// Consume the semantic frame into its bytes.
+    ///
+    /// The Unix transport augments these bytes with its fixed audit-token proof
+    /// after the prelude on macOS.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes

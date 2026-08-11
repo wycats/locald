@@ -6,6 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use locald_core::{IpcRequest, IpcResponse};
+#[cfg(target_os = "macos")]
+use locald_publisher_protocol::MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES;
 use locald_publisher_protocol::{
     AbsolutePath, DescriptorPrelude, EncodedRequestFrame, FRAME_TIMEOUT_MS, MAX_FRAME_JSON_BYTES,
     ProjectInstanceId, PublishedEndpointProtocolInfo,
@@ -477,8 +479,11 @@ pub trait PublisherTransport: Send + Sync + std::fmt::Debug {
 /// Strict production transport for locald's dedicated Unix publisher socket.
 ///
 /// Every exchange uses a fresh close-on-exec, nonblocking connection and one
-/// absolute deadline. The first request byte carries the complete
-/// `SCM_RIGHTS` contract; response ancillary data is never accepted.
+/// absolute deadline. The first semantic-frame byte carries the complete
+/// `SCM_RIGHTS` contract. On macOS, the transport inserts the fixed native
+/// audit-token proof after that byte and before the semantic frame's length;
+/// Linux sends the [`EncodedRequestFrame`] bytes unchanged. Response ancillary
+/// data is never accepted.
 ///
 /// On macOS, every process-spawn or direct-exec path in the publisher host must
 /// hold the process-global [`crate::ProcessSpawnBarrier`] spawn permit. The
@@ -717,10 +722,16 @@ fn send_request_before(
             "publisher request frame is empty",
         ));
     };
-    let first = [*first_byte];
+    let mut request_start = Vec::with_capacity(1 + MACOS_REQUEST_PROOF_BYTES);
+    request_start.push(*first_byte);
+    #[cfg(target_os = "macos")]
+    request_start.extend_from_slice(
+        &current_macos_audit_token()
+            .map_err(|error| TransportFailure::new(DeliveryCertainty::NotSent, error))?,
+    );
 
-    loop {
-        let iov = [IoSlice::new(&first)];
+    let start_written = loop {
+        let iov = [IoSlice::new(&request_start)];
         let sent = listener.map_or_else(
             || sendmsg::<UnixAddr>(stream.as_raw_fd(), &iov, &[], MsgFlags::MSG_DONTWAIT, None),
             |listener| {
@@ -736,12 +747,19 @@ fn send_request_before(
             },
         );
         match sent {
-            Ok(1) => break,
-            Ok(_) => {
+            Ok(sent @ 1..) if sent <= request_start.len() => break sent,
+            Ok(0) => {
                 return Err(publisher_failure(
                     DeliveryCertainty::NotSent,
                     BackendErrorKind::Unreachable,
                     "locald publisher closed before receiving the first request byte",
+                ));
+            }
+            Ok(_) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Protocol,
+                    "locald publisher reported an invalid initial request byte count",
                 ));
             }
             Err(Errno::EINTR) => {}
@@ -754,6 +772,33 @@ fn send_request_before(
                     DeliveryCertainty::NotSent,
                     BackendErrorKind::Unreachable,
                     format!("cannot send first locald publisher request byte: {error}"),
+                ));
+            }
+        }
+    };
+
+    let mut proof_written = start_written;
+    while proof_written < request_start.len() {
+        match stream.write(&request_start[proof_written..]) {
+            Ok(0) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Unreachable,
+                    "locald publisher closed while receiving the process-identity proof",
+                ));
+            }
+            Ok(count) => proof_written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_publisher(stream.as_fd(), PollFlags::POLLOUT, deadline).map_err(
+                    |error| TransportFailure::new(DeliveryCertainty::OutcomeUnknown, error),
+                )?;
+            }
+            Err(error) => {
+                return Err(publisher_failure(
+                    DeliveryCertainty::OutcomeUnknown,
+                    BackendErrorKind::Unreachable,
+                    format!("cannot send locald publisher process-identity proof: {error}"),
                 ));
             }
         }
@@ -786,6 +831,56 @@ fn send_request_before(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_REQUEST_PROOF_BYTES: usize = MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES;
+#[cfg(not(target_os = "macos"))]
+const MACOS_REQUEST_PROOF_BYTES: usize = 0;
+
+#[cfg(target_os = "macos")]
+fn current_macos_audit_token() -> Result<[u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES], BackendError>
+{
+    const TASK_AUDIT_TOKEN: libc::task_flavor_t = 15;
+    const TASK_AUDIT_TOKEN_WORDS: usize =
+        MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES / size_of::<u32>();
+
+    let mut words = [0_u32; TASK_AUDIT_TOKEN_WORDS];
+    let mut word_count = libc::mach_msg_type_number_t::try_from(words.len()).map_err(|error| {
+        BackendError::new(
+            BackendErrorKind::Authentication,
+            format!("publisher audit-token length is invalid: {error}"),
+        )
+    })?;
+    // SAFETY: `words` is writable storage for exactly `word_count` Mach
+    // natural words, and the current task port remains valid for this call.
+    #[allow(unsafe_code, deprecated)]
+    let result = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            TASK_AUDIT_TOKEN,
+            words.as_mut_ptr().cast(),
+            &raw mut word_count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return Err(BackendError::new(
+            BackendErrorKind::Authentication,
+            format!("cannot obtain publisher audit token: Mach error {result}"),
+        ));
+    }
+    if usize::try_from(word_count).ok() != Some(words.len()) {
+        return Err(BackendError::new(
+            BackendErrorKind::Authentication,
+            "publisher audit token had an invalid length",
+        ));
+    }
+
+    let mut token = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
+    for (bytes, word) in token.chunks_exact_mut(size_of::<u32>()).zip(words) {
+        bytes.copy_from_slice(&word.to_ne_bytes());
+    }
+    Ok(token)
 }
 
 fn receive_response_before(
@@ -1503,6 +1598,29 @@ mod tests {
         };
         let mut rest = Vec::new();
         stream.read_to_end(&mut rest).expect("read request frame");
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                rest.len() >= MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES,
+                "macOS request carries a complete audit proof"
+            );
+            let received_proof = rest
+                .drain(..MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES)
+                .collect::<Vec<_>>();
+            let peer_token = getsockopt(&stream, nix::sys::socket::sockopt::LocalPeerToken)
+                .expect("read kernel publisher peer audit token");
+            let mut expected_proof = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
+            for (bytes, word) in expected_proof
+                .chunks_exact_mut(size_of::<u32>())
+                .zip(peer_token.val)
+            {
+                bytes.copy_from_slice(&word.to_ne_bytes());
+            }
+            assert_eq!(
+                received_proof, expected_proof,
+                "request proof matches the kernel-observed client"
+            );
+        }
         let mut frame = first.to_vec();
         frame.extend(rest);
         (frame, descriptors)

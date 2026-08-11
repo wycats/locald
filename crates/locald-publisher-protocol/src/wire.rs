@@ -28,6 +28,8 @@ pub const RENEW_TARGET_MS: u64 = 10_000;
 pub const WAIT_TIMEOUT_MS: u64 = 30_000;
 /// Maximum time to deliver a request frame.
 pub const FRAME_TIMEOUT_MS: u64 = 5_000;
+/// Fixed transport-only audit-token proof inserted after the request prelude on macOS.
+pub const MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES: usize = 32;
 /// Setup-owned installation-record filename under locald's standard data directory.
 pub const INSTALLATION_RECORD_NAME: &str = "publisher-installation-v1.json";
 /// Maximum setup-owned installation-record size.

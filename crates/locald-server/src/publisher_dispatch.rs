@@ -330,13 +330,62 @@ mod tests {
         let envelope = protocol::RequestEnvelope::v1(epoch.clone(), request);
         let frame = protocol::encode_request_frame(&envelope).expect("encode publisher request");
         let mut stream = UnixStream::connect(socket.as_path()).expect("connect publisher socket");
+        let mut transport_frame = Vec::with_capacity(
+            frame.as_bytes().len()
+                + if cfg!(target_os = "macos") {
+                    protocol::MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES
+                } else {
+                    0
+                },
+        );
+        transport_frame.push(frame.as_bytes()[0]);
+        #[cfg(target_os = "macos")]
+        transport_frame.extend_from_slice(&current_macos_audit_proof());
+        transport_frame.extend_from_slice(&frame.as_bytes()[1..]);
         stream
-            .write_all(frame.as_bytes())
+            .write_all(&transport_frame)
             .expect("write publisher request");
         stream
             .shutdown(std::net::Shutdown::Write)
             .expect("finish publisher request");
         stream
+    }
+
+    #[cfg(target_os = "macos")]
+    fn current_macos_audit_proof() -> [u8; protocol::MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES] {
+        const TASK_AUDIT_TOKEN: libc::task_flavor_t = 15;
+        const TASK_AUDIT_TOKEN_WORDS: usize =
+            protocol::MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES / std::mem::size_of::<u32>();
+
+        let mut words = [0_u32; TASK_AUDIT_TOKEN_WORDS];
+        let mut word_count = libc::mach_msg_type_number_t::try_from(words.len())
+            .expect("audit-token word count fits the Mach ABI");
+        // SAFETY: `words` is writable storage for exactly `word_count` Mach
+        // natural words, and the current task port remains valid for the call.
+        #[allow(unsafe_code, deprecated)]
+        let result = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                TASK_AUDIT_TOKEN,
+                words.as_mut_ptr().cast(),
+                &raw mut word_count,
+            )
+        };
+        assert_eq!(result, libc::KERN_SUCCESS, "obtain current audit token");
+        assert_eq!(
+            usize::try_from(word_count).ok(),
+            Some(words.len()),
+            "current audit token has the expected length"
+        );
+
+        let mut proof = [0_u8; protocol::MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
+        for (bytes, word) in proof
+            .chunks_exact_mut(std::mem::size_of::<u32>())
+            .zip(words)
+        {
+            bytes.copy_from_slice(&word.to_ne_bytes());
+        }
+        proof
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -358,15 +407,37 @@ health_check = { type = "http", path = "/api/health" }
 "#,
         )
         .expect("write published configuration");
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(&project_path)
-                .status()
-                .expect("initialize Git worktree")
-                .success(),
-            "Git worktree initialization succeeds"
-        );
+        let mut git = Command::new("git");
+        git.args(["init", "--quiet"])
+            .arg(&project_path)
+            .current_dir(&project_path);
+        // Git exports repository-local environment to hooks. The full test
+        // suite runs from the pre-push hook, so this fixture must not inherit
+        // the enclosing locald checkout as its repository.
+        for variable in [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_GRAFT_FILE",
+            "GIT_INDEX_FILE",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_PREFIX",
+            "GIT_SHALLOW_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            git.env_remove(variable);
+        }
+        let git_status = locald_utils::process_spawn::ProcessSpawnBarrier::global()
+            .spawn_std_command(&mut git)
+            .and_then(|mut child| child.wait())
+            .expect("initialize Git worktree");
+        assert!(git_status.success(), "Git worktree initialization succeeds");
 
         let registry = Arc::new(Mutex::new(Registry::with_path(
             directory.path().join("catalog.json"),
