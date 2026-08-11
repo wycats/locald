@@ -38,6 +38,7 @@ locald-utils = { version = "0.1.0", path = "../locald-utils" }
 locald-oci = { version = "0.1.0", path = "../locald-oci" }
 mime_guess = "2.0.5"
 nix = { version = "0.30.1", features = [
+  "poll",
   "process",
   "signal",
   "socket",

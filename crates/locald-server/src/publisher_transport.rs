@@ -14,6 +14,8 @@ use locald_publisher_protocol::{
     encode_response_frame,
 };
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+#[cfg(target_os = "macos")]
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 #[cfg(not(target_os = "macos"))]
 use nix::sys::socket::sockopt::{AcceptConn, ReusePort};
 use nix::sys::socket::{MsgFlags, SockType, getsockopt, sockopt::SockType as SocketType};
@@ -23,7 +25,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::mem::{size_of, zeroed};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsFd as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
@@ -46,6 +48,9 @@ const RESPONSE_FIXED_BYTES: usize = 4;
 const RUN_DIRECTORY_MODE: u32 = 0o700;
 const PUBLISHER_SOCKET_MODE: u32 = 0o600;
 const PEER_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_CONCURRENT_PUBLISHER_CONNECTIONS: usize = 64;
+const ACCEPT_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
+const ACCEPT_FAILURE_BACKOFF_MAXIMUM: Duration = Duration::from_secs(1);
 const MAX_RECEIVED_DESCRIPTORS: usize = 16;
 const RECEIVE_CONTROL_WORDS: usize = (size_of::<libc::cmsghdr>()
     + MAX_RECEIVED_DESCRIPTORS * size_of::<RawFd>())
@@ -119,6 +124,7 @@ pub(crate) struct PublisherSocketConfig {
     expected_uid: u32,
     front_door_ports: BTreeSet<u16>,
     spawn_barrier: Option<Arc<dyn PublisherSpawnBarrier>>,
+    max_connections: usize,
 }
 
 impl PublisherSocketConfig {
@@ -133,6 +139,7 @@ impl PublisherSocketConfig {
             expected_uid: nix::unistd::geteuid().as_raw(),
             front_door_ports: front_door_ports.into_iter().collect(),
             spawn_barrier,
+            max_connections: MAX_CONCURRENT_PUBLISHER_CONNECTIONS,
         }
     }
 
@@ -143,6 +150,7 @@ impl PublisherSocketConfig {
             expected_uid: nix::unistd::geteuid().as_raw(),
             front_door_ports: front_door_ports.into_iter().collect(),
             spawn_barrier: test_spawn_barrier(),
+            max_connections: MAX_CONCURRENT_PUBLISHER_CONNECTIONS,
         }
     }
 }
@@ -155,6 +163,7 @@ impl fmt::Debug for PublisherSocketConfig {
             .field("expected_uid", &self.expected_uid)
             .field("front_door_ports", &self.front_door_ports)
             .field("has_spawn_barrier", &self.spawn_barrier.is_some())
+            .field("max_connections", &self.max_connections)
             .finish()
     }
 }
@@ -361,17 +370,27 @@ impl PublisherSocketServer {
         let config = Arc::new(config);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
+            let mut accept_backoff = AcceptFailureBackoff::new();
+            let mut accept_delayed = false;
+            let accept_retry = tokio::time::sleep(Duration::ZERO);
+            tokio::pin!(accept_retry);
             loop {
                 tokio::select! {
+                    biased;
                     _ = &mut shutdown_rx => break,
                     completed = connections.join_next(), if !connections.is_empty() => {
                         if let Some(Err(error)) = completed {
                             debug!(error = %error, "publisher connection task failed");
                         }
                     }
-                    accepted = accept_publisher_connection(&listener, &config) => {
+                    () = &mut accept_retry, if accept_delayed => {
+                        accept_delayed = false;
+                    }
+                    accepted = accept_publisher_connection(&listener, &config),
+                        if !accept_delayed && connections.len() < config.max_connections => {
                         match accepted {
                             Ok(stream) => {
+                                accept_backoff.reset();
                                 let config = Arc::clone(&config);
                                 let handler = Arc::clone(&handler);
                                 connections.spawn(async move {
@@ -381,7 +400,16 @@ impl PublisherSocketServer {
                                 });
                             }
                             Err(error) => {
-                                warn!(error = %error, "publisher socket accept failed");
+                                let retry_after = accept_backoff.next_delay();
+                                accept_retry
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + retry_after);
+                                accept_delayed = true;
+                                warn!(
+                                    error = %error,
+                                    retry_after_ms = retry_after.as_millis(),
+                                    "publisher socket accept failed; backing off"
+                                );
                             }
                         }
                     }
@@ -414,6 +442,32 @@ impl PublisherSocketServer {
             task.await.map_err(PublisherSocketError::Join)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct AcceptFailureBackoff {
+    next: Duration,
+}
+
+impl AcceptFailureBackoff {
+    const fn new() -> Self {
+        Self {
+            next: ACCEPT_FAILURE_BACKOFF_INITIAL,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self
+            .next
+            .saturating_mul(2)
+            .min(ACCEPT_FAILURE_BACKOFF_MAXIMUM);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = ACCEPT_FAILURE_BACKOFF_INITIAL;
     }
 }
 
@@ -868,44 +922,14 @@ fn recv_one_chunk(
     deadline: Instant,
     config: &PublisherSocketConfig,
 ) -> Result<(Vec<u8>, Vec<OwnedFd>), PublisherSocketError> {
-    #[cfg(not(target_os = "macos"))]
-    let _ = config;
     if maximum == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
-    set_remaining_read_timeout(stream, deadline)?;
     let mut buffer = vec![0_u8; maximum.min(8_192)];
-    #[cfg(target_os = "macos")]
-    let _spawn_guard = config
-        .spawn_barrier
-        .as_ref()
-        .ok_or(PublisherSocketError::SpawnBarrierUnavailable)?
-        .enter_descriptor_receipt()?;
-
-    #[cfg(target_os = "linux")]
-    let flags = MsgFlags::MSG_CMSG_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = MsgFlags::empty();
-
-    let received = loop {
-        match receive_owned_chunk(stream, &mut buffer, flags) {
-            Ok(received) => break received,
-            Err(nix::errno::Errno::EAGAIN) => return Err(PublisherSocketError::FrameTimeout),
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(error) => return Err(PublisherSocketError::Io(io::Error::from(error))),
-        }
-    };
+    let received = receive_owned_request_chunk(stream, &mut buffer, deadline, config)?;
     let received_bytes = received.bytes;
     let control_truncated = received.flags.contains(MsgFlags::MSG_CTRUNC);
     let descriptors = received.descriptors;
-    // Own every transferred descriptor before any validation can return. This
-    // makes surplus, truncated, and mixed ancillary messages leak-free.
-    let close_on_exec_error = descriptors
-        .iter()
-        .find_map(|descriptor| make_close_on_exec(descriptor).err());
-    if let Some(error) = close_on_exec_error {
-        return Err(error);
-    }
     if control_truncated || received.unexpected_control {
         return Err(PublisherSocketError::InvalidDescriptorTransfer);
     }
@@ -924,37 +948,9 @@ fn require_request_eof(
     deadline: Instant,
     config: &PublisherSocketConfig,
 ) -> Result<(), PublisherSocketError> {
-    #[cfg(not(target_os = "macos"))]
-    let _ = config;
-    set_remaining_read_timeout(stream, deadline)?;
     let mut byte = [0_u8; 1];
-
-    #[cfg(target_os = "macos")]
-    let _spawn_guard = config
-        .spawn_barrier
-        .as_ref()
-        .ok_or(PublisherSocketError::SpawnBarrierUnavailable)?
-        .enter_descriptor_receipt()?;
-
-    #[cfg(target_os = "linux")]
-    let flags = MsgFlags::MSG_CMSG_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = MsgFlags::empty();
-    let received = loop {
-        match receive_owned_chunk(stream, &mut byte, flags) {
-            Ok(received) => break received,
-            Err(nix::errno::Errno::EAGAIN) => return Err(PublisherSocketError::FrameTimeout),
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(error) => return Err(PublisherSocketError::Io(io::Error::from(error))),
-        }
-    };
+    let received = receive_owned_request_chunk(stream, &mut byte, deadline, config)?;
     let descriptors = received.descriptors;
-    let close_on_exec_error = descriptors
-        .iter()
-        .find_map(|descriptor| make_close_on_exec(descriptor).err());
-    if let Some(error) = close_on_exec_error {
-        return Err(error);
-    }
     if received.bytes == 0
         && descriptors.is_empty()
         && !received.flags.contains(MsgFlags::MSG_CTRUNC)
@@ -963,6 +959,123 @@ fn require_request_eof(
         Ok(())
     } else {
         Err(PublisherSocketError::InvalidDescriptorTransfer)
+    }
+}
+
+fn receive_owned_request_chunk(
+    stream: &UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    config: &PublisherSocketConfig,
+) -> Result<OwnedReceive, PublisherSocketError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config;
+        set_remaining_read_timeout(stream, deadline)?;
+        #[cfg(target_os = "linux")]
+        let flags = MsgFlags::MSG_CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = MsgFlags::empty();
+        let received = loop {
+            match receive_owned_chunk(stream, buffer, flags) {
+                Ok(received) => break received,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    return Err(PublisherSocketError::FrameTimeout);
+                }
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(error) => return Err(PublisherSocketError::Io(io::Error::from(error))),
+            }
+        };
+        make_received_descriptors_close_on_exec(&received)?;
+        Ok(received)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        loop {
+            wait_for_request_readiness(stream, deadline)?;
+            let barrier = config
+                .spawn_barrier
+                .as_ref()
+                .ok_or(PublisherSocketError::SpawnBarrierUnavailable)?;
+            let guard = barrier.enter_descriptor_receipt()?;
+            if Instant::now() >= deadline {
+                drop(guard);
+                return Err(PublisherSocketError::FrameTimeout);
+            }
+            match receive_owned_chunk(stream, buffer, MsgFlags::MSG_DONTWAIT) {
+                Ok(received) => {
+                    if let Err(error) = make_received_descriptors_close_on_exec(&received) {
+                        drop(received);
+                        drop(guard);
+                        return Err(error);
+                    }
+                    drop(guard);
+                    return Ok(received);
+                }
+                Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
+                    drop(guard);
+                }
+                Err(error) => {
+                    drop(guard);
+                    return Err(PublisherSocketError::Io(io::Error::from(error)));
+                }
+            }
+        }
+    }
+}
+
+fn make_received_descriptors_close_on_exec(
+    received: &OwnedReceive,
+) -> Result<(), PublisherSocketError> {
+    // Own every transferred descriptor before any validation can return. This
+    // makes surplus, truncated, and mixed ancillary messages leak-free.
+    if let Some(error) = received
+        .descriptors
+        .iter()
+        .find_map(|descriptor| make_close_on_exec(descriptor).err())
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_request_readiness(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> Result<(), PublisherSocketError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(PublisherSocketError::FrameTimeout)?;
+        let timeout_millis =
+            remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+        let timeout = PollTimeout::try_from(timeout_millis).map_err(|error| {
+            PublisherSocketError::Io(io::Error::new(io::ErrorKind::InvalidInput, error))
+        })?;
+        let mut descriptors = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut descriptors, timeout) {
+            Ok(0) => return Err(PublisherSocketError::FrameTimeout),
+            Ok(_) => {
+                let events = descriptors[0].revents().ok_or_else(|| {
+                    PublisherSocketError::Io(io::Error::other(
+                        "publisher readiness returned unknown poll flags",
+                    ))
+                })?;
+                if events.contains(PollFlags::POLLNVAL) {
+                    return Err(PublisherSocketError::Io(io::Error::from_raw_os_error(
+                        libc::EBADF,
+                    )));
+                }
+                if events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
+                    return Ok(());
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => return Err(PublisherSocketError::Io(io::Error::from(error))),
+        }
     }
 }
 
@@ -1151,6 +1264,7 @@ fn validate_response_frame(response: &[u8]) -> Result<(), PublisherSocketError> 
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn set_remaining_read_timeout(
     stream: &UnixStream,
     deadline: Instant,
@@ -1746,6 +1860,99 @@ mod tests {
         dispatches: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct CapacityTestHandler {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Default)]
+    struct CountingSpawnBarrier {
+        entries: AtomicUsize,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct CountingSpawnBarrierGuard;
+
+    #[cfg(target_os = "macos")]
+    impl PublisherSpawnBarrierGuard for CountingSpawnBarrierGuard {}
+
+    #[cfg(target_os = "macos")]
+    impl PublisherSpawnBarrier for CountingSpawnBarrier {
+        fn enter_descriptor_receipt(
+            &self,
+        ) -> Result<Box<dyn PublisherSpawnBarrierGuard + '_>, PublisherSocketError> {
+            self.entries.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingSpawnBarrierGuard))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug)]
+    struct ReadinessRaceSpawnBarrier {
+        drain: UnixStream,
+        entries: AtomicUsize,
+        dropped: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct ReadinessRaceSpawnBarrierGuard {
+        dropped: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ReadinessRaceSpawnBarrierGuard {
+        fn drop(&mut self) {
+            let (count, changed) = &*self.dropped;
+            *count.lock().expect("lock guard-drop count") += 1;
+            changed.notify_all();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PublisherSpawnBarrierGuard for ReadinessRaceSpawnBarrierGuard {}
+
+    #[cfg(target_os = "macos")]
+    impl PublisherSpawnBarrier for ReadinessRaceSpawnBarrier {
+        fn enter_descriptor_receipt(
+            &self,
+        ) -> Result<Box<dyn PublisherSpawnBarrierGuard + '_>, PublisherSocketError> {
+            if self.entries.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut byte = [0_u8; 1];
+                loop {
+                    // SAFETY: `drain` owns a live socket and `byte` is writable
+                    // for exactly the supplied length.
+                    #[allow(unsafe_code)]
+                    let received = unsafe {
+                        libc::recv(
+                            self.drain.as_raw_fd(),
+                            byte.as_mut_ptr().cast(),
+                            byte.len(),
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if received == 1 {
+                        break;
+                    }
+                    if received == -1
+                        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert_eq!(
+                        received, 1,
+                        "first readiness byte must be available before gate entry"
+                    );
+                    break;
+                }
+            }
+            Ok(Box::new(ReadinessRaceSpawnBarrierGuard {
+                dropped: Arc::clone(&self.dropped),
+            }))
+        }
+    }
+
     #[async_trait]
     impl PublisherRequestHandler for RejectionTestHandler {
         async fn daemon_epoch(&self) -> DaemonEpoch {
@@ -1780,6 +1987,29 @@ mod tests {
             self.entered.notify_one();
             context.wait_for_peer_close().await;
             self.canceled.notify_one();
+            Ok(vec![0, 0, 0, 2, b'{', b'}'])
+        }
+    }
+
+    #[async_trait]
+    impl PublisherRequestHandler for CapacityTestHandler {
+        async fn daemon_epoch(&self) -> DaemonEpoch {
+            DaemonEpoch::from_bytes([1; 16])
+        }
+
+        async fn handle(
+            &self,
+            _request: RequestEnvelope,
+            _context: PublisherRequestContext,
+        ) -> Result<Vec<u8>, PublisherSocketError> {
+            self.entered
+                .send(())
+                .map_err(|_| PublisherSocketError::Io(io::Error::other("entry receiver closed")))?;
+            let permit = Arc::clone(&self.release)
+                .acquire_owned()
+                .await
+                .map_err(|_| PublisherSocketError::Io(io::Error::other("release gate closed")))?;
+            permit.forget();
             Ok(vec![0, 0, 0, 2, b'{', b'}'])
         }
     }
@@ -2059,6 +2289,73 @@ mod tests {
         server.shutdown().await.expect("stop publisher socket");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_server_bounds_admitted_connections_until_one_completes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let socket_path = temporary.path().join("run/publisher-v1.sock");
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut config = PublisherSocketConfig::for_test(socket_path.clone(), []);
+        config.max_connections = 2;
+        let server = PublisherSocketServer::bind(
+            config,
+            Arc::new(CapacityTestHandler {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            }),
+        )
+        .await
+        .expect("bind publisher socket");
+
+        let mut publishers = Vec::new();
+        for _ in 0..2 {
+            let mut publisher = UnixStream::connect(&socket_path).expect("connect publisher");
+            send_frame(&mut publisher, &release_request(), None);
+            publishers.push(publisher);
+        }
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+                .await
+                .expect("admitted request enters handler")
+                .expect("entry channel remains open");
+        }
+
+        let mut waiting = UnixStream::connect(&socket_path).expect("connect waiting publisher");
+        send_frame(&mut waiting, &release_request(), None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), entered_rx.recv())
+                .await
+                .is_err(),
+            "the configured admission cap blocks a third handler"
+        );
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("waiting request enters after one admitted task completes")
+            .expect("entry channel remains open");
+
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(1), server.shutdown())
+            .await
+            .expect("bounded connections drain during shutdown")
+            .expect("publisher server shuts down");
+        drop((publishers, waiting));
+    }
+
+    #[test]
+    fn accept_failure_backoff_grows_to_a_cap_and_resets_after_success() {
+        let mut backoff = AcceptFailureBackoff::new();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(200));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(400));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(800));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+    }
+
     #[test]
     fn real_socket_frame_authenticates_peer_without_a_descriptor() {
         let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
@@ -2120,6 +2417,74 @@ mod tests {
             receive_request(receiver, &config),
             Err(PublisherSocketError::InvalidDescriptorTransfer)
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_silent_request_times_out_without_entering_spawn_gate() {
+        let (_sender, receiver) = UnixStream::pair().expect("socket pair");
+        let barrier = Arc::new(CountingSpawnBarrier::default());
+        let mut config = PublisherSocketConfig::for_test(PathBuf::from("/tmp/unused"), []);
+        config.spawn_barrier = Some(barrier.clone());
+        let mut byte = [0_u8; 1];
+
+        assert!(matches!(
+            receive_owned_request_chunk(
+                &receiver,
+                &mut byte,
+                Instant::now() + Duration::from_millis(25),
+                &config,
+            ),
+            Err(PublisherSocketError::FrameTimeout)
+        ));
+        assert_eq!(
+            barrier.entries.load(Ordering::SeqCst),
+            0,
+            "readiness waiting must happen outside the daemon spawn gate"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_readiness_race_drops_spawn_gate_before_repolling() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        let drain = receiver.try_clone().expect("clone receiver for race");
+        let dropped = Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+        let barrier = Arc::new(ReadinessRaceSpawnBarrier {
+            drain,
+            entries: AtomicUsize::new(0),
+            dropped: Arc::clone(&dropped),
+        });
+        let mut config = PublisherSocketConfig::for_test(PathBuf::from("/tmp/unused"), []);
+        config.spawn_barrier = Some(barrier.clone());
+
+        let receiver = std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            let chunk = receive_owned_request_chunk(
+                &receiver,
+                &mut byte,
+                Instant::now() + Duration::from_secs(1),
+                &config,
+            )
+            .expect("second readiness event is received");
+            (chunk, byte)
+        });
+
+        sender.write_all(&[1]).expect("write first readiness byte");
+        let (count, changed) = &*dropped;
+        let first_drop = count.lock().expect("lock guard-drop count");
+        let (first_drop, timeout) = changed
+            .wait_timeout_while(first_drop, Duration::from_secs(1), |count| *count < 1)
+            .expect("wait for first guard drop");
+        assert!(!timeout.timed_out(), "EAGAIN must drop the spawn guard");
+        drop(first_drop);
+
+        sender.write_all(&[2]).expect("write second readiness byte");
+        let (chunk, byte) = receiver.join().expect("receive thread completes");
+        assert_eq!(chunk.bytes, 1);
+        assert_eq!(byte, [2]);
+        assert_eq!(barrier.entries.load(Ordering::SeqCst), 2);
+        assert_eq!(*count.lock().expect("lock final guard-drop count"), 2);
     }
 
     #[cfg(target_os = "linux")]
