@@ -29,13 +29,11 @@ impl PublisherDispatcher {
         let observed = context.principal();
         let birth = match observed.birth() {
             #[cfg(target_os = "macos")]
-            PublisherProcessBirthEvidence::MacOs {
-                start_seconds,
-                start_microseconds,
-            } => PublisherProcessBirth::MacOs {
-                start_seconds: *start_seconds,
-                start_microseconds: *start_microseconds,
-            },
+            PublisherProcessBirthEvidence::MacOs { process_id_version } => {
+                PublisherProcessBirth::MacOs {
+                    process_id_version: *process_id_version,
+                }
+            }
             #[cfg(target_os = "linux")]
             PublisherProcessBirthEvidence::Linux {
                 boot_id,

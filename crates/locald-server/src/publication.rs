@@ -247,8 +247,7 @@ impl fmt::Debug for DaemonEpoch {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PublisherProcessBirth {
     MacOs {
-        start_seconds: u64,
-        start_microseconds: u64,
+        process_id_version: i32,
     },
     Linux {
         boot_id: Box<str>,

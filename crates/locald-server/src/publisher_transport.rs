@@ -228,12 +228,9 @@ impl fmt::Debug for PublisherSocketConfig {
 /// Kernel-observed process-birth evidence for one publisher connection.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PublisherProcessBirthEvidence {
-    /// Darwin process start time from `proc_bsdinfo`.
+    /// Darwin process generation from the authenticated audit token.
     #[cfg(target_os = "macos")]
-    MacOs {
-        start_seconds: u64,
-        start_microseconds: u64,
-    },
+    MacOs { process_id_version: i32 },
     /// Linux boot identity plus `/proc/<pid>/stat` start ticks.
     #[cfg(target_os = "linux")]
     Linux { boot_id: Box<str>, start_ticks: u64 },
@@ -1452,10 +1449,8 @@ fn observe_macos_peer_principal(
             actual: identity.user_id,
         });
     }
-    let birth = capture_macos_process_birth_while_proof_matches(
-        || validate_current_macos_peer(stream, audit_proof, identity),
-        || process_birth(identity.process_id),
-    )?;
+    let process_id_version = validate_current_macos_peer(stream, audit_proof, identity)?;
+    let birth = PublisherProcessBirthEvidence::MacOs { process_id_version };
     Ok(PublisherPrincipalEvidence {
         uid: identity.user_id,
         pid: identity.process_id,
@@ -1463,23 +1458,12 @@ fn observe_macos_peer_principal(
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn capture_macos_process_birth_while_proof_matches<Birth>(
-    mut validate_peer: impl FnMut() -> Result<(), PublisherSocketError>,
-    capture_birth: impl FnOnce() -> Result<Birth, PublisherSocketError>,
-) -> Result<Birth, PublisherSocketError> {
-    validate_peer()?;
-    let birth = capture_birth()?;
-    validate_peer()?;
-    Ok(birth)
-}
-
 #[cfg(target_os = "macos")]
 fn validate_current_macos_peer(
     stream: &UnixStream,
     audit_proof: MacOsAuditToken,
     credentials: MacOsPeerIdentity,
-) -> Result<(), PublisherSocketError> {
+) -> Result<i32, PublisherSocketError> {
     let (user_id, process_id) = peer_uid_pid(stream)?;
     let current = MacOsPeerIdentity {
         user_id,
@@ -1488,14 +1472,15 @@ fn validate_current_macos_peer(
     let socket_token = getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
         .map(MacOsAuditToken::from_native)
         .map_err(|error| PublisherSocketError::PeerIdentityUnavailable(error.to_string()))?;
-    let proof_identity = macos_audit_token_identity(audit_proof)?;
+    let (proof_identity, process_id_version) = macos_audit_token_identity(audit_proof)?;
     validate_macos_peer_proof_values(
         audit_proof,
         socket_token,
         credentials,
         current,
         proof_identity,
-    )
+    )?;
+    Ok(process_id_version)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1528,17 +1513,24 @@ fn validate_macos_peer_proof_values(
 unsafe extern "C" {
     fn audit_token_to_euid(token: nix::sys::socket::audit_token_t) -> libc::uid_t;
     fn audit_token_to_pid(token: nix::sys::socket::audit_token_t) -> libc::pid_t;
+    fn audit_token_to_pidversion(token: nix::sys::socket::audit_token_t) -> libc::c_int;
 }
 
 #[cfg(target_os = "macos")]
 fn macos_audit_token_identity(
     token: MacOsAuditToken,
-) -> Result<MacOsPeerIdentity, PublisherSocketError> {
+) -> Result<(MacOsPeerIdentity, i32), PublisherSocketError> {
     let native = token.into_native();
     // SAFETY: these public libbsm accessors accept one complete audit_token_t
     // value and do not retain references to caller memory.
     #[allow(unsafe_code)]
-    let (uid, pid) = unsafe { (audit_token_to_euid(native), audit_token_to_pid(native)) };
+    let (uid, pid, process_id_version) = unsafe {
+        (
+            audit_token_to_euid(native),
+            audit_token_to_pid(native),
+            audit_token_to_pidversion(native),
+        )
+    };
     let pid = u32::try_from(pid)
         .ok()
         .filter(|pid| *pid > 0)
@@ -1547,10 +1539,13 @@ fn macos_audit_token_identity(
                 "macOS publisher audit proof has no positive PID".to_owned(),
             )
         })?;
-    Ok(MacOsPeerIdentity {
-        user_id: uid,
-        process_id: pid,
-    })
+    Ok((
+        MacOsPeerIdentity {
+            user_id: uid,
+            process_id: pid,
+        },
+        process_id_version,
+    ))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1664,43 +1659,6 @@ fn process_birth(pid: u32) -> Result<PublisherProcessBirthEvidence, PublisherSoc
     Ok(PublisherProcessBirthEvidence::Linux {
         boot_id: boot_id.into(),
         start_ticks,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn process_birth(pid: u32) -> Result<PublisherProcessBirthEvidence, PublisherSocketError> {
-    let pid = i32::try_from(pid).map_err(|_| {
-        PublisherSocketError::PeerIdentityUnavailable("peer PID is out of range".to_owned())
-    })?;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let info_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|_| {
-        PublisherSocketError::PeerIdentityUnavailable(
-            "Darwin process identity structure is too large".to_owned(),
-        )
-    })?;
-    // SAFETY: `info` points to writable storage of the exact structure and
-    // `proc_pidinfo` is called with that structure's Darwin flavor and size.
-    #[allow(unsafe_code)]
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            info_size,
-        )
-    };
-    if bytes != info_size {
-        return Err(PublisherSocketError::PeerIdentityUnavailable(
-            io::Error::last_os_error().to_string(),
-        ));
-    }
-    // SAFETY: Darwin reported that it initialized the complete structure.
-    #[allow(unsafe_code)]
-    let info = unsafe { info.assume_init() };
-    Ok(PublisherProcessBirthEvidence::MacOs {
-        start_seconds: info.pbi_start_tvsec,
-        start_microseconds: info.pbi_start_tvusec,
     })
 }
 
@@ -2737,13 +2695,27 @@ mod tests {
         };
         assert_eq!(request, release_request());
         assert_eq!(context.principal.uid(), config.expected_uid);
+        #[cfg(target_os = "macos")]
+        {
+            let (_, expected_process_id_version) =
+                macos_audit_token_identity(current_macos_audit_proof())
+                    .expect("current audit token has a process generation");
+            assert_eq!(
+                context.principal.birth(),
+                &PublisherProcessBirthEvidence::MacOs {
+                    process_id_version: expected_process_id_version,
+                }
+            );
+        }
         assert!(context.listener.is_none());
     }
 
     #[test]
     fn macos_audit_proof_parser_and_socket_binding_fail_closed() {
         let proof = MacOsAuditToken([7; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES]);
-        let replacement = MacOsAuditToken([8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES]);
+        let mut replacement = proof;
+        replacement.0[MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES - size_of::<i32>()..]
+            .copy_from_slice(&8_i32.to_ne_bytes());
         let expected_identity = MacOsPeerIdentity {
             user_id: 501,
             process_id: 41,
@@ -2819,34 +2791,25 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_audit_proof_rejects_pid_reuse_during_birth_capture() {
-        let checks = std::cell::Cell::new(0);
-        let captures = std::cell::Cell::new(0);
-        let result = capture_macos_process_birth_while_proof_matches(
-            || {
-                let check = checks.get();
-                checks.set(check + 1);
-                if check == 0 {
-                    Ok(())
-                } else {
-                    Err(PublisherSocketError::PeerIdentityUnavailable(
-                        "simulated replacement audit token".to_owned(),
-                    ))
-                }
+    fn macos_audit_token_generation_distinguishes_one_pid_incarnation_from_another() {
+        let principal = PublisherPrincipalEvidence {
+            uid: 501,
+            pid: 41,
+            birth: PublisherProcessBirthEvidence::MacOs {
+                process_id_version: 17,
             },
-            || {
-                captures.set(captures.get() + 1);
-                Ok(42_u64)
+        };
+        let replacement = PublisherPrincipalEvidence {
+            uid: principal.uid,
+            pid: principal.pid,
+            birth: PublisherProcessBirthEvidence::MacOs {
+                process_id_version: 18,
             },
-        );
-        assert!(matches!(
-            result,
-            Err(PublisherSocketError::PeerIdentityUnavailable(message))
-                if message == "simulated replacement audit token"
-        ));
-        assert_eq!(checks.get(), 2);
-        assert_eq!(captures.get(), 1);
+        };
+
+        assert_ne!(principal, replacement);
     }
 
     #[cfg(target_os = "macos")]
