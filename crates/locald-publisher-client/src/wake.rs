@@ -484,7 +484,9 @@ mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
-    use super::{WakeError, WakeObserver, WakeSink, notify_failed, notify_resumed};
+    use super::{
+        WakeError, WakeObserver, WakeSink, notify_failed, notify_resumed, notify_suspending,
+    };
 
     const BUS_WAIT_MICROS: u64 = 100_000;
     const METHOD_TIMEOUT_MICROS: u64 = 2_000_000;
