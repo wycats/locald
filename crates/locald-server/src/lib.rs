@@ -454,6 +454,29 @@ const fn publisher_transport_activation_allowed(sandbox: bool) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublisherWakePolicy {
+    System,
+    #[cfg(target_os = "linux")]
+    ExplicitSandboxNoHostSuspend,
+}
+
+const fn publisher_wake_policy(sandbox: bool) -> PublisherWakePolicy {
+    #[cfg(target_os = "linux")]
+    {
+        if sandbox {
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspend
+        } else {
+            PublisherWakePolicy::System
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sandbox;
+        PublisherWakePolicy::System
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn validate_macos_standard_preflight(ca_trusted: bool, helper_probe: Result<()>) -> Result<()> {
     if !ca_trusted {
@@ -920,7 +943,14 @@ async fn async_main(
         ipc::PublisherTransportDiscovery::Inactive
     } else if let Some(publisher_socket) = publisher_socket {
         let publisher_authority = manager.publisher_authority();
-        match publisher_authority.activate_system_wake_monitor() {
+        let wake_activation = match publisher_wake_policy(sandbox) {
+            PublisherWakePolicy::System => publisher_authority.activate_system_wake_monitor(),
+            #[cfg(target_os = "linux")]
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspend => {
+                publisher_authority.activate_linux_sandbox_no_suspend_wake_monitor()
+            }
+        };
+        match wake_activation {
             Ok(()) => {
                 let front_door_ports = advertised_http_port
                     .into_iter()
@@ -1216,8 +1246,8 @@ mod privileged_startup_tests {
     #[cfg(target_os = "macos")]
     use super::validate_macos_standard_preflight;
     use super::{
-        parse_sandbox_port_override, publisher_transport_activation_allowed,
-        validate_port_override_policy,
+        PublisherWakePolicy, parse_sandbox_port_override, publisher_transport_activation_allowed,
+        publisher_wake_policy, validate_port_override_policy,
     };
     use std::ffi::OsStr;
 
@@ -1267,6 +1297,8 @@ mod privileged_startup_tests {
     fn publisher_transport_is_available_in_standard_and_sandbox_modes_on_macos() {
         assert!(publisher_transport_activation_allowed(false));
         assert!(publisher_transport_activation_allowed(true));
+        assert_eq!(publisher_wake_policy(false), PublisherWakePolicy::System);
+        assert_eq!(publisher_wake_policy(true), PublisherWakePolicy::System);
     }
 
     #[cfg(target_os = "linux")]
@@ -1274,6 +1306,11 @@ mod privileged_startup_tests {
     fn publisher_transport_is_available_only_in_explicit_sandbox_mode_on_linux() {
         assert!(!publisher_transport_activation_allowed(false));
         assert!(publisher_transport_activation_allowed(true));
+        assert_eq!(publisher_wake_policy(false), PublisherWakePolicy::System);
+        assert_eq!(
+            publisher_wake_policy(true),
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspend
+        );
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

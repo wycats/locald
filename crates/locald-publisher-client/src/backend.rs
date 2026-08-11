@@ -127,6 +127,10 @@ pub trait AuthenticatedDaemonDiscovery: Send + Sync + std::fmt::Debug {
 }
 
 /// Bounded, same-UID ordinary command-socket discovery implementation.
+///
+/// On macOS, the publisher host must apply the same process-global
+/// [`crate::ProcessSpawnBarrier`] contract documented for
+/// [`UnixPublisherTransport`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnixCommandSocketDiscovery;
 
@@ -475,6 +479,12 @@ pub trait PublisherTransport: Send + Sync + std::fmt::Debug {
 /// Every exchange uses a fresh close-on-exec, nonblocking connection and one
 /// absolute deadline. The first request byte carries the complete
 /// `SCM_RIGHTS` contract; response ancillary data is never accepted.
+///
+/// On macOS, every process-spawn or direct-exec path in the publisher host must
+/// hold the process-global [`crate::ProcessSpawnBarrier`] spawn permit. The
+/// transport takes the exclusive side of that same barrier through successful
+/// socket close-on-exec and nonblocking setup, and through disposal of any
+/// unexpected descriptors installed while receiving a response.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnixPublisherTransport;
 
@@ -609,16 +619,31 @@ fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
 
 #[cfg(target_os = "macos")]
 fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
-    // Darwin has no SOCK_CLOEXEC/SOCK_NONBLOCK creation flags. Set both
-    // properties before the descriptor can enter any connect or I/O path.
+    create_nonblocking_unix_socket_with_barrier(crate::ProcessSpawnBarrier::global(), || {}, || {})
+}
+
+#[cfg(target_os = "macos")]
+fn create_nonblocking_unix_socket_with_barrier(
+    barrier: &crate::ProcessSpawnBarrier,
+    after_socket: impl FnOnce(),
+    after_flags: impl FnOnce(),
+) -> Result<std::os::fd::OwnedFd, Errno> {
+    // Darwin has no SOCK_CLOEXEC/SOCK_NONBLOCK creation flags. Exclude every
+    // cooperating spawn or exec from socket() through both flag updates, so
+    // the descriptor cannot cross an exec boundary in the transient window.
+    let _acquisition = barrier
+        .try_enter_descriptor_acquisition()
+        .map_err(|_| Errno::EBUSY)?;
     let descriptor = socket(
         AddressFamily::Unix,
         SockType::Stream,
         SockFlag::empty(),
         None,
     )?;
+    after_socket();
     fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
     fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    after_flags();
     Ok(descriptor)
 }
 
@@ -748,11 +773,7 @@ fn receive_response_before(
                 continue;
             }
             Err(error) => {
-                return Err(publisher_failure(
-                    DeliveryCertainty::OutcomeUnknown,
-                    BackendErrorKind::Unreachable,
-                    format!("cannot receive locald publisher response: {error}"),
-                ));
+                return Err(publisher_receive_failure(error));
             }
         };
         if had_control || flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
@@ -801,13 +822,71 @@ fn receive_response_before(
     }
 }
 
+fn publisher_receive_failure(error: Errno) -> TransportFailure {
+    publisher_failure(
+        DeliveryCertainty::OutcomeUnknown,
+        BackendErrorKind::Unreachable,
+        format!("cannot receive locald publisher response: {error}"),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn receive_publisher_chunk(
+    descriptor: std::os::fd::RawFd,
+    chunk: &mut [u8],
+) -> Result<(usize, MsgFlags, bool), Errno> {
+    receive_publisher_chunk_unlocked(descriptor, chunk, || {}, |_| {}, || {})
+}
+
+#[cfg(target_os = "macos")]
+fn receive_publisher_chunk(
+    descriptor: std::os::fd::RawFd,
+    chunk: &mut [u8],
+) -> Result<(usize, MsgFlags, bool), Errno> {
+    receive_publisher_chunk_with_barrier(
+        crate::ProcessSpawnBarrier::global(),
+        descriptor,
+        chunk,
+        || {},
+        |_| {},
+        || {},
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn receive_publisher_chunk_with_barrier(
+    barrier: &crate::ProcessSpawnBarrier,
+    descriptor: std::os::fd::RawFd,
+    chunk: &mut [u8],
+    after_receive: impl FnOnce(),
+    after_descriptor_closed: impl FnMut(std::os::fd::RawFd),
+    after_control_cleanup: impl FnOnce(),
+) -> Result<(usize, MsgFlags, bool), Errno> {
+    // Darwin has no MSG_CMSG_CLOEXEC. Exclude every cooperating spawn or exec
+    // before recvmsg can install an unexpected descriptor, and retain the
+    // exclusion until every installed descriptor has been secured and closed.
+    let _acquisition = barrier
+        .try_enter_descriptor_acquisition()
+        .map_err(|_| Errno::EBUSY)?;
+    receive_publisher_chunk_unlocked(
+        descriptor,
+        chunk,
+        after_receive,
+        after_descriptor_closed,
+        after_control_cleanup,
+    )
+}
+
 #[allow(
     unsafe_code,
     reason = "recvmsg response control data must be inspected so every unexpected SCM_RIGHTS descriptor is closed even when ancillary data is truncated"
 )]
-fn receive_publisher_chunk(
+fn receive_publisher_chunk_unlocked(
     descriptor: std::os::fd::RawFd,
     chunk: &mut [u8],
+    after_receive: impl FnOnce(),
+    after_descriptor_closed: impl FnMut(std::os::fd::RawFd),
+    after_control_cleanup: impl FnOnce(),
 ) -> Result<(usize, MsgFlags, bool), Errno> {
     let mut control = [0_usize; RESPONSE_CONTROL_WORDS];
     let mut iov = libc::iovec {
@@ -829,7 +908,9 @@ fn receive_publisher_chunk(
     if received < 0 {
         return Err(Errno::last());
     }
-    let had_control = close_response_control_messages(&message);
+    after_receive();
+    let had_control = close_response_control_messages(&message, after_descriptor_closed);
+    after_control_cleanup();
     Ok((
         received as usize,
         MsgFlags::from_bits_truncate(message.msg_flags),
@@ -841,7 +922,10 @@ fn receive_publisher_chunk(
     unsafe_code,
     reason = "kernel-produced cmsghdr records must be walked to close all unexpected response descriptors before rejecting the response"
 )]
-fn close_response_control_messages(message: &libc::msghdr) -> bool {
+fn close_response_control_messages(
+    message: &libc::msghdr,
+    mut after_descriptor_closed: impl FnMut(std::os::fd::RawFd),
+) -> bool {
     let control_start = message.msg_control as usize;
     #[allow(
         clippy::unnecessary_cast,
@@ -895,6 +979,7 @@ fn close_response_control_messages(message: &libc::msghdr) -> bool {
                     }
                     libc::close(descriptor);
                 }
+                after_descriptor_closed(descriptor);
             }
         }
         // SAFETY: The current header is complete and lies inside the live
@@ -1068,6 +1153,229 @@ mod tests {
 
         assert!(descriptor_flags.contains(FdFlag::FD_CLOEXEC));
         assert!(status_flags.contains(OFlag::O_NONBLOCK));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_socket_creation_fails_before_acquisition_during_spawn() {
+        let barrier = crate::ProcessSpawnBarrier::isolated_for_test();
+        let _spawn = barrier.enter_spawn();
+        let mut socket_created = false;
+
+        let error = create_nonblocking_unix_socket_with_barrier(
+            &barrier,
+            || {
+                socket_created = true;
+            },
+            || {},
+        )
+        .expect_err("active spawn must close the descriptor-acquisition gate");
+
+        assert_eq!(error, Errno::EBUSY);
+        assert!(!socket_created);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_socket_creation_excludes_spawn_until_cloexec_is_installed() {
+        let barrier = crate::ProcessSpawnBarrier::isolated_for_test();
+        let worker_barrier = barrier.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let mut worker = None;
+
+        let descriptor = create_nonblocking_unix_socket_with_barrier(
+            &barrier,
+            || {
+                worker = Some(thread::spawn(move || {
+                    let _spawn = worker_barrier.enter_spawn();
+                    acquired_tx.send(()).expect("announce spawn permit");
+                }));
+
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while barrier.announced_spawns_for_test() == 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "spawn intent must become observable"
+                    );
+                    thread::yield_now();
+                }
+                assert_eq!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "spawn must remain excluded before close-on-exec setup",
+                );
+            },
+            || {
+                assert_eq!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "spawn must remain excluded after both descriptor flags are installed",
+                );
+            },
+        )
+        .expect("create guarded Unix transport socket");
+
+        let descriptor_flags = FdFlag::from_bits_truncate(
+            fcntl(&descriptor, FcntlArg::F_GETFD).expect("read descriptor flags"),
+        );
+        let status_flags = OFlag::from_bits_truncate(
+            fcntl(&descriptor, FcntlArg::F_GETFL).expect("read socket status flags"),
+        );
+        assert!(descriptor_flags.contains(FdFlag::FD_CLOEXEC));
+        assert!(status_flags.contains(OFlag::O_NONBLOCK));
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawn proceeds after guarded socket setup");
+        worker.expect("spawn worker").join().expect("worker exits");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_response_receive_fails_before_recv_during_spawn() {
+        let (sender, receiver) = UnixStream::pair().expect("create response socket pair");
+        let file = File::open("/dev/null").expect("open descriptor fixture");
+        let descriptors = [file.as_raw_fd()];
+        let control = [ControlMessage::ScmRights(&descriptors)];
+        let response = [IoSlice::new(b"x")];
+        assert_eq!(
+            sendmsg::<UnixAddr>(
+                sender.as_raw_fd(),
+                &response,
+                &control,
+                MsgFlags::empty(),
+                None,
+            )
+            .expect("send response descriptor"),
+            1
+        );
+
+        let barrier = crate::ProcessSpawnBarrier::isolated_for_test();
+        let spawn = barrier.enter_spawn();
+        let mut chunk = [0_u8; 1];
+        let mut received = false;
+        let error = receive_publisher_chunk_with_barrier(
+            &barrier,
+            receiver.as_raw_fd(),
+            &mut chunk,
+            || {
+                received = true;
+            },
+            |_| {},
+            || {},
+        )
+        .expect_err("active spawn must close the response descriptor-acquisition gate");
+
+        assert_eq!(error, Errno::EBUSY);
+        assert!(!received, "barrier contention must fail before recvmsg");
+        assert_eq!(
+            publisher_receive_failure(error).certainty,
+            DeliveryCertainty::OutcomeUnknown,
+            "post-send response-barrier contention has uncertain outcome",
+        );
+        drop(spawn);
+
+        let closed_descriptors = std::cell::Cell::new(0);
+        let (count, _, had_control) = receive_publisher_chunk_with_barrier(
+            &barrier,
+            receiver.as_raw_fd(),
+            &mut chunk,
+            || {},
+            |_| closed_descriptors.set(closed_descriptors.get() + 1),
+            || {},
+        )
+        .expect("receive response after spawn finishes");
+        assert_eq!(count, 1);
+        assert_eq!(chunk, *b"x");
+        assert!(had_control);
+        assert_eq!(closed_descriptors.get(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the fixture verifies that each raw descriptor installed by recvmsg is closed before the acquisition guard is released"
+    )]
+    fn macos_response_receive_excludes_spawn_until_descriptors_are_closed() {
+        let (sender, receiver) = UnixStream::pair().expect("create response socket pair");
+        let first_file = File::open("/dev/null").expect("open first descriptor fixture");
+        let second_file = File::open("/dev/null").expect("open second descriptor fixture");
+        let descriptors = [first_file.as_raw_fd(), second_file.as_raw_fd()];
+        let control = [ControlMessage::ScmRights(&descriptors)];
+        let response = [IoSlice::new(b"x")];
+        assert_eq!(
+            sendmsg::<UnixAddr>(
+                sender.as_raw_fd(),
+                &response,
+                &control,
+                MsgFlags::empty(),
+                None,
+            )
+            .expect("send response descriptors"),
+            1
+        );
+
+        let barrier = crate::ProcessSpawnBarrier::isolated_for_test();
+        let worker_barrier = barrier.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let closed_descriptors = std::cell::Cell::new(0);
+        let mut worker = None;
+        let mut chunk = [0_u8; 1];
+
+        let (count, _, had_control) = receive_publisher_chunk_with_barrier(
+            &barrier,
+            receiver.as_raw_fd(),
+            &mut chunk,
+            || {
+                worker = Some(thread::spawn(move || {
+                    let _spawn = worker_barrier.enter_spawn();
+                    acquired_tx.send(()).expect("announce spawn permit");
+                }));
+
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while barrier.announced_spawns_for_test() == 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "spawn intent must become observable"
+                    );
+                    thread::yield_now();
+                }
+                assert_eq!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "spawn must remain excluded after recvmsg installs descriptors",
+                );
+            },
+            |descriptor| {
+                // SAFETY: The cleanup callback runs immediately after the
+                // transport closes this kernel-installed raw descriptor.
+                assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+                assert_eq!(Errno::last(), Errno::EBADF);
+                closed_descriptors.set(closed_descriptors.get() + 1);
+                assert_eq!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "spawn must remain excluded while response descriptors are closed",
+                );
+            },
+            || {
+                assert_eq!(closed_descriptors.get(), 2);
+                assert_eq!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "spawn must remain excluded after cleanup and before guard release",
+                );
+            },
+        )
+        .expect("receive guarded response descriptors");
+
+        assert_eq!(count, 1);
+        assert_eq!(chunk, *b"x");
+        assert!(had_control);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawn proceeds after response descriptor cleanup");
+        worker.expect("spawn worker").join().expect("worker exits");
     }
 
     fn receive_request(mut stream: UnixStream) -> (Vec<u8>, Vec<RawFd>) {

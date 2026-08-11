@@ -53,6 +53,30 @@ impl WakeMonitor for InactiveWakeMonitor {
     }
 }
 
+/// Wake policy for an explicitly authenticated Linux sandbox whose host is
+/// guaranteed not to suspend for the lifetime of the publisher session.
+///
+/// This is deliberately private to the supported client. It observes no wake
+/// events and is safe only when selected from authenticated explicit-sandbox
+/// provenance under that external precondition.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct NoHostSuspendWakeMonitor;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct NoHostSuspendWakeRegistration;
+
+#[cfg(target_os = "linux")]
+impl WakeRegistration for NoHostSuspendWakeRegistration {}
+
+#[cfg(target_os = "linux")]
+impl WakeMonitor for NoHostSuspendWakeMonitor {
+    fn register(&self, _sink: Arc<dyn WakeSink>) -> Result<Box<dyn WakeRegistration>, WakeError> {
+        Ok(Box::new(NoHostSuspendWakeRegistration))
+    }
+}
+
 /// Production wake monitor for supported desktop Unix hosts.
 ///
 /// macOS uses I/O Kit power notifications. Linux uses logind's
@@ -1201,5 +1225,14 @@ mod tests {
             InactiveWakeMonitor.register(sink as Arc<dyn WakeSink>),
             Err(WakeError::Unavailable)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_host_suspend_monitor_activates_without_ambient_wake_services() {
+        let sink = Arc::new(RecordingSink::default());
+        NoHostSuspendWakeMonitor
+            .register(sink as Arc<dyn WakeSink>)
+            .expect("an explicit no-host-suspend contract needs no ambient wake service");
     }
 }

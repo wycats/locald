@@ -37,6 +37,30 @@ const WAIT_READY_TTL: Duration = Duration::from_secs(30);
 const PREPARATION_TTL: Duration = Duration::from_mins(1);
 const FRAME_DELIVERY_TTL: Duration = Duration::from_secs(5);
 
+/// Wake policy for an explicit Linux sandbox whose host is contractually
+/// guaranteed not to suspend for the lifetime of the daemon.
+///
+/// This private monitor observes nothing. Startup may select it only from the
+/// daemon's parsed sandbox mode; standard installations retain the system wake
+/// monitor and its fail-closed registration behavior.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxSandboxNoHostSuspendWakeMonitor;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxSandboxNoHostSuspendWakeRegistration;
+
+#[cfg(target_os = "linux")]
+impl WakeRegistration for LinuxSandboxNoHostSuspendWakeRegistration {}
+
+#[cfg(target_os = "linux")]
+impl WakeMonitor for LinuxSandboxNoHostSuspendWakeMonitor {
+    fn register(&self, _sink: Arc<dyn WakeSink>) -> Result<Box<dyn WakeRegistration>, WakeError> {
+        Ok(Box::new(LinuxSandboxNoHostSuspendWakeRegistration))
+    }
+}
+
 /// One daemon-lifetime, suspend-inclusive monotonic clock reading.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PublicationInstant(Duration);
@@ -3139,6 +3163,18 @@ impl PublisherAuthority {
         self.activate_wake_monitor(&SystemWakeMonitor)
     }
 
+    /// Activate the explicit Linux-sandbox no-host-suspend policy.
+    ///
+    /// The caller must derive this choice from parsed sandbox mode. This does
+    /// not observe wake events and must never be selected for a standard
+    /// installation.
+    #[cfg(target_os = "linux")]
+    pub(super) fn activate_linux_sandbox_no_suspend_wake_monitor(
+        &self,
+    ) -> Result<(), protocol::ProtocolError> {
+        self.activate_wake_monitor(&LinuxSandboxNoHostSuspendWakeMonitor)
+    }
+
     fn activate_wake_monitor(
         &self,
         monitor: &dyn WakeMonitor,
@@ -5254,6 +5290,23 @@ mod tests {
                 .code(),
             protocol::StableErrorCode::OperationCanceled
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_sandbox_no_host_suspend_policy_activates_without_logind() {
+        let declaration = declaration(instance(30), 1, "thirty.localhost");
+        let (registry, _clock, _key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+
+        authority
+            .activate_linux_sandbox_no_suspend_wake_monitor()
+            .expect("explicit no-host-suspend policy activates without ambient wake services");
+        authority
+            .ensure_wake_trustworthy()
+            .expect("the explicit no-host-suspend precondition admits publication operations");
+
+        authority.shutdown().await;
     }
 
     #[tokio::test]

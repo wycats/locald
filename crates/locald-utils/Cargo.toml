@@ -3,6 +3,9 @@ name = "locald-utils"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = "1.0.100"
 dirs = "6.0.0"

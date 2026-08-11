@@ -66,6 +66,13 @@ impl InstalledPublisher {
         &self.protocol_info
     }
 
+    /// Whether this publisher was authenticated through one caller-selected
+    /// explicit sandbox rather than standard installation authority.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn has_explicit_sandbox_authority(&self) -> bool {
+        matches!(&self.authority, InstallationAuthority::ExplicitSandbox(_))
+    }
+
     pub(crate) const fn from_verified(
         record: InstallationRecord,
         daemon_uid: u32,

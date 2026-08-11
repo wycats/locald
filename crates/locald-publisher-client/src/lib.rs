@@ -4,6 +4,14 @@
 //! frame construction, conservative renewal scheduling, typed authority loss,
 //! and the authenticated one-shot Unix transport used by production
 //! publishers.
+//!
+//! On macOS, every host process using the production transport must hold a
+//! [`ProcessSpawnPermit`] around each operation that can spawn or exec. The
+//! transport takes the opposite side of the same process-global
+//! [`ProcessSpawnBarrier`] across every descriptor acquisition until the new
+//! descriptor is either close-on-exec or closed. Acquire the permit immediately
+//! before `Command::spawn`, drop it when `spawn` returns, and wait for the child
+//! separately.
 
 mod backend;
 #[allow(
@@ -41,5 +49,7 @@ pub use supervisor::{LeaseSnapshot, LeaseState};
 pub use wake::{
     InactiveWakeMonitor, SystemWakeMonitor, WakeError, WakeMonitor, WakeRegistration, WakeSink,
 };
+
+pub use locald_utils::process_spawn::{ProcessSpawnBarrier, ProcessSpawnPermit};
 
 pub use locald_publisher_protocol as protocol;

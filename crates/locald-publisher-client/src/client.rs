@@ -28,6 +28,8 @@ use crate::supervisor::{
     LeaseSnapshot, LeaseState, PendingSupervisor, RenewalCause, SessionFence, SharedSession,
     SupervisorCallError, SupervisorDriver, SupervisorHandle, SupervisorShared,
 };
+#[cfg(target_os = "linux")]
+use crate::wake::NoHostSuspendWakeMonitor;
 use crate::wake::{InactiveWakeMonitor, SystemWakeMonitor, WakeError, WakeMonitor};
 
 const EXACT_MUTATION_ATTEMPTS: u32 = 2;
@@ -44,6 +46,7 @@ struct ClientInner {
     transport: Arc<dyn PublisherTransport>,
     clock: Arc<dyn SuspendAwareClock>,
     wake_monitor: Arc<dyn WakeMonitor>,
+    wake_monitor_source: WakeMonitorSource,
     expected_uid: u32,
     discovery_gate: Mutex<()>,
     clock_state: Mutex<ClockState>,
@@ -57,6 +60,19 @@ struct ClockState {
     failure: Option<ClockError>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeMonitorSource {
+    Production,
+    Injected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectWakePolicy {
+    ConfiguredMonitor,
+    #[cfg(target_os = "linux")]
+    ExplicitSandboxNoHostSuspend,
+}
+
 impl fmt::Debug for ClientInner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -64,6 +80,7 @@ impl fmt::Debug for ClientInner {
             .field("transport", &self.transport)
             .field("clock", &self.clock)
             .field("wake_monitor", &self.wake_monitor)
+            .field("wake_monitor_source", &self.wake_monitor_source)
             .field("expected_uid", &self.expected_uid)
             .finish_non_exhaustive()
     }
@@ -130,11 +147,12 @@ impl PublisherClient {
     /// suspend-inclusive clock, and platform wake observation.
     #[must_use]
     pub fn production() -> Self {
-        Self::with_wake_monitor(
+        Self::with_wake_monitor_source(
             Arc::new(UnixCommandSocketDiscovery),
             Arc::new(UnixPublisherTransport),
             Arc::new(SystemSuspendAwareClock),
             Arc::new(SystemWakeMonitor),
+            WakeMonitorSource::Production,
         )
     }
 
@@ -160,11 +178,28 @@ impl PublisherClient {
         clock: Arc<dyn SuspendAwareClock>,
         wake_monitor: Arc<dyn WakeMonitor>,
     ) -> Self {
+        Self::with_wake_monitor_source(
+            discovery,
+            transport,
+            clock,
+            wake_monitor,
+            WakeMonitorSource::Injected,
+        )
+    }
+
+    fn with_wake_monitor_source(
+        discovery: Arc<dyn AuthenticatedDaemonDiscovery>,
+        transport: Arc<dyn PublisherTransport>,
+        clock: Arc<dyn SuspendAwareClock>,
+        wake_monitor: Arc<dyn WakeMonitor>,
+        wake_monitor_source: WakeMonitorSource,
+    ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 transport,
                 clock,
                 wake_monitor,
+                wake_monitor_source,
                 expected_uid: Uid::effective().as_raw(),
                 discovery_gate: Mutex::new(()),
                 clock_state: Mutex::new(ClockState::default()),
@@ -219,8 +254,10 @@ impl PublisherClient {
         }
         let protocol_info = protocol_info.value;
         let fence = self.inner.activate_epoch(protocol_info.daemon_epoch());
+        let wake_monitor = self.project_wake_monitor(installation);
         Ok(ProjectPublisher {
             inner: Arc::clone(&self.inner),
+            wake_monitor,
             protocol_info,
             project_locator,
             project_instance_id: resolved.value,
@@ -240,6 +277,31 @@ impl PublisherClient {
         self.validate_peer_uid(installed.daemon_uid())
     }
 
+    #[cfg(target_os = "linux")]
+    fn project_wake_policy(&self, installed: &InstalledPublisher) -> ProjectWakePolicy {
+        if self.inner.wake_monitor_source == WakeMonitorSource::Production
+            && installed.has_explicit_sandbox_authority()
+        {
+            return ProjectWakePolicy::ExplicitSandboxNoHostSuspend;
+        }
+
+        ProjectWakePolicy::ConfiguredMonitor
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn project_wake_policy(&self, installed: &InstalledPublisher) -> ProjectWakePolicy {
+        let _ = (self, installed);
+        ProjectWakePolicy::ConfiguredMonitor
+    }
+
+    fn project_wake_monitor(&self, installed: &InstalledPublisher) -> Arc<dyn WakeMonitor> {
+        match self.project_wake_policy(installed) {
+            ProjectWakePolicy::ConfiguredMonitor => Arc::clone(&self.inner.wake_monitor),
+            #[cfg(target_os = "linux")]
+            ProjectWakePolicy::ExplicitSandboxNoHostSuspend => Arc::new(NoHostSuspendWakeMonitor),
+        }
+    }
+
     fn validate_peer_uid(&self, peer_uid: u32) -> Result<(), ClientError> {
         if peer_uid == self.inner.expected_uid {
             Ok(())
@@ -256,6 +318,7 @@ impl PublisherClient {
 #[derive(Debug, Clone)]
 pub struct ProjectPublisher {
     inner: Arc<ClientInner>,
+    wake_monitor: Arc<dyn WakeMonitor>,
     protocol_info: PublishedEndpointProtocolInfo,
     project_locator: AbsolutePath,
     project_instance_id: ProjectInstanceId,
@@ -640,7 +703,7 @@ impl InstalledOrigin {
     pub fn acquire(self, listener: &TcpListener) -> Result<Lease, ClientError> {
         let pending = PendingSupervisor::register(
             &self.prepared.project.inner.session,
-            self.prepared.project.inner.wake_monitor.as_ref(),
+            self.prepared.project.wake_monitor.as_ref(),
         )
         .map_err(ClientError::Wake)?;
         let retained_listener = listener
@@ -1700,6 +1763,17 @@ mod tests {
 
     impl WakeRegistration for FakeRegistration {}
 
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct PolicyTestWakeSink;
+
+    #[cfg(target_os = "linux")]
+    impl WakeSink for PolicyTestWakeSink {
+        fn resumed(&self) {}
+
+        fn failed(&self, _error: WakeError) {}
+    }
+
     #[derive(Debug, Default)]
     struct FakeWakeMonitor {
         sinks: Mutex<Vec<Arc<dyn WakeSink>>>,
@@ -2044,6 +2118,76 @@ mod tests {
             fixture.discovery.take_command_sockets(),
             vec![command_socket.clone(), command_socket]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_host_suspend_policy_requires_production_and_explicit_sandbox_authority() {
+        let fixture = fixture();
+        let context = SandboxPublisherContext::new(
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald")
+                .expect("data directory"),
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/locald.sock")
+                .expect("command socket"),
+        )
+        .expect("sandbox context");
+        let installed_sandbox = InstalledPublisher::from_verified_sandbox(
+            context,
+            Uid::effective().as_raw(),
+            PublishedEndpointProtocolInfo::v1(
+                fixture.epoch.clone(),
+                AbsolutePath::parse(
+                    "/tmp/locald-explicit-sandbox/data/locald/run/publisher-v1.sock",
+                )
+                .expect("publisher socket"),
+            ),
+        );
+        let unavailable_monitor = Arc::new(InactiveWakeMonitor);
+        let production_policy_client = PublisherClient::with_wake_monitor_source(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            Arc::clone(&unavailable_monitor) as Arc<dyn WakeMonitor>,
+            WakeMonitorSource::Production,
+        );
+        let injected_client = PublisherClient::with_wake_monitor(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            unavailable_monitor as Arc<dyn WakeMonitor>,
+        );
+
+        assert_eq!(
+            production_policy_client.project_wake_policy(&fixture.installed),
+            ProjectWakePolicy::ConfiguredMonitor,
+            "standard installation authority keeps the system monitor"
+        );
+        assert_eq!(
+            production_policy_client.project_wake_policy(&installed_sandbox),
+            ProjectWakePolicy::ExplicitSandboxNoHostSuspend,
+            "only authenticated explicit-sandbox authority selects the Linux carveout"
+        );
+        assert_eq!(
+            injected_client.project_wake_policy(&installed_sandbox),
+            ProjectWakePolicy::ConfiguredMonitor,
+            "injected monitors remain authoritative for deterministic tests"
+        );
+        assert!(matches!(
+            production_policy_client
+                .project_wake_monitor(&fixture.installed)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Unavailable)
+        ));
+        production_policy_client
+            .project_wake_monitor(&installed_sandbox)
+            .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>)
+            .expect("authenticated production sandbox activates without logind");
+        assert!(matches!(
+            injected_client
+                .project_wake_monitor(&installed_sandbox)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Unavailable)
+        ));
     }
 
     fn origin() -> SemanticOrigin {

@@ -1,10 +1,11 @@
-//! Process-global coordination between process creation and descriptor receipt.
+//! Process-global coordination between process creation and descriptor acquisition.
 //!
 //! macOS does not provide an atomic `MSG_CMSG_CLOEXEC` equivalent for
-//! descriptors received with `SCM_RIGHTS`. The publisher transport therefore
-//! has to receive a descriptor and set `FD_CLOEXEC` while no other thread can
-//! create a child process. Every daemon process-spawn path takes a shared spawn
-//! permit, while descriptor receipt takes an exclusive, fail-closed guard.
+//! descriptors received with `SCM_RIGHTS`, or atomic close-on-exec socket
+//! creation. Publisher transports therefore have to acquire a descriptor and
+//! set `FD_CLOEXEC` while no other thread can create a child process. Every
+//! process-spawn path takes a shared spawn permit, while descriptor acquisition
+//! takes an exclusive, fail-closed guard.
 //!
 //! Spawn permits deliberately do not exclude one another. Besides allowing
 //! unrelated process creation to proceed concurrently, this makes the barrier
@@ -18,14 +19,14 @@ use thiserror::Error;
 
 static GLOBAL_PROCESS_SPAWN_BARRIER: OnceLock<ProcessSpawnBarrier> = OnceLock::new();
 
-/// Daemon-wide exclusion between process creation and descriptor receipt.
+/// Process-wide exclusion between process creation and descriptor acquisition.
 #[derive(Clone)]
 pub struct ProcessSpawnBarrier {
     inner: Arc<BarrierInner>,
 }
 
 impl ProcessSpawnBarrier {
-    /// Return the process-global barrier shared by every locald spawn path.
+    /// Return the barrier shared by every descriptor and spawn path in this process.
     #[must_use]
     pub fn global() -> &'static Self {
         GLOBAL_PROCESS_SPAWN_BARRIER.get_or_init(Self::new)
@@ -35,12 +36,12 @@ impl ProcessSpawnBarrier {
         Self {
             inner: Arc::new(BarrierInner {
                 state: Mutex::new(BarrierState::default()),
-                descriptor_receipts_finished: Condvar::new(),
+                descriptor_acquisitions_finished: Condvar::new(),
             }),
         }
     }
 
-    /// Announce a process spawn, then wait until descriptor receipt is idle.
+    /// Announce a process spawn or direct exec, then wait for descriptor acquisition.
     ///
     /// More than one spawn permit may be active at once. This is intentional:
     /// code that guards an opaque helper which internally spawns may also guard
@@ -49,13 +50,13 @@ impl ProcessSpawnBarrier {
     pub fn enter_spawn(&self) -> ProcessSpawnPermit {
         let mut state = self.lock_state();
         // Publish spawn intent before waiting. Otherwise a stream of new
-        // descriptor receipts can repeatedly enter while this spawn is queued,
-        // starving every daemon child-process launch.
+        // descriptor acquisitions can repeatedly enter while this spawn is
+        // queued, starving every child-process launch.
         state.active_spawns = state.active_spawns.saturating_add(1);
-        while state.active_descriptor_receipts != 0 {
+        while state.active_descriptor_acquisitions != 0 {
             state = self
                 .inner
-                .descriptor_receipts_finished
+                .descriptor_acquisitions_finished
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
@@ -67,11 +68,40 @@ impl ProcessSpawnBarrier {
         }
     }
 
-    /// Enter the descriptor-receipt exclusion or fail if a spawn is active.
+    /// Enter descriptor acquisition exclusion or fail if a spawn is active.
     ///
-    /// Receipt never waits for an in-progress spawn. The caller must reject the
-    /// publisher request and let the publisher retry, keeping authentication
-    /// and descriptor ownership fail-closed.
+    /// Acquisition never waits for an in-progress spawn. The caller must fail
+    /// the operation before acquiring a descriptor and let its bounded caller
+    /// retry, keeping descriptor ownership fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescriptorAcquisitionBlocked`] when at least one process-spawn
+    /// permit is active.
+    pub fn try_enter_descriptor_acquisition(
+        &self,
+    ) -> Result<DescriptorAcquisitionGuard, DescriptorAcquisitionBlocked> {
+        let mut state = self.lock_state();
+        if state.active_spawns != 0 {
+            return Err(DescriptorAcquisitionBlocked {
+                active_spawns: state.active_spawns,
+            });
+        }
+        state.active_descriptor_acquisitions =
+            state.active_descriptor_acquisitions.saturating_add(1);
+        drop(state);
+
+        Ok(DescriptorAcquisitionGuard {
+            barrier: self.clone(),
+            active: true,
+        })
+    }
+
+    /// Enter descriptor-receipt exclusion or fail if a spawn is active.
+    ///
+    /// This compatibility name retains the server's `SCM_RIGHTS` vocabulary;
+    /// new descriptor-creation code should use
+    /// [`Self::try_enter_descriptor_acquisition`].
     ///
     /// # Errors
     ///
@@ -80,19 +110,7 @@ impl ProcessSpawnBarrier {
     pub fn try_enter_descriptor_receipt(
         &self,
     ) -> Result<DescriptorReceiptGuard, DescriptorReceiptBlocked> {
-        let mut state = self.lock_state();
-        if state.active_spawns != 0 {
-            return Err(DescriptorReceiptBlocked {
-                active_spawns: state.active_spawns,
-            });
-        }
-        state.active_descriptor_receipts = state.active_descriptor_receipts.saturating_add(1);
-        drop(state);
-
-        Ok(DescriptorReceiptGuard {
-            barrier: self.clone(),
-            active: true,
-        })
+        self.try_enter_descriptor_acquisition()
     }
 
     fn lock_state(&self) -> MutexGuard<'_, BarrierState> {
@@ -102,13 +120,19 @@ impl ProcessSpawnBarrier {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    #[cfg(test)]
-    fn isolated_for_test() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    /// Construct an isolated barrier for deterministic cross-crate tests.
+    #[must_use]
+    pub fn isolated_for_test() -> Self {
         Self::new()
     }
 
-    #[cfg(test)]
-    fn announced_spawns_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    /// Observe queued and active spawn sections in deterministic tests.
+    #[must_use]
+    pub fn announced_spawns_for_test(&self) -> usize {
         self.lock_state().active_spawns
     }
 }
@@ -120,8 +144,8 @@ impl fmt::Debug for ProcessSpawnBarrier {
             .debug_struct("ProcessSpawnBarrier")
             .field("active_spawns", &state.active_spawns)
             .field(
-                "active_descriptor_receipts",
-                &state.active_descriptor_receipts,
+                "active_descriptor_acquisitions",
+                &state.active_descriptor_acquisitions,
             )
             .finish()
     }
@@ -130,16 +154,22 @@ impl fmt::Debug for ProcessSpawnBarrier {
 #[derive(Debug)]
 struct BarrierInner {
     state: Mutex<BarrierState>,
-    descriptor_receipts_finished: Condvar,
+    descriptor_acquisitions_finished: Condvar,
 }
 
 #[derive(Debug, Default)]
 struct BarrierState {
     active_spawns: usize,
-    active_descriptor_receipts: usize,
+    active_descriptor_acquisitions: usize,
 }
 
-/// Shared permit announcing that a child process may be created.
+/// Shared permit announcing that a child process may be created or exec may run.
+///
+/// Hold the permit from immediately before the operation that can fork,
+/// `posix_spawn`, or exec until that operation returns. An exec that succeeds
+/// replaces the process while every guarded descriptor is already close-on-exec.
+/// For command APIs, call `spawn` under the permit, drop the permit when
+/// `spawn` returns, and wait for the child separately.
 #[derive(Debug)]
 pub struct ProcessSpawnPermit {
     barrier: ProcessSpawnBarrier,
@@ -160,14 +190,14 @@ impl Drop for ProcessSpawnPermit {
     }
 }
 
-/// Exclusive guard covering `recvmsg` through successful `FD_CLOEXEC` setup.
+/// Exclusive guard covering descriptor acquisition through `FD_CLOEXEC` setup.
 #[derive(Debug)]
-pub struct DescriptorReceiptGuard {
+pub struct DescriptorAcquisitionGuard {
     barrier: ProcessSpawnBarrier,
     active: bool,
 }
 
-impl Drop for DescriptorReceiptGuard {
+impl Drop for DescriptorAcquisitionGuard {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -175,34 +205,44 @@ impl Drop for DescriptorReceiptGuard {
 
         let mut state = self.barrier.lock_state();
         debug_assert!(
-            state.active_descriptor_receipts > 0,
-            "descriptor receipt guard count underflow"
+            state.active_descriptor_acquisitions > 0,
+            "descriptor acquisition guard count underflow"
         );
-        state.active_descriptor_receipts = state.active_descriptor_receipts.saturating_sub(1);
-        let receipt_is_idle = state.active_descriptor_receipts == 0;
+        state.active_descriptor_acquisitions =
+            state.active_descriptor_acquisitions.saturating_sub(1);
+        let acquisition_is_idle = state.active_descriptor_acquisitions == 0;
         self.active = false;
         drop(state);
 
-        if receipt_is_idle {
-            self.barrier.inner.descriptor_receipts_finished.notify_all();
+        if acquisition_is_idle {
+            self.barrier
+                .inner
+                .descriptor_acquisitions_finished
+                .notify_all();
         }
     }
 }
 
-/// Descriptor receipt could not begin because process creation was active.
+/// Compatibility name for an `SCM_RIGHTS` descriptor-receipt guard.
+pub type DescriptorReceiptGuard = DescriptorAcquisitionGuard;
+
+/// Descriptor acquisition could not begin because process creation was active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("descriptor receipt blocked by {active_spawns} active process spawn(s)")]
-pub struct DescriptorReceiptBlocked {
+#[error("descriptor acquisition blocked by {active_spawns} active process spawn(s)")]
+pub struct DescriptorAcquisitionBlocked {
     active_spawns: usize,
 }
 
-impl DescriptorReceiptBlocked {
-    /// Number of active process-spawn sections observed by the failed receipt.
+impl DescriptorAcquisitionBlocked {
+    /// Number of active process-spawn sections observed by the failed acquisition.
     #[must_use]
     pub const fn active_spawns(self) -> usize {
         self.active_spawns
     }
 }
+
+/// Compatibility name for a blocked `SCM_RIGHTS` descriptor receipt.
+pub type DescriptorReceiptBlocked = DescriptorAcquisitionBlocked;
 
 #[cfg(test)]
 mod tests {
@@ -212,23 +252,23 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn descriptor_receipt_fails_closed_while_a_spawn_is_active() {
+    fn descriptor_acquisition_fails_closed_while_a_spawn_is_active() {
         let barrier = ProcessSpawnBarrier::isolated_for_test();
         let _spawn = barrier.enter_spawn();
 
         let error = barrier
-            .try_enter_descriptor_receipt()
-            .expect_err("receipt must fail while a spawn is active");
+            .try_enter_descriptor_acquisition()
+            .expect_err("acquisition must fail while a spawn is active");
 
         assert_eq!(error.active_spawns(), 1);
     }
 
     #[test]
-    fn spawn_waits_until_descriptor_receipt_finishes() {
+    fn spawn_waits_until_descriptor_acquisition_finishes() {
         let barrier = ProcessSpawnBarrier::isolated_for_test();
-        let receipt = barrier
-            .try_enter_descriptor_receipt()
-            .expect("initial receipt starts");
+        let acquisition = barrier
+            .try_enter_descriptor_acquisition()
+            .expect("initial acquisition starts");
         let worker_barrier = barrier.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
@@ -244,13 +284,13 @@ mod tests {
             .expect("worker starts");
         assert!(
             acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "spawn must remain blocked during descriptor receipt"
+            "spawn must remain blocked during descriptor acquisition"
         );
 
-        drop(receipt);
+        drop(acquisition);
         acquired_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("spawn proceeds after receipt");
+            .expect("spawn proceeds after acquisition");
         worker.join().expect("worker exits");
     }
 
@@ -326,6 +366,6 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<ProcessSpawnPermit>();
-        assert_send::<DescriptorReceiptGuard>();
+        assert_send::<DescriptorAcquisitionGuard>();
     }
 }
