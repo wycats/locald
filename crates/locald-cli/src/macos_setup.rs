@@ -110,11 +110,12 @@ impl SetupPlatform for SystemPlatform {
         owner: &SetupOwner,
         launch_agent_plist: &Path,
     ) -> Result<Box<dyn RuntimeQuiescence>> {
-        quiesce_runtime_transactionally(
+        let runtime_quiescence = quiesce_runtime_transactionally(
             || bootout_launch_agent(owner),
             || stop_user_daemon(owner),
             || self.start_launch_agent(owner, launch_agent_plist),
-        )
+        )?;
+        Ok(Box::new(runtime_quiescence))
     }
 
     fn retire_native_host_entries(&self) -> Result<()> {
@@ -158,13 +159,10 @@ fn quiesce_runtime_transactionally<T>(
     bootout: impl FnOnce() -> Result<()>,
     stop_daemon: impl FnOnce() -> Result<T>,
     restore_launch_agent: impl FnOnce() -> Result<()>,
-) -> Result<Box<dyn RuntimeQuiescence>>
-where
-    T: RuntimeQuiescence + 'static,
-{
+) -> Result<T> {
     bootout()?;
     match stop_daemon() {
-        Ok(guard) => Ok(Box::new(guard)),
+        Ok(guard) => Ok(guard),
         Err(quiescence_error) => match restore_launch_agent() {
             Ok(()) => Err(quiescence_error),
             Err(restart_error) => Err(quiescence_error.context(format!(
@@ -232,14 +230,31 @@ impl MacOsTeardownTransaction {
 /// the daemon's catalog-writer lock for the rest of teardown.
 pub(super) fn begin_teardown_transaction() -> Result<MacOsTeardownTransaction> {
     let owner = resolve_setup_owner()?;
-    bootout_launch_agent(&owner)?;
-    let daemon_quiescence = stop_user_daemon(&owner)?;
     let launch_agent = owner
         .home
         .join("Library/LaunchAgents/com.locald.agent.plist");
-    remove_owner_regular_file(&owner, &launch_agent, "LaunchAgent plist")?;
+    let platform = SystemPlatform;
+    begin_teardown_transaction_with(
+        &owner,
+        &launch_agent,
+        || bootout_launch_agent(&owner),
+        || stop_user_daemon(&owner),
+        || platform.start_launch_agent(&owner, &launch_agent),
+    )
+}
+
+fn begin_teardown_transaction_with(
+    owner: &SetupOwner,
+    launch_agent: &Path,
+    bootout: impl FnOnce() -> Result<()>,
+    stop_daemon: impl FnOnce() -> Result<DaemonQuiescence>,
+    restore_launch_agent: impl FnOnce() -> Result<()>,
+) -> Result<MacOsTeardownTransaction> {
+    let daemon_quiescence =
+        quiesce_runtime_transactionally(bootout, stop_daemon, restore_launch_agent)?;
+    remove_owner_regular_file(owner, launch_agent, "LaunchAgent plist")?;
     Ok(MacOsTeardownTransaction {
-        owner,
+        owner: owner.clone(),
         daemon_quiescence,
     })
 }
@@ -2263,6 +2278,47 @@ mod tests {
                 "agent"
             ]
         );
+    }
+
+    #[test]
+    fn teardown_restores_the_launch_agent_when_daemon_quiescence_fails() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        std::fs::create_dir_all(paths.launch_agent.parent().unwrap())
+            .expect("create LaunchAgents directory");
+        std::fs::write(&paths.launch_agent, b"installed launch agent")
+            .expect("install LaunchAgent plist");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let error = begin_teardown_transaction_with(
+            &owner,
+            &paths.launch_agent,
+            || {
+                calls.lock().unwrap().push("bootout");
+                Ok(())
+            },
+            || -> Result<DaemonQuiescence> {
+                calls.lock().unwrap().push("stop");
+                anyhow::bail!("injected daemon stop failure")
+            },
+            || {
+                calls.lock().unwrap().push("agent");
+                Ok(())
+            },
+        )
+        .err()
+        .expect("daemon stop failure must abort teardown after restoration");
+
+        assert!(format!("{error:#}").contains("injected daemon stop failure"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["bootout", "stop", "agent"]
+        );
+        assert_eq!(
+            std::fs::read(&paths.launch_agent).unwrap(),
+            b"installed launch agent"
+        );
+        assert_publisher_installation_record_is_intact(&paths);
     }
 
     #[test]
