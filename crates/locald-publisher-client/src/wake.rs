@@ -90,13 +90,13 @@ impl WakeMonitor for NoHostSuspendWakeMonitor {
 /// observer failure is never downgraded to the no-suspend fallback.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
-pub(crate) struct ExplicitSandboxWakeMonitor {
+pub struct ExplicitSandboxWakeMonitor {
     primary: Arc<dyn WakeMonitor>,
 }
 
 #[cfg(target_os = "linux")]
 impl ExplicitSandboxWakeMonitor {
-    pub(crate) fn new(primary: Arc<dyn WakeMonitor>) -> Self {
+    pub fn new(primary: Arc<dyn WakeMonitor>) -> Self {
         Self { primary }
     }
 }
