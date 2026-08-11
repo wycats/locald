@@ -458,23 +458,44 @@ const fn publisher_transport_activation_allowed(sandbox: bool) -> bool {
 enum PublisherWakePolicy {
     System,
     #[cfg(target_os = "linux")]
-    ExplicitSandboxNoHostSuspend,
+    ExplicitSandboxNoHostSuspendGuarantee,
 }
 
-const fn publisher_wake_policy(sandbox: bool) -> PublisherWakePolicy {
+const fn publisher_wake_policy(
+    sandbox: bool,
+    explicit_no_host_suspend_guarantee: bool,
+) -> PublisherWakePolicy {
     #[cfg(target_os = "linux")]
     {
-        if sandbox {
-            PublisherWakePolicy::ExplicitSandboxNoHostSuspend
+        if sandbox && explicit_no_host_suspend_guarantee {
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspendGuarantee
         } else {
             PublisherWakePolicy::System
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = sandbox;
+        let _ = (sandbox, explicit_no_host_suspend_guarantee);
         PublisherWakePolicy::System
     }
+}
+
+fn validate_explicit_no_host_suspend_guarantee(
+    sandbox: bool,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value != std::ffi::OsStr::new("1") {
+        anyhow::bail!("LOCALD_SANDBOX_NO_HOST_SUSPEND must be exactly `1` when set");
+    }
+    if !sandbox {
+        anyhow::bail!(
+            "LOCALD_SANDBOX_NO_HOST_SUSPEND requires an effective explicit sandbox; use --sandbox together with --sandbox-no-host-suspend"
+        );
+    }
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -618,6 +639,10 @@ async fn async_main(
     let http_port_override = std::env::var_os("LOCALD_HTTP_PORT");
     let https_port_override = std::env::var_os("LOCALD_HTTPS_PORT");
     let sandbox = config.server.is_sandbox();
+    let explicit_no_host_suspend_guarantee = validate_explicit_no_host_suspend_guarantee(
+        sandbox,
+        std::env::var_os("LOCALD_SANDBOX_NO_HOST_SUSPEND").as_deref(),
+    )?;
     validate_port_override_policy(
         sandbox,
         http_port_override.is_some(),
@@ -943,13 +968,14 @@ async fn async_main(
         ipc::PublisherTransportDiscovery::Inactive
     } else if let Some(publisher_socket) = publisher_socket {
         let publisher_authority = manager.publisher_authority();
-        let wake_activation = match publisher_wake_policy(sandbox) {
-            PublisherWakePolicy::System => publisher_authority.activate_system_wake_monitor(),
-            #[cfg(target_os = "linux")]
-            PublisherWakePolicy::ExplicitSandboxNoHostSuspend => {
-                publisher_authority.activate_linux_sandbox_no_suspend_wake_monitor()
-            }
-        };
+        let wake_activation =
+            match publisher_wake_policy(sandbox, explicit_no_host_suspend_guarantee) {
+                PublisherWakePolicy::System => publisher_authority.activate_system_wake_monitor(),
+                #[cfg(target_os = "linux")]
+                PublisherWakePolicy::ExplicitSandboxNoHostSuspendGuarantee => {
+                    publisher_authority.activate_linux_sandbox_explicit_no_suspend_wake_monitor()
+                }
+            };
         match wake_activation {
             Ok(()) => {
                 let front_door_ports = advertised_http_port
@@ -1247,7 +1273,8 @@ mod privileged_startup_tests {
     use super::validate_macos_standard_preflight;
     use super::{
         PublisherWakePolicy, parse_sandbox_port_override, publisher_transport_activation_allowed,
-        publisher_wake_policy, validate_port_override_policy,
+        publisher_wake_policy, validate_explicit_no_host_suspend_guarantee,
+        validate_port_override_policy,
     };
     use std::ffi::OsStr;
 
@@ -1297,8 +1324,14 @@ mod privileged_startup_tests {
     fn publisher_transport_is_available_in_standard_and_sandbox_modes_on_macos() {
         assert!(publisher_transport_activation_allowed(false));
         assert!(publisher_transport_activation_allowed(true));
-        assert_eq!(publisher_wake_policy(false), PublisherWakePolicy::System);
-        assert_eq!(publisher_wake_policy(true), PublisherWakePolicy::System);
+        assert_eq!(
+            publisher_wake_policy(false, false),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(true, false),
+            PublisherWakePolicy::System
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1306,11 +1339,33 @@ mod privileged_startup_tests {
     fn publisher_transport_is_available_only_in_explicit_sandbox_mode_on_linux() {
         assert!(!publisher_transport_activation_allowed(false));
         assert!(publisher_transport_activation_allowed(true));
-        assert_eq!(publisher_wake_policy(false), PublisherWakePolicy::System);
         assert_eq!(
-            publisher_wake_policy(true),
-            PublisherWakePolicy::ExplicitSandboxNoHostSuspend
+            publisher_wake_policy(false, false),
+            PublisherWakePolicy::System
         );
+        assert_eq!(
+            publisher_wake_policy(true, false),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(false, true),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(true, true),
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspendGuarantee
+        );
+    }
+
+    #[test]
+    fn no_host_suspend_marker_requires_the_exact_authenticated_context() {
+        assert!(!validate_explicit_no_host_suspend_guarantee(true, None).unwrap());
+        assert!(validate_explicit_no_host_suspend_guarantee(true, Some(OsStr::new(""))).is_err());
+        assert!(
+            validate_explicit_no_host_suspend_guarantee(true, Some(OsStr::new("true"))).is_err()
+        );
+        assert!(validate_explicit_no_host_suspend_guarantee(false, Some(OsStr::new("1"))).is_err());
+        assert!(validate_explicit_no_host_suspend_guarantee(true, Some(OsStr::new("1"))).unwrap());
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

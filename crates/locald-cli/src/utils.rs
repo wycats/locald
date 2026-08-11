@@ -17,7 +17,7 @@ pub fn trusted_launch_path() -> CliResult<String> {
 }
 
 #[allow(unsafe_code)]
-pub fn setup_sandbox(name: &str) -> CliResult<()> {
+pub fn setup_sandbox(name: &str, no_host_suspend: bool) -> CliResult<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let sandbox_root = std::path::PathBuf::from(home)
         .join(".local/share/locald/sandboxes")
@@ -40,6 +40,13 @@ pub fn setup_sandbox(name: &str) -> CliResult<()> {
         std::env::set_var("LOCALD_SOCKET", &socket_path);
         std::env::set_var("LOCALD_SANDBOX_ACTIVE", "1");
         std::env::set_var("LOCALD_SANDBOX_NAME", name);
+        if no_host_suspend {
+            std::env::set_var("LOCALD_SANDBOX_NO_HOST_SUSPEND", "1");
+        } else {
+            // Never let an ambient parent marker strengthen an ordinary
+            // sandbox's wake policy.
+            std::env::remove_var("LOCALD_SANDBOX_NO_HOST_SUSPEND");
+        }
     }
 
     eprintln!("{} Running in sandbox: {}", style::PACKAGE, name.bold());

@@ -37,12 +37,11 @@ const WAIT_READY_TTL: Duration = Duration::from_secs(30);
 const PREPARATION_TTL: Duration = Duration::from_mins(1);
 const FRAME_DELIVERY_TTL: Duration = Duration::from_secs(5);
 
-/// Wake policy for an explicit Linux sandbox whose host is contractually
-/// guaranteed not to suspend for the lifetime of the daemon.
+/// No-op half of the explicit Linux-sandbox no-host-suspend guarantee.
 ///
-/// This private monitor observes nothing. Startup may select it only from the
-/// daemon's parsed sandbox mode; standard installations retain the system wake
-/// monitor and its fail-closed registration behavior.
+/// This private monitor observes nothing. It is reachable only after the
+/// composite monitor has found system wake observation unavailable and the
+/// daemon has authenticated the dedicated no-host-suspend marker.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct LinuxSandboxNoHostSuspendWakeMonitor;
@@ -58,6 +57,31 @@ impl WakeRegistration for LinuxSandboxNoHostSuspendWakeRegistration {}
 impl WakeMonitor for LinuxSandboxNoHostSuspendWakeMonitor {
     fn register(&self, _sink: Arc<dyn WakeSink>) -> Result<Box<dyn WakeRegistration>, WakeError> {
         Ok(Box::new(LinuxSandboxNoHostSuspendWakeRegistration))
+    }
+}
+
+/// Prefer real Linux wake observation, falling back only when an explicitly
+/// guaranteed sandbox has no system wake service.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxSandboxExplicitNoHostSuspendWakeMonitor<System, Fallback> {
+    system: System,
+    fallback: Fallback,
+}
+
+#[cfg(target_os = "linux")]
+impl<System, Fallback> WakeMonitor
+    for LinuxSandboxExplicitNoHostSuspendWakeMonitor<System, Fallback>
+where
+    System: WakeMonitor,
+    Fallback: WakeMonitor,
+{
+    fn register(&self, sink: Arc<dyn WakeSink>) -> Result<Box<dyn WakeRegistration>, WakeError> {
+        match self.system.register(Arc::clone(&sink)) {
+            Ok(registration) => Ok(registration),
+            Err(WakeError::Unavailable) => self.fallback.register(sink),
+            Err(error @ WakeError::Failed(_)) => Err(error),
+        }
     }
 }
 
@@ -3225,16 +3249,19 @@ impl PublisherAuthority {
         self.activate_wake_monitor(&SystemWakeMonitor)
     }
 
-    /// Activate the explicit Linux-sandbox no-host-suspend policy.
+    /// Activate the explicit Linux-sandbox no-host-suspend guarantee.
     ///
-    /// The caller must derive this choice from parsed sandbox mode. This does
-    /// not observe wake events and must never be selected for a standard
-    /// installation.
+    /// The caller must require both parsed sandbox mode and the dedicated
+    /// no-host-suspend marker. Real system wake observation is preferred; the
+    /// no-op fallback is used only when the system monitor is unavailable.
     #[cfg(target_os = "linux")]
-    pub(super) fn activate_linux_sandbox_no_suspend_wake_monitor(
+    pub(super) fn activate_linux_sandbox_explicit_no_suspend_wake_monitor(
         &self,
     ) -> Result<(), protocol::ProtocolError> {
-        self.activate_wake_monitor(&LinuxSandboxNoHostSuspendWakeMonitor)
+        self.activate_wake_monitor(&LinuxSandboxExplicitNoHostSuspendWakeMonitor {
+            system: SystemWakeMonitor,
+            fallback: LinuxSandboxNoHostSuspendWakeMonitor,
+        })
     }
 
     fn activate_wake_monitor(
@@ -4902,6 +4929,7 @@ mod tests {
     struct FakeWakeMonitor {
         sink: StdMutex<Option<Arc<dyn WakeSink>>>,
         registration_error: StdMutex<Option<WakeError>>,
+        registration_attempts: AtomicUsize,
     }
 
     impl FakeWakeMonitor {
@@ -4931,6 +4959,17 @@ mod tests {
                 .expect("registered wake sink")
                 .failed(error);
         }
+
+        fn fail_registration_with(&self, error: WakeError) {
+            *self
+                .registration_error
+                .lock()
+                .expect("fake wake registration error lock") = Some(error);
+        }
+
+        fn registration_attempts(&self) -> usize {
+            self.registration_attempts.load(Ordering::SeqCst)
+        }
     }
 
     #[derive(Debug)]
@@ -4943,6 +4982,7 @@ mod tests {
             &self,
             sink: Arc<dyn WakeSink>,
         ) -> Result<Box<dyn WakeRegistration>, WakeError> {
+            self.registration_attempts.fetch_add(1, Ordering::SeqCst);
             if let Some(error) = self
                 .registration_error
                 .lock()
@@ -5378,17 +5418,67 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn linux_sandbox_no_host_suspend_policy_activates_without_logind() {
+    async fn linux_sandbox_no_host_suspend_guarantee_activates_without_logind() {
         let declaration = declaration(instance(30), 1, "thirty.localhost");
         let (registry, _clock, _key) = registry(Duration::ZERO, declaration);
         let authority = authority(registry);
 
+        let system = FakeWakeMonitor::default();
+        system.fail_registration_with(WakeError::Unavailable);
+        let fallback = FakeWakeMonitor::default();
+        let monitor = LinuxSandboxExplicitNoHostSuspendWakeMonitor { system, fallback };
+
         authority
-            .activate_linux_sandbox_no_suspend_wake_monitor()
+            .activate_wake_monitor(&monitor)
             .expect("explicit no-host-suspend policy activates without ambient wake services");
+        assert_eq!(monitor.system.registration_attempts(), 1);
+        assert_eq!(monitor.fallback.registration_attempts(), 1);
         authority
             .ensure_wake_trustworthy()
             .expect("the explicit no-host-suspend precondition admits publication operations");
+
+        authority.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_sandbox_no_host_suspend_guarantee_prefers_system_wake_observation() {
+        let declaration = declaration(instance(31), 1, "thirty-one.localhost");
+        let (registry, _clock, _key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let monitor = LinuxSandboxExplicitNoHostSuspendWakeMonitor {
+            system: FakeWakeMonitor::default(),
+            fallback: FakeWakeMonitor::default(),
+        };
+
+        authority
+            .activate_wake_monitor(&monitor)
+            .expect("available system wake observation activates");
+        assert_eq!(monitor.system.registration_attempts(), 1);
+        assert_eq!(monitor.fallback.registration_attempts(), 0);
+
+        authority.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_sandbox_no_host_suspend_guarantee_propagates_system_failure() {
+        let declaration = declaration(instance(32), 1, "thirty-two.localhost");
+        let (registry, _clock, _key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let system = FakeWakeMonitor::default();
+        system.fail_registration_with(WakeError::Failed("lost logind".to_owned()));
+        let monitor = LinuxSandboxExplicitNoHostSuspendWakeMonitor {
+            system,
+            fallback: FakeWakeMonitor::default(),
+        };
+
+        let error = authority
+            .activate_wake_monitor(&monitor)
+            .expect_err("an active system monitor failure must fail closed");
+        assert!(error.to_string().contains("lost logind"));
+        assert_eq!(monitor.system.registration_attempts(), 1);
+        assert_eq!(monitor.fallback.registration_attempts(), 0);
 
         authority.shutdown().await;
     }

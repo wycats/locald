@@ -112,7 +112,7 @@ fn run_main(cli: cli::Cli) -> error::CliResult<()> {
     }
 
     if let Some(sandbox_name) = &cli.sandbox {
-        utils::setup_sandbox(sandbox_name)?;
+        utils::setup_sandbox(sandbox_name, cli.sandbox_no_host_suspend)?;
     }
 
     // Repair, inspection, and shutdown commands must remain available when the

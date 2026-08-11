@@ -82,6 +82,45 @@ impl WakeMonitor for NoHostSuspendWakeMonitor {
     }
 }
 
+/// Wake policy for an explicit Linux sandbox whose external supervisor has
+/// separately guaranteed that the host will not suspend.
+///
+/// Conforming system observation is always preferred. The external guarantee
+/// is used only when a system observer cannot be established at all; an
+/// observer failure is never downgraded to the no-suspend fallback.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct ExplicitSandboxWakeMonitor {
+    primary: Arc<dyn WakeMonitor>,
+}
+
+#[cfg(target_os = "linux")]
+impl ExplicitSandboxWakeMonitor {
+    pub(crate) fn new(primary: Arc<dyn WakeMonitor>) -> Self {
+        Self { primary }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WakeMonitor for ExplicitSandboxWakeMonitor {
+    fn register(&self, sink: Arc<dyn WakeSink>) -> Result<Box<dyn WakeRegistration>, WakeError> {
+        register_with_no_suspend_fallback(self.primary.as_ref(), &NoHostSuspendWakeMonitor, sink)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn register_with_no_suspend_fallback(
+    primary: &dyn WakeMonitor,
+    fallback: &dyn WakeMonitor,
+    sink: Arc<dyn WakeSink>,
+) -> Result<Box<dyn WakeRegistration>, WakeError> {
+    match primary.register(Arc::clone(&sink)) {
+        Ok(registration) => Ok(registration),
+        Err(WakeError::Unavailable) => fallback.register(sink),
+        Err(error) => Err(error),
+    }
+}
+
 /// Production wake monitor for supported desktop Unix hosts.
 ///
 /// macOS uses I/O Kit power notifications. Linux uses logind's
@@ -763,7 +802,9 @@ mod platform {
             match process_one(&api, bus.pointer, &mut signal_state) {
                 Ok(false) if signal_state.pending.is_none() => {}
                 Ok(_) | Err(()) => {
-                    drop(ready.send(Err(WakeError::Unavailable)));
+                    drop(ready.send(Err(WakeError::Failed(
+                        "logind wake state was uncertain during registration".to_owned(),
+                    ))));
                     return;
                 }
             }

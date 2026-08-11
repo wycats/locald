@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub sandbox: Option<String>,
 
+    /// Assert that this sandbox's host cannot suspend while locald is running
+    #[arg(long, global = true, requires = "sandbox")]
+    pub sandbox_no_host_suspend: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -756,6 +760,33 @@ pub enum DebugCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_host_suspend_guarantee_requires_an_explicit_sandbox() {
+        let error = Cli::try_parse_from(["locald", "--sandbox-no-host-suspend", "ping"])
+            .err()
+            .expect("the no-host-suspend guarantee must not stand alone");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn explicit_sandbox_accepts_the_no_host_suspend_guarantee() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "--sandbox",
+            "ci",
+            "--sandbox-no-host-suspend",
+            "ping",
+        ])
+        .expect("parse an explicitly guaranteed sandbox");
+
+        assert_eq!(cli.sandbox.as_deref(), Some("ci"));
+        assert!(cli.sandbox_no_host_suspend);
+    }
 
     #[test]
     fn parse_run_maps_to_exec_variant() {

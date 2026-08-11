@@ -66,11 +66,16 @@ impl InstalledPublisher {
         &self.protocol_info
     }
 
-    /// Whether this publisher was authenticated through one caller-selected
-    /// explicit sandbox rather than standard installation authority.
-    #[cfg(target_os = "linux")]
-    pub(crate) const fn has_explicit_sandbox_authority(&self) -> bool {
-        matches!(&self.authority, InstallationAuthority::ExplicitSandbox(_))
+    /// Whether this publisher was authenticated through an explicit sandbox
+    /// whose external supervisor guarantees that the host will not suspend.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) const fn has_no_host_suspend_guarantee(&self) -> bool {
+        match &self.authority {
+            InstallationAuthority::Standard(_) => false,
+            InstallationAuthority::ExplicitSandbox(context) => {
+                context.has_no_host_suspend_guarantee()
+            }
+        }
     }
 
     pub(crate) const fn from_verified(
@@ -107,6 +112,13 @@ impl InstalledPublisher {
 pub struct SandboxPublisherContext {
     data_dir: AbsolutePath,
     command_socket: AbsolutePath,
+    suspend_policy: SandboxSuspendPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxSuspendPolicy {
+    SystemWakeObservation,
+    ExternallyGuaranteedNoHostSuspend,
 }
 
 impl SandboxPublisherContext {
@@ -126,7 +138,21 @@ impl SandboxPublisherContext {
         Ok(Self {
             data_dir,
             command_socket,
+            suspend_policy: SandboxSuspendPolicy::SystemWakeObservation,
         })
+    }
+
+    /// Attach an external guarantee that the selected sandbox host will not
+    /// suspend while publication authority is live.
+    ///
+    /// This is intentionally separate from selecting a sandbox: sandbox mode
+    /// alone says nothing about host power management. Callers may assert this
+    /// only when they control the host lifecycle for the complete daemon and
+    /// publisher session, and must select the matching daemon launch policy.
+    #[must_use]
+    pub const fn with_no_host_suspend_guarantee(mut self) -> Self {
+        self.suspend_policy = SandboxSuspendPolicy::ExternallyGuaranteedNoHostSuspend;
+        self
     }
 
     /// Exact caller-selected sandbox data directory.
@@ -143,6 +169,14 @@ impl SandboxPublisherContext {
 
     fn expected_publisher_socket(&self) -> PathBuf {
         self.data_dir.as_path().join(PUBLISHER_SOCKET_RELATIVE_PATH)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    const fn has_no_host_suspend_guarantee(&self) -> bool {
+        matches!(
+            self.suspend_policy,
+            SandboxSuspendPolicy::ExternallyGuaranteedNoHostSuspend
+        )
     }
 }
 
@@ -832,6 +866,27 @@ mod tests {
                 .join(INSTALLATION_RECORD_NAME)
                 .exists()
         );
+    }
+
+    #[test]
+    fn no_host_suspend_guarantee_is_separate_from_sandbox_selection() {
+        let root = TempDir::new().expect("tempdir");
+        let ordinary = sandbox_context(&root);
+        let guaranteed = ordinary.clone().with_no_host_suspend_guarantee();
+
+        let ordinary_installed = probe_sandbox_publisher_with(
+            &ordinary,
+            &sandbox_discovery(&ordinary, Uid::effective().as_raw()),
+        )
+        .expect("ordinary authenticated sandbox");
+        let guaranteed_installed = probe_sandbox_publisher_with(
+            &guaranteed,
+            &sandbox_discovery(&guaranteed, Uid::effective().as_raw()),
+        )
+        .expect("externally guaranteed authenticated sandbox");
+
+        assert!(!ordinary_installed.has_no_host_suspend_guarantee());
+        assert!(guaranteed_installed.has_no_host_suspend_guarantee());
     }
 
     #[test]

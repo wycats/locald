@@ -29,7 +29,7 @@ use crate::supervisor::{
     SupervisorCallError, SupervisorDriver, SupervisorHandle, SupervisorShared,
 };
 #[cfg(target_os = "linux")]
-use crate::wake::NoHostSuspendWakeMonitor;
+use crate::wake::ExplicitSandboxWakeMonitor;
 use crate::wake::{InactiveWakeMonitor, SystemWakeMonitor, WakeError, WakeMonitor};
 
 const EXACT_MUTATION_ATTEMPTS: u32 = 2;
@@ -72,7 +72,7 @@ enum WakeMonitorSource {
 enum ProjectWakePolicy {
     ConfiguredMonitor,
     #[cfg(target_os = "linux")]
-    ExplicitSandboxNoHostSuspend,
+    ExplicitSandboxSystemOrNoHostSuspend,
 }
 
 impl fmt::Debug for ClientInner {
@@ -282,9 +282,9 @@ impl PublisherClient {
     #[cfg(target_os = "linux")]
     fn project_wake_policy(&self, installed: &InstalledPublisher) -> ProjectWakePolicy {
         if self.inner.wake_monitor_source == WakeMonitorSource::Production
-            && installed.has_explicit_sandbox_authority()
+            && installed.has_no_host_suspend_guarantee()
         {
-            return ProjectWakePolicy::ExplicitSandboxNoHostSuspend;
+            return ProjectWakePolicy::ExplicitSandboxSystemOrNoHostSuspend;
         }
 
         ProjectWakePolicy::ConfiguredMonitor
@@ -300,7 +300,9 @@ impl PublisherClient {
         match self.project_wake_policy(installed) {
             ProjectWakePolicy::ConfiguredMonitor => Arc::clone(&self.inner.wake_monitor),
             #[cfg(target_os = "linux")]
-            ProjectWakePolicy::ExplicitSandboxNoHostSuspend => Arc::new(NoHostSuspendWakeMonitor),
+            ProjectWakePolicy::ExplicitSandboxSystemOrNoHostSuspend => Arc::new(
+                ExplicitSandboxWakeMonitor::new(Arc::clone(&self.inner.wake_monitor)),
+            ),
         }
     }
 
@@ -1818,6 +1820,20 @@ mod tests {
         fn failed(&self, _error: WakeError) {}
     }
 
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct RegistrationErrorWakeMonitor(WakeError);
+
+    #[cfg(target_os = "linux")]
+    impl WakeMonitor for RegistrationErrorWakeMonitor {
+        fn register(
+            &self,
+            _sink: Arc<dyn WakeSink>,
+        ) -> Result<Box<dyn WakeRegistration>, WakeError> {
+            Err(self.0.clone())
+        }
+    }
+
     #[derive(Debug, Default)]
     struct FakeWakeMonitor {
         sinks: Mutex<Vec<Arc<dyn WakeSink>>>,
@@ -2166,7 +2182,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn no_host_suspend_policy_requires_production_and_explicit_sandbox_authority() {
+    fn no_host_suspend_policy_requires_a_separate_external_guarantee() {
         let fixture = fixture();
         let context = SandboxPublisherContext::new(
             AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald")
@@ -2175,8 +2191,20 @@ mod tests {
                 .expect("command socket"),
         )
         .expect("sandbox context");
+        let guaranteed_context = context.clone().with_no_host_suspend_guarantee();
         let installed_sandbox = InstalledPublisher::from_verified_sandbox(
             context,
+            Uid::effective().as_raw(),
+            PublishedEndpointProtocolInfo::v1(
+                fixture.epoch.clone(),
+                AbsolutePath::parse(
+                    "/tmp/locald-explicit-sandbox/data/locald/run/publisher-v1.sock",
+                )
+                .expect("publisher socket"),
+            ),
+        );
+        let installed_guaranteed_sandbox = InstalledPublisher::from_verified_sandbox(
+            guaranteed_context,
             Uid::effective().as_raw(),
             PublishedEndpointProtocolInfo::v1(
                 fixture.epoch.clone(),
@@ -2208,11 +2236,16 @@ mod tests {
         );
         assert_eq!(
             production_policy_client.project_wake_policy(&installed_sandbox),
-            ProjectWakePolicy::ExplicitSandboxNoHostSuspend,
-            "only authenticated explicit-sandbox authority selects the Linux carveout"
+            ProjectWakePolicy::ConfiguredMonitor,
+            "ordinary explicit sandbox authority keeps the system monitor"
         );
         assert_eq!(
-            injected_client.project_wake_policy(&installed_sandbox),
+            production_policy_client.project_wake_policy(&installed_guaranteed_sandbox),
+            ProjectWakePolicy::ExplicitSandboxSystemOrNoHostSuspend,
+            "the separate external guarantee selects the Linux fallback policy"
+        );
+        assert_eq!(
+            injected_client.project_wake_policy(&installed_guaranteed_sandbox),
             ProjectWakePolicy::ConfiguredMonitor,
             "injected monitors remain authoritative for deterministic tests"
         );
@@ -2222,15 +2255,51 @@ mod tests {
                 .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
             Err(WakeError::Unavailable)
         ));
-        production_policy_client
-            .project_wake_monitor(&installed_sandbox)
-            .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>)
-            .expect("authenticated production sandbox activates without logind");
         assert!(matches!(
-            injected_client
+            production_policy_client
                 .project_wake_monitor(&installed_sandbox)
                 .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
             Err(WakeError::Unavailable)
+        ));
+        production_policy_client
+            .project_wake_monitor(&installed_guaranteed_sandbox)
+            .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>)
+            .expect("the external guarantee permits unavailable-system fallback");
+        assert!(matches!(
+            injected_client
+                .project_wake_monitor(&installed_guaranteed_sandbox)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Unavailable)
+        ));
+
+        let preferred_monitor_client = PublisherClient::with_wake_monitor_source(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            Arc::clone(&fixture.wakes) as Arc<dyn WakeMonitor>,
+            WakeMonitorSource::Production,
+        );
+        preferred_monitor_client
+            .project_wake_monitor(&installed_guaranteed_sandbox)
+            .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>)
+            .expect("available system observation remains preferred");
+        assert_eq!(fixture.wakes.sinks.lock().expect("wake sinks").len(), 1);
+
+        let failed_monitor = Arc::new(RegistrationErrorWakeMonitor(WakeError::Failed(
+            "scripted system failure".to_owned(),
+        )));
+        let failed_monitor_client = PublisherClient::with_wake_monitor_source(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            failed_monitor as Arc<dyn WakeMonitor>,
+            WakeMonitorSource::Production,
+        );
+        assert!(matches!(
+            failed_monitor_client
+                .project_wake_monitor(&installed_guaranteed_sandbox)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Failed(message)) if message == "scripted system failure"
         ));
     }
 

@@ -22,6 +22,14 @@
         "positional": false
       },
       {
+        "long": "sandbox-no-host-suspend",
+        "short": null,
+        "aliases": [],
+        "global": true,
+        "hidden": false,
+        "positional": false
+      },
+      {
         "long": "version",
         "short": "V",
         "aliases": [],
@@ -77,6 +85,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "version",
             "short": null,
             "aliases": [],
@@ -107,6 +123,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": [
@@ -125,6 +149,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -196,6 +228,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": null,
             "short": null,
             "aliases": [],
@@ -221,6 +261,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -285,6 +333,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -309,6 +365,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -328,6 +392,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -359,6 +431,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": [
@@ -377,6 +457,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -435,6 +523,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -456,6 +552,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -514,6 +618,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -540,6 +652,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": []
@@ -559,6 +679,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -624,6 +752,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -643,6 +779,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -685,6 +829,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -1259,6 +1411,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "target",
             "short": null,
             "aliases": [],
@@ -1315,6 +1475,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": null,
             "short": null,
             "aliases": [],
@@ -1345,6 +1513,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": []
@@ -1364,6 +1540,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -1401,6 +1585,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": []
@@ -1420,6 +1612,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -1482,6 +1682,14 @@
                 "positional": false
               },
               {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": "source",
                 "short": null,
                 "aliases": [],
@@ -1530,6 +1738,14 @@
                 "positional": false
               },
               {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": "source",
                 "short": null,
                 "aliases": [],
@@ -1563,6 +1779,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -1602,6 +1826,14 @@
                   },
                   {
                     "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox-no-host-suspend",
                     "short": null,
                     "aliases": [],
                     "global": true,
@@ -1701,6 +1933,14 @@
                     "positional": false
                   },
                   {
+                    "long": "sandbox-no-host-suspend",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
                     "long": "window-id",
                     "short": null,
                     "aliases": [],
@@ -1750,6 +1990,14 @@
                   },
                   {
                     "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox-no-host-suspend",
                     "short": null,
                     "aliases": [],
                     "global": true,
@@ -1906,6 +2154,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -1940,6 +2196,14 @@
                 "positional": false
               },
               {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": null,
                 "short": null,
                 "aliases": [],
@@ -1965,6 +2229,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2012,6 +2284,14 @@
                 "positional": false
               },
               {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": null,
                 "short": null,
                 "aliases": [],
@@ -2037,6 +2317,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2076,6 +2364,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": [
@@ -2094,6 +2390,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2166,6 +2470,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -2185,6 +2497,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2217,6 +2537,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2266,6 +2594,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": null,
             "short": null,
             "aliases": [],
@@ -2293,6 +2629,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -2348,6 +2692,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": "version",
             "short": null,
             "aliases": [],
@@ -2396,6 +2748,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": null,
             "short": null,
             "aliases": [],
@@ -2421,6 +2781,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -2485,6 +2853,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -2509,6 +2885,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -2528,6 +2912,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2559,6 +2951,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": [
@@ -2577,6 +2977,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -2631,6 +3039,14 @@
                     "positional": false
                   },
                   {
+                    "long": "sandbox-no-host-suspend",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
                     "long": null,
                     "short": null,
                     "aliases": [],
@@ -2672,6 +3088,14 @@
                   },
                   {
                     "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox-no-host-suspend",
                     "short": null,
                     "aliases": [],
                     "global": true,
@@ -2754,6 +3178,14 @@
                     "positional": false
                   },
                   {
+                    "long": "sandbox-no-host-suspend",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
                     "long": "version",
                     "short": null,
                     "aliases": [],
@@ -2811,6 +3243,14 @@
                   },
                   {
                     "long": "sandbox",
+                    "short": null,
+                    "aliases": [],
+                    "global": true,
+                    "hidden": false,
+                    "positional": false
+                  },
+                  {
+                    "long": "sandbox-no-host-suspend",
                     "short": null,
                     "aliases": [],
                     "global": true,
@@ -2924,6 +3364,14 @@
                 "positional": false
               },
               {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": null,
                 "short": null,
                 "aliases": [],
@@ -2956,6 +3404,14 @@
                 "positional": false
               },
               {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
                 "long": null,
                 "short": null,
                 "aliases": [],
@@ -2981,6 +3437,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -3038,6 +3502,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": null,
             "short": null,
             "aliases": [],
@@ -3078,6 +3550,14 @@
             "positional": false
           },
           {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
             "long": null,
             "short": null,
             "aliases": [],
@@ -3103,6 +3583,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -3174,6 +3662,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -3193,6 +3689,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -3222,6 +3726,14 @@
                 "global": true,
                 "hidden": false,
                 "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
               }
             ],
             "subcommands": []
@@ -3241,6 +3753,14 @@
               },
               {
                 "long": "sandbox",
+                "short": null,
+                "aliases": [],
+                "global": true,
+                "hidden": false,
+                "positional": false
+              },
+              {
+                "long": "sandbox-no-host-suspend",
                 "short": null,
                 "aliases": [],
                 "global": true,
@@ -3272,6 +3792,14 @@
             "global": true,
             "hidden": false,
             "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
           }
         ],
         "subcommands": []
@@ -3291,6 +3819,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -3323,6 +3859,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
@@ -3363,6 +3907,14 @@
           },
           {
             "long": "sandbox",
+            "short": null,
+            "aliases": [],
+            "global": true,
+            "hidden": false,
+            "positional": false
+          },
+          {
+            "long": "sandbox-no-host-suspend",
             "short": null,
             "aliases": [],
             "global": true,
