@@ -631,7 +631,7 @@ fn validate_owner_mode(
             "{label} is owned by UID {owner_uid}, expected effective UID {current_uid}"
         )));
     }
-    let actual_mode = raw_mode & 0o777;
+    let actual_mode = raw_mode & 0o7777;
     if actual_mode != expected_mode {
         return Err(InstallationError::InvalidRecord(format!(
             "{label} has mode {actual_mode:#05o}, expected {expected_mode:#05o}"
@@ -1095,6 +1095,28 @@ mod tests {
             probe_installation_with(&context, &discovery(&context)).expect("probe"),
             None
         );
+    }
+
+    #[test]
+    fn record_directory_rejects_special_permission_bits() {
+        let owner_uid = Uid::effective().as_raw();
+        for special_bit in [0o4000, 0o2000, 0o1000] {
+            let error =
+                validate_owner_mode(owner_uid, 0o700 | special_bit, 0o700, "record directory")
+                    .expect_err("setuid, setgid, and sticky bits must fail closed");
+            assert!(matches!(error, InstallationError::InvalidRecord(_)));
+        }
+    }
+
+    #[test]
+    fn installation_record_rejects_special_permission_bits() {
+        let owner_uid = Uid::effective().as_raw();
+        for special_bit in [0o4000, 0o2000, 0o1000] {
+            let error =
+                validate_owner_mode(owner_uid, 0o600 | special_bit, 0o600, "installation record")
+                    .expect_err("setuid, setgid, and sticky bits must fail closed");
+            assert!(matches!(error, InstallationError::InvalidRecord(_)));
+        }
     }
 
     #[test]
