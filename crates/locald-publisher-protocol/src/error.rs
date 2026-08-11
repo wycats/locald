@@ -67,6 +67,8 @@ pub enum StableErrorCode {
     EndpointUnhealthy,
     /// An observational readiness wait reached its deadline.
     WaitTimedOut,
+    /// The daemon is applying its serialized wake barrier.
+    WakeBarrierPending,
     /// The operation was canceled.
     OperationCanceled,
     /// This host cannot implement the version-1 authority contract.
@@ -107,6 +109,7 @@ impl StableErrorCode {
             | Self::ListenerFrontDoorConflict
             | Self::NetworkNamespaceMismatch
             | Self::NetworkNamespaceUnverifiable
+            | Self::WakeBarrierPending
             | Self::Internal => RetryClass::AfterExternalChange,
             Self::InvalidRequest
             | Self::ProtocolMismatch
@@ -255,6 +258,10 @@ mod tests {
             RetryClass::AfterExternalChange
         );
         assert_eq!(
+            StableErrorCode::WakeBarrierPending.retry_class(),
+            RetryClass::AfterExternalChange
+        );
+        assert_eq!(
             StableErrorCode::ProtocolMismatch.retry_class(),
             RetryClass::Never
         );
@@ -268,6 +275,21 @@ mod tests {
             "retry":"never"
         }"#;
         assert!(serde_json::from_str::<ProtocolError>(wire).is_err());
+    }
+
+    #[test]
+    fn wake_barrier_pending_round_trips_with_canonical_retry() {
+        let error = ProtocolError::new(
+            StableErrorCode::WakeBarrierPending,
+            "wake barrier pending",
+            None,
+        );
+        let wire = serde_json::to_string(&error).expect("serialize wake barrier error");
+        assert!(wire.contains(r#""code":"wake_barrier_pending""#));
+        let decoded: ProtocolError =
+            serde_json::from_str(&wire).expect("deserialize wake barrier error");
+        assert_eq!(decoded.code(), StableErrorCode::WakeBarrierPending);
+        assert_eq!(decoded.retry(), RetryClass::AfterExternalChange);
     }
 
     #[test]

@@ -237,14 +237,19 @@ impl HostSetWriter for DefaultHostSetWriter {
 
             info!("Auto-syncing hosts using {}", shim_path.display());
 
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                locald_utils::shim::tokio_command(&shim_path)
+            let output = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut command = locald_utils::shim::tokio_command(&shim_path);
+                command
                     .arg("admin")
                     .arg("sync-hosts")
                     .args(hosts.iter())
-                    .output(),
-            )
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let child = locald_utils::process_spawn::ProcessSpawnBarrier::global()
+                    .spawn_tokio_command(&mut command)?;
+                child.wait_with_output().await
+            })
             .await??;
 
             if !output.status.success() {

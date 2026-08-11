@@ -20,6 +20,11 @@ pub enum WakeError {
 
 /// Receiver registered by the client-owned lease supervisor.
 pub trait WakeSink: Send + Sync + fmt::Debug {
+    /// Observe entry to sleep before the platform acknowledges suspend.
+    ///
+    /// Server authority sinks override this to fence publication transitions
+    /// synchronously. Client-only sinks may wait for the matching resume edge.
+    fn suspending(&self) {}
     /// Notify the supervisor that the system resumed.
     fn resumed(&self);
     /// Fail the supervisor closed when wake observation becomes unreliable.
@@ -61,7 +66,7 @@ impl WakeMonitor for InactiveWakeMonitor {
 /// provenance under that external precondition.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct NoHostSuspendWakeMonitor;
+pub struct NoHostSuspendWakeMonitor;
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -224,6 +229,11 @@ fn notify_resumed(sink: &Arc<dyn WakeSink>) -> bool {
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn notify_suspending(sink: &Arc<dyn WakeSink>) -> bool {
+    catch_unwind(AssertUnwindSafe(|| sink.suspending())).is_ok()
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn notify_failed(sink: &Arc<dyn WakeSink>, error: WakeError) {
     drop(catch_unwind(AssertUnwindSafe(|| sink.failed(error))));
 }
@@ -235,7 +245,9 @@ mod platform {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, mpsc};
 
-    use super::{WakeError, WakeObserver, WakeSink, notify_failed, notify_resumed};
+    use super::{
+        WakeError, WakeObserver, WakeSink, notify_failed, notify_resumed, notify_suspending,
+    };
 
     type IoObject = u32;
     type IoConnect = IoObject;
@@ -310,7 +322,7 @@ mod platform {
         // notifier is deregistered and its run-loop source is removed.
         let state = unsafe { &*reference.cast::<CallbackState>() };
         match message_type {
-            K_IO_MESSAGE_CAN_SYSTEM_SLEEP | K_IO_MESSAGE_SYSTEM_WILL_SLEEP => {
+            K_IO_MESSAGE_CAN_SYSTEM_SLEEP => {
                 let root_port = state.root_port.load(Ordering::Acquire);
                 if root_port == IO_OBJECT_NULL {
                     state.fail_once("macOS delivered sleep before wake registration completed");
@@ -318,6 +330,25 @@ mod platform {
                 }
                 // SAFETY: this callback received the notification identifier
                 // from I/O Kit for this exact registered root-power port.
+                let status =
+                    unsafe { IOAllowPowerChange(root_port, message_argument.addr().cast_signed()) };
+                if status != K_IO_RETURN_SUCCESS {
+                    state.fail_once("macOS could not acknowledge a power transition");
+                }
+            }
+            K_IO_MESSAGE_SYSTEM_WILL_SLEEP => {
+                let root_port = state.root_port.load(Ordering::Acquire);
+                if root_port == IO_OBJECT_NULL {
+                    state.fail_once("macOS delivered sleep before wake registration completed");
+                    return;
+                }
+                if !notify_suspending(&state.sink) {
+                    state.fail_once("publisher sleep fencing failed");
+                }
+                // SAFETY: this callback received the notification identifier
+                // from I/O Kit for this exact registered root-power port. The
+                // synchronous sink callback above fenced publication work
+                // before this acknowledgement.
                 let status =
                     unsafe { IOAllowPowerChange(root_port, message_argument.addr().cast_signed()) };
                 if status != K_IO_RETURN_SUCCESS {
@@ -761,7 +792,7 @@ mod platform {
                             break;
                         };
                         if entering_sleep {
-                            if sleeping || inhibitor.take().is_none() {
+                            if sleeping || inhibitor.is_none() {
                                 notify_failed(
                                     &sink,
                                     WakeError::Failed(
@@ -770,9 +801,17 @@ mod platform {
                                 );
                                 break;
                             }
+                            if !notify_suspending(&sink) {
+                                notify_failed(
+                                    &sink,
+                                    WakeError::Failed("publisher sleep fencing failed".to_owned()),
+                                );
+                                break;
+                            }
                             // Dropping the delay-inhibitor descriptor is the
-                            // acknowledgement that this observer has recorded
-                            // the transition and is ready for suspend.
+                            // acknowledgement that publication work is fenced
+                            // and this observer is ready for suspend.
+                            drop(inhibitor.take());
                             sleeping = true;
                         } else {
                             if !sleeping || inhibitor.is_some() {
@@ -942,6 +981,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Observed {
+        Suspending,
         Resumed,
         Failed(WakeError),
     }
@@ -952,6 +992,13 @@ mod tests {
     }
 
     impl WakeSink for RecordingSink {
+        fn suspending(&self) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(Observed::Suspending);
+        }
+
         fn resumed(&self) {
             self.events.lock().expect("events").push(Observed::Resumed);
         }
@@ -965,6 +1012,7 @@ mod tests {
     }
 
     enum ScriptedEvent {
+        Suspend,
         Resume,
         Fail,
     }
@@ -1005,6 +1053,11 @@ mod tests {
             }
             while !stop.load(Ordering::Acquire) {
                 match self.events.recv_timeout(Duration::from_millis(10)) {
+                    Ok(ScriptedEvent::Suspend) => {
+                        if !notify_suspending(&sink) {
+                            break;
+                        }
+                    }
                     Ok(ScriptedEvent::Resume) => {
                         if !notify_resumed(&sink) {
                             break;
@@ -1065,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_observer_delivers_resume_and_failure_in_order() {
+    fn injected_observer_delivers_suspend_resume_and_failure_in_order() {
         let (events_tx, events_rx) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let sink = Arc::new(RecordingSink::default());
@@ -1079,12 +1132,14 @@ mod tests {
         )
         .expect("registration");
 
+        events_tx.send(ScriptedEvent::Suspend).expect("suspend");
         events_tx.send(ScriptedEvent::Resume).expect("resume");
         events_tx.send(ScriptedEvent::Fail).expect("failure");
-        wait_until(|| sink.events.lock().expect("events").len() == 2);
+        wait_until(|| sink.events.lock().expect("events").len() == 3);
         assert_eq!(
             *sink.events.lock().expect("events"),
             vec![
+                Observed::Suspending,
                 Observed::Resumed,
                 Observed::Failed(WakeError::Failed("scripted observer failure".to_owned())),
             ]

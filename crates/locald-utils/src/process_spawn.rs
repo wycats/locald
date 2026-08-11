@@ -15,6 +15,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 use thiserror::Error;
 
 static GLOBAL_PROCESS_SPAWN_BARRIER: OnceLock<ProcessSpawnBarrier> = OnceLock::new();
@@ -37,6 +38,7 @@ impl ProcessSpawnBarrier {
             inner: Arc::new(BarrierInner {
                 state: Mutex::new(BarrierState::default()),
                 descriptor_acquisitions_finished: Condvar::new(),
+                spawns_finished: Condvar::new(),
             }),
         }
     }
@@ -68,6 +70,38 @@ impl ProcessSpawnBarrier {
         }
     }
 
+    /// Spawn one standard-library command while holding the process-spawn permit.
+    ///
+    /// The permit is released as soon as [`std::process::Command::spawn`]
+    /// returns. Waiting for the child is deliberately left to the caller so a
+    /// long-running child does not block descriptor acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`std::process::Command::spawn`].
+    pub fn spawn_std_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        self.with_spawn_permit(|| command.spawn())
+    }
+
+    /// Spawn one Tokio command while holding the process-spawn permit.
+    ///
+    /// The permit is released as soon as [`tokio::process::Command::spawn`]
+    /// returns. Awaiting the child is deliberately left to the caller so a
+    /// long-running child does not block descriptor acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`tokio::process::Command::spawn`].
+    pub fn spawn_tokio_command(
+        &self,
+        command: &mut tokio::process::Command,
+    ) -> std::io::Result<tokio::process::Child> {
+        self.with_spawn_permit(|| command.spawn())
+    }
+
     /// Enter descriptor acquisition exclusion or fail if a spawn is active.
     ///
     /// Acquisition never waits for an in-progress spawn. The caller must fail
@@ -83,6 +117,69 @@ impl ProcessSpawnBarrier {
     ) -> Result<DescriptorAcquisitionGuard, DescriptorAcquisitionBlocked> {
         let mut state = self.lock_state();
         if state.active_spawns != 0 {
+            return Err(DescriptorAcquisitionBlocked {
+                active_spawns: state.active_spawns,
+            });
+        }
+        state.active_descriptor_acquisitions =
+            state.active_descriptor_acquisitions.saturating_add(1);
+        drop(state);
+
+        Ok(DescriptorAcquisitionGuard {
+            barrier: self.clone(),
+            active: true,
+        })
+    }
+
+    /// Wait until descriptor acquisition can begin, bounded by an absolute deadline.
+    ///
+    /// This is intended for operations that have not acquired a descriptor and
+    /// can safely wait for a concurrent process spawn to finish. Descriptor
+    /// receipt after request delivery should continue to use the immediate,
+    /// fail-closed [`Self::try_enter_descriptor_acquisition`] path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescriptorAcquisitionBlocked`] when the deadline is reached
+    /// before descriptor acquisition can begin. The reported active-spawn
+    /// count can be zero when the deadline wins a last-spawn completion race.
+    pub fn enter_descriptor_acquisition_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<DescriptorAcquisitionGuard, DescriptorAcquisitionBlocked> {
+        self.enter_descriptor_acquisition_before_with_wait_hook(deadline, || {}, Instant::now)
+    }
+
+    fn enter_descriptor_acquisition_before_with_wait_hook(
+        &self,
+        deadline: Instant,
+        before_wait: impl FnOnce(),
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<DescriptorAcquisitionGuard, DescriptorAcquisitionBlocked> {
+        let mut state = self.lock_state();
+        let mut before_wait = Some(before_wait);
+        while state.active_spawns != 0 {
+            let Some(remaining) = deadline.checked_duration_since(now()) else {
+                return Err(DescriptorAcquisitionBlocked {
+                    active_spawns: state.active_spawns,
+                });
+            };
+            if let Some(before_wait) = before_wait.take() {
+                before_wait();
+            }
+            let (next_state, wait_result) = self
+                .inner
+                .spawns_finished
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if wait_result.timed_out() && state.active_spawns != 0 {
+                return Err(DescriptorAcquisitionBlocked {
+                    active_spawns: state.active_spawns,
+                });
+            }
+        }
+        if now() >= deadline {
             return Err(DescriptorAcquisitionBlocked {
                 active_spawns: state.active_spawns,
             });
@@ -120,6 +217,13 @@ impl ProcessSpawnBarrier {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn with_spawn_permit<T>(&self, spawn: impl FnOnce() -> T) -> T {
+        let permit = self.enter_spawn();
+        let result = spawn();
+        drop(permit);
+        result
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     /// Construct an isolated barrier for deterministic cross-crate tests.
@@ -155,6 +259,7 @@ impl fmt::Debug for ProcessSpawnBarrier {
 struct BarrierInner {
     state: Mutex<BarrierState>,
     descriptor_acquisitions_finished: Condvar,
+    spawns_finished: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -185,8 +290,13 @@ impl Drop for ProcessSpawnPermit {
         let mut state = self.barrier.lock_state();
         debug_assert!(state.active_spawns > 0, "spawn permit count underflow");
         state.active_spawns = state.active_spawns.saturating_sub(1);
+        let spawns_are_idle = state.active_spawns == 0;
         drop(state);
         self.active = false;
+
+        if spawns_are_idle {
+            self.barrier.inner.spawns_finished.notify_all();
+        }
     }
 }
 
@@ -226,15 +336,18 @@ impl Drop for DescriptorAcquisitionGuard {
 /// Compatibility name for an `SCM_RIGHTS` descriptor-receipt guard.
 pub type DescriptorReceiptGuard = DescriptorAcquisitionGuard;
 
-/// Descriptor acquisition could not begin because process creation was active.
+/// Descriptor acquisition could not begin under the selected barrier policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("descriptor acquisition blocked by {active_spawns} active process spawn(s)")]
+#[error("descriptor acquisition blocked with {active_spawns} active process spawn(s) observed")]
 pub struct DescriptorAcquisitionBlocked {
     active_spawns: usize,
 }
 
 impl DescriptorAcquisitionBlocked {
     /// Number of active process-spawn sections observed by the failed acquisition.
+    ///
+    /// This can be zero for a deadline-bounded acquisition that expires after
+    /// the last spawn finishes but before descriptor authority is granted.
     #[must_use]
     pub const fn active_spawns(self) -> usize {
         self.active_spawns
@@ -247,6 +360,7 @@ pub type DescriptorReceiptBlocked = DescriptorAcquisitionBlocked;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -261,6 +375,119 @@ mod tests {
             .expect_err("acquisition must fail while a spawn is active");
 
         assert_eq!(error.active_spawns(), 1);
+    }
+
+    #[test]
+    fn bounded_descriptor_acquisition_waits_until_spawn_finishes() {
+        let barrier = ProcessSpawnBarrier::isolated_for_test();
+        let spawn = barrier.enter_spawn();
+        let worker_barrier = barrier.clone();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let acquisition = worker_barrier
+                .enter_descriptor_acquisition_before_with_wait_hook(
+                    Instant::now() + Duration::from_secs(1),
+                    || waiting_tx.send(()).expect("announce barrier wait"),
+                    Instant::now,
+                )
+                .expect("acquisition waits for spawn");
+            acquired_tx.send(()).expect("announce acquisition");
+            drop(acquisition);
+        });
+
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reaches barrier wait");
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "descriptor acquisition must not enter during an active spawn"
+        );
+        drop(spawn);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("acquisition proceeds after spawn");
+        worker.join().expect("worker exits");
+    }
+
+    #[test]
+    fn bounded_descriptor_acquisition_fails_when_deadline_expires() {
+        let barrier = ProcessSpawnBarrier::isolated_for_test();
+        let spawn = barrier.enter_spawn();
+
+        let error = barrier
+            .enter_descriptor_acquisition_before(Instant::now())
+            .expect_err("expired deadline must not enter descriptor acquisition");
+
+        assert_eq!(error.active_spawns(), 1);
+        drop(spawn);
+        barrier
+            .try_enter_descriptor_acquisition()
+            .expect("timed-out waiter must not retain descriptor authority");
+    }
+
+    #[test]
+    fn bounded_descriptor_acquisition_rejects_an_expired_deadline_without_a_spawn() {
+        let barrier = ProcessSpawnBarrier::isolated_for_test();
+
+        let error = barrier
+            .enter_descriptor_acquisition_before(Instant::now())
+            .expect_err("expired deadline must not grant descriptor authority");
+
+        assert_eq!(error.active_spawns(), 0);
+        barrier
+            .try_enter_descriptor_acquisition()
+            .expect("expired deadline must not retain descriptor authority");
+    }
+
+    #[test]
+    fn bounded_descriptor_acquisition_rechecks_deadline_after_last_spawn_finishes() {
+        let barrier = ProcessSpawnBarrier::isolated_for_test();
+        let mut spawn = barrier.enter_spawn();
+        let worker_barrier = barrier.clone();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let before_deadline = deadline
+            .checked_sub(Duration::from_secs(1))
+            .expect("construct pre-deadline instant");
+        let spawn_finished = Arc::new(AtomicBool::new(false));
+        let worker_spawn_finished = Arc::clone(&spawn_finished);
+
+        let worker = thread::spawn(move || {
+            worker_barrier.enter_descriptor_acquisition_before_with_wait_hook(
+                deadline,
+                || {
+                    waiting_tx.send(()).expect("announce barrier wait");
+                },
+                || {
+                    if worker_spawn_finished.load(Ordering::Acquire) {
+                        deadline
+                    } else {
+                        before_deadline
+                    }
+                },
+            )
+        });
+
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reaches barrier wait");
+        let mut state = barrier.lock_state();
+        state.active_spawns = 0;
+        spawn.active = false;
+        spawn_finished.store(true, Ordering::Release);
+        barrier.inner.spawns_finished.notify_all();
+        drop(state);
+
+        let error = worker
+            .join()
+            .expect("worker exits")
+            .expect_err("deadline expiry must win the last-spawn completion race");
+        assert_eq!(error.active_spawns(), 0);
+        barrier
+            .try_enter_descriptor_acquisition()
+            .expect("deadline race must not retain descriptor authority");
     }
 
     #[test]
@@ -359,6 +586,27 @@ mod tests {
         barrier
             .try_enter_descriptor_receipt()
             .expect("receipt succeeds after both nested permits drop");
+    }
+
+    #[test]
+    fn command_spawn_helper_releases_the_permit_before_returning() {
+        let barrier = ProcessSpawnBarrier::isolated_for_test();
+
+        let result = barrier.with_spawn_permit(|| {
+            assert_eq!(
+                barrier
+                    .try_enter_descriptor_acquisition()
+                    .expect_err("spawn operation must hold the shared permit")
+                    .active_spawns(),
+                1
+            );
+            "spawned"
+        });
+
+        assert_eq!(result, "spawned");
+        barrier
+            .try_enter_descriptor_acquisition()
+            .expect("spawn helper must release its permit before returning");
     }
 
     #[test]

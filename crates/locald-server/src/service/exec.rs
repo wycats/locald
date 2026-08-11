@@ -491,14 +491,19 @@ impl ServiceController for ExecController {
         if let Some(cgroup_path) = self.cgroup_path.as_deref() {
             match locald_utils::shim::find_privileged() {
                 Ok(Some(shim_path)) => {
-                    let status = locald_utils::shim::tokio_command(&shim_path)
+                    let mut command = locald_utils::shim::tokio_command(&shim_path);
+                    command
                         .arg("admin")
                         .arg("cgroup")
                         .arg("kill")
                         .arg("--path")
-                        .arg(cgroup_path)
-                        .status()
-                        .await;
+                        .arg(cgroup_path);
+                    let status = match locald_utils::process_spawn::ProcessSpawnBarrier::global()
+                        .spawn_tokio_command(&mut command)
+                    {
+                        Ok(mut child) => child.wait().await,
+                        Err(error) => Err(error),
+                    };
 
                     match status {
                         Ok(status) if status.success() => {}

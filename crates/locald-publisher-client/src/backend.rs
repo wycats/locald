@@ -281,7 +281,7 @@ fn connect_before(
     command_socket: &AbsolutePath,
     deadline: Instant,
 ) -> Result<UnixStream, BackendError> {
-    let descriptor = create_nonblocking_unix_socket().map_err(|error| {
+    let descriptor = create_nonblocking_unix_socket_before(deadline).map_err(|error| {
         BackendError::new(
             BackendErrorKind::Io,
             format!("cannot create locald command socket: {error}"),
@@ -565,7 +565,7 @@ fn connect_publisher_before(
     publisher_socket: &AbsolutePath,
     deadline: Instant,
 ) -> Result<UnixStream, BackendError> {
-    let descriptor = create_nonblocking_unix_socket().map_err(|error| {
+    let descriptor = create_nonblocking_unix_socket_before(deadline).map_err(|error| {
         BackendError::new(
             BackendErrorKind::Io,
             format!("cannot create locald publisher socket: {error}"),
@@ -608,7 +608,9 @@ fn connect_publisher_before(
 }
 
 #[cfg(target_os = "linux")]
-fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
+fn create_nonblocking_unix_socket_before(
+    _deadline: Instant,
+) -> Result<std::os::fd::OwnedFd, Errno> {
     socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -618,11 +620,35 @@ fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
 }
 
 #[cfg(target_os = "macos")]
-fn create_nonblocking_unix_socket() -> Result<std::os::fd::OwnedFd, Errno> {
-    create_nonblocking_unix_socket_with_barrier(crate::ProcessSpawnBarrier::global(), || {}, || {})
+fn create_nonblocking_unix_socket_before(deadline: Instant) -> Result<std::os::fd::OwnedFd, Errno> {
+    create_nonblocking_unix_socket_before_with_barrier(
+        crate::ProcessSpawnBarrier::global(),
+        deadline,
+        || {},
+        || {},
+    )
 }
 
 #[cfg(target_os = "macos")]
+fn create_nonblocking_unix_socket_before_with_barrier(
+    barrier: &crate::ProcessSpawnBarrier,
+    deadline: Instant,
+    after_socket: impl FnOnce(),
+    after_flags: impl FnOnce(),
+) -> Result<std::os::fd::OwnedFd, Errno> {
+    // Waiting here is safe because no descriptor exists yet. Reuse the
+    // transport's absolute request deadline so contention is bounded without
+    // burning an exact NotSent replay in a busy loop.
+    let _acquisition = barrier
+        .enter_descriptor_acquisition_before(deadline)
+        .map_err(|_| Errno::EBUSY)?;
+    if Instant::now() >= deadline {
+        return Err(Errno::ETIMEDOUT);
+    }
+    create_nonblocking_unix_socket_after_acquisition(after_socket, after_flags)
+}
+
+#[cfg(all(target_os = "macos", test))]
 fn create_nonblocking_unix_socket_with_barrier(
     barrier: &crate::ProcessSpawnBarrier,
     after_socket: impl FnOnce(),
@@ -634,6 +660,14 @@ fn create_nonblocking_unix_socket_with_barrier(
     let _acquisition = barrier
         .try_enter_descriptor_acquisition()
         .map_err(|_| Errno::EBUSY)?;
+    create_nonblocking_unix_socket_after_acquisition(after_socket, after_flags)
+}
+
+#[cfg(target_os = "macos")]
+fn create_nonblocking_unix_socket_after_acquisition(
+    after_socket: impl FnOnce(),
+    after_flags: impl FnOnce(),
+) -> Result<std::os::fd::OwnedFd, Errno> {
     let descriptor = socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -1143,7 +1177,9 @@ mod tests {
 
     #[test]
     fn created_unix_transport_socket_is_nonblocking_and_close_on_exec() {
-        let descriptor = create_nonblocking_unix_socket().expect("create Unix transport socket");
+        let descriptor =
+            create_nonblocking_unix_socket_before(Instant::now() + PUBLISHER_REQUEST_TIMEOUT)
+                .expect("create Unix transport socket");
         let descriptor_flags = FdFlag::from_bits_truncate(
             fcntl(&descriptor, FcntlArg::F_GETFD).expect("read descriptor flags"),
         );
@@ -1170,6 +1206,70 @@ mod tests {
             || {},
         )
         .expect_err("active spawn must close the descriptor-acquisition gate");
+
+        assert_eq!(error, Errno::EBUSY);
+        assert!(!socket_created);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_socket_creation_waits_for_spawn_before_acquiring_a_descriptor() {
+        let barrier = crate::ProcessSpawnBarrier::isolated_for_test();
+        let spawn = barrier.enter_spawn();
+        let worker_barrier = barrier.clone();
+        let (socket_created_tx, socket_created_rx) = std::sync::mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            create_nonblocking_unix_socket_before_with_barrier(
+                &worker_barrier,
+                Instant::now() + Duration::from_secs(1),
+                || {
+                    socket_created_tx
+                        .send(())
+                        .expect("announce socket creation")
+                },
+                || {},
+            )
+            .expect("socket creation waits for active spawn")
+        });
+
+        assert!(
+            socket_created_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "contention wait must not acquire a descriptor during the spawn"
+        );
+        drop(spawn);
+        socket_created_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("socket is created after spawn finishes");
+        let descriptor = worker.join().expect("socket worker exits");
+        let descriptor_flags = FdFlag::from_bits_truncate(
+            fcntl(&descriptor, FcntlArg::F_GETFD).expect("read descriptor flags"),
+        );
+        let status_flags = OFlag::from_bits_truncate(
+            fcntl(&descriptor, FcntlArg::F_GETFL).expect("read socket status flags"),
+        );
+        assert!(descriptor_flags.contains(FdFlag::FD_CLOEXEC));
+        assert!(status_flags.contains(OFlag::O_NONBLOCK));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_socket_contention_deadline_expires_before_descriptor_creation() {
+        let barrier = crate::ProcessSpawnBarrier::isolated_for_test();
+        let _spawn = barrier.enter_spawn();
+        let mut socket_created = false;
+
+        let error = create_nonblocking_unix_socket_before_with_barrier(
+            &barrier,
+            Instant::now(),
+            || {
+                socket_created = true;
+            },
+            || {},
+        )
+        .expect_err("expired contention wait must fail before socket creation");
 
         assert_eq!(error, Errno::EBUSY);
         assert!(!socket_created);

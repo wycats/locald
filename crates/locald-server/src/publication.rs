@@ -2920,8 +2920,9 @@ pub(crate) struct PublisherAuthority {
 #[derive(Debug)]
 enum PublisherWakeObservation {
     Inactive,
-    Registering { resumed: bool },
+    Registering { suspending: bool, resumed: bool },
     Active(Box<dyn WakeRegistration>),
+    Sleeping(Box<dyn WakeRegistration>),
     BarrierPending(Box<dyn WakeRegistration>),
     Failed(WakeError),
 }
@@ -2984,6 +2985,60 @@ impl PublisherAuthorityWakeSink {
 }
 
 impl WakeSink for PublisherAuthorityWakeSink {
+    fn suspending(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let changed = {
+            // Publisher transitions take this gate for their complete registry
+            // mutation. Waiting for the write side here fences existing work
+            // and prevents successors before the platform acknowledges sleep.
+            let _barrier = inner
+                .wake_barrier_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut observation = inner
+                .wake_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::mem::replace(&mut *observation, PublisherWakeObservation::Inactive);
+            match previous {
+                PublisherWakeObservation::Active(registration) => {
+                    *observation = PublisherWakeObservation::Sleeping(registration);
+                    true
+                }
+                PublisherWakeObservation::Registering { resumed, .. } => {
+                    *observation = PublisherWakeObservation::Registering {
+                        suspending: true,
+                        resumed,
+                    };
+                    true
+                }
+                PublisherWakeObservation::Sleeping(registration) => {
+                    *observation = PublisherWakeObservation::Sleeping(registration);
+                    false
+                }
+                PublisherWakeObservation::BarrierPending(registration) => {
+                    *observation = PublisherWakeObservation::BarrierPending(registration);
+                    false
+                }
+                PublisherWakeObservation::Inactive => {
+                    *observation = PublisherWakeObservation::Inactive;
+                    false
+                }
+                PublisherWakeObservation::Failed(error) => {
+                    *observation = PublisherWakeObservation::Failed(error);
+                    false
+                }
+            }
+        };
+        if changed {
+            inner.changes.send_modify(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
+        }
+    }
+
     fn resumed(&self) {
         let Some(inner) = self.inner.upgrade() else {
             return;
@@ -3003,12 +3058,19 @@ impl WakeSink for PublisherAuthorityWakeSink {
                     *observation = PublisherWakeObservation::BarrierPending(registration);
                     true
                 }
+                PublisherWakeObservation::Sleeping(registration) => {
+                    *observation = PublisherWakeObservation::BarrierPending(registration);
+                    true
+                }
                 PublisherWakeObservation::BarrierPending(registration) => {
                     *observation = PublisherWakeObservation::BarrierPending(registration);
                     false
                 }
-                PublisherWakeObservation::Registering { .. } => {
-                    *observation = PublisherWakeObservation::Registering { resumed: true };
+                PublisherWakeObservation::Registering { suspending, .. } => {
+                    *observation = PublisherWakeObservation::Registering {
+                        suspending,
+                        resumed: true,
+                    };
                     false
                 }
                 PublisherWakeObservation::Inactive => {
@@ -3194,6 +3256,7 @@ impl PublisherAuthority {
             match &*observation {
                 PublisherWakeObservation::Active(_) => return Ok(()),
                 PublisherWakeObservation::Registering { .. }
+                | PublisherWakeObservation::Sleeping(_)
                 | PublisherWakeObservation::BarrierPending(_) => {
                     return Err(Self::wake_barrier_pending());
                 }
@@ -3202,7 +3265,10 @@ impl PublisherAuthority {
                 }
                 PublisherWakeObservation::Inactive => {}
             }
-            *observation = PublisherWakeObservation::Registering { resumed: false };
+            *observation = PublisherWakeObservation::Registering {
+                suspending: false,
+                resumed: false,
+            };
         }
         let sink = Arc::new(PublisherAuthorityWakeSink {
             inner: Arc::downgrade(&self.inner),
@@ -3223,6 +3289,7 @@ impl PublisherAuthority {
                     PublisherWakeObservation::Inactive
                     | PublisherWakeObservation::Registering { .. }
                     | PublisherWakeObservation::Active(_)
+                    | PublisherWakeObservation::Sleeping(_)
                     | PublisherWakeObservation::BarrierPending(_) => Self::wake_unavailable(&error),
                 });
             }
@@ -3236,11 +3303,16 @@ impl PublisherAuthority {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*observation {
-                PublisherWakeObservation::Registering { resumed } => {
+                PublisherWakeObservation::Registering {
+                    suspending,
+                    resumed,
+                } => {
                     signal_resume = *resumed;
                     let registration = registration.take().expect("wake registration present");
                     *observation = if signal_resume {
                         PublisherWakeObservation::BarrierPending(registration)
+                    } else if *suspending {
+                        PublisherWakeObservation::Sleeping(registration)
                     } else {
                         PublisherWakeObservation::Active(registration)
                     };
@@ -3249,6 +3321,7 @@ impl PublisherAuthority {
                 PublisherWakeObservation::Failed(error) => Err(Self::wake_unavailable(error)),
                 PublisherWakeObservation::Inactive
                 | PublisherWakeObservation::Active(_)
+                | PublisherWakeObservation::Sleeping(_)
                 | PublisherWakeObservation::BarrierPending(_) => Err(Self::internal(
                     "publisher wake registration changed state unexpectedly",
                 )),
@@ -4286,6 +4359,7 @@ impl PublisherAuthority {
         match &*observation {
             PublisherWakeObservation::Failed(error) => Err(Self::wake_unavailable(error)),
             PublisherWakeObservation::Registering { .. }
+            | PublisherWakeObservation::Sleeping(_)
             | PublisherWakeObservation::BarrierPending(_) => Err(Self::wake_barrier_pending()),
             PublisherWakeObservation::Inactive | PublisherWakeObservation::Active(_) => Ok(()),
         }
@@ -4324,6 +4398,7 @@ impl PublisherAuthority {
         if matches!(
             &*observation,
             PublisherWakeObservation::Registering { .. }
+                | PublisherWakeObservation::Sleeping(_)
                 | PublisherWakeObservation::BarrierPending(_)
         ) {
             return None;
@@ -4731,7 +4806,7 @@ impl PublisherAuthority {
 
     fn wake_barrier_pending() -> protocol::ProtocolError {
         protocol::ProtocolError::new(
-            protocol::StableErrorCode::OperationCanceled,
+            protocol::StableErrorCode::WakeBarrierPending,
             "the publisher wake barrier is still being applied",
             None,
         )
@@ -4830,6 +4905,15 @@ mod tests {
     }
 
     impl FakeWakeMonitor {
+        fn suspend(&self) {
+            self.sink
+                .lock()
+                .expect("fake wake sink lock")
+                .clone()
+                .expect("registered wake sink")
+                .suspending();
+        }
+
         fn resume(&self) {
             self.sink
                 .lock()
@@ -5310,6 +5394,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sleep_entry_waits_out_active_transition_and_blocks_successors_before_ack() {
+        let declaration = declaration(instance(30), 1, "thirty.localhost");
+        let (registry, _clock, _key) = registry(Duration::ZERO, declaration);
+        let authority = authority(registry);
+        let monitor = Arc::new(FakeWakeMonitor::default());
+        authority
+            .activate_wake_monitor(monitor.as_ref())
+            .expect("activate fake wake monitor");
+
+        let active_transition = authority
+            .inner
+            .wake_barrier_gate
+            .read()
+            .expect("active publisher transition");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (returned_tx, returned_rx) = std::sync::mpsc::sync_channel(1);
+        let suspending_monitor = Arc::clone(&monitor);
+        let suspending = std::thread::spawn(move || {
+            entered_tx.send(()).expect("announce sleep callback");
+            suspending_monitor.suspend();
+            returned_tx.send(()).expect("announce fenced sleep entry");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sleep callback starts");
+        assert!(
+            returned_rx.try_recv().is_err(),
+            "sleep acknowledgement must wait for the active publisher transition"
+        );
+
+        drop(active_transition);
+        returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sleep entry returns after authority is fenced");
+        suspending.join().expect("join sleep callback");
+        assert_eq!(
+            authority
+                .ensure_wake_trustworthy()
+                .expect_err("sleep entry blocks successor publication operations")
+                .code(),
+            protocol::StableErrorCode::WakeBarrierPending
+        );
+
+        monitor.resume();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if authority.ensure_wake_trustworthy().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resume applies the serialized wake barrier");
+    }
+
+    #[tokio::test]
+    async fn sleeping_and_pending_barrier_reject_renewal_before_mutation() {
+        let declaration = declaration(instance(37), 1, "thirty-seven.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_attempt, grant) = publish(&mut registry, &key, &owner, 37, &drops);
+        let lease_handle = grant.lease.wire();
+        let original_expiry = grant.expiry_fence.clone();
+        let authority = authority(registry);
+        let monitor = FakeWakeMonitor::default();
+        authority
+            .activate_wake_monitor(&monitor)
+            .expect("activate fake wake monitor");
+
+        monitor.suspend();
+        assert_eq!(
+            authority
+                .renew(&lease_handle, &owner)
+                .await
+                .expect_err("sleeping authority rejects renewal")
+                .code(),
+            protocol::StableErrorCode::WakeBarrierPending
+        );
+        {
+            let registry = authority.inner.registry.lock().await;
+            let SlotState::Live(lease) = &registry.slots.get(&key).expect("live slot").state else {
+                panic!("expected live lease");
+            };
+            assert_eq!(lease.renewal_revision, original_expiry.renewal_revision);
+            assert_eq!(lease.deadline, original_expiry.deadline);
+        }
+
+        // Hold the intermediate state deterministically so the async barrier
+        // driver cannot win the race before the public renewal entry point.
+        {
+            let mut observation = authority
+                .inner
+                .wake_observation
+                .lock()
+                .expect("wake observation");
+            let previous = std::mem::replace(&mut *observation, PublisherWakeObservation::Inactive);
+            let PublisherWakeObservation::Sleeping(registration) = previous else {
+                panic!("expected sleeping wake observation");
+            };
+            *observation = PublisherWakeObservation::BarrierPending(registration);
+        }
+        assert_eq!(
+            authority
+                .renew(&lease_handle, &owner)
+                .await
+                .expect_err("pending wake barrier rejects renewal")
+                .code(),
+            protocol::StableErrorCode::WakeBarrierPending
+        );
+        {
+            let registry = authority.inner.registry.lock().await;
+            let SlotState::Live(lease) = &registry.slots.get(&key).expect("live slot").state else {
+                panic!("expected live lease");
+            };
+            assert_eq!(lease.renewal_revision, original_expiry.renewal_revision);
+            assert_eq!(lease.deadline, original_expiry.deadline);
+        }
+
+        authority
+            .apply_wake_barrier(true)
+            .await
+            .expect("apply pending wake barrier");
+        authority
+            .renew(&lease_handle, &owner)
+            .await
+            .expect("renewal succeeds after the barrier completes");
+        let registry = authority.inner.registry.lock().await;
+        let SlotState::Live(lease) = &registry.slots.get(&key).expect("live slot").state else {
+            panic!("expected live lease");
+        };
+        assert_eq!(lease.renewal_revision, original_expiry.renewal_revision + 1);
+    }
+
+    #[tokio::test]
     async fn resumed_wake_sweeps_expired_authority_and_releases_exact_wait() {
         let declaration = declaration(instance(31), 1, "thirty-one.localhost");
         let (mut registry, clock, key) = registry(Duration::ZERO, declaration);
@@ -5341,7 +5561,7 @@ mod tests {
                 .ensure_wake_trustworthy()
                 .expect_err("wake callback closes the operation gate synchronously")
                 .code(),
-            protocol::StableErrorCode::OperationCanceled
+            protocol::StableErrorCode::WakeBarrierPending
         );
         for _ in 0..32 {
             if waiter.is_finished() {
