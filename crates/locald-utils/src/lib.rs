@@ -29,6 +29,8 @@ pub mod privileged;
 pub mod probe;
 /// Process management utilities.
 pub mod process;
+/// Process-spawn and descriptor-acquisition coordination.
+pub mod process_spawn;
 /// Project management utilities.
 pub mod project;
 /// Shim management utilities.

@@ -13,6 +13,8 @@ Options:
           Run in a sandbox environment
       --name <NAME>
           Project name (overrides prompt/default when using --from-distribution)
+      --sandbox-no-host-suspend
+          Assert that this sandbox's host cannot suspend while locald is running
       --target <TARGET>
           Target directory (default: `./<project_name>`)
       --no-scaffold
@@ -40,10 +42,11 @@ Arguments:
   [PATH]  Path to the service directory (defaults to current directory if locald.toml exists)
 
 Options:
-      --sandbox <SANDBOX>  Run in a sandbox environment
-  -v, --verbose            Show verbose output
-      --follow             Follow this project's logs after it becomes ready
-  -h, --help               Print help
+      --sandbox <SANDBOX>        Run in a sandbox environment
+  -v, --verbose                  Show verbose output
+      --follow                   Follow this project's logs after it becomes ready
+      --sandbox-no-host-suspend  Assert that this sandbox's host cannot suspend while locald is running
+  -h, --help                     Print help
 
 ```
 
@@ -74,8 +77,9 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-      --sandbox <SANDBOX>  Run in a sandbox environment
-  -h, --help               Print help
+      --sandbox <SANDBOX>        Run in a sandbox environment
+      --sandbox-no-host-suspend  Assert that this sandbox's host cannot suspend while locald is running
+  -h, --help                     Print help
 
 ```
 
@@ -88,8 +92,9 @@ Show CLI and daemon binary identity
 Usage: locald debug identity [OPTIONS]
 
 Options:
-      --json               Machine-readable JSON output
-      --sandbox <SANDBOX>  Run in a sandbox environment
-  -h, --help               Print help
+      --json                     Machine-readable JSON output
+      --sandbox <SANDBOX>        Run in a sandbox environment
+      --sandbox-no-host-suspend  Assert that this sandbox's host cannot suspend while locald is running
+  -h, --help                     Print help
 
 ```

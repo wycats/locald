@@ -107,6 +107,8 @@ pub mod port_allocator;
 #[doc(hidden)]
 pub mod proxy;
 mod publication;
+mod publisher_dispatch;
+mod publisher_transport;
 #[doc(hidden)]
 pub mod runtime;
 #[doc(hidden)]
@@ -435,6 +437,67 @@ fn parse_sandbox_port_override(name: &str, value: Option<&std::ffi::OsStr>) -> R
     Ok(Some(port))
 }
 
+const fn publisher_transport_activation_allowed(sandbox: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = sandbox;
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        sandbox
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = sandbox;
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublisherWakePolicy {
+    System,
+    #[cfg(target_os = "linux")]
+    ExplicitSandboxNoHostSuspendGuarantee,
+}
+
+const fn publisher_wake_policy(
+    sandbox: bool,
+    explicit_no_host_suspend_guarantee: bool,
+) -> PublisherWakePolicy {
+    #[cfg(target_os = "linux")]
+    {
+        if sandbox && explicit_no_host_suspend_guarantee {
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspendGuarantee
+        } else {
+            PublisherWakePolicy::System
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (sandbox, explicit_no_host_suspend_guarantee);
+        PublisherWakePolicy::System
+    }
+}
+
+fn validate_explicit_no_host_suspend_guarantee(
+    sandbox: bool,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value != std::ffi::OsStr::new("1") {
+        anyhow::bail!("LOCALD_SANDBOX_NO_HOST_SUSPEND must be exactly `1` when set");
+    }
+    if !sandbox {
+        anyhow::bail!(
+            "LOCALD_SANDBOX_NO_HOST_SUSPEND requires an effective explicit sandbox; use --sandbox together with --sandbox-no-host-suspend"
+        );
+    }
+    Ok(true)
+}
+
 #[cfg(target_os = "macos")]
 fn validate_macos_standard_preflight(ca_trusted: bool, helper_probe: Result<()>) -> Result<()> {
     if !ca_trusted {
@@ -576,6 +639,10 @@ async fn async_main(
     let http_port_override = std::env::var_os("LOCALD_HTTP_PORT");
     let https_port_override = std::env::var_os("LOCALD_HTTPS_PORT");
     let sandbox = config.server.is_sandbox();
+    let explicit_no_host_suspend_guarantee = validate_explicit_no_host_suspend_guarantee(
+        sandbox,
+        std::env::var_os("LOCALD_SANDBOX_NO_HOST_SUSPEND").as_deref(),
+    )?;
     validate_port_override_policy(
         sandbox,
         http_port_override.is_some(),
@@ -671,6 +738,10 @@ async fn async_main(
         .migrate_catalog_schema_if_needed()
         .await
         .context("Failed to migrate the project catalog schema")?;
+    manager
+        .hydrate_publisher_availability_state()
+        .await
+        .context("Failed to hydrate published endpoint availability policy")?;
     manager.spawn_metrics_collector();
 
     // Initialize ContainerManager
@@ -880,6 +951,89 @@ async fn async_main(
         });
     }
 
+    // The dedicated publisher socket becomes discoverable only after catalog
+    // recovery, durable origin validation, and all front-door listeners have
+    // completed. A bind failure leaves ordinary discovery explicitly inactive
+    // so installed publishers fail visibly rather than deriving a socket.
+    let publisher_socket_path = locald_core::storage::data_dir()
+        .join(locald_publisher_protocol::PUBLISHER_SOCKET_RELATIVE_PATH);
+    let publisher_socket = publisher_socket_path
+        .to_str()
+        .and_then(|path| locald_publisher_protocol::AbsolutePath::parse(path).ok());
+    let mut publisher_server = None;
+    let publisher_discovery = if !publisher_transport_activation_allowed(sandbox) {
+        info!(
+            "publisher transport is inactive until this platform has an atomic installation-record lifecycle"
+        );
+        ipc::PublisherTransportDiscovery::Inactive
+    } else if let Some(publisher_socket) = publisher_socket {
+        let publisher_authority = manager.publisher_authority();
+        let wake_activation =
+            match publisher_wake_policy(sandbox, explicit_no_host_suspend_guarantee) {
+                PublisherWakePolicy::System => publisher_authority.activate_system_wake_monitor(),
+                #[cfg(target_os = "linux")]
+                PublisherWakePolicy::ExplicitSandboxNoHostSuspendGuarantee => {
+                    publisher_authority.activate_linux_sandbox_explicit_no_suspend_wake_monitor()
+                }
+            };
+        match wake_activation {
+            Ok(()) => {
+                let front_door_ports = advertised_http_port
+                    .into_iter()
+                    .chain(advertised_https_port);
+                let config = publisher_transport::PublisherSocketConfig::for_current_user(
+                    publisher_socket_path.clone(),
+                    front_door_ports,
+                    publisher_transport::publisher_spawn_barrier(),
+                );
+                let dispatcher = std::sync::Arc::new(publisher_dispatch::PublisherDispatcher::new(
+                    manager.clone(),
+                ));
+                match publisher_transport::PublisherSocketServer::bind(config, dispatcher).await {
+                    Ok(server) => {
+                        let protocol_info =
+                            publisher_authority.protocol_info(publisher_socket).await;
+                        info!(
+                            path = %server.socket_path().display(),
+                            "publisher transport is active"
+                        );
+                        publisher_server = Some(server);
+                        ipc::PublisherTransportDiscovery::Active(protocol_info)
+                    }
+                    Err(error) => {
+                        error!(
+                            path = %publisher_socket_path.display(),
+                            error = %error,
+                            "publisher transport is unavailable"
+                        );
+                        ipc::PublisherTransportDiscovery::Inactive
+                    }
+                }
+            }
+            Err(error) => {
+                error!(
+                    error = %error,
+                    "publisher transport wake safety is unavailable"
+                );
+                ipc::PublisherTransportDiscovery::Inactive
+            }
+        }
+    } else {
+        error!(
+            path = %publisher_socket_path.display(),
+            "publisher transport path is not an absolute UTF-8 path"
+        );
+        ipc::PublisherTransportDiscovery::Inactive
+    };
+
+    let mut publisher_changes = manager.publisher_authority().subscribe_changes();
+    let publisher_event_sender = manager.event_sender.clone();
+    let publisher_projection_handle = tokio::spawn(async move {
+        while publisher_changes.changed().await.is_ok() {
+            let _ = publisher_event_sender.send(locald_core::ipc::Event::ServiceListChanged);
+        }
+    });
+
     // Only after catalogued origins agree with the bound listeners may any
     // lifecycle request, policy restoration, or background convergence run.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownReason>(1);
@@ -887,13 +1041,13 @@ async fn async_main(
     let container_manager_clone = container_manager.clone();
     let version_clone = version.clone();
     let shutdown_tx_ipc = shutdown_tx.clone();
-    let ipc_handle = tokio::spawn(async move {
+    let mut ipc_handle = tokio::spawn(async move {
         ipc::run_ipc_server(
             manager_clone,
             container_manager_clone,
             shutdown_tx_ipc,
             version_clone,
-            ipc::PublisherTransportDiscovery::Inactive,
+            publisher_discovery,
         )
         .await
     });
@@ -926,24 +1080,40 @@ async fn async_main(
         watch_for_upgrade(container_manager_clone, shutdown_tx_clone).await;
     });
 
-    let reason = tokio::select! {
+    let (reason, ipc_joined) = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down");
-            ShutdownReason::Stop
+            (ShutdownReason::Stop, false)
         },
         r = shutdown_rx.recv() => {
             info!("Received shutdown signal");
-            r.unwrap_or(ShutdownReason::Stop)
+            (r.unwrap_or(ShutdownReason::Stop), false)
         },
-        result = ipc_handle => {
+        result = &mut ipc_handle => {
             match result {
                 Ok(Err(e)) => error!("IPC server failed: {e}"),
                 Ok(Ok(())) => info!("IPC server exited normally"),
                 Err(e) => error!("IPC server task panicked: {e}"),
             }
-            ShutdownReason::Stop
+            (ShutdownReason::Stop, true)
         }
     };
+
+    if !ipc_joined {
+        ipc_handle.abort();
+        let _ = ipc_handle.await;
+    }
+    // Retire publisher authority before waiting for accepted publisher
+    // connections. This wakes readiness/preparation waiters and prevents a
+    // request already admitted by the socket from committing after shutdown.
+    manager.publisher_authority().shutdown().await;
+    if let Some(server) = publisher_server.take()
+        && let Err(error) = server.shutdown().await
+    {
+        warn!(error = %error, "failed to stop publisher transport cleanly");
+    }
+    publisher_projection_handle.abort();
+    let _ = publisher_projection_handle.await;
 
     info!("Stopping all services...");
     if let Err(e) = manager.shutdown().await {
@@ -969,6 +1139,7 @@ async fn async_main(
 
         let inherited_fd = catalog_writer_lock.file.as_raw_fd();
         let environment = restart_environment(inherited_fd)?;
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
         catalog_writer_lock.prepare_for_exec()?;
         let err = execve(&exe, &argv, &environment)
             .err()
@@ -978,6 +1149,7 @@ async fn async_main(
                 "Failed to restore catalog writer lock descriptor after exec error: {restore_error}"
             );
         }
+        drop(spawn_permit);
         error!("Failed to exec: {}", err);
         return Err(err.into());
     }
@@ -1099,7 +1271,11 @@ async fn watch_for_upgrade(
 mod privileged_startup_tests {
     #[cfg(target_os = "macos")]
     use super::validate_macos_standard_preflight;
-    use super::{parse_sandbox_port_override, validate_port_override_policy};
+    use super::{
+        PublisherWakePolicy, parse_sandbox_port_override, publisher_transport_activation_allowed,
+        publisher_wake_policy, validate_explicit_no_host_suspend_guarantee,
+        validate_port_override_policy,
+    };
     use std::ffi::OsStr;
 
     #[test]
@@ -1141,6 +1317,62 @@ mod privileged_startup_tests {
                 .to_string()
                 .contains("LOCALD_HTTPS_PORT")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn publisher_transport_is_available_in_standard_and_sandbox_modes_on_macos() {
+        assert!(publisher_transport_activation_allowed(false));
+        assert!(publisher_transport_activation_allowed(true));
+        assert_eq!(
+            publisher_wake_policy(false, false),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(true, false),
+            PublisherWakePolicy::System
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publisher_transport_is_available_only_in_explicit_sandbox_mode_on_linux() {
+        assert!(!publisher_transport_activation_allowed(false));
+        assert!(publisher_transport_activation_allowed(true));
+        assert_eq!(
+            publisher_wake_policy(false, false),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(true, false),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(false, true),
+            PublisherWakePolicy::System
+        );
+        assert_eq!(
+            publisher_wake_policy(true, true),
+            PublisherWakePolicy::ExplicitSandboxNoHostSuspendGuarantee
+        );
+    }
+
+    #[test]
+    fn no_host_suspend_marker_requires_the_exact_authenticated_context() {
+        assert!(!validate_explicit_no_host_suspend_guarantee(true, None).unwrap());
+        assert!(validate_explicit_no_host_suspend_guarantee(true, Some(OsStr::new(""))).is_err());
+        assert!(
+            validate_explicit_no_host_suspend_guarantee(true, Some(OsStr::new("true"))).is_err()
+        );
+        assert!(validate_explicit_no_host_suspend_guarantee(false, Some(OsStr::new("1"))).is_err());
+        assert!(validate_explicit_no_host_suspend_guarantee(true, Some(OsStr::new("1"))).unwrap());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn publisher_transport_stays_inactive_on_unsupported_platforms() {
+        assert!(!publisher_transport_activation_allowed(false));
+        assert!(!publisher_transport_activation_allowed(true));
     }
 
     #[cfg(target_os = "macos")]

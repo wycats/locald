@@ -98,8 +98,21 @@ fn main() {
 }
 
 fn run_main(cli: cli::Cli) -> error::CliResult<()> {
+    // The daemon spawns this hidden helper specifically so opaque embedded
+    // Postgres setup cannot inherit publisher descriptors. It must run before
+    // ordinary installation readiness checks or daemon startup behavior.
+    if let cli::Commands::PostgresSetup {
+        version,
+        port,
+        data_dir,
+        installation_dir,
+    } = &cli.command
+    {
+        return handlers::run_internal_postgres_setup(version, *port, data_dir, installation_dir);
+    }
+
     if let Some(sandbox_name) = &cli.sandbox {
-        utils::setup_sandbox(sandbox_name)?;
+        utils::setup_sandbox(sandbox_name, cli.sandbox_no_host_suspend)?;
     }
 
     // Repair, inspection, and shutdown commands must remain available when the

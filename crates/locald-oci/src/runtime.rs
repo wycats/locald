@@ -32,11 +32,12 @@ pub async fn run(
         container_id
     );
 
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to execute locald-shim")?;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+    let spawn_result = cmd.spawn();
+    drop(spawn_permit);
+    let mut child = spawn_result.context("Failed to execute locald-shim")?;
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;

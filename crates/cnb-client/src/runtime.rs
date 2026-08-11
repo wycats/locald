@@ -27,7 +27,8 @@ impl ShimRuntime {
             container_id
         );
 
-        let mut child = Command::new(&shim_path)
+        let mut command = Command::new(&shim_path);
+        command
             .env_remove("LD_LIBRARY_PATH")
             .arg("bundle")
             .arg("run")
@@ -36,9 +37,11 @@ impl ShimRuntime {
             .arg("--id")
             .arg(container_id)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to execute locald-shim bundle")?;
+            .stderr(Stdio::piped());
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+        let spawn_result = command.spawn();
+        drop(spawn_permit);
+        let mut child = spawn_result.context("Failed to execute locald-shim bundle")?;
 
         let stdout = child
             .stdout
@@ -181,13 +184,16 @@ impl ShimRuntime {
 
         debug!("Delegating cleanup of {} to shim", path.display());
 
-        let status = Command::new(&shim_path)
+        let mut command = Command::new(&shim_path);
+        command
             .env_remove("LD_LIBRARY_PATH")
             .arg("admin")
             .arg("cleanup")
-            .arg(path)
-            .status()
-            .await?;
+            .arg(path);
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+        let spawn_result = command.spawn();
+        drop(spawn_permit);
+        let status = spawn_result?.wait().await?;
 
         if !status.success() {
             return Err(anyhow::anyhow!("Shim cleanup failed with status: {status}"));

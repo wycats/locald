@@ -854,7 +854,8 @@ pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
         return false;
     };
 
-    std::process::Command::new("/usr/bin/security")
+    let mut command = std::process::Command::new("/usr/bin/security");
+    command
         .args(["verify-cert", "-c"])
         .arg(&probe_file.path)
         .arg("-c")
@@ -862,8 +863,10 @@ pub fn is_ca_path_trusted(ca_path: &Path) -> bool {
         .args(["-p", "ssl", "-n", "localhost", "-L", "-q"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::null());
+    crate::process_spawn::ProcessSpawnBarrier::global()
+        .spawn_std_command(&mut command)
+        .and_then(|mut child| child.wait())
         .is_ok_and(|status| status.success())
 }
 

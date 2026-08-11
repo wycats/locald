@@ -18,17 +18,23 @@ use thiserror::Error;
 
 use crate::backend::{
     AuthenticatedDaemonDiscovery, BackendError, DeliveryCertainty, PublisherTransport,
-    TransportFailure,
+    TransportFailure, UnixCommandSocketDiscovery, UnixPublisherTransport,
 };
-use crate::clock::{ClockError, RenewalSchedule, SuspendAwareClock, SuspendInstant};
+use crate::clock::{
+    ClockError, RenewalSchedule, SuspendAwareClock, SuspendInstant, SystemSuspendAwareClock,
+};
 use crate::installation::InstalledPublisher;
 use crate::supervisor::{
     LeaseSnapshot, LeaseState, PendingSupervisor, RenewalCause, SessionFence, SharedSession,
     SupervisorCallError, SupervisorDriver, SupervisorHandle, SupervisorShared,
 };
-use crate::wake::{InactiveWakeMonitor, WakeError, WakeMonitor};
+#[cfg(target_os = "linux")]
+use crate::wake::ExplicitSandboxWakeMonitor;
+use crate::wake::{InactiveWakeMonitor, SystemWakeMonitor, WakeError, WakeMonitor};
 
-const SUPERVISOR_TIMEOUT_FRAME_MULTIPLIER: u32 = 3;
+const EXACT_MUTATION_ATTEMPTS: u32 = 2;
+const WAKE_BARRIER_REQUEST_ATTEMPTS: u32 = 2;
+const WAKE_BARRIER_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SUPERVISOR_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
 
 /// Supported publisher client.
@@ -42,6 +48,7 @@ struct ClientInner {
     transport: Arc<dyn PublisherTransport>,
     clock: Arc<dyn SuspendAwareClock>,
     wake_monitor: Arc<dyn WakeMonitor>,
+    wake_monitor_source: WakeMonitorSource,
     expected_uid: u32,
     discovery_gate: Mutex<()>,
     clock_state: Mutex<ClockState>,
@@ -55,6 +62,19 @@ struct ClockState {
     failure: Option<ClockError>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeMonitorSource {
+    Production,
+    Injected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectWakePolicy {
+    ConfiguredMonitor,
+    #[cfg(target_os = "linux")]
+    ExplicitSandboxSystemOrNoHostSuspend,
+}
+
 impl fmt::Debug for ClientInner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -62,6 +82,7 @@ impl fmt::Debug for ClientInner {
             .field("transport", &self.transport)
             .field("clock", &self.clock)
             .field("wake_monitor", &self.wake_monitor)
+            .field("wake_monitor_source", &self.wake_monitor_source)
             .field("expected_uid", &self.expected_uid)
             .finish_non_exhaustive()
     }
@@ -123,9 +144,24 @@ impl fmt::Debug for PublisherClient {
 }
 
 impl PublisherClient {
-    /// Construct the production client while publisher discovery remains
-    /// inactive. An advertised production transport must install a conforming
-    /// wake monitor and use [`Self::with_wake_monitor`].
+    /// Construct the supported production client with authenticated ordinary
+    /// discovery, the dedicated Unix publisher transport, a
+    /// suspend-inclusive clock, and platform wake observation.
+    #[must_use]
+    pub fn production() -> Self {
+        Self::with_wake_monitor_source(
+            Arc::new(UnixCommandSocketDiscovery),
+            Arc::new(UnixPublisherTransport),
+            Arc::new(SystemSuspendAwareClock),
+            Arc::new(SystemWakeMonitor),
+            WakeMonitorSource::Production,
+        )
+    }
+
+    /// Construct an injected client with wake observation disabled.
+    /// Production callers should use [`Self::production`]; deterministic
+    /// tests and alternate contexts may supply an explicit wake monitor with
+    /// [`Self::with_wake_monitor`].
     #[must_use]
     pub fn new(
         discovery: Arc<dyn AuthenticatedDaemonDiscovery>,
@@ -144,11 +180,28 @@ impl PublisherClient {
         clock: Arc<dyn SuspendAwareClock>,
         wake_monitor: Arc<dyn WakeMonitor>,
     ) -> Self {
+        Self::with_wake_monitor_source(
+            discovery,
+            transport,
+            clock,
+            wake_monitor,
+            WakeMonitorSource::Injected,
+        )
+    }
+
+    fn with_wake_monitor_source(
+        discovery: Arc<dyn AuthenticatedDaemonDiscovery>,
+        transport: Arc<dyn PublisherTransport>,
+        clock: Arc<dyn SuspendAwareClock>,
+        wake_monitor: Arc<dyn WakeMonitor>,
+        wake_monitor_source: WakeMonitorSource,
+    ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 transport,
                 clock,
                 wake_monitor,
+                wake_monitor_source,
                 expected_uid: Uid::effective().as_raw(),
                 discovery_gate: Mutex::new(()),
                 clock_state: Mutex::new(ClockState::default()),
@@ -182,12 +235,12 @@ impl PublisherClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let resolved = self
             .discovery
-            .resolve_project(installation.record().command_socket(), &project_locator)
+            .resolve_project(installation.command_socket(), &project_locator)
             .map_err(ClientError::Backend)?;
         self.validate_peer_uid(resolved.peer_uid)?;
         let protocol_info = self
             .discovery
-            .protocol_info(installation.record().command_socket())
+            .protocol_info(installation.command_socket())
             .map_err(ClientError::Backend)?;
         self.validate_peer_uid(protocol_info.peer_uid)?;
         protocol_info.value.validate().map_err(|error| {
@@ -203,8 +256,10 @@ impl PublisherClient {
         }
         let protocol_info = protocol_info.value;
         let fence = self.inner.activate_epoch(protocol_info.daemon_epoch());
+        let wake_monitor = self.project_wake_monitor(installation);
         Ok(ProjectPublisher {
             inner: Arc::clone(&self.inner),
+            wake_monitor,
             protocol_info,
             project_locator,
             project_instance_id: resolved.value,
@@ -213,13 +268,42 @@ impl PublisherClient {
     }
 
     fn validate_installed(&self, installed: &InstalledPublisher) -> Result<(), ClientError> {
-        installed.record().validate().map_err(|error| {
-            ClientError::InvalidDiscovery(format!("invalid installation record: {error}"))
-        })?;
+        if let Some(record) = installed.standard_record() {
+            record.validate().map_err(|error| {
+                ClientError::InvalidDiscovery(format!("invalid installation record: {error}"))
+            })?;
+        }
         installed.protocol_info().validate().map_err(|error| {
             ClientError::InvalidDiscovery(format!("invalid publisher protocol info: {error}"))
         })?;
         self.validate_peer_uid(installed.daemon_uid())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn project_wake_policy(&self, installed: &InstalledPublisher) -> ProjectWakePolicy {
+        if self.inner.wake_monitor_source == WakeMonitorSource::Production
+            && installed.has_no_host_suspend_guarantee()
+        {
+            return ProjectWakePolicy::ExplicitSandboxSystemOrNoHostSuspend;
+        }
+
+        ProjectWakePolicy::ConfiguredMonitor
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn project_wake_policy(&self, installed: &InstalledPublisher) -> ProjectWakePolicy {
+        let _ = (self, installed);
+        ProjectWakePolicy::ConfiguredMonitor
+    }
+
+    fn project_wake_monitor(&self, installed: &InstalledPublisher) -> Arc<dyn WakeMonitor> {
+        match self.project_wake_policy(installed) {
+            ProjectWakePolicy::ConfiguredMonitor => Arc::clone(&self.inner.wake_monitor),
+            #[cfg(target_os = "linux")]
+            ProjectWakePolicy::ExplicitSandboxSystemOrNoHostSuspend => Arc::new(
+                ExplicitSandboxWakeMonitor::new(Arc::clone(&self.inner.wake_monitor)),
+            ),
+        }
     }
 
     fn validate_peer_uid(&self, peer_uid: u32) -> Result<(), ClientError> {
@@ -238,6 +322,7 @@ impl PublisherClient {
 #[derive(Debug, Clone)]
 pub struct ProjectPublisher {
     inner: Arc<ClientInner>,
+    wake_monitor: Arc<dyn WakeMonitor>,
     protocol_info: PublishedEndpointProtocolInfo,
     project_locator: AbsolutePath,
     project_instance_id: ProjectInstanceId,
@@ -302,13 +387,19 @@ impl ProjectPublisher {
         if !self.fence.is_current() {
             return Err(ClientError::DaemonEpochChanged);
         }
-        let exact_replay = matches!(
-            &request,
+        let (retry_not_sent, retry_outcome_unknown) = match &request {
+            PublisherRequest::BeginAcquisition(arguments) => {
+                (true, arguments.replace_terminal_attempt_handle.is_none())
+            }
+            PublisherRequest::BeginRebind(arguments) => {
+                (true, arguments.replace_terminal_attempt_handle.is_none())
+            }
             PublisherRequest::Acquire(_)
-                | PublisherRequest::Renew(_)
-                | PublisherRequest::Rebind(_)
-                | PublisherRequest::Release(_)
-        );
+            | PublisherRequest::Renew(_)
+            | PublisherRequest::Rebind(_)
+            | PublisherRequest::Release(_) => (true, true),
+            PublisherRequest::WaitReady(_) => (false, false),
+        };
         let schedule_bearing = matches!(
             &request,
             PublisherRequest::Acquire(_) | PublisherRequest::Renew(_) | PublisherRequest::Rebind(_)
@@ -319,107 +410,138 @@ impl ProjectPublisher {
         if (frame.descriptor() == DescriptorPrelude::Listener) != has_listener {
             return Err(ClientError::ListenerDescriptorMismatch);
         }
-        let request_started = if schedule_bearing || authority_schedule.is_some() {
-            Some(self.inner.now().map_err(ClientError::Clock)?)
-        } else {
-            None
-        };
-        if let (Some(schedule), Some(request_started)) = (authority_schedule, request_started)
-            && schedule.expired(request_started)
-        {
-            return Err(ClientError::LeaseExpired);
-        }
-
-        let reply = match self.inner.transport.exchange(
-            self.protocol_info.publisher_socket(),
-            &frame,
-            listener,
-        ) {
-            Ok(reply) => reply,
-            Err(first_failure)
-                if exact_replay
-                    && matches!(
-                        first_failure.certainty,
-                        DeliveryCertainty::NotSent | DeliveryCertainty::OutcomeUnknown
-                    ) =>
+        let mut wake_barrier_retry_available = true;
+        loop {
+            if !self.fence.is_current() {
+                return Err(ClientError::DaemonEpochChanged);
+            }
+            let request_started = if schedule_bearing || authority_schedule.is_some() {
+                Some(self.inner.now().map_err(ClientError::Clock)?)
+            } else {
+                None
+            };
+            if let (Some(schedule), Some(request_started)) = (authority_schedule, request_started)
+                && schedule.expired(request_started)
             {
-                // These mutation phases have a protocol-defined convergence rule:
-                // acquire/rebind replay their exact terminal request, renew
-                // repeats on the same live lease, and release converges on the
-                // exact handle. The encoded frame and borrowed listener are
-                // reused unchanged.
-                match self.inner.transport.exchange(
-                    self.protocol_info.publisher_socket(),
-                    &frame,
-                    listener,
-                ) {
-                    Ok(reply) => reply,
-                    Err(second_failure) => {
-                        return Err(ClientError::Transport(exact_replay_failure(
-                            first_failure.certainty,
-                            second_failure,
-                        )));
+                return Err(ClientError::LeaseExpired);
+            }
+
+            let reply = match self.inner.transport.exchange(
+                self.protocol_info.publisher_socket(),
+                &frame,
+                listener,
+            ) {
+                Ok(reply) => reply,
+                Err(first_failure)
+                    if match first_failure.certainty {
+                        DeliveryCertainty::NotSent => retry_not_sent,
+                        DeliveryCertainty::OutcomeUnknown => retry_outcome_unknown,
+                        DeliveryCertainty::Fatal => false,
+                    } =>
+                {
+                    // These operations have a protocol-defined convergence rule:
+                    // ordinary begins return the current attempt for the same
+                    // exact authority, while compare-and-swap begin replacements
+                    // enter only after definitively unsent delivery. Acquire and
+                    // rebind replay their exact terminal request, renew repeats on
+                    // the same live lease, and release converges on the exact
+                    // handle. The encoded frame and borrowed listener are reused
+                    // unchanged.
+                    match self.inner.transport.exchange(
+                        self.protocol_info.publisher_socket(),
+                        &frame,
+                        listener,
+                    ) {
+                        Ok(reply) => reply,
+                        Err(second_failure) => {
+                            return Err(ClientError::Transport(exact_replay_failure(
+                                first_failure.certainty,
+                                second_failure,
+                            )));
+                        }
                     }
                 }
+                Err(failure) => return Err(ClientError::Transport(failure)),
+            };
+            if reply.peer_uid != self.inner.expected_uid {
+                return Err(ClientError::PeerUidMismatch {
+                    expected: self.inner.expected_uid,
+                    actual: reply.peer_uid,
+                });
             }
-            Err(failure) => return Err(ClientError::Transport(failure)),
-        };
-        if reply.peer_uid != self.inner.expected_uid {
-            return Err(ClientError::PeerUidMismatch {
-                expected: self.inner.expected_uid,
-                actual: reply.peer_uid,
-            });
-        }
-        let response: ResponseEnvelope<R> =
-            decode_response_frame(&reply.response_frame).map_err(ClientError::Frame)?;
-        if response.protocol_version() != locald_publisher_protocol::PROTOCOL_VERSION {
-            return Err(ClientError::ProtocolVersionMismatch(
-                response.protocol_version(),
-            ));
-        }
-        // A response is not authority until it is committed by its caller.
-        // Serialize that commit with live discovery/epoch activation, then
-        // retain the guard in TimedResponse through the caller's complete
-        // typestate or lease-state transition.
-        let epoch_guard = self
-            .inner
-            .discovery_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.fence.is_current() {
-            return Err(ClientError::DaemonEpochChanged);
-        }
-        if response.daemon_epoch() != self.protocol_info.daemon_epoch() {
-            self.fence.invalidate();
-            return Err(ClientError::DaemonEpochChanged);
-        }
-        let value = match response.into_result() {
-            Ok(value) => value,
-            Err(error) if error.code() == StableErrorCode::DaemonEpochChanged => {
+            let response: ResponseEnvelope<R> =
+                decode_response_frame(&reply.response_frame).map_err(ClientError::Frame)?;
+            if response.protocol_version() != locald_publisher_protocol::PROTOCOL_VERSION {
+                return Err(ClientError::ProtocolVersionMismatch(
+                    response.protocol_version(),
+                ));
+            }
+            // A response is not authority until it is committed by its caller.
+            // Serialize that commit with live discovery/epoch activation, then
+            // retain the guard in TimedResponse through the caller's complete
+            // typestate or lease-state transition.
+            let epoch_guard = self
+                .inner
+                .discovery_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self.fence.is_current() {
+                return Err(ClientError::DaemonEpochChanged);
+            }
+            if response.daemon_epoch() != self.protocol_info.daemon_epoch() {
                 self.fence.invalidate();
                 return Err(ClientError::DaemonEpochChanged);
             }
-            Err(error) => return Err(ClientError::Protocol(error)),
-        };
-        let timing = if schedule_bearing {
-            request_started.map(|request_started| ResponseTiming {
-                request_started,
-                response_received: self.inner.now(),
-            })
-        } else {
-            None
-        };
-        Ok(TimedResponse {
-            value,
-            timing,
-            _epoch_guard: epoch_guard,
-        })
+            let value = match response.into_result() {
+                Ok(value) => value,
+                Err(error) if error.code() == StableErrorCode::DaemonEpochChanged => {
+                    self.fence.invalidate();
+                    return Err(ClientError::DaemonEpochChanged);
+                }
+                Err(error)
+                    if error.code() == StableErrorCode::WakeBarrierPending
+                        && wake_barrier_retry_available =>
+                {
+                    wake_barrier_retry_available = false;
+                    drop(epoch_guard);
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "the synchronous publisher API owns no async runtime and its bounded exact retry must not busy-loop"
+                    )]
+                    std::thread::sleep(WAKE_BARRIER_RETRY_DELAY);
+                    continue;
+                }
+                Err(error) => return Err(ClientError::Protocol(error)),
+            };
+            let timing = if schedule_bearing {
+                request_started.map(|request_started| ResponseTiming {
+                    request_started,
+                    response_received: self.inner.now(),
+                })
+            } else {
+                None
+            };
+            return Ok(TimedResponse {
+                value,
+                timing,
+                _epoch_guard: epoch_guard,
+            });
+        }
     }
 
     const fn command_timeout(&self) -> Duration {
-        Duration::from_millis(self.protocol_info.frame_timeout_ms())
-            .saturating_mul(SUPERVISOR_TIMEOUT_FRAME_MULTIPLIER)
-            .saturating_add(SUPERVISOR_TIMEOUT_MARGIN)
+        // Each exact mutation attempt has an independently bounded request
+        // phase, semantic attempt lifetime, and response-framing phase. The
+        // supervisor must outlive both complete rebind exchanges, including
+        // one exact transport replay and one definitive wake-barrier retry for
+        // each, before it can classify the outcome as uncertain.
+        Duration::from_millis(
+            self.protocol_info
+                .attempt_ttl_ms()
+                .saturating_add(self.protocol_info.frame_timeout_ms().saturating_mul(2)),
+        )
+        .saturating_mul(EXACT_MUTATION_ATTEMPTS.saturating_mul(WAKE_BARRIER_REQUEST_ATTEMPTS))
+        .saturating_add(SUPERVISOR_TIMEOUT_MARGIN)
     }
 
     fn best_effort_release(&self, lease_handle: LeaseHandle) {
@@ -605,7 +727,7 @@ impl InstalledOrigin {
     pub fn acquire(self, listener: &TcpListener) -> Result<Lease, ClientError> {
         let pending = PendingSupervisor::register(
             &self.prepared.project.inner.session,
-            self.prepared.project.inner.wake_monitor.as_ref(),
+            self.prepared.project.wake_monitor.as_ref(),
         )
         .map_err(ClientError::Wake)?;
         let retained_listener = listener
@@ -978,6 +1100,20 @@ struct LeaseDriver {
     shared: Arc<SupervisorShared>,
 }
 
+impl LeaseDriver {
+    fn defer_definitive_renewal_retry(&mut self) -> Result<(), ClientError> {
+        let now = self.project.inner.now().map_err(ClientError::Clock)?;
+        // Both a definitively unsent exchange and WakeBarrierPending prove that
+        // this request did not mutate daemon authority. Reuse the bounded
+        // pre-expiry retry schedule without replacing the original expiry.
+        self.renewal_retry_not_before = self.schedule.unsent_retry_not_before(now);
+        if self.renewal_retry_not_before.is_none() {
+            return Err(ClientError::LeaseExpired);
+        }
+        Ok(())
+    }
+}
+
 impl SupervisorDriver for LeaseDriver {
     fn renewal_wait(&self) -> Result<Duration, ClientError> {
         let now = self.project.inner.now().map_err(ClientError::Clock)?;
@@ -1001,7 +1137,8 @@ impl SupervisorDriver for LeaseDriver {
         if self.schedule.expired(now) {
             return Err(ClientError::LeaseExpired);
         }
-        let response = self.project.exchange::<RenewResult>(
+        let project = self.project.clone();
+        let response = project.exchange::<RenewResult>(
             PublisherRequest::Renew(RenewArguments {
                 lease_handle: self.lease_handle.clone(),
             }),
@@ -1016,14 +1153,19 @@ impl SupervisorDriver for LeaseDriver {
                     ..
                 }),
             ) => {
-                let now = self.project.inner.now().map_err(ClientError::Clock)?;
-                self.renewal_retry_not_before = self.schedule.unsent_retry_not_before(now);
-                if self.renewal_retry_not_before.is_none() {
-                    return Err(ClientError::LeaseExpired);
+                self.defer_definitive_renewal_retry()?;
+                return Err(error);
+            }
+            Err(error) => {
+                if matches!(
+                    &error,
+                    ClientError::Protocol(protocol_error)
+                        if protocol_error.code() == StableErrorCode::WakeBarrierPending
+                ) {
+                    self.defer_definitive_renewal_retry()?;
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error),
         };
         let timing = response
             .timing
@@ -1551,6 +1693,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{AuthenticatedValue, BackendErrorKind, TransportReply};
+    use crate::installation::SandboxPublisherContext;
     use crate::wake::{WakeRegistration, WakeSink};
 
     const ATTEMPT_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1563,6 +1706,7 @@ mod tests {
         project_instance_id: ProjectInstanceId,
         protocol_info: Mutex<PublishedEndpointProtocolInfo>,
         blocked_protocol_info: Mutex<Option<(SyncSender<()>, Arc<BlockGate>)>>,
+        command_sockets: Mutex<Vec<AbsolutePath>>,
     }
 
     impl FakeDiscovery {
@@ -1579,13 +1723,26 @@ mod tests {
                 .expect("blocked protocol info") = Some((entered, Arc::clone(&gate)));
             (receiver, gate)
         }
+
+        fn take_command_sockets(&self) -> Vec<AbsolutePath> {
+            std::mem::take(
+                &mut *self
+                    .command_sockets
+                    .lock()
+                    .expect("recorded command sockets"),
+            )
+        }
     }
 
     impl AuthenticatedDaemonDiscovery for FakeDiscovery {
         fn protocol_info(
             &self,
-            _command_socket: &AbsolutePath,
+            command_socket: &AbsolutePath,
         ) -> Result<AuthenticatedValue<PublishedEndpointProtocolInfo>, BackendError> {
+            self.command_sockets
+                .lock()
+                .expect("recorded command sockets")
+                .push(command_socket.clone());
             let value = self.protocol_info.lock().expect("protocol info").clone();
             let blocked = self
                 .blocked_protocol_info
@@ -1604,9 +1761,13 @@ mod tests {
 
         fn resolve_project(
             &self,
-            _command_socket: &AbsolutePath,
+            command_socket: &AbsolutePath,
             _project_locator: &AbsolutePath,
         ) -> Result<AuthenticatedValue<ProjectInstanceId>, BackendError> {
+            self.command_sockets
+                .lock()
+                .expect("recorded command sockets")
+                .push(command_socket.clone());
             Ok(AuthenticatedValue {
                 peer_uid: self.uid,
                 value: self.project_instance_id,
@@ -1645,6 +1806,33 @@ mod tests {
     struct FakeRegistration;
 
     impl WakeRegistration for FakeRegistration {}
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct PolicyTestWakeSink;
+
+    #[cfg(target_os = "linux")]
+    impl WakeSink for PolicyTestWakeSink {
+        fn suspending(&self) {}
+
+        fn resumed(&self) {}
+
+        fn failed(&self, _error: WakeError) {}
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct RegistrationErrorWakeMonitor(WakeError);
+
+    #[cfg(target_os = "linux")]
+    impl WakeMonitor for RegistrationErrorWakeMonitor {
+        fn register(
+            &self,
+            _sink: Arc<dyn WakeSink>,
+        ) -> Result<Box<dyn WakeRegistration>, WakeError> {
+            Err(self.0.clone())
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FakeWakeMonitor {
@@ -1930,6 +2118,7 @@ mod tests {
             project_instance_id: instance,
             protocol_info: Mutex::new(protocol_info),
             blocked_protocol_info: Mutex::new(None),
+            command_sockets: Mutex::new(Vec::new()),
         });
         let transport = Arc::new(FakeTransport::default());
         let clock = Arc::new(FakeClock::default());
@@ -1950,6 +2139,168 @@ mod tests {
             instance,
             epoch,
         }
+    }
+
+    #[test]
+    fn explicit_sandbox_command_socket_drives_project_discovery() {
+        let fixture = fixture();
+        let command_socket = AbsolutePath::parse("/tmp/locald-explicit-sandbox/locald.sock")
+            .expect("command socket");
+        let context = SandboxPublisherContext::new(
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald")
+                .expect("data directory"),
+            command_socket.clone(),
+        )
+        .expect("sandbox context");
+        let protocol_info = PublishedEndpointProtocolInfo::v1(
+            fixture.epoch.clone(),
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald/run/publisher-v1.sock")
+                .expect("publisher socket"),
+        );
+        fixture.discovery.set_protocol_info(protocol_info.clone());
+        let installed = InstalledPublisher::from_verified_sandbox(
+            context,
+            Uid::effective().as_raw(),
+            protocol_info,
+        );
+
+        let project = fixture
+            .client
+            .for_project(
+                &installed,
+                AbsolutePath::parse("/work/project").expect("locator"),
+            )
+            .expect("sandbox project");
+
+        assert!(project.fence.is_current());
+        assert_eq!(installed.standard_record(), None);
+        assert_eq!(
+            fixture.discovery.take_command_sockets(),
+            vec![command_socket.clone(), command_socket]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_host_suspend_policy_requires_a_separate_external_guarantee() {
+        let fixture = fixture();
+        let context = SandboxPublisherContext::new(
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/data/locald")
+                .expect("data directory"),
+            AbsolutePath::parse("/tmp/locald-explicit-sandbox/locald.sock")
+                .expect("command socket"),
+        )
+        .expect("sandbox context");
+        let guaranteed_context = context.clone().with_no_host_suspend_guarantee();
+        let installed_sandbox = InstalledPublisher::from_verified_sandbox(
+            context,
+            Uid::effective().as_raw(),
+            PublishedEndpointProtocolInfo::v1(
+                fixture.epoch.clone(),
+                AbsolutePath::parse(
+                    "/tmp/locald-explicit-sandbox/data/locald/run/publisher-v1.sock",
+                )
+                .expect("publisher socket"),
+            ),
+        );
+        let installed_guaranteed_sandbox = InstalledPublisher::from_verified_sandbox(
+            guaranteed_context,
+            Uid::effective().as_raw(),
+            PublishedEndpointProtocolInfo::v1(
+                fixture.epoch.clone(),
+                AbsolutePath::parse(
+                    "/tmp/locald-explicit-sandbox/data/locald/run/publisher-v1.sock",
+                )
+                .expect("publisher socket"),
+            ),
+        );
+        let unavailable_monitor = Arc::new(InactiveWakeMonitor);
+        let production_policy_client = PublisherClient::with_wake_monitor_source(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            Arc::clone(&unavailable_monitor) as Arc<dyn WakeMonitor>,
+            WakeMonitorSource::Production,
+        );
+        let injected_client = PublisherClient::with_wake_monitor(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            unavailable_monitor as Arc<dyn WakeMonitor>,
+        );
+
+        assert_eq!(
+            production_policy_client.project_wake_policy(&fixture.installed),
+            ProjectWakePolicy::ConfiguredMonitor,
+            "standard installation authority keeps the system monitor"
+        );
+        assert_eq!(
+            production_policy_client.project_wake_policy(&installed_sandbox),
+            ProjectWakePolicy::ConfiguredMonitor,
+            "ordinary explicit sandbox authority keeps the system monitor"
+        );
+        assert_eq!(
+            production_policy_client.project_wake_policy(&installed_guaranteed_sandbox),
+            ProjectWakePolicy::ExplicitSandboxSystemOrNoHostSuspend,
+            "the separate external guarantee selects the Linux fallback policy"
+        );
+        assert_eq!(
+            injected_client.project_wake_policy(&installed_guaranteed_sandbox),
+            ProjectWakePolicy::ConfiguredMonitor,
+            "injected monitors remain authoritative for deterministic tests"
+        );
+        assert!(matches!(
+            production_policy_client
+                .project_wake_monitor(&fixture.installed)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Unavailable)
+        ));
+        assert!(matches!(
+            production_policy_client
+                .project_wake_monitor(&installed_sandbox)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Unavailable)
+        ));
+        production_policy_client
+            .project_wake_monitor(&installed_guaranteed_sandbox)
+            .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>)
+            .expect("the external guarantee permits unavailable-system fallback");
+        assert!(matches!(
+            injected_client
+                .project_wake_monitor(&installed_guaranteed_sandbox)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Unavailable)
+        ));
+
+        let preferred_monitor_client = PublisherClient::with_wake_monitor_source(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            Arc::clone(&fixture.wakes) as Arc<dyn WakeMonitor>,
+            WakeMonitorSource::Production,
+        );
+        preferred_monitor_client
+            .project_wake_monitor(&installed_guaranteed_sandbox)
+            .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>)
+            .expect("available system observation remains preferred");
+        assert_eq!(fixture.wakes.sinks.lock().expect("wake sinks").len(), 1);
+
+        let failed_monitor = Arc::new(RegistrationErrorWakeMonitor(WakeError::Failed(
+            "scripted system failure".to_owned(),
+        )));
+        let failed_monitor_client = PublisherClient::with_wake_monitor_source(
+            Arc::clone(&fixture.discovery) as Arc<dyn AuthenticatedDaemonDiscovery>,
+            Arc::clone(&fixture.transport) as Arc<dyn PublisherTransport>,
+            Arc::clone(&fixture.clock) as Arc<dyn SuspendAwareClock>,
+            failed_monitor as Arc<dyn WakeMonitor>,
+            WakeMonitorSource::Production,
+        );
+        assert!(matches!(
+            failed_monitor_client
+                .project_wake_monitor(&installed_guaranteed_sandbox)
+                .register(Arc::new(PolicyTestWakeSink) as Arc<dyn WakeSink>),
+            Err(WakeError::Failed(message)) if message == "scripted system failure"
+        ));
     }
 
     fn origin() -> SemanticOrigin {
@@ -2001,6 +2352,17 @@ mod tests {
         .expect("valid renew result")
     }
 
+    fn wake_barrier_pending<R>(fixture: &Fixture) -> ResponseEnvelope<R> {
+        ResponseEnvelope::error(
+            fixture.epoch.clone(),
+            ProtocolError::new(
+                StableErrorCode::WakeBarrierPending,
+                "the publisher wake barrier is still being applied",
+                None,
+            ),
+        )
+    }
+
     fn begin_rebind_result(state: AttemptState, handle: &str) -> BeginRebindResult {
         BeginRebindResult::new(
             RebindAttemptHandle::parse(handle).expect("rebind attempt"),
@@ -2009,6 +2371,27 @@ mod tests {
             state,
         )
         .expect("valid begin rebind")
+    }
+
+    fn replacement_begin_acquisition(fixture: &Fixture) -> PublisherRequest {
+        PublisherRequest::BeginAcquisition(BeginAcquisitionArguments {
+            expected_project_instance_id: fixture.instance,
+            project_locator: AbsolutePath::parse("/work/project").expect("locator"),
+            service_name: ServiceName::parse("workbench").expect("service"),
+            replace_terminal_attempt_handle: Some(
+                AcquisitionAttemptHandle::parse(ATTEMPT_A).expect("acquisition attempt"),
+            ),
+        })
+    }
+
+    fn replacement_begin_rebind() -> PublisherRequest {
+        PublisherRequest::BeginRebind(BeginRebindArguments {
+            lease_handle: LeaseHandle::parse(LEASE).expect("lease"),
+            expected_binding_revision: BindingRevision::new(1).expect("revision"),
+            replace_terminal_attempt_handle: Some(
+                RebindAttemptHandle::parse(ATTEMPT_A).expect("rebind attempt"),
+            ),
+        })
     }
 
     fn rebind_result() -> RebindResult {
@@ -2034,6 +2417,15 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_timeout_covers_barrier_retries_for_two_complete_rebind_exchanges() {
+        let fixture = fixture();
+        assert_eq!(
+            project(&fixture).command_timeout(),
+            Duration::from_secs(101)
+        );
+    }
+
+    #[test]
     fn stale_installation_snapshot_cannot_roll_back_the_active_daemon_epoch() {
         let fixture = fixture();
         let stale_installation = fixture.installed.clone();
@@ -2043,7 +2435,10 @@ mod tests {
             .discovery
             .set_protocol_info(current_protocol_info.clone());
         let current_installation = InstalledPublisher::from_verified(
-            stale_installation.record().clone(),
+            stale_installation
+                .standard_record()
+                .expect("standard installation record")
+                .clone(),
             stale_installation.daemon_uid(),
             current_protocol_info,
         );
@@ -2094,7 +2489,11 @@ mod tests {
             .discovery
             .set_protocol_info(current_protocol_info.clone());
         let current_installation = InstalledPublisher::from_verified(
-            fixture.installed.record().clone(),
+            fixture
+                .installed
+                .standard_record()
+                .expect("standard installation record")
+                .clone(),
             fixture.installed.daemon_uid(),
             current_protocol_info,
         );
@@ -2163,7 +2562,11 @@ mod tests {
             .discovery
             .set_protocol_info(current_protocol_info.clone());
         let current_installation = InstalledPublisher::from_verified(
-            fixture.installed.record().clone(),
+            fixture
+                .installed
+                .standard_record()
+                .expect("standard installation record")
+                .clone(),
             fixture.installed.daemon_uid(),
             current_protocol_info,
         );
@@ -2508,6 +2911,72 @@ mod tests {
     }
 
     #[test]
+    fn wake_barrier_pending_renewal_retries_exactly_until_success() {
+        let fixture = fixture();
+        enqueue_acquisition(&fixture, 10_000);
+        let lease = acquire_lease(&fixture, "workbench");
+        fixture
+            .transport
+            .push("renew", &wake_barrier_pending::<RenewResult>(&fixture));
+        fixture
+            .transport
+            .push("renew", &wake_barrier_pending::<RenewResult>(&fixture));
+
+        fixture.wakes.resume(0);
+        fixture.transport.wait_for_requests("renew", 2);
+        lease.supervisor.synchronize().expect("renewal settled");
+        assert_eq!(lease.snapshot().state(), LeaseState::Active);
+
+        fixture.transport.push(
+            "renew",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                renew_result(PublicationState::Ready),
+            ),
+        );
+        fixture.clock.set_millis(1_000);
+        lease.supervisor.synchronize().expect("scheduled retry");
+
+        let renew_frames = fixture.transport.frames("renew");
+        assert_eq!(renew_frames.len(), 3);
+        assert_eq!(renew_frames[0], renew_frames[1]);
+        assert_eq!(renew_frames[1], renew_frames[2]);
+        assert_eq!(lease.snapshot().state(), LeaseState::Active);
+        assert_eq!(
+            lease.snapshot().publication_state(),
+            PublicationState::Ready
+        );
+        release_success(&fixture);
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn wake_barrier_pending_renewal_preserves_only_original_expiry() {
+        let fixture = fixture();
+        enqueue_acquisition(&fixture, 10_000);
+        let lease = acquire_lease(&fixture, "workbench");
+        fixture
+            .transport
+            .push("renew", &wake_barrier_pending::<RenewResult>(&fixture));
+        fixture
+            .transport
+            .push("renew", &wake_barrier_pending::<RenewResult>(&fixture));
+
+        fixture.wakes.resume(0);
+        fixture.transport.wait_for_requests("renew", 2);
+        lease.supervisor.synchronize().expect("renewal settled");
+        assert_eq!(lease.snapshot().state(), LeaseState::Active);
+
+        fixture.clock.set_millis(30_001);
+        fixture.wakes.resume(0);
+        assert_eq!(
+            lease.wait_for_change(0, Duration::from_secs(2)).state(),
+            LeaseState::ReacquisitionRequired(ReacquisitionReason::LeaseLost)
+        );
+        assert_eq!(fixture.transport.frames("renew").len(), 2);
+    }
+
+    #[test]
     fn ambiguous_renewal_still_makes_authority_uncertain() {
         let fixture = fixture();
         enqueue_acquisition(&fixture, 10_000);
@@ -2598,6 +3067,256 @@ mod tests {
             .map(|request| request.operation.clone())
             .collect::<Vec<_>>();
         assert_eq!(operations, ["renew".to_owned(), "wait_ready".to_owned()]);
+        release_success(&fixture);
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn begin_operations_replay_byte_identical_ambiguous_requests() {
+        let fixture = fixture();
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        fixture.transport.push(
+            "begin_acquisition",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_result(&fixture, ATTEMPT_A, AttemptState::Pending),
+            ),
+        );
+        let prepared = project(&fixture)
+            .prepare(ServiceName::parse("workbench").expect("service"))
+            .expect("prepare after ambiguous delivery");
+        let begin_acquisition = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(begin_acquisition.len(), 2);
+        assert_eq!(begin_acquisition[0].frame, begin_acquisition[1].frame);
+        assert!(
+            begin_acquisition
+                .iter()
+                .all(|request| request.listener_fd.is_none())
+        );
+
+        fixture.transport.push(
+            "acquire",
+            &ResponseEnvelope::success(fixture.epoch.clone(), acquire_result(10_000)),
+        );
+        let installed = prepared
+            .confirm_origin_installed(&origin())
+            .expect("origin installed");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let lease = installed.acquire(&listener).expect("acquire");
+
+        fixture.transport.push_error(
+            "begin_rebind",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        fixture.transport.push(
+            "begin_rebind",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_rebind_result(AttemptState::Pending, ATTEMPT_B),
+            ),
+        );
+        lease
+            .prepare_rebind()
+            .expect("prepare rebind after ambiguous delivery");
+        let begin_rebind = fixture.transport.recorded("begin_rebind");
+        assert_eq!(begin_rebind.len(), 2);
+        assert_eq!(begin_rebind[0].frame, begin_rebind[1].frame);
+        assert!(
+            begin_rebind
+                .iter()
+                .all(|request| request.listener_fd.is_none())
+        );
+
+        release_success(&fixture);
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn begin_replay_preserves_delivery_certainty_and_stops_on_fatal_failure() {
+        let ambiguous_fixture = fixture();
+        ambiguous_fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        ambiguous_fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::NotSent),
+        );
+        assert!(matches!(
+            project(&ambiguous_fixture).prepare(ServiceName::parse("workbench").expect("service")),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let ambiguous_frames = ambiguous_fixture.transport.frames("begin_acquisition");
+        assert_eq!(ambiguous_frames.len(), 2);
+        assert_eq!(ambiguous_frames[0], ambiguous_frames[1]);
+
+        let fatal_fixture = fixture();
+        fatal_fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::Fatal),
+        );
+        assert!(matches!(
+            project(&fatal_fixture).prepare(ServiceName::parse("workbench").expect("service")),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::Fatal,
+                ..
+            }))
+        ));
+        assert_eq!(fatal_fixture.transport.frames("begin_acquisition").len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_begin_replacements_are_not_replayed() {
+        let fixture = fixture();
+        let project = project(&fixture);
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        assert!(matches!(
+            project.exchange::<BeginAcquisitionResult>(
+                replacement_begin_acquisition(&fixture),
+                None,
+                None,
+            ),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let acquisition = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(acquisition.len(), 1);
+        assert!(acquisition[0].listener_fd.is_none());
+
+        fixture.transport.push_error(
+            "begin_rebind",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+        assert!(matches!(
+            project.exchange::<BeginRebindResult>(replacement_begin_rebind(), None, None),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let rebind = fixture.transport.recorded("begin_rebind");
+        assert_eq!(rebind.len(), 1);
+        assert!(rebind[0].listener_fd.is_none());
+    }
+
+    #[test]
+    fn wake_barrier_retry_preserves_begin_replacement_ambiguity_rules() {
+        let fixture = fixture();
+        let project = project(&fixture);
+        fixture.transport.push(
+            "begin_acquisition",
+            &wake_barrier_pending::<BeginAcquisitionResult>(&fixture),
+        );
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::OutcomeUnknown),
+        );
+
+        assert!(matches!(
+            project.exchange::<BeginAcquisitionResult>(
+                replacement_begin_acquisition(&fixture),
+                None,
+                None,
+            ),
+            Err(ClientError::Transport(TransportFailure {
+                certainty: DeliveryCertainty::OutcomeUnknown,
+                ..
+            }))
+        ));
+        let requests = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].frame, requests[1].frame);
+        assert!(requests.iter().all(|request| request.listener_fd.is_none()));
+    }
+
+    #[test]
+    fn definitively_unsent_begin_replacements_retry_byte_identically() {
+        let fixture = fixture();
+        let project = project(&fixture);
+        fixture.transport.push_error(
+            "begin_acquisition",
+            transport_failure(DeliveryCertainty::NotSent),
+        );
+        fixture.transport.push(
+            "begin_acquisition",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_result(&fixture, ATTEMPT_B, AttemptState::Pending),
+            ),
+        );
+        project
+            .exchange::<BeginAcquisitionResult>(replacement_begin_acquisition(&fixture), None, None)
+            .expect("retry definitively unsent acquisition replacement");
+        let acquisition = fixture.transport.recorded("begin_acquisition");
+        assert_eq!(acquisition.len(), 2);
+        assert_eq!(acquisition[0].frame, acquisition[1].frame);
+        assert!(
+            acquisition
+                .iter()
+                .all(|request| request.listener_fd.is_none())
+        );
+
+        fixture.transport.push_error(
+            "begin_rebind",
+            transport_failure(DeliveryCertainty::NotSent),
+        );
+        fixture.transport.push(
+            "begin_rebind",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_rebind_result(AttemptState::Pending, ATTEMPT_B),
+            ),
+        );
+        project
+            .exchange::<BeginRebindResult>(replacement_begin_rebind(), None, None)
+            .expect("retry definitively unsent rebind replacement");
+        let rebind = fixture.transport.recorded("begin_rebind");
+        assert_eq!(rebind.len(), 2);
+        assert_eq!(rebind[0].frame, rebind[1].frame);
+        assert!(rebind.iter().all(|request| request.listener_fd.is_none()));
+    }
+
+    #[test]
+    fn wake_barrier_pending_acquire_reuses_exact_frame_and_listener() {
+        let fixture = fixture();
+        fixture.transport.push(
+            "begin_acquisition",
+            &ResponseEnvelope::success(
+                fixture.epoch.clone(),
+                begin_result(&fixture, ATTEMPT_A, AttemptState::Pending),
+            ),
+        );
+        fixture
+            .transport
+            .push("acquire", &wake_barrier_pending::<AcquireResult>(&fixture));
+        fixture.transport.push(
+            "acquire",
+            &ResponseEnvelope::success(fixture.epoch.clone(), acquire_result(10_000)),
+        );
+        let installed = project(&fixture)
+            .prepare(ServiceName::parse("workbench").expect("service"))
+            .expect("prepare")
+            .confirm_origin_installed(&origin())
+            .expect("origin installed");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let lease = installed.acquire(&listener).expect("acquire after barrier");
+
+        let requests = fixture.transport.recorded("acquire");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].frame, requests[1].frame);
+        assert!(requests[0].listener_fd.is_some());
+        assert_eq!(requests[0].listener_fd, requests[1].listener_fd);
         release_success(&fixture);
         lease.release().expect("release");
     }

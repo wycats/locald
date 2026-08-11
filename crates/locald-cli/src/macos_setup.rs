@@ -1,16 +1,22 @@
 //! Fail-closed macOS installation, readiness, and repair transaction.
 
+#![allow(clippy::redundant_pub_crate)] // The sibling command handler owns this transaction.
+
 use anyhow::{Context, Result};
 use locald_helper_protocol::{
     AUTHORITY_MAX_BYTES, AUTHORITY_PATH, HELPER_PATH, HELPER_PLIST_PATH, HelperAuthority,
     code_signing, load_authority,
+};
+use locald_publisher_protocol::{
+    INSTALLATION_RECORD_MAX_BYTES, INSTALLATION_RECORD_NAME, InstallationRecord,
+    PUBLISHER_SOCKET_RELATIVE_PATH, STANDARD_COMMAND_SOCKET,
 };
 use locald_utils::privileged::{
     CgroupStrategyKind, CleanupMode, DoctorReport, EvidenceItem, FixAdvice, FixKey, Problem,
     Severity, Status, StrategyReport,
 };
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -37,10 +43,20 @@ struct InstallationPaths {
     certs: PathBuf,
     agent: PathBuf,
     launch_agent: PathBuf,
+    publisher_installation: PathBuf,
     daemon: PathBuf,
 }
 
 impl InstallationPaths {
+    fn publisher_installation_for_owner(owner: &SetupOwner) -> PathBuf {
+        owner
+            .home
+            .join("Library")
+            .join("Application Support")
+            .join("com.locald.locald")
+            .join(INSTALLATION_RECORD_NAME)
+    }
+
     fn for_owner(owner: &SetupOwner, daemon: PathBuf) -> Self {
         let data = owner
             .home
@@ -53,6 +69,7 @@ impl InstallationPaths {
             launch_agent: owner
                 .home
                 .join("Library/LaunchAgents/com.locald.agent.plist"),
+            publisher_installation: Self::publisher_installation_for_owner(owner),
             daemon,
         }
     }
@@ -93,11 +110,12 @@ impl SetupPlatform for SystemPlatform {
         owner: &SetupOwner,
         launch_agent_plist: &Path,
     ) -> Result<Box<dyn RuntimeQuiescence>> {
-        quiesce_runtime_transactionally(
+        let runtime_quiescence = quiesce_runtime_transactionally(
             || bootout_launch_agent(owner),
             || stop_user_daemon(owner),
             || self.start_launch_agent(owner, launch_agent_plist),
-        )
+        )?;
+        Ok(Box::new(runtime_quiescence))
     }
 
     fn retire_native_host_entries(&self) -> Result<()> {
@@ -141,13 +159,10 @@ fn quiesce_runtime_transactionally<T>(
     bootout: impl FnOnce() -> Result<()>,
     stop_daemon: impl FnOnce() -> Result<T>,
     restore_launch_agent: impl FnOnce() -> Result<()>,
-) -> Result<Box<dyn RuntimeQuiescence>>
-where
-    T: RuntimeQuiescence + 'static,
-{
+) -> Result<T> {
     bootout()?;
     match stop_daemon() {
-        Ok(guard) => Ok(Box::new(guard)),
+        Ok(guard) => Ok(guard),
         Err(quiescence_error) => match restore_launch_agent() {
             Ok(()) => Err(quiescence_error),
             Err(restart_error) => Err(quiescence_error.context(format!(
@@ -174,6 +189,74 @@ fn bootout_launch_agent(owner: &SetupOwner) -> Result<()> {
 
 struct DaemonQuiescence {
     _catalog_writer_lock: File,
+    command_socket: PathBuf,
+}
+
+/// One fail-closed macOS teardown transaction.
+///
+/// The catalog-writer lock remains held until the authoritative installation
+/// record is removed, preventing a `LaunchAgent` or manual daemon restart from
+/// racing artifact retirement.
+pub(super) struct MacOsTeardownTransaction {
+    owner: SetupOwner,
+    daemon_quiescence: DaemonQuiescence,
+}
+
+impl MacOsTeardownTransaction {
+    /// Remove the owner-controlled menu bar agent binary while daemon restart
+    /// remains fenced.
+    pub(super) fn remove_agent_binary(&self) -> Result<()> {
+        let path = self
+            .owner
+            .home
+            .join("Library/Application Support/locald/locald-agent");
+        remove_owner_regular_file(&self.owner, &path, "menu bar agent")
+    }
+
+    /// Remove the authoritative record last and complete the transaction.
+    pub(super) fn remove_publisher_record(self) -> Result<()> {
+        remove_stale_command_socket_for_owner(&self.owner, &self.daemon_quiescence.command_socket)?;
+        let path = InstallationPaths::publisher_installation_for_owner(&self.owner);
+        let publisher_socket = path
+            .parent()
+            .context("publisher installation record has no data directory")?
+            .join(PUBLISHER_SOCKET_RELATIVE_PATH);
+        remove_stale_publisher_socket_for_owner(&self.owner, &publisher_socket)?;
+        remove_publisher_record_for_owner(&self.owner, &path)
+    }
+}
+
+/// Stop `launchd` and the user daemon, remove the `LaunchAgent` plist, and retain
+/// the daemon's catalog-writer lock for the rest of teardown.
+pub(super) fn begin_teardown_transaction() -> Result<MacOsTeardownTransaction> {
+    let owner = resolve_setup_owner()?;
+    let launch_agent = owner
+        .home
+        .join("Library/LaunchAgents/com.locald.agent.plist");
+    let platform = SystemPlatform;
+    begin_teardown_transaction_with(
+        &owner,
+        &launch_agent,
+        || bootout_launch_agent(&owner),
+        || stop_user_daemon(&owner),
+        || platform.start_launch_agent(&owner, &launch_agent),
+    )
+}
+
+fn begin_teardown_transaction_with(
+    owner: &SetupOwner,
+    launch_agent: &Path,
+    bootout: impl FnOnce() -> Result<()>,
+    stop_daemon: impl FnOnce() -> Result<DaemonQuiescence>,
+    restore_launch_agent: impl FnOnce() -> Result<()>,
+) -> Result<MacOsTeardownTransaction> {
+    let daemon_quiescence =
+        quiesce_runtime_transactionally(bootout, stop_daemon, restore_launch_agent)?;
+    remove_owner_regular_file(owner, launch_agent, "LaunchAgent plist")?;
+    Ok(MacOsTeardownTransaction {
+        owner: owner.clone(),
+        daemon_quiescence,
+    })
 }
 
 enum CatalogWriterLockProbe {
@@ -273,6 +356,7 @@ fn stop_user_daemon_at(
                     .context("daemon quiescence completed without holding the catalog lock")?;
                 return Ok(DaemonQuiescence {
                     _catalog_writer_lock: catalog_writer_lock,
+                    command_socket: socket.to_path_buf(),
                 });
             }
         } else {
@@ -544,6 +628,9 @@ fn run_setup_with(
     authority: &HelperAuthority,
     platform: &impl SetupPlatform,
 ) -> Result<()> {
+    install_publisher_record(owner, &paths.publisher_installation)
+        .context("could not publish the locald installation record")?;
+
     let ca = locald_utils::cert::repair_root_ca_in_dir(&paths.certs, owner.uid, owner.gid)
         .context("could not establish valid Root CA material")?;
     platform
@@ -617,6 +704,26 @@ fn run_setup_with(
     }
 }
 
+fn install_publisher_record(owner: &SetupOwner, path: &Path) -> Result<()> {
+    let record = InstallationRecord::v1().context("publisher installation policy is invalid")?;
+    let bytes = serde_json::to_vec(&record)
+        .context("could not encode the publisher installation record")?;
+    anyhow::ensure!(
+        bytes.len() <= INSTALLATION_RECORD_MAX_BYTES,
+        "publisher installation record exceeds its protocol size bound"
+    );
+    let directory = ensure_directory(
+        path.parent()
+            .context("publisher installation record has no parent")?,
+        owner.uid,
+        owner.gid,
+        0o700,
+    )
+    .context("could not secure the publisher installation directory")?;
+    atomic_install_file_at(&directory, path, &bytes, 0o600, owner.uid, owner.gid)
+        .context("could not atomically install the publisher installation record")
+}
+
 /// Collect the canonical structured macOS installation-readiness report.
 pub fn collect_report(verbose: bool) -> Result<DoctorReport> {
     if std::env::var_os("LOCALD_SANDBOX_ACTIVE").is_some()
@@ -671,6 +778,17 @@ fn collect_report_for(caller: ReportCaller, _verbose: bool) -> Result<DoctorRepo
 
     match paths.as_ref() {
         Ok(paths) => {
+            push_check(
+                &mut problems,
+                "macos.publisher.installation",
+                "Publisher installation record is valid and securely installed",
+                owner_result.as_ref().map_or_else(
+                    |error| Err(anyhow::anyhow!("setup owner unavailable: {error}")),
+                    |owner| {
+                        validate_publisher_installation_record(&paths.publisher_installation, owner)
+                    },
+                ),
+            );
             push_check(
                 &mut problems,
                 "macos.ca.material",
@@ -732,6 +850,10 @@ fn collect_report_for(caller: ReportCaller, _verbose: bool) -> Result<DoctorRepo
         }
         Err(error) => {
             for (id, summary) in [
+                (
+                    "macos.publisher.installation",
+                    "Publisher installation record is valid and securely installed",
+                ),
                 (
                     "macos.ca.material",
                     "Root CA certificate and key are valid and matched",
@@ -956,6 +1078,107 @@ fn validate_file(path: &Path, expected: &[u8], owner: Option<(u32, u32)>, mode: 
     Ok(())
 }
 
+fn validate_publisher_installation_record(path: &Path, owner: &SetupOwner) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("publisher installation record has no parent directory")?;
+    let directory = open_existing_directory(parent)?.with_context(|| {
+        format!(
+            "publisher installation record directory is missing at {}",
+            parent.display()
+        )
+    })?;
+    let directory_metadata = nix::sys::stat::fstat(&directory)
+        .with_context(|| format!("could not inspect {}", parent.display()))?;
+    let directory_mode = directory_metadata.st_mode & 0o7777;
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(directory_metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFDIR,
+        "publisher installation record directory at {} is not a real directory",
+        parent.display()
+    );
+    anyhow::ensure!(
+        directory_metadata.st_uid == owner.uid && directory_metadata.st_gid == owner.gid,
+        "publisher installation record directory at {} is owned by {}:{}, expected {}:{}",
+        parent.display(),
+        directory_metadata.st_uid,
+        directory_metadata.st_gid,
+        owner.uid,
+        owner.gid
+    );
+    anyhow::ensure!(
+        directory_mode == 0o700,
+        "publisher installation record directory at {} has mode {directory_mode:04o}, expected 0700",
+        parent.display()
+    );
+
+    let name = path
+        .file_name()
+        .context("publisher installation record has no file name")?;
+    let descriptor = match nix::fcntl::openat(
+        &directory,
+        name,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC
+            | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(nix::errno::Errno::ENOENT) => {
+            anyhow::bail!(
+                "publisher installation record is missing at {}",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not open {} safely", path.display()));
+        }
+    };
+    let metadata = nix::sys::stat::fstat(&descriptor)
+        .with_context(|| format!("could not inspect {}", path.display()))?;
+    let mode = metadata.st_mode & 0o7777;
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFREG,
+        "publisher installation record at {} is not a regular non-symlink file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.st_uid == owner.uid && metadata.st_gid == owner.gid,
+        "publisher installation record at {} is owned by {}:{}, expected {}:{}",
+        path.display(),
+        metadata.st_uid,
+        metadata.st_gid,
+        owner.uid,
+        owner.gid
+    );
+    anyhow::ensure!(
+        mode == 0o600,
+        "publisher installation record at {} has mode {mode:04o}, expected 0600",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.st_size >= 0 && metadata.st_size as usize <= INSTALLATION_RECORD_MAX_BYTES,
+        "publisher installation record exceeds {INSTALLATION_RECORD_MAX_BYTES} bytes"
+    );
+
+    let mut bytes = Vec::new();
+    File::from(descriptor)
+        .take((INSTALLATION_RECORD_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= INSTALLATION_RECORD_MAX_BYTES,
+        "publisher installation record exceeds {INSTALLATION_RECORD_MAX_BYTES} bytes"
+    );
+    let record = serde_json::from_slice::<InstallationRecord>(&bytes)
+        .context("publisher installation record is malformed or incompatible")?;
+    record
+        .validate()
+        .context("publisher installation record is incompatible")
+}
+
 fn validate_launch_agent(
     path: &Path,
     paths: &InstallationPaths,
@@ -1028,6 +1251,10 @@ fn report_from_problems(problems: Vec<Problem>) -> DoctorReport {
 fn sandbox_report() -> DoctorReport {
     let problems = [
         ("macos.console_user", "Console-user identity"),
+        (
+            "macos.publisher.installation",
+            "Publisher installation record",
+        ),
         ("macos.ca.material", "Root CA material"),
         ("macos.ca.permissions", "Root CA permissions"),
         ("macos.ca.trust", "System Root CA trust"),
@@ -1233,6 +1460,222 @@ fn atomic_install_file_at(
     result
 }
 
+fn open_existing_directory(path: &Path) -> Result<Option<OwnedFd>> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "installation directory must be absolute: {}",
+            path.display()
+        );
+    }
+
+    let flags = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_DIRECTORY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    let mut directory = nix::fcntl::open("/", flags, nix::sys::stat::Mode::empty())
+        .context("could not open the filesystem root safely")?;
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            anyhow::bail!(
+                "installation directory has an unsupported component: {}",
+                path.display()
+            );
+        };
+        current.push(name);
+        directory = match nix::fcntl::openat(&directory, name, flags, nix::sys::stat::Mode::empty())
+        {
+            Ok(next) => next,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not open {} safely", current.display()));
+            }
+        };
+    }
+    Ok(Some(directory))
+}
+
+fn remove_publisher_record_for_owner(owner: &SetupOwner, path: &Path) -> Result<()> {
+    remove_owner_regular_file(owner, path, "publisher installation record")
+}
+
+fn remove_stale_publisher_socket_for_owner(owner: &SetupOwner, path: &Path) -> Result<()> {
+    remove_stale_unix_socket_for_owner(
+        owner,
+        path,
+        "publisher socket",
+        SocketParentAuthority::OwnerControlled,
+    )
+}
+
+fn remove_stale_command_socket_for_owner(owner: &SetupOwner, path: &Path) -> Result<()> {
+    let parent_authority = if path == Path::new(STANDARD_COMMAND_SOCKET) {
+        SocketParentAuthority::MacOsTemporaryDirectory
+    } else {
+        // Hermetic tests use an owner-controlled command-socket directory.
+        SocketParentAuthority::OwnerControlled
+    };
+    remove_stale_unix_socket_for_owner(owner, path, "command socket", parent_authority)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SocketParentAuthority {
+    OwnerControlled,
+    MacOsTemporaryDirectory,
+}
+
+fn remove_stale_unix_socket_for_owner(
+    owner: &SetupOwner,
+    path: &Path,
+    role: &str,
+    parent_authority: SocketParentAuthority,
+) -> Result<()> {
+    let requested_parent = path
+        .parent()
+        .with_context(|| format!("{role} has no parent directory"))?;
+    // `/tmp` is the system-owned `/private/tmp` symlink on macOS. Open the
+    // stable real directory directly so descriptor-anchored inspection does
+    // not follow an attacker-controlled path component.
+    let parent = match parent_authority {
+        SocketParentAuthority::OwnerControlled => requested_parent,
+        SocketParentAuthority::MacOsTemporaryDirectory => Path::new("/private/tmp"),
+    };
+    let Some(directory) = open_existing_directory(parent)? else {
+        return Ok(());
+    };
+    let name = path
+        .file_name()
+        .with_context(|| format!("{role} has no file name"))?;
+    let metadata =
+        match nix::sys::stat::fstatat(&directory, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(nix::errno::Errno::ENOENT) => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not inspect {} safely", path.display()));
+            }
+        };
+    let directory_metadata = nix::sys::stat::fstat(&directory)
+        .with_context(|| format!("could not inspect {}", parent.display()))?;
+    let directory_mode = directory_metadata.st_mode & 0o7777;
+    let directory_is_safe = match parent_authority {
+        SocketParentAuthority::OwnerControlled => {
+            directory_metadata.st_uid == owner.uid && directory_mode & 0o022 == 0
+        }
+        SocketParentAuthority::MacOsTemporaryDirectory => {
+            directory_metadata.st_uid == 0
+                && directory_mode & libc::S_ISVTX as libc::mode_t != 0
+                && directory_mode & 0o002 != 0
+        }
+    };
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(directory_metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFDIR
+            && directory_is_safe,
+        "{role} directory at {} is not a safe teardown directory",
+        parent.display()
+    );
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFSOCK
+            && metadata.st_uid == owner.uid,
+        "{role} at {} is not an owner-controlled Unix socket",
+        path.display()
+    );
+
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => anyhow::bail!("{role} at {} still has an active listener", path.display()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not prove {role} {} is stale", path.display()));
+        }
+    }
+
+    let current =
+        match nix::sys::stat::fstatat(&directory, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(nix::errno::Errno::ENOENT) => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not recheck {} safely", path.display()));
+            }
+        };
+    let same_file = current.st_dev == metadata.st_dev && current.st_ino == metadata.st_ino;
+    let same_owner = current.st_uid == owner.uid;
+    let remains_socket = nix::sys::stat::SFlag::from_bits_truncate(current.st_mode)
+        == nix::sys::stat::SFlag::S_IFSOCK;
+    anyhow::ensure!(
+        same_file && same_owner && remains_socket,
+        "{role} at {} changed while proving it stale",
+        path.display()
+    );
+    nix::unistd::unlinkat(&directory, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+        .with_context(|| format!("could not remove stale {role} {}", path.display()))?;
+    nix::unistd::fsync(&directory).with_context(|| {
+        format!(
+            "could not synchronize stale {role} removal at {}",
+            path.display()
+        )
+    })?;
+    match nix::sys::stat::fstatat(&directory, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Ok(_) => anyhow::bail!("{role} at {} still exists after removal", path.display()),
+        Err(error) => {
+            Err(error).with_context(|| format!("could not verify removal of {}", path.display()))
+        }
+    }
+}
+
+fn remove_owner_regular_file(owner: &SetupOwner, path: &Path, role: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{role} has no parent"))?;
+    let Some(directory) = open_existing_directory(parent)? else {
+        return Ok(());
+    };
+    let name = path
+        .file_name()
+        .context("publisher installation record has no file name")?;
+    let metadata =
+        match nix::sys::stat::fstatat(&directory, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(nix::errno::Errno::ENOENT) => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not inspect {} safely", path.display()));
+            }
+        };
+    let directory_metadata = nix::sys::stat::fstat(&directory)
+        .with_context(|| format!("could not inspect {}", parent.display()))?;
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(directory_metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFDIR
+            && directory_metadata.st_uid == owner.uid,
+        "{role} directory at {} is not owned by the setup user",
+        parent.display()
+    );
+    anyhow::ensure!(
+        nix::sys::stat::SFlag::from_bits_truncate(metadata.st_mode)
+            == nix::sys::stat::SFlag::S_IFREG
+            && metadata.st_uid == owner.uid,
+        "{role} at {} is not an owner-controlled regular file",
+        path.display()
+    );
+    nix::unistd::unlinkat(&directory, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+        .with_context(|| format!("could not remove {} safely", path.display()))?;
+    nix::unistd::fsync(&directory)
+        .with_context(|| format!("could not synchronize removal of {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,7 +1746,9 @@ mod tests {
         InstallationPaths,
         HelperAuthority,
     ) {
-        let root = tempfile::tempdir().unwrap();
+        // Keep the derived publisher socket below Darwin's short `sun_path`
+        // bound while still exercising the complete owner-home hierarchy.
+        let root = tempfile::tempdir_in("/tmp").unwrap();
         let owner = SetupOwner {
             uid: nix::unistd::getuid().as_raw(),
             gid: nix::unistd::getgid().as_raw(),
@@ -1323,6 +1768,121 @@ mod tests {
         (root, owner, paths, authority)
     }
 
+    fn publisher_socket_fixture(paths: &InstallationPaths) -> PathBuf {
+        let socket = paths
+            .publisher_installation
+            .parent()
+            .unwrap()
+            .join(PUBLISHER_SOCKET_RELATIVE_PATH);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            socket.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        socket
+    }
+
+    fn teardown_transaction(
+        root: &tempfile::TempDir,
+        owner: &SetupOwner,
+    ) -> MacOsTeardownTransaction {
+        teardown_transaction_with_command_socket(root, owner, owner.home.join("locald.sock"))
+    }
+
+    fn teardown_transaction_with_command_socket(
+        root: &tempfile::TempDir,
+        owner: &SetupOwner,
+        command_socket: PathBuf,
+    ) -> MacOsTeardownTransaction {
+        let catalog_writer_lock = std::fs::File::create(root.path().join("catalog.writer.lock"))
+            .expect("create teardown writer lock");
+        MacOsTeardownTransaction {
+            owner: owner.clone(),
+            daemon_quiescence: DaemonQuiescence {
+                _catalog_writer_lock: catalog_writer_lock,
+                command_socket,
+            },
+        }
+    }
+
+    fn assert_publisher_installation_record_is_intact(paths: &InstallationPaths) {
+        assert_eq!(
+            serde_json::from_slice::<InstallationRecord>(
+                &std::fs::read(&paths.publisher_installation).unwrap()
+            )
+            .unwrap(),
+            InstallationRecord::v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn publisher_record_readiness_accepts_the_setup_owned_v1_record() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+
+        validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect("the setup-owned record must satisfy readiness");
+    }
+
+    #[test]
+    fn publisher_record_readiness_rejects_a_missing_record() {
+        let (_root, owner, paths, _authority) = fixture();
+
+        let error = validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect_err("a missing publisher record must fail readiness");
+
+        assert!(format!("{error:#}").contains("record directory is missing"));
+    }
+
+    #[test]
+    fn publisher_record_readiness_rejects_malformed_content() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        std::fs::write(&paths.publisher_installation, b"not-json").unwrap();
+
+        let error = validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect_err("a malformed publisher record must fail readiness");
+
+        assert!(format!("{error:#}").contains("malformed or incompatible"));
+    }
+
+    #[test]
+    fn publisher_record_readiness_rejects_unsafe_mode() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        std::fs::set_permissions(
+            &paths.publisher_installation,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let error = validate_publisher_installation_record(&paths.publisher_installation, &owner)
+            .expect_err("a group-readable publisher record must fail readiness");
+
+        assert!(format!("{error:#}").contains("mode 0644, expected 0600"));
+    }
+
+    #[test]
+    fn publisher_record_readiness_uses_the_resolved_setup_owner() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let different_owner = SetupOwner {
+            uid: owner.uid.wrapping_add(1),
+            gid: owner.gid,
+            home: owner.home.clone(),
+        };
+
+        let error =
+            validate_publisher_installation_record(&paths.publisher_installation, &different_owner)
+                .expect_err(
+                    "a record outside the resolved setup owner's authority must fail readiness",
+                );
+
+        assert!(format!("{error:#}").contains("expected"));
+        assert!(format!("{error:#}").contains(&different_owner.uid.to_string()));
+    }
+
     #[test]
     fn repair_transaction_is_atomic_idempotent_and_replaces_stale_components() {
         let (_root, owner, paths, authority) = fixture();
@@ -1338,6 +1898,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&paths.agent, b"stale").unwrap();
+        std::fs::write(&paths.publisher_installation, b"stale").unwrap();
         run_setup_with(
             &owner,
             &paths,
@@ -1349,6 +1910,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read(&paths.agent).unwrap(), b"agent-v1");
+        assert_eq!(
+            serde_json::from_slice::<InstallationRecord>(
+                &std::fs::read(&paths.publisher_installation).unwrap()
+            )
+            .unwrap(),
+            InstallationRecord::v1().unwrap()
+        );
+        let publisher_directory = paths.publisher_installation.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(publisher_directory).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.publisher_installation)
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.publisher_installation)
+                .unwrap()
+                .uid(),
+            owner.uid
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.publisher_installation)
+                .unwrap()
+                .gid(),
+            owner.gid
+        );
         assert_eq!(
             std::fs::metadata(&paths.agent).unwrap().mode() & 0o7777,
             0o755
@@ -1376,6 +1968,215 @@ mod tests {
                 "agent"
             ]
         );
+    }
+
+    #[test]
+    fn installation_record_is_durable_before_the_first_platform_step() {
+        let (_root, owner, paths, authority) = fixture();
+        let platform = RecordingPlatform {
+            fail_at: vec!["trust"],
+            ..RecordingPlatform::default()
+        };
+
+        let error = run_setup_with(
+            &owner,
+            &paths,
+            b"agent-v1",
+            b"helper-v1",
+            &authority,
+            &platform,
+        )
+        .expect_err("the first platform failure must stop setup");
+
+        assert!(format!("{error:#}").contains("could not install Root CA into system trust"));
+        assert_eq!(platform.calls.lock().unwrap().as_slice(), ["trust"]);
+        assert_eq!(
+            serde_json::from_slice::<InstallationRecord>(
+                &std::fs::read(&paths.publisher_installation).unwrap()
+            )
+            .unwrap(),
+            InstallationRecord::v1().unwrap()
+        );
+        assert!(!paths.agent.exists());
+        assert!(!paths.launch_agent.exists());
+    }
+
+    #[test]
+    fn publisher_record_removal_is_safe_durable_and_idempotent() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+
+        // Teardown must still remove installed-invalid evidence rather than
+        // requiring setup to repair its permissions first.
+        std::fs::set_permissions(
+            paths.publisher_installation.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &paths.publisher_installation,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        remove_publisher_record_for_owner(&owner, &paths.publisher_installation).unwrap();
+        assert!(!paths.publisher_installation.exists());
+        remove_publisher_record_for_owner(&owner, &paths.publisher_installation).unwrap();
+    }
+
+    #[test]
+    fn publisher_record_removal_rejects_a_symlink() {
+        let (root, owner, paths, _authority) = fixture();
+        let parent = paths.publisher_installation.parent().unwrap();
+        let directory = ensure_directory(parent, owner.uid, owner.gid, 0o700).unwrap();
+        drop(directory);
+        let outside = root.path().join("outside-record");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, &paths.publisher_installation).unwrap();
+
+        remove_publisher_record_for_owner(&owner, &paths.publisher_installation)
+            .expect_err("a symlinked record must fail closed");
+
+        assert!(std::fs::symlink_metadata(&paths.publisher_installation).is_ok());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn teardown_removes_a_stale_publisher_socket_before_the_installation_record() {
+        let (root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let socket = publisher_socket_fixture(&paths);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind publisher socket fixture");
+        drop(listener);
+
+        teardown_transaction(&root, &owner)
+            .remove_publisher_record()
+            .expect("remove stale socket and installation record");
+
+        assert!(std::fs::symlink_metadata(&socket).is_err());
+        assert!(std::fs::symlink_metadata(&paths.publisher_installation).is_err());
+    }
+
+    #[test]
+    fn teardown_removes_a_crash_stale_command_socket_before_the_installation_record() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let command_socket = owner.home.join("locald.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&command_socket)
+            .expect("bind command socket fixture");
+        drop(listener);
+        let daemon_quiescence = stop_user_daemon_at(
+            owner.uid,
+            owner.gid,
+            &command_socket,
+            &owner.home.join("catalog.writer.lock"),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(25),
+        )
+        .expect("prove the crash-stale daemon quiescent");
+
+        MacOsTeardownTransaction {
+            owner: owner.clone(),
+            daemon_quiescence,
+        }
+        .remove_publisher_record()
+        .expect("remove stale command socket and installation record");
+
+        assert!(std::fs::symlink_metadata(command_socket).is_err());
+        assert!(std::fs::symlink_metadata(&paths.publisher_installation).is_err());
+    }
+
+    #[test]
+    fn teardown_rejects_an_active_command_socket_and_preserves_the_installation_record() {
+        let (root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let command_socket = owner.home.join("locald.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&command_socket)
+            .expect("bind active command socket fixture");
+
+        let error = teardown_transaction_with_command_socket(&root, &owner, command_socket.clone())
+            .remove_publisher_record()
+            .expect_err("an active command listener must fail closed");
+
+        assert!(format!("{error:#}").contains("still has an active listener"));
+        assert!(std::fs::symlink_metadata(command_socket).is_ok());
+        assert_publisher_installation_record_is_intact(&paths);
+    }
+
+    #[test]
+    fn teardown_rejects_a_non_socket_command_occupant_and_preserves_the_record() {
+        let (root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let command_socket = owner.home.join("locald.sock");
+        std::fs::write(&command_socket, b"not a socket")
+            .expect("create unsafe command socket occupant");
+
+        let error = teardown_transaction_with_command_socket(&root, &owner, command_socket.clone())
+            .remove_publisher_record()
+            .expect_err("a non-socket command occupant must fail closed");
+
+        assert!(format!("{error:#}").contains("not an owner-controlled Unix socket"));
+        assert_eq!(std::fs::read(command_socket).unwrap(), b"not a socket");
+        assert_publisher_installation_record_is_intact(&paths);
+    }
+
+    #[test]
+    fn teardown_rejects_an_active_publisher_socket_and_preserves_the_installation_record() {
+        let (root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let socket = publisher_socket_fixture(&paths);
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)
+            .expect("bind active publisher socket fixture");
+
+        let error = teardown_transaction(&root, &owner)
+            .remove_publisher_record()
+            .expect_err("an active publisher listener must fail closed");
+
+        assert!(format!("{error:#}").contains("still has an active listener"));
+        assert!(std::fs::symlink_metadata(&socket).is_ok());
+        assert_publisher_installation_record_is_intact(&paths);
+    }
+
+    #[test]
+    fn teardown_rejects_a_non_socket_occupant_and_preserves_the_installation_record() {
+        let (root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let socket = publisher_socket_fixture(&paths);
+        std::fs::write(&socket, b"not a socket").expect("create unsafe socket occupant");
+
+        let error = teardown_transaction(&root, &owner)
+            .remove_publisher_record()
+            .expect_err("a non-socket occupant must fail closed");
+
+        assert!(format!("{error:#}").contains("not an owner-controlled Unix socket"));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+        assert_publisher_installation_record_is_intact(&paths);
+    }
+
+    #[test]
+    fn teardown_rejects_a_symlink_socket_occupant_and_preserves_the_installation_record() {
+        let (root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        let socket = publisher_socket_fixture(&paths);
+        let outside = root.path().join("outside-socket");
+        std::fs::write(&outside, b"outside").expect("create symlink target");
+        std::os::unix::fs::symlink(&outside, &socket).expect("create unsafe socket symlink");
+
+        let error = teardown_transaction(&root, &owner)
+            .remove_publisher_record()
+            .expect_err("a symlinked socket occupant must fail closed");
+
+        assert!(format!("{error:#}").contains("not an owner-controlled Unix socket"));
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert_publisher_installation_record_is_intact(&paths);
     }
 
     #[test]
@@ -1477,6 +2278,47 @@ mod tests {
                 "agent"
             ]
         );
+    }
+
+    #[test]
+    fn teardown_restores_the_launch_agent_when_daemon_quiescence_fails() {
+        let (_root, owner, paths, _authority) = fixture();
+        install_publisher_record(&owner, &paths.publisher_installation).unwrap();
+        std::fs::create_dir_all(paths.launch_agent.parent().unwrap())
+            .expect("create LaunchAgents directory");
+        std::fs::write(&paths.launch_agent, b"installed launch agent")
+            .expect("install LaunchAgent plist");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let error = begin_teardown_transaction_with(
+            &owner,
+            &paths.launch_agent,
+            || {
+                calls.lock().unwrap().push("bootout");
+                Ok(())
+            },
+            || -> Result<DaemonQuiescence> {
+                calls.lock().unwrap().push("stop");
+                anyhow::bail!("injected daemon stop failure")
+            },
+            || {
+                calls.lock().unwrap().push("agent");
+                Ok(())
+            },
+        )
+        .err()
+        .expect("daemon stop failure must abort teardown after restoration");
+
+        assert!(format!("{error:#}").contains("injected daemon stop failure"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["bootout", "stop", "agent"]
+        );
+        assert_eq!(
+            std::fs::read(&paths.launch_agent).unwrap(),
+            b"installed launch agent"
+        );
+        assert_publisher_installation_record_is_intact(&paths);
     }
 
     #[test]
@@ -1946,6 +2788,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "macos.console_user",
+                "macos.publisher.installation",
                 "macos.ca.material",
                 "macos.ca.permissions",
                 "macos.ca.trust",

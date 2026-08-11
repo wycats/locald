@@ -1,11 +1,11 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use locald_publisher_protocol::{
-    INSTALLATION_RECORD_MAX_BYTES, INSTALLATION_RECORD_NAME, InstallationRecord,
+    AbsolutePath, INSTALLATION_RECORD_MAX_BYTES, INSTALLATION_RECORD_NAME, InstallationRecord,
     PUBLISHER_SOCKET_RELATIVE_PATH, PublishedEndpointProtocolInfo, STANDARD_COMMAND_SOCKET,
 };
 use nix::errno::Errno;
@@ -19,19 +19,39 @@ use crate::backend::{AuthenticatedDaemonDiscovery, BackendError, UnixCommandSock
 /// A verified compatible locald installation and active publisher transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPublisher {
-    /// Safely read setup-owned installation record.
-    record: InstallationRecord,
+    /// Exact authority used to discover this publisher.
+    authority: InstallationAuthority,
     /// Kernel-authenticated UID of the active daemon.
     daemon_uid: u32,
     /// Exact active publisher protocol information.
     protocol_info: PublishedEndpointProtocolInfo,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallationAuthority {
+    Standard(InstallationRecord),
+    ExplicitSandbox(SandboxPublisherContext),
+}
+
 impl InstalledPublisher {
-    /// Safely read setup-owned installation record.
+    /// Safely read the setup-owned record for a standard installation.
+    ///
+    /// Explicit sandbox discovery has no setup-owned installation record.
     #[must_use]
-    pub const fn record(&self) -> &InstallationRecord {
-        &self.record
+    pub const fn standard_record(&self) -> Option<&InstallationRecord> {
+        match &self.authority {
+            InstallationAuthority::Standard(record) => Some(record),
+            InstallationAuthority::ExplicitSandbox(_) => None,
+        }
+    }
+
+    /// Exact authenticated ordinary command socket for this publisher.
+    #[must_use]
+    pub const fn command_socket(&self) -> &AbsolutePath {
+        match &self.authority {
+            InstallationAuthority::Standard(record) => record.command_socket(),
+            InstallationAuthority::ExplicitSandbox(context) => context.command_socket(),
+        }
     }
 
     /// Kernel-authenticated UID of the active daemon.
@@ -46,17 +66,155 @@ impl InstalledPublisher {
         &self.protocol_info
     }
 
+    /// Whether this publisher was authenticated through an explicit sandbox
+    /// whose external supervisor guarantees that the host will not suspend.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) const fn has_no_host_suspend_guarantee(&self) -> bool {
+        match &self.authority {
+            InstallationAuthority::Standard(_) => false,
+            InstallationAuthority::ExplicitSandbox(context) => {
+                context.has_no_host_suspend_guarantee()
+            }
+        }
+    }
+
     pub(crate) const fn from_verified(
         record: InstallationRecord,
         daemon_uid: u32,
         protocol_info: PublishedEndpointProtocolInfo,
     ) -> Self {
         Self {
-            record,
+            authority: InstallationAuthority::Standard(record),
             daemon_uid,
             protocol_info,
         }
     }
+
+    pub(crate) const fn from_verified_sandbox(
+        context: SandboxPublisherContext,
+        daemon_uid: u32,
+        protocol_info: PublishedEndpointProtocolInfo,
+    ) -> Self {
+        Self {
+            authority: InstallationAuthority::ExplicitSandbox(context),
+            daemon_uid,
+            protocol_info,
+        }
+    }
+}
+
+/// Caller-selected paths for one explicit locald sandbox.
+///
+/// This context is never derived from ambient process state and carries no
+/// direct-fallback authority. A selected sandbox must authenticate and expose
+/// a compatible active publisher or fail visibly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPublisherContext {
+    data_dir: AbsolutePath,
+    command_socket: AbsolutePath,
+    suspend_policy: SandboxSuspendPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxSuspendPolicy {
+    SystemWakeObservation,
+    ExternallyGuaranteedNoHostSuspend,
+}
+
+impl SandboxPublisherContext {
+    /// Construct one explicit sandbox context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxProbeError::StandardCommandSocket`] when the caller
+    /// tries to label the standard installation command socket as a sandbox.
+    pub fn new(
+        data_dir: AbsolutePath,
+        command_socket: AbsolutePath,
+    ) -> Result<Self, SandboxProbeError> {
+        if command_socket.as_path() == Path::new(STANDARD_COMMAND_SOCKET) {
+            return Err(SandboxProbeError::StandardCommandSocket);
+        }
+        Ok(Self {
+            data_dir,
+            command_socket,
+            suspend_policy: SandboxSuspendPolicy::SystemWakeObservation,
+        })
+    }
+
+    /// Attach an external guarantee that the selected sandbox host will not
+    /// suspend while publication authority is live.
+    ///
+    /// This is intentionally separate from selecting a sandbox: sandbox mode
+    /// alone says nothing about host power management. Callers may assert this
+    /// only when they control the host lifecycle for the complete daemon and
+    /// publisher session, and must select the matching daemon launch policy.
+    #[must_use]
+    pub const fn with_no_host_suspend_guarantee(mut self) -> Self {
+        self.suspend_policy = SandboxSuspendPolicy::ExternallyGuaranteedNoHostSuspend;
+        self
+    }
+
+    /// Exact caller-selected sandbox data directory.
+    #[must_use]
+    pub const fn data_dir(&self) -> &AbsolutePath {
+        &self.data_dir
+    }
+
+    /// Exact caller-selected sandbox command socket.
+    #[must_use]
+    pub const fn command_socket(&self) -> &AbsolutePath {
+        &self.command_socket
+    }
+
+    fn expected_publisher_socket(&self) -> PathBuf {
+        self.data_dir.as_path().join(PUBLISHER_SOCKET_RELATIVE_PATH)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    const fn has_no_host_suspend_guarantee(&self) -> bool {
+        matches!(
+            self.suspend_policy,
+            SandboxSuspendPolicy::ExternallyGuaranteedNoHostSuspend
+        )
+    }
+}
+
+/// Failure to authenticate and verify one explicitly selected sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SandboxProbeError {
+    /// The standard installation socket cannot be relabeled as a sandbox.
+    #[error("the standard command socket cannot be used as an explicit sandbox context")]
+    StandardCommandSocket,
+    /// The selected or standard command-socket identity could not be inspected.
+    #[error("cannot inspect command socket identity at `{path}`: {message}")]
+    CommandSocketInspection {
+        /// Socket path whose filesystem identity could not be inspected.
+        path: PathBuf,
+        /// Redaction-safe inspection failure.
+        message: String,
+    },
+    /// The selected sandbox daemon was unreachable, inactive, or incompatible.
+    #[error("explicit sandbox publisher discovery failed: {0}")]
+    Discovery(BackendError),
+    /// The authenticated daemon is not running as the caller's effective user.
+    #[error(
+        "explicit sandbox daemon belongs to UID {daemon_uid}, but publisher belongs to UID {expected_uid}"
+    )]
+    DaemonUidMismatch {
+        /// Effective UID required for this publisher process.
+        expected_uid: u32,
+        /// UID authenticated from the selected daemon connection.
+        daemon_uid: u32,
+    },
+    /// Active discovery named a publisher socket outside the selected data root.
+    #[error("sandbox publisher socket is `{actual}`, expected `{expected}`")]
+    PublisherSocketMismatch {
+        /// Only publisher socket valid beneath the selected sandbox data root.
+        expected: PathBuf,
+        /// Socket advertised by authenticated ordinary discovery.
+        actual: PathBuf,
+    },
 }
 
 /// Failure to prove positive absence or a usable compatible installation.
@@ -198,6 +356,97 @@ fn select_standard_home(
     } else {
         Ok(home)
     }
+}
+
+/// Authenticate and verify one caller-selected explicit sandbox.
+///
+/// Unlike [`probe_installation`], this positive-only probe never establishes
+/// installation absence and therefore never authorizes direct fallback. The
+/// caller must supply both paths from its deliberately selected sandbox
+/// context; ambient sandbox, storage, and socket variables are not consulted.
+///
+/// # Errors
+///
+/// Returns [`SandboxProbeError`] unless the selected command socket belongs to
+/// the effective user, advertises a compatible active protocol, and names the
+/// exact publisher socket beneath the selected sandbox data directory.
+pub fn probe_sandbox_publisher(
+    context: &SandboxPublisherContext,
+) -> Result<InstalledPublisher, SandboxProbeError> {
+    reject_standard_command_socket_identity(context)?;
+    let installed = probe_sandbox_publisher_with(context, &UnixCommandSocketDiscovery)?;
+    // Recheck after authenticated discovery so an ordinary path replacement
+    // cannot relabel the standard endpoint across the exchange.
+    reject_standard_command_socket_identity(context)?;
+    Ok(installed)
+}
+
+fn reject_standard_command_socket_identity(
+    context: &SandboxPublisherContext,
+) -> Result<(), SandboxProbeError> {
+    reject_standard_command_socket_identity_against(context, Path::new(STANDARD_COMMAND_SOCKET))
+}
+
+fn reject_standard_command_socket_identity_against(
+    context: &SandboxPublisherContext,
+    standard_command_socket: &Path,
+) -> Result<(), SandboxProbeError> {
+    let selected_path = context.command_socket().as_path();
+    let selected = std::fs::metadata(selected_path).map_err(|error| {
+        SandboxProbeError::CommandSocketInspection {
+            path: selected_path.to_path_buf(),
+            message: error.to_string(),
+        }
+    })?;
+    let standard = match std::fs::metadata(standard_command_socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(SandboxProbeError::CommandSocketInspection {
+                path: standard_command_socket.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if selected.dev() == standard.dev() && selected.ino() == standard.ino() {
+        Err(SandboxProbeError::StandardCommandSocket)
+    } else {
+        Ok(())
+    }
+}
+
+fn probe_sandbox_publisher_with(
+    context: &SandboxPublisherContext,
+    discovery: &dyn AuthenticatedDaemonDiscovery,
+) -> Result<InstalledPublisher, SandboxProbeError> {
+    let discovered = discovery
+        .protocol_info(context.command_socket())
+        .map_err(SandboxProbeError::Discovery)?;
+    let expected_uid = Uid::effective().as_raw();
+    if discovered.peer_uid != expected_uid {
+        return Err(SandboxProbeError::DaemonUidMismatch {
+            expected_uid,
+            daemon_uid: discovered.peer_uid,
+        });
+    }
+    discovered.value.validate().map_err(|error| {
+        SandboxProbeError::Discovery(BackendError::new(
+            crate::backend::BackendErrorKind::Protocol,
+            format!("sandbox daemon returned incompatible publisher policy: {error}"),
+        ))
+    })?;
+    let expected_publisher_socket = context.expected_publisher_socket();
+    if discovered.value.publisher_socket().as_path() != expected_publisher_socket {
+        return Err(SandboxProbeError::PublisherSocketMismatch {
+            expected: expected_publisher_socket,
+            actual: discovered.value.publisher_socket().to_path_buf(),
+        });
+    }
+    Ok(InstalledPublisher::from_verified_sandbox(
+        context.clone(),
+        discovered.peer_uid,
+        discovered.value,
+    ))
 }
 
 /// Probe the standard installation and its active authenticated publisher API.
@@ -382,7 +631,7 @@ fn validate_owner_mode(
             "{label} is owned by UID {owner_uid}, expected effective UID {current_uid}"
         )));
     }
-    let actual_mode = raw_mode & 0o777;
+    let actual_mode = raw_mode & 0o7777;
     if actual_mode != expected_mode {
         return Err(InstallationError::InvalidRecord(format!(
             "{label} has mode {actual_mode:#05o}, expected {expected_mode:#05o}"
@@ -464,9 +713,12 @@ fn find_trusted_path_executable(
 )]
 mod tests {
     use std::fs::{self, File};
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
 
+    use locald_core::{IpcRequest, IpcResponse};
     use locald_publisher_protocol::{AbsolutePath, DaemonEpoch};
     use tempfile::TempDir;
 
@@ -476,13 +728,36 @@ mod tests {
     #[derive(Debug)]
     struct FakeDiscovery {
         result: Result<AuthenticatedValue<PublishedEndpointProtocolInfo>, BackendError>,
+        command_sockets: Mutex<Vec<AbsolutePath>>,
+    }
+
+    impl FakeDiscovery {
+        fn new(
+            result: Result<AuthenticatedValue<PublishedEndpointProtocolInfo>, BackendError>,
+        ) -> Self {
+            Self {
+                result,
+                command_sockets: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn command_sockets(&self) -> Vec<AbsolutePath> {
+            self.command_sockets
+                .lock()
+                .expect("command sockets")
+                .clone()
+        }
     }
 
     impl AuthenticatedDaemonDiscovery for FakeDiscovery {
         fn protocol_info(
             &self,
-            _command_socket: &AbsolutePath,
+            command_socket: &AbsolutePath,
         ) -> Result<AuthenticatedValue<PublishedEndpointProtocolInfo>, BackendError> {
+            self.command_sockets
+                .lock()
+                .expect("command sockets")
+                .push(command_socket.clone());
             self.result.clone()
         }
 
@@ -513,12 +788,32 @@ mod tests {
     }
 
     fn discovery(context: &InstallationProbeContext) -> FakeDiscovery {
-        FakeDiscovery {
-            result: Ok(AuthenticatedValue {
-                peer_uid: Uid::effective().as_raw(),
-                value: active_info(context),
-            }),
-        }
+        FakeDiscovery::new(Ok(AuthenticatedValue {
+            peer_uid: Uid::effective().as_raw(),
+            value: active_info(context),
+        }))
+    }
+
+    fn sandbox_context(root: &TempDir) -> SandboxPublisherContext {
+        SandboxPublisherContext::new(
+            AbsolutePath::try_from(root.path().join("data/locald")).expect("sandbox data"),
+            AbsolutePath::try_from(root.path().join("locald.sock")).expect("command socket"),
+        )
+        .expect("sandbox context")
+    }
+
+    fn sandbox_info(context: &SandboxPublisherContext) -> PublishedEndpointProtocolInfo {
+        PublishedEndpointProtocolInfo::v1(
+            DaemonEpoch::from_bytes([3; 16]),
+            AbsolutePath::try_from(context.expected_publisher_socket()).expect("publisher socket"),
+        )
+    }
+
+    fn sandbox_discovery(context: &SandboxPublisherContext, peer_uid: u32) -> FakeDiscovery {
+        FakeDiscovery::new(Ok(AuthenticatedValue {
+            peer_uid,
+            value: sandbox_info(context),
+        }))
     }
 
     fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -546,6 +841,179 @@ mod tests {
             .expect("probe")
             .expect("installed");
         assert_eq!(installed.protocol_info, active_info(&context));
+    }
+
+    #[test]
+    fn explicit_sandbox_is_authenticated_without_an_installation_record() {
+        let root = TempDir::new().expect("tempdir");
+        let context = sandbox_context(&root);
+        let discovery = sandbox_discovery(&context, Uid::effective().as_raw());
+
+        let installed = probe_sandbox_publisher_with(&context, &discovery)
+            .expect("authenticated sandbox publisher");
+
+        assert_eq!(installed.standard_record(), None);
+        assert_eq!(installed.command_socket(), context.command_socket());
+        assert_eq!(installed.protocol_info(), &sandbox_info(&context));
+        assert_eq!(
+            discovery.command_sockets(),
+            vec![context.command_socket().clone()]
+        );
+        assert!(
+            !context
+                .data_dir()
+                .as_path()
+                .join(INSTALLATION_RECORD_NAME)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn no_host_suspend_guarantee_is_separate_from_sandbox_selection() {
+        let root = TempDir::new().expect("tempdir");
+        let ordinary = sandbox_context(&root);
+        let guaranteed = ordinary.clone().with_no_host_suspend_guarantee();
+
+        let ordinary_installed = probe_sandbox_publisher_with(
+            &ordinary,
+            &sandbox_discovery(&ordinary, Uid::effective().as_raw()),
+        )
+        .expect("ordinary authenticated sandbox");
+        let guaranteed_installed = probe_sandbox_publisher_with(
+            &guaranteed,
+            &sandbox_discovery(&guaranteed, Uid::effective().as_raw()),
+        )
+        .expect("externally guaranteed authenticated sandbox");
+
+        assert!(!ordinary_installed.has_no_host_suspend_guarantee());
+        assert!(guaranteed_installed.has_no_host_suspend_guarantee());
+    }
+
+    #[test]
+    fn public_explicit_sandbox_probe_uses_authenticated_command_ipc() {
+        let root = TempDir::new().expect("tempdir");
+        let context = sandbox_context(&root);
+        let protocol_info = sandbox_info(&context);
+        let listener =
+            UnixListener::bind(context.command_socket().as_path()).expect("bind command socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept discovery");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("read discovery");
+            assert!(matches!(
+                serde_json::from_slice::<IpcRequest>(&request).expect("decode discovery"),
+                IpcRequest::GetPublishedEndpointProtocolInfo
+            ));
+            serde_json::to_writer(
+                &mut stream,
+                &IpcResponse::PublishedEndpointProtocolInfo(protocol_info),
+            )
+            .expect("write discovery");
+        });
+
+        let installed = probe_sandbox_publisher(&context).expect("public sandbox probe");
+        server.join().expect("discovery server");
+
+        assert_eq!(installed.standard_record(), None);
+        assert_eq!(installed.command_socket(), context.command_socket());
+    }
+
+    #[test]
+    fn explicit_sandbox_requires_the_effective_daemon_uid() {
+        let root = TempDir::new().expect("tempdir");
+        let context = sandbox_context(&root);
+        let expected_uid = Uid::effective().as_raw();
+        let discovery = sandbox_discovery(&context, expected_uid.wrapping_add(1));
+
+        assert!(matches!(
+            probe_sandbox_publisher_with(&context, &discovery),
+            Err(SandboxProbeError::DaemonUidMismatch {
+                expected_uid: actual_expected,
+                daemon_uid,
+            }) if actual_expected == expected_uid && daemon_uid == expected_uid.wrapping_add(1)
+        ));
+    }
+
+    #[test]
+    fn explicit_sandbox_requires_its_exact_publisher_socket() {
+        let root = TempDir::new().expect("tempdir");
+        let context = sandbox_context(&root);
+        let discovery = FakeDiscovery::new(Ok(AuthenticatedValue {
+            peer_uid: Uid::effective().as_raw(),
+            value: PublishedEndpointProtocolInfo::v1(
+                DaemonEpoch::from_bytes([3; 16]),
+                AbsolutePath::parse("/tmp/other-sandbox/run/publisher-v1.sock")
+                    .expect("publisher socket"),
+            ),
+        }));
+
+        assert!(matches!(
+            probe_sandbox_publisher_with(&context, &discovery),
+            Err(SandboxProbeError::PublisherSocketMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_sandbox_failure_never_becomes_absence() {
+        let root = TempDir::new().expect("tempdir");
+        let context = sandbox_context(&root);
+        let unavailable = FakeDiscovery::new(Err(BackendError::new(
+            BackendErrorKind::ProtocolUnavailable,
+            "publisher transport inactive",
+        )));
+
+        assert!(matches!(
+            probe_sandbox_publisher_with(&context, &unavailable),
+            Err(SandboxProbeError::Discovery(BackendError {
+                kind: BackendErrorKind::ProtocolUnavailable,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn standard_command_socket_cannot_be_relabeled_as_a_sandbox() {
+        assert_eq!(
+            SandboxPublisherContext::new(
+                AbsolutePath::parse("/tmp/sandbox/data/locald").expect("data directory"),
+                AbsolutePath::parse(STANDARD_COMMAND_SOCKET).expect("command socket"),
+            ),
+            Err(SandboxProbeError::StandardCommandSocket)
+        );
+    }
+
+    #[test]
+    fn standard_command_socket_aliases_cannot_be_relabeled_as_a_sandbox() {
+        let root = TempDir::new().expect("tempdir");
+        let standard_socket = root.path().join("standard.sock");
+        let _listener = UnixListener::bind(&standard_socket).expect("bind standard socket");
+        let alias = root.path().join("alias.sock");
+        symlink(&standard_socket, &alias).expect("command socket alias");
+        let context = SandboxPublisherContext::new(
+            AbsolutePath::try_from(root.path().join("sandbox/data/locald"))
+                .expect("data directory"),
+            AbsolutePath::try_from(alias).expect("aliased command socket"),
+        )
+        .expect("lexically distinct sandbox context");
+
+        assert_eq!(
+            reject_standard_command_socket_identity_against(&context, &standard_socket),
+            Err(SandboxProbeError::StandardCommandSocket)
+        );
+
+        let segment = root.path().join("segment");
+        fs::create_dir(&segment).expect("alias segment");
+        let lexical_alias = segment.join("..").join("standard.sock");
+        let context = SandboxPublisherContext::new(
+            AbsolutePath::try_from(root.path().join("sandbox/data/locald"))
+                .expect("data directory"),
+            AbsolutePath::try_from(lexical_alias).expect("lexical command socket alias"),
+        )
+        .expect("lexically distinct sandbox context");
+        assert_eq!(
+            reject_standard_command_socket_identity_against(&context, &standard_socket),
+            Err(SandboxProbeError::StandardCommandSocket)
+        );
     }
 
     #[test]
@@ -630,6 +1098,28 @@ mod tests {
     }
 
     #[test]
+    fn record_directory_rejects_special_permission_bits() {
+        let owner_uid = Uid::effective().as_raw();
+        for special_bit in [0o4000, 0o2000, 0o1000] {
+            let error =
+                validate_owner_mode(owner_uid, 0o700 | special_bit, 0o700, "record directory")
+                    .expect_err("setuid, setgid, and sticky bits must fail closed");
+            assert!(matches!(error, InstallationError::InvalidRecord(_)));
+        }
+    }
+
+    #[test]
+    fn installation_record_rejects_special_permission_bits() {
+        let owner_uid = Uid::effective().as_raw();
+        for special_bit in [0o4000, 0o2000, 0o1000] {
+            let error =
+                validate_owner_mode(owner_uid, 0o600 | special_bit, 0o600, "installation record")
+                    .expect_err("setuid, setgid, and sticky bits must fail closed");
+            assert!(matches!(error, InstallationError::InvalidRecord(_)));
+        }
+    }
+
+    #[test]
     fn positive_absence_requires_every_evidence_surface_to_be_absent() {
         let root = TempDir::new().expect("tempdir");
         let context = context(&root);
@@ -676,12 +1166,10 @@ mod tests {
             &context,
             r#"{"schema_version":1,"publisher_protocol_version":1,"command_socket":"/tmp/locald.sock"}"#,
         );
-        let unavailable = FakeDiscovery {
-            result: Err(BackendError::new(
-                BackendErrorKind::ProtocolUnavailable,
-                "publisher transport inactive",
-            )),
-        };
+        let unavailable = FakeDiscovery::new(Err(BackendError::new(
+            BackendErrorKind::ProtocolUnavailable,
+            "publisher transport inactive",
+        )));
         assert!(matches!(
             probe_installation_with(&context, &unavailable),
             Err(InstallationError::Discovery(BackendError {
@@ -715,15 +1203,13 @@ mod tests {
             &context,
             r#"{"schema_version":1,"publisher_protocol_version":1,"command_socket":"/tmp/locald.sock"}"#,
         );
-        let discovery = FakeDiscovery {
-            result: Ok(AuthenticatedValue {
-                peer_uid: Uid::effective().as_raw(),
-                value: PublishedEndpointProtocolInfo::v1(
-                    DaemonEpoch::from_bytes([2; 16]),
-                    AbsolutePath::parse("/tmp/other/publisher-v1.sock").expect("socket"),
-                ),
-            }),
-        };
+        let discovery = FakeDiscovery::new(Ok(AuthenticatedValue {
+            peer_uid: Uid::effective().as_raw(),
+            value: PublishedEndpointProtocolInfo::v1(
+                DaemonEpoch::from_bytes([2; 16]),
+                AbsolutePath::parse("/tmp/other/publisher-v1.sock").expect("socket"),
+            ),
+        }));
         assert!(matches!(
             probe_installation_with(&context, &discovery),
             Err(InstallationError::PublisherSocketMismatch { .. })

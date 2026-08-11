@@ -59,7 +59,10 @@ impl Lifecycle {
         // to support containerized execution. For now, we use tokio::process::Command
         // which corresponds to the "Native" strategy.
 
-        let mut child = cmd.spawn().map_err(|e| {
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+        let child = cmd.spawn();
+        drop(spawn_permit);
+        let mut child = child.map_err(|e| {
             let err = format!("Failed to spawn {phase_name}: {e}");
             progress.phase_failed(phase_name, &err);
             anyhow::anyhow!(err)

@@ -8,7 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
-use locald_publisher_protocol::{BindingRevision, LeaseHandle, PublicationState, SemanticOrigin};
+use locald_publisher_protocol::{
+    BindingRevision, LeaseHandle, PublicationState, SemanticOrigin, StableErrorCode,
+};
 
 use crate::client::{
     ClientError, PreparedRebind, ReacquisitionReason, RebindInstalledOrigin,
@@ -456,6 +458,11 @@ impl SupervisorSignals {
 }
 
 impl WakeSink for SupervisorSignals {
+    fn suspending(&self) {
+        // The daemon's synchronous sleep-entry gate fences publication
+        // authority. The client renews only after the matching resume edge.
+    }
+
     fn resumed(&self) {
         self.wake_pending.store(true, Ordering::Release);
         self.nudge();
@@ -947,13 +954,21 @@ fn finish_call_result<T>(
         return true;
     }
     let uncertain = match operation {
-        MaintenanceOperation::Renew => !matches!(
-            error,
-            ClientError::Transport(crate::backend::TransportFailure {
-                certainty: crate::backend::DeliveryCertainty::NotSent,
-                ..
-            })
-        ),
+        MaintenanceOperation::Renew => {
+            let definitive_transport_rejection = matches!(
+                error,
+                ClientError::Transport(crate::backend::TransportFailure {
+                    certainty: crate::backend::DeliveryCertainty::NotSent,
+                    ..
+                })
+            );
+            let wake_barrier_rejection = matches!(
+                error,
+                ClientError::Protocol(protocol_error)
+                    if protocol_error.code() == StableErrorCode::WakeBarrierPending
+            );
+            !(definitive_transport_rejection || wake_barrier_rejection)
+        }
         MaintenanceOperation::BeginRebind => matches!(error, ClientError::RebindResultMismatch),
         MaintenanceOperation::Rebind => mutation_outcome_is_uncertain(error),
     };

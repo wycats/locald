@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub sandbox: Option<String>,
 
+    /// Assert that this sandbox's host cannot suspend while locald is running
+    #[arg(long, global = true, requires = "sandbox")]
+    pub sandbox_no_host_suspend: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -302,6 +306,19 @@ pub enum Commands {
         /// Interface to bind to
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
+    },
+
+    /// Isolated child-process entry point for embedded Postgres setup.
+    #[command(name = "__postgres-setup", hide = true)]
+    PostgresSetup {
+        #[arg(long, hide = true)]
+        version: String,
+        #[arg(long, hide = true)]
+        port: u16,
+        #[arg(long, hide = true)]
+        data_dir: std::path::PathBuf,
+        #[arg(long, hide = true)]
+        installation_dir: std::path::PathBuf,
     },
 
     /// Internal tooling commands (not part of the taught surface)
@@ -745,6 +762,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_host_suspend_guarantee_requires_an_explicit_sandbox() {
+        let error = Cli::try_parse_from(["locald", "--sandbox-no-host-suspend", "ping"])
+            .err()
+            .expect("the no-host-suspend guarantee must not stand alone");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn explicit_sandbox_accepts_the_no_host_suspend_guarantee() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "--sandbox",
+            "ci",
+            "--sandbox-no-host-suspend",
+            "ping",
+        ])
+        .expect("parse an explicitly guaranteed sandbox");
+
+        assert_eq!(cli.sandbox.as_deref(), Some("ci"));
+        assert!(cli.sandbox_no_host_suspend);
+    }
+
+    #[test]
     fn parse_run_maps_to_exec_variant() {
         let cli = Cli::try_parse_from(["locald", "run", "api", "echo", "hi"]).unwrap();
 
@@ -821,6 +865,41 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected editor restart command"),
+        }
+    }
+
+    #[test]
+    fn parse_hidden_postgres_setup_captures_the_bounded_request() {
+        let cli = Cli::try_parse_from([
+            "locald",
+            "__postgres-setup",
+            "--version",
+            "15.3",
+            "--port",
+            "54321",
+            "--data-dir",
+            "/data/postgres",
+            "--installation-dir",
+            "/data/postgres-dist",
+        ])
+        .expect("parse Postgres setup helper");
+
+        match cli.command {
+            Commands::PostgresSetup {
+                version,
+                port,
+                data_dir,
+                installation_dir,
+            } => {
+                assert_eq!(version, "15.3");
+                assert_eq!(port, 54321);
+                assert_eq!(data_dir, std::path::PathBuf::from("/data/postgres"));
+                assert_eq!(
+                    installation_dir,
+                    std::path::PathBuf::from("/data/postgres-dist")
+                );
+            }
+            _ => panic!("expected Postgres setup helper command"),
         }
     }
 }

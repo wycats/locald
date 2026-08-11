@@ -41,8 +41,9 @@ Commands:
   help          Print this message or the help of the given subcommand(s)
 
 Options:
-      --sandbox <SANDBOX>  Run in a sandbox environment
-  -h, --help               Print help
-  -V, --version            Print version
+      --sandbox <SANDBOX>        Run in a sandbox environment
+      --sandbox-no-host-suspend  Assert that this sandbox's host cannot suspend while locald is running
+  -h, --help                     Print help
+  -V, --version                  Print version
 
 ```

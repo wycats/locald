@@ -422,8 +422,35 @@ fn warn_if_daemon_identity_mismatch() {
     }
 }
 
+pub fn run_internal_postgres_setup(
+    version: &str,
+    port: u16,
+    data_dir: &std::path::Path,
+    installation_dir: &std::path::Path,
+) -> CliResult<()> {
+    let request = locald_utils::postgres::PostgresSetup::new(
+        version.to_owned(),
+        port,
+        data_dir.to_path_buf(),
+        installation_dir.to_path_buf(),
+    )
+    .map_err(|error| CliError::expected(format!("Invalid Postgres setup request: {error:#}")))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime
+        .block_on(locald_utils::postgres::setup_postgres(request))
+        .map_err(|error| CliError::expected(format!("Postgres setup failed: {error:#}")))
+}
+
 pub fn run(cli: Cli) -> CliResult<()> {
     match &cli.command {
+        Commands::PostgresSetup {
+            version,
+            port,
+            data_dir,
+            installation_dir,
+        } => run_internal_postgres_setup(version, *port, data_dir, installation_dir)?,
         Commands::Init {
             from_distribution,
             name,
@@ -1319,31 +1346,29 @@ pub fn run(cli: Cli) -> CliResult<()> {
                             let s = cliclack::spinner();
                             s.start("Removing menu bar agent...");
 
-                            match uninstall_launch_agent() {
-                                Ok(()) => {
-                                    s.stop("Menu bar agent removed (if installed)");
-                                    println!(
-                                        "{} LaunchAgent com.locald.agent removed (if present).",
-                                        style::CHECK
-                                    );
+                            let teardown = match crate::macos_setup::begin_teardown_transaction() {
+                                Ok(teardown) => teardown,
+                                Err(error) => {
+                                    s.error(format!("locald runtime quiescence failed: {error}"));
+                                    return Err(CliError::message(format!(
+                                        "Failed to quiesce locald before teardown: {error}"
+                                    )));
                                 }
-                                Err(e) => {
-                                    s.stop(format!(
-                                        "Menu bar agent removal failed: {e} (non-fatal)"
-                                    ));
-                                }
+                            };
+                            if let Err(error) = teardown.remove_agent_binary() {
+                                s.error(format!("Menu bar agent binary removal failed: {error}"));
+                                return Err(CliError::message(format!(
+                                    "Failed to remove menu bar agent binary: {error}"
+                                )));
                             }
+                            s.stop("Menu bar agent removed (if installed)");
+                            println!(
+                                "{} LaunchAgent com.locald.agent removed (if present).",
+                                style::CHECK
+                            );
 
-                            // Remove extracted agent binary.
-                            if let Ok(agent_path) = locald_utils::agent::agent_path() {
-                                if agent_path.exists() {
-                                    let _ = std::fs::remove_file(&agent_path);
-                                }
-                            }
-                        }
-
-                        // Remove privileged helper.
-                        {
+                            // Remove privileged helper while daemon restart is
+                            // still fenced by the teardown transaction.
                             let s = cliclack::spinner();
                             s.start("Removing privileged helper...");
                             match crate::macos_helper::remove() {
@@ -1352,6 +1377,24 @@ pub fn run(cli: Cli) -> CliResult<()> {
                                     s.error(format!("Privileged helper removal failed: {error}"));
                                     return Err(CliError::message(format!(
                                         "Failed to remove privileged helper: {error}"
+                                    )));
+                                }
+                            }
+
+                            // This record is the authoritative
+                            // installed-vs-absent discovery signal. Remove it
+                            // only after every other teardown step succeeds,
+                            // while the daemon restart fence is still held.
+                            let s = cliclack::spinner();
+                            s.start("Removing publisher installation record...");
+                            match teardown.remove_publisher_record() {
+                                Ok(()) => s.stop("Publisher installation record removed"),
+                                Err(error) => {
+                                    s.error(format!(
+                                        "Publisher installation record removal failed: {error}"
+                                    ));
+                                    return Err(CliError::message(format!(
+                                        "Failed to remove publisher installation record: {error}"
                                     )));
                                 }
                             }
@@ -2901,51 +2944,4 @@ type = "published"
         assert!(invoking_user_uid(Some("root")).is_err());
         assert!(invoking_user_uid(Some("0")).is_err());
     }
-}
-
-#[cfg(target_os = "macos")]
-fn uninstall_launch_agent() -> anyhow::Result<()> {
-    let label = "com.locald.agent";
-
-    // Under sudo, resolve the real user's plist location and UID.
-    let (user_home, target_uid) = if nix::unistd::geteuid().is_root() {
-        if let Ok(sudo_user) = std::env::var("SUDO_USER")
-            && let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user)
-        {
-            (Some(user.dir), Some(user.uid.as_raw()))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
-    let plist_dir = if let Some(ref home) = user_home {
-        home.join("Library/LaunchAgents")
-    } else {
-        dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-            .join("Library/LaunchAgents")
-    };
-
-    let plist_path = plist_dir.join(format!("{label}.plist"));
-
-    if plist_path.exists() {
-        // Unload from the correct domain.
-        #[allow(clippy::disallowed_methods)]
-        if let Some(uid) = target_uid {
-            let service_target = format!("gui/{uid}/{label}");
-            let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &service_target])
-                .output();
-        } else {
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", "-w"])
-                .arg(&plist_path)
-                .output();
-        }
-        std::fs::remove_file(&plist_path)?;
-    }
-
-    Ok(())
 }

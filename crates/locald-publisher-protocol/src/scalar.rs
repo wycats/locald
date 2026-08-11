@@ -183,6 +183,23 @@ opaque_scalar!(
 );
 opaque_scalar!(LeaseHandle, "lease handle", OpaqueLength::AtLeast(32));
 
+macro_rules! authority_from_bytes {
+    ($name:ident) => {
+        impl $name {
+            /// Construct a version-1 authority handle from 256 bits of
+            /// daemon-selected entropy.
+            #[must_use]
+            pub fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(URL_SAFE_NO_PAD.encode(bytes))
+            }
+        }
+    };
+}
+
+authority_from_bytes!(AcquisitionAttemptHandle);
+authority_from_bytes!(RebindAttemptHandle);
+authority_from_bytes!(LeaseHandle);
+
 impl DaemonEpoch {
     /// Construct an epoch from the exact 128 bits selected by the daemon.
     #[must_use]

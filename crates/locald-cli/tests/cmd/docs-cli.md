@@ -13,6 +13,8 @@ Options:
           Run in a sandbox environment
       --name <NAME>
           Project name (overrides prompt/default when using --from-distribution)
+      --sandbox-no-host-suspend
+          Assert that this sandbox's host cannot suspend while locald is running
       --target <TARGET>
           Target directory (default: `./<project_name>`)
       --no-scaffold
@@ -40,10 +42,11 @@ Arguments:
   [PATH]  Path to the service directory (defaults to current directory if locald.toml exists)
 
 Options:
-      --sandbox <SANDBOX>  Run in a sandbox environment
-  -v, --verbose            Show verbose output
-      --follow             Follow this project's logs after it becomes ready
-  -h, --help               Print help
+      --sandbox <SANDBOX>        Run in a sandbox environment
+  -v, --verbose                  Show verbose output
+      --follow                   Follow this project's logs after it becomes ready
+      --sandbox-no-host-suspend  Assert that this sandbox's host cannot suspend while locald is running
+  -h, --help                     Print help
 
 ```
 
@@ -59,10 +62,11 @@ Arguments:
   [PATH]  Project path (defaults to the current directory)
 
 Options:
-      --all                Show all known projects instead of the current project
-      --sandbox <SANDBOX>  Run in a sandbox environment
-      --json               Machine-readable JSON output
-  -h, --help               Print help
+      --all                      Show all known projects instead of the current project
+      --sandbox <SANDBOX>        Run in a sandbox environment
+      --json                     Machine-readable JSON output
+      --sandbox-no-host-suspend  Assert that this sandbox's host cannot suspend while locald is running
+  -h, --help                     Print help
 
 ```
 
@@ -83,6 +87,9 @@ Arguments:
 Options:
       --sandbox <SANDBOX>
           Run in a sandbox environment
+
+      --sandbox-no-host-suspend
+          Assert that this sandbox's host cannot suspend while locald is running
 
   -h, --help
           Print help (see a summary with '-h')

@@ -19,13 +19,14 @@ pub async fn bind_privileged_port(port: u16) -> Result<std::net::TcpListener> {
 
     debug!("Invoking shim");
 
-    let status = cmd
-        .arg("bind")
-        .arg(port.to_string())
-        .arg(&socket_path)
-        .status()
-        .await
+    cmd.arg("bind").arg(port.to_string()).arg(&socket_path);
+    let mut child = locald_utils::process_spawn::ProcessSpawnBarrier::global()
+        .spawn_tokio_command(&mut cmd)
         .context("Failed to execute locald-shim")?;
+    let status = child
+        .wait()
+        .await
+        .context("Failed to wait for locald-shim")?;
 
     if !status.success() {
         return Err(anyhow::anyhow!(

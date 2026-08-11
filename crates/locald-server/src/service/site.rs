@@ -9,6 +9,7 @@ use locald_core::service::{
 use locald_core::state::{HealthStatus, ServiceState};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast};
@@ -108,9 +109,20 @@ impl SiteService {
         }
 
         let mut cmd = Command::new(parts[0]);
-        cmd.args(&parts[1..]).current_dir(project_root).envs(env);
+        cmd.args(&parts[1..])
+            .current_dir(project_root)
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let output = cmd.output().await.context("Failed to run build command")?;
+        let spawn_permit = locald_utils::process_spawn::ProcessSpawnBarrier::global().enter_spawn();
+        let child = cmd.spawn().context("Failed to run build command")?;
+        drop(spawn_permit);
+        let output = child
+            .wait_with_output()
+            .await
+            .context("Failed to wait for build command")?;
 
         if !output.stdout.is_empty() {
             let stdout = String::from_utf8_lossy(&output.stdout);
