@@ -8,10 +8,11 @@ use axum::{
     body::Body,
     extract::{Request, State},
     handler::Handler,
-    http::{Method, Uri},
+    http::{HeaderName, HeaderValue, Method, Uri},
     response::{IntoResponse, Response},
 };
 use axum_server::tls_rustls::RustlsConfig;
+use http_body_util::{BodyExt as _, StreamBody};
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use tokio::io::copy_bidirectional;
@@ -109,7 +110,12 @@ impl ProxyManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn make_app(&self) -> Router {
+        self.make_app_for_scheme(true)
+    }
+
+    pub(crate) fn make_app_for_scheme(&self, is_secure: bool) -> Router {
         let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         connector.set_nodelay(true);
         let keepalive_secs = 60;
@@ -124,6 +130,7 @@ impl ProxyManager {
             client,
             api_router: Router::new().nest("/api", self.api_router.clone()),
             responsive_backends: self.responsive_backends.clone(),
+            is_secure,
         };
 
         Router::new()
@@ -152,7 +159,7 @@ impl ProxyManager {
     }
 
     pub async fn serve_http(&self, listener: TcpListener) -> anyhow::Result<()> {
-        let app = self.make_app();
+        let app = self.make_app_for_scheme(false);
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -188,7 +195,7 @@ impl ProxyManager {
             .with_cert_resolver(cert_manager.clone());
 
         let rustls_config = RustlsConfig::from_config(Arc::new(config));
-        let app = self.make_app();
+        let app = self.make_app_for_scheme(true);
 
         axum_server::from_tcp_rustls(listener, rustls_config)
             .serve(app.into_make_service())
@@ -206,6 +213,7 @@ struct AppState {
     >,
     api_router: Router,
     responsive_backends: ResponsiveBackends,
+    is_secure: bool,
 }
 
 async fn handle_websocket_upgrade(state: AppState, mut req: Request, backend_uri: Uri) -> Response {
@@ -287,9 +295,14 @@ async fn handle_proxy(State(state): State<AppState>, req: Request) -> Response {
     // own dashboard and docs through the same managed-domain workflow.
     let resolution = state.resolver.resolve_service_by_domain(&host).await;
     if let Some(resolution) = resolution {
-        if let DomainResolution::PublishedUnavailable { publication, .. } = &resolution {
+        if let DomainResolution::PublishedUnavailable { publication, .. }
+        | DomainResolution::PublishedReady { publication, .. } = &resolution
+        {
             if let Some(response) = published_alias_redirect(req.uri(), &host, publication) {
                 return response;
+            }
+            if !state.is_secure {
+                return published_https_redirect(req.uri(), publication);
             }
         }
         if domain_resolution_supports_resume(&resolution) && is_resume_api_request(&req) {
@@ -334,6 +347,7 @@ fn domain_resolution_supports_resume(resolution: &DomainResolution) -> bool {
         DomainResolution::PublishedUnavailable { publication, .. } => {
             publication.state == PublicationState::RoutePaused
         }
+        DomainResolution::PublishedReady { .. } => false,
         DomainResolution::OwnershipOnly => true,
     }
 }
@@ -369,6 +383,14 @@ async fn proxy_to_domain_resolution(
 ) -> Response {
     if let DomainResolution::PublishedUnavailable { name, publication } = &resolution {
         return published_service_response(host, name, publication);
+    }
+    if let DomainResolution::PublishedReady {
+        name,
+        publication: _,
+        route,
+    } = resolution
+    {
+        return proxy_to_published(req, &name, route).await;
     }
     let DomainResolution::Service {
         name: service_name,
@@ -508,6 +530,225 @@ async fn proxy_to_local_port(
     }
 }
 
+async fn proxy_to_published(
+    mut req: Request,
+    service_name: &str,
+    route: locald_core::resolver::PublishedRoute,
+) -> Response {
+    if let Err(response) = canonicalize_published_headers(&mut req, &route.semantic_origin) {
+        return *response;
+    }
+    let uri_string = format!(
+        "http://127.0.0.1:{}{}",
+        route.port,
+        req.uri()
+            .path_and_query()
+            .map_or("/", axum::http::uri::PathAndQuery::as_str)
+    );
+    let uri: Uri = match uri_string.parse() {
+        Ok(uri) => uri,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid URI").into_response(),
+    };
+    *req.uri_mut() = uri;
+
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.set_nodelay(true);
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build(connector);
+
+    if req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return proxy_published_websocket(req, client, route).await;
+    }
+
+    let mut cancellation = route.cancellation.clone();
+    let request = client.request(req);
+    let response = tokio::select! {
+        biased;
+        () = wait_for_route_cancellation(&mut cancellation) => {
+            return published_service_cancelled(service_name);
+        }
+        result = request => match result {
+            Ok(response) => response,
+            Err(error) => {
+                error!("Published proxy error: {error}");
+                return error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {error}"));
+            }
+        }
+    };
+    cancellable_published_response(response, client, route)
+}
+
+type PublishedClient =
+    hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
+
+async fn proxy_published_websocket(
+    mut request: Request,
+    client: PublishedClient,
+    route: locald_core::resolver::PublishedRoute,
+) -> Response {
+    let client_upgrade = hyper::upgrade::on(&mut request);
+    let mut cancellation = route.cancellation.clone();
+    let mut backend_response = tokio::select! {
+        biased;
+        () = wait_for_route_cancellation(&mut cancellation) => {
+            return published_service_cancelled("published service");
+        }
+        result = client.request(request) => match result {
+            Ok(response) => response,
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, format!("Proxy error: {error}")),
+        }
+    };
+    if backend_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return cancellable_published_response(backend_response, client, route);
+    }
+
+    let backend_upgrade = hyper::upgrade::on(&mut backend_response);
+    let headers = backend_response.headers().clone();
+    tokio::spawn(async move {
+        let _capability_guard = route.capability_guard;
+        let _client = client;
+        tokio::select! {
+            biased;
+            () = wait_for_route_cancellation(&mut cancellation) => {}
+            result = async {
+                let (client_io, backend_io) = tokio::try_join!(client_upgrade, backend_upgrade)?;
+                let mut client_io = TokioIo::new(client_io);
+                let mut backend_io = TokioIo::new(backend_io);
+                copy_bidirectional(&mut client_io, &mut backend_io).await?;
+                Ok::<(), anyhow::Error>(())
+            } => {
+                if let Err(error) = result {
+                    error!("Published WebSocket bridge error: {error}");
+                }
+            }
+        }
+    });
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *response.headers_mut() = headers;
+    response
+}
+
+fn cancellable_published_response(
+    response: hyper::Response<hyper::body::Incoming>,
+    client: PublishedClient,
+    route: locald_core::resolver::PublishedRoute,
+) -> Response {
+    let (parts, mut upstream) = response.into_parts();
+    let mut cancellation = route.cancellation.clone();
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let _capability_guard = route.capability_guard;
+        let _client = client;
+        loop {
+            let frame = tokio::select! {
+                biased;
+                () = wait_for_route_cancellation(&mut cancellation) => return,
+                frame = upstream.frame() => match frame {
+                    Some(frame) => frame,
+                    None => return,
+                }
+            };
+            tokio::select! {
+                biased;
+                () = wait_for_route_cancellation(&mut cancellation) => return,
+                sent = sender.send(frame) => if sent.is_err() { return; },
+            }
+        }
+    });
+    let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
+    Response::from_parts(parts, Body::new(body))
+}
+
+async fn wait_for_route_cancellation(cancellation: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*cancellation.borrow() {
+        if cancellation.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn published_service_cancelled(service_name: &str) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Published route for {service_name} is no longer authorized"),
+    )
+}
+
+fn canonicalize_published_headers(
+    request: &mut Request,
+    semantic_origin: &str,
+) -> Result<(), Box<Response>> {
+    let origin: Uri = semantic_origin.parse().map_err(|_| {
+        Box::new((StatusCode::INTERNAL_SERVER_ERROR, "Invalid semantic origin").into_response())
+    })?;
+    let authority = origin
+        .authority()
+        .map(axum::http::uri::Authority::as_str)
+        .ok_or_else(|| {
+            Box::new((StatusCode::INTERNAL_SERVER_ERROR, "Invalid semantic origin").into_response())
+        })?;
+    let port = origin.port_u16().unwrap_or(443);
+    let remove = request
+        .headers()
+        .keys()
+        .filter(|name| {
+            name.as_str().eq_ignore_ascii_case("forwarded")
+                || name
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .starts_with("x-forwarded-")
+                || name.as_str().eq_ignore_ascii_case("x-real-ip")
+        })
+        .cloned()
+        .collect::<Vec<HeaderName>>();
+    for name in remove {
+        request.headers_mut().remove(name);
+    }
+    let headers = request.headers_mut();
+    headers.insert(
+        hyper::header::HOST,
+        HeaderValue::from_str(authority).map_err(|_| {
+            Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid semantic authority",
+                )
+                    .into_response(),
+            )
+        })?,
+    );
+    for (name, value) in [
+        (
+            "forwarded",
+            format!("for=127.0.0.1;host=\"{authority}\";proto=https"),
+        ),
+        ("x-forwarded-for", "127.0.0.1".to_owned()),
+        ("x-forwarded-host", authority.to_owned()),
+        ("x-forwarded-proto", "https".to_owned()),
+        ("x-forwarded-port", port.to_string()),
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(&value).map_err(|_| {
+                Box::new(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid forwarding context",
+                    )
+                        .into_response(),
+                )
+            })?,
+        );
+    }
+    Ok(())
+}
+
 fn dev_ui_enabled() -> bool {
     if cfg!(debug_assertions) {
         return true;
@@ -622,7 +863,27 @@ fn published_alias_redirect(
         .path_and_query()
         .map_or("/", axum::http::uri::PathAndQuery::as_str);
     let location = format!("{}{path_and_query}", publication.origin);
-    Some(axum::response::Redirect::temporary(&location).into_response())
+    Some(permanent_redirect(&location))
+}
+
+fn published_https_redirect(request_uri: &Uri, publication: &PublicationStatus) -> Response {
+    let path_and_query = request_uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    permanent_redirect(&format!("{}{path_and_query}", publication.origin))
+}
+
+fn permanent_redirect(location: &str) -> Response {
+    HeaderValue::from_str(location).map_or_else(
+        |_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid redirect target").into_response(),
+        |location| {
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                [(hyper::header::LOCATION, location)],
+            )
+                .into_response()
+        },
+    )
 }
 
 fn published_service_response(

@@ -1852,6 +1852,16 @@ impl ProcessManager {
         record: &locald_core::catalog::ProjectInstanceRecord,
         declaration: &PublishedServiceDeclaration,
     ) -> ServiceStatus {
+        self.published_service_status_with_state(record, declaration, None)
+            .await
+    }
+
+    async fn published_service_status_with_state(
+        &self,
+        record: &locald_core::catalog::ProjectInstanceRecord,
+        declaration: &PublishedServiceDeclaration,
+        exact_state: Option<PublicationState>,
+    ) -> ServiceStatus {
         use locald_core::ipc::ServiceType;
 
         let (publication_state, explanation, next_step) = if record.presence
@@ -1888,7 +1898,11 @@ impl ProcessManager {
                             record.id,
                             ServiceName::new(declaration.service_name.as_str()),
                         );
-                        match self.publisher_authority.projection(&key).await {
+                        let projection = match exact_state {
+                            Some(state) => Ok(Some((state, declaration.origin.clone()))),
+                            None => self.publisher_authority.projection(&key).await,
+                        };
+                        match projection {
                             Ok(Some((PublicationState::CheckingEndpoint, _))) => (
                                 PublicationState::CheckingEndpoint,
                                 "The owning workflow has published an exact endpoint, but locald has not authorized it for routing yet."
@@ -1998,12 +2012,14 @@ impl ProcessManager {
             connection_url: None,
             domain,
             health_status: match publication_state {
-                PublicationState::CheckingEndpoint => HealthStatus::Starting,
+                PublicationState::CheckingEndpoint | PublicationState::RoutePaused => {
+                    HealthStatus::Starting
+                }
                 PublicationState::EndpointUnhealthy => HealthStatus::Unhealthy,
                 PublicationState::Ready => HealthStatus::Healthy,
-                PublicationState::WaitingForPublisher
-                | PublicationState::RoutePaused
-                | PublicationState::InstanceMissing => HealthStatus::Unknown,
+                PublicationState::WaitingForPublisher | PublicationState::InstanceMissing => {
+                    HealthStatus::Unknown
+                }
             },
             health_source: HealthSource::Http,
             path: record
@@ -3568,7 +3584,6 @@ impl ProcessManager {
         acknowledged_origin: &publisher_protocol::SemanticOrigin,
         capability: RetainedListenerCapability,
     ) -> Result<publisher_protocol::RebindResult, publisher_protocol::ProtocolError> {
-        let _publication_guard = self.publisher_transition_lock.lock().await;
         self.ensure_publisher_mutation_available()?;
         self.publisher_authority
             .rebind(handle, principal, acknowledged_origin, capability)
@@ -8067,8 +8082,41 @@ impl ProcessManager {
             record.cloned().zip(declaration.cloned())
         };
         if let Some((record, declaration)) = published {
-            let status = self.published_service_status(&record, &declaration).await;
+            let key = ServiceKey::new(
+                declaration.project_instance_id,
+                declaration.service_name.clone(),
+            );
+            let canonical_host = declaration.origin.domain().ok();
+            let requested_is_primary = canonical_host
+                .as_ref()
+                .is_some_and(|canonical| canonical.as_str().eq_ignore_ascii_case(domain));
+            let exact = self
+                .publisher_authority
+                .projection_and_route(&key, requested_is_primary)
+                .await;
+            let (exact_state, route) = match exact {
+                Ok(Some((state, _, route)))
+                    if state != PublicationState::Ready
+                        || route.is_some()
+                        || !requested_is_primary =>
+                {
+                    (state, route)
+                }
+                Ok(Some(_) | None) | Err(_) => (PublicationState::WaitingForPublisher, None),
+            };
+            let status = self
+                .published_service_status_with_state(&record, &declaration, Some(exact_state))
+                .await;
             if let Some(publication) = status.publication {
+                if publication.state == PublicationState::Ready
+                    && let Some(route) = route
+                {
+                    return Some(locald_core::resolver::DomainResolution::PublishedReady {
+                        name: status.name,
+                        publication,
+                        route,
+                    });
+                }
                 return Some(
                     locald_core::resolver::DomainResolution::PublishedUnavailable {
                         name: status.name,

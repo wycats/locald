@@ -13,8 +13,8 @@
 
 use locald_core::ipc::PublicationState;
 use locald_core::{
-    CatalogPresence, ProjectInstanceId, PublishedServiceDeclaration, Registry, SemanticOrigin,
-    ServiceKey,
+    CatalogPresence, ProjectInstanceId, PublishedHttpHealthPolicy, PublishedServiceDeclaration,
+    Registry, SemanticOrigin, ServiceKey,
 };
 use locald_publisher_client::{
     SystemWakeMonitor, WakeError, WakeMonitor, WakeRegistration, WakeSink,
@@ -327,10 +327,12 @@ struct OperationCancellationController {
 impl OperationCancellationController {
     fn pair() -> (Self, OperationCancellationObserver) {
         let (sender, receiver) = watch::channel(false);
+        let observer_sender = sender.clone();
         (
             Self { sender },
             OperationCancellationObserver {
                 identity: AuthorityToken::random(),
+                sender: observer_sender,
                 receiver,
             },
         )
@@ -339,6 +341,139 @@ impl OperationCancellationController {
     fn cancel(&self) {
         self.sender.send_replace(true);
     }
+
+    fn sender(&self) -> watch::Sender<bool> {
+        self.sender.clone()
+    }
+}
+
+#[derive(Debug, Default)]
+struct IoActivityCoordinator {
+    state: std::sync::Mutex<IoActivityState>,
+    quiesced: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct IoActivityState {
+    active: BTreeMap<AuthorityToken, watch::Sender<bool>>,
+}
+
+impl IoActivityCoordinator {
+    fn begin(self: &Arc<Self>, cancellation: watch::Sender<bool>) -> IoActivityGuard {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut id = AuthorityToken::random();
+        while state.active.contains_key(&id) {
+            id = AuthorityToken::random();
+        }
+        state.active.insert(id.clone(), cancellation);
+        IoActivityGuard {
+            coordinator: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn cancel_and_quiesce(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for cancellation in state.active.values() {
+            cancellation.send_replace(true);
+        }
+        while !state.active.is_empty() {
+            state = self
+                .quiesced
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IoActivityGuard {
+    coordinator: Arc<IoActivityCoordinator>,
+    id: AuthorityToken,
+}
+
+impl Drop for IoActivityGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active.remove(&self.id);
+        self.coordinator.quiesced.notify_all();
+    }
+}
+
+struct RetainedRouteGuard {
+    _listener: Arc<dyn Send + Sync>,
+    _activity: IoActivityGuard,
+}
+
+impl fmt::Debug for RetainedRouteGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RetainedRouteGuard(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficScopeKind {
+    ProbeOnly,
+    Routable,
+}
+
+#[derive(Debug)]
+struct TrafficScope {
+    revision: u64,
+    kind: TrafficScopeKind,
+    cancellation: OperationCancellationController,
+    observer: OperationCancellationObserver,
+}
+
+impl TrafficScope {
+    fn new(revision: u64, kind: TrafficScopeKind) -> Self {
+        let (cancellation, observer) = OperationCancellationController::pair();
+        Self {
+            revision,
+            kind,
+            cancellation,
+            observer,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedEndpointHealth {
+    Checking,
+    Unhealthy,
+    Healthy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthFence {
+    lease: LeaseHandle,
+    binding_revision: u64,
+    traffic_scope_revision: u64,
+    health_policy_revision: u64,
+}
+
+#[derive(Clone)]
+struct HealthProbePermit {
+    fence: HealthFence,
+    port: u16,
+    origin: SemanticOrigin,
+    policy: PublishedHttpHealthPolicy,
+    cancellation: OperationCancellationObserver,
+    capability_guard: Arc<dyn Send + Sync>,
 }
 
 impl fmt::Debug for OperationCancellationController {
@@ -350,6 +485,7 @@ impl fmt::Debug for OperationCancellationController {
 #[derive(Clone)]
 struct OperationCancellationObserver {
     identity: AuthorityToken,
+    sender: watch::Sender<bool>,
     receiver: watch::Receiver<bool>,
 }
 
@@ -364,6 +500,10 @@ impl OperationCancellationObserver {
                 std::future::pending::<()>().await;
             }
         }
+    }
+
+    fn sender(&self) -> watch::Sender<bool> {
+        self.sender.clone()
     }
 }
 
@@ -402,6 +542,24 @@ impl RetainedListenerCapability {
 
     pub(crate) const fn identity(&self) -> &ListenerIdentity {
         &self.identity
+    }
+
+    fn loopback_port(&self) -> Option<u16> {
+        match &self.identity {
+            ListenerIdentity::MacOsIpv4 { address, port, .. }
+            | ListenerIdentity::LinuxIpv4 { address, port, .. }
+                if *address == [127, 0, 0, 1] =>
+            {
+                Some(*port)
+            }
+            ListenerIdentity::MacOsIpv4 { .. } | ListenerIdentity::LinuxIpv4 { .. } => None,
+            #[cfg(test)]
+            ListenerIdentity::Test(_) => None,
+        }
+    }
+
+    fn clone_guard(&self) -> Arc<dyn Send + Sync> {
+        Arc::clone(&self.guard)
     }
 }
 
@@ -643,6 +801,16 @@ struct PublicationProjection {
     origin: SemanticOrigin,
 }
 
+#[derive(Clone)]
+struct PublishedRouteSelection {
+    port: u16,
+    binding_revision: u64,
+    traffic_scope_revision: u64,
+    semantic_origin: SemanticOrigin,
+    cancellation: OperationCancellationObserver,
+    capability_guard: Arc<dyn Send + Sync>,
+}
+
 #[derive(Debug, Default)]
 struct PublicationEffects {
     projection_changed: BTreeSet<ServiceKey>,
@@ -865,6 +1033,10 @@ struct LiveLease {
     acknowledged_origin: SemanticOrigin,
     acquisition_replay: AcquisitionReplay,
     rebind: Option<RebindAttempt>,
+    health_policy_revision: u64,
+    health: ObservedEndpointHealth,
+    traffic_scope: TrafficScope,
+    probe_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -971,10 +1143,22 @@ impl PublicationRegistry {
                 PublicationState::InstanceMissing
             } else if slot.paused {
                 PublicationState::RoutePaused
-            } else if matches!(slot.state, SlotState::Live(_)) {
-                PublicationState::CheckingEndpoint
             } else {
-                PublicationState::WaitingForPublisher
+                match &slot.state {
+                    SlotState::Live(lease) => match lease.health {
+                        ObservedEndpointHealth::Checking => PublicationState::CheckingEndpoint,
+                        ObservedEndpointHealth::Unhealthy => PublicationState::EndpointUnhealthy,
+                        ObservedEndpointHealth::Healthy
+                            if lease.traffic_scope.kind == TrafficScopeKind::Routable =>
+                        {
+                            PublicationState::Ready
+                        }
+                        ObservedEndpointHealth::Healthy => PublicationState::CheckingEndpoint,
+                    },
+                    SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => {
+                        PublicationState::WaitingForPublisher
+                    }
+                }
             },
             origin: slot.declaration.0.origin.clone(),
         })
@@ -1151,6 +1335,28 @@ impl PublicationRegistry {
             && current_revision.and_then(|current| current.checked_add(1))
                 == Some(configuration_revision);
 
+        // Configuration convergence is one complete generation. Preflight
+        // every compatible live transfer before retiring candidate authority,
+        // removing declarations, or mutating an earlier service.
+        let transfer_would_overflow = candidates.iter().any(|(key, candidate)| {
+            let Some(slot) = self.slots.get(key) else {
+                return false;
+            };
+            candidate != &slot.declaration
+                && may_transfer_authority
+                && slot.declaration.routing_equivalent(candidate)
+                && !slot.declaration.health_equivalent(candidate)
+                && matches!(
+                    &slot.state,
+                    SlotState::Live(lease)
+                        if lease.health_policy_revision == u64::MAX
+                            || lease.traffic_scope.revision == u64::MAX
+                )
+        });
+        if transfer_would_overflow {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        }
+
         // A Begin operation may have reserved the exact validated candidate
         // before journaled hosts/catalog convergence. Preserve only that exact
         // declaration; every older or divergent candidate loses authority.
@@ -1200,6 +1406,11 @@ impl PublicationRegistry {
                         health_equivalent,
                     );
                     if !health_equivalent {
+                        lease.health_policy_revision += 1;
+                        Self::replace_traffic_scope(lease, TrafficScopeKind::ProbeOnly)
+                            .expect("complete configuration transfer was preflighted");
+                        lease.health = ObservedEndpointHealth::Checking;
+                        lease.probe_in_flight = false;
                         effects.probe_required.insert(key.clone());
                     }
                 }
@@ -1809,6 +2020,10 @@ impl PublicationRegistry {
                 acknowledged_origin: fence.acknowledged_origin.clone(),
             },
             rebind: None,
+            health_policy_revision: 1,
+            health: ObservedEndpointHealth::Checking,
+            traffic_scope: TrafficScope::new(1, TrafficScopeKind::ProbeOnly),
+            probe_in_flight: false,
         };
         let grant = Self::lease_grant(&lease, now);
         slot.state = SlotState::Live(Box::new(lease));
@@ -2044,13 +2259,164 @@ impl PublicationRegistry {
             } else if pause_observed {
                 PublicationState::RoutePaused
             } else {
-                // b.3.5 deliberately installs no route authorization. b.3.6
-                // replaces this with exact health- and route-scoped state.
-                PublicationState::CheckingEndpoint
+                match lease.health {
+                    ObservedEndpointHealth::Checking => PublicationState::CheckingEndpoint,
+                    ObservedEndpointHealth::Unhealthy => PublicationState::EndpointUnhealthy,
+                    ObservedEndpointHealth::Healthy
+                        if lease.traffic_scope.kind == TrafficScopeKind::Routable =>
+                    {
+                        PublicationState::Ready
+                    }
+                    ObservedEndpointHealth::Healthy => PublicationState::CheckingEndpoint,
+                }
             },
             origin: slot.declaration.0.origin.clone(),
         };
         PublicationOutcome::ok((projection, wait_remaining), effects)
+    }
+
+    fn begin_health_probe(
+        &mut self,
+        key: &ServiceKey,
+    ) -> PublicationOutcome<Option<HealthProbePermit>> {
+        let (now, mut effects) = match self.begin_transition_except(key) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(slot) = self.slots.get_mut(key) else {
+            return PublicationOutcome::ok(None, effects);
+        };
+        let SlotState::Live(lease) = &mut slot.state else {
+            return PublicationOutcome::ok(None, effects);
+        };
+        if lease.deadline <= now {
+            Self::retire_slot_state(key, slot, &mut effects);
+            return PublicationOutcome::ok(None, effects);
+        }
+        if slot.missing || lease.probe_in_flight {
+            return PublicationOutcome::ok(None, effects);
+        }
+        let Some(port) = lease.capability.loopback_port() else {
+            return PublicationOutcome::ok(None, effects);
+        };
+        lease.probe_in_flight = true;
+        PublicationOutcome::ok(
+            Some(HealthProbePermit {
+                fence: HealthFence {
+                    lease: lease.handle.clone(),
+                    binding_revision: lease.binding_revision,
+                    traffic_scope_revision: lease.traffic_scope.revision,
+                    health_policy_revision: lease.health_policy_revision,
+                },
+                port,
+                origin: lease.acknowledged_origin.clone(),
+                policy: slot.declaration.0.health_policy.clone(),
+                cancellation: lease.traffic_scope.observer.clone(),
+                capability_guard: lease.capability.clone_guard(),
+            }),
+            effects,
+        )
+    }
+
+    fn commit_health_result(
+        &mut self,
+        permit: &HealthProbePermit,
+        healthy: bool,
+    ) -> PublicationOutcome<bool> {
+        let (now, mut effects) = match self.begin_transition_except(&permit.fence.lease.service) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let key = &permit.fence.lease.service;
+        let Some(slot) = self.slots.get_mut(key) else {
+            return PublicationOutcome::ok(false, effects);
+        };
+        let SlotState::Live(lease) = &mut slot.state else {
+            return PublicationOutcome::ok(false, effects);
+        };
+        let current = lease.handle == permit.fence.lease
+            && lease.binding_revision == permit.fence.binding_revision
+            && lease.traffic_scope.revision == permit.fence.traffic_scope_revision
+            && lease.health_policy_revision == permit.fence.health_policy_revision
+            && lease.deadline > now;
+        if !current {
+            return PublicationOutcome::ok(false, effects);
+        }
+
+        let replacement =
+            if healthy && !slot.paused && lease.traffic_scope.kind == TrafficScopeKind::ProbeOnly {
+                Some(TrafficScopeKind::Routable)
+            } else if !healthy && lease.traffic_scope.kind == TrafficScopeKind::Routable {
+                Some(TrafficScopeKind::ProbeOnly)
+            } else {
+                None
+            };
+        if replacement.is_some() && lease.traffic_scope.revision == u64::MAX {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        }
+
+        lease.probe_in_flight = false;
+        let before_health = lease.health;
+        let before_scope = lease.traffic_scope.kind;
+        lease.health = if healthy {
+            ObservedEndpointHealth::Healthy
+        } else {
+            ObservedEndpointHealth::Unhealthy
+        };
+        if let Some(kind) = replacement {
+            if let Err(error) = Self::replace_traffic_scope(lease, kind) {
+                return PublicationOutcome::err(error, effects);
+            }
+        }
+        if before_scope != lease.traffic_scope.kind
+            || (!slot.paused && before_health != lease.health)
+        {
+            effects.projection_changed.insert(key.clone());
+        }
+        PublicationOutcome::ok(true, effects)
+    }
+
+    fn select_route(
+        &mut self,
+        key: &ServiceKey,
+    ) -> PublicationOutcome<Option<PublishedRouteSelection>> {
+        let (now, mut effects) = match self.begin_transition_except(key) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(slot) = self.slots.get_mut(key) else {
+            return PublicationOutcome::ok(None, effects);
+        };
+        let SlotState::Live(lease) = &mut slot.state else {
+            return PublicationOutcome::ok(None, effects);
+        };
+        if lease.deadline <= now {
+            Self::retire_slot_state(key, slot, &mut effects);
+            return PublicationOutcome::ok(None, effects);
+        }
+        if slot.paused
+            || slot.missing
+            || lease.health != ObservedEndpointHealth::Healthy
+            || lease.traffic_scope.kind != TrafficScopeKind::Routable
+            || lease.traffic_scope.observer.is_cancelled()
+            || lease.acknowledged_origin != slot.declaration.0.origin
+        {
+            return PublicationOutcome::ok(None, effects);
+        }
+        let Some(port) = lease.capability.loopback_port() else {
+            return PublicationOutcome::ok(None, effects);
+        };
+        PublicationOutcome::ok(
+            Some(PublishedRouteSelection {
+                port,
+                binding_revision: lease.binding_revision,
+                traffic_scope_revision: lease.traffic_scope.revision,
+                semantic_origin: lease.acknowledged_origin.clone(),
+                cancellation: lease.traffic_scope.observer.clone(),
+                capability_guard: lease.capability.clone_guard(),
+            }),
+            effects,
+        )
     }
 
     fn expire(&mut self, fence: &ExpiryFence) -> PublicationOutcome<bool> {
@@ -2275,10 +2641,24 @@ impl PublicationRegistry {
         let Some(binding_revision) = lease.binding_revision.checked_add(1) else {
             return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
         };
+        let Some(traffic_scope_revision) = lease.traffic_scope.revision.checked_add(1) else {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        };
         effects
             .retired_capabilities
             .push(std::mem::replace(&mut lease.capability, capability));
+        lease.traffic_scope.cancel();
         lease.binding_revision = binding_revision;
+        lease.traffic_scope = TrafficScope::new(
+            traffic_scope_revision,
+            if slot.paused {
+                TrafficScopeKind::ProbeOnly
+            } else {
+                TrafficScopeKind::Routable
+            },
+        );
+        lease.health = ObservedEndpointHealth::Healthy;
+        lease.probe_in_flight = false;
         lease.acknowledged_origin = fence.acknowledged_origin.clone();
         lease.rebind = Some(RebindAttempt {
             handle: fence.handle.clone(),
@@ -2395,6 +2775,13 @@ impl PublicationRegistry {
         {
             return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
         }
+        if self.slots.iter().any(|(key, slot)| {
+            key.instance() == instance
+                && slot.paused != paused
+                && matches!(&slot.state, SlotState::Live(lease) if lease.traffic_scope.revision == u64::MAX)
+        }) {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        }
         if paused {
             self.paused_instances.insert(instance);
         } else {
@@ -2413,6 +2800,12 @@ impl PublicationRegistry {
             slot.paused = paused;
             if let SlotState::Live(lease) = &mut slot.state {
                 Self::retire_nonreplayable_rebind(lease);
+                if let Err(error) = Self::replace_traffic_scope(lease, TrafficScopeKind::ProbeOnly)
+                {
+                    return PublicationOutcome::err(error, effects);
+                }
+                lease.health = ObservedEndpointHealth::Checking;
+                lease.probe_in_flight = false;
                 effects.probe_required.insert(key.clone());
             }
             effects.projection_changed.insert(key.clone());
@@ -2545,6 +2938,11 @@ impl PublicationRegistry {
             Ok(value) => value,
             Err(outcome) => return outcome,
         };
+        if self.slots.values().any(
+            |slot| matches!(&slot.state, SlotState::Live(lease) if lease.traffic_scope.revision == u64::MAX),
+        ) {
+            return PublicationOutcome::err(PublicationRegistryError::GenerationOverflow, effects);
+        }
         let candidate_keys = self
             .candidate_preparations
             .keys()
@@ -2576,6 +2974,13 @@ impl PublicationRegistry {
             match &mut slot.state {
                 SlotState::Live(lease) => {
                     Self::retire_nonreplayable_rebind(lease);
+                    if let Err(error) =
+                        Self::replace_traffic_scope(lease, TrafficScopeKind::ProbeOnly)
+                    {
+                        return PublicationOutcome::err(error, effects);
+                    }
+                    lease.health = ObservedEndpointHealth::Checking;
+                    lease.probe_in_flight = false;
                     effects.probe_required.insert(key.clone());
                 }
                 SlotState::Vacant | SlotState::Preparing(_) | SlotState::Attempt(_) => {}
@@ -2827,6 +3232,7 @@ impl PublicationRegistry {
             }
             SlotState::Live(lease) => {
                 let mut lease = *lease;
+                lease.traffic_scope.cancel();
                 Self::clear_rebind(&mut lease);
                 effects.retired_capabilities.push(lease.capability);
                 effects.projection_changed.insert(key.clone());
@@ -2912,6 +3318,20 @@ impl PublicationRegistry {
         }
     }
 
+    fn replace_traffic_scope(
+        lease: &mut LiveLease,
+        kind: TrafficScopeKind,
+    ) -> Result<(), PublicationRegistryError> {
+        let revision = lease
+            .traffic_scope
+            .revision
+            .checked_add(1)
+            .ok_or(PublicationRegistryError::GenerationOverflow)?;
+        lease.traffic_scope.cancel();
+        lease.traffic_scope = TrafficScope::new(revision, kind);
+        Ok(())
+    }
+
     fn retire_all_authority(&mut self) -> PublicationEffects {
         let mut effects = PublicationEffects::default();
         let candidate_keys = self
@@ -2974,6 +3394,7 @@ struct PublisherAuthorityInner {
     wake_receiver: std::sync::Mutex<Option<mpsc::UnboundedReceiver<PublisherWakeSignal>>>,
     deadline_driver_started: AtomicBool,
     shutdown: AtomicBool,
+    io_activity: Arc<IoActivityCoordinator>,
     #[cfg(test)]
     wait_ready_capture_hook: std::sync::Mutex<Option<WaitReadyCaptureHook>>,
 }
@@ -3020,6 +3441,7 @@ impl WakeSink for PublisherAuthorityWakeSink {
                 .wake_barrier_gate
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.io_activity.cancel_and_quiesce();
             let mut observation = inner
                 .wake_observation
                 .lock()
@@ -3234,6 +3656,7 @@ impl PublisherAuthority {
                 wake_receiver: std::sync::Mutex::new(Some(wake_receiver)),
                 deadline_driver_started: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
+                io_activity: Arc::new(IoActivityCoordinator::default()),
                 #[cfg(test)]
                 wait_ready_capture_hook: std::sync::Mutex::new(None),
             }),
@@ -4153,30 +4576,103 @@ impl PublisherAuthority {
         capability: RetainedListenerCapability,
     ) -> Result<protocol::RebindResult, protocol::ProtocolError> {
         self.ensure_deadline_driver();
-        let mut registry = self.inner.registry.lock().await;
-        self.ensure_active()?;
-        let _wake_barrier = self.enter_publisher_transition()?;
-        let before = registry.preparation_tokens();
-        let handle = registry
-            .rebind_handle_for_wire(handle)
-            .ok_or_else(|| Self::error(&PublicationRegistryError::AttemptStale))?;
         let origin = SemanticOrigin::parse(acknowledged_origin.as_str())
             .map_err(|error| Self::internal(error.to_string()))?;
         let listener = capability.identity().clone();
-        let grant = match self
-            .outcome(registry.begin_rebind_candidate(&handle, principal, &origin, &listener))?
-        {
-            BeginRebindCandidate::Started(permit) => {
-                self.outcome(registry.commit_rebind(&permit.fence, capability))?
+        let mut capability = Some(capability);
+        let mut changes = self.subscribe_changes();
+        loop {
+            let mut registry = self.inner.registry.lock().await;
+            self.ensure_active()?;
+            let wake_barrier = self.enter_publisher_transition()?;
+            let resolved = registry
+                .rebind_handle_for_wire(handle)
+                .ok_or_else(|| Self::error(&PublicationRegistryError::AttemptStale))?;
+            let begin = self.outcome(
+                registry.begin_rebind_candidate(&resolved, principal, &origin, &listener),
+            )?;
+            match begin {
+                BeginRebindCandidate::Started(permit) => {
+                    let policy = registry
+                        .slots
+                        .get(&permit.fence.handle.service)
+                        .map(|slot| slot.declaration.0.health_policy.clone())
+                        .ok_or_else(|| {
+                            Self::error(&PublicationRegistryError::ServiceNotDeclared)
+                        })?;
+                    let port = capability
+                        .as_ref()
+                        .and_then(RetainedListenerCapability::loopback_port);
+                    let guard = capability
+                        .as_ref()
+                        .map(RetainedListenerCapability::clone_guard);
+                    let activity = self.inner.io_activity.begin(permit.cancellation.sender());
+                    drop(registry);
+                    drop(wake_barrier);
+                    let healthy = match (port, guard) {
+                        (Some(port), Some(_guard)) => {
+                            let _activity = activity;
+                            Self::probe_http(port, &origin, &policy, permit.cancellation.clone())
+                                .await
+                        }
+                        #[cfg(test)]
+                        (None, Some(_guard)) => {
+                            drop(activity);
+                            true
+                        }
+                        _ => {
+                            drop(activity);
+                            false
+                        }
+                    };
+                    let mut registry = self.inner.registry.lock().await;
+                    self.ensure_active()?;
+                    let _wake_barrier = self.enter_publisher_transition()?;
+                    if !healthy {
+                        self.outcome(registry.fail_rebind(
+                            &permit.fence,
+                            TerminalAttemptFailure::EndpointUnhealthy,
+                        ))?;
+                        return Err(Self::terminal_error(
+                            TerminalAttemptFailure::EndpointUnhealthy,
+                        ));
+                    }
+                    let grant = self.outcome(
+                        registry.commit_rebind(
+                            &permit.fence,
+                            capability
+                                .take()
+                                .expect("candidate capability consumed exactly once"),
+                        ),
+                    )?;
+                    let state = Self::state_for(&registry, &grant.lease.service)?;
+                    self.notify_change();
+                    return Self::rebind_result(&grant, state);
+                }
+                BeginRebindCandidate::Replay(grant) => {
+                    let state = Self::state_for(&registry, &grant.lease.service)?;
+                    return Self::rebind_result(&grant, state);
+                }
+                BeginRebindCandidate::Terminal(failure) => {
+                    return Err(Self::terminal_error(failure));
+                }
+                BeginRebindCandidate::Joined(_) => {
+                    drop(registry);
+                    drop(wake_barrier);
+                    changes
+                        .changed()
+                        .await
+                        .map_err(|_| Self::operation_canceled())?;
+                }
             }
-            BeginRebindCandidate::Replay(grant) => grant,
-            BeginRebindCandidate::Terminal(failure) => return Err(Self::terminal_error(failure)),
-            BeginRebindCandidate::Joined(_) => {
-                return Err(Self::error(&PublicationRegistryError::RebindInProgress));
-            }
-        };
-        let state = Self::state_for(&registry, &grant.lease.service)?;
-        let result = protocol::RebindResult::new(
+        }
+    }
+
+    fn rebind_result(
+        grant: &LeaseGrant,
+        state: PublicationState,
+    ) -> Result<protocol::RebindResult, protocol::ProtocolError> {
+        protocol::RebindResult::new(
             grant.lease.wire(),
             protocol::BindingRevision::new(grant.binding_revision)
                 .map_err(|error| Self::internal(error.to_string()))?,
@@ -4185,12 +4681,7 @@ impl PublisherAuthority {
             Self::duration_ms(grant.schedule.expires_in)?,
             Self::wire_publication_state(state),
         )
-        .map_err(|error| Self::internal(error.to_string()))?;
-        let after = registry.preparation_tokens();
-        drop(registry);
-        self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
-        self.notify_change();
-        Ok(result)
+        .map_err(|error| Self::internal(error.to_string()))
     }
 
     pub(crate) async fn wait_ready(
@@ -4321,6 +4812,173 @@ impl PublisherAuthority {
         drop(registry);
         self.finish_removed_preparations(&before, &after, &Self::preparation_timed_out());
         Ok(projection.map(|projection| (projection.state, projection.origin)))
+    }
+
+    pub(crate) async fn route(
+        &self,
+        key: &ServiceKey,
+    ) -> Result<Option<locald_core::resolver::PublishedRoute>, protocol::ProtocolError> {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_registry_transition()?;
+        let selection = self.outcome(registry.select_route(key))?;
+        drop(registry);
+        Ok(selection.map(|route| self.public_route(route)))
+    }
+
+    pub(crate) async fn projection_and_route(
+        &self,
+        key: &ServiceKey,
+        include_route: bool,
+    ) -> Result<
+        Option<(
+            PublicationState,
+            SemanticOrigin,
+            Option<locald_core::resolver::PublishedRoute>,
+        )>,
+        protocol::ProtocolError,
+    > {
+        self.ensure_deadline_driver();
+        let mut registry = self.inner.registry.lock().await;
+        self.ensure_active()?;
+        let _wake_barrier = self.enter_registry_transition()?;
+        let Some(projection) = self.outcome(registry.snapshot(key))? else {
+            return Ok(None);
+        };
+        let route = if include_route && projection.state == PublicationState::Ready {
+            self.outcome(registry.select_route(key))?
+                .map(|route| self.public_route(route))
+        } else {
+            None
+        };
+        Ok(Some((projection.state, projection.origin, route)))
+    }
+
+    fn public_route(
+        &self,
+        route: PublishedRouteSelection,
+    ) -> locald_core::resolver::PublishedRoute {
+        let activity = self.inner.io_activity.begin(route.cancellation.sender());
+        let guard: Arc<dyn Send + Sync> = Arc::new(RetainedRouteGuard {
+            _listener: route.capability_guard,
+            _activity: activity,
+        });
+        locald_core::resolver::PublishedRoute {
+            port: route.port,
+            binding_revision: route.binding_revision,
+            traffic_scope_revision: route.traffic_scope_revision,
+            semantic_origin: route.semantic_origin.to_string(),
+            cancellation: route.cancellation.receiver,
+            capability_guard: guard,
+        }
+    }
+
+    fn schedule_probe(&self, key: ServiceKey) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let authority = self.clone();
+        handle.spawn(async move {
+            authority.drive_health(key).await;
+        });
+    }
+
+    async fn drive_health(self, key: ServiceKey) {
+        loop {
+            let (permit, activity) = {
+                let mut registry = self.inner.registry.lock().await;
+                if self.ensure_active().is_err() {
+                    return;
+                }
+                let Some(_wake_barrier) = self.try_enter_registry_transition() else {
+                    drop(registry);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                match self.outcome(registry.begin_health_probe(&key)) {
+                    Ok(Some(permit)) => {
+                        let activity = self.inner.io_activity.begin(permit.cancellation.sender());
+                        (permit, activity)
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            };
+            let interval = Duration::from_secs(permit.policy.interval_secs);
+            let healthy = {
+                let _activity = activity;
+                Self::perform_http_probe(&permit).await
+            };
+            let committed = {
+                let mut registry = self.inner.registry.lock().await;
+                if self.ensure_active().is_err() {
+                    return;
+                }
+                let Some(_wake_barrier) = self.try_enter_registry_transition() else {
+                    return;
+                };
+                self.outcome(registry.commit_health_result(&permit, healthy))
+                    .unwrap_or(false)
+            };
+            if !committed {
+                return;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    async fn perform_http_probe(permit: &HealthProbePermit) -> bool {
+        let _capability_guard = Arc::clone(&permit.capability_guard);
+        Self::probe_http(
+            permit.port,
+            &permit.origin,
+            &permit.policy,
+            permit.cancellation.clone(),
+        )
+        .await
+    }
+
+    async fn probe_http(
+        port: u16,
+        semantic_origin: &SemanticOrigin,
+        policy: &PublishedHttpHealthPolicy,
+        mut cancellation: OperationCancellationObserver,
+    ) -> bool {
+        let Ok(origin) = semantic_origin.as_str().parse::<hyper::Uri>() else {
+            return false;
+        };
+        let Some(authority) = origin.authority().map(hyper::http::uri::Authority::as_str) else {
+            return false;
+        };
+        let url = format!("http://127.0.0.1:{port}{}", policy.path);
+        let client = match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        let request = client
+            .get(url)
+            .header(hyper::header::HOST, authority)
+            .header(
+                "forwarded",
+                format!("for=127.0.0.1;host=\"{authority}\";proto=https"),
+            )
+            .header("x-forwarded-for", "127.0.0.1")
+            .header("x-forwarded-host", authority)
+            .header("x-forwarded-proto", "https")
+            .header(
+                "x-forwarded-port",
+                semantic_origin.port().unwrap_or(443).to_string(),
+            );
+        let timeout = Duration::from_secs(policy.timeout_secs);
+        tokio::select! {
+            () = cancellation.cancelled() => false,
+            result = tokio::time::timeout(timeout, request.send()) => {
+                matches!(result, Ok(Ok(response)) if response.status().is_success())
+            }
+        }
     }
 
     pub(crate) async fn sweep_deadlines(&self) -> Result<(), protocol::ProtocolError> {
@@ -4746,6 +5404,7 @@ impl PublisherAuthority {
     ) -> Result<T, protocol::ProtocolError> {
         let PublicationOutcome { result, effects } = outcome;
         let changed = effects.has_changes();
+        let probes = effects.probe_required.iter().cloned().collect::<Vec<_>>();
         let retired_preparations = effects.retired_preparations.clone();
         let timed_out_preparations = effects.timed_out_preparations.clone();
         let result = result.map_err(|error| Self::error(&error));
@@ -4758,6 +5417,9 @@ impl PublisherAuthority {
         }
         if changed {
             self.notify_change();
+        }
+        for key in probes {
+            self.schedule_probe(key);
         }
         result
     }
@@ -5063,6 +5725,7 @@ mod tests {
                 wake_receiver: std::sync::Mutex::new(Some(wake_receiver)),
                 deadline_driver_started: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
+                io_activity: Arc::new(IoActivityCoordinator::default()),
                 wait_ready_capture_hook: std::sync::Mutex::new(None),
             }),
         }
@@ -5122,6 +5785,552 @@ mod tests {
             .result
             .expect("commit acquisition");
         (attempt, grant)
+    }
+
+    fn publish_on_listener(
+        registry: &mut PublicationRegistry,
+        key: &ServiceKey,
+        principal: &PublisherPrincipal,
+        listener: ListenerIdentity,
+        drops: &Arc<AtomicUsize>,
+    ) -> LeaseGrant {
+        let attempt = begin_attempt(registry, key, principal);
+        let origin = registry
+            .projection(key)
+            .expect("published projection")
+            .origin;
+        let BeginAcquire::Started(fence) = registry
+            .begin_acquire(&attempt, principal, &origin, &listener)
+            .result
+            .expect("begin acquisition")
+        else {
+            panic!("expected fresh acquisition");
+        };
+        registry
+            .commit_acquire(
+                &fence,
+                RetainedListenerCapability::new(listener, Arc::new(DropCounter(drops.clone()))),
+            )
+            .result
+            .expect("commit acquisition")
+    }
+
+    #[test]
+    fn continuous_health_promotes_with_exact_scope_and_withdraws_on_failure() {
+        let declaration = declaration(instance(91), 1, "health.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+
+        let initial = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin initial probe")
+            .expect("initial probe permit");
+        assert_eq!(initial.fence.traffic_scope_revision, 1);
+        assert!(
+            registry
+                .commit_health_result(&initial, true)
+                .result
+                .unwrap()
+        );
+        assert_eq!(
+            registry.projection(&key).unwrap().state,
+            PublicationState::Ready
+        );
+
+        let route = registry
+            .select_route(&key)
+            .result
+            .expect("select healthy route")
+            .expect("ready route");
+        assert_eq!(route.traffic_scope_revision, 2);
+        let continuous = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin continuous probe")
+            .expect("continuous probe permit");
+        assert!(
+            registry
+                .commit_health_result(&continuous, true)
+                .result
+                .unwrap()
+        );
+        let unchanged = registry
+            .select_route(&key)
+            .result
+            .expect("select continuously healthy route")
+            .expect("route remains ready");
+        assert_eq!(
+            unchanged.traffic_scope_revision,
+            route.traffic_scope_revision
+        );
+        assert!(!route.cancellation.is_cancelled());
+
+        let failing = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin failing probe")
+            .expect("failing probe permit");
+        assert!(
+            registry
+                .commit_health_result(&failing, false)
+                .result
+                .unwrap()
+        );
+        assert!(route.cancellation.is_cancelled());
+        assert_eq!(
+            registry.projection(&key).unwrap().state,
+            PublicationState::EndpointUnhealthy
+        );
+        assert!(registry.select_route(&key).result.unwrap().is_none());
+
+        let recovery = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin recovery probe")
+            .expect("recovery probe permit");
+        assert!(
+            registry
+                .commit_health_result(&recovery, true)
+                .result
+                .unwrap()
+        );
+        let recovered = registry
+            .select_route(&key)
+            .result
+            .expect("select recovered route")
+            .expect("recovered route");
+        assert!(recovered.traffic_scope_revision > route.traffic_scope_revision);
+    }
+
+    #[test]
+    fn alias_transfer_accepts_inflight_initial_health_and_continues_monitoring() {
+        let declaration = declaration(instance(98), 1, "initial-alias.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let permit = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin initial probe")
+            .expect("initial probe permit");
+        let scope_revision = permit.fence.traffic_scope_revision;
+        let cancellation = permit.cancellation.clone();
+
+        let mut alias_only = declaration;
+        alias_only.configuration_revision = 2;
+        alias_only.domain_claims.insert(DomainPattern::exact(
+            "alternate.initial-alias.localhost"
+                .parse()
+                .expect("valid alias domain"),
+        ));
+        registry
+            .reconcile_declarations(key.instance(), 2, [alias_only])
+            .result
+            .expect("transfer alias while initial probe is in flight");
+        let SlotState::Live(lease) = &registry.slots.get(&key).unwrap().state else {
+            panic!("live lease survives compatible alias transfer");
+        };
+        assert!(lease.probe_in_flight);
+        assert_eq!(lease.health, ObservedEndpointHealth::Checking);
+        assert_eq!(lease.traffic_scope.revision, scope_revision);
+        assert!(!cancellation.is_cancelled());
+
+        assert!(registry.commit_health_result(&permit, true).result.unwrap());
+        assert_eq!(
+            registry.projection(&key).unwrap().state,
+            PublicationState::Ready
+        );
+        let successor = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin successor continuous probe")
+            .expect("continuous monitoring remains eligible");
+        assert!(
+            registry
+                .commit_health_result(&successor, true)
+                .result
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn alias_transfer_accepts_inflight_continuous_health_without_replacing_scope() {
+        let declaration = declaration(instance(99), 1, "continuous-alias.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration.clone());
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let initial = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin initial probe")
+            .expect("initial probe permit");
+        assert!(
+            registry
+                .commit_health_result(&initial, true)
+                .result
+                .unwrap()
+        );
+        let continuous = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin continuous probe")
+            .expect("continuous probe permit");
+        let scope_revision = continuous.fence.traffic_scope_revision;
+        let cancellation = continuous.cancellation.clone();
+
+        let mut alias_only = declaration;
+        alias_only.configuration_revision = 2;
+        alias_only.domain_claims.insert(DomainPattern::exact(
+            "alternate.continuous-alias.localhost"
+                .parse()
+                .expect("valid alias domain"),
+        ));
+        registry
+            .reconcile_declarations(key.instance(), 2, [alias_only])
+            .result
+            .expect("transfer alias while continuous probe is in flight");
+        assert!(
+            registry
+                .commit_health_result(&continuous, true)
+                .result
+                .unwrap()
+        );
+        let SlotState::Live(lease) = &registry.slots.get(&key).unwrap().state else {
+            panic!("live lease survives compatible alias transfer");
+        };
+        assert_eq!(lease.health, ObservedEndpointHealth::Healthy);
+        assert_eq!(lease.traffic_scope.kind, TrafficScopeKind::Routable);
+        assert_eq!(lease.traffic_scope.revision, scope_revision);
+        assert!(!cancellation.is_cancelled());
+        assert!(registry.begin_health_probe(&key).result.unwrap().is_some());
+    }
+
+    #[test]
+    fn health_promotion_scope_overflow_preserves_probe_and_projection_atomically() {
+        let declaration = declaration(instance(96), 1, "promotion-max.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let SlotState::Live(lease) = &mut registry.slots.get_mut(&key).unwrap().state else {
+            panic!("live lease");
+        };
+        lease.traffic_scope.revision = u64::MAX;
+        let cancellation = lease.traffic_scope.observer.clone();
+
+        let permit = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin promotion probe")
+            .expect("promotion probe permit");
+        let outcome = registry.commit_health_result(&permit, true);
+        assert_eq!(
+            outcome.result,
+            Err(PublicationRegistryError::GenerationOverflow)
+        );
+        assert!(outcome.effects.projection_changed.is_empty());
+        let SlotState::Live(lease) = &registry.slots.get(&key).unwrap().state else {
+            panic!("live lease survives rejected promotion");
+        };
+        assert!(lease.probe_in_flight);
+        assert_eq!(lease.health, ObservedEndpointHealth::Checking);
+        assert_eq!(lease.traffic_scope.kind, TrafficScopeKind::ProbeOnly);
+        assert_eq!(lease.traffic_scope.revision, u64::MAX);
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            registry.projection(&key).unwrap().state,
+            PublicationState::CheckingEndpoint
+        );
+    }
+
+    #[test]
+    fn health_withdrawal_scope_overflow_preserves_probe_and_projection_atomically() {
+        let declaration = declaration(instance(97), 1, "withdrawal-max.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let initial = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin initial probe")
+            .expect("initial probe permit");
+        assert!(
+            registry
+                .commit_health_result(&initial, true)
+                .result
+                .unwrap()
+        );
+        let SlotState::Live(lease) = &mut registry.slots.get_mut(&key).unwrap().state else {
+            panic!("live lease");
+        };
+        lease.traffic_scope.revision = u64::MAX;
+        let cancellation = lease.traffic_scope.observer.clone();
+
+        let permit = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin withdrawal probe")
+            .expect("withdrawal probe permit");
+        let outcome = registry.commit_health_result(&permit, false);
+        assert_eq!(
+            outcome.result,
+            Err(PublicationRegistryError::GenerationOverflow)
+        );
+        assert!(outcome.effects.projection_changed.is_empty());
+        let SlotState::Live(lease) = &registry.slots.get(&key).unwrap().state else {
+            panic!("live lease survives rejected withdrawal");
+        };
+        assert!(lease.probe_in_flight);
+        assert_eq!(lease.health, ObservedEndpointHealth::Healthy);
+        assert_eq!(lease.traffic_scope.kind, TrafficScopeKind::Routable);
+        assert_eq!(lease.traffic_scope.revision, u64::MAX);
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            registry.projection(&key).unwrap().state,
+            PublicationState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_uses_exact_semantic_headers_once_and_rejects_redirects() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe backend");
+        let port = listener.local_addr().expect("probe address").port();
+        let declaration = declaration(instance(95), 1, "probe.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(
+            &mut registry,
+            &key,
+            &owner,
+            ListenerIdentity::MacOsIpv4 {
+                address: [127, 0, 0, 1],
+                port,
+                pcb_generation: 95,
+            },
+            &drops,
+        );
+        let permit = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin wire probe")
+            .expect("wire probe permit");
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept probe");
+            let mut bytes = vec![0_u8; 8192];
+            let mut length = 0;
+            loop {
+                let read = stream
+                    .read(&mut bytes[length..])
+                    .await
+                    .expect("read probe request");
+                length += read;
+                if read == 0
+                    || bytes[..length]
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(redirect.as_bytes())
+                .await
+                .expect("write probe response");
+            let followed = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok();
+            (
+                String::from_utf8(bytes[..length].to_vec()).expect("ASCII probe request"),
+                followed,
+            )
+        });
+
+        assert!(!PublisherAuthority::perform_http_probe(&permit).await);
+        let (request, followed) = backend.await.expect("probe backend task");
+        assert!(!followed, "the probe client must not follow redirects");
+        let headers = request
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let values = |name: &str| {
+            headers
+                .iter()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("host"), ["probe.localhost"]);
+        assert_eq!(
+            values("forwarded"),
+            ["for=127.0.0.1;host=\"probe.localhost\";proto=https"]
+        );
+        assert_eq!(values("x-forwarded-for"), ["127.0.0.1"]);
+        assert_eq!(values("x-forwarded-host"), ["probe.localhost"]);
+        assert_eq!(values("x-forwarded-proto"), ["https"]);
+        assert_eq!(values("x-forwarded-port"), ["443"]);
+        assert!(values("origin").is_empty());
+    }
+
+    #[test]
+    fn rebind_scope_revision_overflow_preserves_old_binding_atomically() {
+        let declaration = declaration(instance(92), 1, "overflow.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let grant = publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let SlotState::Live(lease) = &mut registry.slots.get_mut(&key).unwrap().state else {
+            panic!("live lease");
+        };
+        lease.traffic_scope.revision = u64::MAX;
+        let BeginRebind::Started { handle, .. } = registry
+            .begin_rebind(&grant.lease, &owner, grant.binding_revision)
+            .result
+            .expect("begin rebind")
+        else {
+            panic!("fresh rebind");
+        };
+        let origin = registry.projection(&key).unwrap().origin;
+        let candidate_listener = macos_listener(2);
+        let BeginRebindCandidate::Started(permit) = registry
+            .begin_rebind_candidate(&handle, &owner, &origin, &candidate_listener)
+            .result
+            .expect("begin candidate")
+        else {
+            panic!("candidate permit");
+        };
+        let candidate = RetainedListenerCapability::new(
+            candidate_listener,
+            Arc::new(DropCounter(drops.clone())),
+        );
+        assert_eq!(
+            registry.commit_rebind(&permit.fence, candidate).result,
+            Err(PublicationRegistryError::GenerationOverflow)
+        );
+        let SlotState::Live(lease) = &registry.slots.get(&key).unwrap().state else {
+            panic!("old lease remains live");
+        };
+        assert_eq!(lease.binding_revision, grant.binding_revision);
+        assert_eq!(lease.capability.identity(), &macos_listener(1));
+    }
+
+    #[test]
+    fn pause_and_wake_scope_revision_overflow_fail_before_cancelling_live_scope() {
+        let declaration = declaration(instance(93), 1, "scope-max.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let SlotState::Live(lease) = &mut registry.slots.get_mut(&key).unwrap().state else {
+            panic!("live lease");
+        };
+        lease.traffic_scope.revision = u64::MAX;
+        let cancellation = lease.traffic_scope.observer.clone();
+
+        assert_eq!(
+            registry.set_paused(key.instance(), true).result,
+            Err(PublicationRegistryError::GenerationOverflow)
+        );
+        assert!(!registry.slots.get(&key).unwrap().paused);
+        assert!(!cancellation.is_cancelled());
+
+        assert_eq!(
+            registry.wake_barrier(true).result,
+            Err(PublicationRegistryError::GenerationOverflow)
+        );
+        let SlotState::Live(lease) = &registry.slots.get(&key).unwrap().state else {
+            panic!("live lease survives rejected wake");
+        };
+        assert_eq!(lease.traffic_scope.revision, u64::MAX);
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn multi_service_health_policy_transfer_overflow_is_fully_atomic() {
+        let project = instance(94);
+        let mut first = declaration(project, 1, "first.localhost");
+        first.service_name = "a-first".into();
+        let mut removed = declaration(project, 1, "removed.localhost");
+        removed.service_name = "m-removed".into();
+        let mut last = declaration(project, 1, "last.localhost");
+        last.service_name = "z-last".into();
+        let clock = FakePublicationClock::new(Duration::ZERO);
+        let mut registry =
+            PublicationRegistry::with_epoch(Arc::new(clock), DaemonEpoch::from_byte(7));
+        registry
+            .reconcile_declarations(project, 1, [first.clone(), removed.clone(), last.clone()])
+            .result
+            .expect("admit initial generation");
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        for (index, declaration) in [&first, &removed, &last].into_iter().enumerate() {
+            let key = ServiceKey::new(project, declaration.service_name.clone());
+            publish_on_listener(
+                &mut registry,
+                &key,
+                &owner,
+                macos_listener(index as u64 + 1),
+                &drops,
+            );
+        }
+        let first_key = ServiceKey::new(project, first.service_name.clone());
+        let removed_key = ServiceKey::new(project, removed.service_name.clone());
+        let last_key = ServiceKey::new(project, last.service_name.clone());
+        let SlotState::Live(first_lease) = &registry.slots[&first_key].state else {
+            panic!("first live lease");
+        };
+        let first_scope = first_lease.traffic_scope.revision;
+        let first_cancellation = first_lease.traffic_scope.observer.clone();
+        let SlotState::Live(last_lease) = &mut registry.slots.get_mut(&last_key).unwrap().state
+        else {
+            panic!("last live lease");
+        };
+        last_lease.health_policy_revision = u64::MAX;
+
+        let mut next_first = first.clone();
+        next_first.configuration_revision = 2;
+        next_first.health_policy =
+            PublishedHttpHealthPolicy::new("/ready", 1, 5).expect("next first policy");
+        let mut next_last = last.clone();
+        next_last.configuration_revision = 2;
+        next_last.health_policy =
+            PublishedHttpHealthPolicy::new("/ready", 1, 5).expect("next last policy");
+        assert_eq!(
+            registry
+                .reconcile_declarations(project, 2, [next_first, next_last])
+                .result,
+            Err(PublicationRegistryError::GenerationOverflow)
+        );
+
+        assert_eq!(
+            registry.configuration_states[&project],
+            InstanceConfigurationState::Active(1)
+        );
+        assert!(registry.slots.contains_key(&removed_key));
+        assert_eq!(
+            registry.slots[&first_key].declaration,
+            DeclarationAuthority(first)
+        );
+        let SlotState::Live(first_lease) = &registry.slots[&first_key].state else {
+            panic!("first lease remains live");
+        };
+        assert_eq!(first_lease.traffic_scope.revision, first_scope);
+        assert!(!first_cancellation.is_cancelled());
     }
 
     #[test]
@@ -6936,6 +8145,15 @@ mod tests {
         let committed = registry.commit_rebind(&fence, capability(2, &drops));
         let grant = committed.result.expect("commit rebind");
         assert_eq!(grant.binding_revision, 2);
+        assert_eq!(
+            registry.projection(&key).expect("rebound projection").state,
+            PublicationState::Ready
+        );
+        let SlotState::Live(lease) = &registry.slots.get(&key).expect("rebound slot").state else {
+            panic!("rebound lease remains live");
+        };
+        assert_eq!(lease.health, ObservedEndpointHealth::Healthy);
+        assert_eq!(lease.traffic_scope.kind, TrafficScopeKind::Routable);
         drop(committed.effects);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 

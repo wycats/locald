@@ -253,11 +253,12 @@ mod tests {
     use locald_core::registry::Registry;
     use locald_publisher_client::{PublisherTransport as _, UnixPublisherTransport};
     use serde::de::DeserializeOwned;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::os::fd::{AsFd as _, BorrowedFd};
     use std::os::unix::net::UnixStream;
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::tempdir;
     use tokio::sync::{Mutex, Notify};
@@ -387,7 +388,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_socket_drives_the_complete_routeless_publication_lifecycle() {
+    async fn real_socket_drives_the_complete_health_gated_publication_lifecycle() {
         let directory = tempdir().expect("create publisher integration fixture");
         let project_path = directory.path().join("project");
         std::fs::create_dir(&project_path).expect("create published project");
@@ -540,7 +541,7 @@ health_check = { type = "http", path = "/api/health" }
         let locald_core::resolver::DomainResolution::PublishedUnavailable { publication, .. } =
             resolution
         else {
-            panic!("L1 must keep canonical HTTPS unroutable");
+            panic!("an unanswered health endpoint must remain unroutable");
         };
         assert_eq!(publication.state, CorePublicationState::CheckingEndpoint);
 
@@ -587,6 +588,64 @@ health_check = { type = "http", path = "/api/health" }
         )
         .expect("prepare rebind");
         let second_listener = TcpListener::bind("127.0.0.1:0").expect("bind second listener");
+        let candidate_probe_listener = second_listener
+            .try_clone()
+            .expect("clone candidate listener for its health response");
+        let candidate_probe_host = begin_rebind
+            .origin()
+            .as_str()
+            .strip_prefix("https://")
+            .expect("published origin uses HTTPS")
+            .to_owned();
+        candidate_probe_listener
+            .set_nonblocking(true)
+            .expect("make candidate health responder cancellable");
+        let stop_candidate_probe = Arc::new(AtomicBool::new(false));
+        let candidate_probe_count = Arc::new(AtomicUsize::new(0));
+        let candidate_probe_stop = Arc::clone(&stop_candidate_probe);
+        let observed_candidate_probes = Arc::clone(&candidate_probe_count);
+        let candidate_probe = std::thread::spawn(move || {
+            while !candidate_probe_stop.load(Ordering::Acquire) {
+                let (mut connection, _) = match candidate_probe_listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept candidate health probe: {error}"),
+                };
+                connection
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .expect("bound candidate probe read");
+                let mut request = vec![0_u8; 8192];
+                let mut length = 0;
+                loop {
+                    let read = connection
+                        .read(&mut request[length..])
+                        .expect("read candidate health probe");
+                    length += read;
+                    if read == 0
+                        || request[..length]
+                            .windows(4)
+                            .any(|window| window == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request[..length].to_vec())
+                    .expect("candidate health probe is HTTP");
+                assert!(request.starts_with("GET /api/health HTTP/1.1\r\n"));
+                assert!(request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("host") && value.trim() == candidate_probe_host
+                    })
+                }));
+                connection
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .expect("answer candidate health probe");
+                observed_candidate_probes.fetch_add(1, Ordering::AcqRel);
+            }
+        });
         let rebound = exchange::<protocol::RebindResult>(
             &socket,
             &epoch,
@@ -598,6 +657,25 @@ health_check = { type = "http", path = "/api/health" }
         )
         .expect("install replacement binding");
         assert_eq!(rebound.binding_revision().get(), 2);
+        assert_eq!(
+            rebound.publication_state(),
+            protocol::PublicationState::Ready
+        );
+        assert!(candidate_probe_count.load(Ordering::Acquire) >= 1);
+        let resolution = manager
+            .resolve_service_by_domain("workbench.publisher-integration.localhost")
+            .await
+            .expect("resolve healthy replacement binding");
+        let locald_core::resolver::DomainResolution::PublishedReady {
+            publication, route, ..
+        } = resolution
+        else {
+            panic!("healthy replacement binding must be routable");
+        };
+        assert_eq!(publication.state, CorePublicationState::Ready);
+        assert_eq!(route.binding_revision, 2);
+        assert_eq!(route.port, second_listener.local_addr().unwrap().port());
+        let route_cancellation = route.cancellation.clone();
 
         let released = exchange::<protocol::ReleaseResult>(
             &socket,
@@ -609,6 +687,22 @@ health_check = { type = "http", path = "/api/health" }
         )
         .expect("release live lease");
         assert!(released.is_released());
+        assert!(*route_cancellation.borrow());
+        drop(route);
+        let resolution = manager
+            .resolve_service_by_domain("workbench.publisher-integration.localhost")
+            .await
+            .expect("declared origin remains owned after release");
+        let locald_core::resolver::DomainResolution::PublishedUnavailable { publication, .. } =
+            resolution
+        else {
+            panic!("released binding must be unavailable");
+        };
+        assert_eq!(publication.state, CorePublicationState::WaitingForPublisher);
+        stop_candidate_probe.store(true, Ordering::Release);
+        candidate_probe
+            .join()
+            .expect("candidate health responder completes");
 
         let wait_error = exchange::<protocol::WaitReadyResult>(
             &socket,
