@@ -799,6 +799,7 @@ struct LeaseGrant {
 struct PublicationProjection {
     state: PublicationState,
     origin: SemanticOrigin,
+    health_policy: PublishedHttpHealthPolicy,
 }
 
 #[derive(Clone)]
@@ -1161,6 +1162,7 @@ impl PublicationRegistry {
                 }
             },
             origin: slot.declaration.0.origin.clone(),
+            health_policy: slot.declaration.0.health_policy.clone(),
         })
     }
 
@@ -2271,6 +2273,7 @@ impl PublicationRegistry {
                 }
             },
             origin: slot.declaration.0.origin.clone(),
+            health_policy: slot.declaration.0.health_policy.clone(),
         };
         PublicationOutcome::ok((projection, wait_remaining), effects)
     }
@@ -2367,6 +2370,10 @@ impl PublicationRegistry {
             if let Err(error) = Self::replace_traffic_scope(lease, kind) {
                 return PublicationOutcome::err(error, effects);
             }
+            // Replacing the scope cancels the permit that owns the current
+            // driver. Hand continuous monitoring to a driver for the exact
+            // successor scope instead of silently ending it.
+            effects.probe_required.insert(key.clone());
         }
         if before_scope != lease.traffic_scope.kind
             || (!slot.paused && before_health != lease.health)
@@ -4839,6 +4846,7 @@ impl PublisherAuthority {
         Option<(
             PublicationState,
             SemanticOrigin,
+            PublishedHttpHealthPolicy,
             Option<locald_core::resolver::PublishedRoute>,
         )>,
         protocol::ProtocolError,
@@ -4856,7 +4864,12 @@ impl PublisherAuthority {
         } else {
             None
         };
-        Ok(Some((projection.state, projection.origin, route)))
+        Ok(Some((
+            projection.state,
+            projection.origin,
+            projection.health_policy,
+            route,
+        )))
     }
 
     fn public_route(
@@ -5849,12 +5862,9 @@ mod tests {
             .expect("begin initial probe")
             .expect("initial probe permit");
         assert_eq!(initial.fence.traffic_scope_revision, 1);
-        assert!(
-            registry
-                .commit_health_result(&initial, true)
-                .result
-                .unwrap()
-        );
+        let promoted = registry.commit_health_result(&initial, true);
+        assert!(promoted.result.unwrap());
+        assert!(promoted.effects.probe_required.contains(&key));
         assert_eq!(
             registry.projection(&key).unwrap().state,
             PublicationState::Ready
@@ -5871,12 +5881,9 @@ mod tests {
             .result
             .expect("begin continuous probe")
             .expect("continuous probe permit");
-        assert!(
-            registry
-                .commit_health_result(&continuous, true)
-                .result
-                .unwrap()
-        );
+        let unchanged_health = registry.commit_health_result(&continuous, true);
+        assert!(unchanged_health.result.unwrap());
+        assert!(unchanged_health.effects.probe_required.is_empty());
         let unchanged = registry
             .select_route(&key)
             .result
@@ -5893,12 +5900,9 @@ mod tests {
             .result
             .expect("begin failing probe")
             .expect("failing probe permit");
-        assert!(
-            registry
-                .commit_health_result(&failing, false)
-                .result
-                .unwrap()
-        );
+        let withdrawn = registry.commit_health_result(&failing, false);
+        assert!(withdrawn.result.unwrap());
+        assert!(withdrawn.effects.probe_required.contains(&key));
         assert!(route.cancellation.is_cancelled());
         assert_eq!(
             registry.projection(&key).unwrap().state,
@@ -5911,12 +5915,9 @@ mod tests {
             .result
             .expect("begin recovery probe")
             .expect("recovery probe permit");
-        assert!(
-            registry
-                .commit_health_result(&recovery, true)
-                .result
-                .unwrap()
-        );
+        let recovered_health = registry.commit_health_result(&recovery, true);
+        assert!(recovered_health.result.unwrap());
+        assert!(recovered_health.effects.probe_required.contains(&key));
         let recovered = registry
             .select_route(&key)
             .result
@@ -6214,17 +6215,26 @@ mod tests {
         let owner = principal(1);
         let drops = Arc::new(AtomicUsize::new(0));
         let grant = publish_on_listener(&mut registry, &key, &owner, macos_listener(100), &drops);
-        let permit = registry
+        let initial = registry
             .begin_health_probe(&key)
             .result
             .expect("begin guarded probe")
             .expect("guarded probe permit");
         assert!(
             registry
-                .commit_health_result(&permit, true)
+                .commit_health_result(&initial, true)
                 .result
                 .expect("commit guarded probe")
         );
+        drop(initial);
+        let permit = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin continuous guarded probe")
+            .expect("continuous guarded probe permit");
+        let committed = registry.commit_health_result(&permit, true);
+        assert!(committed.result.expect("commit continuous guarded probe"));
+        assert!(committed.effects.probe_required.is_empty());
         let guard = Arc::clone(&permit.capability_guard);
         assert_eq!(
             Arc::strong_count(&guard),

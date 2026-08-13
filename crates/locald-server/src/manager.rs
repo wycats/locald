@@ -8137,6 +8137,7 @@ impl ProcessManager {
         exact: Option<(
             PublicationState,
             SemanticOrigin,
+            PublishedHttpHealthPolicy,
             Option<locald_core::resolver::PublishedRoute>,
         )>,
     ) -> (
@@ -8144,8 +8145,9 @@ impl ProcessManager {
         Option<locald_core::resolver::PublishedRoute>,
     ) {
         match exact {
-            Some((state, authority_origin, route))
+            Some((state, authority_origin, authority_health_policy, route))
                 if authority_origin == declaration.origin
+                    && authority_health_policy == declaration.health_policy
                     && (state != PublicationState::Ready
                         || route.is_some()
                         || !requested_is_primary) =>
@@ -32853,7 +32855,7 @@ domains = ["workbench"]
     }
 
     #[tokio::test]
-    async fn published_domain_route_rejects_a_stale_authority_origin() {
+    async fn published_domain_route_rejects_stale_authority_origin_or_health_policy() {
         let directory = tempdir().expect("create published route-origin fixture");
         let project_path = directory.path().join("project");
         std::fs::create_dir(&project_path).expect("create published route-origin project");
@@ -32915,6 +32917,7 @@ domains = ["new"]
             Some((
                 PublicationState::Ready,
                 declaration.origin.clone(),
+                declaration.health_policy.clone(),
                 Some(route()),
             )),
         );
@@ -32927,7 +32930,27 @@ domains = ["new"]
         let (state, selected) = ProcessManager::validated_published_projection(
             &declaration,
             true,
-            Some((PublicationState::Ready, stale_origin, Some(route()))),
+            Some((
+                PublicationState::Ready,
+                stale_origin,
+                declaration.health_policy.clone(),
+                Some(route()),
+            )),
+        );
+        assert_eq!(state, PublicationState::WaitingForPublisher);
+        assert!(selected.is_none());
+
+        let stale_health_policy =
+            PublishedHttpHealthPolicy::new("/ready", 2, 5).expect("valid stale health policy");
+        let (state, selected) = ProcessManager::validated_published_projection(
+            &declaration,
+            true,
+            Some((
+                PublicationState::Ready,
+                declaration.origin.clone(),
+                stale_health_policy,
+                Some(route()),
+            )),
         );
         assert_eq!(state, PublicationState::WaitingForPublisher);
         assert!(selected.is_none());
