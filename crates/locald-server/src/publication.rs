@@ -4633,6 +4633,10 @@ impl PublisherAuthority {
                             &permit.fence,
                             TerminalAttemptFailure::EndpointUnhealthy,
                         ))?;
+                        // Terminal failure does not change the route
+                        // projection, but a same-request waiter may be blocked
+                        // in the Joined branch below.
+                        self.notify_change();
                         return Err(Self::terminal_error(
                             TerminalAttemptFailure::EndpointUnhealthy,
                         ));
@@ -4923,7 +4927,20 @@ impl PublisherAuthority {
             if !committed {
                 return;
             }
-            tokio::time::sleep(interval).await;
+            if !Self::wait_for_next_health_probe(permit, interval).await {
+                return;
+            }
+        }
+    }
+
+    async fn wait_for_next_health_probe(permit: HealthProbePermit, interval: Duration) -> bool {
+        let mut cancellation = permit.cancellation.clone();
+        // A completed probe no longer needs to retain its listener while
+        // waiting for the next interval.
+        drop(permit);
+        tokio::select! {
+            () = cancellation.cancelled() => false,
+            () = tokio::time::sleep(interval) => true,
         }
     }
 
@@ -4952,6 +4969,9 @@ impl PublisherAuthority {
         };
         let url = format!("http://127.0.0.1:{port}{}", policy.path);
         let client = match reqwest::Client::builder()
+            // Exact-binding health evidence must come from the retained
+            // loopback listener, never an ambient HTTP(S)/ALL_PROXY setting.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
         {
@@ -6185,6 +6205,139 @@ mod tests {
         assert_eq!(values("x-forwarded-proto"), ["https"]);
         assert_eq!(values("x-forwarded-port"), ["443"]);
         assert!(values("origin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_probe_drops_its_capability_guard_and_cancels_interval_wait() {
+        let declaration = declaration(instance(100), 1, "probe-guard.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let grant = publish_on_listener(&mut registry, &key, &owner, macos_listener(100), &drops);
+        let permit = registry
+            .begin_health_probe(&key)
+            .result
+            .expect("begin guarded probe")
+            .expect("guarded probe permit");
+        assert!(
+            registry
+                .commit_health_result(&permit, true)
+                .result
+                .expect("commit guarded probe")
+        );
+        let guard = Arc::clone(&permit.capability_guard);
+        assert_eq!(
+            Arc::strong_count(&guard),
+            3,
+            "lease, permit, and test guard"
+        );
+
+        let waiting = tokio::spawn(PublisherAuthority::wait_for_next_health_probe(
+            permit,
+            Duration::from_secs(60),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&guard) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed permit releases its listener guard before sleeping");
+
+        let released = registry.release(&grant.lease, &owner);
+        released.result.expect("release guarded publication");
+        drop(released.effects);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("scope cancellation ends interval wait")
+                .expect("join interval waiter")
+        );
+        assert_eq!(Arc::strong_count(&guard), 1, "only the test guard remains");
+    }
+
+    #[tokio::test]
+    async fn failed_rebind_notifies_an_exact_joined_request() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing rebind endpoint");
+        let port = listener
+            .local_addr()
+            .expect("rebind endpoint address")
+            .port();
+        let declaration = declaration(instance(101), 1, "joined-rebind.localhost");
+        let (mut registry, _clock, key) = registry(Duration::ZERO, declaration);
+        let owner = principal(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let grant = publish_on_listener(&mut registry, &key, &owner, macos_listener(1), &drops);
+        let authority = authority(registry);
+        let begin = authority
+            .begin_rebind(
+                &grant.lease.wire(),
+                &owner,
+                protocol::BindingRevision::new(grant.binding_revision)
+                    .expect("wire binding revision"),
+                None,
+            )
+            .await
+            .expect("begin joined rebind");
+        let listener_identity = ListenerIdentity::MacOsIpv4 {
+            address: [127, 0, 0, 1],
+            port,
+            pcb_generation: 101,
+        };
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let close = Arc::new(tokio::sync::Notify::new());
+        let backend = tokio::spawn({
+            let accepted = accepted.clone();
+            let close = close.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept rebind probe");
+                let mut request = vec![0_u8; 4096];
+                let _ = stream.read(&mut request).await.expect("read rebind probe");
+                accepted.notify_one();
+                close.notified().await;
+            }
+        });
+        let invoke = |authority: PublisherAuthority| {
+            let owner = owner.clone();
+            let handle = begin.rebind_attempt_handle().clone();
+            let origin = begin.origin().clone();
+            let listener_identity = listener_identity.clone();
+            async move {
+                authority
+                    .rebind(
+                        &handle,
+                        &owner,
+                        &origin,
+                        RetainedListenerCapability::new(listener_identity, Arc::new(())),
+                    )
+                    .await
+            }
+        };
+        let first = tokio::spawn(invoke(authority.clone()));
+        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .expect("first rebind reaches its health probe");
+        let joined = tokio::spawn(invoke(authority));
+        tokio::task::yield_now().await;
+        assert!(
+            !joined.is_finished(),
+            "second exact request joins the probe"
+        );
+        close.notify_one();
+
+        for task in [first, joined] {
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("failed rebind returns within the notification boundary")
+                .expect("join rebind request")
+                .expect_err("failed probe cannot install the candidate");
+            assert_eq!(error.code(), protocol::StableErrorCode::EndpointUnhealthy);
+        }
+        backend.await.expect("join failing rebind backend");
     }
 
     #[test]

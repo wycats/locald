@@ -1867,14 +1867,13 @@ impl ProcessManager {
         let (publication_state, explanation, next_step) = if record.presence
             == CatalogPresence::Missing
         {
-            (
-                    PublicationState::InstanceMissing,
-                    "The worktree for this published service is missing; locald is preserving its stable origin without routing it.".to_owned(),
-                    Some(
-                        "Restore the worktree, or explicitly forget the project if this identity is no longer needed."
-                            .to_owned(),
-                    ),
-                )
+            Self::published_state_guidance(PublicationState::InstanceMissing)
+        } else if let Some(exact_state) = exact_state {
+            // Domain routing obtained this state atomically with its optional
+            // request-scoped route. Reopening durable availability here would
+            // add per-request filesystem I/O and could only make the exact
+            // authority result stale.
+            Self::published_state_guidance(exact_state)
         } else {
             let paused = match self.load_availability(record.id).await {
                 Ok(mut availability) => availability
@@ -1884,80 +1883,24 @@ impl ProcessManager {
                 Err(error) => Err(error),
             };
             match paused {
-                    Ok(true) => (
-                        PublicationState::RoutePaused,
-                        "The project is paused; locald is preserving this published origin without routing it."
-                            .to_owned(),
-                        Some(
-                            "Resume the project to allow its owning workflow to restore publication."
-                                .to_owned(),
-                        ),
-                    ),
-                    Ok(false) => {
-                        let key = ServiceKey::new(
-                            record.id,
-                            ServiceName::new(declaration.service_name.as_str()),
-                        );
-                        let projection = match exact_state {
-                            Some(state) => Ok(Some((state, declaration.origin.clone()))),
-                            None => self.publisher_authority.projection(&key).await,
-                        };
-                        match projection {
-                            Ok(Some((PublicationState::CheckingEndpoint, _))) => (
-                                PublicationState::CheckingEndpoint,
-                                "The owning workflow has published an exact endpoint, but locald has not authorized it for routing yet."
-                                    .to_owned(),
-                                Some(
-                                    "Wait for locald to verify the published endpoint."
-                                        .to_owned(),
-                                ),
-                            ),
-                            Ok(Some((PublicationState::EndpointUnhealthy, _))) => (
-                                PublicationState::EndpointUnhealthy,
-                                "The owning workflow is publishing this service, but its exact endpoint is unhealthy."
-                                    .to_owned(),
-                                Some(
-                                    "Inspect the owning workflow and its `/api/health` endpoint."
-                                        .to_owned(),
-                                ),
-                            ),
-                            Ok(Some((PublicationState::Ready, _))) => (
-                                PublicationState::Ready,
-                                "The owning workflow is publishing a healthy endpoint through this stable origin."
-                                    .to_owned(),
-                                None,
-                            ),
-                            Ok(Some((PublicationState::RoutePaused, _))) => (
-                                PublicationState::RoutePaused,
-                                "The project route is paused; locald is preserving this published origin without routing it."
-                                    .to_owned(),
-                                Some(
-                                    "Resume the project to allow its owning workflow to restore publication."
-                                        .to_owned(),
-                                ),
-                            ),
-                            Ok(Some((PublicationState::InstanceMissing, _))) => (
-                                PublicationState::InstanceMissing,
-                                "The worktree for this published service is missing; locald is preserving its stable origin without routing it."
-                                    .to_owned(),
-                                Some(
-                                    "Restore the worktree, or explicitly forget the project if this identity is no longer needed."
-                                        .to_owned(),
-                                ),
-                            ),
-                            Ok(Some((PublicationState::WaitingForPublisher, _)) | None) => (
-                                PublicationState::WaitingForPublisher,
-                                "The stable service identity is declared, but no external publisher currently fulfills it."
-                                    .to_owned(),
-                                Some("Start the service with its owning workflow.".to_owned()),
-                            ),
-                            Err(error) => {
-                                warn!(
-                                    "failed to read publication authority for service {} in instance {}: {error}",
-                                    declaration.service_name,
-                                    declaration.project_instance_id
-                                );
-                                (
+                Ok(true) => Self::published_state_guidance(PublicationState::RoutePaused),
+                Ok(false) => {
+                    let key = ServiceKey::new(
+                        record.id,
+                        ServiceName::new(declaration.service_name.as_str()),
+                    );
+                    let projection = self.publisher_authority.projection(&key).await;
+                    match projection {
+                        Ok(Some((state, _))) => Self::published_state_guidance(state),
+                        Ok(None) => {
+                            Self::published_state_guidance(PublicationState::WaitingForPublisher)
+                        }
+                        Err(error) => {
+                            warn!(
+                                "failed to read publication authority for service {} in instance {}: {error}",
+                                declaration.service_name, declaration.project_instance_id
+                            );
+                            (
                                     PublicationState::WaitingForPublisher,
                                     "The stable service identity is declared, but locald could not verify its publisher authority."
                                         .to_owned(),
@@ -1966,16 +1909,15 @@ impl ProcessManager {
                                             .to_owned(),
                                     ),
                                 )
-                            }
                         }
                     }
-                    Err(error) => {
-                        warn!(
-                            "failed to read availability while projecting published service {} in instance {}: {error}",
-                            declaration.service_name,
-                            declaration.project_instance_id
-                        );
-                        (
+                }
+                Err(error) => {
+                    warn!(
+                        "failed to read availability while projecting published service {} in instance {}: {error}",
+                        declaration.service_name, declaration.project_instance_id
+                    );
+                    (
                             PublicationState::WaitingForPublisher,
                             "The stable service identity is declared, but locald could not verify its lifecycle state."
                                 .to_owned(),
@@ -1984,8 +1926,8 @@ impl ProcessManager {
                                     .to_owned(),
                             ),
                         )
-                    }
                 }
+            }
         };
         let origin = declaration.origin.to_string();
         let domain = declaration
@@ -2036,6 +1978,40 @@ impl ProcessManager {
                 next_step,
             }),
         }
+    }
+
+    fn published_state_guidance(
+        state: PublicationState,
+    ) -> (PublicationState, String, Option<String>) {
+        let (explanation, next_step) = match state {
+            PublicationState::WaitingForPublisher => (
+                "The stable service identity is declared, but no external publisher currently fulfills it.",
+                Some("Start the service with its owning workflow."),
+            ),
+            PublicationState::CheckingEndpoint => (
+                "The owning workflow has published an exact endpoint, but locald has not authorized it for routing yet.",
+                Some("Wait for locald to verify the published endpoint."),
+            ),
+            PublicationState::EndpointUnhealthy => (
+                "The owning workflow is publishing this service, but its exact endpoint is unhealthy.",
+                Some("Inspect the owning workflow and its `/api/health` endpoint."),
+            ),
+            PublicationState::Ready => (
+                "The owning workflow is publishing a healthy endpoint through this stable origin.",
+                None,
+            ),
+            PublicationState::RoutePaused => (
+                "The project route is paused; locald is preserving this published origin without routing it.",
+                Some("Resume the project to allow its owning workflow to restore publication."),
+            ),
+            PublicationState::InstanceMissing => (
+                "The worktree for this published service is missing; locald is preserving its stable origin without routing it.",
+                Some(
+                    "Restore the worktree, or explicitly forget the project if this identity is no longer needed.",
+                ),
+            ),
+        };
+        (state, explanation.to_owned(), next_step.map(str::to_owned))
     }
 
     pub async fn set_http_port(&self, port: Option<u16>) {
@@ -8094,16 +8070,11 @@ impl ProcessManager {
                 .publisher_authority
                 .projection_and_route(&key, requested_is_primary)
                 .await;
-            let (exact_state, route) = match exact {
-                Ok(Some((state, _, route)))
-                    if state != PublicationState::Ready
-                        || route.is_some()
-                        || !requested_is_primary =>
-                {
-                    (state, route)
-                }
-                Ok(Some(_) | None) | Err(_) => (PublicationState::WaitingForPublisher, None),
-            };
+            let (exact_state, route) = Self::validated_published_projection(
+                &declaration,
+                requested_is_primary,
+                exact.ok().flatten(),
+            );
             let status = self
                 .published_service_status_with_state(&record, &declaration, Some(exact_state))
                 .await;
@@ -8157,6 +8128,31 @@ impl ProcessManager {
                     runtime_generation,
                 })
             }
+        }
+    }
+
+    fn validated_published_projection(
+        declaration: &PublishedServiceDeclaration,
+        requested_is_primary: bool,
+        exact: Option<(
+            PublicationState,
+            SemanticOrigin,
+            Option<locald_core::resolver::PublishedRoute>,
+        )>,
+    ) -> (
+        PublicationState,
+        Option<locald_core::resolver::PublishedRoute>,
+    ) {
+        match exact {
+            Some((state, authority_origin, route))
+                if authority_origin == declaration.origin
+                    && (state != PublicationState::Ready
+                        || route.is_some()
+                        || !requested_is_primary) =>
+            {
+                (state, route)
+            }
+            Some(_) | None => (PublicationState::WaitingForPublisher, None),
         }
     }
 
@@ -32853,6 +32849,170 @@ domains = ["workbench"]
                 .load(AtomicOrdering::SeqCst),
             2,
             "the expired lock waiter vacates and the successor enters once"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_domain_route_rejects_a_stale_authority_origin() {
+        let directory = tempdir().expect("create published route-origin fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create published route-origin project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "published-route-origin"
+domain = "published-route-origin.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["new"]
+"#,
+        )
+        .expect("write published route-origin config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create published route-origin manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("admit published route-origin declaration");
+        let declaration = registry
+            .lock()
+            .await
+            .published_declarations()
+            .flat_map(|(_, declarations)| declarations.values())
+            .next()
+            .expect("published declaration")
+            .clone();
+        let route = || {
+            let (_, cancellation) = tokio::sync::watch::channel(false);
+            locald_core::resolver::PublishedRoute {
+                port: 41_555,
+                binding_revision: 1,
+                traffic_scope_revision: 2,
+                semantic_origin: declaration.origin.to_string(),
+                cancellation,
+                capability_guard: Arc::new(()),
+            }
+        };
+
+        let (state, selected) = ProcessManager::validated_published_projection(
+            &declaration,
+            true,
+            Some((
+                PublicationState::Ready,
+                declaration.origin.clone(),
+                Some(route()),
+            )),
+        );
+        assert_eq!(state, PublicationState::Ready);
+        assert!(selected.is_some());
+
+        let stale_origin =
+            SemanticOrigin::parse("https://old.published-route-origin.localhost:4443")
+                .expect("valid stale origin");
+        let (state, selected) = ProcessManager::validated_published_projection(
+            &declaration,
+            true,
+            Some((PublicationState::Ready, stale_origin, Some(route()))),
+        );
+        assert_eq!(state, PublicationState::WaitingForPublisher);
+        assert!(selected.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_published_status_does_not_reopen_availability_storage() {
+        let directory = tempdir().expect("create exact published-status fixture");
+        let project_path = directory.path().join("project");
+        std::fs::create_dir(&project_path).expect("create exact published-status project");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "exact-published-status"
+domain = "exact-published-status.localhost"
+
+[services.workbench]
+type = "published"
+domains = ["workbench"]
+"#,
+        )
+        .expect("write exact published-status config");
+        let registry = Arc::new(Mutex::new(Registry::with_path(
+            directory.path().join("catalog.json"),
+        )));
+        let mut manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            registry.clone(),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create exact published-status manager");
+        manager.use_sandbox_host_set_writer();
+        manager.set_https_port(Some(4443)).await;
+        manager
+            .apply_config(project_path, None, false)
+            .await
+            .expect("admit exact published-status declaration");
+        let (record, declaration) = {
+            let catalog = registry.lock().await;
+            let declaration = catalog
+                .published_declarations()
+                .flat_map(|(_, declarations)| declarations.values())
+                .next()
+                .expect("published declaration")
+                .clone();
+            let record = catalog.instances[&declaration.project_instance_id].clone();
+            (record, declaration)
+        };
+        let availability_file = availability_path(
+            &manager.availability_data_dir,
+            declaration.project_instance_id,
+        );
+        if availability_file.exists() {
+            if availability_file.is_dir() {
+                std::fs::remove_dir_all(&availability_file)
+                    .expect("remove existing availability directory fixture");
+            } else {
+                std::fs::remove_file(&availability_file)
+                    .expect("remove existing availability fixture");
+            }
+        }
+        std::fs::create_dir_all(
+            availability_file
+                .parent()
+                .expect("availability file has a parent directory"),
+        )
+        .expect("create availability fixture parent");
+        std::fs::create_dir(&availability_file)
+            .expect("make availability path unreadable as a state file");
+
+        let status = manager
+            .published_service_status_with_state(
+                &record,
+                &declaration,
+                Some(PublicationState::Ready),
+            )
+            .await;
+        assert_eq!(
+            status.publication.map(|publication| publication.state),
+            Some(PublicationState::Ready)
         );
     }
 
