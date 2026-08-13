@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 use axum::{
@@ -139,6 +140,179 @@ struct PublishedResolver {
     state: PublicationState,
 }
 
+#[derive(Debug)]
+struct OneShotPublishedRouteResolver {
+    route: Mutex<Option<locald_core::resolver::PublishedRoute>>,
+}
+
+#[async_trait::async_trait]
+impl locald_core::resolver::ServiceResolver for OneShotPublishedRouteResolver {
+    async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
+        self.route
+            .lock()
+            .await
+            .take()
+            .map(|route| DomainResolution::PublishedReady {
+                name: "app:workbench".to_owned(),
+                publication: PublicationStatus {
+                    state: PublicationState::Ready,
+                    origin: "https://workbench.app.localhost".to_owned(),
+                    explanation: "ready".to_owned(),
+                    next_step: None,
+                },
+                route,
+            })
+    }
+
+    async fn set_http_port(&self, _port: Option<u16>) {}
+    async fn set_https_port(&self, _port: Option<u16>) {}
+}
+
+#[derive(Debug)]
+struct DropSignal {
+    drops: Arc<AtomicUsize>,
+    dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn published_stream_cancels_and_quiesces_without_downstream_body_polling() {
+    let backend = Router::new().route(
+        "/",
+        get(|| async {
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"first"));
+                std::future::pending::<()>().await;
+            };
+            Body::from_stream(stream)
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let (cancellation, receiver) = tokio::sync::watch::channel(false);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
+    let guard: Arc<dyn Send + Sync> = Arc::new(DropSignal {
+        drops: Arc::clone(&drops),
+        dropped: Some(dropped),
+    });
+    let resolver = Arc::new(OneShotPublishedRouteResolver {
+        route: Mutex::new(Some(locald_core::resolver::PublishedRoute {
+            port,
+            binding_revision: 1,
+            traffic_scope_revision: 2,
+            semantic_origin: "https://workbench.app.localhost".to_owned(),
+            cancellation: receiver,
+            capability_guard: guard,
+        })),
+    });
+    let app = ProxyManager::new(resolver, Router::new(), None).make_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("Host", "workbench.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cancellation.send_replace(true);
+    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("cancellation quiesces the upstream pump without body polling")
+        .expect("drop signal remains connected");
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(response);
+    backend_task.abort();
+}
+
+#[tokio::test]
+async fn published_proxy_preserves_semantic_origin_and_replaces_forwarding_context() {
+    let (observed, observed_rx) = tokio::sync::oneshot::channel();
+    let observed = Arc::new(Mutex::new(Some(observed)));
+    let backend = Router::new().route(
+        "/headers",
+        get({
+            let observed = Arc::clone(&observed);
+            move |headers: HeaderMap| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    if let Some(sender) = observed.lock().await.take() {
+                        let _ = sender.send(headers);
+                    }
+                    "ok"
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let (_cancellation, receiver) = tokio::sync::watch::channel(false);
+    let resolver = Arc::new(OneShotPublishedRouteResolver {
+        route: Mutex::new(Some(locald_core::resolver::PublishedRoute {
+            port,
+            binding_revision: 1,
+            traffic_scope_revision: 2,
+            semantic_origin: "https://workbench.app.localhost".to_owned(),
+            cancellation: receiver,
+            capability_guard: Arc::new(()),
+        })),
+    });
+    let app = ProxyManager::new(resolver, Router::new(), None).make_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/headers")
+                .header("Host", "workbench.app.localhost")
+                .header("Origin", "https://workbench.app.localhost")
+                .header("Forwarded", "for=203.0.113.9;proto=http")
+                .header("X-Forwarded-For", "203.0.113.9")
+                .header("X-Forwarded-Evil", "attacker")
+                .header("X-Real-IP", "203.0.113.9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "ok");
+    let headers = observed_rx.await.expect("backend observed headers");
+    assert_eq!(headers.get_all("host").iter().count(), 1);
+    assert_eq!(headers.get("host").unwrap(), "workbench.app.localhost");
+    assert_eq!(
+        headers.get("origin").unwrap(),
+        "https://workbench.app.localhost"
+    );
+    assert_eq!(headers.get_all("forwarded").iter().count(), 1);
+    assert_eq!(
+        headers.get("forwarded").unwrap(),
+        "for=127.0.0.1;host=\"workbench.app.localhost\";proto=https"
+    );
+    assert_eq!(headers.get("x-forwarded-for").unwrap(), "127.0.0.1");
+    assert_eq!(
+        headers.get("x-forwarded-host").unwrap(),
+        "workbench.app.localhost"
+    );
+    assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
+    assert_eq!(headers.get("x-forwarded-port").unwrap(), "443");
+    assert!(!headers.contains_key("x-forwarded-evil"));
+    assert!(!headers.contains_key("x-real-ip"));
+    backend_task.abort();
+}
+
 #[async_trait::async_trait]
 impl locald_core::resolver::ServiceResolver for PublishedResolver {
     async fn resolve_service_by_domain(&self, _domain: &str) -> Option<DomainResolution> {
@@ -228,7 +402,7 @@ async fn published_aliases_redirect_to_the_canonical_origin_with_path_and_query(
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{host}");
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{host}");
         assert_eq!(
             response
                 .headers()
@@ -238,6 +412,36 @@ async fn published_aliases_redirect_to_the_canonical_origin_with_path_and_query(
             "{host}"
         );
     }
+}
+
+#[tokio::test]
+async fn published_primary_http_front_door_redirects_to_exact_https_before_routing() {
+    let app = ProxyManager::new(
+        Arc::new(PublishedResolver {
+            state: PublicationState::Ready,
+        }),
+        Router::new(),
+        None,
+    )
+    .make_app_for_scheme(false);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/socket?workspace=one")
+                .header("Host", "workbench.app.localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("https://workbench.app.localhost/socket?workspace=one")
+    );
 }
 
 #[tokio::test]
@@ -267,7 +471,7 @@ async fn paused_published_alias_redirects_before_the_resume_api_is_selected() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
     assert_eq!(
         response
             .headers()
