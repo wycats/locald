@@ -1,0 +1,88 @@
+---
+/*
+ * SpecRow — one numbered spec entry in the style-guide left column.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-5-patterns.png. Each row is a
+ * number badge, a title + short description (left), and a demo panel (right /
+ * below). This is the repeating unit of the patterns poster's main column.
+ */
+interface Props {
+  /** Two-digit number badge, e.g. "01". */
+  number: string;
+  /** Spec title (uppercase in the poster). */
+  title: string;
+  /** Short description under the title. */
+  description?: string;
+  class?: string;
+}
+
+const { number, title, description, class: className } = Astro.props;
+---
+
+<section class:list={["locald-spec-row", className]}>
+  <div class="locald-spec-row__head">
+    <span class="locald-spec-row__number">{number}</span>
+    <div class="locald-spec-row__meta">
+      <h2 class="locald-spec-row__title">{title}</h2>
+      {description && <p class="locald-spec-row__desc">{description}</p>}
+    </div>
+  </div>
+  <div class="locald-spec-row__demo">
+    <slot />
+  </div>
+</section>
+
+<style>
+  .locald-spec-row {
+    display: grid;
+    grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+    gap: var(--locald-space-3);
+    align-items: start;
+  }
+
+  @media (max-width: 48rem) {
+    .locald-spec-row {
+      grid-template-columns: 1fr;
+      gap: var(--locald-space-2);
+    }
+  }
+
+  .locald-spec-row__head {
+    display: flex;
+    gap: var(--locald-gap-md);
+    align-items: baseline;
+  }
+
+  .locald-spec-row__number {
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-caption-size);
+    color: var(--locald-status-running);
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-sm);
+    padding: 0.1rem 0.35rem;
+    flex: none;
+  }
+
+  .locald-spec-row__title {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--locald-text-primary);
+    border: 0;
+    padding: 0;
+  }
+
+  .locald-spec-row__desc {
+    margin: var(--locald-gap-xs) 0 0;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-spec-row__demo {
+    min-width: 0;
+  }
+</style>

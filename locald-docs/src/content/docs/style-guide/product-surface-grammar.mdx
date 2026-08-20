@@ -1,0 +1,197 @@
+---
+title: Product Surface Grammar
+description: The four nouns — Rack, Stream, Deck, and System Plane — how they appear in the product, and how they relate.
+template: splash
+tableOfContents: false
+---
+
+import StyleGuidePage from "../../../components/styleguide/StyleGuidePage.astro";
+import RackPanel from "../../../components/grammar/RackPanel.astro";
+import StreamPanel from "../../../components/grammar/StreamPanel.astro";
+import DeckCard from "../../../components/grammar/DeckCard.astro";
+import SystemPlanePanel from "../../../components/grammar/SystemPlanePanel.astro";
+import NounSpecCard from "../../../components/grammar/NounSpecCard.astro";
+import SurfacePatterns from "../../../components/grammar/SurfacePatterns.astro";
+import BehaviorList from "../../../components/grammar/BehaviorList.astro";
+import PrincipleCard from "../../../components/styleguide/PrincipleCard.astro";
+
+<StyleGuidePage
+  title="Product Surface Grammar"
+  version="v0.1"
+  lede="The four nouns, how they appear, and how they relate."
+  page="03"
+  meta={[
+    { key: "RACK", value: "your project" },
+    { key: "STREAM", value: "logs · metrics · events" },
+    { key: "DECK", value: "focused panes" },
+    { key: "SYSTEM PLANE", value: "the platform itself" },
+  ]}
+  metaCommand="$ locald status"
+>
+
+<div class="locald-grammar">
+
+{/* ---- Annotated hero ---- */}
+
+<div class="locald-grammar-hero">
+  <div class="locald-grammar-callouts">
+    <div class="locald-grammar-callout">
+      <span class="locald-grammar-callout__title">Rack</span>
+      <span class="locald-grammar-callout__desc">Inventory of everything running locally.</span>
+    </div>
+    <div class="locald-grammar-callout">
+      <span class="locald-grammar-callout__title">Stream</span>
+      <span class="locald-grammar-callout__desc">The timeline of logs, metrics, and events for the focused service.</span>
+    </div>
+    <div class="locald-grammar-callout">
+      <span class="locald-grammar-callout__title">Deck</span>
+      <span class="locald-grammar-callout__desc">Focused panes for deep inspection and control.</span>
+    </div>
+    <div class="locald-grammar-callout">
+      <span class="locald-grammar-callout__title">System Plane</span>
+      <span class="locald-grammar-callout__desc">A virtual service that represents the platform itself.</span>
+    </div>
+  </div>
+
+  <div class="locald-grammar-stage">
+    <div class="locald-grammar-mockup">
+      <RackPanel />
+      <StreamPanel />
+      <div class="locald-grammar-deck">
+        <DeckCard domain="web.localhost" status="running" metricLabel="p95" metricValue="24ms" throughput="RPS 128" tone="active" />
+        <DeckCard domain="api.localhost" status="running" metricLabel="p95" metricValue="38ms" throughput="RPS 67" tone="running" />
+        <DeckCard domain="worker.localhost" status="network" metricLabel="jobs" metricValue="42" throughput="ok 98%" tone="network" />
+        <DeckCard domain="db.localhost" status="active" metricLabel="p95" metricValue="5ms" throughput="QPS 214" tone="active" />
+      </div>
+      <SystemPlanePanel />
+    </div>
+    <p class="locald-grammar-stage__caption">All services connect to the <em>System Plane</em>.</p>
+  </div>
+</div>
+
+{/* ---- Noun spec cards ---- */}
+
+<div class="locald-grammar-nouns">
+  <NounSpecCard
+    icon="rack"
+    title="Rack"
+    description="A structured inventory of services in your project."
+    rows={[
+      { label: "Service row" },
+      { label: "Status dot" },
+      { label: "Type badge" },
+    ]}
+  >
+    <span slot="demo-0" class="locald-demochip locald-demochip--icon">
+      <svg width="13" height="13" viewBox="0 0 20 20" fill="none"><path d="M10 2.5 16.5 6v8L10 17.5 3.5 14V6z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" /><path d="M10 2.5 16.5 6 10 9.5 3.5 6zM10 9.5v8" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" /></svg>
+      api
+    </span>
+    <span slot="demo-1" class="locald-demodot locald-demodot--running"></span>
+    <span slot="demo-2" class="locald-demochip locald-demochip--badge">VIRTUAL</span>
+  </NounSpecCard>
+
+<NounSpecCard
+  icon="stream"
+  title="Stream"
+  description="A live timeline of what's happening for the focus."
+  rows={[{ label: "Timestamp" }, { label: "Source" }, { label: "Event line" }]}
+>
+  <span slot="demo-0" class="locald-demochip">
+    10:15:23
+  </span>
+  <span slot="demo-1" class="locald-demochip">
+    api
+  </span>
+  <span slot="demo-2" class="locald-demochip">
+    POST /v1/users 201
+  </span>
+</NounSpecCard>
+
+<NounSpecCard
+  icon="deck"
+  title="Deck"
+  description="Focused panes for metrics, logs, traces, and control."
+  rows={[
+    { label: "Pinned pane" },
+    { label: "Mini chart" },
+    { label: "Focus dot" },
+  ]}
+>
+  <span slot="demo-0" class="locald-demochip">
+    api.localhost
+  </span>
+  <svg
+    slot="demo-1"
+    class="locald-demospark"
+    width="56"
+    height="16"
+    viewBox="0 0 56 16"
+    fill="none"
+  >
+    <path
+      d="M1 12 L9 6 L17 9 L25 4 L33 8 L41 5 L55 7"
+      stroke="var(--locald-status-active)"
+      stroke-width="1.25"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </svg>
+  <span slot="demo-2" class="locald-demodot locald-demodot--running"></span>
+</NounSpecCard>
+
+  <NounSpecCard
+    icon="system-plane"
+    title="System Plane"
+    description="A virtual service representing your local platform."
+    rows={[
+      { label: "Platform card" },
+      { label: "Health strip" },
+      { label: "Resource row" },
+    ]}
+  >
+    <span slot="demo-0" class="locald-demochip locald-demochip--platform">System Plane</span>
+    <span slot="demo-1" class="locald-demohealth">
+      <span class="locald-demodot locald-demodot--running"></span>
+      <span class="locald-demodot locald-demodot--running"></span>
+      <span class="locald-demodot locald-demodot--running"></span>
+      <span class="locald-demodot locald-demodot--running"></span>
+      <span class="locald-demodot locald-demodot--running"></span>
+    </span>
+    <span slot="demo-2" class="locald-demoresource">
+      CPU 11%
+      <span class="locald-demoresource__bar"><span class="locald-demoresource__fill" style="width:11%"></span></span>
+    </span>
+  </NounSpecCard>
+</div>
+
+{/* ---- Design principles / Behavior ---- */}
+
+<div class="locald-grammar-meta">
+  <section>
+    <p class="locald-section-label">Design Principles</p>
+    <div class="locald-grammar-principles">
+      <PrincipleCard icon="rack" title="Inventory">Everything has a place in the Rack.</PrincipleCard>
+      <PrincipleCard icon="stream" title="Timeline">Time-ordered truth in the Stream.</PrincipleCard>
+      <PrincipleCard icon="deck" title="Focus">Deep work happens in the Deck.</PrincipleCard>
+      <PrincipleCard icon="system-plane" title="Platform Visibility">The System Plane is always present.</PrincipleCard>
+    </div>
+  </section>
+
+  <section>
+    <p class="locald-section-label">Behavior</p>
+    <BehaviorList />
+  </section>
+</div>
+
+{/* ---- Surface patterns ---- */}
+
+<section>
+  <div class="locald-section-head">
+    <p class="locald-section-label">Surface Patterns</p>
+  </div>
+  <SurfacePatterns />
+</section>
+
+</div>
+
+</StyleGuidePage>

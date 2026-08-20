@@ -1,0 +1,273 @@
+---
+/*
+ * StyleGuidePage — the poster-shaped page surface for style-guide pages.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide.png (cover) and the numbered
+ * posters. The shell carries the poster composition: dark canvas, top-left
+ * `[ld` mark + display wordmark, subtitle, lime version marker, an optional
+ * terminal metadata panel (top-right), a positioning line under a hairline,
+ * a content slot, and a footer with a muted left label + lime page number.
+ *
+ * This component must support both dense style-system sheets and more spacious
+ * public-site pages, so spacing comes from tokens and the metadata panel is
+ * optional.
+ */
+import LocaldMark from "../brand/LocaldMark.astro";
+
+interface MetaRow {
+  key: string;
+  value: string;
+}
+
+interface Props {
+  /** Large display title (defaults to the locald wordmark only). */
+  title?: string;
+  /** Mono subtitle under the title, e.g. "Visual Style Guide". */
+  subtitle?: string;
+  /** Version marker rendered in lime, e.g. "v0.1". */
+  version?: string;
+  /** Positioning / lede line under the header hairline. */
+  lede?: string;
+  /** Optional terminal metadata panel rows (top-right). */
+  meta?: MetaRow[];
+  /** Command shown as the metadata panel header. */
+  metaCommand?: string;
+  /** Footer left label. */
+  footerLabel?: string;
+  /** Footer right page marker, e.g. "01". */
+  page?: string;
+  class?: string;
+}
+
+const {
+  title,
+  subtitle,
+  version,
+  lede,
+  meta,
+  metaCommand = "$ locald --version",
+  footerLabel = "LOCALD VISUAL STYLE GUIDE",
+  page,
+  class: className,
+} = Astro.props;
+---
+
+<section class:list={["locald-sg", className]}>
+  <header class="locald-sg__header">
+    <div class="locald-sg__identity">
+      <LocaldMark size={28} label="locald" />
+      <div class="locald-sg__titles">
+        <h1 class="locald-sg__wordmark">{title ?? "locald"}</h1>
+        {
+          (subtitle || version) && (
+            <p class="locald-sg__tagline">
+              {subtitle && (
+                <span class="locald-sg__subtitle">{subtitle}</span>
+              )}
+              {version && (
+                <span class="locald-sg__version">_ {version}</span>
+              )}
+            </p>
+          )
+        }
+      </div>
+    </div>
+
+    {
+      meta && meta.length > 0 && (
+        <aside class="locald-sg__meta" aria-label="locald metadata">
+          <div class="locald-sg__meta-cmd">{metaCommand}</div>
+          <dl class="locald-sg__meta-rows">
+            {meta.map((row) => (
+              <div class="locald-sg__meta-row">
+                <dt>{row.key}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        </aside>
+      )
+    }
+  </header>
+
+  {
+    lede && (
+      <>
+        <hr class="locald-sg__rule" />
+        <p class="locald-sg__lede">{lede}</p>
+      </>
+    )
+  }
+
+  <div class="locald-sg__body">
+    <slot />
+  </div>
+
+  {
+    (footerLabel || page) && (
+      <footer class="locald-sg__footer">
+        <span class="locald-sg__footer-label">{footerLabel}</span>
+        {page && <span class="locald-sg__page">{page}</span>}
+      </footer>
+    )
+  }
+</section>
+
+<!--
+  Suppress Starlight's auto-rendered splash title (h1#_top): on style-guide
+  pages our shell provides the canonical header, so the template title would be
+  a duplicate. Scoped to pages that contain a .locald-sg shell.
+-->
+<style is:global>
+  .sl-markdown-content > h1#_top:has(+ .locald-sg),
+  main:has(.locald-sg) h1#_top {
+    display: none;
+  }
+</style>
+
+<style>
+  .locald-sg {
+    background: var(--locald-canvas);
+    color: var(--locald-text-primary);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-lg);
+    padding: var(--locald-space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-3);
+  }
+
+  .locald-sg__header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--locald-space-4);
+    flex-wrap: wrap;
+  }
+
+  .locald-sg__identity {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--locald-gap-md);
+  }
+
+  .locald-sg__titles {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-xs);
+  }
+
+  .locald-sg__wordmark {
+    margin: 0;
+    font-family: var(--locald-font-sans);
+    font-weight: var(--locald-type-display-weight);
+    font-size: clamp(2.5rem, 6vw, var(--locald-type-display-size));
+    line-height: 1;
+    letter-spacing: -0.03em;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-sg__tagline {
+    margin: 0;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--locald-gap-sm) var(--locald-space-2);
+  }
+
+  .locald-sg__subtitle {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.95rem;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-sg__version {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.85rem;
+    color: var(--locald-status-running);
+  }
+
+  .locald-sg__meta {
+    min-width: 16rem;
+    max-width: 22rem;
+    background: var(--locald-surface-1);
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    padding: var(--locald-space-2);
+    font-family: var(--locald-font-mono);
+    font-size: 0.8rem;
+  }
+
+  .locald-sg__meta-cmd {
+    color: var(--locald-status-running);
+    margin-bottom: var(--locald-gap-md);
+  }
+
+  .locald-sg__meta-rows {
+    margin: 0;
+    display: grid;
+    gap: var(--locald-gap-xs);
+  }
+
+  .locald-sg__meta-row {
+    display: grid;
+    grid-template-columns: 8rem 1fr;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-sg__meta-row dt {
+    color: var(--locald-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .locald-sg__meta-row dd {
+    margin: 0;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-sg__rule {
+    margin: 0;
+    border: 0;
+    border-top: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-sg__lede {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 1.05rem;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-sg__body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-3);
+  }
+
+  .locald-sg__footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--locald-space-2);
+    padding-top: var(--locald-space-2);
+    border-top: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-sg__footer-label {
+    font-family: var(--locald-font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-sg__page {
+    font-family: var(--locald-font-mono);
+    font-size: 0.8rem;
+    color: var(--locald-status-running);
+  }
+</style>

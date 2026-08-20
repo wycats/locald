@@ -1,0 +1,114 @@
+---
+/*
+ * NounSpecCard — one of the four noun spec cards from the Product Surface
+ * Grammar poster (page 03, second band). Each card is an icon + title header,
+ * a short description, then a list of labeled spec rows. Each spec row pairs a
+ * label (left) with a small live demo (right), supplied via three fixed named
+ * slots (demo-0, demo-1, demo-2) — Astro requires static slot names.
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-3-grammar.png.
+ */
+import PrincipleCard from "../styleguide/PrincipleCard.astro";
+
+type Icon = "rack" | "stream" | "deck" | "system-plane";
+
+interface SpecRow {
+  label: string;
+}
+
+interface Props {
+  icon: Icon;
+  title: string;
+  description: string;
+  rows: SpecRow[];
+  class?: string;
+}
+
+const { icon, title, description, rows, class: className } = Astro.props;
+---
+
+<section class:list={["locald-nouncard", className]}>
+  <PrincipleCard icon={icon} title={title} layout="stacked">
+    {description}
+  </PrincipleCard>
+
+  <dl class="locald-nouncard__rows">
+    {
+      rows[0] && (
+        <div class="locald-nouncard__row">
+          <dt class="locald-nouncard__label">{rows[0].label}</dt>
+          <dd class="locald-nouncard__demo">
+            <slot name="demo-0" />
+          </dd>
+        </div>
+      )
+    }
+    {
+      rows[1] && (
+        <div class="locald-nouncard__row">
+          <dt class="locald-nouncard__label">{rows[1].label}</dt>
+          <dd class="locald-nouncard__demo">
+            <slot name="demo-1" />
+          </dd>
+        </div>
+      )
+    }
+    {
+      rows[2] && (
+        <div class="locald-nouncard__row">
+          <dt class="locald-nouncard__label">{rows[2].label}</dt>
+          <dd class="locald-nouncard__demo">
+            <slot name="demo-2" />
+          </dd>
+        </div>
+      )
+    }
+  </dl>
+</section>
+
+<style>
+  .locald-nouncard {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-space-3);
+    height: 100%;
+  }
+
+  .locald-nouncard__rows {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .locald-nouncard__row {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-md) 0;
+    border-top: 1px solid var(--locald-border-subtle);
+  }
+
+  .locald-nouncard__row:first-child {
+    border-top: 0;
+  }
+
+  .locald-nouncard__label {
+    font-family: var(--locald-font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+    white-space: nowrap;
+  }
+
+  .locald-nouncard__demo {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    min-width: 0;
+    max-width: 100%;
+  }
+</style>

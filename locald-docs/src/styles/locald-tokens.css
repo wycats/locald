@@ -1,0 +1,109 @@
+/*
+ * locald design tokens
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide-2-foundations.png (Brand Foundations poster).
+ * The Foundations poster is the dedicated color + type spec. Where it conflicts
+ * with the patterns poster or the styleguide.md prose token blocks, it wins.
+ *
+ * Domains in components/screenshots use `*.localhost` (written-guide rule),
+ * NOT the `.local` / `.test` shown in the posters.
+ *
+ * Tokens are locald-namespaced. Starlight variables are mapped to these in
+ * locald-theme.css rather than overriding Starlight names directly here.
+ */
+
+:root {
+  /* Typography */
+  --locald-font-sans:
+    "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --locald-font-mono:
+    "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SFMono-Regular",
+    "Menlo", "Consolas", monospace;
+
+  /* Type scale (size / line-height) from Foundations poster panel 02 */
+  --locald-type-display-size: 4.5rem; /* 72px */
+  --locald-type-display-line: 5rem; /* 80px */
+  --locald-type-display-weight: 700;
+  --locald-type-heading-size: 2rem; /* 32px */
+  --locald-type-heading-line: 2.5rem; /* 40px */
+  --locald-type-heading-weight: 600;
+  --locald-type-body-size: 1rem; /* 16px */
+  --locald-type-body-line: 1.5rem; /* 24px */
+  --locald-type-body-weight: 400;
+  --locald-type-caption-size: 0.75rem; /* 12px */
+  --locald-type-caption-line: 1rem; /* 16px */
+  --locald-type-caption-weight: 400;
+  --locald-type-code-size: 0.75rem; /* 12px */
+  --locald-type-code-line: 1rem; /* 16px */
+  --locald-type-code-weight: 500;
+
+  /* Surfaces — bluish-charcoal (Foundations poster panel 01) */
+  --locald-canvas: #0b0f14;
+  --locald-surface-1: #11161d;
+  --locald-surface-2: #151b23;
+  --locald-surface-3: #1b222b;
+
+  /* Borders */
+  --locald-border-subtle: #1f2730;
+  --locald-border-strong: #2a3342;
+
+  /* Text */
+  --locald-text-primary: #e6e8eb;
+  --locald-text-secondary: #aab2bd;
+  --locald-text-muted: #7b8592;
+
+  /*
+   * Status colors (Foundations poster panel 01).
+   * Color means state, not brand decoration.
+   */
+  --locald-status-running: #a6e22e; /* lime — running, healthy, ready */
+  --locald-status-building: #22d3ee; /* cyan — building, waiting */
+  --locald-status-failed: #f87171; /* red — failed, stopped, destructive */
+  --locald-status-active: #c084fc; /* purple — selected, active, informational */
+  --locald-status-network: #facc15; /* amber — network / domain / URL affordances */
+
+  /*
+   * Extended status roles used by component props (status="idle"|"warning").
+   * Idle is a quiet neutral; warning reuses the network amber family but warmer.
+   */
+  --locald-status-idle: #7b8592;
+  --locald-status-warning: #f59e0b;
+
+  /* System Plane accent — the platform-as-virtual-service marker */
+  --locald-plane-system: var(--locald-status-network);
+
+  /* Radius scale (Foundations / patterns posters) */
+  --locald-radius-sm: 4px;
+  --locald-radius-md: 8px;
+  --locald-radius-lg: 12px;
+  --locald-radius-xl: 16px;
+
+  /* Spacing — 8pt grid */
+  --locald-space-1: 0.5rem; /* 8 */
+  --locald-space-2: 1rem; /* 16 */
+  --locald-space-3: 1.5rem; /* 24 */
+  --locald-space-4: 2rem; /* 32 */
+  --locald-space-6: 3rem; /* 48 */
+  --locald-space-8: 4rem; /* 64 */
+
+  /* Fine-grained gaps for dense component interiors */
+  --locald-gap-xs: 0.25rem;
+  --locald-gap-sm: 0.5rem;
+  --locald-gap-md: 0.75rem;
+  --locald-gap-lg: 1rem;
+
+  /* Diagram strokes */
+  --locald-stroke-width: 1.5px;
+  --locald-stroke-subtle: var(--locald-border-strong);
+  --locald-stroke-route: var(--locald-status-network);
+
+  /* Elevation — structure should read without shadows; these are supplemental */
+  --locald-shadow-panel: 0 1px 0 rgba(0, 0, 0, 0.4);
+  --locald-shadow-raised: 0 10px 24px rgba(0, 0, 0, 0.35);
+
+  /* z-index layers */
+  --locald-z-base: 0;
+  --locald-z-panel: 10;
+  --locald-z-overlay: 100;
+  --locald-z-palette: 1000;
+}

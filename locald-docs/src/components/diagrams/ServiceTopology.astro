@@ -1,0 +1,713 @@
+---
+/*
+ * ServiceTopology — the Overview poster centerpiece (guide.png, page 01).
+ *
+ * AUTHORITATIVE SOURCE: .private/style/guide.png. A full-width bordered panel
+ * laying out the locald flow left→right across labeled lanes:
+ *
+ *   RACK (your project)  →  STREAM (logs)  →  [ld] ROUTING & TLS hub
+ *     →  STABLE LOCAL DOMAINS  →  DECK (observability)
+ *
+ * with a SYSTEM PLANE box tied into the flow by amber dashed connectors.
+ *
+ * The lane layout is a CSS grid; connectors are CSS borders / dashed rules that
+ * use the existing diagram stroke tokens (--locald-stroke-*). Markup is kept
+ * reusable: every lane reads from props with sensible defaults matching the
+ * poster, so later pages (Grammar, Public Site) can re-skin or re-feed it.
+ *
+ * Domains use `*.localhost` (written-guide rule), never `.local` / `.test`.
+ */
+import LocaldMark from "../brand/LocaldMark.astro";
+import UrlPill from "../product/UrlPill.astro";
+
+type Status = "running" | "building" | "failed" | "active" | "idle" | "warning";
+
+interface ServiceNode {
+  name: string;
+  status?: Status;
+}
+
+interface LogLine {
+  time: string;
+  source: string;
+  message: string;
+}
+
+interface DomainEntry {
+  domain: string;
+  status?: Status;
+}
+
+interface MetricTile {
+  label: string;
+  value: string;
+  tone?: "running" | "failed" | "active" | "network";
+}
+
+interface HealthEntry {
+  name: string;
+  status?: Status;
+  label?: string;
+}
+
+interface EventEntry {
+  text: string;
+}
+
+interface Props {
+  services?: ServiceNode[];
+  logs?: LogLine[];
+  domains?: DomainEntry[];
+  metrics?: MetricTile[];
+  health?: HealthEntry[];
+  events?: EventEntry[];
+  class?: string;
+}
+
+const {
+  services = [
+    { name: "web", status: "running" },
+    { name: "api", status: "running" },
+    { name: "worker", status: "running" },
+    { name: "db", status: "running" },
+  ],
+  logs = [
+    { time: "10:15:23", source: "web", message: "GET / 200 12ms" },
+    { time: "10:15:23", source: "api", message: "POST /v1/users 201 38ms" },
+    { time: "10:15:24", source: "worker", message: "job_42 ok 210ms" },
+    { time: "10:15:24", source: "db", message: "SELECT * 5ms" },
+    { time: "10:15:25", source: "web", message: "GET /v1/me 200 22ms" },
+  ],
+  domains = [
+    { domain: "web.localhost", status: "running" },
+    { domain: "api.localhost", status: "running" },
+    { domain: "worker.localhost", status: "running" },
+    { domain: "db.localhost", status: "active" },
+  ],
+  metrics = [
+    { label: "Requests (RPS)", value: "128", tone: "running" },
+    { label: "Err Rate", value: "0.7%", tone: "failed" },
+    { label: "P95 Latency", value: "38ms", tone: "active" },
+  ],
+  health = [
+    { name: "web", status: "running" },
+    { name: "api", status: "running" },
+    { name: "worker", status: "running" },
+    { name: "db", status: "running" },
+  ],
+  events = [
+    { text: "worker job_42 completed" },
+    { text: "api deploy successful" },
+    { text: "db backup completed" },
+  ],
+  class: className,
+} = Astro.props;
+
+const SPARK = "M1 10 L8 6 L15 8 L22 4 L29 9 L36 5 L43 7 L47 6";
+---
+
+<div class:list={["locald-topology", className]}>
+  <!-- RACK -->
+  <section class="locald-topology__lane locald-topology__rack">
+    <p class="locald-topology__lane-label">Rack (your project)</p>
+    <div class="locald-topology__nodes">
+      {
+        services.map((svc) => (
+          <div class="locald-topology__node" data-status={svc.status ?? "running"}>
+            <span class="locald-topology__node-icon" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <rect
+                  x="2.5"
+                  y="2.5"
+                  width="11"
+                  height="11"
+                  rx="2"
+                  stroke="currentColor"
+                  stroke-width="1.25"
+                />
+                <path
+                  d="M2.5 6.5h11M6 6.5v7"
+                  stroke="currentColor"
+                  stroke-width="1.25"
+                />
+              </svg>
+            </span>
+            <span class="locald-topology__node-name">{svc.name}</span>
+            <span class="locald-topology__node-state">
+              <span
+                class="locald-topology__dot"
+                data-status={svc.status ?? "running"}
+                aria-hidden="true"
+              />
+              {(svc.status ?? "running").toUpperCase()}
+            </span>
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- STREAM -->
+  <section class="locald-topology__lane locald-topology__stream">
+    <p class="locald-topology__lane-label">Stream (logs)</p>
+    <div class="locald-topology__terminal">
+      <div class="locald-topology__terminal-head">▣ STREAM (logs)</div>
+      <div class="locald-topology__terminal-body">
+        {
+          logs.map((line) => (
+            <div class="locald-topology__log">
+              <span class="locald-topology__log-ts">{line.time}</span>
+              <span class="locald-topology__log-src">{line.source}</span>
+              <span class="locald-topology__log-msg">{line.message}</span>
+            </div>
+          ))
+        }
+        <div class="locald-topology__prompt">&gt;_</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- HUB -->
+  <section class="locald-topology__lane locald-topology__hub">
+    <p class="locald-topology__lane-label">Routing &amp; TLS</p>
+    <p class="locald-topology__hub-secure">🔒 HTTPS</p>
+    <div class="locald-topology__hex" aria-hidden="false">
+      <svg
+        class="locald-topology__hex-svg"
+        viewBox="0 0 100 100"
+        aria-hidden="true"
+      >
+        <polygon
+          points="25,6 75,6 96,50 75,94 25,94 4,50"
+          fill="none"
+          stroke="var(--locald-stroke-route)"
+          stroke-width="var(--locald-stroke-width)"
+        />
+      </svg>
+      <span class="locald-topology__hex-mark">
+        <LocaldMark size={24} label="locald routing hub" />
+      </span>
+    </div>
+    <div class="locald-topology__routes" aria-hidden="true">
+      <span></span><span></span><span></span><span></span>
+    </div>
+  </section>
+
+  <!-- DOMAINS -->
+  <section class="locald-topology__lane locald-topology__domains">
+    <p class="locald-topology__lane-label">Stable Local Domains</p>
+    <div class="locald-topology__domain-list">
+      {
+        domains.map((d) => (
+          <div class="locald-topology__domain-row">
+            <UrlPill href={d.domain} status={d.status ?? "running"} static />
+          </div>
+        ))
+      }
+    </div>
+  </section>
+
+  <!-- DECK -->
+  <section class="locald-topology__lane locald-topology__deck">
+    <p class="locald-topology__lane-label">Deck (observability)</p>
+    <div class="locald-topology__metrics">
+      {
+        metrics.map((m) => (
+          <div class="locald-topology__metric">
+            <span class="locald-topology__metric-label">{m.label}</span>
+            <span class="locald-topology__metric-value">{m.value}</span>
+            <svg
+              class="locald-topology__metric-spark"
+              width="48"
+              height="14"
+              viewBox="0 0 48 14"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d={SPARK}
+                stroke={`var(--locald-status-${m.tone ?? "running"})`}
+                stroke-width="1.25"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </div>
+        ))
+      }
+    </div>
+
+    <div class="locald-topology__deck-block">
+      <p class="locald-topology__deck-title">Service Health</p>
+      <ul class="locald-topology__health">
+        {
+          health.map((h) => (
+            <li class="locald-topology__health-row">
+              <span
+                class="locald-topology__dot"
+                data-status={h.status ?? "running"}
+                aria-hidden="true"
+              />
+              <span class="locald-topology__health-name">{h.name}</span>
+              <span class="locald-topology__health-label">
+                {h.label ?? "HEALTHY"}
+              </span>
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+
+    <div class="locald-topology__deck-block">
+      <p class="locald-topology__deck-title">Recent Events</p>
+      <ul class="locald-topology__events">
+        {
+          events.map((e) => (
+            <li class="locald-topology__event">{e.text}</li>
+          ))
+        }
+      </ul>
+    </div>
+  </section>
+
+  <!-- SYSTEM PLANE -->
+  <section class="locald-topology__lane locald-topology__plane">
+    <div class="locald-topology__plane-box">
+      <p class="locald-topology__plane-title">System Plane</p>
+      <p class="locald-topology__plane-caps">DNS · TLS · Auth · Routing</p>
+      <p class="locald-topology__plane-caps">Metrics · Events · Control</p>
+    </div>
+  </section>
+</div>
+
+<style>
+  /*
+   * Lane grid. Five flow lanes across the top row; the System Plane spans the
+   * full width on its own row beneath, tied in by amber dashed connectors.
+   */
+  .locald-topology {
+    display: grid;
+    grid-template-columns:
+      minmax(0, 0.9fr)
+      minmax(0, 1.3fr)
+      minmax(0, 0.7fr)
+      minmax(0, 0.9fr)
+      minmax(0, 1.2fr);
+    grid-template-areas:
+      "rack stream hub domains deck"
+      "plane plane plane plane plane";
+    gap: var(--locald-space-3);
+    align-items: stretch;
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-lg);
+    background: var(--locald-surface-1);
+    padding: var(--locald-space-3);
+    position: relative;
+    isolation: isolate;
+    min-height: 22rem;
+  }
+
+  .locald-topology__rack { grid-area: rack; }
+  .locald-topology__stream { grid-area: stream; }
+  .locald-topology__hub { grid-area: hub; }
+  .locald-topology__domains { grid-area: domains; }
+  .locald-topology__deck { grid-area: deck; }
+  .locald-topology__plane { grid-area: plane; }
+
+  .locald-topology__lane {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-md);
+    min-width: 0;
+    position: relative;
+    z-index: 2;
+  }
+
+  .locald-topology__lane-label {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-topology__rack .locald-topology__lane-label,
+  .locald-topology__stream .locald-topology__lane-label,
+  .locald-topology__hub .locald-topology__lane-label,
+  .locald-topology__domains .locald-topology__lane-label,
+  .locald-topology__deck .locald-topology__lane-label {
+    min-height: 2.4em;
+  }
+
+  /* Shared status dot */
+  .locald-topology__dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    flex: none;
+    background: var(--locald-status-idle);
+  }
+  .locald-topology__dot[data-status="running"] { background: var(--locald-status-running); }
+  .locald-topology__dot[data-status="building"] { background: var(--locald-status-building); }
+  .locald-topology__dot[data-status="failed"] { background: var(--locald-status-failed); }
+  .locald-topology__dot[data-status="active"] { background: var(--locald-status-active); }
+  .locald-topology__dot[data-status="idle"] { background: var(--locald-status-idle); }
+  .locald-topology__dot[data-status="warning"] { background: var(--locald-status-warning); }
+
+  /* RACK nodes */
+  .locald-topology__nodes {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-topology__node {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: var(--locald-gap-sm) var(--locald-gap-md);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-2);
+    font-family: var(--locald-font-mono);
+    font-size: 0.75rem;
+    position: relative;
+  }
+
+  .locald-topology__node::after {
+    content: "";
+    position: absolute;
+    right: calc(-1 * var(--locald-space-3));
+    top: 50%;
+    width: var(--locald-space-3);
+    border-top: var(--locald-stroke-width) dashed var(--locald-status-building);
+    transform: translateY(-50%);
+    opacity: 0.9;
+  }
+
+  .locald-topology__node-icon {
+    color: var(--locald-text-muted);
+    display: inline-flex;
+    flex: none;
+  }
+
+  .locald-topology__node-name {
+    color: var(--locald-text-primary);
+    font-weight: 600;
+  }
+
+  .locald-topology__node-state {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--locald-gap-xs);
+    font-size: 0.6rem;
+    letter-spacing: 0.06em;
+    color: var(--locald-status-running);
+  }
+
+  /* STREAM terminal */
+  .locald-topology__terminal {
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-canvas);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+
+  .locald-topology__terminal::after {
+    content: "";
+    position: absolute;
+    right: calc(-1 * var(--locald-space-3));
+    top: 50%;
+    width: var(--locald-space-3);
+    border-top: var(--locald-stroke-width) dashed var(--locald-status-building);
+    transform: translateY(-50%);
+  }
+
+  .locald-topology__terminal::before {
+    content: "";
+    position: absolute;
+    right: calc(-1 * var(--locald-space-3) + 2px);
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    border-top: var(--locald-stroke-width) solid var(--locald-status-building);
+    border-right: var(--locald-stroke-width) solid var(--locald-status-building);
+    transform: translateY(-50%) rotate(45deg);
+  }
+
+  .locald-topology__terminal-head {
+    padding: var(--locald-gap-sm) var(--locald-gap-md);
+    border-bottom: 1px solid var(--locald-border-subtle);
+    font-family: var(--locald-font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.06em;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-topology__terminal-body {
+    padding: var(--locald-gap-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-xs);
+  }
+
+  .locald-topology__log {
+    display: grid;
+    grid-template-columns: 4.5rem 3.25rem 1fr;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: 0.68rem;
+    line-height: 1.3;
+  }
+
+  .locald-topology__log-ts { color: var(--locald-text-muted); }
+  .locald-topology__log-src { color: var(--locald-status-building); }
+  .locald-topology__log-msg {
+    color: var(--locald-text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .locald-topology__prompt {
+    margin-top: var(--locald-gap-xs);
+    font-family: var(--locald-font-mono);
+    font-size: 0.7rem;
+    color: var(--locald-status-running);
+  }
+
+  /* HUB */
+  .locald-topology__hub {
+    align-items: center;
+    justify-content: flex-start;
+    text-align: center;
+  }
+
+  .locald-topology__hub-secure {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.7rem;
+    color: var(--locald-status-network);
+  }
+
+  .locald-topology__hex {
+    width: 5.5rem;
+    height: 5.5rem;
+    display: grid;
+    place-items: center;
+    position: relative;
+  }
+
+  .locald-topology__hex-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .locald-topology__hex-mark {
+    position: relative;
+    z-index: 1;
+  }
+
+  .locald-topology__routes {
+    display: none;
+  }
+
+  .locald-topology__routes span {
+    height: 0;
+    border-top: var(--locald-stroke-width) dashed var(--locald-stroke-route);
+    opacity: 0.7;
+  }
+
+  /* DOMAINS */
+  .locald-topology__domain-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-sm);
+    align-items: flex-start;
+  }
+
+  .locald-topology__domain-row {
+    position: relative;
+    padding-left: var(--locald-space-3);
+  }
+
+  .locald-topology__domain-row::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: var(--locald-space-3);
+    border-top: var(--locald-stroke-width) dashed var(--locald-stroke-subtle);
+    transform: translateY(-50%);
+    opacity: 0.9;
+  }
+
+  .locald-topology__domain-row::after {
+    content: "";
+    position: absolute;
+    left: calc(var(--locald-space-3) - 7px);
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    border-top: var(--locald-stroke-width) solid var(--locald-stroke-subtle);
+    border-right: var(--locald-stroke-width) solid var(--locald-stroke-subtle);
+    transform: translateY(-50%) rotate(45deg);
+  }
+
+  /* DECK */
+  .locald-topology__metrics {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--locald-gap-sm);
+  }
+
+  .locald-topology__metric {
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-xs);
+    padding: var(--locald-gap-sm);
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+  }
+
+  .locald-topology__metric-label {
+    font-family: var(--locald-font-mono);
+    font-size: 0.55rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-topology__metric-value {
+    font-family: var(--locald-font-mono);
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--locald-text-primary);
+  }
+
+  .locald-topology__deck-block {
+    border: 1px solid var(--locald-border-subtle);
+    border-radius: var(--locald-radius-sm);
+    background: var(--locald-surface-2);
+    padding: var(--locald-gap-sm) var(--locald-gap-md);
+  }
+
+  .locald-topology__deck-title {
+    margin: 0 0 var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: 0.6rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--locald-text-muted);
+  }
+
+  .locald-topology__health,
+  .locald-topology__events {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--locald-gap-xs);
+  }
+
+  .locald-topology__health-row {
+    display: flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    font-family: var(--locald-font-mono);
+    font-size: 0.68rem;
+    color: var(--locald-text-secondary);
+  }
+
+  .locald-topology__health-name { color: var(--locald-text-primary); }
+  .locald-topology__health-label {
+    margin-left: auto;
+    font-size: 0.58rem;
+    letter-spacing: 0.06em;
+    color: var(--locald-status-running);
+  }
+
+  .locald-topology__event {
+    font-family: var(--locald-font-mono);
+    font-size: 0.65rem;
+    color: var(--locald-text-secondary);
+  }
+
+  /* SYSTEM PLANE — amber dashed connector tie-in */
+  .locald-topology__plane {
+    align-items: center;
+    padding-top: var(--locald-space-2);
+    border-top: var(--locald-stroke-width) dashed var(--locald-stroke-route);
+  }
+
+  .locald-topology__plane-box {
+    width: 100%;
+    max-width: 30rem;
+    text-align: center;
+    border: var(--locald-stroke-width) dashed var(--locald-stroke-route);
+    border-radius: var(--locald-radius-md);
+    background: color-mix(in srgb, var(--locald-status-network) 6%, transparent);
+    padding: var(--locald-gap-md) var(--locald-space-2);
+    position: relative;
+  }
+
+  .locald-topology__plane-box::before {
+    content: "";
+    position: absolute;
+    top: calc(-1 * var(--locald-space-3));
+    left: 50%;
+    height: var(--locald-space-3);
+    border-left: var(--locald-stroke-width) dashed var(--locald-stroke-route);
+    transform: translateX(-50%);
+  }
+
+  .locald-topology__plane-box::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    right: calc(-1 * var(--locald-space-4));
+    width: var(--locald-space-4);
+    border-top: var(--locald-stroke-width) dashed var(--locald-stroke-route);
+    transform: translateY(-50%);
+  }
+
+  .locald-topology__plane-title {
+    margin: 0 0 var(--locald-gap-xs);
+    font-family: var(--locald-font-mono);
+    font-weight: 700;
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--locald-status-network);
+  }
+
+  .locald-topology__plane-caps {
+    margin: 0;
+    font-family: var(--locald-font-mono);
+    font-size: 0.68rem;
+    color: var(--locald-text-secondary);
+  }
+
+  /* Responsive: collapse lanes to a single column on narrow viewports. */
+  @media (max-width: 64rem) {
+    .locald-topology {
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "rack"
+        "stream"
+        "hub"
+        "domains"
+        "deck"
+        "plane";
+    }
+  }
+</style>

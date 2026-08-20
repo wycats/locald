@@ -1,0 +1,128 @@
+---
+/*
+ * UrlPill — a local-domain affordance.
+ *
+ * Anatomy (patterns poster panel 03): bordered rounded-rect, leading lock glyph,
+ * monospace domain, optional trailing status dot. URLs are a core product win,
+ * so they are presented as a first-class affordance, not metadata.
+ *
+ * Domains use `*.localhost` (written-guide rule), never `.local` / `.test`.
+ */
+interface Props {
+  /** Domain or full URL, e.g. "api.localhost" or "https://api.localhost". */
+  href: string;
+  /** Display text; defaults to href with any scheme stripped. */
+  label?: string;
+  /** Optional trailing status dot. */
+  status?: "running" | "building" | "failed" | "active" | "idle" | "warning";
+  /** Render as a static pill instead of a link. */
+  static?: boolean;
+  class?: string;
+}
+
+const {
+  href,
+  label,
+  status,
+  static: isStatic = false,
+  class: className,
+} = Astro.props;
+
+const display = label ?? href.replace(/^https?:\/\//, "");
+const Tag = isStatic ? "span" : "a";
+const linkAttrs = isStatic ? {} : { href };
+---
+
+<Tag class:list={["locald-url-pill", className]} {...linkAttrs}>
+  <svg
+    class="locald-url-pill__lock"
+    width="12"
+    height="12"
+    viewBox="0 0 12 12"
+    fill="none"
+    aria-hidden="true"
+  >
+    <rect
+      x="2.5"
+      y="5"
+      width="7"
+      height="5"
+      rx="1"
+      stroke="currentColor"
+      stroke-width="1"></rect>
+    <path
+      d="M4 5V3.75a2 2 0 0 1 4 0V5"
+      stroke="currentColor"
+      stroke-width="1"></path>
+  </svg>
+  <span class="locald-url-pill__domain">{display}</span>
+  {
+    status && (
+      <span
+        class="locald-url-pill__dot"
+        data-status={status}
+        aria-hidden="true"
+      />
+    )
+  }
+</Tag>
+
+<style>
+  .locald-url-pill {
+    --pill-color: var(--locald-status-network);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--locald-gap-sm);
+    padding: 0.1875rem 0.5rem;
+    border: 1px solid var(--locald-border-strong);
+    border-radius: var(--locald-radius-md);
+    background: var(--locald-surface-2);
+    font-family: var(--locald-font-mono);
+    font-size: var(--locald-type-code-size);
+    line-height: var(--locald-type-code-line);
+    color: var(--locald-text-secondary);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  a.locald-url-pill:hover {
+    border-color: var(--pill-color);
+    color: var(--locald-text-primary);
+  }
+
+  .locald-url-pill__lock {
+    color: var(--pill-color);
+    flex: none;
+  }
+
+  .locald-url-pill__domain {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .locald-url-pill__dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    flex: none;
+    background: var(--locald-status-idle);
+  }
+  .locald-url-pill__dot[data-status="running"] {
+    background: var(--locald-status-running);
+  }
+  .locald-url-pill__dot[data-status="building"] {
+    background: var(--locald-status-building);
+  }
+  .locald-url-pill__dot[data-status="failed"] {
+    background: var(--locald-status-failed);
+  }
+  .locald-url-pill__dot[data-status="active"] {
+    background: var(--locald-status-active);
+  }
+  .locald-url-pill__dot[data-status="idle"] {
+    background: var(--locald-status-idle);
+  }
+  .locald-url-pill__dot[data-status="warning"] {
+    background: var(--locald-status-warning);
+  }
+</style>

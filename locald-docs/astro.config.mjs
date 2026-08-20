@@ -8,7 +8,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "locald",
-      customCss: ["./src/styles/custom.css"],
+      customCss: ["./src/styles/locald-theme.css", "./src/styles/custom.css"],
       social: [
         {
           label: "GitHub",
@@ -22,6 +22,28 @@ export default defineConfig({
           items: [
             { label: "Overview", link: "/" },
             { label: "Your First Workspace", link: "/getting-started/" },
+          ],
+        },
+        {
+          label: "Style Guide",
+          items: [
+            { label: "Overview", link: "/style-guide/overview/" },
+            {
+              label: "Brand Foundations",
+              link: "/style-guide/brand-foundations/",
+            },
+            {
+              label: "Components & Interface Patterns",
+              link: "/style-guide/components-interface-patterns/",
+            },
+            {
+              label: "Product Surface Grammar",
+              link: "/style-guide/product-surface-grammar/",
+            },
+            {
+              label: "Public Site Direction",
+              link: "/style-guide/public-site-direction/",
+            },
           ],
         },
         {
