@@ -102,6 +102,41 @@ type = "worker"
 command = "bundle exec sidekiq"
 ```
 
+### Generated JSON and JSONC Files
+
+Host `exec` and `worker` services can render a private runtime file from a
+project JSON or JSONC source. Replacements target existing JSON Pointers and may
+use the owning service's allocated port or named-listener ports.
+
+```toml
+[services.web.generated.microfrontends]
+source = "chat/microfrontends.jsonc"
+project_path = "chat/.microfrontends.locald.json"
+
+[services.web.generated.microfrontends.replace]
+"/options/localProxyPort" = "${services.web.port}"
+```
+
+The optional `project_path` supports tools that require a package-local file on
+macOS and Linux. Other platforms reject configurations that use `project_path`;
+private generated files without a projection remain supported. The project and
+locald private data directory must be on the same filesystem so the projection
+can select an already-recorded private seed identity atomically. Before a
+service starts, locald detaches the canonical private path onto its own inode,
+so an in-place project-file edit cannot mutate canonical runtime state.
+It must be a relative `.json` or `.jsonc` path whose parent already exists.
+Before the project entry appears, locald durably records the private seed's
+identity and a write-ahead ownership manifest. It then projects the same bytes
+without overwriting any pre-existing project entry and publishes the final
+private generation only after every projection succeeds. That private file
+remains the canonical `${services.<name>.generated.<file>.path}` value. The
+projection is mode `0600`, exists before the service starts, and is removed on
+stop only after an atomic quarantine preserves the exact recorded directory
+entry and its file identity and content still prove ownership.
+If it is replaced or modified, locald retains it and reports the mismatch.
+The detailed mismatch remains in daemon logs, and a catalogued stopped service
+also exposes a status warning while locald retains cleanup ownership for retry.
+
 ### Health Checks
 
 You can explicitly configure how `locald` determines if a service is ready.

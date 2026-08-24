@@ -459,6 +459,15 @@ struct ServiceListenerRuntime {
 }
 
 #[derive(Debug)]
+struct StagedServiceRuntime {
+    port: Option<u16>,
+    port_guard: Option<PortGuard>,
+    listener_runtime: ServiceListenerRuntime,
+    readiness: ReadinessRequirement,
+    generated_files: Option<GeneratedFileSet>,
+}
+
+#[derive(Debug)]
 struct ConfigTransitionPlan {
     removed_service_names: Vec<ServiceKey>,
     restart_service_names: Vec<ServiceKey>,
@@ -473,6 +482,9 @@ struct DeferredGeneratedFileCleanup {
     key: ServiceKey,
     generated_files: GeneratedFileSet,
 }
+
+const GENERATED_FILE_CLEANUP_WARNING: &str =
+    "Generated-file cleanup is pending; locald retained ownership and will retry.";
 
 #[derive(Clone, Copy, Debug)]
 struct PrepublicationStopOptions<'a> {
@@ -1285,6 +1297,118 @@ impl ProcessManager {
             bindings: ServiceRuntimeBindings::new(primary_port, listeners),
             guards,
         })
+    }
+
+    async fn stage_service_runtime(
+        &self,
+        path: &Path,
+        key: &ServiceKey,
+        display_name: &str,
+        service_config: &ServiceConfig,
+        plugin_port_guards: &mut Vec<PortGuard>,
+        prepared_generated_files: Option<PreparedGeneratedFileSet>,
+    ) -> Result<StagedServiceRuntime> {
+        let needs_port = ReadinessRequirement::service_requires_port(service_config);
+        let (port, port_guard) = if !needs_port {
+            (None, None)
+        } else if let Some(configured) = service_config.port() {
+            let guard = Self::take_reserved_port_guard(plugin_port_guards, configured)
+                .or_else(|| self.port_allocator.try_allocate_specific(configured))
+                .with_context(|| {
+                    format!(
+                        "configured port {configured} for service `{display_name}` is unavailable"
+                    )
+                })?;
+            (Some(configured), Some(guard))
+        } else {
+            let sticky = self
+                .services
+                .lock()
+                .await
+                .get(key)
+                .and_then(|service| service.sticky_port);
+            let guard = if let Some(sticky) = sticky {
+                if let Some(guard) = self.port_allocator.try_allocate_specific(sticky) {
+                    info!("Reusing sticky port {sticky} for service {display_name}");
+                    guard
+                } else {
+                    warn!(
+                        "Sticky port {sticky} for service {display_name} is taken, assigning new port"
+                    );
+                    self.port_allocator.allocate()?
+                }
+            } else {
+                self.port_allocator.allocate()?
+            };
+            (Some(guard.port()), Some(guard))
+        };
+
+        let listener_runtime = self
+            .allocate_listener_runtime(key, service_config, port, display_name)
+            .await?;
+        let readiness =
+            ReadinessRequirement::for_service(service_config, port).with_context(|| {
+                format!("service `{display_name}` has an invalid readiness contract")
+            })?;
+        if matches!(
+            service_config,
+            ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
+        ) {
+            Self::ensure_postgres_resource_namespace_ready(key, display_name)?;
+        }
+        let generated_files = if let Some(prepared) = prepared_generated_files {
+            Some(
+                crate::generated_files::materialize_prepared(
+                    &self.availability_data_dir,
+                    key,
+                    &listener_runtime.bindings,
+                    &prepared,
+                )
+                .await?,
+            )
+        } else {
+            crate::generated_files::materialize(
+                &self.availability_data_dir,
+                path,
+                key,
+                service_config,
+                &listener_runtime.bindings,
+            )
+            .await?
+        };
+        Ok(StagedServiceRuntime {
+            port,
+            port_guard,
+            listener_runtime,
+            readiness,
+            generated_files,
+        })
+    }
+
+    async fn cleanup_staged_service_runtimes(
+        &self,
+        staged: &HashMap<ServiceKey, StagedServiceRuntime>,
+    ) -> Result<()> {
+        let mut errors = Vec::new();
+        for (key, runtime) in staged {
+            if let Some(generated_files) = &runtime.generated_files {
+                if let Err(error) = self
+                    .cleanup_generated_files_or_defer(key, generated_files)
+                    .await
+                {
+                    errors.push(format!("{}: {error:#}", key.resource_id()));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "staged generated-file cleanup encountered {} error(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )
+        }
     }
 
     async fn release_listener_guards(&self, key: &ServiceKey) {
@@ -2562,6 +2686,7 @@ impl ProcessManager {
                             project_path,
                             &key,
                             service_config,
+                            generated_files.as_ref(),
                         )
                         .await
                         .with_context(|| {
@@ -2574,7 +2699,7 @@ impl ProcessManager {
                             prepared_generated_file_set.as_ref(),
                         ) {
                             (Some(generated_files), Some(prepared)) => {
-                                generated_files.matches_prepared(prepared)
+                                generated_files.matches_prepared(prepared).await
                             }
                             (None, None) => true,
                             _ => false,
@@ -6326,12 +6451,23 @@ impl ProcessManager {
                     .services
                     .get(&service_name)
                     .expect("generated start candidate belongs to the loaded config");
+                let allowed_existing = self
+                    .services
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|service| service.generated_files.clone());
                 if let Some(prepared) = self
                     .await_publisher_candidate_convergence(
                         publisher_cold_admission,
                         &mut publisher_preparation,
                         async {
-                            crate::generated_files::prepare(&path, &key, service_config)
+                            crate::generated_files::prepare(
+                                &path,
+                                &key,
+                                service_config,
+                                allowed_existing.as_ref(),
+                            )
                                 .await
                                 .with_context(|| {
                                     format!(
@@ -6572,6 +6708,7 @@ impl ProcessManager {
                 }
             }
             for key in &published_stopped_service_names {
+                self.refresh_generated_file_cleanup_warning(key).await;
                 self.broadcast_service_update(key).await;
             }
             if published_service_list_changed {
@@ -6626,6 +6763,50 @@ impl ProcessManager {
             });
         }
 
+        // Allocate bindings and publish every generated projection before any
+        // candidate controller is created. This is the startup atomicity
+        // boundary: a late collision or projection failure cannot leave an
+        // earlier service process running against a partially published set.
+        let mut staged_service_runtimes = HashMap::new();
+        for service_name in &sorted_services {
+            let key = Self::service_key(instance_id, service_name.clone());
+            if self.service_stop_suppressions.lock().await.contains(&key)
+                || reusable_service_envs.contains_key(&key)
+            {
+                continue;
+            }
+            let service_config = &config.services[service_name];
+            let display_name = key.display_name(&config.project.name);
+            let prepared = prepared_generated_files.remove(&key);
+            match self
+                .stage_service_runtime(
+                    &path,
+                    &key,
+                    &display_name,
+                    service_config,
+                    &mut plugin_port_guards,
+                    prepared,
+                )
+                .await
+            {
+                Ok(staged) => {
+                    staged_service_runtimes.insert(key, staged);
+                }
+                Err(error) => {
+                    if let Err(cleanup_error) = self
+                        .cleanup_staged_service_runtimes(&staged_service_runtimes)
+                        .await
+                    {
+                        return Err(error.context(format!(
+                            "failed to roll back already-published generated-file projections: {cleanup_error:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let service_start_result: Result<()> = async {
         for service_name in sorted_services {
             anyhow::ensure!(
                 self.path_matches_instance(&path, instance_id).await,
@@ -6717,83 +6898,14 @@ impl ProcessManager {
                 "service `{name}` changed after prepublication transition planning"
             );
 
-            let needs_port = ReadinessRequirement::service_requires_port(service_config);
-
-            info!(
-                "Service {name}: needs_port={needs_port}, config type={:?}",
-                service_config
-            );
-
-            // Find free port or use configured port
-            // Use PortGuard to prevent race conditions between parallel service starts
-
-            let (port, mut port_guard): (Option<u16>, Option<crate::port_allocator::PortGuard>) =
-                if !needs_port {
-                    (None, None)
-                } else if let Some(p) = service_config.port() {
-                    let guard = Self::take_reserved_port_guard(&mut plugin_port_guards, p)
-                        .or_else(|| self.port_allocator.try_allocate_specific(p))
-                        .with_context(|| {
-                            format!("configured port {p} for service `{name}` is unavailable")
-                        })?;
-                    (Some(p), Some(guard))
-                } else {
-                    // Check for sticky port
-                    let sticky = {
-                        let services = self.services.lock().await;
-                        services.get(&key).and_then(|s| s.sticky_port)
-                    };
-
-                    if let Some(p) = sticky {
-                        // Try to bind to sticky port to ensure it's free
-                        if let Some(guard) = self.port_allocator.try_allocate_specific(p) {
-                            info!("Reusing sticky port {p} for service {name}");
-                            (Some(p), Some(guard))
-                        } else {
-                            warn!(
-                                "Sticky port {p} for service {name} is taken, assigning new port"
-                            );
-                            let guard = self.port_allocator.allocate()?;
-                            (Some(guard.port()), Some(guard))
-                        }
-                    } else {
-                        let guard = self.port_allocator.allocate()?;
-                        (Some(guard.port()), Some(guard))
-                    }
-                };
-
-            let listener_runtime = self
-                .allocate_listener_runtime(&key, service_config, port, &name)
-                .await?;
-            let readiness = ReadinessRequirement::for_service(service_config, port)
-                .with_context(|| format!("service `{name}` has an invalid readiness contract"))?;
-            if matches!(
-                service_config,
-                ServiceConfig::Typed(TypedServiceConfig::Postgres(_))
-            ) {
-                Self::ensure_postgres_resource_namespace_ready(&key, &name)?;
-            }
-            let mut generated_files = if let Some(prepared) = prepared_generated_files.remove(&key)
-            {
-                Some(
-                    crate::generated_files::materialize_prepared(
-                        &self.availability_data_dir,
-                        &key,
-                        &listener_runtime.bindings,
-                        &prepared,
-                    )
-                    .await?,
-                )
-            } else {
-                crate::generated_files::materialize(
-                    &self.availability_data_dir,
-                    &path,
-                    &key,
-                    service_config,
-                    &listener_runtime.bindings,
-                )
-                .await?
-            };
+            let staged = staged_service_runtimes
+                .remove(&key)
+                .with_context(|| format!("service `{name}` has no staged runtime resources"))?;
+            let port = staged.port;
+            let mut port_guard = staged.port_guard;
+            let listener_runtime = staged.listener_runtime;
+            let readiness = staged.readiness;
+            let mut generated_files = staged.generated_files;
             let resolved_env = self
                 .resolve_env_with_candidate_bindings(
                     &combined_env,
@@ -7073,6 +7185,21 @@ impl ProcessManager {
                     .await;
             }
         }
+        Ok(())
+        }
+        .await;
+        if let Err(error) = service_start_result {
+            if let Err(cleanup_error) = self
+                .cleanup_staged_service_runtimes(&staged_service_runtimes)
+                .await
+            {
+                return Err(error.context(format!(
+                    "failed to roll back unconsumed generated-file projections: {cleanup_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+        debug_assert!(staged_service_runtimes.is_empty());
 
         self.persist_state().await;
         if !self.loaded_generated_sources_match(instance_id).await {
@@ -7239,6 +7366,36 @@ impl ProcessManager {
         }
     }
 
+    async fn refresh_generated_file_cleanup_warning(&self, key: &ServiceKey) -> bool {
+        let cleanup_pending = self
+            .deferred_generated_file_cleanups
+            .lock()
+            .await
+            .iter()
+            .any(|pending| pending.key == *key);
+        let mut services = self.services.lock().await;
+        let Some(service) = services.get_mut(key) else {
+            return false;
+        };
+        let had_warning = service
+            .warnings
+            .iter()
+            .any(|warning| warning == GENERATED_FILE_CLEANUP_WARNING);
+        service
+            .warnings
+            .retain(|warning| warning != GENERATED_FILE_CLEANUP_WARNING);
+        if cleanup_pending {
+            service
+                .warnings
+                .push(GENERATED_FILE_CLEANUP_WARNING.to_owned());
+        }
+        let changed = had_warning != cleanup_pending;
+        if changed {
+            Self::advance_service_projection(service);
+        }
+        changed
+    }
+
     async fn cleanup_generated_files_or_defer(
         &self,
         key: &ServiceKey,
@@ -7251,6 +7408,7 @@ impl ProcessManager {
                     .await
                     .retain(|pending| pending.generated_files != *generated_files);
                 self.clear_generated_file_owner(generated_files).await;
+                self.refresh_generated_file_cleanup_warning(key).await;
                 Ok(())
             }
             Err(error) => {
@@ -7266,6 +7424,7 @@ impl ProcessManager {
                 }
                 drop(deferred);
                 self.clear_generated_file_owner(generated_files).await;
+                self.refresh_generated_file_cleanup_warning(key).await;
                 Err(error)
             }
         }
@@ -7274,7 +7433,9 @@ impl ProcessManager {
     async fn retry_deferred_generated_file_cleanups(&self) {
         let pending = std::mem::take(&mut *self.deferred_generated_file_cleanups.lock().await);
         let mut failures = Vec::new();
+        let mut affected_keys = HashSet::new();
         for cleanup in pending {
+            affected_keys.insert(cleanup.key.clone());
             match cleanup.generated_files.cleanup().await {
                 Ok(()) => {
                     self.clear_generated_file_owner(&cleanup.generated_files)
@@ -7296,6 +7457,12 @@ impl ProcessManager {
                 .any(|pending| pending.generated_files == failure.generated_files)
             {
                 deferred.push(failure);
+            }
+        }
+        drop(deferred);
+        for key in affected_keys {
+            if self.refresh_generated_file_cleanup_warning(&key).await {
+                self.broadcast_service_update(&key).await;
             }
         }
     }
@@ -34077,6 +34244,7 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
             std::fs::canonicalize(root.path()).expect("canonicalize watcher path directory");
         let source = project_path.join("chat/nested/microfrontends.jsonc");
         let unrelated = project_path.join("chat/README.md");
+        let projection = project_path.join("chat/.microfrontends.locald.json");
         let generated_sources = HashSet::from([source.clone()]);
 
         assert!(config_reload_event_is_relevant(
@@ -34095,6 +34263,10 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
             &[unrelated],
             &generated_sources
         ));
+        assert!(
+            !config_reload_event_is_relevant(&[projection], &generated_sources),
+            "a derived project projection is not a generated source and cannot trigger a reload loop"
+        );
         assert!(config_reload_event_is_relevant(
             &[project_path.join("locald.toml")],
             &HashSet::new()
@@ -34376,6 +34548,7 @@ listeners = ["events"]
 
 [services."api.worker".generated.runtime]
 source = "config/runtime.jsonc"
+project_path = "config/runtime.locald.json"
 
 [services."api.worker".generated.runtime.replace]
 "/listener" = "${services.api.worker.listeners.events.port}"
@@ -34462,6 +34635,12 @@ RUNTIME_CONFIG = "${services.api.worker.generated.runtime.path}"
                 bindings.listener_port("events").expect("events listener")
             ))
         );
+        let project_projection = project_path.join("config/runtime.locald.json");
+        assert_eq!(
+            std::fs::read_to_string(&project_projection)
+                .expect("read generated project projection"),
+            std::fs::read_to_string(&generated_path).expect("read private generated file")
+        );
 
         let key = ServiceKey::new(instance_id, "api.worker");
         let projection_before_stop = manager
@@ -34489,6 +34668,10 @@ RUNTIME_CONFIG = "${services.api.worker.generated.runtime.path}"
             .expect("cleanup failure does not prevent the selected service from stopping");
         assert_eq!(stop_count.load(Ordering::SeqCst), 1);
         assert!(!generated_path.exists());
+        assert!(
+            !project_projection.exists(),
+            "normal stop removes the still-owned project projection even when private-directory cleanup is deferred"
+        );
         {
             let services = manager.services.lock().await;
             let service = services.get(&key).expect("stopped service remains loaded");
@@ -34498,6 +34681,11 @@ RUNTIME_CONFIG = "${services.api.worker.generated.runtime.path}"
             assert!(
                 service.generated_files.is_none(),
                 "cleanup ownership transfers out of the stopped projection"
+            );
+            assert_eq!(
+                service.warnings,
+                vec![GENERATED_FILE_CLEANUP_WARNING],
+                "stopped status reports retained cleanup ownership"
             );
         }
         assert_eq!(
@@ -34549,6 +34737,11 @@ RUNTIME_CONFIG = "${services.api.worker.generated.runtime.path}"
         assert_eq!(status.name, "generated-file-project:api.worker");
         assert_eq!(status.status, ServiceState::Stopped);
         assert_eq!(status.health_status, HealthStatus::Unknown);
+        assert_eq!(
+            status.warnings,
+            vec![GENERATED_FILE_CLEANUP_WARNING],
+            "the stopped-service event reports deferred generated-file cleanup"
+        );
 
         manager.watchers.lock().await.remove(&canonical_project);
         tokio::fs::write(
@@ -34626,6 +34819,7 @@ listeners = ["events"]
 
 [services.worker.generated.runtime]
 source = "config/runtime.json"
+project_path = "config/runtime.locald.json"
 
 [services.worker.generated.runtime.replace]
 "/listener" = "${services.worker.listeners.events.port}"
@@ -34673,6 +34867,10 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
             !generated_path.exists(),
             "preparation rollback must remove the unpublished runtime file"
         );
+        assert!(
+            !project_path.join("config/runtime.locald.json").exists(),
+            "preparation rollback must remove the project projection"
+        );
         let canonical_project =
             std::fs::canonicalize(&project_path).expect("canonical generated-file project");
         let watchers = manager.watchers.lock().await;
@@ -34691,6 +34889,270 @@ RUNTIME_CONFIG = "${services.worker.generated.runtime.path}"
                 .generated_directories
                 .contains(&canonical_project.join("config"))
         );
+    }
+
+    #[tokio::test]
+    async fn foreign_projection_target_is_rejected_before_any_service_process_starts() {
+        let dir = tempdir().expect("create projection preflight directory");
+        let project_path = dir.path().join("projection-preflight");
+        let (mut manager, instance_id, availability_data_dir) =
+            availability_manager(dir.path(), &project_path, "projection-preflight").await;
+        std::fs::create_dir(project_path.join("config")).expect("create config directory");
+        std::fs::write(project_path.join("config/first.json"), r#"{"port":1}"#)
+            .expect("write first source");
+        std::fs::write(project_path.join("config/second.json"), r#"{"port":2}"#)
+            .expect("write second source");
+        let foreign = project_path.join("config/second.locald.json");
+        std::fs::write(&foreign, "foreign").expect("write foreign collision");
+        std::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "projection-preflight"
+
+[services.first]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.first.generated.runtime]
+source = "config/first.json"
+project_path = "config/first.locald.json"
+
+[services.first.env]
+PATH = "/usr/bin:/bin"
+
+[services.second]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.second.generated.runtime]
+source = "config/second.json"
+project_path = "config/second.locald.json"
+
+[services.second.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .expect("write projection preflight config");
+        let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
+            .await
+            .expect("load projection preflight availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("seed projection preflight policy");
+
+        let captured_env = Arc::new(StdMutex::new(None));
+        manager.factories.insert(
+            0,
+            Arc::new(CapturingContextFactory {
+                env: captured_env.clone(),
+                bindings: Arc::new(StdMutex::new(None)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+                fail_prepare: false,
+            }),
+        );
+
+        let error = manager
+            .converge_managed_instance(instance_id, None, false, true)
+            .await
+            .expect_err("foreign projection target rejects admission");
+        assert!(
+            format!("{error:#}").contains("never adopts or overwrites"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            captured_env.lock().expect("read captured env").is_none(),
+            "no controller is created before all projection targets pass preflight"
+        );
+        assert!(!project_path.join("config/first.locald.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("read foreign target"),
+            "foreign"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_projection_failure_rolls_back_every_unstarted_service_projection() {
+        let dir = tempdir().expect("create staged projection directory");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir_all(project_path.join("config")).expect("create config directory");
+        std::fs::write(project_path.join("config/first.json"), r#"{"value":1}"#)
+            .expect("write first source");
+        std::fs::write(project_path.join("config/second.json"), r#"{"value":2}"#)
+            .expect("write second source");
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "staged-projection"
+
+[services.first]
+type = "worker"
+command = "unused"
+
+[services.first.generated.runtime]
+source = "config/first.json"
+project_path = "config/first.locald.json"
+
+[services.second]
+type = "worker"
+command = "unused"
+
+[services.second.generated.runtime]
+source = "config/second.json"
+project_path = "config/second.locald.json"
+"#,
+        )
+        .expect("parse staged projection config");
+        let manager = readiness_test_manager(dir.path());
+        let first_key = ServiceKey::new(test_instance_id(), "first");
+        let second_key = ServiceKey::new(test_instance_id(), "second");
+        let first_prepared = crate::generated_files::prepare(
+            &project_path,
+            &first_key,
+            &config.services["first"],
+            None,
+        )
+        .await
+        .expect("prepare first")
+        .expect("first generated set");
+        let second_prepared = crate::generated_files::prepare(
+            &project_path,
+            &second_key,
+            &config.services["second"],
+            None,
+        )
+        .await
+        .expect("prepare second")
+        .expect("second generated set");
+        let mut plugin_guards = Vec::new();
+        let first = manager
+            .stage_service_runtime(
+                &project_path,
+                &first_key,
+                "staged-projection:first",
+                &config.services["first"],
+                &mut plugin_guards,
+                Some(first_prepared),
+            )
+            .await
+            .expect("publish first staged projection");
+        let mut staged = HashMap::from([(first_key, first)]);
+        let foreign = project_path.join("config/second.locald.json");
+        std::fs::write(&foreign, "foreign").expect("race foreign second target");
+        manager
+            .stage_service_runtime(
+                &project_path,
+                &second_key,
+                "staged-projection:second",
+                &config.services["second"],
+                &mut plugin_guards,
+                Some(second_prepared),
+            )
+            .await
+            .expect_err("second projection collision rejects staging");
+        manager
+            .cleanup_staged_service_runtimes(&staged)
+            .await
+            .expect("roll back first staged projection");
+        staged.clear();
+        assert!(!project_path.join("config/first.locald.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(foreign).expect("read foreign target"),
+            "foreign"
+        );
+        assert!(manager.services.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_cleanup_visits_and_defers_every_failed_generated_set() {
+        let dir = tempdir().expect("create staged aggregate-cleanup directory");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir_all(project_path.join("config")).expect("create config directory");
+        std::fs::write(project_path.join("config/first.json"), r#"{"value":1}"#)
+            .expect("write first source");
+        std::fs::write(project_path.join("config/second.json"), r#"{"value":2}"#)
+            .expect("write second source");
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "staged-aggregate-cleanup"
+
+[services.first]
+type = "worker"
+command = "unused"
+[services.first.generated.runtime]
+source = "config/first.json"
+project_path = "config/first.locald.json"
+
+[services.second]
+type = "worker"
+command = "unused"
+[services.second.generated.runtime]
+source = "config/second.json"
+project_path = "config/second.locald.json"
+"#,
+        )
+        .expect("parse aggregate cleanup config");
+        let manager = readiness_test_manager(dir.path());
+        let first_key = ServiceKey::new(test_instance_id(), "first");
+        let second_key = ServiceKey::new(test_instance_id(), "second");
+        let mut staged = HashMap::new();
+        let mut plugin_guards = Vec::new();
+        for (key, name) in [(&first_key, "first"), (&second_key, "second")] {
+            let prepared =
+                crate::generated_files::prepare(&project_path, key, &config.services[name], None)
+                    .await
+                    .expect("prepare staged generated set")
+                    .expect("prepared set");
+            let runtime = manager
+                .stage_service_runtime(
+                    &project_path,
+                    key,
+                    &format!("staged-aggregate-cleanup:{name}"),
+                    &config.services[name],
+                    &mut plugin_guards,
+                    Some(prepared),
+                )
+                .await
+                .expect("stage generated set");
+            staged.insert(key.clone(), runtime);
+        }
+
+        let first_target = project_path.join("config/first.locald.json");
+        let second_target = project_path.join("config/second.locald.json");
+        let originals = [
+            std::fs::read(&first_target).expect("read first projection"),
+            std::fs::read(&second_target).expect("read second projection"),
+        ];
+        std::fs::write(&first_target, b"modified first").expect("modify first projection");
+        std::fs::write(&second_target, b"modified second").expect("modify second projection");
+
+        let error = manager
+            .cleanup_staged_service_runtimes(&staged)
+            .await
+            .expect_err("both staged cleanups fail");
+        assert!(format!("{error:#}").contains("2 error(s)"));
+        assert_eq!(
+            manager.deferred_generated_file_cleanups.lock().await.len(),
+            2,
+            "every failed staged set remains retry-owned"
+        );
+        assert!(first_target.exists());
+        assert!(second_target.exists());
+
+        std::fs::write(&first_target, &originals[0]).expect("restore first projection");
+        std::fs::write(&second_target, &originals[1]).expect("restore second projection");
+        manager.retry_deferred_generated_file_cleanups().await;
+        assert!(
+            manager
+                .deferred_generated_file_cleanups
+                .lock()
+                .await
+                .is_empty()
+        );
+        assert!(!first_target.exists());
+        assert!(!second_target.exists());
     }
 
     #[tokio::test]
@@ -37573,6 +38035,181 @@ command = "api"
             ["api", "web", "db"].map(|name| test_service_key(test_instance_id(), name))
         );
         assert!(plan.reusable_service_envs.is_empty());
+    }
+
+    async fn projected_reuse_fixture(
+        root: &Path,
+        name: &str,
+    ) -> (ProcessManager, LocaldConfig, ServiceKey, PathBuf, PathBuf) {
+        let project_path = root.join(name);
+        std::fs::create_dir_all(project_path.join("chat")).expect("create projection parent");
+        std::fs::write(project_path.join("source.json"), r#"{"value":1}"#)
+            .expect("write projection source");
+        let config: LocaldConfig = toml::from_str(&format!(
+            r#"
+[project]
+name = "{name}"
+
+[services.worker]
+type = "worker"
+command = "unused"
+
+[services.worker.generated.runtime]
+source = "source.json"
+project_path = "chat/runtime.locald.json"
+"#
+        ))
+        .expect("parse projection reuse config");
+        let key = test_service_key(test_instance_id(), "worker");
+        let generated_files = crate::generated_files::materialize(
+            &root.join(format!("{name}-data")),
+            &project_path,
+            &key,
+            &config.services["worker"],
+            &ServiceRuntimeBindings::new(None, BTreeMap::new()),
+        )
+        .await
+        .expect("materialize active projection")
+        .expect("generated set");
+        let manager = readiness_test_manager(root);
+        let mut controller = TestController::new(
+            format!("{name}:worker"),
+            RuntimeState {
+                pid: Some(42),
+                port: None,
+                status: ServiceState::Running,
+                health_status: HealthStatus::Healthy,
+            },
+        );
+        controller.owned_process_id = Some(42);
+        controller.process_identity = Some(test_process_identity(
+            1_237,
+            42,
+            &format!("/test/{name}-worker"),
+        ));
+        let mut service = test_service(
+            config.clone(),
+            config.services["worker"].clone(),
+            ServiceRuntime::Controller(Arc::new(Mutex::new(controller))),
+            project_path.clone(),
+        );
+        service.generated_files = Some(generated_files);
+        manager.services.lock().await.insert(key.clone(), service);
+        let target = project_path.join("chat/runtime.locald.json");
+        (manager, config, key, project_path, target)
+    }
+
+    async fn projected_reuse_plan(
+        manager: &ProcessManager,
+        config: &LocaldConfig,
+        key: &ServiceKey,
+        project_path: &Path,
+    ) -> Result<ConfigTransitionPlan> {
+        manager
+            .prepublication_stop_plan(
+                test_instance_id(),
+                config,
+                manager.domain_index.snapshot(),
+                &HashMap::new(),
+                None,
+                PrepublicationStopOptions {
+                    sorted_services: &["worker".to_owned()],
+                    desired_service_names: &HashSet::from([key.clone()]),
+                    readiness_probe_budget: SERVICE_READINESS_TIMEOUT,
+                    project_path,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn missing_active_projection_forces_controller_restart() {
+        let dir = tempdir().expect("create missing-projection reuse root");
+        let (manager, config, key, project_path, target) =
+            projected_reuse_fixture(dir.path(), "missing-projection").await;
+        std::fs::remove_file(&target).expect("remove active projection");
+        let plan = projected_reuse_plan(&manager, &config, &key, &project_path)
+            .await
+            .expect("missing projection is safely reprovisioned");
+        assert_eq!(plan.restart_service_names, [key.clone()]);
+        assert!(!plan.reusable_service_envs.contains_key(&key));
+        assert!(matches!(
+            manager.services.lock().await[&key].runtime_state,
+            ServiceRuntime::Controller(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replaced_active_projection_fails_reuse_closed_and_retains_foreign() {
+        let dir = tempdir().expect("create replaced-projection reuse root");
+        let (manager, config, key, project_path, target) =
+            projected_reuse_fixture(dir.path(), "replaced-projection").await;
+        let owned = target.with_extension("owned-backup");
+        std::fs::rename(&target, &owned).expect("move owned projection");
+        std::fs::write(&target, b"foreign replacement").expect("write foreign projection");
+        let error = projected_reuse_plan(&manager, &config, &key, &project_path)
+            .await
+            .expect_err("foreign replacement rejects reuse");
+        assert!(format!("{error:#}").contains("never adopts or overwrites"));
+        assert_eq!(
+            std::fs::read(&target).expect("read foreign"),
+            b"foreign replacement"
+        );
+        assert!(owned.exists());
+        assert!(matches!(
+            manager.services.lock().await[&key].runtime_state,
+            ServiceRuntime::Controller(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn modified_active_projection_fails_reuse_closed_and_retains_content() {
+        let dir = tempdir().expect("create modified-projection reuse root");
+        let (manager, config, key, project_path, target) =
+            projected_reuse_fixture(dir.path(), "modified-projection").await;
+        std::fs::write(&target, b"modified in place").expect("modify projection");
+        let error = projected_reuse_plan(&manager, &config, &key, &project_path)
+            .await
+            .expect_err("modified projection rejects reuse");
+        assert!(format!("{error:#}").contains("never adopts or overwrites"));
+        assert_eq!(
+            std::fs::read(&target).expect("read modified"),
+            b"modified in place"
+        );
+        assert!(matches!(
+            manager.services.lock().await[&key].runtime_state,
+            ServiceRuntime::Controller(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swapped_projection_ancestor_fails_reuse_closed_and_preserves_outside() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("create swapped-ancestor reuse root");
+        let (manager, config, key, project_path, _target) =
+            projected_reuse_fixture(dir.path(), "swapped-ancestor").await;
+        let saved = dir.path().join("saved-chat");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside");
+        std::fs::write(outside.join("runtime.locald.json"), b"outside foreign")
+            .expect("write outside foreign");
+        std::fs::rename(project_path.join("chat"), &saved).expect("move admitted parent");
+        symlink(&outside, project_path.join("chat")).expect("install outside symlink");
+        let error = projected_reuse_plan(&manager, &config, &key, &project_path)
+            .await
+            .expect_err("ancestor swap rejects reuse");
+        assert!(format!("{error:#}").contains("without following symlinks"));
+        assert_eq!(
+            std::fs::read(outside.join("runtime.locald.json")).expect("read outside"),
+            b"outside foreign"
+        );
+        assert!(saved.join("runtime.locald.json").exists());
+        assert!(matches!(
+            manager.services.lock().await[&key].runtime_state,
+            ServiceRuntime::Controller(_)
+        ));
     }
 
     #[tokio::test]

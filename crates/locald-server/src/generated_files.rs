@@ -13,14 +13,21 @@ use jsonc_parser::{ParseOptions, parse_to_serde_value, parse_to_value};
 use locald_core::config::{GeneratedFileConfig, LocaldConfig, ServiceConfig};
 use locald_core::service::{ListenerName, ServiceKey, ServiceRuntimeBindings};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::ffi::CString;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_GENERATED_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_GENERATED_SOURCE_BYTES_U64: u64 = 1024 * 1024;
+const PROJECTION_MANIFEST_NAME: &str = ".projection-ownership.json";
+const PROJECTION_MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceFingerprint([u8; 32]);
@@ -48,6 +55,71 @@ struct PreparedGeneratedSource {
     value: Value,
     replacements: BTreeMap<String, Value>,
     fingerprint: SourceFingerprint,
+    projection: Option<PreparedProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedProjection {
+    canonical_project_root: PathBuf,
+    project_root_identity: ProjectionFileIdentity,
+    relative_path: PathBuf,
+    parent_relative_path: PathBuf,
+    parent_identity: ProjectionFileIdentity,
+    file_name: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectionFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    unsupported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectionOwnership {
+    name: String,
+    projection_id: String,
+    canonical_project_root: PathBuf,
+    project_root_identity: ProjectionFileIdentity,
+    parent_relative_path: PathBuf,
+    parent_identity: ProjectionFileIdentity,
+    file_name: PathBuf,
+    quarantine_root: PathBuf,
+    quarantine_root_identity: ProjectionFileIdentity,
+    relative_path: PathBuf,
+    target_quarantine_path: PathBuf,
+    digest: [u8; 32],
+    identity: ProjectionFileIdentity,
+}
+
+struct PlannedProjection {
+    name: String,
+    projection_id: String,
+    canonical_project_root: PathBuf,
+    project_root_identity: ProjectionFileIdentity,
+    parent_relative_path: PathBuf,
+    parent_identity: ProjectionFileIdentity,
+    file_name: PathBuf,
+    relative_path: PathBuf,
+    target_quarantine_path: PathBuf,
+    digest: [u8; 32],
+    identity: ProjectionFileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectionManifest {
+    version: u32,
+    generation: String,
+    projections: Vec<ProjectionOwnership>,
+}
+
+struct RenderedGeneration {
+    relative_paths: BTreeMap<String, PathBuf>,
+    source_fingerprints: BTreeMap<String, SourceFingerprint>,
+    projected_contents: BTreeMap<String, Vec<u8>>,
 }
 
 /// An immutable, validated snapshot of one service's generated-file sources.
@@ -62,6 +134,7 @@ pub(crate) struct GeneratedFileSet {
     generation_dir: PathBuf,
     paths: BTreeMap<String, PathBuf>,
     source_fingerprints: BTreeMap<String, SourceFingerprint>,
+    projections: Vec<ProjectionOwnership>,
 }
 
 impl GeneratedFileSet {
@@ -86,18 +159,77 @@ impl GeneratedFileSet {
                 return false;
             }
         }
+        self.projections_match().await
+    }
+
+    pub(crate) async fn matches_prepared(&self, prepared: &PreparedGeneratedFileSet) -> bool {
+        if self.source_fingerprints.len() != prepared.sources.len()
+            || !prepared.sources.iter().all(|(name, source)| {
+                self.source_fingerprints.get(name) == Some(&source.fingerprint)
+            })
+        {
+            return false;
+        }
+        let prepared_projections = prepared
+            .sources
+            .values()
+            .filter_map(|source| source.projection.as_ref())
+            .collect::<Vec<_>>();
+        if prepared_projections.len() != self.projections.len() {
+            return false;
+        }
+        for prepared in prepared_projections {
+            let Some(owned) = self.projections.iter().find(|owned| {
+                owned.canonical_project_root == prepared.canonical_project_root
+                    && owned.relative_path == prepared.relative_path
+                    && owned.parent_identity == prepared.parent_identity
+                    && owned.file_name == prepared.file_name
+            }) else {
+                return false;
+            };
+            let owned = owned.clone();
+            if !tokio::task::spawn_blocking(move || projection_path_matches_ownership(&owned))
+                .await
+                .is_ok_and(|result| result.unwrap_or(false))
+            {
+                return false;
+            }
+        }
         true
     }
 
-    pub(crate) fn matches_prepared(&self, prepared: &PreparedGeneratedFileSet) -> bool {
-        self.source_fingerprints.len() == prepared.sources.len()
-            && prepared.sources.iter().all(|(name, source)| {
-                self.source_fingerprints.get(name) == Some(&source.fingerprint)
-            })
+    async fn projections_match(&self) -> bool {
+        for projection in &self.projections {
+            let projection = projection.clone();
+            if !tokio::task::spawn_blocking(move || projection_path_matches_ownership(&projection))
+                .await
+                .is_ok_and(|result| result.unwrap_or(false))
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
+        cleanup_projections(&self.projections).await?;
         cleanup_generation_dir(&self.generation_dir).await
+    }
+
+    async fn owns_projection(&self, project_root: &Path, relative_path: &Path) -> bool {
+        let Ok(canonical_project_root) = tokio::fs::canonicalize(project_root).await else {
+            return false;
+        };
+        let Some(ownership) = self.projections.iter().find(|ownership| {
+            ownership.canonical_project_root == canonical_project_root
+                && ownership.relative_path == relative_path
+        }) else {
+            return false;
+        };
+        let ownership = ownership.clone();
+        tokio::task::spawn_blocking(move || projection_path_matches_ownership(&ownership))
+            .await
+            .is_ok_and(|result| result.unwrap_or(false))
     }
 }
 
@@ -112,6 +244,7 @@ pub(crate) fn generated_name_from_path_field(field: &str) -> Option<&str> {
 /// Validate generated declarations and their private runtime references.
 pub(crate) fn validate_declarations(config: &LocaldConfig) -> Result<()> {
     let valid_name = Regex::new(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")?;
+    let mut project_targets = BTreeMap::new();
 
     for (service_name, service) in &config.services {
         if service.generated().is_empty() {
@@ -134,6 +267,26 @@ pub(crate) fn validate_declarations(config: &LocaldConfig) -> Result<()> {
                 );
             }
             validate_source_path(service_name, name, &generated.source)?;
+            if let Some(project_path) = &generated.project_path {
+                anyhow::ensure!(
+                    project_path_supported(),
+                    "service `{service_name}` generated file `{name}` uses project_path, which is supported only on macOS and Linux"
+                );
+                validate_project_path(service_name, name, &generated.source, project_path)?;
+                let normalized = normalized_relative_path(project_path)
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                if let Some((existing_service, existing_name, existing_path)) = project_targets
+                    .insert(
+                        normalized,
+                        (service_name.as_str(), name.as_str(), project_path.as_str()),
+                    )
+                {
+                    anyhow::bail!(
+                        "services `{existing_service}` and `{service_name}` generated files `{existing_name}` and `{name}` project paths `{existing_path}` and `{project_path}` collide on a case-insensitive filesystem"
+                    );
+                }
+            }
             validate_replacement_pointers(service_name, name, generated)?;
             validate_replacement_references(service_name, name, service, generated)?;
         }
@@ -147,6 +300,7 @@ pub(crate) async fn prepare(
     project_root: &Path,
     key: &ServiceKey,
     service_config: &ServiceConfig,
+    allowed_existing: Option<&GeneratedFileSet>,
 ) -> Result<Option<PreparedGeneratedFileSet>> {
     if service_config.generated().is_empty() {
         return Ok(None);
@@ -172,12 +326,26 @@ pub(crate) async fn prepare(
                 key.name()
             )
         })?;
+        let projection = match &config.project_path {
+            Some(project_path) => Some(
+                prepare_projection_target(project_root, project_path, allowed_existing)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare project_path `{project_path}` for generated file `{name}` on service `{}`",
+                            key.name()
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         sources.insert(
             name.clone(),
             PreparedGeneratedSource {
                 value,
                 replacements: config.replace.clone(),
                 fingerprint: source.fingerprint,
+                projection,
             },
         );
     }
@@ -198,7 +366,7 @@ pub(crate) async fn materialize(
     }
 
     let service_root = prepare_service_root(data_dir, key).await?;
-    let prepared = prepare(project_root, key, service_config)
+    let prepared = prepare(project_root, key, service_config, None)
         .await?
         .context("non-empty generated-file declarations produced no prepared snapshot")?;
     publish_prepared(&service_root, key, bindings, &prepared)
@@ -235,13 +403,33 @@ async fn publish_prepared(
     bindings: &ServiceRuntimeBindings,
     prepared: &PreparedGeneratedFileSet,
 ) -> Result<GeneratedFileSet> {
+    publish_prepared_with_projection_validator(
+        service_root,
+        key,
+        bindings,
+        prepared,
+        ensure_projection_same_filesystem,
+    )
+    .await
+}
+
+async fn publish_prepared_with_projection_validator<F>(
+    service_root: &Path,
+    key: &ServiceKey,
+    bindings: &ServiceRuntimeBindings,
+    prepared: &PreparedGeneratedFileSet,
+    projection_validator: F,
+) -> Result<GeneratedFileSet>
+where
+    F: Fn(&ProjectionFileIdentity, &ProjectionFileIdentity) -> Result<()>,
+{
     let generation = uuid::Uuid::new_v4().to_string();
     let staging_dir = service_root.join(format!(".staging-{generation}"));
-    let generation_dir = service_root.join(generation);
+    let generation_dir = service_root.join(&generation);
     create_private_directory(&staging_dir, false).await?;
 
     let render_result = render_generation(key, bindings, prepared, &staging_dir).await;
-    let (relative_paths, source_fingerprints) = match render_result {
+    let rendered = match render_result {
         Ok(rendered) => rendered,
         Err(error) => {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -249,34 +437,879 @@ async fn publish_prepared(
         }
     };
 
-    if let Err(error) = sync_directory(&staging_dir).await {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        return Err(error);
-    }
-    if let Err(error) = tokio::fs::rename(&staging_dir, &generation_dir).await {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        return Err(error).with_context(|| {
-            format!(
-                "failed to publish generated-file generation `{}`",
-                generation_dir.display()
+    let planned = match plan_projection_files_with_validator(
+        &staging_dir,
+        &generation,
+        prepared,
+        &rendered,
+        &projection_validator,
+    ) {
+        Ok(planned) => planned,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = sync_directory(service_root).await;
+            return Err(error);
+        }
+    };
+    let quarantine_root = service_root.join(format!(".projection-quarantine-{generation}"));
+    let projections = if planned.is_empty() {
+        Vec::new()
+    } else {
+        let setup = async {
+            create_private_directory(&quarantine_root, true).await?;
+            sync_directory(service_root).await?;
+            let metadata = tokio::fs::symlink_metadata(&quarantine_root).await?;
+            Ok::<_, anyhow::Error>(projection_file_identity_from_std(&metadata))
+        }
+        .await;
+        let quarantine_root_identity = match setup {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&quarantine_root).await;
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                let _ = sync_directory(service_root).await;
+                return Err(error);
+            }
+        };
+        planned
+            .into_iter()
+            .map(|planned| planned.with_quarantine(&quarantine_root, &quarantine_root_identity))
+            .collect()
+    };
+    if !projections.is_empty() {
+        let manifest = ProjectionManifest {
+            version: PROJECTION_MANIFEST_VERSION,
+            generation: generation.clone(),
+            projections: projections.clone(),
+        };
+        if let Err(error) = write_projection_manifest(&staging_dir, &manifest).await {
+            let _ = tokio::fs::remove_dir_all(&quarantine_root).await;
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = sync_directory(service_root).await;
+            return Err(error);
+        }
+        // This manifest is the write-ahead ownership record.  Persist both it and
+        // the staging-directory entry before creating any state in the project.
+        if let Err(error) = sync_directory(&staging_dir).await {
+            let _ = tokio::fs::remove_dir_all(&quarantine_root).await;
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = sync_directory(service_root).await;
+            return Err(error);
+        }
+        if let Err(error) = sync_directory(service_root).await {
+            let _ = tokio::fs::remove_dir_all(&quarantine_root).await;
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            let _ = sync_directory(service_root).await;
+            return Err(error);
+        }
+        if let Err(error) = prepare_projection_files(&staging_dir, &projections, &rendered).await {
+            return rollback_or_retain(
+                error,
+                "projection preparation rollback",
+                &staging_dir,
+                service_root,
+                &projections,
             )
-        });
-    }
-    if let Err(error) = sync_directory(service_root).await {
-        let _ = tokio::fs::remove_dir_all(&generation_dir).await;
-        let _ = sync_directory(service_root).await;
-        return Err(error);
+            .await;
+        }
     }
 
-    let paths = relative_paths
+    if let Err(error) = sync_directory(&staging_dir).await {
+        return rollback_or_retain(
+            error,
+            "projection staging sync rollback",
+            &staging_dir,
+            service_root,
+            &projections,
+        )
+        .await;
+    }
+    if let Err(error) = tokio::fs::rename(&staging_dir, &generation_dir).await {
+        let error = anyhow::Error::new(error).context(format!(
+            "failed to publish generated-file generation `{}`",
+            generation_dir.display()
+        ));
+        return rollback_or_retain(
+            error,
+            "projection generation rename rollback",
+            &staging_dir,
+            service_root,
+            &projections,
+        )
+        .await;
+    }
+    if let Err(error) = sync_directory(service_root).await {
+        return rollback_or_retain(
+            error,
+            "projection generation publication rollback",
+            &generation_dir,
+            service_root,
+            &projections,
+        )
+        .await;
+    }
+
+    let paths = rendered
+        .relative_paths
         .into_iter()
         .map(|(name, relative)| (name, generation_dir.join(relative)))
         .collect();
     Ok(GeneratedFileSet {
         generation_dir,
         paths,
-        source_fingerprints,
+        source_fingerprints: rendered.source_fingerprints,
+        projections,
     })
+}
+
+async fn rollback_or_retain<T>(
+    error: anyhow::Error,
+    scope: &str,
+    generation_directory: &Path,
+    service_root: &Path,
+    projections: &[ProjectionOwnership],
+) -> Result<T> {
+    if let Err(rollback_error) = cleanup_projections(projections).await {
+        return Err(error.context(format!(
+            "{scope} was incomplete; durable ownership state was retained for recovery: {rollback_error:#}"
+        )));
+    }
+    if let Err(rollback_error) = tokio::fs::remove_dir_all(generation_directory).await {
+        return Err(error.context(format!(
+            "{scope} removed project projections but could not remove private generation state: {rollback_error}"
+        )));
+    }
+    let _ = sync_directory(service_root).await;
+    Err(error)
+}
+
+#[cfg(test)]
+fn plan_projection_files(
+    staging_dir: &Path,
+    generation: &str,
+    prepared: &PreparedGeneratedFileSet,
+    rendered: &RenderedGeneration,
+) -> Result<Vec<PlannedProjection>> {
+    plan_projection_files_with_validator(
+        staging_dir,
+        generation,
+        prepared,
+        rendered,
+        &ensure_projection_same_filesystem,
+    )
+}
+
+fn plan_projection_files_with_validator<F>(
+    staging_dir: &Path,
+    generation: &str,
+    prepared: &PreparedGeneratedFileSet,
+    rendered: &RenderedGeneration,
+    projection_validator: &F,
+) -> Result<Vec<PlannedProjection>>
+where
+    F: Fn(&ProjectionFileIdentity, &ProjectionFileIdentity) -> Result<()>,
+{
+    let mut projections = Vec::new();
+    for (name, source) in &prepared.sources {
+        let Some(projection) = &source.projection else {
+            continue;
+        };
+        let contents = rendered
+            .projected_contents
+            .get(name)
+            .context("rendered projection content is missing")?;
+        let projection_id = uuid::Uuid::new_v4().to_string();
+        let canonical_relative_path = rendered
+            .relative_paths
+            .get(name)
+            .context("rendered canonical projection path is missing")?;
+        let canonical_metadata =
+            std::fs::symlink_metadata(staging_dir.join(canonical_relative_path))
+                .context("failed to inspect rendered canonical projection")?;
+        anyhow::ensure!(
+            canonical_metadata.is_file() && !canonical_metadata.file_type().is_symlink(),
+            "rendered canonical projection is not a regular file"
+        );
+        let identity = projection_file_identity_from_std(&canonical_metadata);
+        projection_validator(&identity, &projection.project_root_identity)?;
+        projections.push(PlannedProjection {
+            name: name.clone(),
+            projection_id: projection_id.clone(),
+            canonical_project_root: projection.canonical_project_root.clone(),
+            project_root_identity: projection.project_root_identity.clone(),
+            parent_relative_path: projection.parent_relative_path.clone(),
+            parent_identity: projection.parent_identity.clone(),
+            file_name: projection.file_name.clone(),
+            relative_path: projection.relative_path.clone(),
+            target_quarantine_path: PathBuf::from(format!(
+                "{generation}-{projection_id}.target-quarantine"
+            )),
+            digest: Sha256::digest(contents).into(),
+            identity,
+        });
+    }
+    Ok(projections)
+}
+
+impl PlannedProjection {
+    fn with_quarantine(
+        self,
+        quarantine_root: &Path,
+        quarantine_root_identity: &ProjectionFileIdentity,
+    ) -> ProjectionOwnership {
+        ProjectionOwnership {
+            name: self.name,
+            projection_id: self.projection_id,
+            canonical_project_root: self.canonical_project_root,
+            project_root_identity: self.project_root_identity,
+            parent_relative_path: self.parent_relative_path,
+            parent_identity: self.parent_identity,
+            file_name: self.file_name,
+            quarantine_root: quarantine_root.to_path_buf(),
+            quarantine_root_identity: quarantine_root_identity.clone(),
+            relative_path: self.relative_path,
+            target_quarantine_path: self.target_quarantine_path,
+            digest: self.digest,
+            identity: self.identity,
+        }
+    }
+}
+
+fn ensure_projection_same_filesystem(
+    canonical_identity: &ProjectionFileIdentity,
+    project_root_identity: &ProjectionFileIdentity,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        anyhow::ensure!(
+            canonical_identity.device == project_root_identity.device,
+            "generated-file project_path requires locald's private data directory and the project to be on the same filesystem"
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (canonical_identity, project_root_identity);
+        anyhow::bail!("generated-file project_path is supported only on macOS and Linux")
+    }
+}
+
+async fn prepare_projection_files(
+    staging_dir: &Path,
+    projections: &[ProjectionOwnership],
+    rendered: &RenderedGeneration,
+) -> Result<()> {
+    for projection in projections {
+        let canonical_relative_path = rendered
+            .relative_paths
+            .get(&projection.name)
+            .context("rendered canonical projection path is missing")?
+            .clone();
+        let contents = rendered
+            .projected_contents
+            .get(&projection.name)
+            .context("rendered projection content is missing")?
+            .clone();
+        let projection = projection.clone();
+        let staging_dir = staging_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            publish_projection_direct(
+                &staging_dir,
+                &canonical_relative_path,
+                &projection,
+                &contents,
+            )
+        })
+        .await
+        .context("generated-file projection link task failed")??;
+    }
+    Ok(())
+}
+
+fn publish_projection_direct(
+    staging_dir: &Path,
+    canonical_relative_path: &Path,
+    projection: &ProjectionOwnership,
+    contents: &[u8],
+) -> Result<()> {
+    publish_projection_direct_with_hook(
+        staging_dir,
+        canonical_relative_path,
+        projection,
+        contents,
+        |_| Ok(()),
+    )
+}
+
+fn publish_projection_direct_with_hook<F>(
+    staging_dir: &Path,
+    canonical_relative_path: &Path,
+    projection: &ProjectionOwnership,
+    contents: &[u8],
+    before_link: F,
+) -> Result<()>
+where
+    F: FnOnce(&Dir) -> Result<()>,
+{
+    publish_projection_direct_with_hooks(
+        staging_dir,
+        canonical_relative_path,
+        projection,
+        contents,
+        before_link,
+        |_| Ok(()),
+    )
+}
+
+fn publish_projection_direct_with_hooks<F, G>(
+    staging_dir: &Path,
+    canonical_relative_path: &Path,
+    projection: &ProjectionOwnership,
+    contents: &[u8],
+    before_link: F,
+    after_detach: G,
+) -> Result<()>
+where
+    F: FnOnce(&Dir) -> Result<()>,
+    G: FnOnce(&Dir) -> Result<()>,
+{
+    use std::io::Write as _;
+
+    let canonical_root = Dir::open_ambient_dir(staging_dir, ambient_authority())?;
+    let parent = open_exact_project_parent(
+        &projection.canonical_project_root,
+        &projection.project_root_identity,
+        &projection.parent_relative_path,
+        &projection.parent_identity,
+    )?;
+    let canonical_metadata = canonical_root.symlink_metadata(canonical_relative_path)?;
+    anyhow::ensure!(
+        canonical_metadata.is_file()
+            && !canonical_metadata.file_type().is_symlink()
+            && projection_file_identity(&canonical_metadata) == projection.identity,
+        "private canonical generated file identity changed before projection"
+    );
+    before_link(&parent)?;
+    let canonical_metadata = canonical_root.symlink_metadata(canonical_relative_path)?;
+    anyhow::ensure!(
+        canonical_metadata.is_file()
+            && !canonical_metadata.file_type().is_symlink()
+            && projection_file_identity(&canonical_metadata) == projection.identity,
+        "private canonical generated file identity changed at projection selection"
+    );
+    canonical_root
+        .hard_link(canonical_relative_path, &parent, &projection.file_name)
+        .with_context(|| {
+            format!(
+                "refusing to overwrite generated-file project_path `{}`",
+                projection
+                    .canonical_project_root
+                    .join(&projection.relative_path)
+                    .display()
+            )
+        })?;
+    parent.open(".")?.sync_all()?;
+
+    // The hard link selected an inode whose identity was durable before the
+    // project entry appeared.  Detach the private canonical path onto a fresh
+    // private inode before service startup, so project edits cannot mutate the
+    // canonical runtime file through the shared seed inode.
+    let canonical_name = canonical_relative_path
+        .file_name()
+        .context("canonical generated path has no file name")?
+        .to_string_lossy();
+    let detached_path = canonical_relative_path.with_file_name(format!(
+        ".{canonical_name}.locald-detach-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut detached = canonical_root.open_with(&detached_path, &options)?;
+    detached.write_all(contents)?;
+    detached.sync_all()?;
+    canonical_root.rename(&detached_path, &canonical_root, canonical_relative_path)?;
+    canonical_root.open(".")?.sync_all()?;
+
+    // Detachment is the last publication mutation. Verify the exact visible
+    // path only now so an ancestor swap or in-place rewrite during detachment
+    // cannot leave a service starting against a detached or modified project
+    // entry. Roll back through the pinned parent capability; the quarantine
+    // protocol removes only the recorded identity and digest and retains any
+    // changed entry for recovery.
+    let publication_validation =
+        after_detach(&parent).and_then(|()| validate_visible_projection_at_publication(projection));
+    if let Err(error) = publication_validation {
+        let quarantine_root =
+            Dir::open_ambient_dir(&projection.quarantine_root, ambient_authority())?;
+        let rollback =
+            cleanup_projection_in_open_parent(&parent, &quarantine_root, projection, |_| Ok(()));
+        return match rollback {
+            Ok(()) => Err(error.context(
+                "generated-file project_path changed at the final publication boundary; the pinned entry was rolled back",
+            )),
+            Err(rollback_error) => Err(error.context(format!(
+                "generated-file project_path changed at the final publication boundary; pinned-entry rollback retained durable ownership state: {rollback_error:#}"
+            ))),
+        };
+    }
+    Ok(())
+}
+
+fn validate_visible_projection_at_publication(projection: &ProjectionOwnership) -> Result<()> {
+    use std::io::Read as _;
+
+    let parent = open_exact_project_parent(
+        &projection.canonical_project_root,
+        &projection.project_root_identity,
+        &projection.parent_relative_path,
+        &projection.parent_identity,
+    )?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = parent.open_with(&projection.file_name, &options)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && projection_file_identity(&metadata) == projection.identity,
+        "generated-file project_path entry identity changed at the final publication boundary"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        <[u8; 32]>::from(Sha256::digest(&bytes)) == projection.digest,
+        "generated-file project_path content changed at the final publication boundary"
+    );
+
+    // Re-open through the current project path after reading so a concurrent
+    // ancestor or final-entry replacement cannot be hidden by the open file
+    // capability used for digest verification.
+    let current_parent = open_exact_project_parent(
+        &projection.canonical_project_root,
+        &projection.project_root_identity,
+        &projection.parent_relative_path,
+        &projection.parent_identity,
+    )?;
+    let current_metadata = current_parent.symlink_metadata(&projection.file_name)?;
+    anyhow::ensure!(
+        current_metadata.is_file()
+            && !current_metadata.file_type().is_symlink()
+            && projection_file_identity(&current_metadata) == projection.identity,
+        "generated-file project_path entry identity changed after final digest verification"
+    );
+    Ok(())
+}
+
+fn projection_file_identity(metadata: &cap_std::fs::Metadata) -> ProjectionFileIdentity {
+    ProjectionFileIdentity {
+        #[cfg(unix)]
+        device: CapMetadataExt::dev(metadata),
+        #[cfg(unix)]
+        inode: CapMetadataExt::ino(metadata),
+        #[cfg(not(unix))]
+        unsupported: true,
+    }
+}
+
+fn open_exact_project_parent(
+    canonical_project_root: &Path,
+    expected_project_root_identity: &ProjectionFileIdentity,
+    parent_relative_path: &Path,
+    expected_parent_identity: &ProjectionFileIdentity,
+) -> Result<Dir> {
+    let current = open_project_parent_nofollow(
+        canonical_project_root,
+        expected_project_root_identity,
+        parent_relative_path,
+    )?;
+    anyhow::ensure!(
+        projection_file_identity(&current.dir_metadata()?) == *expected_parent_identity,
+        "generated-file project_path parent identity changed at `{}`",
+        canonical_project_root.join(parent_relative_path).display()
+    );
+    Ok(current)
+}
+
+fn open_project_parent_nofollow(
+    canonical_project_root: &Path,
+    expected_project_root_identity: &ProjectionFileIdentity,
+    parent_relative_path: &Path,
+) -> Result<Dir> {
+    let root = Dir::open_ambient_dir(canonical_project_root, ambient_authority())?;
+    anyhow::ensure!(
+        projection_file_identity(&root.dir_metadata()?) == *expected_project_root_identity,
+        "generated-file project root identity changed at `{}`",
+        canonical_project_root.display()
+    );
+    let mut current = root;
+    for component in parent_relative_path.components() {
+        let Component::Normal(component) = component else {
+            anyhow::bail!("generated-file projection parent contains an unsafe component");
+        };
+        current = open_directory_component_nofollow(&current, component).with_context(|| {
+            format!(
+                "failed to open generated-file project_path parent `{}` without following symlinks",
+                canonical_project_root.join(parent_relative_path).display()
+            )
+        })?;
+    }
+    Ok(current)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)] // Converts the owned descriptor returned by openat into a capability.
+fn open_directory_component_nofollow(
+    parent: &Dir,
+    component: &std::ffi::OsStr,
+) -> std::io::Result<Dir> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let component = CString::new(component.as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: the component C string lives for the call; openat returns a new
+    // owned descriptor or -1, and O_NOFOLLOW rejects a final symlink.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh owned descriptor returned by successful openat.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_directory_component_nofollow(
+    _parent: &Dir,
+    _component: &std::ffi::OsStr,
+) -> std::io::Result<Dir> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "generated-file project_path is supported only on macOS and Linux",
+    ))
+}
+
+async fn write_projection_manifest(
+    staging_dir: &Path,
+    manifest: &ProjectionManifest,
+) -> Result<()> {
+    let path = staging_dir.join(PROJECTION_MANIFEST_NAME);
+    let mut bytes = serde_json::to_vec_pretty(manifest)?;
+    bytes.push(b'\n');
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).await?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+async fn cleanup_projections(projections: &[ProjectionOwnership]) -> Result<()> {
+    let mut errors = Vec::new();
+    for projection in projections {
+        let projection = projection.clone();
+        let result =
+            tokio::task::spawn_blocking(move || cleanup_owned_projection_path(&projection))
+                .await
+                .context("generated-file projection cleanup task failed")
+                .and_then(|result| result);
+        if let Err(error) = result {
+            errors.push(format!("{error:#}"));
+        }
+    }
+    if errors.is_empty() {
+        let quarantine_roots = projections
+            .iter()
+            .map(|projection| projection.quarantine_root.clone())
+            .collect::<BTreeSet<_>>();
+        for quarantine_root in quarantine_roots {
+            match tokio::fs::remove_dir(&quarantine_root).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!(
+                    "failed to remove private projection quarantine `{}`: {error}",
+                    quarantine_root.display()
+                )),
+            }
+        }
+    }
+    finish_cleanup_errors("generated-file projection cleanup", &errors)
+}
+
+fn finish_cleanup_errors(scope: &str, errors: &[String]) -> Result<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{scope} encountered {} error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        )
+    }
+}
+
+fn cleanup_owned_projection_path(projection: &ProjectionOwnership) -> Result<()> {
+    cleanup_owned_projection_path_with_hook(projection, |_| Ok(()))
+}
+
+fn cleanup_owned_projection_path_with_hook<F>(
+    projection: &ProjectionOwnership,
+    after_quarantine: F,
+) -> Result<()>
+where
+    F: FnOnce(&Dir) -> Result<()>,
+{
+    let parent = open_exact_project_parent(
+        &projection.canonical_project_root,
+        &projection.project_root_identity,
+        &projection.parent_relative_path,
+        &projection.parent_identity,
+    )?;
+    let quarantine_root = match Dir::open_ambient_dir(
+        &projection.quarantine_root,
+        ambient_authority(),
+    ) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match parent.symlink_metadata(&projection.file_name) {
+                Err(path_error) if path_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => anyhow::bail!(
+                    "retaining generated-file projection `{}` because its private quarantine root is missing",
+                    projection
+                        .canonical_project_root
+                        .join(&projection.relative_path)
+                        .display()
+                ),
+                Err(path_error) => Err(path_error.into()),
+            };
+        }
+        Err(error) => return Err(error.into()),
+    };
+    cleanup_projection_in_open_parent(&parent, &quarantine_root, projection, after_quarantine)
+}
+
+fn cleanup_projection_in_open_parent<F>(
+    parent: &Dir,
+    quarantine_root: &Dir,
+    projection: &ProjectionOwnership,
+    after_quarantine: F,
+) -> Result<()>
+where
+    F: FnOnce(&Dir) -> Result<()>,
+{
+    anyhow::ensure!(
+        projection_file_identity(&quarantine_root.dir_metadata()?)
+            == projection.quarantine_root_identity,
+        "retaining generated-file projection because its private quarantine root identity changed at `{}`",
+        projection.quarantine_root.display()
+    );
+    let quarantine_path = projection.target_quarantine_path.as_path();
+
+    // A prior crash may have happened after the atomic move but before deletion.
+    cleanup_quarantined_projection_path(
+        parent,
+        quarantine_root,
+        projection,
+        &projection.file_name,
+        quarantine_path,
+    )?;
+    match rename_projection_noreplace(
+        parent,
+        &projection.file_name,
+        quarantine_root,
+        quarantine_path,
+    ) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to quarantine generated-file projection `{}`",
+                    projection
+                        .canonical_project_root
+                        .join(&projection.relative_path)
+                        .display()
+                )
+            });
+        }
+    }
+    parent.open(".")?.sync_all()?;
+    quarantine_root.open(".")?.sync_all()?;
+    after_quarantine(parent)?;
+    cleanup_quarantined_projection_path(
+        parent,
+        quarantine_root,
+        projection,
+        &projection.file_name,
+        quarantine_path,
+    )
+}
+
+fn cleanup_quarantined_projection_path(
+    project_root: &Dir,
+    quarantine_root: &Dir,
+    projection: &ProjectionOwnership,
+    original_path: &Path,
+    quarantine_path: &Path,
+) -> Result<()> {
+    use std::io::Read as _;
+
+    let metadata = match quarantine_root.symlink_metadata(quarantine_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let validation = (|| -> Result<()> {
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "retaining generated-file projection `{}` because it is not a regular file",
+            projection.quarantine_root.join(quarantine_path).display()
+        );
+        anyhow::ensure!(
+            projection_file_identity(&metadata) == projection.identity,
+            "retaining generated-file projection `{}` because its file identity changed",
+            projection.quarantine_root.join(quarantine_path).display()
+        );
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = quarantine_root.open_with(quarantine_path, &options)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            <[u8; 32]>::from(Sha256::digest(&bytes)) == projection.digest,
+            "retaining generated-file projection `{}` because its content changed",
+            projection.quarantine_root.join(quarantine_path).display()
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = validation {
+        match rename_projection_noreplace(
+            quarantine_root,
+            quarantine_path,
+            project_root,
+            original_path,
+        ) {
+            Ok(()) => return Err(error),
+            Err(restore_error) => {
+                return Err(error.context(format!(
+                    "the quarantined entry was retained at `{}` because restoration to `{}` failed: {restore_error}",
+                    projection.quarantine_root.join(quarantine_path).display(),
+                    projection.canonical_project_root.join(original_path).display()
+                )));
+            }
+        }
+    }
+
+    quarantine_root.remove_file(quarantine_path)?;
+    quarantine_root.open(".")?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)] // The platform no-replace rename is the atomic ownership boundary.
+fn rename_projection_noreplace(
+    from_root: &Dir,
+    from: &Path,
+    to_root: &Dir,
+    to: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let from_fd = from_root.as_raw_fd();
+    let to_fd = to_root.as_raw_fd();
+    #[cfg(target_os = "macos")]
+    // SAFETY: both C strings live for the call and both directory descriptors
+    // are open capabilities for the recorded source and destination roots.
+    let result = unsafe {
+        libc::renameatx_np(
+            from_fd,
+            from.as_ptr(),
+            to_fd,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_fd,
+            from.as_ptr(),
+            to_fd,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        ) as libc::c_int
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_projection_noreplace(
+    _from_root: &Dir,
+    _from: &Path,
+    _to_root: &Dir,
+    _to: &Path,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "generated-file project_path cleanup is supported only on macOS and Linux",
+    ))
+}
+
+fn projection_path_matches_ownership(projection: &ProjectionOwnership) -> Result<bool> {
+    use std::io::Read as _;
+
+    let parent = match open_exact_project_parent(
+        &projection.canonical_project_root,
+        &projection.project_root_identity,
+        &projection.parent_relative_path,
+        &projection.parent_identity,
+    ) {
+        Ok(parent) => parent,
+        Err(_) => return Ok(false),
+    };
+    let metadata = match parent.symlink_metadata(&projection.file_name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || projection_file_identity(&metadata) != projection.identity
+    {
+        return Ok(false);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = parent.open_with(&projection.file_name, &options)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(<[u8; 32]>::from(Sha256::digest(&bytes)) == projection.digest)
 }
 
 /// Remove every generated runtime file for one project instance.
@@ -313,6 +1346,7 @@ pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<()> {
         }
     };
 
+    let mut errors = Vec::new();
     while let Some(entry) = entries.next_entry().await.with_context(|| {
         format!(
             "failed to enumerate generated-file instance roots at `{}`",
@@ -329,17 +1363,20 @@ pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<()> {
             continue;
         }
         let generated_root = entry.path().join("generated");
-        remove_generated_root(&generated_root)
+        if let Err(error) = remove_generated_root(&generated_root)
             .await
             .with_context(|| {
                 format!(
                     "failed to remove stale generated files at `{}`",
                     generated_root.display()
                 )
-            })?;
+            })
+        {
+            errors.push(format!("{error:#}"));
+        }
     }
 
-    Ok(())
+    finish_cleanup_errors("generated-file instance recovery", &errors)
 }
 
 async fn remove_generated_root(root: &Path) -> Result<()> {
@@ -351,9 +1388,71 @@ async fn remove_generated_root(root: &Path) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         tokio::fs::remove_file(root).await?;
     } else {
+        let mut errors = Vec::new();
+        for manifest in load_projection_manifests(root).await? {
+            if let Err(error) = cleanup_projections(&manifest.projections).await {
+                errors.push(format!("generation {}: {error:#}", manifest.generation));
+            }
+        }
+        if !errors.is_empty() {
+            return finish_cleanup_errors("generated-file manifest recovery", &errors);
+        }
         tokio::fs::remove_dir_all(root).await?;
     }
     Ok(())
+}
+
+#[allow(clippy::disallowed_methods)] // This entire directory walk runs inside spawn_blocking.
+async fn load_projection_manifests(root: &Path) -> Result<Vec<ProjectionManifest>> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut manifests = Vec::new();
+        for service in std::fs::read_dir(&root)? {
+            let service = service?;
+            let service_type = service.file_type()?;
+            if !service_type.is_dir() || service_type.is_symlink() {
+                continue;
+            }
+            for generation in std::fs::read_dir(service.path())? {
+                let generation = generation?;
+                let generation_type = generation.file_type()?;
+                if !generation_type.is_dir() || generation_type.is_symlink() {
+                    continue;
+                }
+                let manifest_path = generation.path().join(PROJECTION_MANIFEST_NAME);
+                let bytes = match std::fs::read(&manifest_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let manifest: ProjectionManifest =
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        format!(
+                            "failed to parse generated-file projection ownership manifest `{}`",
+                            manifest_path.display()
+                        )
+                    })?;
+                anyhow::ensure!(
+                    manifest.version == PROJECTION_MANIFEST_VERSION,
+                    "unsupported generated-file projection ownership manifest version {} at `{}`",
+                    manifest.version,
+                    manifest_path.display()
+                );
+                let generation_file_name = generation.file_name();
+                let directory_name = generation_file_name.to_string_lossy();
+                anyhow::ensure!(
+                    directory_name == manifest.generation
+                        || directory_name == format!(".staging-{}", manifest.generation),
+                    "generated-file projection ownership manifest generation does not match `{}`",
+                    generation.path().display()
+                );
+                manifests.push(manifest);
+            }
+        }
+        Ok::<_, anyhow::Error>(manifests)
+    })
+    .await
+    .context("generated-file projection recovery scan task failed")?
 }
 
 async fn create_private_directory(path: &Path, recursive: bool) -> Result<()> {
@@ -390,12 +1489,10 @@ async fn render_generation(
     bindings: &ServiceRuntimeBindings,
     prepared: &PreparedGeneratedFileSet,
     staging_dir: &Path,
-) -> Result<(
-    BTreeMap<String, PathBuf>,
-    BTreeMap<String, SourceFingerprint>,
-)> {
+) -> Result<RenderedGeneration> {
     let mut relative_paths = BTreeMap::new();
     let mut source_fingerprints = BTreeMap::new();
+    let mut projected_contents = BTreeMap::new();
 
     for (name, source) in &prepared.sources {
         let mut value = source.value.clone();
@@ -433,9 +1530,16 @@ async fn render_generation(
             .with_context(|| format!("failed to sync generated file `{}`", output.display()))?;
         relative_paths.insert(name.clone(), relative);
         source_fingerprints.insert(name.clone(), source.fingerprint.clone());
+        if source.projection.is_some() {
+            projected_contents.insert(name.clone(), rendered);
+        }
     }
 
-    Ok((relative_paths, source_fingerprints))
+    Ok(RenderedGeneration {
+        relative_paths,
+        source_fingerprints,
+        projected_contents,
+    })
 }
 
 async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Result<LoadedSource> {
@@ -556,6 +1660,128 @@ async fn load_source(project_root: &Path, config: &GeneratedFileConfig) -> Resul
         fingerprint,
         format,
     })
+}
+
+async fn prepare_projection_target(
+    project_root: &Path,
+    configured: &str,
+    allowed_existing: Option<&GeneratedFileSet>,
+) -> Result<PreparedProjection> {
+    anyhow::ensure!(
+        project_path_supported(),
+        "generated-file project_path is supported only on macOS and Linux"
+    );
+    let relative_path = normalized_relative_path(configured);
+    anyhow::ensure!(
+        !relative_path.as_os_str().is_empty() && !Path::new(configured).is_absolute(),
+        "generated-file project_path must be a non-empty project-relative path"
+    );
+    anyhow::ensure!(
+        !Path::new(configured).components().any(|component| matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )),
+        "generated-file project_path may not traverse outside the project"
+    );
+    source_format(configured)
+        .context("generated-file project_path has an unsupported extension")?;
+
+    let canonical_project_root =
+        tokio::fs::canonicalize(project_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve generated-file project root `{}`",
+                    project_root.display()
+                )
+            })?;
+    let root_metadata = tokio::fs::symlink_metadata(&canonical_project_root).await?;
+    anyhow::ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "generated-file project root `{}` is not a regular directory",
+        canonical_project_root.display()
+    );
+    let project_root_identity = projection_file_identity_from_std(&root_metadata);
+
+    let parent_relative_path = relative_path
+        .parent()
+        .context("generated-file project_path has no parent directory")?
+        .to_path_buf();
+    let file_name = PathBuf::from(
+        relative_path
+            .file_name()
+            .context("generated-file project_path has no file name")?,
+    );
+    let target_is_owned = match allowed_existing {
+        Some(owned) => owned.owns_projection(project_root, &relative_path).await,
+        None => false,
+    };
+    let root_for_task = canonical_project_root.clone();
+    let root_identity_for_task = project_root_identity.clone();
+    let parent_for_task = parent_relative_path.clone();
+    let file_name_for_task = file_name.clone();
+    let (parent_identity, target_metadata) = tokio::task::spawn_blocking(move || {
+        let parent = open_project_parent_nofollow(
+            &root_for_task,
+            &root_identity_for_task,
+            &parent_for_task,
+        )?;
+        let parent_identity = projection_file_identity(&parent.dir_metadata()?);
+        let metadata = match parent.symlink_metadata(&file_name_for_task) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok::<_, anyhow::Error>((parent_identity, metadata))
+    })
+    .await
+    .context("generated-file project_path parent capability task failed")??;
+    let target = canonical_project_root.join(&relative_path);
+    match target_metadata {
+        Some(_) if target_is_owned => {}
+        Some(metadata) => anyhow::bail!(
+            "generated-file project_path target `{}` already exists as {}; locald never adopts or overwrites project files",
+            target.display(),
+            if metadata.file_type().is_symlink() {
+                "a symlink"
+            } else if metadata.is_file() {
+                "a file"
+            } else {
+                "a non-regular entry"
+            }
+        ),
+        None => {}
+    }
+
+    Ok(PreparedProjection {
+        canonical_project_root,
+        project_root_identity,
+        relative_path,
+        parent_relative_path,
+        parent_identity,
+        file_name,
+    })
+}
+
+const fn project_path_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
+fn projection_file_identity_from_std(metadata: &std::fs::Metadata) -> ProjectionFileIdentity {
+    ProjectionFileIdentity {
+        #[cfg(unix)]
+        device: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        },
+        #[cfg(not(unix))]
+        unsupported: true,
+    }
 }
 
 fn open_source_under_project_capability(
@@ -763,6 +1989,49 @@ fn validate_source_path(service_name: &str, name: &str, source: &str) -> Result<
     Ok(())
 }
 
+fn validate_project_path(
+    service_name: &str,
+    name: &str,
+    source: &str,
+    project_path: &str,
+) -> Result<()> {
+    let path = Path::new(project_path);
+    anyhow::ensure!(
+        !project_path.trim().is_empty(),
+        "service `{service_name}` generated file `{name}` project_path is empty"
+    );
+    anyhow::ensure!(
+        !path.is_absolute(),
+        "service `{service_name}` generated file `{name}` project_path must be project-relative"
+    );
+    anyhow::ensure!(
+        !path.components().any(|component| matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )),
+        "service `{service_name}` generated file `{name}` project_path may not traverse outside the project"
+    );
+    source_format(project_path).with_context(|| {
+        format!("service `{service_name}` generated file `{name}` has an unsupported project_path")
+    })?;
+    anyhow::ensure!(
+        normalized_relative_path(source) != normalized_relative_path(project_path),
+        "service `{service_name}` generated file `{name}` project_path must differ from its source"
+    );
+    Ok(())
+}
+
+fn normalized_relative_path(path: &str) -> PathBuf {
+    Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value),
+            Component::CurDir => None,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
 fn source_format(source: &str) -> Result<GeneratedFileFormat> {
     match Path::new(source)
         .extension()
@@ -946,6 +2215,30 @@ mod tests {
                     "microfrontends".to_owned(),
                     GeneratedFileConfig {
                         source: source.to_owned(),
+                        project_path: None,
+                        replace: replacements,
+                    },
+                )]),
+                ..CommonServiceConfig::default()
+            },
+            command: Some("true".to_owned()),
+            ..ExecServiceConfig::default()
+        })
+    }
+
+    fn projected_service_config(
+        source: &str,
+        project_path: &str,
+        replacements: BTreeMap<String, Value>,
+    ) -> ServiceConfig {
+        ServiceConfig::Legacy(ExecServiceConfig {
+            common: CommonServiceConfig {
+                listeners: vec!["chat".to_owned()],
+                generated: BTreeMap::from([(
+                    "microfrontends".to_owned(),
+                    GeneratedFileConfig {
+                        source: source.to_owned(),
+                        project_path: Some(project_path.to_owned()),
                         replace: replacements,
                     },
                 )]),
@@ -1053,6 +2346,1173 @@ mod tests {
         );
         assert!(output.ends_with('\n'));
         generated.cleanup().await.expect("clean generation");
+    }
+
+    #[tokio::test]
+    async fn projects_private_generation_with_typed_replacements_and_exact_cleanup() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(
+            root.path().join("chat/source.jsonc"),
+            r#"{"proxy":3000,"chat":3001}"#,
+        )
+        .await
+        .expect("write source");
+        let config = projected_service_config(
+            "chat/source.jsonc",
+            "chat/.microfrontends.locald.json",
+            BTreeMap::from([
+                (
+                    "/proxy".to_owned(),
+                    Value::String("${services.web.port}".to_owned()),
+                ),
+                (
+                    "/chat".to_owned(),
+                    Value::String("${services.web.listeners.chat.port}".to_owned()),
+                ),
+            ]),
+        );
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize projection")
+            .expect("generated set");
+        let canonical = generated.path("microfrontends").expect("canonical path");
+        let projected = root.path().join("chat/.microfrontends.locald.json");
+        assert_ne!(canonical, projected);
+        let canonical_bytes = tokio::fs::read(canonical).await.expect("read canonical");
+        assert_eq!(
+            tokio::fs::read(&projected).await.expect("read projection"),
+            canonical_bytes
+        );
+        let value: Value = serde_json::from_slice(&canonical_bytes).expect("valid JSON");
+        assert_eq!(value["proxy"], 4100);
+        assert_eq!(value["chat"], 4200);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            use std::os::unix::fs::PermissionsExt;
+            let canonical_metadata = tokio::fs::metadata(canonical)
+                .await
+                .expect("canonical metadata");
+            let projected_metadata = tokio::fs::metadata(&projected)
+                .await
+                .expect("projection metadata");
+            assert_ne!(
+                (canonical_metadata.dev(), canonical_metadata.ino()),
+                (projected_metadata.dev(), projected_metadata.ino()),
+                "the package projection cannot mutate the private canonical file in place"
+            );
+            assert_eq!(projected_metadata.permissions().mode() & 0o777, 0o600);
+        }
+        tokio::fs::write(&projected, b"project-side mutation")
+            .await
+            .expect("mutate projection in place");
+        assert_eq!(
+            tokio::fs::read(canonical).await.expect("reread canonical"),
+            canonical_bytes,
+            "project-side mutation cannot alter private canonical authority"
+        );
+        tokio::fs::write(&projected, &canonical_bytes)
+            .await
+            .expect("restore projection fixture");
+        generated.cleanup().await.expect("clean generation");
+        assert!(!projected.exists());
+    }
+
+    async fn projection_intent_fixture(
+        root: &Path,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        String,
+        Vec<ProjectionOwnership>,
+        RenderedGeneration,
+    ) {
+        tokio::fs::create_dir(root.join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/runtime.locald.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let prepared = prepare(root, &key(), &config, None)
+            .await
+            .expect("prepare")
+            .expect("prepared generated set");
+        let data_dir = root.join("data");
+        let service_root = prepare_service_root(&data_dir, &key())
+            .await
+            .expect("prepare service root");
+        let generation = uuid::Uuid::new_v4().to_string();
+        let staging_dir = service_root.join(format!(".staging-{generation}"));
+        create_private_directory(&staging_dir, false)
+            .await
+            .expect("create staging directory");
+        let rendered = render_generation(&key(), &bindings(), &prepared, &staging_dir)
+            .await
+            .expect("render private generation");
+        let quarantine_root = service_root.join(".projection-quarantine");
+        create_private_directory(&quarantine_root, true)
+            .await
+            .expect("create private quarantine");
+        let quarantine_identity = projection_file_identity_from_std(
+            &tokio::fs::symlink_metadata(&quarantine_root)
+                .await
+                .expect("quarantine metadata"),
+        );
+        let projections = plan_projection_files(&staging_dir, &generation, &prepared, &rendered)
+            .expect("plan projections")
+            .into_iter()
+            .map(|planned| planned.with_quarantine(&quarantine_root, &quarantine_identity))
+            .collect::<Vec<_>>();
+        write_projection_manifest(
+            &staging_dir,
+            &ProjectionManifest {
+                version: PROJECTION_MANIFEST_VERSION,
+                generation: generation.clone(),
+                projections: projections.clone(),
+            },
+        )
+        .await
+        .expect("persist ownership intent");
+        sync_directory(&staging_dir).await.expect("sync intent");
+        sync_directory(&service_root)
+            .await
+            .expect("sync staging entry");
+        (data_dir, staging_dir, generation, projections, rendered)
+    }
+
+    #[tokio::test]
+    async fn durable_intent_recovers_every_prepublication_projection_phase() {
+        for phase in 0..4 {
+            let root = tempdir().expect("create crash-phase root");
+            let (data_dir, staging_dir, _generation, projections, rendered) =
+                projection_intent_fixture(root.path()).await;
+            let projection = &projections[0];
+            assert!(staging_dir.join(PROJECTION_MANIFEST_NAME).exists());
+            assert!(
+                !root.path().join(&projection.relative_path).exists(),
+                "ownership intent is durable before direct target publication"
+            );
+
+            if phase == 1 || phase == 2 {
+                let canonical_root = Dir::open_ambient_dir(&staging_dir, ambient_authority())
+                    .expect("open private generation capability");
+                let project_parent = open_exact_project_parent(
+                    &projection.canonical_project_root,
+                    &projection.project_root_identity,
+                    &projection.parent_relative_path,
+                    &projection.parent_identity,
+                )
+                .expect("open exact project parent");
+                canonical_root
+                    .hard_link(
+                        &rendered.relative_paths["microfrontends"],
+                        &project_parent,
+                        &projection.file_name,
+                    )
+                    .expect("atomically publish known canonical inode");
+                if phase == 2 {
+                    project_parent
+                        .open(".")
+                        .expect("open project package directory")
+                        .sync_all()
+                        .expect("sync project package directory");
+                }
+            } else if phase == 3 {
+                publish_projection_direct(
+                    &staging_dir,
+                    &rendered.relative_paths["microfrontends"],
+                    projection,
+                    &rendered.projected_contents["microfrontends"],
+                )
+                .expect("complete direct publication");
+            }
+
+            cleanup_all_instances(&data_dir)
+                .await
+                .unwrap_or_else(|error| panic!("recover phase {phase}: {error:#}"));
+            assert!(!staging_dir.exists(), "phase {phase} staging state removed");
+            assert!(!root.path().join(&projections[0].relative_path).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn planning_failure_leaves_no_quarantine_directory() {
+        let root = tempdir().expect("create planning-failure root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let prepared = prepare(root.path(), &key(), &config, None)
+            .await
+            .expect("prepare")
+            .expect("prepared set");
+        let data_dir = root.path().join("data");
+        let service_root = prepare_service_root(&data_dir, &key())
+            .await
+            .expect("prepare service root");
+        let error = publish_prepared_with_projection_validator(
+            &service_root,
+            &key(),
+            &bindings(),
+            &prepared,
+            |_, _| anyhow::bail!("injected cross-filesystem planning failure"),
+        )
+        .await
+        .expect_err("injected planning failure");
+        assert!(format!("{error:#}").contains("injected cross-filesystem"));
+        let entries = std::fs::read_dir(&service_root)
+            .expect("read service root")
+            .map(|entry| entry.expect("read entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.to_string_lossy().contains("projection-quarantine")),
+            "planning rejection precedes private quarantine creation: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_publication_never_overwrites_a_boundary_replacement() {
+        let root = tempdir().expect("create direct-publication race root");
+        let (data_dir, staging_dir, _generation, projections, rendered) =
+            projection_intent_fixture(root.path()).await;
+        let projection = &projections[0];
+        let error = publish_projection_direct_with_hook(
+            &staging_dir,
+            &rendered.relative_paths["microfrontends"],
+            projection,
+            &rendered.projected_contents["microfrontends"],
+            |parent| {
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                use std::io::Write as _;
+                let mut foreign = parent.open_with(&projection.file_name, &options)?;
+                foreign.write_all(b"foreign before direct link")?;
+                Ok(())
+            },
+        )
+        .expect_err("foreign final entry wins no-clobber race");
+        assert!(format!("{error:#}").contains("refusing to overwrite"));
+        let target = root.path().join(&projection.relative_path);
+        assert_eq!(
+            tokio::fs::read(&target).await.expect("read foreign target"),
+            b"foreign before direct link"
+        );
+        let project_entries = std::fs::read_dir(target.parent().expect("target parent"))
+            .expect("read project package")
+            .map(|entry| entry.expect("read project entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            project_entries
+                .iter()
+                .all(|entry| !entry.to_string_lossy().contains("locald-")
+                    || entry == target.file_name().unwrap()),
+            "direct publication creates no project temporary entry: {project_entries:?}"
+        );
+        tokio::fs::remove_file(&target)
+            .await
+            .expect("remove injected foreign fixture");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover intent after fixture removal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_detachment_ancestor_swap_rolls_back_the_pinned_projection() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("create direct-publication ancestor race root");
+        let (data_dir, staging_dir, _generation, projections, rendered) =
+            projection_intent_fixture(root.path()).await;
+        let projection = &projections[0];
+        let saved_chat = root.path().join("saved-chat");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("create outside directory");
+        tokio::fs::write(outside.join(&projection.file_name), b"outside foreign")
+            .await
+            .expect("write outside foreign");
+
+        let error = publish_projection_direct_with_hooks(
+            &staging_dir,
+            &rendered.relative_paths["microfrontends"],
+            projection,
+            &rendered.projected_contents["microfrontends"],
+            |_| Ok(()),
+            |_| {
+                std::fs::rename(root.path().join("chat"), &saved_chat)?;
+                symlink(&outside, root.path().join("chat"))?;
+                Ok(())
+            },
+        )
+        .expect_err("detached pinned parent rejects publication");
+        assert!(
+            format!("{error:#}").contains("final publication boundary"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            tokio::fs::read(outside.join(&projection.file_name))
+                .await
+                .expect("outside survives"),
+            b"outside foreign"
+        );
+        assert!(
+            !saved_chat.join(&projection.file_name).exists(),
+            "the entry published through the detached capability is rolled back"
+        );
+
+        tokio::fs::remove_file(root.path().join("chat"))
+            .await
+            .expect("remove ancestor symlink");
+        tokio::fs::rename(&saved_chat, root.path().join("chat"))
+            .await
+            .expect("restore admitted ancestor");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover retained private authority");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_detachment_same_inode_rewrite_is_retained_for_recovery() {
+        let root = tempdir().expect("create direct-publication rewrite race root");
+        let (data_dir, staging_dir, _generation, projections, rendered) =
+            projection_intent_fixture(root.path()).await;
+        let projection = &projections[0];
+        let target = root.path().join(&projection.relative_path);
+        let owned_contents = rendered.projected_contents["microfrontends"].clone();
+        let modified_contents = b"same inode, modified at publication boundary";
+
+        let error = publish_projection_direct_with_hooks(
+            &staging_dir,
+            &rendered.relative_paths["microfrontends"],
+            projection,
+            &owned_contents,
+            |_| Ok(()),
+            |_| {
+                std::fs::write(&target, modified_contents)?;
+                Ok(())
+            },
+        )
+        .expect_err("same-inode rewrite rejects final publication");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("content changed at the final publication boundary"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("rollback retained durable ownership state"),
+            "modified content cannot be deleted as owned: {message}"
+        );
+        let target_parent = Dir::open_ambient_dir(
+            target.parent().expect("projection has a parent"),
+            ambient_authority(),
+        )
+        .expect("open retained projection parent");
+        let metadata = target_parent
+            .symlink_metadata(target.file_name().expect("projection has a file name"))
+            .expect("stat retained modified target");
+        assert_eq!(
+            projection_file_identity(&metadata),
+            projection.identity,
+            "the mutation preserved the originally selected inode"
+        );
+        assert_eq!(
+            tokio::fs::read(&target)
+                .await
+                .expect("read retained modified projection"),
+            modified_contents,
+            "cleanup restores modified content instead of deleting it"
+        );
+        assert!(
+            cleanup_all_instances(&data_dir).await.is_err(),
+            "recovery retains the modified projection and its ownership manifest"
+        );
+
+        tokio::fs::write(&target, &owned_contents)
+            .await
+            .expect("restore exact owned content");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover retained authority after exact content restoration");
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn direct_publication_rejects_a_replaced_private_seed_at_selection() {
+        let root = tempdir().expect("create private-seed race root");
+        let (data_dir, staging_dir, _generation, projections, rendered) =
+            projection_intent_fixture(root.path()).await;
+        let projection = &projections[0];
+        let canonical_relative = &rendered.relative_paths["microfrontends"];
+        let saved = staging_dir.join("saved-private-seed");
+        let error = publish_projection_direct_with_hook(
+            &staging_dir,
+            canonical_relative,
+            projection,
+            &rendered.projected_contents["microfrontends"],
+            |_| {
+                std::fs::rename(staging_dir.join(canonical_relative), &saved)?;
+                std::fs::write(
+                    staging_dir.join(canonical_relative),
+                    b"foreign private seed",
+                )?;
+                Ok(())
+            },
+        )
+        .expect_err("replaced private seed is rejected at link selection");
+        assert!(format!("{error:#}").contains("identity changed at projection selection"));
+        assert!(
+            !root.path().join(&projection.relative_path).exists(),
+            "replaced seed is never projected"
+        );
+        std::fs::remove_file(staging_dir.join(canonical_relative))
+            .expect("remove replacement fixture");
+        std::fs::rename(saved, staging_dir.join(canonical_relative))
+            .expect("restore owned private seed");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover private-seed race fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_ancestor_swap_fails_publication_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("create nested publication root");
+        let project = root.path().join("project");
+        tokio::fs::create_dir_all(project.join("chat/nested"))
+            .await
+            .expect("create nested parent");
+        tokio::fs::write(project.join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/nested/runtime.locald.json",
+            BTreeMap::new(),
+        );
+        let prepared = prepare(&project, &key(), &config, None)
+            .await
+            .expect("prepare nested projection")
+            .expect("prepared set");
+        let saved_chat = root.path().join("saved-chat");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(outside.join("nested"))
+            .await
+            .expect("create outside tree");
+        tokio::fs::write(
+            outside.join("nested/runtime.locald.json"),
+            b"outside foreign",
+        )
+        .await
+        .expect("write outside foreign");
+        tokio::fs::rename(project.join("chat"), &saved_chat)
+            .await
+            .expect("move admitted ancestor");
+        symlink(&outside, project.join("chat")).expect("replace ancestor with outside symlink");
+        let data_dir = root.path().join("data");
+        let error = materialize_prepared(&data_dir, &key(), &bindings(), &prepared)
+            .await
+            .expect_err("swapped ancestor rejects direct publication");
+        assert!(format!("{error:#}").contains("without following symlinks"));
+        assert_eq!(
+            tokio::fs::read(outside.join("nested/runtime.locald.json"))
+                .await
+                .expect("outside survives"),
+            b"outside foreign"
+        );
+        assert!(!saved_chat.join("nested/runtime.locald.json").exists());
+        tokio::fs::remove_file(project.join("chat"))
+            .await
+            .expect("remove symlink fixture");
+        tokio::fs::rename(&saved_chat, project.join("chat"))
+            .await
+            .expect("restore admitted ancestor");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover retained private authority");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restoration_uses_the_pinned_parent_after_an_ancestor_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("create restore-swap root");
+        tokio::fs::create_dir_all(root.path().join("chat/nested"))
+            .await
+            .expect("create nested parent");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/nested/runtime.locald.json",
+            BTreeMap::new(),
+        );
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let projection = generated.projections[0].clone();
+        let target = root.path().join(&projection.relative_path);
+        let original = tokio::fs::read(&target).await.expect("read original");
+        tokio::fs::write(&target, b"modified owned inode")
+            .await
+            .expect("modify target");
+        let saved_chat = root.path().join("saved-chat");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(outside.join("nested"))
+            .await
+            .expect("create outside tree");
+        tokio::fs::write(
+            outside.join("nested/runtime.locald.json"),
+            b"outside foreign",
+        )
+        .await
+        .expect("write outside foreign");
+        let error = cleanup_owned_projection_path_with_hook(&projection, |_| {
+            std::fs::rename(root.path().join("chat"), &saved_chat)?;
+            symlink(&outside, root.path().join("chat"))?;
+            Ok(())
+        })
+        .expect_err("modified target is restored through pinned parent");
+        assert!(format!("{error:#}").contains("content changed"));
+        assert_eq!(
+            tokio::fs::read(outside.join("nested/runtime.locald.json"))
+                .await
+                .expect("outside survives"),
+            b"outside foreign"
+        );
+        assert_eq!(
+            tokio::fs::read(saved_chat.join("nested/runtime.locald.json"))
+                .await
+                .expect("restored into pinned original parent"),
+            b"modified owned inode"
+        );
+        tokio::fs::remove_file(root.path().join("chat"))
+            .await
+            .expect("remove symlink fixture");
+        tokio::fs::rename(&saved_chat, root.path().join("chat"))
+            .await
+            .expect("restore ancestor");
+        tokio::fs::write(&target, original)
+            .await
+            .expect("restore target contents");
+        generated.cleanup().await.expect("finish cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_requires_private_and_project_paths_on_the_same_filesystem() {
+        let canonical = ProjectionFileIdentity {
+            device: 1,
+            inode: 10,
+        };
+        let same_project = ProjectionFileIdentity {
+            device: 1,
+            inode: 20,
+        };
+        let other_project = ProjectionFileIdentity {
+            device: 2,
+            inode: 20,
+        };
+        ensure_projection_same_filesystem(&canonical, &same_project)
+            .expect("same-filesystem projection supported");
+        let error = ensure_projection_same_filesystem(&canonical, &other_project)
+            .expect_err("cross-filesystem projection rejected");
+        assert!(error.to_string().contains("same filesystem"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_quarantine_preserves_a_foreign_replacement_at_the_original_path() {
+        let root = tempdir().expect("create replacement-race root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let projection = generated.projections[0].clone();
+        cleanup_owned_projection_path_with_hook(&projection, |capability_root| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut foreign = capability_root.open_with(&projection.file_name, &options)?;
+            use std::io::Write as _;
+            foreign.write_all(b"foreign replacement")?;
+            Ok(())
+        })
+        .expect("delete only quarantined owned inode");
+        assert_eq!(
+            tokio::fs::read(root.path().join(&projection.relative_path))
+                .await
+                .expect("foreign replacement survives"),
+            b"foreign replacement"
+        );
+        assert!(
+            !projection
+                .quarantine_root
+                .join(&projection.target_quarantine_path)
+                .exists()
+        );
+        cleanup_generation_dir(&generated.generation_dir)
+            .await
+            .expect("remove private generation fixture");
+    }
+
+    #[tokio::test]
+    async fn cleanup_visits_later_projections_after_an_ownership_mismatch() {
+        let root = tempdir().expect("create aggregate cleanup root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("one.json"), r#"{"port":1}"#)
+            .await
+            .expect("write first source");
+        tokio::fs::write(root.path().join("two.json"), r#"{"port":2}"#)
+            .await
+            .expect("write second source");
+        let config: ServiceConfig = toml::from_str(
+            r#"
+command = "true"
+[generated.one]
+source = "one.json"
+project_path = "chat/one.locald.json"
+[generated.two]
+source = "two.json"
+project_path = "chat/two.locald.json"
+"#,
+        )
+        .expect("parse two-projection service");
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let first = root.path().join("chat/one.locald.json");
+        let second = root.path().join("chat/two.locald.json");
+        let first_original = tokio::fs::read(&first).await.expect("read first");
+        tokio::fs::write(&first, b"modified")
+            .await
+            .expect("modify first");
+        let error = generated.cleanup().await.expect_err("aggregate mismatch");
+        assert!(format!("{error:#}").contains("1 error(s)"));
+        assert_eq!(
+            tokio::fs::read(&first).await.expect("retained first"),
+            b"modified"
+        );
+        assert!(!second.exists(), "later still-owned sibling is removed");
+        tokio::fs::write(&first, first_original)
+            .await
+            .expect("restore first");
+        generated.cleanup().await.expect("finish fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn same_basename_projections_have_independent_quarantine_identity() {
+        let root = tempdir().expect("create same-basename cleanup root");
+        tokio::fs::create_dir_all(root.path().join("one"))
+            .await
+            .expect("create first parent");
+        tokio::fs::create_dir_all(root.path().join("two"))
+            .await
+            .expect("create second parent");
+        tokio::fs::write(root.path().join("one.json"), r#"{"port":1}"#)
+            .await
+            .expect("write first source");
+        tokio::fs::write(root.path().join("two.json"), r#"{"port":2}"#)
+            .await
+            .expect("write second source");
+        let config: ServiceConfig = toml::from_str(
+            r#"
+command = "true"
+[generated.one]
+source = "one.json"
+project_path = "one/runtime.locald.json"
+[generated.two]
+source = "two.json"
+project_path = "two/runtime.locald.json"
+"#,
+        )
+        .expect("parse same-basename service");
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        assert_ne!(
+            generated.projections[0].projection_id,
+            generated.projections[1].projection_id
+        );
+        assert_ne!(
+            generated.projections[0].target_quarantine_path,
+            generated.projections[1].target_quarantine_path
+        );
+        let first = root.path().join("one/runtime.locald.json");
+        let second = root.path().join("two/runtime.locald.json");
+        let first_original = tokio::fs::read(&first).await.expect("read first");
+        tokio::fs::write(&first, b"modified")
+            .await
+            .expect("modify first");
+        generated
+            .cleanup()
+            .await
+            .expect_err("first mismatch retained");
+        assert_eq!(
+            tokio::fs::read(&first).await.expect("retained first"),
+            b"modified"
+        );
+        assert!(
+            !second.exists(),
+            "same-basename sibling cleaned independently"
+        );
+        tokio::fs::write(&first, first_original)
+            .await
+            .expect("restore first");
+        generated.cleanup().await.expect("retry first cleanup");
+        assert!(!first.exists());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn project_path_is_rejected_on_platforms_without_identity_safe_cleanup() {
+        let mut config = LocaldConfig::default();
+        config.services.insert(
+            "web".to_owned(),
+            projected_service_config("source.json", "chat/runtime.json", BTreeMap::new()),
+        );
+        let error = validate_declarations(&config).expect_err("reject unsupported projection");
+        assert!(
+            error
+                .to_string()
+                .contains("supported only on macOS and Linux")
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_publication_collision_rolls_back_prior_targets() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("one.json"), r#"{"port":1}"#)
+            .await
+            .expect("write first source");
+        tokio::fs::write(root.path().join("two.json"), r#"{"port":2}"#)
+            .await
+            .expect("write second source");
+        let config: ServiceConfig = toml::from_str(
+            r#"
+command = "true"
+
+[generated.one]
+source = "one.json"
+project_path = "chat/one.locald.json"
+
+[generated.one.replace]
+"/port" = "${services.web.port}"
+
+[generated.two]
+source = "two.json"
+project_path = "chat/two.locald.json"
+
+[generated.two.replace]
+"/port" = "${services.web.port}"
+"#,
+        )
+        .expect("parse projected service");
+        let prepared = prepare(root.path(), &key(), &config, None)
+            .await
+            .expect("prepare")
+            .expect("prepared set");
+        let foreign = root.path().join("chat/two.locald.json");
+        tokio::fs::write(&foreign, b"foreign")
+            .await
+            .expect("race in foreign target");
+        let error = materialize_prepared(&root.path().join("data"), &key(), &bindings(), &prepared)
+            .await
+            .expect_err("foreign target rejects admission");
+        assert!(
+            format!("{error:#}").contains("refusing to overwrite"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!root.path().join("chat/one.locald.json").exists());
+        assert_eq!(
+            tokio::fs::read(&foreign).await.expect("read foreign"),
+            b"foreign"
+        );
+        let leftovers = std::fs::read_dir(root.path().join("chat"))
+            .expect("read projection directory")
+            .map(|entry| entry.expect("read projection entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(leftovers.len(), 1);
+        assert_eq!(
+            leftovers[0],
+            foreign.file_name().expect("foreign file name")
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_retains_modified_projection_and_manifest_for_recovery() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/runtime.locald.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let projection = root.path().join("chat/runtime.locald.json");
+        tokio::fs::write(&projection, b"modified")
+            .await
+            .expect("modify owned target");
+        let error = generated
+            .cleanup()
+            .await
+            .expect_err("retain modified target");
+        assert!(
+            error
+                .to_string()
+                .contains("retaining generated-file projection")
+        );
+        assert_eq!(
+            tokio::fs::read(&projection).await.expect("read retained"),
+            b"modified"
+        );
+        assert!(generated.generation_dir.exists());
+        let recovery_error = cleanup_all_instances(&data_dir)
+            .await
+            .expect_err("recovery also retains modified target");
+        assert!(
+            format!("{recovery_error:#}").contains("retaining generated-file projection"),
+            "unexpected recovery error: {recovery_error:#}"
+        );
+        assert!(projection.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_manifest_removes_an_owned_projection_after_restart() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/runtime.locald.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let generation_dir = generated.generation_dir.clone();
+        let projection = root.path().join("chat/runtime.locald.json");
+        drop(generated);
+
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover owned projection");
+        assert!(!projection.exists());
+        assert!(!generation_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn active_owned_projection_is_allowed_but_foreign_content_is_not() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/runtime.locald.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        prepare(root.path(), &key(), &config, Some(&generated))
+            .await
+            .expect("current owned target passes preflight");
+        let projection = root.path().join("chat/runtime.locald.json");
+        let owned = tokio::fs::read(&projection)
+            .await
+            .expect("read owned bytes");
+        tokio::fs::write(&projection, b"foreign")
+            .await
+            .expect("modify projection");
+        assert!(
+            prepare(root.path(), &key(), &config, Some(&generated))
+                .await
+                .is_err(),
+            "modified content must not inherit locald ownership"
+        );
+        tokio::fs::write(&projection, owned)
+            .await
+            .expect("restore owned bytes");
+        generated.cleanup().await.expect("cleanup owned projection");
+    }
+
+    #[tokio::test]
+    async fn projections_are_isolated_by_project_root_and_instance_generation() {
+        let root = tempdir().expect("create isolation root");
+        let first_root = root.path().join("first");
+        let second_root = root.path().join("second");
+        for project_root in [&first_root, &second_root] {
+            tokio::fs::create_dir_all(project_root.join("chat"))
+                .await
+                .expect("create package root");
+            tokio::fs::write(project_root.join("source.json"), r#"{"port":1}"#)
+                .await
+                .expect("write source");
+        }
+        let config = projected_service_config(
+            "source.json",
+            "chat/runtime.locald.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let first = materialize(
+            &root.path().join("data"),
+            &first_root,
+            &key_for("00000000-0000-4000-8000-000000000001"),
+            &config,
+            &ServiceRuntimeBindings::new(Some(4101), BTreeMap::new()),
+        )
+        .await
+        .expect("materialize first")
+        .expect("first generated set");
+        let second = materialize(
+            &root.path().join("data"),
+            &second_root,
+            &key_for("00000000-0000-4000-8000-000000000002"),
+            &config,
+            &ServiceRuntimeBindings::new(Some(4102), BTreeMap::new()),
+        )
+        .await
+        .expect("materialize second")
+        .expect("second generated set");
+        let first_projection = first_root.join("chat/runtime.locald.json");
+        let second_projection = second_root.join("chat/runtime.locald.json");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&tokio::fs::read(&first_projection).await.unwrap())
+                .unwrap()["port"],
+            4101
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&tokio::fs::read(&second_projection).await.unwrap())
+                .unwrap()["port"],
+            4102
+        );
+        first.cleanup().await.expect("cleanup first");
+        assert!(!first_projection.exists());
+        assert!(second_projection.exists());
+        second.cleanup().await.expect("cleanup second");
+    }
+
+    #[tokio::test]
+    async fn project_path_declarations_reject_unsafe_and_duplicate_targets() {
+        for invalid in [
+            "",
+            "/absolute.json",
+            "../outside.json",
+            "source.json",
+            "runtime.toml",
+        ] {
+            let mut config = LocaldConfig::default();
+            config.services.insert(
+                "web".to_owned(),
+                projected_service_config("source.json", invalid, BTreeMap::new()),
+            );
+            assert!(
+                validate_declarations(&config).is_err(),
+                "unsafe project_path unexpectedly admitted: {invalid}"
+            );
+        }
+
+        let mut duplicate = LocaldConfig::default();
+        duplicate.services.insert(
+            "web".to_owned(),
+            projected_service_config("source.json", "Chat/runtime.locald.json", BTreeMap::new()),
+        );
+        duplicate.services.insert(
+            "worker".to_owned(),
+            projected_service_config("other.json", "chat/runtime.locald.json", BTreeMap::new()),
+        );
+        let error = validate_declarations(&duplicate).expect_err("case-folded collision");
+        assert!(error.to_string().contains("case-insensitive filesystem"));
+    }
+
+    #[tokio::test]
+    async fn project_path_preparation_rejects_missing_symlinked_and_foreign_targets() {
+        let root = tempdir().expect("create project root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "missing/runtime.locald.json",
+            BTreeMap::new(),
+        );
+        assert!(prepare(root.path(), &key(), &config, None).await.is_err());
+
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        let foreign = root.path().join("chat/runtime.locald.json");
+        tokio::fs::write(&foreign, b"foreign")
+            .await
+            .expect("write foreign target");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        assert!(prepare(root.path(), &key(), &config, None).await.is_err());
+        tokio::fs::remove_file(&foreign)
+            .await
+            .expect("remove foreign target");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path(), root.path().join("linked"))
+                .expect("create ancestor symlink");
+            let linked = projected_service_config(
+                "source.json",
+                "linked/runtime.locald.json",
+                BTreeMap::new(),
+            );
+            assert!(prepare(root.path(), &key(), &linked, None).await.is_err());
+
+            std::os::unix::fs::symlink(root.path().join("source.json"), &foreign)
+                .expect("create final symlink");
+            assert!(prepare(root.path(), &key(), &config, None).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_publication_rejects_a_replaced_project_root() {
+        let root = tempdir().expect("create project parent");
+        let project_root = root.path().join("project");
+        tokio::fs::create_dir_all(project_root.join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(project_root.join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config = projected_service_config(
+            "source.json",
+            "chat/runtime.locald.json",
+            BTreeMap::from([(
+                "/port".to_owned(),
+                Value::String("${services.web.port}".to_owned()),
+            )]),
+        );
+        let prepared = prepare(&project_root, &key(), &config, None)
+            .await
+            .expect("prepare projection")
+            .expect("prepared set");
+        let moved_root = root.path().join("moved-project");
+        tokio::fs::rename(&project_root, &moved_root)
+            .await
+            .expect("move prepared project root");
+        tokio::fs::create_dir_all(project_root.join("chat"))
+            .await
+            .expect("replace project path");
+
+        let error = materialize_prepared(&root.path().join("data"), &key(), &bindings(), &prepared)
+            .await
+            .expect_err("replaced root rejects projection publication");
+        assert!(
+            format!("{error:#}").contains("project root identity changed"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            std::fs::read_dir(project_root.join("chat"))
+                .expect("read replacement package")
+                .next()
+                .is_none()
+        );
+        assert!(!moved_root.join("chat/runtime.locald.json").exists());
     }
 
     #[tokio::test]
@@ -1290,7 +3750,7 @@ source = "runtime.json"
         };
         validate_declarations(&array_locald)
             .expect("array append cannot be rejected before the source is known");
-        let error = prepare(root.path(), &key(), &array_config)
+        let error = prepare(root.path(), &key(), &array_config, None)
             .await
             .expect_err("generated replacements never append to arrays");
         assert!(format!("{error:#}").contains("does not identify an existing value"));
@@ -1398,7 +3858,7 @@ source = "runtime.json"
         );
         let data_dir = root.path().join("data");
 
-        let error = prepare(root.path(), &key(), &config)
+        let error = prepare(root.path(), &key(), &config, None)
             .await
             .expect_err("preparation must validate replacement targets");
         assert!(format!("{error:#}").contains("does not identify an existing value"));
@@ -1475,7 +3935,7 @@ source = "runtime.json"
                 Value::String("${services.web.port}".to_owned()),
             )]),
         );
-        let prepared = prepare(root.path(), &key(), &config)
+        let prepared = prepare(root.path(), &key(), &config, None)
             .await
             .expect("prepare valid source")
             .expect("prepared generated files");
@@ -1495,7 +3955,7 @@ source = "runtime.json"
         let value: Value = serde_json::from_str(&output).expect("valid generated JSON");
 
         assert_eq!(value.pointer("/port"), Some(&Value::from(4100)));
-        assert!(generated.matches_prepared(&prepared));
+        assert!(generated.matches_prepared(&prepared).await);
         assert!(
             !generated.sources_match(root.path(), &config).await,
             "the invalid live source must queue a later retry without changing this generation"
@@ -1796,7 +4256,7 @@ source = "runtime.json"
         });
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            prepare(root.path(), &key(), &config),
+            prepare(root.path(), &key(), &config, None),
         )
         .await;
         if result.is_ok() {

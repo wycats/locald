@@ -251,6 +251,13 @@ $ locald ai schema
       "description": "One JSON or JSONC file generated for a host exec or worker service.",
       "type": "object",
       "properties": {
+        "project_path": {
+          "description": "Optional project-relative JSON or JSONC path where the rendered file is/nprojected for tools that require a package-local configuration file./n/nThe private generated file remains the canonical interpolation result./nlocald owns the projection for the lifetime of the service instance and/nnever adopts or overwrites a pre-existing project file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "replace": {
           "description": "Existing JSON Pointer targets and their replacement values.",
           "type": "object",
