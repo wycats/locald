@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::ffi::CString;
+use std::ffi::OsString;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
@@ -141,6 +142,17 @@ pub(crate) struct GeneratedFileSet {
     paths: BTreeMap<String, PathBuf>,
     source_fingerprints: BTreeMap<String, SourceFingerprint>,
     projections: Vec<ProjectionOwnership>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartupGeneratedFileCleanup {
+    pub(crate) service_resource_ids: BTreeSet<OsString>,
+    pub(crate) generated_files: GeneratedFileSet,
+}
+
+struct LoadedProjectionManifest {
+    service_resource_id: OsString,
+    manifest: ProjectionManifest,
 }
 
 #[derive(Debug)]
@@ -1995,7 +2007,9 @@ pub(crate) async fn cleanup_instance(
 }
 
 /// Remove ephemeral generated runtime files for every recorded instance root.
-pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<Vec<GeneratedFileSet>> {
+pub(crate) async fn cleanup_all_instances(
+    data_dir: &Path,
+) -> Result<Vec<StartupGeneratedFileCleanup>> {
     let instances_root = data_dir.join("instances");
     let mut entries = match tokio::fs::read_dir(&instances_root).await {
         Ok(entries) => entries,
@@ -2045,7 +2059,7 @@ pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<Vec<Generat
     Ok(retained)
 }
 
-async fn remove_generated_root(root: &Path) -> Result<Vec<GeneratedFileSet>> {
+async fn remove_generated_root(root: &Path) -> Result<Vec<StartupGeneratedFileCleanup>> {
     let metadata = match tokio::fs::symlink_metadata(root).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2057,12 +2071,19 @@ async fn remove_generated_root(root: &Path) -> Result<Vec<GeneratedFileSet>> {
     } else {
         let mut errors = Vec::new();
         let mut retained_projections = Vec::new();
-        for manifest in load_projection_manifests(root).await? {
-            match cleanup_projections_for_startup(&manifest.projections).await {
+        let mut retained_service_resource_ids = BTreeSet::new();
+        for loaded in load_projection_manifests(root).await? {
+            match cleanup_projections_for_startup(&loaded.manifest.projections).await {
                 Ok(true) => {}
-                Ok(false) => retained_projections.extend(manifest.projections),
+                Ok(false) => {
+                    retained_service_resource_ids.insert(loaded.service_resource_id);
+                    retained_projections.extend(loaded.manifest.projections);
+                }
                 Err(error) => {
-                    errors.push(format!("generation {}: {error:#}", manifest.generation));
+                    errors.push(format!(
+                        "generation {}: {error:#}",
+                        loaded.manifest.generation
+                    ));
                 }
             }
         }
@@ -2073,18 +2094,21 @@ async fn remove_generated_root(root: &Path) -> Result<Vec<GeneratedFileSet>> {
             tokio::fs::remove_dir_all(root).await?;
             Ok(Vec::new())
         } else {
-            Ok(vec![GeneratedFileSet {
-                generation_dir: root.to_path_buf(),
-                paths: BTreeMap::new(),
-                source_fingerprints: BTreeMap::new(),
-                projections: retained_projections,
+            Ok(vec![StartupGeneratedFileCleanup {
+                service_resource_ids: retained_service_resource_ids,
+                generated_files: GeneratedFileSet {
+                    generation_dir: root.to_path_buf(),
+                    paths: BTreeMap::new(),
+                    source_fingerprints: BTreeMap::new(),
+                    projections: retained_projections,
+                },
             }])
         }
     }
 }
 
 #[allow(clippy::disallowed_methods)] // This entire directory walk runs inside spawn_blocking.
-async fn load_projection_manifests(root: &Path) -> Result<Vec<ProjectionManifest>> {
+async fn load_projection_manifests(root: &Path) -> Result<Vec<LoadedProjectionManifest>> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut manifests = Vec::new();
@@ -2127,7 +2151,10 @@ async fn load_projection_manifests(root: &Path) -> Result<Vec<ProjectionManifest
                     "generated-file projection ownership manifest generation does not match `{}`",
                     generation.path().display()
                 );
-                manifests.push(manifest);
+                manifests.push(LoadedProjectionManifest {
+                    service_resource_id: service.file_name(),
+                    manifest,
+                });
             }
         }
         Ok::<_, anyhow::Error>(manifests)
@@ -4359,7 +4386,12 @@ project_path = "chat/two.locald.json"
         tokio::fs::write(&projection, original)
             .await
             .expect("restore owned projection");
+        assert_eq!(
+            retained[0].service_resource_ids,
+            BTreeSet::from([OsString::from(key().resource_id())])
+        );
         retained[0]
+            .generated_files
             .cleanup()
             .await
             .expect("startup-retained ownership remains live-retryable");
@@ -4419,12 +4451,14 @@ project_path = "chat/two.locald.json"
             1,
             "one retry owns the shared generated root"
         );
-        assert_eq!(retained[0].projections.len(), 2);
+        assert_eq!(retained[0].generated_files.projections.len(), 2);
+        assert_eq!(retained[0].service_resource_ids.len(), 1);
 
         tokio::fs::write(&first_path, first_original)
             .await
             .expect("restore first");
         retained[0]
+            .generated_files
             .cleanup()
             .await
             .expect_err("the second retained projection keeps the shared root live");
@@ -4437,6 +4471,7 @@ project_path = "chat/two.locald.json"
             .await
             .expect("restore second");
         retained[0]
+            .generated_files
             .cleanup()
             .await
             .expect("the aggregate retry removes the shared root after all ownership matches");

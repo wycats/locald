@@ -491,7 +491,7 @@ struct ConfigTransitionPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeferredGeneratedFileCleanup {
-    key: Option<ServiceKey>,
+    keys: HashSet<ServiceKey>,
     generated_files: GeneratedFileSet,
 }
 
@@ -1446,6 +1446,22 @@ impl ProcessManager {
                 key.name()
             );
         }
+        Ok(())
+    }
+
+    async fn validate_service_projections_before_controller(
+        &self,
+        key: &ServiceKey,
+        generated_files: Option<&GeneratedFileSet>,
+    ) -> Result<()> {
+        let Some(generated_files) = generated_files else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            generated_files.projections_match().await,
+            "generated-file projection changed immediately before controller creation for service `{}`",
+            key.name()
+        );
         Ok(())
     }
 
@@ -4116,14 +4132,24 @@ impl ProcessManager {
             crate::generated_files::cleanup_all_instances(&self.availability_data_dir).await?;
         if !retained_generated_files.is_empty() {
             let mut deferred = self.deferred_generated_file_cleanups.lock().await;
-            for generated_files in retained_generated_files {
+            for retained in retained_generated_files {
+                let keys = state
+                    .services
+                    .iter()
+                    .filter_map(|service| service.service_key.clone())
+                    .filter(|key| {
+                        retained
+                            .service_resource_ids
+                            .contains(std::ffi::OsStr::new(&key.resource_id()))
+                    })
+                    .collect();
                 if !deferred
                     .iter()
-                    .any(|pending| pending.generated_files == generated_files)
+                    .any(|pending| pending.generated_files == retained.generated_files)
                 {
                     deferred.push(DeferredGeneratedFileCleanup {
-                        key: None,
-                        generated_files,
+                        keys,
+                        generated_files: retained.generated_files,
                     });
                 }
             }
@@ -7108,6 +7134,24 @@ impl ProcessManager {
             let mut handled = false;
             for factory in &self.factories {
                 if factory.can_handle(service_config) {
+                    if let Err(error) = self
+                        .validate_service_projections_before_controller(
+                            &key,
+                            generated_files.as_ref(),
+                        )
+                        .await
+                    {
+                        if let Some(generated_files) = &generated_files
+                            && let Err(cleanup_error) = self
+                                .cleanup_generated_files_or_defer(&key, generated_files)
+                                .await
+                        {
+                            return Err(error.context(format!(
+                                "generated-file cleanup was deferred after final controller-boundary validation failed: {cleanup_error:#}"
+                            )));
+                        }
+                        return Err(error);
+                    }
                     info!("Using factory for service {}", name);
                     let ctx = ServiceContext {
                         key: key.clone(),
@@ -7529,7 +7573,7 @@ impl ProcessManager {
             .lock()
             .await
             .iter()
-            .any(|pending| pending.key.as_ref() == Some(key));
+            .any(|pending| pending.keys.contains(key));
         let mut services = self.services.lock().await;
         let Some(service) = services.get_mut(key) else {
             return false;
@@ -7587,7 +7631,7 @@ impl ProcessManager {
             .any(|pending| pending.generated_files == *generated_files)
         {
             deferred.push(DeferredGeneratedFileCleanup {
-                key: Some(key.clone()),
+                keys: HashSet::from([key.clone()]),
                 generated_files: generated_files.clone(),
             });
         }
@@ -7601,21 +7645,27 @@ impl ProcessManager {
         let mut failures = Vec::new();
         let mut affected_keys = HashSet::new();
         for cleanup in pending {
-            affected_keys.extend(cleanup.key.iter().cloned());
+            affected_keys.extend(cleanup.keys.iter().cloned());
             match cleanup.generated_files.cleanup().await {
                 Ok(()) => {
                     self.clear_generated_file_owner(&cleanup.generated_files)
                         .await;
                 }
                 Err(error) => {
-                    if let Some(key) = &cleanup.key {
-                        warn!(
-                            "Failed to retry deferred generated-file cleanup for service {}: {error:#}",
-                            key.name()
-                        );
-                    } else {
+                    if cleanup.keys.is_empty() {
                         warn!(
                             "Failed to retry generated-file cleanup retained during startup: {error:#}"
+                        );
+                    } else {
+                        let mut service_names = cleanup
+                            .keys
+                            .iter()
+                            .map(|key| key.name().to_string())
+                            .collect::<Vec<_>>();
+                        service_names.sort();
+                        warn!(
+                            "Failed to retry deferred generated-file cleanup for services {}: {error:#}",
+                            service_names.join(", ")
                         );
                     }
                     failures.push(cleanup);
@@ -35432,6 +35482,69 @@ project_path = "config/second.locald.json"
     }
 
     #[tokio::test]
+    async fn controller_boundary_revalidation_rejects_a_late_projection_change() {
+        let dir = tempdir().expect("create controller-boundary directory");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir_all(project_path.join("config")).expect("create config directory");
+        std::fs::write(project_path.join("source.json"), r#"{"value":1}"#).expect("write source");
+        let config: ServiceConfig = toml::from_str(
+            r#"
+type = "worker"
+command = "unused"
+[generated.runtime]
+source = "source.json"
+project_path = "config/runtime.locald.json"
+"#,
+        )
+        .expect("parse controller-boundary config");
+        let manager = readiness_test_manager(dir.path());
+        let key = ServiceKey::new(test_instance_id(), "worker");
+        let prepared = crate::generated_files::prepare(&project_path, &key, &config, None)
+            .await
+            .expect("prepare generated set")
+            .expect("prepared set");
+        let mut plugin_guards = Vec::new();
+        let staged = manager
+            .stage_service_runtime(
+                &project_path,
+                &key,
+                "controller-boundary:worker",
+                &config,
+                &mut plugin_guards,
+                Some(prepared),
+            )
+            .await
+            .expect("stage generated set");
+        manager
+            .validate_service_projections_before_controller(&key, staged.generated_files.as_ref())
+            .await
+            .expect("unchanged staged projection is initially valid");
+
+        let target = project_path.join("config/runtime.locald.json");
+        let original = std::fs::read(&target).expect("read original projection");
+        std::fs::write(&target, b"changed after an earlier service became healthy")
+            .expect("race late projection change");
+        let error = manager
+            .validate_service_projections_before_controller(&key, staged.generated_files.as_ref())
+            .await
+            .expect_err("final controller boundary rejects the late change");
+        assert!(
+            error
+                .to_string()
+                .contains("immediately before controller creation")
+        );
+        assert!(manager.services.lock().await.is_empty());
+
+        std::fs::write(&target, original).expect("restore projection");
+        staged
+            .generated_files
+            .expect("generated set")
+            .cleanup()
+            .await
+            .expect("clean restored projection");
+    }
+
+    #[tokio::test]
     async fn startup_retained_projection_is_registered_for_live_retry() {
         let dir = tempdir().expect("create startup retained cleanup directory");
         let project_path = dir.path().join("project");
@@ -35450,6 +35563,25 @@ project_path = "config/runtime.locald.json"
         .expect("parse startup retained config");
         let manager = unregistered_availability_manager(dir.path());
         let key = ServiceKey::new(test_instance_id(), "worker");
+        manager
+            .state_manager
+            .save(&ServerState {
+                services: vec![PersistedServiceState {
+                    service_key: Some(key.clone()),
+                    name: "startup-retained:worker".to_owned(),
+                    config: LocaldConfig::default(),
+                    path: project_path.clone(),
+                    pid: None,
+                    process_identity: None,
+                    container_id: None,
+                    port: None,
+                    status: ServiceState::Stopped,
+                    health_status: HealthStatus::Unknown,
+                    health_source: HealthSource::None,
+                }],
+            })
+            .await
+            .expect("persist stopped service identity");
         let _generated = crate::generated_files::materialize(
             &manager.availability_data_dir,
             &project_path,
@@ -35472,8 +35604,32 @@ project_path = "config/runtime.locald.json"
         {
             let deferred = manager.deferred_generated_file_cleanups.lock().await;
             assert_eq!(deferred.len(), 1);
-            assert!(deferred[0].key.is_none());
+            assert_eq!(deferred[0].keys, HashSet::from([key.clone()]));
         }
+        manager.services.lock().await.insert(
+            key.clone(),
+            Service {
+                instance_id: key.instance(),
+                controller_generation: 0,
+                projection_generation: 1,
+                config: LocaldConfig::default(),
+                service_config: config.clone(),
+                resolved_env: HashMap::new(),
+                runtime_state: ServiceRuntime::None,
+                sticky_port: None,
+                pending_port_guard: None,
+                generated_files: None,
+                path: project_path.clone(),
+                health_status: HealthStatus::Unknown,
+                health_source: HealthSource::None,
+                warnings: Vec::new(),
+            },
+        );
+        assert!(manager.refresh_generated_file_cleanup_warning(&key).await);
+        assert_eq!(
+            manager.services.lock().await[&key].warnings,
+            vec![GENERATED_FILE_CLEANUP_WARNING]
+        );
 
         std::fs::write(&target, original).expect("restore startup projection");
         manager.retry_deferred_generated_file_cleanups().await;
