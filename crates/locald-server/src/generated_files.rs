@@ -1368,6 +1368,31 @@ where
             .join(&projection.relative_path)
             .display()
     );
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = parent.open_with(&projection.file_name, &options)?;
+    let opened_metadata = file.metadata()?;
+    anyhow::ensure!(
+        opened_metadata.is_file()
+            && !opened_metadata.file_type().is_symlink()
+            && projection_file_identity(&opened_metadata) == projection.identity,
+        "retaining generated-file projection `{}` because its entry changed while opening before quarantine",
+        projection
+            .canonical_project_root
+            .join(&projection.relative_path)
+            .display()
+    );
+    anyhow::ensure!(
+        projection_provenance_matches(&file, &projection.projection_id)?,
+        "retaining generated-file projection `{}` because its provenance changed before quarantine",
+        projection
+            .canonical_project_root
+            .join(&projection.relative_path)
+            .display()
+    );
+    drop(file);
     match rename_projection_noreplace(
         parent,
         &projection.file_name,
@@ -3449,7 +3474,7 @@ mod tests {
         })
         .expect_err("known foreign identity is rejected before quarantine");
         assert!(
-            format!("{error:#}").contains("file identity changed before quarantine"),
+            format!("{error:#}").contains("changed before quarantine"),
             "unexpected error: {error:#}"
         );
         assert!(
