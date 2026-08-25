@@ -152,6 +152,7 @@ pub(crate) struct StartupGeneratedFileCleanup {
 
 struct LoadedProjectionManifest {
     service_resource_id: OsString,
+    generation_dir: PathBuf,
     manifest: ProjectionManifest,
 }
 
@@ -332,13 +333,20 @@ impl GeneratedFileSet {
         cleanup_generation_dir(&self.generation_dir).await
     }
 
-    async fn owns_projection(&self, project_root: &Path, relative_path: &Path) -> bool {
-        let Ok(canonical_project_root) = tokio::fs::canonicalize(project_root).await else {
+    async fn owns_projection(
+        &self,
+        canonical_project_root: &Path,
+        parent_identity: &ProjectionFileIdentity,
+        target_metadata: &cap_std::fs::Metadata,
+    ) -> bool {
+        if !target_metadata.is_file() || target_metadata.file_type().is_symlink() {
             return false;
-        };
+        }
+        let target_identity = projection_file_identity(target_metadata);
         let Some(ownership) = self.projections.iter().find(|ownership| {
             ownership.canonical_project_root == canonical_project_root
-                && ownership.relative_path == relative_path
+                && ownership.parent_identity == *parent_identity
+                && ownership.identity == target_identity
         }) else {
             return false;
         };
@@ -1153,6 +1161,9 @@ fn projection_provenance_matches(file: &cap_std::fs::File, projection_id: &str) 
         }
         #[cfg(target_os = "linux")]
         if error.raw_os_error() == Some(libc::ENODATA) {
+            return Ok(false);
+        }
+        if error.raw_os_error() == Some(libc::ERANGE) {
             return Ok(false);
         }
         return Err(error).context("failed to read generated-file projection provenance");
@@ -2080,14 +2091,27 @@ async fn remove_generated_root(root: &Path) -> Result<Vec<StartupGeneratedFileCl
         Ok(Vec::new())
     } else {
         let mut errors = Vec::new();
-        let mut retained_projections = Vec::new();
-        let mut retained_service_resource_ids = BTreeSet::new();
+        let mut retained = Vec::new();
         for loaded in load_projection_manifests(root).await? {
             match cleanup_projections_for_startup(&loaded.manifest.projections).await {
-                Ok(true) => {}
+                Ok(true) => {
+                    if let Err(error) = cleanup_generation_dir(&loaded.generation_dir).await {
+                        errors.push(format!(
+                            "generation {}: {error:#}",
+                            loaded.manifest.generation
+                        ));
+                    }
+                }
                 Ok(false) => {
-                    retained_service_resource_ids.insert(loaded.service_resource_id);
-                    retained_projections.extend(loaded.manifest.projections);
+                    retained.push(StartupGeneratedFileCleanup {
+                        service_resource_ids: BTreeSet::from([loaded.service_resource_id]),
+                        generated_files: GeneratedFileSet {
+                            generation_dir: loaded.generation_dir,
+                            paths: BTreeMap::new(),
+                            source_fingerprints: BTreeMap::new(),
+                            projections: loaded.manifest.projections,
+                        },
+                    });
                 }
                 Err(error) => {
                     errors.push(format!(
@@ -2100,19 +2124,11 @@ async fn remove_generated_root(root: &Path) -> Result<Vec<StartupGeneratedFileCl
         if !errors.is_empty() {
             finish_cleanup_errors("generated-file manifest recovery", &errors)?;
         }
-        if retained_projections.is_empty() {
+        if retained.is_empty() {
             tokio::fs::remove_dir_all(root).await?;
             Ok(Vec::new())
         } else {
-            Ok(vec![StartupGeneratedFileCleanup {
-                service_resource_ids: retained_service_resource_ids,
-                generated_files: GeneratedFileSet {
-                    generation_dir: root.to_path_buf(),
-                    paths: BTreeMap::new(),
-                    source_fingerprints: BTreeMap::new(),
-                    projections: retained_projections,
-                },
-            }])
+            Ok(retained)
         }
     }
 }
@@ -2163,6 +2179,7 @@ async fn load_projection_manifests(root: &Path) -> Result<Vec<LoadedProjectionMa
                 );
                 manifests.push(LoadedProjectionManifest {
                     service_resource_id: service.file_name(),
+                    generation_dir: generation.path(),
                     manifest,
                 });
             }
@@ -2430,10 +2447,6 @@ async fn prepare_projection_target(
             .file_name()
             .context("generated-file project_path has no file name")?,
     );
-    let target_is_owned = match allowed_existing {
-        Some(owned) => owned.owns_projection(project_root, &relative_path).await,
-        None => false,
-    };
     let root_for_task = canonical_project_root.clone();
     let root_identity_for_task = project_root_identity.clone();
     let parent_for_task = parent_relative_path.clone();
@@ -2454,6 +2467,14 @@ async fn prepare_projection_target(
     })
     .await
     .context("generated-file project_path parent capability task failed")??;
+    let target_is_owned = match (allowed_existing, target_metadata.as_ref()) {
+        (Some(owned), Some(metadata)) => {
+            owned
+                .owns_projection(&canonical_project_root, &parent_identity, metadata)
+                .await
+        }
+        _ => false,
+    };
     let target = canonical_project_root.join(&relative_path);
     match target_metadata {
         Some(_) if target_is_owned => {}
@@ -4410,7 +4431,7 @@ project_path = "chat/two.locald.json"
     }
 
     #[tokio::test]
-    async fn startup_retry_keeps_all_retained_generations_under_one_root() {
+    async fn startup_retry_is_scoped_to_each_retained_generation() {
         let root = tempdir().expect("create multi-generation recovery root");
         tokio::fs::create_dir(root.path().join("chat"))
             .await
@@ -4456,38 +4477,77 @@ project_path = "chat/two.locald.json"
         let retained = cleanup_all_instances(&data_dir)
             .await
             .expect("collect both retained generations");
-        assert_eq!(
-            retained.len(),
-            1,
-            "one retry owns the shared generated root"
+        assert_eq!(retained.len(), 2, "each generation has its own retry");
+        assert!(
+            retained
+                .iter()
+                .all(|retry| retry.generated_files.projections.len() == 1)
         );
-        assert_eq!(retained[0].generated_files.projections.len(), 2);
-        assert_eq!(retained[0].service_resource_ids.len(), 1);
+        assert!(
+            retained
+                .iter()
+                .all(|retry| retry.service_resource_ids.len() == 1)
+        );
+
+        tokio::fs::write(root.path().join("three.json"), r#"{"value":3}"#)
+            .await
+            .expect("write fresh source");
+        let fresh = materialize(
+            &data_dir,
+            root.path(),
+            &key(),
+            &projected_service_config("three.json", "chat/three.locald.json", BTreeMap::new()),
+            &bindings(),
+        )
+        .await
+        .expect("materialize fresh generation")
+        .expect("fresh generated set");
+        let fresh_path = root.path().join("chat/three.locald.json");
+
+        let first_retry = retained
+            .iter()
+            .find(|retry| {
+                retry.generated_files.projections[0].relative_path
+                    == Path::new("chat/one.locald.json")
+            })
+            .expect("first retained generation");
+        let second_retry = retained
+            .iter()
+            .find(|retry| {
+                retry.generated_files.projections[0].relative_path
+                    == Path::new("chat/two.locald.json")
+            })
+            .expect("second retained generation");
 
         tokio::fs::write(&first_path, first_original)
             .await
             .expect("restore first");
-        retained[0]
+        first_retry
             .generated_files
             .cleanup()
             .await
-            .expect_err("the second retained projection keeps the shared root live");
+            .expect("the first retry removes only its generation");
         assert!(!first_path.exists());
         assert!(second_path.exists());
-        assert!(first.generation_dir.exists());
+        assert!(!first.generation_dir.exists());
         assert!(second.generation_dir.exists());
+        assert!(fresh_path.exists());
+        assert!(fresh.generation_dir.exists());
 
         tokio::fs::write(&second_path, second_original)
             .await
             .expect("restore second");
-        retained[0]
+        second_retry
             .generated_files
             .cleanup()
             .await
-            .expect("the aggregate retry removes the shared root after all ownership matches");
+            .expect("the second retry removes only its generation");
         assert!(!second_path.exists());
-        assert!(!first.generation_dir.exists());
         assert!(!second.generation_dir.exists());
+        assert!(fresh_path.exists());
+        assert!(fresh.generation_dir.exists());
+
+        fresh.cleanup().await.expect("clean fresh generation");
     }
 
     #[cfg(unix)]
@@ -4581,6 +4641,59 @@ project_path = "chat/two.locald.json"
         assert!(!generated.generation_dir.exists());
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn startup_retains_oversized_projection_provenance_for_retry() {
+        let root = tempdir().expect("create oversized-provenance root");
+        let project_parent = root.path().join("chat");
+        tokio::fs::create_dir(&project_parent)
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let parent = Dir::open_ambient_dir(&project_parent, ambient_authority())
+            .expect("open projection parent");
+        let projection_file = parent.open("runtime.locald.json").expect("open projection");
+        set_projection_provenance(&projection_file, &"x".repeat(128))
+            .expect("replace provenance with an oversized value");
+        projection_file
+            .sync_all()
+            .expect("sync oversized provenance");
+        drop(projection_file);
+
+        let retained = cleanup_all_instances(&data_dir)
+            .await
+            .expect("oversized provenance cannot block daemon startup");
+        assert_eq!(retained.len(), 1);
+        assert!(root.path().join("chat/runtime.locald.json").exists());
+        assert!(generated.generation_dir.exists());
+
+        let projection_file = parent
+            .open("runtime.locald.json")
+            .expect("reopen projection");
+        set_projection_provenance(&projection_file, &generated.projections[0].projection_id)
+            .expect("restore projection provenance");
+        projection_file
+            .sync_all()
+            .expect("sync restored provenance");
+        drop(projection_file);
+        retained[0]
+            .generated_files
+            .cleanup()
+            .await
+            .expect("retry removes the projection after provenance is restored");
+        assert!(!root.path().join("chat/runtime.locald.json").exists());
+        assert!(!generated.generation_dir.exists());
+    }
+
     #[tokio::test]
     async fn recovery_manifest_removes_an_owned_projection_after_restart() {
         let root = tempdir().expect("create project root");
@@ -4660,6 +4773,44 @@ project_path = "chat/two.locald.json"
         tokio::fs::write(&projection, owned)
             .await
             .expect("restore owned bytes");
+        generated.cleanup().await.expect("cleanup owned projection");
+    }
+
+    #[tokio::test]
+    async fn case_only_projection_path_change_keeps_owned_target_admissible() {
+        let root = tempdir().expect("create case-only projection root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let alias = root.path().join("Chat/Runtime.locald.json");
+        if tokio::fs::symlink_metadata(&alias).await.is_err() {
+            generated
+                .cleanup()
+                .await
+                .expect("cleanup case-sensitive fixture");
+            return;
+        }
+
+        let renamed =
+            projected_service_config("source.json", "Chat/Runtime.locald.json", BTreeMap::new());
+        prepare(root.path(), &key(), &renamed, Some(&generated))
+            .await
+            .expect("case-only spelling of the same owned entry passes preflight");
         generated.cleanup().await.expect("cleanup owned projection");
     }
 
