@@ -27,7 +27,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MAX_GENERATED_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_GENERATED_SOURCE_BYTES_U64: u64 = 1024 * 1024;
 const PROJECTION_MANIFEST_NAME: &str = ".projection-ownership.json";
-const PROJECTION_MANIFEST_VERSION: u32 = 2;
+const PROJECTION_MANIFEST_VERSION: u32 = 3;
+#[cfg(target_os = "macos")]
+const PROJECTION_PROVENANCE_XATTR: &[u8] = b"com.locald.projection-id\0";
+#[cfg(target_os = "linux")]
+const PROJECTION_PROVENANCE_XATTR: &[u8] = b"user.locald.projection-id\0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceFingerprint([u8; 32]);
@@ -92,6 +96,7 @@ struct ProjectionOwnership {
     relative_path: PathBuf,
     target_quarantine_path: PathBuf,
     digest: [u8; 32],
+    size: u64,
     identity: ProjectionFileIdentity,
 }
 
@@ -106,6 +111,7 @@ struct PlannedProjection {
     relative_path: PathBuf,
     target_quarantine_path: PathBuf,
     digest: [u8; 32],
+    size: u64,
     identity: ProjectionFileIdentity,
 }
 
@@ -645,6 +651,7 @@ where
                 "{generation}-{projection_id}.target-quarantine"
             )),
             digest: Sha256::digest(contents).into(),
+            size: contents.len() as u64,
             identity,
         });
     }
@@ -670,6 +677,7 @@ impl PlannedProjection {
             relative_path: self.relative_path,
             target_quarantine_path: self.target_quarantine_path,
             digest: self.digest,
+            size: self.size,
             identity: self.identity,
         }
     }
@@ -789,6 +797,17 @@ where
             && projection_file_identity(&canonical_metadata) == projection.identity,
         "private canonical generated file identity changed before projection"
     );
+    let mut canonical_options = OpenOptions::new();
+    canonical_options.read(true);
+    #[cfg(unix)]
+    canonical_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let canonical_file = canonical_root.open_with(canonical_relative_path, &canonical_options)?;
+    anyhow::ensure!(
+        projection_file_identity(&canonical_file.metadata()?) == projection.identity,
+        "private canonical generated file identity changed at provenance binding"
+    );
+    set_projection_provenance(&canonical_file, &projection.projection_id)?;
+    canonical_file.sync_all()?;
     before_link(&parent)?;
     let canonical_metadata = canonical_root.symlink_metadata(canonical_relative_path)?;
     anyhow::ensure!(
@@ -858,8 +877,6 @@ where
 }
 
 fn validate_visible_projection_at_publication(projection: &ProjectionOwnership) -> Result<()> {
-    use std::io::Read as _;
-
     let parent = open_exact_project_parent(
         &projection.canonical_project_root,
         &projection.project_root_identity,
@@ -878,10 +895,12 @@ fn validate_visible_projection_at_publication(projection: &ProjectionOwnership) 
             && projection_file_identity(&metadata) == projection.identity,
         "generated-file project_path entry identity changed at the final publication boundary"
     );
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
     anyhow::ensure!(
-        <[u8; 32]>::from(Sha256::digest(&bytes)) == projection.digest,
+        projection_provenance_matches(&file, &projection.projection_id)?,
+        "generated-file project_path provenance changed at the final publication boundary"
+    );
+    anyhow::ensure!(
+        projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
         "generated-file project_path content changed at the final publication boundary"
     );
 
@@ -913,6 +932,118 @@ fn projection_file_identity(metadata: &cap_std::fs::Metadata) -> ProjectionFileI
         #[cfg(not(unix))]
         unsupported: true,
     }
+}
+
+fn projection_contents_match_bounded(
+    file: &mut cap_std::fs::File,
+    expected_size: u64,
+    expected_digest: &[u8; 32],
+) -> Result<bool> {
+    use std::io::Read as _;
+
+    let mut hasher = Sha256::new();
+    let mut remaining = expected_size;
+    let mut buffer = [0_u8; 8192];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded digest chunk fits usize");
+        let read = file.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Ok(false);
+    }
+    Ok(<[u8; 32]>::from(hasher.finalize()) == *expected_digest)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)] // File-descriptor xattrs bind provenance to the selected inode.
+fn set_projection_provenance(file: &cap_std::fs::File, projection_id: &str) -> Result<()> {
+    let name = PROJECTION_PROVENANCE_XATTR.as_ptr().cast();
+    let value = projection_id.as_bytes();
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            name,
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            name,
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .context("failed to bind generated-file projection provenance to its selected inode")
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)] // File-descriptor xattrs verify the already-open selected inode.
+fn projection_provenance_matches(file: &cap_std::fs::File, projection_id: &str) -> Result<bool> {
+    let mut value = [0_u8; 64];
+    let name = PROJECTION_PROVENANCE_XATTR.as_ptr().cast();
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name,
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name,
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::ENOATTR) {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        if error.raw_os_error() == Some(libc::ENODATA) {
+            return Ok(false);
+        }
+        return Err(error).context("failed to read generated-file projection provenance");
+    }
+    let size = usize::try_from(result).context("projection provenance length is invalid")?;
+    Ok(value.get(..size) == Some(projection_id.as_bytes()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn set_projection_provenance(_file: &cap_std::fs::File, _projection_id: &str) -> Result<()> {
+    anyhow::bail!("generated-file projection provenance is supported only on macOS and Linux")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn projection_provenance_matches(_file: &cap_std::fs::File, _projection_id: &str) -> Result<bool> {
+    Ok(false)
 }
 
 fn open_exact_project_parent(
@@ -1002,17 +1133,50 @@ async fn write_projection_manifest(
     staging_dir: &Path,
     manifest: &ProjectionManifest,
 ) -> Result<()> {
+    write_projection_manifest_with_hook(staging_dir, manifest, || Ok(())).await
+}
+
+async fn write_projection_manifest_with_hook<F>(
+    staging_dir: &Path,
+    manifest: &ProjectionManifest,
+    before_publish: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     let path = staging_dir.join(PROJECTION_MANIFEST_NAME);
+    let temporary_path = staging_dir.join(format!(
+        ".{PROJECTION_MANIFEST_NAME}.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
     let mut bytes = serde_json::to_vec_pretty(manifest)?;
     bytes.push(b'\n');
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&path).await?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    Ok(())
+    let result = async {
+        match tokio::fs::symlink_metadata(&path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!(
+                "generated-file projection ownership manifest already exists at `{}`",
+                path.display()
+            ),
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary_path).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        before_publish()?;
+        tokio::fs::rename(&temporary_path, &path).await?;
+        sync_directory(staging_dir).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+    }
+    result
 }
 
 async fn cleanup_projections(projections: &[ProjectionOwnership]) -> Result<()> {
@@ -1070,12 +1234,22 @@ fn cleanup_owned_projection_path_with_hook<F>(
 where
     F: FnOnce(&Dir) -> Result<()>,
 {
-    let parent = open_exact_project_parent(
+    let parent = match open_exact_project_parent(
         &projection.canonical_project_root,
         &projection.project_root_identity,
         &projection.parent_relative_path,
         &projection.parent_identity,
-    )?;
+    ) {
+        Ok(parent) => parent,
+        Err(error) => {
+            tracing::warn!(
+                project_path = %projection.canonical_project_root.join(&projection.relative_path).display(),
+                error = %format!("{error:#}"),
+                "Retiring stale generated-file projection ownership because the recorded project parent is no longer reachable"
+            );
+            return cleanup_orphaned_projection_quarantine(projection);
+        }
+    };
     let quarantine_root = match Dir::open_ambient_dir(
         &projection.quarantine_root,
         ambient_authority(),
@@ -1097,6 +1271,61 @@ where
         Err(error) => return Err(error.into()),
     };
     cleanup_projection_in_open_parent(&parent, &quarantine_root, projection, after_quarantine)
+}
+
+fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> Result<()> {
+    let quarantine_root =
+        match Dir::open_ambient_dir(&projection.quarantine_root, ambient_authority()) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+    anyhow::ensure!(
+        projection_file_identity(&quarantine_root.dir_metadata()?)
+            == projection.quarantine_root_identity,
+        "retaining orphaned generated-file projection because its private quarantine root identity changed at `{}`",
+        projection.quarantine_root.display()
+    );
+    let quarantine_path = projection.target_quarantine_path.as_path();
+    let metadata = match quarantine_root.symlink_metadata(quarantine_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && projection_file_identity(&metadata) == projection.identity,
+        "retaining orphaned generated-file projection because its quarantined entry identity changed at `{}`",
+        projection.quarantine_root.join(quarantine_path).display()
+    );
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = quarantine_root.open_with(quarantine_path, &options)?;
+    let opened_metadata = file.metadata()?;
+    anyhow::ensure!(
+        opened_metadata.is_file()
+            && !opened_metadata.file_type().is_symlink()
+            && projection_file_identity(&opened_metadata) == projection.identity,
+        "retaining orphaned generated-file projection because its quarantined entry changed while opening `{}`",
+        projection.quarantine_root.join(quarantine_path).display()
+    );
+    anyhow::ensure!(
+        projection_provenance_matches(&file, &projection.projection_id)?,
+        "retaining orphaned generated-file projection because its quarantined provenance changed at `{}`",
+        projection.quarantine_root.join(quarantine_path).display()
+    );
+    anyhow::ensure!(
+        projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
+        "retaining orphaned generated-file projection because its quarantined content changed at `{}`",
+        projection.quarantine_root.join(quarantine_path).display()
+    );
+    drop(file);
+    quarantine_root.remove_file(quarantine_path)?;
+    quarantine_root.open(".")?.sync_all()?;
+    Ok(())
 }
 
 fn cleanup_projection_in_open_parent<F>(
@@ -1163,8 +1392,6 @@ fn cleanup_quarantined_projection_path(
     original_path: &Path,
     quarantine_path: &Path,
 ) -> Result<()> {
-    use std::io::Read as _;
-
     let metadata = match quarantine_root.symlink_metadata(quarantine_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1187,10 +1414,21 @@ fn cleanup_quarantined_projection_path(
         #[cfg(unix)]
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         let mut file = quarantine_root.open_with(quarantine_path, &options)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let opened_metadata = file.metadata()?;
         anyhow::ensure!(
-            <[u8; 32]>::from(Sha256::digest(&bytes)) == projection.digest,
+            opened_metadata.is_file()
+                && !opened_metadata.file_type().is_symlink()
+                && projection_file_identity(&opened_metadata) == projection.identity,
+            "retaining generated-file projection `{}` because its entry changed while opening",
+            projection.quarantine_root.join(quarantine_path).display()
+        );
+        anyhow::ensure!(
+            projection_provenance_matches(&file, &projection.projection_id)?,
+            "retaining generated-file projection `{}` because its provenance changed",
+            projection.quarantine_root.join(quarantine_path).display()
+        );
+        anyhow::ensure!(
+            projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
             "retaining generated-file projection `{}` because its content changed",
             projection.quarantine_root.join(quarantine_path).display()
         );
@@ -1280,8 +1518,6 @@ fn rename_projection_noreplace(
 }
 
 fn projection_path_matches_ownership(projection: &ProjectionOwnership) -> Result<bool> {
-    use std::io::Read as _;
-
     let parent = match open_exact_project_parent(
         &projection.canonical_project_root,
         &projection.project_root_identity,
@@ -1307,9 +1543,15 @@ fn projection_path_matches_ownership(projection: &ProjectionOwnership) -> Result
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let mut file = parent.open_with(&projection.file_name, &options)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(<[u8; 32]>::from(Sha256::digest(&bytes)) == projection.digest)
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || opened_metadata.file_type().is_symlink()
+        || projection_file_identity(&opened_metadata) != projection.identity
+        || !projection_provenance_matches(&file, &projection.projection_id)?
+    {
+        return Ok(false);
+    }
+    projection_contents_match_bounded(&mut file, projection.size, &projection.digest)
 }
 
 /// Remove every generated runtime file for one project instance.
@@ -2493,6 +2735,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_manifest_publication_is_atomic() {
+        let root = tempdir().expect("create manifest publication root");
+        let staging_dir = root.path().join("staging");
+        tokio::fs::create_dir(&staging_dir)
+            .await
+            .expect("create manifest staging directory");
+        let manifest = ProjectionManifest {
+            version: PROJECTION_MANIFEST_VERSION,
+            generation: "generation".to_owned(),
+            projections: Vec::new(),
+        };
+
+        let error = write_projection_manifest_with_hook(&staging_dir, &manifest, || {
+            anyhow::bail!("injected crash before manifest publication")
+        })
+        .await
+        .expect_err("injected prepublication failure");
+        assert!(format!("{error:#}").contains("injected crash"));
+        assert!(!staging_dir.join(PROJECTION_MANIFEST_NAME).exists());
+        assert!(
+            std::fs::read_dir(&staging_dir)
+                .expect("read staging directory")
+                .next()
+                .is_none(),
+            "failed publication removes its private temporary manifest"
+        );
+
+        write_projection_manifest(&staging_dir, &manifest)
+            .await
+            .expect("publish manifest atomically");
+        let bytes = tokio::fs::read(staging_dir.join(PROJECTION_MANIFEST_NAME))
+            .await
+            .expect("read published manifest");
+        assert_eq!(
+            serde_json::from_slice::<ProjectionManifest>(&bytes).expect("parse complete manifest"),
+            manifest
+        );
+    }
+
+    #[test]
+    fn projection_digest_validation_is_bounded_by_recorded_size() {
+        let root = tempdir().expect("create bounded digest root");
+        std::fs::write(root.path().join("projection"), b"expected-and-growing")
+            .expect("write oversized projection");
+        let directory =
+            Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open digest root");
+        let mut file = directory.open("projection").expect("open projection");
+        let digest: [u8; 32] = Sha256::digest(b"expected").into();
+        assert!(
+            !projection_contents_match_bounded(&mut file, b"expected".len() as u64, &digest)
+                .expect("validate bounded digest"),
+            "content beyond the recorded size is rejected after one bounded extra-byte read"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_bytes_and_reused_identity_cannot_adopt_a_replacement() {
+        let root = tempdir().expect("create provenance replacement root");
+        let (data_dir, staging_dir, _generation, projections, rendered) =
+            projection_intent_fixture(root.path()).await;
+        let projection = &projections[0];
+        publish_projection_direct(
+            &staging_dir,
+            &rendered.relative_paths["microfrontends"],
+            projection,
+            &rendered.projected_contents["microfrontends"],
+        )
+        .expect("publish owned projection");
+        let target = root.path().join(&projection.relative_path);
+        let original = tokio::fs::read(&target).await.expect("read owned bytes");
+        tokio::fs::remove_file(&target)
+            .await
+            .expect("remove owned projection");
+        tokio::fs::write(&target, &original)
+            .await
+            .expect("write same-byte replacement");
+
+        let mut simulated_reused_identity = projection.clone();
+        simulated_reused_identity.identity = projection_file_identity_from_std(
+            &std::fs::symlink_metadata(&target).expect("replacement metadata"),
+        );
+        assert!(
+            !projection_path_matches_ownership(&simulated_reused_identity)
+                .expect("check replacement provenance"),
+            "a same-byte replacement remains foreign even if an inode identity were reused"
+        );
+
+        tokio::fs::remove_file(&target)
+            .await
+            .expect("remove foreign fixture");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("recover fixture after foreign removal");
+    }
+
+    #[tokio::test]
+    async fn stale_project_identity_does_not_block_global_recovery() {
+        let root = tempdir().expect("create stale-project recovery root");
+        let project_root = root.path().join("project");
+        let data_dir = root.path().join("data");
+        tokio::fs::create_dir_all(project_root.join("chat"))
+            .await
+            .expect("create original project");
+        tokio::fs::write(project_root.join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write projection source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        materialize(&data_dir, &project_root, &key(), &config, &bindings())
+            .await
+            .expect("materialize projection")
+            .expect("generated set");
+
+        tokio::fs::remove_dir_all(&project_root)
+            .await
+            .expect("remove original project");
+        tokio::fs::create_dir_all(project_root.join("chat"))
+            .await
+            .expect("recreate replacement project");
+        let replacement = project_root.join("chat/runtime.locald.json");
+        tokio::fs::write(&replacement, b"foreign replacement")
+            .await
+            .expect("write replacement project file");
+
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("stale project ownership cannot block global recovery");
+        assert_eq!(
+            tokio::fs::read(&replacement)
+                .await
+                .expect("read untouched replacement"),
+            b"foreign replacement"
+        );
+        assert!(
+            !data_dir
+                .join("instances")
+                .join("00000000-0000-4000-8000-000000000001")
+                .join("generated")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn durable_intent_recovers_every_prepublication_projection_phase() {
         for phase in 0..4 {
             let root = tempdir().expect("create crash-phase root");
@@ -2515,6 +2900,14 @@ mod tests {
                     &projection.parent_identity,
                 )
                 .expect("open exact project parent");
+                let canonical_file = canonical_root
+                    .open(&rendered.relative_paths["microfrontends"])
+                    .expect("open selected canonical projection");
+                set_projection_provenance(&canonical_file, &projection.projection_id)
+                    .expect("bind durable projection provenance");
+                canonical_file
+                    .sync_all()
+                    .expect("sync durable projection provenance");
                 canonical_root
                     .hard_link(
                         &rendered.relative_paths["microfrontends"],

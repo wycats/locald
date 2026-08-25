@@ -300,6 +300,7 @@ struct ConfigWatcher {
     watcher: RecommendedWatcher,
     reload_tx: tokio::sync::mpsc::Sender<()>,
     generated_sources: Arc<StdMutex<HashSet<PathBuf>>>,
+    generated_projections: Arc<StdMutex<HashSet<PathBuf>>>,
     generated_directories: HashSet<PathBuf>,
     invalidated_generated_watch_paths: Arc<StdMutex<HashSet<PathBuf>>>,
 }
@@ -323,6 +324,15 @@ fn config_reload_event_is_relevant(
             || path.ends_with(".env")
             || generated_source_event_path_is_relevant(path, generated_sources)
     })
+}
+
+fn projection_reconciliation_event_is_relevant(
+    paths: &[PathBuf],
+    generated_projections: &HashSet<PathBuf>,
+) -> bool {
+    paths
+        .iter()
+        .any(|path| generated_source_event_path_is_relevant(path, generated_projections))
 }
 
 fn generated_source_event_path_is_relevant(
@@ -5704,22 +5714,86 @@ impl ProcessManager {
             }
         });
 
+        let (projection_tx, mut projection_rx) = tokio::sync::mpsc::channel::<()>(100);
+        let projection_manager = self.clone();
+        let projection_project_path = path.clone();
+        tokio::spawn(async move {
+            loop {
+                if projection_rx.recv().await.is_none() {
+                    break;
+                }
+                loop {
+                    let timeout = tokio::time::sleep(std::time::Duration::from_millis(500));
+                    tokio::select! {
+                        event = projection_rx.recv() => {
+                            if event.is_none() {
+                                return;
+                            }
+                        }
+                        () = timeout => {
+                            let instance_id = match projection_manager
+                                .resolve_lifecycle_target(&projection_project_path)
+                                .await
+                            {
+                                Ok(LifecycleTargetResolution::Catalogued(target)) => {
+                                    Some(target.instance_id)
+                                }
+                                Ok(_) => None,
+                                Err(error) => {
+                                    warn!(
+                                        "Failed to resolve generated-file projection event for {}: {error}",
+                                        projection_project_path.display()
+                                    );
+                                    None
+                                }
+                            };
+                            if let Some(instance_id) = instance_id
+                                && !projection_manager
+                                    .loaded_generated_sources_match(instance_id)
+                                    .await
+                            {
+                                info!(
+                                    "Generated-file projection changed for {}; queuing reconciliation",
+                                    projection_project_path.display()
+                                );
+                                projection_manager
+                                    .queue_config_reload(&projection_project_path)
+                                    .await;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         let handle = tokio::runtime::Handle::current();
         let generated_sources = Arc::new(StdMutex::new(HashSet::<PathBuf>::new()));
         let callback_generated_sources = Arc::clone(&generated_sources);
+        let generated_projections = Arc::new(StdMutex::new(HashSet::<PathBuf>::new()));
+        let callback_generated_projections = Arc::clone(&generated_projections);
         let invalidated_generated_watch_paths = Arc::new(StdMutex::new(HashSet::<PathBuf>::new()));
         let callback_invalidated_generated_watch_paths =
             Arc::clone(&invalidated_generated_watch_paths);
         let callback_tx = tx.clone();
+        let callback_projection_tx = projection_tx.clone();
 
         let watcher_res = notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(event) => {
                     if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {
-                        let (relevant, invalidated) = {
+                        let (config_relevant, projection_relevant, invalidated) = {
                             let generated_sources = callback_generated_sources
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let generated_projections = callback_generated_projections
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let watched_generated_paths = generated_sources
+                                .iter()
+                                .chain(generated_projections.iter())
+                                .cloned()
+                                .collect::<HashSet<_>>();
                             let invalidating_watch = event.kind.is_remove()
                                 || matches!(
                                     event.kind,
@@ -5728,11 +5802,15 @@ impl ProcessManager {
                             let invalidated = invalidating_watch.then(|| {
                                 collect_invalidated_generated_watch_paths(
                                     &event.paths,
-                                    &generated_sources,
+                                    &watched_generated_paths,
                                 )
                             });
                             (
                                 config_reload_event_is_relevant(&event.paths, &generated_sources),
+                                projection_reconciliation_event_is_relevant(
+                                    &event.paths,
+                                    &generated_projections,
+                                ),
                                 invalidated,
                             )
                         };
@@ -5744,9 +5822,16 @@ impl ProcessManager {
                                 .extend(invalidated);
                         }
 
-                        if relevant {
+                        if config_relevant {
                             info!("Config changed: {:?}", event.paths);
                             let tx = callback_tx.clone();
+                            handle.spawn(async move {
+                                let _ = tx.send(()).await;
+                            });
+                        }
+                        if projection_relevant {
+                            info!("Generated-file projection changed: {:?}", event.paths);
+                            let tx = callback_projection_tx.clone();
                             handle.spawn(async move {
                                 let _ = tx.send(()).await;
                             });
@@ -5772,6 +5857,7 @@ impl ProcessManager {
                             watcher,
                             reload_tx: tx,
                             generated_sources,
+                            generated_projections,
                             generated_directories: HashSet::new(),
                             invalidated_generated_watch_paths,
                         },
@@ -5785,6 +5871,7 @@ impl ProcessManager {
     async fn update_generated_source_watches(&self, project_path: &Path, config: &LocaldConfig) {
         let project_path = Self::canonicalize_path(project_path);
         let mut desired_sources = HashSet::new();
+        let mut desired_projections = HashSet::new();
         for service in config.services.values() {
             for generated in service.generated().values() {
                 let configured = project_path.join(&generated.source);
@@ -5793,6 +5880,9 @@ impl ProcessManager {
                     if canonical.starts_with(&project_path) {
                         desired_sources.insert(canonical);
                     }
+                }
+                if let Some(projection) = &generated.project_path {
+                    desired_projections.insert(project_path.join(projection));
                 }
             }
         }
@@ -5805,6 +5895,15 @@ impl ProcessManager {
             .generated_sources
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = desired_sources;
+        config_watcher
+            .generated_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&desired_projections);
+        let watcher_paths = desired_projections
+            .into_iter()
+            .chain(watcher_sources)
+            .collect::<HashSet<_>>();
 
         let invalidated = std::mem::take(
             &mut *config_watcher
@@ -5839,7 +5938,7 @@ impl ProcessManager {
         }
 
         let mut retained_directories = HashSet::new();
-        for source in &watcher_sources {
+        for source in &watcher_paths {
             // Try the deepest existing directory first. If it disappears
             // between discovery and `watch`, fall back through its existing
             // ancestors. The previous ancestor watch remains active until a
@@ -34246,30 +34345,38 @@ COMBINED = "${services.web.port}:${services.web.listeners.hmr.port}"
         let unrelated = project_path.join("chat/README.md");
         let projection = project_path.join("chat/.microfrontends.locald.json");
         let generated_sources = HashSet::from([source.clone()]);
+        let generated_projections = HashSet::from([projection.clone()]);
 
         assert!(config_reload_event_is_relevant(
             std::slice::from_ref(&source),
-            &generated_sources
+            &generated_sources,
         ));
         assert!(config_reload_event_is_relevant(
             &[project_path.join("chat")],
-            &generated_sources
+            &generated_sources,
         ));
         assert!(config_reload_event_is_relevant(
             &[project_path.join("chat/nested")],
-            &generated_sources
+            &generated_sources,
         ));
         assert!(!config_reload_event_is_relevant(
             &[unrelated],
-            &generated_sources
+            &generated_sources,
         ));
         assert!(
-            !config_reload_event_is_relevant(&[projection], &generated_sources),
-            "a derived project projection is not a generated source and cannot trigger a reload loop"
+            projection_reconciliation_event_is_relevant(
+                std::slice::from_ref(&projection),
+                &generated_projections,
+            ),
+            "a derived project projection triggers integrity reconciliation"
+        );
+        assert!(
+            !config_reload_event_is_relevant(std::slice::from_ref(&projection), &generated_sources,),
+            "projection events do not feed back into ordinary config reloads"
         );
         assert!(config_reload_event_is_relevant(
             &[project_path.join("locald.toml")],
-            &HashSet::new()
+            &HashSet::new(),
         ));
 
         let nested = project_path.join("chat/nested");
@@ -34598,6 +34705,13 @@ RUNTIME_CONFIG = "${services.api.worker.generated.runtime.path}"
                     .lock()
                     .expect("read generated source watches")
                     .contains(&canonical_project.join("config/runtime.jsonc"))
+            );
+            assert!(
+                watcher
+                    .generated_projections
+                    .lock()
+                    .expect("read generated projection watches")
+                    .contains(&canonical_project.join("config/runtime.locald.json"))
             );
             assert!(
                 watcher
