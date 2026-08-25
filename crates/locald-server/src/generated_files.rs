@@ -1437,7 +1437,17 @@ where
             );
             return cleanup_orphaned_projection_quarantine(projection);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(retain_inaccessible_projection(error, || {
+                format!(
+                    "retaining generated-file projection because its project parent is inaccessible at `{}`",
+                    projection
+                        .canonical_project_root
+                        .join(&projection.parent_relative_path)
+                        .display()
+                )
+            }));
+        }
     };
     let quarantine_root = match Dir::open_ambient_dir(
         &projection.quarantine_root,
@@ -4522,6 +4532,53 @@ project_path = "chat/two.locald.json"
             .await
             .expect("retry removes the restored owned projection");
         assert!(!projection.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_retains_an_inaccessible_projection_parent_for_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempdir().expect("create inaccessible parent root");
+        let project_parent = root.path().join("chat");
+        tokio::fs::create_dir(&project_parent)
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let projection = project_parent.join("runtime.locald.json");
+        let original_permissions = std::fs::metadata(&project_parent)
+            .expect("read parent permissions")
+            .permissions();
+        let mut inaccessible = original_permissions.clone();
+        inaccessible.set_mode(0);
+        std::fs::set_permissions(&project_parent, inaccessible)
+            .expect("remove project-parent access");
+
+        let retained = cleanup_all_instances(&data_dir)
+            .await
+            .expect("inaccessible project parent cannot block daemon startup");
+        std::fs::set_permissions(&project_parent, original_permissions)
+            .expect("restore project-parent access");
+        assert_eq!(retained.len(), 1);
+        assert!(projection.exists());
+        assert!(generated.generation_dir.exists());
+
+        retained[0]
+            .generated_files
+            .cleanup()
+            .await
+            .expect("live retry removes the projection after parent access returns");
+        assert!(!projection.exists());
+        assert!(!generated.generation_dir.exists());
     }
 
     #[tokio::test]
