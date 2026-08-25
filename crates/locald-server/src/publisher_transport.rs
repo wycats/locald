@@ -86,7 +86,12 @@ impl MacOsAuditToken {
     #[cfg(target_os = "macos")]
     fn from_native(token: nix::sys::socket::audit_token_t) -> Self {
         let mut bytes = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
-        for (bytes, word) in bytes.chunks_exact_mut(size_of::<u32>()).zip(token.val) {
+        for (bytes, word) in bytes
+            .as_chunks_mut::<{ size_of::<u32>() }>()
+            .0
+            .iter_mut()
+            .zip(token.val)
+        {
             bytes.copy_from_slice(&word.to_ne_bytes());
         }
         Self(bytes)
@@ -95,12 +100,11 @@ impl MacOsAuditToken {
     #[cfg(target_os = "macos")]
     fn into_native(self) -> nix::sys::socket::audit_token_t {
         let mut words = [0_u32; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES / size_of::<u32>()];
-        for (word, bytes) in words.iter_mut().zip(self.0.chunks_exact(size_of::<u32>())) {
-            *word = u32::from_ne_bytes(
-                bytes
-                    .try_into()
-                    .expect("audit-token chunks have one native word"),
-            );
+        for (word, bytes) in words
+            .iter_mut()
+            .zip(self.0.as_chunks::<{ size_of::<u32>() }>().0.iter())
+        {
+            *word = u32::from_ne_bytes(*bytes);
         }
         nix::sys::socket::audit_token_t { val: words }
     }
@@ -2348,7 +2352,12 @@ mod tests {
         );
 
         let mut bytes = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
-        for (bytes, word) in bytes.chunks_exact_mut(size_of::<u32>()).zip(words) {
+        for (bytes, word) in bytes
+            .as_chunks_mut::<{ size_of::<u32>() }>()
+            .0
+            .iter_mut()
+            .zip(words)
+        {
             bytes.copy_from_slice(&word.to_ne_bytes());
         }
         MacOsAuditToken(bytes)
