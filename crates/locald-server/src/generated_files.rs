@@ -302,7 +302,7 @@ impl GeneratedFileSet {
         true
     }
 
-    async fn projections_match(&self) -> bool {
+    pub(crate) async fn projections_match(&self) -> bool {
         for projection in &self.projections {
             let projection = projection.clone();
             if !tokio::task::spawn_blocking(move || projection_path_matches_ownership(&projection))
@@ -970,8 +970,13 @@ where
     if let Err(error) = publication_validation {
         let quarantine_root =
             Dir::open_ambient_dir(&projection.quarantine_root, ambient_authority())?;
-        let rollback =
-            cleanup_projection_in_open_parent(&parent, &quarantine_root, projection, |_| Ok(()));
+        let rollback = cleanup_projection_in_open_parent(
+            &parent,
+            &quarantine_root,
+            projection,
+            |_| Ok(()),
+            |_| Ok(()),
+        );
         return match rollback {
             Ok(()) => Err(error.context(
                 "generated-file project_path changed at the final publication boundary; the pinned entry was rolled back",
@@ -1393,6 +1398,18 @@ fn cleanup_owned_projection_path_with_hook<F>(
 where
     F: FnOnce(&Dir) -> Result<()>,
 {
+    cleanup_owned_projection_path_with_hooks(projection, |_| Ok(()), after_quarantine)
+}
+
+fn cleanup_owned_projection_path_with_hooks<F, G>(
+    projection: &ProjectionOwnership,
+    before_quarantine: F,
+    after_quarantine: G,
+) -> Result<()>
+where
+    F: FnOnce(&Dir) -> Result<()>,
+    G: FnOnce(&Dir) -> Result<()>,
+{
     let parent = match open_exact_project_parent(
         &projection.canonical_project_root,
         &projection.project_root_identity,
@@ -1430,7 +1447,13 @@ where
         }
         Err(error) => return Err(error.into()),
     };
-    cleanup_projection_in_open_parent(&parent, &quarantine_root, projection, after_quarantine)
+    cleanup_projection_in_open_parent(
+        &parent,
+        &quarantine_root,
+        projection,
+        before_quarantine,
+        after_quarantine,
+    )
 }
 
 fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> Result<()> {
@@ -1534,14 +1557,16 @@ fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> R
     Ok(())
 }
 
-fn cleanup_projection_in_open_parent<F>(
+fn cleanup_projection_in_open_parent<F, G>(
     parent: &Dir,
     quarantine_root: &Dir,
     projection: &ProjectionOwnership,
-    after_quarantine: F,
+    before_quarantine: F,
+    after_quarantine: G,
 ) -> Result<()>
 where
     F: FnOnce(&Dir) -> Result<()>,
+    G: FnOnce(&Dir) -> Result<()>,
 {
     ensure_retained_projection(
         projection_file_identity(&quarantine_root.dir_metadata()?)
@@ -1638,6 +1663,7 @@ where
         },
     )?;
     drop(file);
+    before_quarantine(parent)?;
     match rename_projection_noreplace(
         parent,
         &projection.file_name,
@@ -1773,6 +1799,36 @@ fn cleanup_quarantined_projection_path(
             original_path,
         ) {
             Ok(()) => return Err(error),
+            Err(restore_error) if restore_error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let recovered_path =
+                    PathBuf::from(format!(".locald-recovered-{}", uuid::Uuid::new_v4()));
+                match rename_projection_noreplace(
+                    quarantine_root,
+                    quarantine_path,
+                    project_root,
+                    &recovered_path,
+                ) {
+                    Ok(()) => {
+                        project_root.open(".")?.sync_all()?;
+                        quarantine_root.open(".")?.sync_all()?;
+                        return Err(error.context(format!(
+                            "the quarantined entry changed during cleanup and the original path was occupied; it was returned to the project namespace at `{}`",
+                            projection
+                                .canonical_project_root
+                                .join(&projection.parent_relative_path)
+                                .join(&recovered_path)
+                                .display()
+                        )));
+                    }
+                    Err(recovery_error) => {
+                        return Err(error.context(format!(
+                            "the quarantined entry was retained at `{}` because restoration to `{}` failed: {restore_error}; recovery into the project namespace also failed: {recovery_error}",
+                            projection.quarantine_root.join(quarantine_path).display(),
+                            projection.canonical_project_root.join(original_path).display()
+                        )));
+                    }
+                }
+            }
             Err(restore_error) => {
                 return Err(error.context(format!(
                     "the quarantined entry was retained at `{}` because restoration to `{}` failed: {restore_error}",
@@ -1848,6 +1904,16 @@ fn rename_projection_noreplace(
 }
 
 fn projection_path_matches_ownership(projection: &ProjectionOwnership) -> Result<bool> {
+    projection_path_matches_ownership_with_hook(projection, |_| Ok(()))
+}
+
+fn projection_path_matches_ownership_with_hook<F>(
+    projection: &ProjectionOwnership,
+    after_digest: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Dir) -> Result<()>,
+{
     let parent = match open_exact_project_parent(
         &projection.canonical_project_root,
         &projection.project_root_identity,
@@ -1882,7 +1948,29 @@ fn projection_path_matches_ownership(projection: &ProjectionOwnership) -> Result
     {
         return Ok(false);
     }
-    projection_contents_match_bounded(&mut file, projection.size, &projection.digest)
+    if !projection_contents_match_bounded(&mut file, projection.size, &projection.digest)? {
+        return Ok(false);
+    }
+    after_digest(&parent)?;
+
+    let current_parent = match open_exact_project_parent(
+        &projection.canonical_project_root,
+        &projection.project_root_identity,
+        &projection.parent_relative_path,
+        &projection.parent_identity,
+    ) {
+        Ok(parent) => parent,
+        Err(error) if error_proves_stale_projection_parent(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let current_metadata = match current_parent.symlink_metadata(&projection.file_name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(current_metadata.is_file()
+        && !current_metadata.file_type().is_symlink()
+        && projection_file_identity(&current_metadata) == projection.identity)
 }
 
 /// Remove every generated runtime file for one project instance.
@@ -1895,20 +1983,23 @@ pub(crate) async fn cleanup_instance(
         .join("instances")
         .join(instance_id.to_string())
         .join("generated");
-    remove_generated_root(&root).await.with_context(|| {
-        format!(
-            "failed to remove generated files for project instance {instance_id} at `{}`",
-            root.display()
-        )
-    })
+    remove_generated_root(&root)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to remove generated files for project instance {instance_id} at `{}`",
+                root.display()
+            )
+        })
+        .map(|_| ())
 }
 
 /// Remove ephemeral generated runtime files for every recorded instance root.
-pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<()> {
+pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<Vec<GeneratedFileSet>> {
     let instances_root = data_dir.join("instances");
     let mut entries = match tokio::fs::read_dir(&instances_root).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -1920,6 +2011,7 @@ pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<()> {
     };
 
     let mut errors = Vec::new();
+    let mut retained = Vec::new();
     while let Some(entry) = entries.next_entry().await.with_context(|| {
         format!(
             "failed to enumerate generated-file instance roots at `{}`",
@@ -1936,49 +2028,59 @@ pub(crate) async fn cleanup_all_instances(data_dir: &Path) -> Result<()> {
             continue;
         }
         let generated_root = entry.path().join("generated");
-        if let Err(error) = remove_generated_root(&generated_root)
+        match remove_generated_root(&generated_root)
             .await
             .with_context(|| {
                 format!(
                     "failed to remove stale generated files at `{}`",
                     generated_root.display()
                 )
-            })
-        {
-            errors.push(format!("{error:#}"));
+            }) {
+            Ok(mut generated_files) => retained.append(&mut generated_files),
+            Err(error) => errors.push(format!("{error:#}")),
         }
     }
 
-    finish_cleanup_errors("generated-file instance recovery", &errors)
+    finish_cleanup_errors("generated-file instance recovery", &errors)?;
+    Ok(retained)
 }
 
-async fn remove_generated_root(root: &Path) -> Result<()> {
+async fn remove_generated_root(root: &Path) -> Result<Vec<GeneratedFileSet>> {
     let metadata = match tokio::fs::symlink_metadata(root).await {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         tokio::fs::remove_file(root).await?;
+        Ok(Vec::new())
     } else {
         let mut errors = Vec::new();
-        let mut retained = false;
+        let mut retained_projections = Vec::new();
         for manifest in load_projection_manifests(root).await? {
             match cleanup_projections_for_startup(&manifest.projections).await {
-                Ok(cleaned) => retained |= !cleaned,
+                Ok(true) => {}
+                Ok(false) => retained_projections.extend(manifest.projections),
                 Err(error) => {
                     errors.push(format!("generation {}: {error:#}", manifest.generation));
                 }
             }
         }
         if !errors.is_empty() {
-            return finish_cleanup_errors("generated-file manifest recovery", &errors);
+            finish_cleanup_errors("generated-file manifest recovery", &errors)?;
         }
-        if !retained {
+        if retained_projections.is_empty() {
             tokio::fs::remove_dir_all(root).await?;
+            Ok(Vec::new())
+        } else {
+            Ok(vec![GeneratedFileSet {
+                generation_dir: root.to_path_buf(),
+                paths: BTreeMap::new(),
+                source_fingerprints: BTreeMap::new(),
+                projections: retained_projections,
+            }])
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::disallowed_methods)] // This entire directory walk runs inside spawn_blocking.
@@ -3877,6 +3979,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_returns_a_raced_foreign_entry_to_the_project_namespace() {
+        let root = tempdir().expect("create quarantine selection-race root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let projection = generated.projections[0].clone();
+        let target = root.path().join(&projection.relative_path);
+
+        let error = cleanup_owned_projection_path_with_hooks(
+            &projection,
+            |capability_root| {
+                capability_root.remove_file(&projection.file_name)?;
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                let mut foreign = capability_root.open_with(&projection.file_name, &options)?;
+                use std::io::Write as _;
+                foreign.write_all(b"foreign selected by raced rename")?;
+                Ok(())
+            },
+            |capability_root| {
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                let mut replacement = capability_root.open_with(&projection.file_name, &options)?;
+                use std::io::Write as _;
+                replacement.write_all(b"newest project entry")?;
+                Ok(())
+            },
+        )
+        .expect_err("raced foreign selection is retained outside private quarantine");
+        assert!(
+            format!("{error:#}").contains("returned to the project namespace"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            tokio::fs::read(&target).await.expect("read newest target"),
+            b"newest project entry"
+        );
+        let recovered = std::fs::read_dir(root.path().join("chat"))
+            .expect("read project package")
+            .map(|entry| entry.expect("read project entry").path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".locald-recovered-"))
+            })
+            .expect("raced foreign entry is recovered beside the project target");
+        assert_eq!(
+            tokio::fs::read(&recovered)
+                .await
+                .expect("read recovered foreign entry"),
+            b"foreign selected by raced rename"
+        );
+        assert!(
+            !projection
+                .quarantine_root
+                .join(&projection.target_quarantine_path)
+                .exists(),
+            "raced foreign content is not stranded in locald's private quarantine"
+        );
+        cleanup_generation_dir(&generated.generation_dir)
+            .await
+            .expect("remove private generation fixture");
+    }
+
+    #[tokio::test]
+    async fn reuse_rechecks_the_visible_projection_after_digest_verification() {
+        let root = tempdir().expect("create reuse recheck root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let projection = generated.projections[0].clone();
+        let original = tokio::fs::read(root.path().join(&projection.relative_path))
+            .await
+            .expect("read projected contents");
+
+        let matches = projection_path_matches_ownership_with_hook(&projection, |capability_root| {
+            capability_root.remove_file(&projection.file_name)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut replacement = capability_root.open_with(&projection.file_name, &options)?;
+            use std::io::Write as _;
+            replacement.write_all(&original)?;
+            Ok(())
+        })
+        .expect("reuse validation completes");
+        assert!(
+            !matches,
+            "an identical-byte replacement after digest verification cannot authorize reuse"
+        );
+        cleanup_generation_dir(&generated.generation_dir)
+            .await
+            .expect("remove private generation fixture");
+    }
+
+    #[tokio::test]
     async fn cleanup_visits_later_projections_after_an_ownership_mismatch() {
         let root = tempdir().expect("create aggregate cleanup root");
         tokio::fs::create_dir(root.path().join("chat"))
@@ -4101,6 +4327,9 @@ project_path = "chat/two.locald.json"
             .expect("materialize")
             .expect("generated set");
         let projection = root.path().join("chat/runtime.locald.json");
+        let original = tokio::fs::read(&projection)
+            .await
+            .expect("read original projection");
         tokio::fs::write(&projection, b"modified")
             .await
             .expect("modify owned target");
@@ -4118,14 +4347,102 @@ project_path = "chat/two.locald.json"
             b"modified"
         );
         assert!(generated.generation_dir.exists());
-        cleanup_all_instances(&data_dir)
+        let retained = cleanup_all_instances(&data_dir)
             .await
             .expect("recovery isolates the modified target from unrelated startup cleanup");
+        assert_eq!(retained.len(), 1);
         assert!(projection.exists());
         assert!(
             generated.generation_dir.exists(),
             "recovery retains the ownership manifest for a later exact retry"
         );
+        tokio::fs::write(&projection, original)
+            .await
+            .expect("restore owned projection");
+        retained[0]
+            .cleanup()
+            .await
+            .expect("startup-retained ownership remains live-retryable");
+        assert!(!projection.exists());
+        assert!(!generated.generation_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_retry_keeps_all_retained_generations_under_one_root() {
+        let root = tempdir().expect("create multi-generation recovery root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("one.json"), r#"{"value":1}"#)
+            .await
+            .expect("write first source");
+        tokio::fs::write(root.path().join("two.json"), r#"{"value":2}"#)
+            .await
+            .expect("write second source");
+        let data_dir = root.path().join("data");
+        let first = materialize(
+            &data_dir,
+            root.path(),
+            &key(),
+            &projected_service_config("one.json", "chat/one.locald.json", BTreeMap::new()),
+            &bindings(),
+        )
+        .await
+        .expect("materialize first generation")
+        .expect("first generated set");
+        let second = materialize(
+            &data_dir,
+            root.path(),
+            &key(),
+            &projected_service_config("two.json", "chat/two.locald.json", BTreeMap::new()),
+            &bindings(),
+        )
+        .await
+        .expect("materialize second generation")
+        .expect("second generated set");
+        let first_path = root.path().join("chat/one.locald.json");
+        let second_path = root.path().join("chat/two.locald.json");
+        let first_original = tokio::fs::read(&first_path).await.expect("read first");
+        let second_original = tokio::fs::read(&second_path).await.expect("read second");
+        tokio::fs::write(&first_path, b"modified first")
+            .await
+            .expect("modify first");
+        tokio::fs::write(&second_path, b"modified second")
+            .await
+            .expect("modify second");
+
+        let retained = cleanup_all_instances(&data_dir)
+            .await
+            .expect("collect both retained generations");
+        assert_eq!(
+            retained.len(),
+            1,
+            "one retry owns the shared generated root"
+        );
+        assert_eq!(retained[0].projections.len(), 2);
+
+        tokio::fs::write(&first_path, first_original)
+            .await
+            .expect("restore first");
+        retained[0]
+            .cleanup()
+            .await
+            .expect_err("the second retained projection keeps the shared root live");
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        assert!(first.generation_dir.exists());
+        assert!(second.generation_dir.exists());
+
+        tokio::fs::write(&second_path, second_original)
+            .await
+            .expect("restore second");
+        retained[0]
+            .cleanup()
+            .await
+            .expect("the aggregate retry removes the shared root after all ownership matches");
+        assert!(!second_path.exists());
+        assert!(!first.generation_dir.exists());
+        assert!(!second.generation_dir.exists());
     }
 
     #[cfg(unix)]
