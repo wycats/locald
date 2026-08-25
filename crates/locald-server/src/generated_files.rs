@@ -1353,6 +1353,21 @@ where
         &projection.file_name,
         quarantine_path,
     )?;
+    let metadata = match parent.symlink_metadata(&projection.file_name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && projection_file_identity(&metadata) == projection.identity,
+        "retaining generated-file projection `{}` because its file identity changed before quarantine",
+        projection
+            .canonical_project_root
+            .join(&projection.relative_path)
+            .display()
+    );
     match rename_projection_noreplace(
         parent,
         &projection.file_name,
@@ -3386,6 +3401,73 @@ mod tests {
                 .quarantine_root
                 .join(&projection.target_quarantine_path)
                 .exists()
+        );
+        cleanup_generation_dir(&generated.generation_dir)
+            .await
+            .expect("remove private generation fixture");
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_a_known_foreign_identity_before_quarantine() {
+        let root = tempdir().expect("create pre-quarantine identity root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let projection = generated.projections[0].clone();
+        let target = root.path().join(&projection.relative_path);
+        tokio::fs::remove_file(&target)
+            .await
+            .expect("remove owned projection");
+        tokio::fs::write(&target, b"foreign before cleanup")
+            .await
+            .expect("write foreign replacement");
+
+        let mut after_quarantine_ran = false;
+        let error = cleanup_owned_projection_path_with_hook(&projection, |capability_root| {
+            after_quarantine_ran = true;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut replacement = capability_root.open_with(&projection.file_name, &options)?;
+            use std::io::Write as _;
+            replacement.write_all(b"concurrent recreation")?;
+            Ok(())
+        })
+        .expect_err("known foreign identity is rejected before quarantine");
+        assert!(
+            format!("{error:#}").contains("file identity changed before quarantine"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !after_quarantine_ran,
+            "cleanup must not expose an absent project path for a known foreign identity"
+        );
+        assert_eq!(
+            tokio::fs::read(&target)
+                .await
+                .expect("foreign replacement remains in place"),
+            b"foreign before cleanup"
+        );
+        assert!(
+            !projection
+                .quarantine_root
+                .join(&projection.target_quarantine_path)
+                .exists(),
+            "known foreign entry is never moved into locald's quarantine"
         );
         cleanup_generation_dir(&generated.generation_dir)
             .await
