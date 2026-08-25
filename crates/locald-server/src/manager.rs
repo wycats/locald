@@ -5817,8 +5817,8 @@ impl ProcessManager {
                                 }
                             };
                             if let Some(instance_id) = instance_id
-                                && !projection_manager
-                                    .loaded_generated_sources_match(instance_id)
+                                && projection_manager
+                                    .generated_projection_change_requires_reconciliation(instance_id)
                                     .await
                             {
                                 info!(
@@ -6092,6 +6092,16 @@ impl ProcessManager {
             }
         }
         true
+    }
+
+    async fn generated_projection_change_requires_reconciliation(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> bool {
+        let recovered_retained_projection = self
+            .retry_deferred_generated_file_cleanups_for_instance(instance_id)
+            .await;
+        recovered_retained_projection || !self.loaded_generated_sources_match(instance_id).await
     }
 
     async fn queue_config_reload(&self, project_path: &Path) {
@@ -7640,14 +7650,32 @@ impl ProcessManager {
         self.refresh_generated_file_cleanup_warning(key).await;
     }
 
-    async fn retry_deferred_generated_file_cleanups(&self) {
-        let pending = std::mem::take(&mut *self.deferred_generated_file_cleanups.lock().await);
+    async fn retry_deferred_generated_file_cleanups_matching(
+        &self,
+        mut should_retry: impl FnMut(&DeferredGeneratedFileCleanup) -> bool,
+    ) -> bool {
+        let pending = {
+            let mut deferred = self.deferred_generated_file_cleanups.lock().await;
+            let mut pending = Vec::new();
+            let mut untouched = Vec::new();
+            for cleanup in std::mem::take(&mut *deferred) {
+                if should_retry(&cleanup) {
+                    pending.push(cleanup);
+                } else {
+                    untouched.push(cleanup);
+                }
+            }
+            *deferred = untouched;
+            pending
+        };
         let mut failures = Vec::new();
         let mut affected_keys = HashSet::new();
+        let mut completed = false;
         for cleanup in pending {
             affected_keys.extend(cleanup.keys.iter().cloned());
             match cleanup.generated_files.cleanup().await {
                 Ok(()) => {
+                    completed = true;
                     self.clear_generated_file_owner(&cleanup.generated_files)
                         .await;
                 }
@@ -7687,6 +7715,22 @@ impl ProcessManager {
                 self.broadcast_service_update(&key).await;
             }
         }
+        completed
+    }
+
+    async fn retry_deferred_generated_file_cleanups_for_instance(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> bool {
+        self.retry_deferred_generated_file_cleanups_matching(|cleanup| {
+            cleanup.keys.iter().any(|key| key.instance() == instance_id)
+        })
+        .await
+    }
+
+    async fn retry_deferred_generated_file_cleanups(&self) {
+        self.retry_deferred_generated_file_cleanups_matching(|_| true)
+            .await;
     }
 
     async fn stop_service_instance_runtime_locked(&self, key: &ServiceKey) -> Result<()> {
@@ -35632,7 +35676,12 @@ project_path = "config/runtime.locald.json"
         );
 
         std::fs::write(&target, original).expect("restore startup projection");
-        manager.retry_deferred_generated_file_cleanups().await;
+        assert!(
+            manager
+                .generated_projection_change_requires_reconciliation(key.instance())
+                .await,
+            "the projection event queues reconciliation after consuming restored ownership"
+        );
         assert!(
             manager
                 .deferred_generated_file_cleanups
@@ -35642,6 +35691,10 @@ project_path = "config/runtime.locald.json"
             "the running daemon consumes startup-retained ownership after restoration"
         );
         assert!(!target.exists());
+        crate::generated_files::prepare(&project_path, &key, &config, None)
+            .await
+            .expect("direct service-start preparation accepts the recovered target")
+            .expect("generated-file preparation remains configured");
     }
 
     #[tokio::test]
