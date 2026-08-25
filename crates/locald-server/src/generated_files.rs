@@ -195,6 +195,22 @@ fn ensure_retained_projection(condition: bool, message: impl FnOnce() -> String)
     }
 }
 
+fn retain_inaccessible_projection(
+    error: anyhow::Error,
+    message: impl FnOnce() -> String,
+) -> anyhow::Error {
+    let permission_denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    });
+    if permission_denied {
+        retained_projection_error(format!("{}: {error}", message()))
+    } else {
+        error
+    }
+}
+
 fn error_retains_projection(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -1455,8 +1471,22 @@ fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> R
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let mut file = quarantine_root.open_with(quarantine_path, &options)?;
-    let opened_metadata = file.metadata()?;
+    let mut file = quarantine_root
+        .open_with(quarantine_path, &options)
+        .map_err(|error| {
+            retain_inaccessible_projection(error.into(), || {
+                format!(
+                    "retaining orphaned generated-file projection because its quarantined entry is unreadable at `{}`",
+                    projection.quarantine_root.join(quarantine_path).display()
+                )
+            })
+        })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        retain_inaccessible_projection(error.into(), || {
+            "retaining orphaned generated-file projection because its quarantined entry is unreadable"
+                .to_owned()
+        })
+    })?;
     ensure_retained_projection(
         opened_metadata.is_file()
             && !opened_metadata.file_type().is_symlink()
@@ -1469,7 +1499,12 @@ fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> R
         },
     )?;
     ensure_retained_projection(
-        projection_provenance_matches(&file, &projection.projection_id)?,
+        projection_provenance_matches(&file, &projection.projection_id).map_err(|error| {
+            retain_inaccessible_projection(error, || {
+                "retaining orphaned generated-file projection because its quarantined provenance is unreadable"
+                    .to_owned()
+            })
+        })?,
         || {
             format!(
                 "retaining orphaned generated-file projection because its quarantined provenance changed at `{}`",
@@ -1478,7 +1513,14 @@ fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> R
         },
     )?;
     ensure_retained_projection(
-        projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
+        projection_contents_match_bounded(&mut file, projection.size, &projection.digest).map_err(
+            |error| {
+                retain_inaccessible_projection(error, || {
+                    "retaining orphaned generated-file projection because its quarantined content is unreadable"
+                        .to_owned()
+                })
+            },
+        )?,
         || {
             format!(
                 "retaining orphaned generated-file projection because its quarantined content changed at `{}`",
@@ -1544,8 +1586,24 @@ where
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let file = parent.open_with(&projection.file_name, &options)?;
-    let opened_metadata = file.metadata()?;
+    let file = parent
+        .open_with(&projection.file_name, &options)
+        .map_err(|error| {
+            retain_inaccessible_projection(error.into(), || {
+                format!(
+                    "retaining generated-file projection `{}` because it is unreadable before quarantine",
+                    projection.canonical_project_root.join(&projection.relative_path).display()
+                )
+            })
+        })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        retain_inaccessible_projection(error.into(), || {
+            format!(
+                "retaining generated-file projection `{}` because it became unreadable before quarantine",
+                projection.canonical_project_root.join(&projection.relative_path).display()
+            )
+        })
+    })?;
     ensure_retained_projection(
         opened_metadata.is_file()
             && !opened_metadata.file_type().is_symlink()
@@ -1561,7 +1619,14 @@ where
         },
     )?;
     ensure_retained_projection(
-        projection_provenance_matches(&file, &projection.projection_id)?,
+        projection_provenance_matches(&file, &projection.projection_id).map_err(|error| {
+            retain_inaccessible_projection(error, || {
+                format!(
+                    "retaining generated-file projection `{}` because its provenance is unreadable before quarantine",
+                    projection.canonical_project_root.join(&projection.relative_path).display()
+                )
+            })
+        })?,
         || {
             format!(
                 "retaining generated-file projection `{}` because its provenance changed before quarantine",
@@ -1641,8 +1706,22 @@ fn cleanup_quarantined_projection_path(
         options.read(true);
         #[cfg(unix)]
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        let mut file = quarantine_root.open_with(quarantine_path, &options)?;
-        let opened_metadata = file.metadata()?;
+        let mut file = quarantine_root
+            .open_with(quarantine_path, &options)
+            .map_err(|error| {
+                retain_inaccessible_projection(error.into(), || {
+                    format!(
+                        "retaining generated-file projection `{}` because it is unreadable in quarantine",
+                        projection.quarantine_root.join(quarantine_path).display()
+                    )
+                })
+            })?;
+        let opened_metadata = file.metadata().map_err(|error| {
+            retain_inaccessible_projection(error.into(), || {
+                "retaining generated-file projection because it became unreadable in quarantine"
+                    .to_owned()
+            })
+        })?;
         ensure_retained_projection(
             opened_metadata.is_file()
                 && !opened_metadata.file_type().is_symlink()
@@ -1655,7 +1734,12 @@ fn cleanup_quarantined_projection_path(
             },
         )?;
         ensure_retained_projection(
-            projection_provenance_matches(&file, &projection.projection_id)?,
+            projection_provenance_matches(&file, &projection.projection_id).map_err(|error| {
+                retain_inaccessible_projection(error, || {
+                    "retaining generated-file projection because its quarantined provenance is unreadable"
+                        .to_owned()
+                })
+            })?,
             || {
                 format!(
                     "retaining generated-file projection `{}` because its provenance changed",
@@ -1664,7 +1748,13 @@ fn cleanup_quarantined_projection_path(
             },
         )?;
         ensure_retained_projection(
-            projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
+            projection_contents_match_bounded(&mut file, projection.size, &projection.digest)
+                .map_err(|error| {
+                    retain_inaccessible_projection(error, || {
+                        "retaining generated-file projection because its quarantined content is unreadable"
+                            .to_owned()
+                    })
+                })?,
             || {
                 format!(
                     "retaining generated-file projection `{}` because its content changed",
@@ -4036,6 +4126,50 @@ project_path = "chat/two.locald.json"
             generated.generation_dir.exists(),
             "recovery retains the ownership manifest for a later exact retry"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_isolates_an_unreadable_owned_projection_for_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempdir().expect("create unreadable projection root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let projection = root.path().join("chat/runtime.locald.json");
+        let original_permissions = std::fs::metadata(&projection)
+            .expect("read original permissions")
+            .permissions();
+        let mut unreadable = original_permissions.clone();
+        unreadable.set_mode(0);
+        std::fs::set_permissions(&projection, unreadable).expect("remove projection read access");
+
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("unreadable projection cannot block unrelated startup recovery");
+        assert!(projection.exists());
+        assert!(
+            generated.generation_dir.exists(),
+            "unreadable projection retains its durable retry authority"
+        );
+
+        std::fs::set_permissions(&projection, original_permissions)
+            .expect("restore projection read access");
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("retry removes the restored owned projection");
+        assert!(!projection.exists());
     }
 
     #[tokio::test]
