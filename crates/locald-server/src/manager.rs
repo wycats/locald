@@ -6,7 +6,9 @@ use crate::catalog_publication::{
     catalog_schema_version, ensure_v5_backup, ensure_v5_recovery_backup, host_set_for_catalog,
 };
 use crate::config_loader::ConfigLoader;
-use crate::generated_files::{GeneratedFileSet, PreparedGeneratedFileSet};
+use crate::generated_files::{
+    GeneratedFileSet, PreparedGeneratedFileSet, retained_generated_file_set,
+};
 use crate::health::{HealthMonitor, ReadinessRequirement};
 use crate::lifecycle_migration::{
     availability_demand_for_attachment_source, manual_cli_session_demand,
@@ -1366,16 +1368,15 @@ impl ProcessManager {
         ) {
             Self::ensure_postgres_resource_namespace_ready(key, display_name)?;
         }
-        let generated_files = if let Some(prepared) = prepared_generated_files {
-            Some(
-                crate::generated_files::materialize_prepared(
-                    &self.availability_data_dir,
-                    key,
-                    &listener_runtime.bindings,
-                    &prepared,
-                )
-                .await?,
+        let generated_files_result = if let Some(prepared) = prepared_generated_files {
+            crate::generated_files::materialize_prepared(
+                &self.availability_data_dir,
+                key,
+                &listener_runtime.bindings,
+                &prepared,
             )
+            .await
+            .map(Some)
         } else {
             crate::generated_files::materialize(
                 &self.availability_data_dir,
@@ -1384,7 +1385,17 @@ impl ProcessManager {
                 service_config,
                 &listener_runtime.bindings,
             )
-            .await?
+            .await
+        };
+        let generated_files = match generated_files_result {
+            Ok(generated_files) => generated_files,
+            Err(error) => {
+                if let Some(generated_files) = retained_generated_file_set(&error) {
+                    self.defer_generated_file_cleanup(key, &generated_files)
+                        .await;
+                }
+                return Err(error);
+            }
         };
         Ok(StagedServiceRuntime {
             port,
@@ -7511,22 +7522,31 @@ impl ProcessManager {
                 Ok(())
             }
             Err(error) => {
-                let mut deferred = self.deferred_generated_file_cleanups.lock().await;
-                if !deferred
-                    .iter()
-                    .any(|pending| pending.generated_files == *generated_files)
-                {
-                    deferred.push(DeferredGeneratedFileCleanup {
-                        key: key.clone(),
-                        generated_files: generated_files.clone(),
-                    });
-                }
-                drop(deferred);
-                self.clear_generated_file_owner(generated_files).await;
-                self.refresh_generated_file_cleanup_warning(key).await;
+                self.defer_generated_file_cleanup(key, generated_files)
+                    .await;
                 Err(error)
             }
         }
+    }
+
+    async fn defer_generated_file_cleanup(
+        &self,
+        key: &ServiceKey,
+        generated_files: &GeneratedFileSet,
+    ) {
+        let mut deferred = self.deferred_generated_file_cleanups.lock().await;
+        if !deferred
+            .iter()
+            .any(|pending| pending.generated_files == *generated_files)
+        {
+            deferred.push(DeferredGeneratedFileCleanup {
+                key: key.clone(),
+                generated_files: generated_files.clone(),
+            });
+        }
+        drop(deferred);
+        self.clear_generated_file_owner(generated_files).await;
+        self.refresh_generated_file_cleanup_warning(key).await;
     }
 
     async fn retry_deferred_generated_file_cleanups(&self) {
@@ -38314,7 +38334,7 @@ project_path = "chat/runtime.locald.json"
         let error = projected_reuse_plan(&manager, &config, &key, &project_path)
             .await
             .expect_err("ancestor swap rejects reuse");
-        assert!(format!("{error:#}").contains("without following symlinks"));
+        assert!(format!("{error:#}").contains("no longer reachable"));
         assert_eq!(
             std::fs::read(outside.join("runtime.locald.json")).expect("read outside"),
             b"outside foreign"

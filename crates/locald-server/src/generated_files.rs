@@ -143,6 +143,88 @@ pub(crate) struct GeneratedFileSet {
     projections: Vec<ProjectionOwnership>,
 }
 
+#[derive(Debug)]
+struct RetainedProjectionError(String);
+
+impl std::fmt::Display for RetainedProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RetainedProjectionError {}
+
+#[derive(Debug)]
+struct StaleProjectionParentError(String);
+
+impl std::fmt::Display for StaleProjectionParentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleProjectionParentError {}
+
+#[derive(Debug)]
+struct RetainedGeneratedFileSetError {
+    source: anyhow::Error,
+    generated_files: GeneratedFileSet,
+}
+
+impl std::fmt::Display for RetainedGeneratedFileSetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for RetainedGeneratedFileSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn retained_projection_error(message: impl Into<String>) -> anyhow::Error {
+    RetainedProjectionError(message.into()).into()
+}
+
+fn ensure_retained_projection(condition: bool, message: impl FnOnce() -> String) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(retained_projection_error(message()))
+    }
+}
+
+fn error_retains_projection(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RetainedProjectionError>().is_some())
+}
+
+fn error_proves_stale_projection_parent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StaleProjectionParentError>().is_some())
+}
+
+fn io_error_proves_stale_projection_parent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.kind() == std::io::ErrorKind::NotADirectory
+        || error.raw_os_error() == Some(libc::ELOOP)
+}
+
+fn stale_projection_parent_error(message: impl Into<String>) -> anyhow::Error {
+    StaleProjectionParentError(message.into()).into()
+}
+
+pub(crate) fn retained_generated_file_set(error: &anyhow::Error) -> Option<GeneratedFileSet> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<RetainedGeneratedFileSetError>()
+            .map(|retained| retained.generated_files.clone())
+    })
+}
+
 impl GeneratedFileSet {
     pub(crate) fn path(&self, name: &str) -> Option<&Path> {
         self.paths.get(name).map(PathBuf::as_path)
@@ -576,9 +658,19 @@ async fn rollback_or_retain<T>(
     projections: &[ProjectionOwnership],
 ) -> Result<T> {
     if let Err(rollback_error) = cleanup_projections(projections).await {
-        return Err(error.context(format!(
+        let source = error.context(format!(
             "{scope} was incomplete; durable ownership state was retained for recovery: {rollback_error:#}"
-        )));
+        ));
+        return Err(RetainedGeneratedFileSetError {
+            source,
+            generated_files: GeneratedFileSet {
+                generation_dir: generation_directory.to_path_buf(),
+                paths: BTreeMap::new(),
+                source_fingerprints: BTreeMap::new(),
+                projections: projections.to_vec(),
+            },
+        }
+        .into());
     }
     if let Err(rollback_error) = tokio::fs::remove_dir_all(generation_directory).await {
         return Err(error.context(format!(
@@ -1057,11 +1149,12 @@ fn open_exact_project_parent(
         expected_project_root_identity,
         parent_relative_path,
     )?;
-    anyhow::ensure!(
-        projection_file_identity(&current.dir_metadata()?) == *expected_parent_identity,
-        "generated-file project_path parent identity changed at `{}`",
-        canonical_project_root.join(parent_relative_path).display()
-    );
+    if projection_file_identity(&current.dir_metadata()?) != *expected_parent_identity {
+        return Err(stale_projection_parent_error(format!(
+            "generated-file project_path parent identity changed at `{}`",
+            canonical_project_root.join(parent_relative_path).display()
+        )));
+    }
     Ok(current)
 }
 
@@ -1070,22 +1163,40 @@ fn open_project_parent_nofollow(
     expected_project_root_identity: &ProjectionFileIdentity,
     parent_relative_path: &Path,
 ) -> Result<Dir> {
-    let root = Dir::open_ambient_dir(canonical_project_root, ambient_authority())?;
-    anyhow::ensure!(
-        projection_file_identity(&root.dir_metadata()?) == *expected_project_root_identity,
-        "generated-file project root identity changed at `{}`",
-        canonical_project_root.display()
-    );
+    let root =
+        Dir::open_ambient_dir(canonical_project_root, ambient_authority()).map_err(|error| {
+            if io_error_proves_stale_projection_parent(&error) {
+                stale_projection_parent_error(format!(
+                    "generated-file project root is no longer reachable at `{}`: {error}",
+                    canonical_project_root.display()
+                ))
+            } else {
+                error.into()
+            }
+        })?;
+    if projection_file_identity(&root.dir_metadata()?) != *expected_project_root_identity {
+        return Err(stale_projection_parent_error(format!(
+            "generated-file project root identity changed at `{}`",
+            canonical_project_root.display()
+        )));
+    }
     let mut current = root;
     for component in parent_relative_path.components() {
         let Component::Normal(component) = component else {
             anyhow::bail!("generated-file projection parent contains an unsafe component");
         };
-        current = open_directory_component_nofollow(&current, component).with_context(|| {
-            format!(
-                "failed to open generated-file project_path parent `{}` without following symlinks",
-                canonical_project_root.join(parent_relative_path).display()
-            )
+        current = open_directory_component_nofollow(&current, component).map_err(|error| {
+            if io_error_proves_stale_projection_parent(&error) {
+                stale_projection_parent_error(format!(
+                    "generated-file project_path parent is no longer reachable at `{}`: {error}",
+                    canonical_project_root.join(parent_relative_path).display()
+                ))
+            } else {
+                anyhow::Error::from(error).context(format!(
+                    "failed to open generated-file project_path parent `{}` without following symlinks",
+                    canonical_project_root.join(parent_relative_path).display()
+                ))
+            }
         })?;
     }
     Ok(current)
@@ -1182,33 +1293,65 @@ where
 async fn cleanup_projections(projections: &[ProjectionOwnership]) -> Result<()> {
     let mut errors = Vec::new();
     for projection in projections {
-        let projection = projection.clone();
-        let result =
-            tokio::task::spawn_blocking(move || cleanup_owned_projection_path(&projection))
-                .await
-                .context("generated-file projection cleanup task failed")
-                .and_then(|result| result);
-        if let Err(error) = result {
+        if let Err(error) = cleanup_projection(projection).await {
             errors.push(format!("{error:#}"));
         }
     }
     if errors.is_empty() {
-        let quarantine_roots = projections
-            .iter()
-            .map(|projection| projection.quarantine_root.clone())
-            .collect::<BTreeSet<_>>();
-        for quarantine_root in quarantine_roots {
-            match tokio::fs::remove_dir(&quarantine_root).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => errors.push(format!(
-                    "failed to remove private projection quarantine `{}`: {error}",
-                    quarantine_root.display()
-                )),
-            }
-        }
+        remove_projection_quarantine_roots(projections, &mut errors).await;
     }
     finish_cleanup_errors("generated-file projection cleanup", &errors)
+}
+
+async fn cleanup_projection(projection: &ProjectionOwnership) -> Result<()> {
+    let projection = projection.clone();
+    tokio::task::spawn_blocking(move || cleanup_owned_projection_path(&projection))
+        .await
+        .context("generated-file projection cleanup task failed")?
+}
+
+async fn remove_projection_quarantine_roots(
+    projections: &[ProjectionOwnership],
+    errors: &mut Vec<String>,
+) {
+    let quarantine_roots = projections
+        .iter()
+        .map(|projection| projection.quarantine_root.clone())
+        .collect::<BTreeSet<_>>();
+    for quarantine_root in quarantine_roots {
+        match tokio::fs::remove_dir(&quarantine_root).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!(
+                "failed to remove private projection quarantine `{}`: {error}",
+                quarantine_root.display()
+            )),
+        }
+    }
+}
+
+async fn cleanup_projections_for_startup(projections: &[ProjectionOwnership]) -> Result<bool> {
+    let mut errors = Vec::new();
+    let mut retained = false;
+    for projection in projections {
+        match cleanup_projection(projection).await {
+            Ok(()) => {}
+            Err(error) if error_retains_projection(&error) => {
+                retained = true;
+                tracing::warn!(
+                    project_path = %projection.canonical_project_root.join(&projection.relative_path).display(),
+                    error = %format!("{error:#}"),
+                    "Retaining modified generated-file projection for recovery while continuing startup"
+                );
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    if !retained && errors.is_empty() {
+        remove_projection_quarantine_roots(projections, &mut errors).await;
+    }
+    finish_cleanup_errors("generated-file projection cleanup", &errors)?;
+    Ok(!retained)
 }
 
 fn finish_cleanup_errors(scope: &str, errors: &[String]) -> Result<()> {
@@ -1241,7 +1384,7 @@ where
         &projection.parent_identity,
     ) {
         Ok(parent) => parent,
-        Err(error) => {
+        Err(error) if error_proves_stale_projection_parent(&error) => {
             tracing::warn!(
                 project_path = %projection.canonical_project_root.join(&projection.relative_path).display(),
                 error = %format!("{error:#}"),
@@ -1249,6 +1392,7 @@ where
             );
             return cleanup_orphaned_projection_quarantine(projection);
         }
+        Err(error) => return Err(error),
     };
     let quarantine_root = match Dir::open_ambient_dir(
         &projection.quarantine_root,
@@ -1258,13 +1402,13 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return match parent.symlink_metadata(&projection.file_name) {
                 Err(path_error) if path_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Ok(_) => anyhow::bail!(
+                Ok(_) => Err(retained_projection_error(format!(
                     "retaining generated-file projection `{}` because its private quarantine root is missing",
                     projection
                         .canonical_project_root
                         .join(&projection.relative_path)
                         .display()
-                ),
+                ))),
                 Err(path_error) => Err(path_error.into()),
             };
         }
@@ -1280,48 +1424,68 @@ fn cleanup_orphaned_projection_quarantine(projection: &ProjectionOwnership) -> R
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-    anyhow::ensure!(
+    ensure_retained_projection(
         projection_file_identity(&quarantine_root.dir_metadata()?)
             == projection.quarantine_root_identity,
-        "retaining orphaned generated-file projection because its private quarantine root identity changed at `{}`",
-        projection.quarantine_root.display()
-    );
+        || {
+            format!(
+                "retaining orphaned generated-file projection because its private quarantine root identity changed at `{}`",
+                projection.quarantine_root.display()
+            )
+        },
+    )?;
     let quarantine_path = projection.target_quarantine_path.as_path();
     let metadata = match quarantine_root.symlink_metadata(quarantine_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(
+    ensure_retained_projection(
         metadata.is_file()
             && !metadata.file_type().is_symlink()
             && projection_file_identity(&metadata) == projection.identity,
-        "retaining orphaned generated-file projection because its quarantined entry identity changed at `{}`",
-        projection.quarantine_root.join(quarantine_path).display()
-    );
+        || {
+            format!(
+                "retaining orphaned generated-file projection because its quarantined entry identity changed at `{}`",
+                projection.quarantine_root.join(quarantine_path).display()
+            )
+        },
+    )?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let mut file = quarantine_root.open_with(quarantine_path, &options)?;
     let opened_metadata = file.metadata()?;
-    anyhow::ensure!(
+    ensure_retained_projection(
         opened_metadata.is_file()
             && !opened_metadata.file_type().is_symlink()
             && projection_file_identity(&opened_metadata) == projection.identity,
-        "retaining orphaned generated-file projection because its quarantined entry changed while opening `{}`",
-        projection.quarantine_root.join(quarantine_path).display()
-    );
-    anyhow::ensure!(
+        || {
+            format!(
+                "retaining orphaned generated-file projection because its quarantined entry changed while opening `{}`",
+                projection.quarantine_root.join(quarantine_path).display()
+            )
+        },
+    )?;
+    ensure_retained_projection(
         projection_provenance_matches(&file, &projection.projection_id)?,
-        "retaining orphaned generated-file projection because its quarantined provenance changed at `{}`",
-        projection.quarantine_root.join(quarantine_path).display()
-    );
-    anyhow::ensure!(
+        || {
+            format!(
+                "retaining orphaned generated-file projection because its quarantined provenance changed at `{}`",
+                projection.quarantine_root.join(quarantine_path).display()
+            )
+        },
+    )?;
+    ensure_retained_projection(
         projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
-        "retaining orphaned generated-file projection because its quarantined content changed at `{}`",
-        projection.quarantine_root.join(quarantine_path).display()
-    );
+        || {
+            format!(
+                "retaining orphaned generated-file projection because its quarantined content changed at `{}`",
+                projection.quarantine_root.join(quarantine_path).display()
+            )
+        },
+    )?;
     drop(file);
     quarantine_root.remove_file(quarantine_path)?;
     quarantine_root.open(".")?.sync_all()?;
@@ -1337,12 +1501,16 @@ fn cleanup_projection_in_open_parent<F>(
 where
     F: FnOnce(&Dir) -> Result<()>,
 {
-    anyhow::ensure!(
+    ensure_retained_projection(
         projection_file_identity(&quarantine_root.dir_metadata()?)
             == projection.quarantine_root_identity,
-        "retaining generated-file projection because its private quarantine root identity changed at `{}`",
-        projection.quarantine_root.display()
-    );
+        || {
+            format!(
+                "retaining generated-file projection because its private quarantine root identity changed at `{}`",
+                projection.quarantine_root.display()
+            )
+        },
+    )?;
     let quarantine_path = projection.target_quarantine_path.as_path();
 
     // A prior crash may have happened after the atomic move but before deletion.
@@ -1358,40 +1526,52 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(
+    ensure_retained_projection(
         metadata.is_file()
             && !metadata.file_type().is_symlink()
             && projection_file_identity(&metadata) == projection.identity,
-        "retaining generated-file projection `{}` because its file identity changed before quarantine",
-        projection
-            .canonical_project_root
-            .join(&projection.relative_path)
-            .display()
-    );
+        || {
+            format!(
+                "retaining generated-file projection `{}` because its file identity changed before quarantine",
+                projection
+                    .canonical_project_root
+                    .join(&projection.relative_path)
+                    .display()
+            )
+        },
+    )?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let file = parent.open_with(&projection.file_name, &options)?;
     let opened_metadata = file.metadata()?;
-    anyhow::ensure!(
+    ensure_retained_projection(
         opened_metadata.is_file()
             && !opened_metadata.file_type().is_symlink()
             && projection_file_identity(&opened_metadata) == projection.identity,
-        "retaining generated-file projection `{}` because its entry changed while opening before quarantine",
-        projection
-            .canonical_project_root
-            .join(&projection.relative_path)
-            .display()
-    );
-    anyhow::ensure!(
+        || {
+            format!(
+                "retaining generated-file projection `{}` because its entry changed while opening before quarantine",
+                projection
+                    .canonical_project_root
+                    .join(&projection.relative_path)
+                    .display()
+            )
+        },
+    )?;
+    ensure_retained_projection(
         projection_provenance_matches(&file, &projection.projection_id)?,
-        "retaining generated-file projection `{}` because its provenance changed before quarantine",
-        projection
-            .canonical_project_root
-            .join(&projection.relative_path)
-            .display()
-    );
+        || {
+            format!(
+                "retaining generated-file projection `{}` because its provenance changed before quarantine",
+                projection
+                    .canonical_project_root
+                    .join(&projection.relative_path)
+                    .display()
+            )
+        },
+    )?;
     drop(file);
     match rename_projection_noreplace(
         parent,
@@ -1438,16 +1618,24 @@ fn cleanup_quarantined_projection_path(
         Err(error) => return Err(error.into()),
     };
     let validation = (|| -> Result<()> {
-        anyhow::ensure!(
+        ensure_retained_projection(
             metadata.is_file() && !metadata.file_type().is_symlink(),
-            "retaining generated-file projection `{}` because it is not a regular file",
-            projection.quarantine_root.join(quarantine_path).display()
-        );
-        anyhow::ensure!(
+            || {
+                format!(
+                    "retaining generated-file projection `{}` because it is not a regular file",
+                    projection.quarantine_root.join(quarantine_path).display()
+                )
+            },
+        )?;
+        ensure_retained_projection(
             projection_file_identity(&metadata) == projection.identity,
-            "retaining generated-file projection `{}` because its file identity changed",
-            projection.quarantine_root.join(quarantine_path).display()
-        );
+            || {
+                format!(
+                    "retaining generated-file projection `{}` because its file identity changed",
+                    projection.quarantine_root.join(quarantine_path).display()
+                )
+            },
+        )?;
 
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1455,23 +1643,35 @@ fn cleanup_quarantined_projection_path(
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         let mut file = quarantine_root.open_with(quarantine_path, &options)?;
         let opened_metadata = file.metadata()?;
-        anyhow::ensure!(
+        ensure_retained_projection(
             opened_metadata.is_file()
                 && !opened_metadata.file_type().is_symlink()
                 && projection_file_identity(&opened_metadata) == projection.identity,
-            "retaining generated-file projection `{}` because its entry changed while opening",
-            projection.quarantine_root.join(quarantine_path).display()
-        );
-        anyhow::ensure!(
+            || {
+                format!(
+                    "retaining generated-file projection `{}` because its entry changed while opening",
+                    projection.quarantine_root.join(quarantine_path).display()
+                )
+            },
+        )?;
+        ensure_retained_projection(
             projection_provenance_matches(&file, &projection.projection_id)?,
-            "retaining generated-file projection `{}` because its provenance changed",
-            projection.quarantine_root.join(quarantine_path).display()
-        );
-        anyhow::ensure!(
+            || {
+                format!(
+                    "retaining generated-file projection `{}` because its provenance changed",
+                    projection.quarantine_root.join(quarantine_path).display()
+                )
+            },
+        )?;
+        ensure_retained_projection(
             projection_contents_match_bounded(&mut file, projection.size, &projection.digest)?,
-            "retaining generated-file projection `{}` because its content changed",
-            projection.quarantine_root.join(quarantine_path).display()
-        );
+            || {
+                format!(
+                    "retaining generated-file projection `{}` because its content changed",
+                    projection.quarantine_root.join(quarantine_path).display()
+                )
+            },
+        )?;
         Ok(())
     })();
 
@@ -1565,7 +1765,8 @@ fn projection_path_matches_ownership(projection: &ProjectionOwnership) -> Result
         &projection.parent_identity,
     ) {
         Ok(parent) => parent,
-        Err(_) => return Ok(false),
+        Err(error) if error_proves_stale_projection_parent(&error) => return Ok(false),
+        Err(error) => return Err(error),
     };
     let metadata = match parent.symlink_metadata(&projection.file_name) {
         Ok(metadata) => metadata,
@@ -1671,15 +1872,21 @@ async fn remove_generated_root(root: &Path) -> Result<()> {
         tokio::fs::remove_file(root).await?;
     } else {
         let mut errors = Vec::new();
+        let mut retained = false;
         for manifest in load_projection_manifests(root).await? {
-            if let Err(error) = cleanup_projections(&manifest.projections).await {
-                errors.push(format!("generation {}: {error:#}", manifest.generation));
+            match cleanup_projections_for_startup(&manifest.projections).await {
+                Ok(cleaned) => retained |= !cleaned,
+                Err(error) => {
+                    errors.push(format!("generation {}: {error:#}", manifest.generation));
+                }
             }
         }
         if !errors.is_empty() {
             return finish_cleanup_errors("generated-file manifest recovery", &errors);
         }
-        tokio::fs::remove_dir_all(root).await?;
+        if !retained {
+            tokio::fs::remove_dir_all(root).await?;
+        }
     }
     Ok(())
 }
@@ -2830,6 +3037,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_missing_or_replaced_project_parents_are_classified_as_stale() {
+        assert!(io_error_proves_stale_projection_parent(
+            &std::io::Error::from(std::io::ErrorKind::NotFound)
+        ));
+        assert!(io_error_proves_stale_projection_parent(
+            &std::io::Error::from(std::io::ErrorKind::NotADirectory)
+        ));
+        assert!(io_error_proves_stale_projection_parent(
+            &std::io::Error::from_raw_os_error(libc::ELOOP)
+        ));
+        assert!(!io_error_proves_stale_projection_parent(
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        ));
+        assert!(!io_error_proves_stale_projection_parent(
+            &std::io::Error::from_raw_os_error(libc::EMFILE)
+        ));
+        assert!(error_proves_stale_projection_parent(
+            &stale_projection_parent_error("stale fixture")
+        ));
+        assert!(!error_proves_stale_projection_parent(&anyhow::anyhow!(
+            "transient fixture"
+        )));
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_returns_retryable_generated_file_ownership() {
+        let root = tempdir().expect("create retained rollback root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create projection parent");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let data_dir = root.path().join("data");
+        let generated = materialize(&data_dir, root.path(), &key(), &config, &bindings())
+            .await
+            .expect("materialize")
+            .expect("generated set");
+        let target = root.path().join("chat/runtime.locald.json");
+        let owned = tokio::fs::read(&target).await.expect("read owned target");
+        tokio::fs::write(&target, b"modified")
+            .await
+            .expect("modify target");
+        let service_root = generated
+            .generation_dir
+            .parent()
+            .expect("generation has service root")
+            .to_path_buf();
+
+        let error = rollback_or_retain::<()>(
+            anyhow::anyhow!("publication failed"),
+            "publication rollback",
+            &generated.generation_dir,
+            &service_root,
+            &generated.projections,
+        )
+        .await
+        .expect_err("modified target prevents rollback");
+        let retained = retained_generated_file_set(&error)
+            .expect("failed rollback returns independently retryable ownership");
+        assert_eq!(retained.generation_dir, generated.generation_dir);
+        assert_eq!(retained.projections, generated.projections);
+
+        tokio::fs::write(&target, owned)
+            .await
+            .expect("restore owned target");
+        retained.cleanup().await.expect("retry retained cleanup");
+        assert!(!target.exists());
+    }
+
     #[tokio::test]
     async fn same_bytes_and_reused_identity_cannot_adopt_a_replacement() {
         let root = tempdir().expect("create provenance replacement root");
@@ -3176,9 +3456,16 @@ mod tests {
             modified_contents,
             "cleanup restores modified content instead of deleting it"
         );
+        cleanup_all_instances(&data_dir)
+            .await
+            .expect("modified projection is isolated without blocking global recovery");
         assert!(
-            cleanup_all_instances(&data_dir).await.is_err(),
-            "recovery retains the modified projection and its ownership manifest"
+            target.exists(),
+            "startup recovery retains the modified projection"
+        );
+        assert!(
+            staging_dir.exists(),
+            "startup recovery retains its durable ownership manifest"
         );
 
         tokio::fs::write(&target, &owned_contents)
@@ -3268,7 +3555,7 @@ mod tests {
         let error = materialize_prepared(&data_dir, &key(), &bindings(), &prepared)
             .await
             .expect_err("swapped ancestor rejects direct publication");
-        assert!(format!("{error:#}").contains("without following symlinks"));
+        assert!(format!("{error:#}").contains("no longer reachable"));
         assert_eq!(
             tokio::fs::read(outside.join("nested/runtime.locald.json"))
                 .await
@@ -3741,14 +4028,14 @@ project_path = "chat/two.locald.json"
             b"modified"
         );
         assert!(generated.generation_dir.exists());
-        let recovery_error = cleanup_all_instances(&data_dir)
+        cleanup_all_instances(&data_dir)
             .await
-            .expect_err("recovery also retains modified target");
-        assert!(
-            format!("{recovery_error:#}").contains("retaining generated-file projection"),
-            "unexpected recovery error: {recovery_error:#}"
-        );
+            .expect("recovery isolates the modified target from unrelated startup cleanup");
         assert!(projection.exists());
+        assert!(
+            generated.generation_dir.exists(),
+            "recovery retains the ownership manifest for a later exact retry"
+        );
     }
 
     #[tokio::test]
