@@ -595,7 +595,8 @@ async fn ensure_prepared_projection_filesystems(
     })
     .await
     .context("generated-file private filesystem identity task failed")??;
-    validate_prepared_projection_filesystems(&private_filesystem_identity, prepared)
+    validate_prepared_projection_filesystems(&private_filesystem_identity, prepared)?;
+    verify_prepared_projection_writes(prepared).await
 }
 
 fn validate_prepared_projection_filesystems(
@@ -620,6 +621,74 @@ fn ensure_projection_same_mount(
         private_identity == projection_parent_identity,
         "generated-file project_path requires locald's private data directory and the project to be on the same filesystem mount"
     );
+    Ok(())
+}
+
+async fn verify_prepared_projection_writes(prepared: &PreparedGeneratedFileSet) -> Result<()> {
+    let projections = prepared
+        .sources
+        .values()
+        .filter_map(|source| source.projection.clone())
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        for projection in projections {
+            let parent = open_exact_project_parent(
+                &projection.canonical_project_root,
+                &projection.project_root_identity,
+                &projection.parent_relative_path,
+                &projection.parent_identity,
+            )?;
+            verify_projection_parent_write(&parent).with_context(|| {
+                format!(
+                    "generated-file project_path parent `{}` cannot create projection entries",
+                    projection
+                        .canonical_project_root
+                        .join(&projection.parent_relative_path)
+                        .display()
+                )
+            })?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("generated-file project_path write preflight task failed")?
+}
+
+struct ProjectionWriteProbeCleanup<'a> {
+    parent: &'a Dir,
+    name: &'a Path,
+    removed: bool,
+}
+
+impl Drop for ProjectionWriteProbeCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.parent.remove_file(self.name);
+        }
+    }
+}
+
+fn verify_projection_parent_write(parent: &Dir) -> Result<()> {
+    let name = PathBuf::from(format!(
+        ".locald-projection-write-probe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let probe = parent.open_with(&name, &options)?;
+    drop(probe);
+
+    let mut cleanup = ProjectionWriteProbeCleanup {
+        parent,
+        name: &name,
+        removed: false,
+    };
+    parent.remove_file(&name)?;
+    cleanup.removed = true;
     Ok(())
 }
 
@@ -4167,6 +4236,49 @@ mod tests {
                 "nested cross-filesystem projection parent is rejected before materialization",
             );
         assert!(error.to_string().contains("same filesystem"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preparation_rejects_a_non_writable_projection_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("create projection-write root");
+        let parent = root.path().join("nested");
+        tokio::fs::create_dir(&parent)
+            .await
+            .expect("create projection parent");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "nested/runtime.locald.json", BTreeMap::new());
+        let original_permissions = std::fs::metadata(&parent)
+            .expect("inspect projection parent")
+            .permissions();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+            .expect("make projection parent non-writable");
+
+        let result = prepare_for_materialization(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            None,
+        )
+        .await;
+        std::fs::set_permissions(&parent, original_permissions)
+            .expect("restore projection parent permissions");
+
+        let error = result.expect_err("non-writable parent is rejected before materialization");
+        assert!(format!("{error:#}").contains("cannot create projection entries"));
+        assert!(
+            std::fs::read_dir(&parent)
+                .expect("read restored projection parent")
+                .next()
+                .is_none(),
+            "the write probe leaves no project entry behind"
+        );
     }
 
     #[cfg(target_os = "linux")]
