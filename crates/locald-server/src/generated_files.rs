@@ -10,6 +10,7 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use jsonc_parser::{ParseOptions, parse_to_serde_value, parse_to_value};
+use locald_core::ProjectInstanceId;
 use locald_core::config::{GeneratedFileConfig, LocaldConfig, ServiceConfig};
 use locald_core::service::{ListenerName, ServiceKey, ServiceRuntimeBindings};
 use regex::Regex;
@@ -70,7 +71,15 @@ struct PreparedProjection {
     relative_path: PathBuf,
     parent_relative_path: PathBuf,
     parent_identity: ProjectionFileIdentity,
+    parent_filesystem_identity: ProjectionFilesystemIdentity,
     file_name: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionFilesystemIdentity {
+    device: u64,
+    #[cfg(target_os = "linux")]
+    mount_id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +155,7 @@ pub(crate) struct GeneratedFileSet {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StartupGeneratedFileCleanup {
+    pub(crate) instance_id: Option<ProjectInstanceId>,
     pub(crate) service_resource_ids: BTreeSet<OsString>,
     pub(crate) generated_files: GeneratedFileSet,
 }
@@ -337,6 +347,7 @@ impl GeneratedFileSet {
         &self,
         canonical_project_root: &Path,
         parent_identity: &ProjectionFileIdentity,
+        selected_entry_name: &Path,
         target_metadata: &cap_std::fs::Metadata,
     ) -> bool {
         if !target_metadata.is_file() || target_metadata.file_type().is_symlink() {
@@ -346,6 +357,7 @@ impl GeneratedFileSet {
         let Some(ownership) = self.projections.iter().find(|ownership| {
             ownership.canonical_project_root == canonical_project_root
                 && ownership.parent_identity == *parent_identity
+                && ownership.file_name == selected_entry_name
                 && ownership.identity == target_identity
         }) else {
             return false;
@@ -558,7 +570,7 @@ async fn ensure_prepared_projection_filesystems(
     }
 
     let mut private_parent = service_root_path(data_dir, key);
-    let private_identity = loop {
+    let private_parent = loop {
         match tokio::fs::symlink_metadata(&private_parent).await {
             Ok(metadata) => {
                 anyhow::ensure!(
@@ -566,7 +578,7 @@ async fn ensure_prepared_projection_filesystems(
                     "generated-file private data ancestor `{}` is not a regular directory",
                     private_parent.display()
                 );
-                break projection_file_identity_from_std(&metadata);
+                break private_parent;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 anyhow::ensure!(
@@ -577,11 +589,17 @@ async fn ensure_prepared_projection_filesystems(
             Err(error) => return Err(error.into()),
         }
     };
-    validate_prepared_projection_filesystems(&private_identity, prepared)
+    let private_filesystem_identity = tokio::task::spawn_blocking(move || {
+        let private_parent = Dir::open_ambient_dir(&private_parent, ambient_authority())?;
+        projection_filesystem_identity(&private_parent)
+    })
+    .await
+    .context("generated-file private filesystem identity task failed")??;
+    validate_prepared_projection_filesystems(&private_filesystem_identity, prepared)
 }
 
 fn validate_prepared_projection_filesystems(
-    private_identity: &ProjectionFileIdentity,
+    private_identity: &ProjectionFilesystemIdentity,
     prepared: &PreparedGeneratedFileSet,
 ) -> Result<()> {
     for projection in prepared
@@ -589,8 +607,19 @@ fn validate_prepared_projection_filesystems(
         .values()
         .filter_map(|source| source.projection.as_ref())
     {
-        ensure_projection_same_filesystem(private_identity, &projection.parent_identity)?;
+        ensure_projection_same_mount(private_identity, &projection.parent_filesystem_identity)?;
     }
+    Ok(())
+}
+
+fn ensure_projection_same_mount(
+    private_identity: &ProjectionFilesystemIdentity,
+    projection_parent_identity: &ProjectionFilesystemIdentity,
+) -> Result<()> {
+    anyhow::ensure!(
+        private_identity == projection_parent_identity,
+        "generated-file project_path requires locald's private data directory and the project to be on the same filesystem mount"
+    );
     Ok(())
 }
 
@@ -2083,13 +2112,13 @@ where
 #[cfg(test)]
 pub(crate) async fn cleanup_instance(
     data_dir: &Path,
-    instance_id: locald_core::ProjectInstanceId,
+    instance_id: ProjectInstanceId,
 ) -> Result<()> {
     let root = data_dir
         .join("instances")
         .join(instance_id.to_string())
         .join("generated");
-    remove_generated_root(&root)
+    remove_generated_root(&root, Some(instance_id))
         .await
         .with_context(|| {
             format!(
@@ -2135,8 +2164,12 @@ pub(crate) async fn cleanup_all_instances(
         if !file_type.is_dir() {
             continue;
         }
+        let instance_name = entry.file_name();
+        let instance_id = instance_name
+            .to_str()
+            .and_then(|name| name.parse::<ProjectInstanceId>().ok());
         let generated_root = entry.path().join("generated");
-        match remove_generated_root(&generated_root)
+        match remove_generated_root(&generated_root, instance_id)
             .await
             .with_context(|| {
                 format!(
@@ -2153,7 +2186,10 @@ pub(crate) async fn cleanup_all_instances(
     Ok(retained)
 }
 
-async fn remove_generated_root(root: &Path) -> Result<Vec<StartupGeneratedFileCleanup>> {
+async fn remove_generated_root(
+    root: &Path,
+    instance_id: Option<ProjectInstanceId>,
+) -> Result<Vec<StartupGeneratedFileCleanup>> {
     let metadata = match tokio::fs::symlink_metadata(root).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2177,6 +2213,7 @@ async fn remove_generated_root(root: &Path) -> Result<Vec<StartupGeneratedFileCl
                 }
                 Ok(false) => {
                     retained.push(StartupGeneratedFileCleanup {
+                        instance_id,
                         service_resource_ids: BTreeSet::from([loaded.service_resource_id]),
                         generated_files: GeneratedFileSet {
                             generation_dir: loaded.generation_dir,
@@ -2524,26 +2561,46 @@ async fn prepare_projection_target(
     let root_identity_for_task = project_root_identity.clone();
     let parent_for_task = parent_relative_path.clone();
     let file_name_for_task = file_name.clone();
-    let (parent_identity, target_metadata) = tokio::task::spawn_blocking(move || {
-        let parent = open_project_parent_nofollow(
-            &root_for_task,
-            &root_identity_for_task,
-            &parent_for_task,
-        )?;
-        let parent_identity = projection_file_identity(&parent.dir_metadata()?);
-        let metadata = match parent.symlink_metadata(&file_name_for_task) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        Ok::<_, anyhow::Error>((parent_identity, metadata))
-    })
-    .await
-    .context("generated-file project_path parent capability task failed")??;
+    let (parent_identity, parent_filesystem_identity, target_metadata, selected_entry_name) =
+        tokio::task::spawn_blocking(move || {
+            let parent = open_project_parent_nofollow(
+                &root_for_task,
+                &root_identity_for_task,
+                &parent_for_task,
+            )?;
+            let parent_identity = projection_file_identity(&parent.dir_metadata()?);
+            let parent_filesystem_identity = projection_filesystem_identity(&parent)?;
+            let metadata = match parent.symlink_metadata(&file_name_for_task) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let selected_entry_name = metadata
+                .as_ref()
+                .map(|metadata| {
+                    selected_projection_entry_name(&parent, &file_name_for_task, metadata)
+                })
+                .transpose()?;
+            Ok::<_, anyhow::Error>((
+                parent_identity,
+                parent_filesystem_identity,
+                metadata,
+                selected_entry_name,
+            ))
+        })
+        .await
+        .context("generated-file project_path parent capability task failed")??;
     let target_is_owned = match (allowed_existing, target_metadata.as_ref()) {
         (Some(owned), Some(metadata)) => {
             owned
-                .owns_projection(&canonical_project_root, &parent_identity, metadata)
+                .owns_projection(
+                    &canonical_project_root,
+                    &parent_identity,
+                    selected_entry_name
+                        .as_deref()
+                        .context("generated-file project_path selected entry is missing")?,
+                    metadata,
+                )
                 .await
         }
         _ => false,
@@ -2571,8 +2628,46 @@ async fn prepare_projection_target(
         relative_path,
         parent_relative_path,
         parent_identity,
+        parent_filesystem_identity,
         file_name,
     })
+}
+
+fn selected_projection_entry_name(
+    parent: &Dir,
+    requested_name: &Path,
+    target_metadata: &cap_std::fs::Metadata,
+) -> Result<PathBuf> {
+    let target_identity = projection_file_identity(target_metadata);
+    let mut case_match = None;
+    for entry in parent.entries()? {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let entry_metadata = entry.metadata()?;
+        if projection_file_identity(&entry_metadata) != target_identity {
+            continue;
+        }
+        if Path::new(&entry_name) == requested_name {
+            return Ok(PathBuf::from(entry_name));
+        }
+        if entry_name
+            .to_str()
+            .zip(requested_name.to_str())
+            .is_some_and(|(actual, requested)| actual.eq_ignore_ascii_case(requested))
+        {
+            anyhow::ensure!(
+                case_match.is_none(),
+                "generated-file project_path selected multiple case-equivalent directory entries"
+            );
+            case_match = Some(PathBuf::from(entry_name));
+        }
+    }
+    case_match.context(
+        "generated-file project_path changed while locald was selecting its directory entry",
+    )
 }
 
 const fn project_path_supported() -> bool {
@@ -2594,6 +2689,48 @@ fn projection_file_identity_from_std(metadata: &std::fs::Metadata) -> Projection
         #[cfg(not(unix))]
         unsupported: true,
     }
+}
+
+#[allow(unsafe_code)] // statx binds the comparison to the selected directory mount.
+fn projection_filesystem_identity(dir: &Dir) -> Result<ProjectionFilesystemIdentity> {
+    let metadata = dir.dir_metadata()?;
+    #[cfg(target_os = "linux")]
+    let mount_id = {
+        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: `dir` owns a valid descriptor, the empty path is NUL-terminated,
+        // and `stat` points to writable storage for the duration of the call.
+        let result = unsafe {
+            libc::statx(
+                dir.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_MNT_ID,
+                stat.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect generated-file filesystem mount identity");
+        }
+        // SAFETY: a successful `statx` initialized the output structure.
+        let stat = unsafe { stat.assume_init() };
+        anyhow::ensure!(
+            stat.stx_mask & libc::STATX_MNT_ID != 0,
+            "generated-file filesystem mount identity is unavailable"
+        );
+        stat.stx_mnt_id
+    };
+    Ok(ProjectionFilesystemIdentity {
+        #[cfg(unix)]
+        device: {
+            use cap_std::fs::MetadataExt;
+            metadata.dev()
+        },
+        #[cfg(not(unix))]
+        device: 0,
+        #[cfg(target_os = "linux")]
+        mount_id,
+    })
 }
 
 fn open_source_under_project_capability(
@@ -3491,6 +3628,12 @@ mod tests {
             .expect("materialize projection")
             .expect("generated set");
 
+        // Keep the unlinked directories alive so Linux cannot immediately
+        // reuse both recorded inodes for the replacement hierarchy.
+        let _original_project =
+            std::fs::File::open(&project_root).expect("hold original project directory identity");
+        let _original_parent = std::fs::File::open(project_root.join("chat"))
+            .expect("hold original projection parent identity");
         tokio::fs::remove_dir_all(&project_root)
             .await
             .expect("remove original project");
@@ -4016,14 +4159,44 @@ mod tests {
             .next()
             .and_then(|source| source.projection.as_mut())
             .expect("prepared projection");
-        let private_identity = projection.project_root_identity.clone();
-        projection.parent_identity.device = private_identity.device.wrapping_add(1);
+        let private_identity = projection.parent_filesystem_identity.clone();
+        projection.parent_filesystem_identity.device = private_identity.device.wrapping_add(1);
 
         let error = validate_prepared_projection_filesystems(&private_identity, &prepared)
             .expect_err(
                 "nested cross-filesystem projection parent is rejected before materialization",
             );
         assert!(error.to_string().contains("same filesystem"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn preparation_rejects_a_distinct_mount_with_the_same_device() {
+        let root = tempdir().expect("create projection-mount root");
+        tokio::fs::create_dir(root.path().join("nested"))
+            .await
+            .expect("create projection parent");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "nested/runtime.locald.json", BTreeMap::new());
+        let mut prepared = prepare(root.path(), &key(), &config, None)
+            .await
+            .expect("prepare projection")
+            .expect("prepared set");
+        let projection = prepared
+            .sources
+            .values_mut()
+            .next()
+            .and_then(|source| source.projection.as_mut())
+            .expect("prepared projection");
+        let private_identity = projection.parent_filesystem_identity.clone();
+        projection.parent_filesystem_identity.mount_id = private_identity.mount_id.wrapping_add(1);
+
+        let error = validate_prepared_projection_filesystems(&private_identity, &prepared)
+            .expect_err("a distinct bind mount is rejected before materialization");
+        assert!(error.to_string().contains("same filesystem mount"));
     }
 
     #[tokio::test]
@@ -4916,6 +5089,46 @@ project_path = "chat/two.locald.json"
         prepare(root.path(), &key(), &renamed, Some(&generated))
             .await
             .expect("case-only spelling of the same owned entry passes preflight");
+        generated.cleanup().await.expect("cleanup owned projection");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_link_alias_does_not_inherit_projection_ownership() {
+        let root = tempdir().expect("create hard-link alias root");
+        tokio::fs::create_dir(root.path().join("chat"))
+            .await
+            .expect("create package root");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "chat/runtime.locald.json", BTreeMap::new());
+        let generated = materialize(
+            &root.path().join("data"),
+            root.path(),
+            &key(),
+            &config,
+            &bindings(),
+        )
+        .await
+        .expect("materialize")
+        .expect("generated set");
+        let target = root.path().join("chat/runtime.locald.json");
+        let alias = root.path().join("chat/alias.locald.json");
+        std::fs::hard_link(&target, &alias).expect("create unrecorded hard-link alias");
+        let aliased =
+            projected_service_config("source.json", "chat/alias.locald.json", BTreeMap::new());
+
+        let error = prepare(root.path(), &key(), &aliased, Some(&generated))
+            .await
+            .expect_err("a distinct hard-link alias cannot inherit ownership");
+        let message = format!("{error:#}");
+        assert!(message.contains("never adopts or overwrites"), "{message}");
+
+        tokio::fs::remove_file(alias)
+            .await
+            .expect("remove hard-link alias");
         generated.cleanup().await.expect("cleanup owned projection");
     }
 

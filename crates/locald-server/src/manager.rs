@@ -491,6 +491,7 @@ struct ConfigTransitionPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeferredGeneratedFileCleanup {
+    instance_id: Option<ProjectInstanceId>,
     keys: HashSet<ServiceKey>,
     generated_files: GeneratedFileSet,
 }
@@ -4150,6 +4151,7 @@ impl ProcessManager {
                     .any(|pending| pending.generated_files == retained.generated_files)
                 {
                     deferred.push(DeferredGeneratedFileCleanup {
+                        instance_id: retained.instance_id,
                         keys,
                         generated_files: retained.generated_files,
                     });
@@ -7644,6 +7646,7 @@ impl ProcessManager {
             .any(|pending| pending.generated_files == *generated_files)
         {
             deferred.push(DeferredGeneratedFileCleanup {
+                instance_id: Some(key.instance()),
                 keys: HashSet::from([key.clone()]),
                 generated_files: generated_files.clone(),
             });
@@ -7726,7 +7729,7 @@ impl ProcessManager {
         instance_id: ProjectInstanceId,
     ) -> bool {
         self.retry_deferred_generated_file_cleanups_matching(|cleanup| {
-            cleanup.keys.iter().any(|key| key.instance() == instance_id)
+            cleanup.instance_id == Some(instance_id)
         })
         .await
     }
@@ -35592,7 +35595,7 @@ project_path = "config/runtime.locald.json"
     }
 
     #[tokio::test]
-    async fn startup_retained_projection_is_registered_for_live_retry() {
+    async fn startup_retained_orphan_projection_is_registered_for_live_retry() {
         let dir = tempdir().expect("create startup retained cleanup directory");
         let project_path = dir.path().join("project");
         std::fs::create_dir_all(project_path.join("config")).expect("create config directory");
@@ -35610,25 +35613,6 @@ project_path = "config/runtime.locald.json"
         .expect("parse startup retained config");
         let manager = unregistered_availability_manager(dir.path());
         let key = ServiceKey::new(test_instance_id(), "worker");
-        manager
-            .state_manager
-            .save(&ServerState {
-                services: vec![PersistedServiceState {
-                    service_key: Some(key.clone()),
-                    name: "startup-retained:worker".to_owned(),
-                    config: LocaldConfig::default(),
-                    path: project_path.clone(),
-                    pid: None,
-                    process_identity: None,
-                    container_id: None,
-                    port: None,
-                    status: ServiceState::Stopped,
-                    health_status: HealthStatus::Unknown,
-                    health_source: HealthSource::None,
-                }],
-            })
-            .await
-            .expect("persist stopped service identity");
         let _generated = crate::generated_files::materialize(
             &manager.availability_data_dir,
             &project_path,
@@ -35651,32 +35635,12 @@ project_path = "config/runtime.locald.json"
         {
             let deferred = manager.deferred_generated_file_cleanups.lock().await;
             assert_eq!(deferred.len(), 1);
-            assert_eq!(deferred[0].keys, HashSet::from([key.clone()]));
+            assert!(
+                deferred[0].keys.is_empty(),
+                "the crash fixture has no published service record"
+            );
+            assert_eq!(deferred[0].instance_id, Some(key.instance()));
         }
-        manager.services.lock().await.insert(
-            key.clone(),
-            Service {
-                instance_id: key.instance(),
-                controller_generation: 0,
-                projection_generation: 1,
-                config: LocaldConfig::default(),
-                service_config: config.clone(),
-                resolved_env: HashMap::new(),
-                runtime_state: ServiceRuntime::None,
-                sticky_port: None,
-                pending_port_guard: None,
-                generated_files: None,
-                path: project_path.clone(),
-                health_status: HealthStatus::Unknown,
-                health_source: HealthSource::None,
-                warnings: Vec::new(),
-            },
-        );
-        assert!(manager.refresh_generated_file_cleanup_warning(&key).await);
-        assert_eq!(
-            manager.services.lock().await[&key].warnings,
-            vec![GENERATED_FILE_CLEANUP_WARNING]
-        );
 
         std::fs::write(&target, original).expect("restore startup projection");
         assert!(
