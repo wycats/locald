@@ -2736,12 +2736,14 @@ impl ProcessManager {
                         let environment_matches = resolved_env
                             .as_ref()
                             .is_some_and(|resolved_env| current_env == *resolved_env);
-                        let prepared_generated_file_set = crate::generated_files::prepare(
-                            project_path,
-                            &key,
-                            service_config,
-                            generated_files.as_ref(),
-                        )
+                        let prepared_generated_file_set =
+                            crate::generated_files::prepare_for_materialization(
+                                &self.availability_data_dir,
+                                project_path,
+                                &key,
+                                service_config,
+                                generated_files.as_ref(),
+                            )
                         .await
                         .with_context(|| {
                             format!(
@@ -6640,7 +6642,8 @@ impl ProcessManager {
                         publisher_cold_admission,
                         &mut publisher_preparation,
                         async {
-                            crate::generated_files::prepare(
+                            crate::generated_files::prepare_for_materialization(
+                                &self.availability_data_dir,
                                 &path,
                                 &key,
                                 service_config,
@@ -35691,10 +35694,16 @@ project_path = "config/runtime.locald.json"
             "the running daemon consumes startup-retained ownership after restoration"
         );
         assert!(!target.exists());
-        crate::generated_files::prepare(&project_path, &key, &config, None)
-            .await
-            .expect("direct service-start preparation accepts the recovered target")
-            .expect("generated-file preparation remains configured");
+        crate::generated_files::prepare_for_materialization(
+            &manager.availability_data_dir,
+            &project_path,
+            &key,
+            &config,
+            None,
+        )
+        .await
+        .expect("direct service-start preparation accepts the recovered target")
+        .expect("generated-file preparation remains configured");
     }
 
     #[tokio::test]

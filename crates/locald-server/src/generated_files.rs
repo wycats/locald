@@ -477,6 +477,22 @@ pub(crate) async fn prepare(
     Ok(Some(PreparedGeneratedFileSet { sources }))
 }
 
+/// Prepare generated files and reject projection targets that cannot receive
+/// hard links from this service's private generation before a runtime stops.
+pub(crate) async fn prepare_for_materialization(
+    data_dir: &Path,
+    project_root: &Path,
+    key: &ServiceKey,
+    service_config: &ServiceConfig,
+    allowed_existing: Option<&GeneratedFileSet>,
+) -> Result<Option<PreparedGeneratedFileSet>> {
+    let prepared = prepare(project_root, key, service_config, allowed_existing).await?;
+    if let Some(prepared) = &prepared {
+        ensure_prepared_projection_filesystems(data_dir, key, prepared).await?;
+    }
+    Ok(prepared)
+}
+
 /// Materialize one service's complete generated-file set.
 pub(crate) async fn materialize(
     data_dir: &Path,
@@ -490,7 +506,7 @@ pub(crate) async fn materialize(
     }
 
     let service_root = prepare_service_root(data_dir, key).await?;
-    let prepared = prepare(project_root, key, service_config, None)
+    let prepared = prepare_for_materialization(data_dir, project_root, key, service_config, None)
         .await?
         .context("non-empty generated-file declarations produced no prepared snapshot")?;
     publish_prepared(&service_root, key, bindings, &prepared)
@@ -510,15 +526,72 @@ pub(crate) async fn materialize_prepared(
 }
 
 async fn prepare_service_root(data_dir: &Path, key: &ServiceKey) -> Result<PathBuf> {
-    let generated_root = data_dir
-        .join("instances")
-        .join(key.instance().to_string())
-        .join("generated");
-    create_private_directory(&generated_root, true).await?;
+    let service_root = service_root_path(data_dir, key);
+    let generated_root = service_root
+        .parent()
+        .context("generated-file service root has no generated parent")?;
+    create_private_directory(generated_root, true).await?;
 
-    let service_root = generated_root.join(key.resource_id());
     create_private_directory(&service_root, true).await?;
     Ok(service_root)
+}
+
+fn service_root_path(data_dir: &Path, key: &ServiceKey) -> PathBuf {
+    data_dir
+        .join("instances")
+        .join(key.instance().to_string())
+        .join("generated")
+        .join(key.resource_id())
+}
+
+async fn ensure_prepared_projection_filesystems(
+    data_dir: &Path,
+    key: &ServiceKey,
+    prepared: &PreparedGeneratedFileSet,
+) -> Result<()> {
+    if !prepared
+        .sources
+        .values()
+        .any(|source| source.projection.is_some())
+    {
+        return Ok(());
+    }
+
+    let mut private_parent = service_root_path(data_dir, key);
+    let private_identity = loop {
+        match tokio::fs::symlink_metadata(&private_parent).await {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "generated-file private data ancestor `{}` is not a regular directory",
+                    private_parent.display()
+                );
+                break projection_file_identity_from_std(&metadata);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    private_parent.pop(),
+                    "generated-file private data path has no existing ancestor"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    validate_prepared_projection_filesystems(&private_identity, prepared)
+}
+
+fn validate_prepared_projection_filesystems(
+    private_identity: &ProjectionFileIdentity,
+    prepared: &PreparedGeneratedFileSet,
+) -> Result<()> {
+    for projection in prepared
+        .sources
+        .values()
+        .filter_map(|source| source.projection.as_ref())
+    {
+        ensure_projection_same_filesystem(private_identity, &projection.parent_identity)?;
+    }
+    Ok(())
 }
 
 async fn publish_prepared(
@@ -765,7 +838,7 @@ where
             "rendered canonical projection is not a regular file"
         );
         let identity = projection_file_identity_from_std(&canonical_metadata);
-        projection_validator(&identity, &projection.project_root_identity)?;
+        projection_validator(&identity, &projection.parent_identity)?;
         projections.push(PlannedProjection {
             name: name.clone(),
             projection_id: projection_id.clone(),
@@ -813,19 +886,19 @@ impl PlannedProjection {
 
 fn ensure_projection_same_filesystem(
     canonical_identity: &ProjectionFileIdentity,
-    project_root_identity: &ProjectionFileIdentity,
+    projection_parent_identity: &ProjectionFileIdentity,
 ) -> Result<()> {
     #[cfg(unix)]
     {
         anyhow::ensure!(
-            canonical_identity.device == project_root_identity.device,
+            canonical_identity.device == projection_parent_identity.device,
             "generated-file project_path requires locald's private data directory and the project to be on the same filesystem"
         );
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let _ = (canonical_identity, project_root_identity);
+        let _ = (canonical_identity, projection_parent_identity);
         anyhow::bail!("generated-file project_path is supported only on macOS and Linux")
     }
 }
@@ -3918,6 +3991,38 @@ mod tests {
             .expect("same-filesystem projection supported");
         let error = ensure_projection_same_filesystem(&canonical, &other_project)
             .expect_err("cross-filesystem projection rejected");
+        assert!(error.to_string().contains("same filesystem"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preparation_uses_the_projection_parent_filesystem_boundary() {
+        let root = tempdir().expect("create projection-filesystem root");
+        tokio::fs::create_dir(root.path().join("nested"))
+            .await
+            .expect("create projection parent");
+        tokio::fs::write(root.path().join("source.json"), r#"{"port":1}"#)
+            .await
+            .expect("write source");
+        let config =
+            projected_service_config("source.json", "nested/runtime.locald.json", BTreeMap::new());
+        let mut prepared = prepare(root.path(), &key(), &config, None)
+            .await
+            .expect("prepare projection")
+            .expect("prepared set");
+        let projection = prepared
+            .sources
+            .values_mut()
+            .next()
+            .and_then(|source| source.projection.as_mut())
+            .expect("prepared projection");
+        let private_identity = projection.project_root_identity.clone();
+        projection.parent_identity.device = private_identity.device.wrapping_add(1);
+
+        let error = validate_prepared_projection_filesystems(&private_identity, &prepared)
+            .expect_err(
+                "nested cross-filesystem projection parent is rejected before materialization",
+            );
         assert!(error.to_string().contains("same filesystem"));
     }
 
