@@ -51,6 +51,7 @@ export interface LogEntry {
 	service: string;
 	instance_id?: string | null;
 	service_name?: string | null;
+	service_domain?: string | null;
 	stream: string;
 	message: string;
 }

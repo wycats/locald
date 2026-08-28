@@ -41,7 +41,8 @@
 
 	// Access store value reactively
 	let identity = $derived(serviceIdentity(service));
-	let serviceLogs = $derived($logs[identity] || []);
+	let serviceHistory = $derived($logs[identity] ?? { recent: [], live: [] });
+	let serviceLogs = $derived([...serviceHistory.recent, ...serviceHistory.live]);
 	let lastLogs = $derived(serviceLogs.slice(-3));
 	let isPending = $derived(
 		$pendingActions.some(

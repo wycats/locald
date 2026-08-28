@@ -2,7 +2,8 @@ import { get } from 'svelte/store';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { connectEvents, reconnect, restartService } from './api';
 import { services } from './stores/services';
-import type { ServiceStatus } from './types';
+import { logs, stream } from './stores/logs';
+import type { LogEntry, ServiceStatus } from './types';
 
 class FakeEventSource {
 	static readonly CLOSED = 2;
@@ -46,10 +47,71 @@ const service: ServiceStatus = {
 afterEach(() => {
 	FakeEventSource.instances = [];
 	services.set([]);
+	logs.clear();
 	vi.unstubAllGlobals();
 });
 
 describe('dashboard lifecycle events', () => {
+	it('buffers replay events until the snapshot finishes, then appends live logs', () => {
+		vi.stubGlobal('EventSource', FakeEventSource);
+		const disconnect = connectEvents();
+		const source = FakeEventSource.instances.at(-1);
+		const recent: LogEntry = {
+			timestamp: 1,
+			service: 'alpha:api:worker',
+			instance_id: 'instance-alpha',
+			service_name: 'api:worker',
+			stream: 'stdout',
+			message: 'recent'
+		};
+		const live = { ...recent, timestamp: 2, message: 'live' };
+
+		for (const message of [
+			{ type: 'LogReplayStarted' },
+			{ type: 'Log', data: recent },
+			{ type: 'LogReplayFinished' },
+			{ type: 'Log', data: live }
+		]) {
+			source?.onmessage?.(new MessageEvent('message', { data: JSON.stringify(message) }));
+		}
+
+		expect(get(stream)).toEqual({ recent: [recent], live: [live] });
+		disconnect();
+	});
+
+	it('prunes one retired project instance from connected log state', () => {
+		vi.stubGlobal('EventSource', FakeEventSource);
+		const disconnect = connectEvents();
+		const source = FakeEventSource.instances.at(-1);
+		const first: LogEntry = {
+			timestamp: 1,
+			service: 'app:workbench',
+			instance_id: 'instance-first',
+			service_name: 'workbench',
+			service_domain: 'workbench.first.on.app.localhost',
+			stream: 'stdout',
+			message: 'first'
+		};
+		const second = {
+			...first,
+			instance_id: 'instance-second',
+			service_domain: 'workbench.second.on.app.localhost',
+			message: 'second'
+		};
+		for (const message of [
+			{ type: 'LogReplayStarted' },
+			{ type: 'Log', data: first },
+			{ type: 'Log', data: second },
+			{ type: 'LogReplayFinished' },
+			{ type: 'LogInstanceRetired', data: 'instance-first' }
+		]) {
+			source?.onmessage?.(new MessageEvent('message', { data: JSON.stringify(message) }));
+		}
+
+		expect(get(stream)).toEqual({ recent: [second], live: [] });
+		disconnect();
+	});
+
 	it('preserves the project refresh callback across a manual SSE reconnect', () => {
 		vi.stubGlobal('EventSource', FakeEventSource);
 		const lifecycleChange = vi.fn();
