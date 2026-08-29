@@ -877,7 +877,12 @@ fn current_macos_audit_token() -> Result<[u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_
     }
 
     let mut token = [0_u8; MACOS_PUBLISHER_AUDIT_TOKEN_PROOF_BYTES];
-    for (bytes, word) in token.chunks_exact_mut(size_of::<u32>()).zip(words) {
+    for (bytes, word) in token
+        .as_chunks_mut::<{ size_of::<u32>() }>()
+        .0
+        .iter_mut()
+        .zip(words)
+    {
         bytes.copy_from_slice(&word.to_ne_bytes());
     }
     Ok(token)
