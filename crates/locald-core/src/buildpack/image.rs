@@ -15,6 +15,8 @@ impl BuilderImage {
         })
     }
 
+    // Preserve the async API for the OCI pulling implementation that replaces this placeholder.
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     pub async fn pull(&self, _cache_dir: &PathBuf) -> Result<()> {
         // Placeholder for OCI pulling logic
         // We will implement this in the next step

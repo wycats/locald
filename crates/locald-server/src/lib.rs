@@ -543,13 +543,11 @@ async fn load_attachment_store_for_lifecycle_recovery(
             None
         };
         let declares_exact_v2 = legacy_input.as_ref().is_some_and(|content| {
-            serde_json::from_slice::<serde_json::Value>(content)
-                .ok()
-                .is_some_and(|value| {
-                    value
-                        .as_object()
-                        .is_some_and(|object| object.contains_key("instance_owners"))
-                })
+            serde_json::from_slice::<serde_json::Value>(content).is_ok_and(|value| {
+                value
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("instance_owners"))
+            })
         });
         if declares_exact_v2 {
             return Err(exact_error).with_context(|| {
