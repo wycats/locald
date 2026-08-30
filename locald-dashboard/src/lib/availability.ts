@@ -74,3 +74,9 @@ export function formatTransition(
 	}
 	return `in ${Math.ceil(remainingMilliseconds / 3_600_000)}h`;
 }
+
+export function transitionLabel(
+	availability: ProjectAvailabilityStatus | null | undefined
+): 'Next retry' | 'Next transition' {
+	return availability?.desired && availability.last_error ? 'Next retry' : 'Next transition';
+}
