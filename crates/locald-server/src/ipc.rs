@@ -576,6 +576,7 @@ async fn handle_connection(
                 service: "container".to_string(),
                 instance_id: None,
                 service_name: None,
+                service_domain: None,
                 stream: stream_type,
                 message: line,
             });
@@ -1411,6 +1412,7 @@ mod tests {
             service: "locald".to_owned(),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             stream: locald_core::ipc::LogStream::Stdout,
             message: "daemon diagnostic".to_owned(),
         };

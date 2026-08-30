@@ -284,6 +284,7 @@ pub struct EnsureProjectSuperseded {
 ///     service: "web".to_string(),
 ///     instance_id: None,
 ///     service_name: None,
+///     service_domain: None,
 ///     stream: LogStream::Stdout,
 ///     message: "Server started".to_string(),
 /// };
@@ -301,6 +302,13 @@ pub struct LogEntry {
     /// The configured service name within the owning project instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    /// The canonical semantic domain for this exact project service instance.
+    ///
+    /// This is the stable, human-readable worktree discriminator used for log
+    /// presentation. Machine filtering continues to use `instance_id` and
+    /// `service_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_domain: Option<String>,
     /// The stream the log came from (stdout/stderr).
     pub stream: LogStream,
     /// The log message content.
@@ -752,6 +760,7 @@ pub enum IpcResponse {
 ///     service: "web".to_string(),
 ///     instance_id: None,
 ///     service_name: None,
+///     service_domain: None,
 ///     stream: LogStream::Stdout,
 ///     message: "hello".to_string(),
 /// });
@@ -759,8 +768,15 @@ pub enum IpcResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "data")]
 pub enum Event {
+    /// The server is about to send the current recent-log snapshot.
+    LogReplayStarted,
     /// A new log entry.
     Log(LogEntry),
+    /// The recent-log snapshot is complete; following logs are live.
+    LogReplayFinished,
+    /// One exact project instance retired and its dashboard log history should
+    /// leave the live observability surface.
+    LogInstanceRetired(#[schemars(with = "String")] ProjectInstanceId),
     /// A service status update.
     ServiceUpdate(Box<ServiceStatus>),
     /// The authoritative service list or a catalog-backed status projection

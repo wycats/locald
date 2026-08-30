@@ -78,6 +78,7 @@ impl SiteService {
             service: format!("{}:build", name),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             stream,
             message,
             timestamp: chrono::Utc::now().timestamp_millis(),

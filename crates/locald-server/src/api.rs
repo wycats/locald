@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::manager::{ProcessManager, ServiceNotFoundError};
-use locald_core::ipc::Event;
+use locald_core::ipc::{Event, LogEntry};
 use locald_core::{DemandKey, ProjectInstanceId};
 
 pub fn router(pm: ProcessManager) -> Router {
@@ -190,8 +190,7 @@ async fn handle_ws(
 async fn handle_events(
     State(pm): State<Arc<ProcessManager>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let mut rx = pm.event_sender.subscribe();
-    let recent_logs = pm.get_recent_logs();
+    let (mut rx, recent_logs) = pm.subscribe_events_with_log_snapshot();
 
     let stream = async_stream::stream! {
         // Send an initial comment to trigger the browser's onopen callback.
@@ -199,20 +198,47 @@ async fn handle_events(
         // firing onopen, which may never happen in an idle system.
         yield Ok(SseEvent::default().comment("connected"));
 
-        for entry in recent_logs {
-             if let Ok(data) = serde_json::to_string(&Event::Log(entry)) {
+        for event in log_replay_events(recent_logs) {
+             if let Ok(data) = serde_json::to_string(&event) {
                 yield Ok(SseEvent::default().data(data));
             }
         }
 
-        while let Ok(event) = rx.recv().await {
-            if let Ok(data) = serde_json::to_string(&event) {
-                yield Ok(SseEvent::default().data(data));
+        while let Some(events) = next_event_batch(&pm, &mut rx).await {
+            for event in events {
+                if let Ok(data) = serde_json::to_string(&event) {
+                    yield Ok(SseEvent::default().data(data));
+                }
             }
         }
     };
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+fn log_replay_events(recent_logs: Vec<LogEntry>) -> impl Iterator<Item = Event> {
+    std::iter::once(Event::LogReplayStarted)
+        .chain(recent_logs.into_iter().map(Event::Log))
+        .chain(std::iter::once(Event::LogReplayFinished))
+}
+
+async fn next_event_batch(
+    pm: &ProcessManager,
+    receiver: &mut tokio::sync::broadcast::Receiver<Event>,
+) -> Option<Vec<Event>> {
+    match receiver.recv().await {
+        Ok(event) => Some(vec![event]),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            let (replacement, recent_logs) = pm.subscribe_events_with_log_snapshot();
+            *receiver = replacement;
+            Some(
+                log_replay_events(recent_logs)
+                    .chain(std::iter::once(Event::ServiceListChanged))
+                    .collect(),
+            )
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+    }
 }
 
 async fn handle_socket(mut socket: WebSocket, pm: Arc<ProcessManager>) {
@@ -466,5 +492,103 @@ async fn handle_project_remove(
     match pm.remove_project(&project_path).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::StateManager;
+    use locald_core::ProjectCatalog;
+    use locald_core::attachments::AttachmentStore;
+    use locald_core::ipc::LogStream;
+    use locald_core::service::ServiceKey;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn replay_events_frame_the_exact_snapshot_in_order() {
+        let entry = LogEntry {
+            timestamp: 1,
+            service: "alpha:api:worker".to_owned(),
+            instance_id: Some(
+                "00000000-0000-4000-8000-000000000001"
+                    .parse()
+                    .expect("valid project instance ID"),
+            ),
+            service_name: Some("api:worker".to_owned()),
+            service_domain: None,
+            stream: LogStream::Stderr,
+            message: "line one\\nline two".to_owned(),
+        };
+
+        let events = log_replay_events(vec![entry.clone()]).collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                Event::LogReplayStarted,
+                Event::Log(entry),
+                Event::LogReplayFinished,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_event_stream_recovers_with_an_atomic_replay() {
+        let directory = tempfile::tempdir().expect("create lag recovery directory");
+        let manager = ProcessManager::new(
+            directory.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(directory.path().join("state.json"))),
+            Arc::new(Mutex::new(ProjectCatalog::default())),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                directory.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create lag recovery manager");
+        let instance_id = "00000000-0000-4000-8000-000000000001"
+            .parse()
+            .expect("valid project instance ID");
+        let key = ServiceKey::new(instance_id, "workbench");
+        let make_entry = |timestamp: i64| LogEntry {
+            timestamp,
+            service: "app:workbench".to_owned(),
+            instance_id: Some(instance_id),
+            service_name: Some("workbench".to_owned()),
+            service_domain: Some("workbench.app.localhost".to_owned()),
+            stream: LogStream::Stdout,
+            message: format!("line {timestamp}"),
+        };
+
+        let (mut receiver, initial) = manager.subscribe_events_with_log_snapshot();
+        assert!(initial.is_empty());
+        // Tokio rounds the requested 100-slot broadcast capacity to 128.
+        for timestamp in 0..=128 {
+            manager.record_log_for_sse_test(key.clone(), make_entry(timestamp));
+        }
+
+        let recovery = next_event_batch(&manager, &mut receiver)
+            .await
+            .expect("lag recovery remains connected");
+        assert_eq!(recovery.first(), Some(&Event::LogReplayStarted));
+        assert_eq!(
+            recovery.get(recovery.len() - 2),
+            Some(&Event::LogReplayFinished)
+        );
+        assert_eq!(recovery.last(), Some(&Event::ServiceListChanged));
+        let recovered_timestamps = recovery
+            .iter()
+            .filter_map(|event| match event {
+                Event::Log(entry) => Some(entry.timestamp),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_timestamps, (0..=128).collect::<Vec<_>>());
+
+        manager.record_log_for_sse_test(key, make_entry(129));
+        assert_eq!(
+            next_event_batch(&manager, &mut receiver).await,
+            Some(vec![Event::Log(make_entry(129))])
+        );
     }
 }

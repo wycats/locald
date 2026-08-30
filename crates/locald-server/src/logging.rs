@@ -28,6 +28,7 @@ where
             service: "locald".to_string(),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             message: visitor.message,
             stream: LogStream::Stdout, // Treat all daemon logs as stdout for now
             timestamp,

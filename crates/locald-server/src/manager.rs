@@ -1150,6 +1150,8 @@ pub struct ProcessManager {
     readiness_wait_hook: Arc<StdMutex<Option<Arc<Notify>>>>,
     #[cfg(test)]
     readiness_wait_timeout: Arc<StdMutex<Option<std::time::Duration>>>,
+    #[cfg(test)]
+    broadcast_log_validation_hook: Arc<StdMutex<Option<ConfigPublicationHook>>>,
 }
 
 async fn load_durable_catalog_image(path: &Path) -> Result<Option<Registry>> {
@@ -1599,6 +1601,8 @@ impl ProcessManager {
             readiness_wait_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             readiness_wait_timeout: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            broadcast_log_validation_hook: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -1624,6 +1628,27 @@ impl ProcessManager {
     async fn wait_at_config_publication_hook(&self) {
         let hook = self
             .config_publication_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_broadcast_log_validation_hook(&self, hook: ConfigPublicationHook) {
+        *self
+            .broadcast_log_validation_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_broadcast_log_validation_hook(&self) {
+        let hook = self
+            .broadcast_log_validation_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -2794,12 +2819,13 @@ impl ProcessManager {
         Ok(changed && has_published_declarations)
     }
 
-    fn clear_log_buffer(&self, key: &ServiceKey) {
+    fn retire_log_buffers_for_instance(&self, instance_id: ProjectInstanceId) {
         #[allow(clippy::expect_used)]
-        self.log_buffers
-            .lock()
-            .expect("log buffer mutex poisoned")
-            .remove(key);
+        let mut buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
+        buffers.retain(|key, _| key.instance() != instance_id);
+        let _ = self
+            .event_sender
+            .send(Event::LogInstanceRetired(instance_id));
     }
 
     async fn broadcast_log(
@@ -2818,10 +2844,22 @@ impl ProcessManager {
         entry.instance_id = Some(key.instance());
         entry.service_name = Some(key.name().as_str().to_owned());
         entry.service = Self::service_display_name(&key, service);
-        drop(services);
+        entry.service_domain = self
+            .domain_index
+            .snapshot()
+            .domain_for_service(key.instance(), &entry.service)
+            .map(ToString::to_string);
+
+        // The services guard is the lifecycle fence for both validation and
+        // publication. Retirement takes the same services -> log_buffers lock
+        // order, so a validated log cannot recreate a buffer after purge.
+        #[cfg(test)]
+        self.wait_at_broadcast_log_validation_hook().await;
 
         info!("Broadcasting log for {}: {}", entry.service, entry.message);
-        // Add to buffer
+        // Publish the buffered entry and its live event under the same lock.
+        // This gives SSE subscribers an atomic snapshot/live cut: a log is
+        // either present in the captured snapshot or arrives on the receiver.
         {
             #[allow(clippy::expect_used)]
             let mut buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
@@ -2832,7 +2870,9 @@ impl ProcessManager {
                     logs: LogBuffer::new(LOG_BUFFER_SIZE),
                 });
             buffer.logs.push(entry.clone());
+            let _ = self.event_sender.send(Event::Log(entry.clone()));
         }
+        drop(services);
 
         // Broadcast (ignore error if no receivers)
         let _ = self.instance_log_sender.send(InstanceLogEntry {
@@ -2840,7 +2880,6 @@ impl ProcessManager {
             entry: entry.clone(),
         });
         let _ = self.log_sender.send(entry.clone());
-        let _ = self.event_sender.send(Event::Log(entry));
     }
 
     fn forward_boot_logs_for_instance(
@@ -2871,6 +2910,18 @@ impl ProcessManager {
         self.get_recent_logs_for_instance(None)
     }
 
+    /// Atomically subscribe to daemon events and capture the recent-log
+    /// snapshot that precedes them.
+    pub(crate) fn subscribe_events_with_log_snapshot(
+        &self,
+    ) -> (broadcast::Receiver<Event>, Vec<LogEntry>) {
+        #[allow(clippy::expect_used)]
+        let buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
+        let receiver = self.event_sender.subscribe();
+        let recent_logs = Self::collect_recent_logs(&buffers, None);
+        (receiver, recent_logs)
+    }
+
     #[must_use]
     pub fn get_recent_logs_for_instance(
         &self,
@@ -2878,6 +2929,13 @@ impl ProcessManager {
     ) -> Vec<LogEntry> {
         #[allow(clippy::expect_used)]
         let buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
+        Self::collect_recent_logs(&buffers, instance_id)
+    }
+
+    fn collect_recent_logs(
+        buffers: &HashMap<ServiceKey, InstanceLogBuffer>,
+        instance_id: Option<ProjectInstanceId>,
+    ) -> Vec<LogEntry> {
         let mut all_logs = Vec::new();
         for buffer in buffers.values() {
             if instance_id.is_some_and(|instance_id| buffer.instance_id != instance_id) {
@@ -2887,6 +2945,20 @@ impl ProcessManager {
         }
         all_logs.sort_by_key(|e| e.timestamp);
         all_logs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_log_for_sse_test(&self, key: ServiceKey, entry: LogEntry) {
+        #[allow(clippy::expect_used)]
+        let mut buffers = self.log_buffers.lock().expect("log buffer mutex poisoned");
+        let buffer = buffers
+            .entry(key.clone())
+            .or_insert_with(|| InstanceLogBuffer {
+                instance_id: key.instance(),
+                logs: LogBuffer::new(LOG_BUFFER_SIZE),
+            });
+        buffer.logs.push(entry.clone());
+        let _ = self.event_sender.send(Event::Log(entry));
     }
 
     pub async fn project_instance_for_logs(
@@ -6865,7 +6937,6 @@ impl ProcessManager {
                             .await
                             .insert(key.clone(), listener_runtime);
                         let mut services = self.services.lock().await;
-                        self.clear_log_buffer(&key);
                         services.insert(
                             key.clone(),
                             Service {
@@ -11457,32 +11528,44 @@ impl ProcessManager {
             self.clear_service_stop_suppressions(instance_id).await;
         }
 
-        let retired_instances = expected_instance
-            .into_iter()
-            .collect::<HashSet<ProjectInstanceId>>();
-        self.retire_config_reload_paths(retired_paths, retired_instances)
-            .await;
         if let Some(instance_id) = expected_instance {
-            self.services
-                .lock()
-                .await
-                .retain(|_, service| service.instance_id != instance_id);
+            self.retire_config_reload_paths(retired_paths, HashSet::from([instance_id]))
+                .await;
+            let mut services = self.services.lock().await;
+            services.retain(|_, service| service.instance_id != instance_id);
+            self.retire_log_buffers_for_instance(instance_id);
+            drop(services);
             self.listener_runtimes
                 .lock()
                 .await
                 .retain(|key, _| key.instance() != instance_id);
         } else {
-            self.services
-                .lock()
-                .await
-                .retain(|_, service| Self::canonicalize_path(&service.path) != canonical);
-            let surviving_keys = self
-                .services
-                .lock()
-                .await
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>();
+            let (surviving_keys, retired_instances) = {
+                let mut services = self.services.lock().await;
+                let removed_instances = services
+                    .values()
+                    .filter(|service| Self::canonicalize_path(&service.path) == canonical)
+                    .map(|service| service.instance_id)
+                    .collect::<HashSet<_>>();
+                services.retain(|_, service| Self::canonicalize_path(&service.path) != canonical);
+                let surviving_instances = services
+                    .values()
+                    .map(|service| service.instance_id)
+                    .collect::<HashSet<_>>();
+                let retired_instances = removed_instances
+                    .difference(&surviving_instances)
+                    .copied()
+                    .collect::<HashSet<_>>();
+                for instance_id in &retired_instances {
+                    self.retire_log_buffers_for_instance(*instance_id);
+                }
+                (
+                    services.keys().cloned().collect::<HashSet<_>>(),
+                    retired_instances,
+                )
+            };
+            self.retire_config_reload_paths(retired_paths, retired_instances)
+                .await;
             self.listener_runtimes
                 .lock()
                 .await
@@ -12342,10 +12425,16 @@ impl ProcessManager {
         let retired_paths = removed_paths.clone();
         self.retire_config_reload_paths(removed_paths, removed_set.clone())
             .await;
-        self.services.lock().await.retain(|_, service| {
-            !removed_set.contains(&service.instance_id)
-                && !retired_paths.contains(&Self::canonicalize_path(&service.path))
-        });
+        {
+            let mut services = self.services.lock().await;
+            services.retain(|_, service| {
+                !removed_set.contains(&service.instance_id)
+                    && !retired_paths.contains(&Self::canonicalize_path(&service.path))
+            });
+            for instance_id in &removed_instance_ids {
+                self.retire_log_buffers_for_instance(*instance_id);
+            }
+        }
         self.service_stop_suppressions
             .lock()
             .await
@@ -17814,6 +17903,32 @@ domains = ["retained"]
                 .split_once(':')
                 .map_or(display_name, |(_, configured_name)| configured_name),
         )
+    }
+
+    fn insert_buffered_test_log(
+        manager: &ProcessManager,
+        instance_id: ProjectInstanceId,
+        service_name: &str,
+        message: &str,
+    ) {
+        let mut logs = LogBuffer::new(LOG_BUFFER_SIZE);
+        logs.push(LogEntry {
+            timestamp: 1,
+            service: format!("test:{service_name}"),
+            instance_id: Some(instance_id),
+            service_name: Some(service_name.to_owned()),
+            service_domain: None,
+            stream: locald_core::ipc::LogStream::Stdout,
+            message: message.to_owned(),
+        });
+        manager
+            .log_buffers
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .insert(
+                ServiceKey::new(instance_id, service_name),
+                InstanceLogBuffer { instance_id, logs },
+            );
     }
 
     fn insert_test_service(
@@ -29528,6 +29643,7 @@ PATH = "/usr/bin:/bin"
             service: "test".to_string(),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             message: "msg".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 0,
@@ -29549,6 +29665,7 @@ PATH = "/usr/bin:/bin"
             service: "test".to_string(),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             message: "1".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 1,
@@ -29557,6 +29674,7 @@ PATH = "/usr/bin:/bin"
             service: "test".to_string(),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             message: "2".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 2,
@@ -29565,6 +29683,7 @@ PATH = "/usr/bin:/bin"
             service: "test".to_string(),
             instance_id: None,
             service_name: None,
+            service_domain: None,
             message: "3".to_string(),
             stream: locald_core::ipc::LogStream::Stdout,
             timestamp: 3,
@@ -29583,6 +29702,319 @@ PATH = "/usr/bin:/bin"
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].message, "2");
         assert_eq!(logs[1].message, "3");
+    }
+
+    #[tokio::test]
+    async fn event_subscription_has_an_atomic_snapshot_live_boundary() {
+        let dir = tempdir().expect("create temporary directory");
+        let manager = readiness_test_manager(dir.path());
+        let instance_id = test_instance_id();
+        let key = test_service_key(instance_id, "alpha:api:worker");
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "alpha:api:worker",
+                RuntimeState {
+                    pid: Some(42),
+                    port: Some(3000),
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let mut service = test_service(
+            test_config_with_domain("alpha", "alpha.localhost"),
+            ServiceConfig::Legacy(ExecServiceConfig::default()),
+            ServiceRuntime::Controller(controller),
+            dir.path().to_path_buf(),
+        );
+        service.instance_id = instance_id;
+        manager.services.lock().await.insert(key.clone(), service);
+
+        let log_entry = |timestamp, message: &str| LogEntry {
+            timestamp,
+            service: String::new(),
+            instance_id: None,
+            service_name: None,
+            service_domain: None,
+            stream: locald_core::ipc::LogStream::Stdout,
+            message: message.to_owned(),
+        };
+        manager
+            .broadcast_log(key.clone(), 1, log_entry(1, "recent"))
+            .await;
+
+        let (mut events, recent) = manager.subscribe_events_with_log_snapshot();
+        manager.broadcast_log(key, 1, log_entry(2, "live")).await;
+
+        assert_eq!(
+            recent
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["recent"]
+        );
+        let event = events.recv().await.expect("live event follows snapshot");
+        assert!(matches!(event, Event::Log(entry) if entry.message == "live"));
+    }
+
+    #[tokio::test]
+    async fn logs_carry_authoritative_domains_for_same_named_worktree_services() {
+        let directory = tempdir().expect("create worktree log directory");
+        let manager = readiness_test_manager(directory.path());
+        let first_instance = test_instance_id();
+        let second_instance = alternate_test_instance_id();
+        let make_service = |instance_id| {
+            let controller: Arc<Mutex<dyn ServiceController>> =
+                Arc::new(Mutex::new(TestController::new(
+                    "app:workbench",
+                    RuntimeState {
+                        pid: Some(42),
+                        port: Some(3000),
+                        status: ServiceState::Running,
+                        health_status: HealthStatus::Healthy,
+                    },
+                )));
+            let mut service = test_service(
+                test_config_with_domain("app", "app.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                directory.path().to_path_buf(),
+            );
+            service.instance_id = instance_id;
+            service
+        };
+        let first_key = ServiceKey::new(first_instance, "workbench");
+        let second_key = ServiceKey::new(second_instance, "workbench");
+        {
+            let mut services = manager.services.lock().await;
+            services.insert(first_key.clone(), make_service(first_instance));
+            services.insert(second_key.clone(), make_service(second_instance));
+        }
+        install_test_claim_for_instance(
+            &manager,
+            first_instance,
+            "workbench.first.on.app.localhost",
+            "app:workbench",
+        );
+        install_test_claim_for_instance(
+            &manager,
+            second_instance,
+            "workbench.second.on.app.localhost",
+            "app:workbench",
+        );
+        let entry = |timestamp, message: &str| LogEntry {
+            timestamp,
+            service: String::new(),
+            instance_id: None,
+            service_name: None,
+            service_domain: None,
+            stream: locald_core::ipc::LogStream::Stdout,
+            message: message.to_owned(),
+        };
+
+        manager.broadcast_log(first_key, 1, entry(1, "first")).await;
+        manager
+            .broadcast_log(second_key, 1, entry(2, "second"))
+            .await;
+
+        let logs = manager.get_recent_logs();
+        assert_eq!(logs[0].service, "app:workbench");
+        assert_eq!(logs[1].service, "app:workbench");
+        assert_eq!(logs[0].service_name.as_deref(), Some("workbench"));
+        assert_eq!(logs[1].service_name.as_deref(), Some("workbench"));
+        assert_eq!(logs[0].instance_id, Some(first_instance));
+        assert_eq!(logs[1].instance_id, Some(second_instance));
+        assert_eq!(
+            logs[0].service_domain.as_deref(),
+            Some("workbench.first.on.app.localhost")
+        );
+        assert_eq!(
+            logs[1].service_domain.as_deref(),
+            Some("workbench.second.on.app.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_preserve_exact_instance_identity_when_service_domains_are_empty() {
+        let directory = tempdir().expect("create domainless log directory");
+        let manager = readiness_test_manager(directory.path());
+        let instance_id = test_instance_id();
+        let config: LocaldConfig = toml::from_str(
+            r#"
+[project]
+name = "app"
+
+[services.internal]
+type = "worker"
+command = "internal"
+domains = []
+"#,
+        )
+        .expect("parse domainless service config");
+        assert!(
+            ProcessManager::build_domain_claims(instance_id, &config, None)
+                .expect("build domainless service claims")
+                .is_empty(),
+            "domains = [] must publish no canonical domain for fallback identity"
+        );
+        let service_config = config.services["internal"].clone();
+        let controller: Arc<Mutex<dyn ServiceController>> =
+            Arc::new(Mutex::new(TestController::new(
+                "app:internal",
+                RuntimeState {
+                    pid: Some(42),
+                    port: None,
+                    status: ServiceState::Running,
+                    health_status: HealthStatus::Healthy,
+                },
+            )));
+        let mut service = test_service(
+            config,
+            service_config,
+            ServiceRuntime::Controller(controller),
+            directory.path().to_path_buf(),
+        );
+        service.instance_id = instance_id;
+        let key = ServiceKey::new(instance_id, "internal");
+        manager.services.lock().await.insert(key.clone(), service);
+
+        manager
+            .broadcast_log(
+                key,
+                1,
+                LogEntry {
+                    timestamp: 1,
+                    service: String::new(),
+                    instance_id: None,
+                    service_name: None,
+                    service_domain: None,
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: "domainless".to_owned(),
+                },
+            )
+            .await;
+
+        let logs = manager.get_recent_logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].service, "app:internal");
+        assert_eq!(logs[0].instance_id, Some(instance_id));
+        assert_eq!(logs[0].service_name.as_deref(), Some("internal"));
+        assert_eq!(logs[0].service_domain, None);
+    }
+
+    #[tokio::test]
+    async fn project_retirement_fences_validated_log_publication_before_purge() {
+        let directory = tempdir().expect("create retirement race directory");
+        let project_path = directory.path().join("retirement-race");
+        let (manager, instance_id, _) =
+            availability_manager(directory.path(), &project_path, "retirement-race").await;
+        let key = ServiceKey::new(instance_id, "web");
+        manager.services.lock().await.insert(
+            key.clone(),
+            availability_test_service(instance_id, "retirement-race", &project_path, false),
+        );
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        manager.set_broadcast_log_validation_hook(ConfigPublicationHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        let entry = LogEntry {
+            timestamp: 1,
+            service: String::new(),
+            instance_id: None,
+            service_name: None,
+            service_domain: None,
+            stream: locald_core::ipc::LogStream::Stdout,
+            message: "validated before retirement".to_owned(),
+        };
+
+        let log_manager = manager.clone();
+        let log_key = key.clone();
+        let log_entry = entry.clone();
+        let log_task = tokio::spawn(async move {
+            log_manager.broadcast_log(log_key, 1, log_entry).await;
+        });
+        reached.notified().await;
+
+        let removal_manager = manager.clone();
+        let removal_path = project_path.clone();
+        let mut removal =
+            tokio::spawn(async move { removal_manager.remove_project(&removal_path).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut removal)
+                .await
+                .is_err(),
+            "retirement must wait for the validated log publication fence"
+        );
+
+        resume.notify_one();
+        log_task.await.expect("validated log task completes");
+        removal
+            .await
+            .expect("retirement task completes")
+            .expect("retirement succeeds");
+
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(instance_id))
+                .is_empty(),
+            "successful retirement purges the log published before its fence"
+        );
+        manager.broadcast_log(key, 1, entry).await;
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(instance_id))
+                .is_empty(),
+            "a retired service cannot recreate its purged buffer"
+        );
+    }
+
+    #[test]
+    fn clearing_retired_instance_logs_preserves_other_instances() {
+        let dir = tempdir().expect("create temporary directory");
+        let manager = readiness_test_manager(dir.path());
+        let first_instance = test_instance_id();
+        let second_instance = alternate_test_instance_id();
+        let buffered = |instance_id, message: &str| {
+            let mut logs = LogBuffer::new(LOG_BUFFER_SIZE);
+            logs.push(LogEntry {
+                timestamp: 1,
+                service: "app:workbench".to_owned(),
+                instance_id: Some(instance_id),
+                service_name: Some("workbench".to_owned()),
+                service_domain: None,
+                stream: locald_core::ipc::LogStream::Stdout,
+                message: message.to_owned(),
+            });
+            InstanceLogBuffer { instance_id, logs }
+        };
+        {
+            #[allow(clippy::expect_used)]
+            let mut buffers = manager
+                .log_buffers
+                .lock()
+                .expect("log buffer mutex poisoned");
+            buffers.insert(
+                ServiceKey::new(first_instance, "workbench"),
+                buffered(first_instance, "retired"),
+            );
+            buffers.insert(
+                ServiceKey::new(second_instance, "workbench"),
+                buffered(second_instance, "preserved"),
+            );
+        }
+
+        manager.retire_log_buffers_for_instance(first_instance);
+
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(first_instance))
+                .is_empty()
+        );
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(second_instance))[0].message,
+            "preserved"
+        );
     }
 
     #[tokio::test]
@@ -29698,6 +30130,37 @@ PATH = "/usr/bin:/bin"
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: calls.clone(),
         }));
+        let unrelated_instance = alternate_test_instance_id();
+        {
+            #[allow(clippy::expect_used)]
+            let mut buffers = manager
+                .log_buffers
+                .lock()
+                .expect("log buffer mutex poisoned");
+            for (buffered_instance, message) in [
+                (instance_id, "retired history"),
+                (unrelated_instance, "preserved history"),
+            ] {
+                let mut logs = LogBuffer::new(LOG_BUFFER_SIZE);
+                logs.push(LogEntry {
+                    timestamp: 1,
+                    service: "workbench".to_owned(),
+                    instance_id: Some(buffered_instance),
+                    service_name: Some("workbench".to_owned()),
+                    service_domain: None,
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: message.to_owned(),
+                });
+                buffers.insert(
+                    ServiceKey::new(buffered_instance, "workbench"),
+                    InstanceLogBuffer {
+                        instance_id: buffered_instance,
+                        logs,
+                    },
+                );
+            }
+        }
+        let mut events = manager.event_sender.subscribe();
 
         assert_eq!(manager.registry_clean().await.expect("clean registry"), 1);
         assert_eq!(
@@ -29714,6 +30177,26 @@ PATH = "/usr/bin:/bin"
                 .resolve("missing.localhost")
                 .is_none()
         );
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(instance_id))
+                .is_empty()
+        );
+        assert_eq!(
+            manager
+                .get_recent_logs_for_instance(Some(unrelated_instance))
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["preserved history"]
+        );
+        let retired_instances = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::LogInstanceRetired(instance_id) => Some(instance_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retired_instances, vec![instance_id]);
     }
 
     #[tokio::test]
@@ -31400,6 +31883,28 @@ domain = "reload.localhost"
         manager.set_host_syncer(Arc::new(RecordingHostSyncer {
             calls: calls.clone(),
         }));
+        let mut events = manager.event_sender.subscribe();
+        {
+            let mut logs = LogBuffer::new(LOG_BUFFER_SIZE);
+            logs.push(LogEntry {
+                timestamp: 1,
+                service: "removed:web".to_owned(),
+                instance_id: Some(instance_id),
+                service_name: Some("web".to_owned()),
+                service_domain: None,
+                stream: locald_core::ipc::LogStream::Stdout,
+                message: "retired history".to_owned(),
+            });
+            #[allow(clippy::expect_used)]
+            manager
+                .log_buffers
+                .lock()
+                .expect("log buffer mutex poisoned")
+                .insert(
+                    ServiceKey::new(instance_id, "web"),
+                    InstanceLogBuffer { instance_id, logs },
+                );
+        }
 
         manager
             .remove_project(&project_path)
@@ -31414,6 +31919,16 @@ domain = "reload.localhost"
             &[expected_hosts(&[])]
         );
         assert!(registry.lock().await.get_project(&project_path).is_none());
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            emitted.contains(&Event::LogInstanceRetired(instance_id)),
+            "successful removal emits exact-instance log retirement: {emitted:?}"
+        );
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(instance_id))
+                .is_empty()
+        );
         assert!(
             manager
                 .domain_index()
@@ -31421,6 +31936,142 @@ domain = "reload.localhost"
                 .resolve("removed.localhost")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn removing_unresolved_legacy_project_retires_only_instances_without_surviving_services()
+    {
+        let dir = tempdir().expect("create unresolved removal directory");
+        let project_path = dir.path().join("unresolved-project");
+        let canonical = ProcessManager::canonicalize_path(&project_path);
+        let surviving_path = dir.path().join("surviving-project");
+        let retired_instance = test_instance_id();
+        let shared_instance = alternate_test_instance_id();
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        catalog.unresolved_legacy.insert(
+            canonical.clone(),
+            locald_core::UnresolvedLegacyProject {
+                path: canonical.clone(),
+                display_name: Some("unresolved".to_owned()),
+                pinned: false,
+                last_seen: Some(UNIX_EPOCH),
+                sources: BTreeSet::from([locald_core::catalog::LegacyLocatorSource::Registry]),
+            },
+        );
+        catalog.save().await.expect("persist unresolved catalog");
+
+        let mut manager = ProcessManager::new(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+        )
+        .expect("create unresolved removal manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        let make_service = |instance_id, name: &str, path: PathBuf| {
+            let controller: Arc<Mutex<dyn ServiceController>> =
+                Arc::new(Mutex::new(TestController::new(
+                    format!("unresolved:{name}"),
+                    RuntimeState {
+                        pid: Some(42),
+                        port: None,
+                        status: ServiceState::Running,
+                        health_status: HealthStatus::Healthy,
+                    },
+                )));
+            let mut service = test_service(
+                test_config_with_domain("unresolved", "unresolved.localhost"),
+                ServiceConfig::Legacy(ExecServiceConfig::default()),
+                ServiceRuntime::Controller(controller),
+                path,
+            );
+            service.instance_id = instance_id;
+            service
+        };
+        let retired_key = ServiceKey::new(retired_instance, "web");
+        let shared_removed_key = ServiceKey::new(shared_instance, "worker");
+        let shared_survivor_key = ServiceKey::new(shared_instance, "survivor");
+        {
+            let mut services = manager.services.lock().await;
+            services.insert(
+                retired_key.clone(),
+                make_service(retired_instance, "web", canonical.clone()),
+            );
+            services.insert(
+                shared_removed_key.clone(),
+                make_service(shared_instance, "worker", canonical.clone()),
+            );
+            services.insert(
+                shared_survivor_key.clone(),
+                make_service(shared_instance, "survivor", surviving_path),
+            );
+        }
+        {
+            #[allow(clippy::expect_used)]
+            let mut buffers = manager
+                .log_buffers
+                .lock()
+                .expect("log buffer mutex poisoned");
+            for (key, message) in [
+                (retired_key, "retired"),
+                (shared_removed_key, "shared removed"),
+                (shared_survivor_key.clone(), "shared survivor"),
+            ] {
+                let mut logs = LogBuffer::new(LOG_BUFFER_SIZE);
+                logs.push(LogEntry {
+                    timestamp: 1,
+                    service: format!("unresolved:{}", key.name()),
+                    instance_id: Some(key.instance()),
+                    service_name: Some(key.name().to_string()),
+                    service_domain: None,
+                    stream: locald_core::ipc::LogStream::Stdout,
+                    message: message.to_owned(),
+                });
+                buffers.insert(
+                    key.clone(),
+                    InstanceLogBuffer {
+                        instance_id: key.instance(),
+                        logs,
+                    },
+                );
+            }
+        }
+        let mut events = manager.event_sender.subscribe();
+
+        manager
+            .remove_project(&canonical)
+            .await
+            .expect("remove unresolved legacy project");
+
+        let services = manager.services.lock().await;
+        assert_eq!(
+            services.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([shared_survivor_key])
+        );
+        drop(services);
+        assert!(
+            manager
+                .get_recent_logs_for_instance(Some(retired_instance))
+                .is_empty()
+        );
+        assert_eq!(
+            manager
+                .get_recent_logs_for_instance(Some(shared_instance))
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["shared removed", "shared survivor"])
+        );
+        let retired_events = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::LogInstanceRetired(instance_id) => Some(instance_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retired_events, vec![retired_instance]);
     }
 
     #[tokio::test]
@@ -31482,6 +32133,27 @@ domain = "reload.localhost"
             .lock()
             .await
             .insert_display("busy:web".to_owned(), service);
+        {
+            let mut logs = LogBuffer::new(LOG_BUFFER_SIZE);
+            logs.push(LogEntry {
+                timestamp: 1,
+                service: "busy:web".to_owned(),
+                instance_id: Some(instance_id),
+                service_name: Some("web".to_owned()),
+                service_domain: None,
+                stream: locald_core::ipc::LogStream::Stderr,
+                message: "preserved failure history".to_owned(),
+            });
+            #[allow(clippy::expect_used)]
+            manager
+                .log_buffers
+                .lock()
+                .expect("log buffer mutex poisoned")
+                .insert(
+                    ServiceKey::new(instance_id, "web"),
+                    InstanceLogBuffer { instance_id, logs },
+                );
+        }
 
         let error = manager
             .remove_project(&project_path)
@@ -31498,6 +32170,10 @@ domain = "reload.localhost"
                 .is_some()
         );
         assert!(manager.get_service_controller("busy:web").await.is_some());
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(instance_id))[0].message,
+            "preserved failure history"
+        );
     }
 
     #[tokio::test]
@@ -33161,6 +33837,7 @@ domains = ["workbench"]
             .required_availability_instance_for_path(&project_path)
             .await
             .expect("resolve published lifecycle instance");
+        insert_buffered_test_log(&manager, instance_id, "workbench", "pause history");
         let authority = manager.publisher_authority();
         let principal =
             PublisherPrincipal::new(501, 42, crate::publication::PublisherProcessBirth::Test(1));
@@ -33320,6 +33997,10 @@ domains = ["workbench"]
         assert_eq!(
             renewed_after_resume.publication_state(),
             publisher_protocol::PublicationState::CheckingEndpoint
+        );
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(instance_id))[0].message,
+            "pause history"
         );
 
         manager
@@ -36789,6 +37470,7 @@ PATH = "/usr/bin:/bin"
                     service: started_service.clone(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "build output retained across supersession".to_owned(),
                 },
@@ -37318,6 +38000,7 @@ domains = ["workbench"]
                     .clone(),
             )
         };
+        insert_buffered_test_log(&manager, instance_id, "api", "restart history");
         events
             .lock()
             .expect("clear initial lifecycle events")
@@ -37379,6 +38062,10 @@ domains = ["workbench"]
                     publication.state == locald_core::ipc::PublicationState::WaitingForPublisher
                 })
         }));
+        assert_eq!(
+            manager.get_recent_logs_for_instance(Some(instance_id))[0].message,
+            "restart history"
+        );
     }
 
     #[tokio::test]
@@ -38358,6 +39045,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "first-instance history".to_owned(),
                 },
@@ -38495,6 +39183,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "stale first-instance log".to_owned(),
                 },
@@ -38510,6 +39199,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "stale second-instance controller log".to_owned(),
                 },
@@ -38525,6 +39215,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "current second-instance log".to_owned(),
                 },
@@ -38569,6 +39260,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: None,
                     service_name: None,
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "stopped controller log".to_owned(),
                 },
@@ -38595,6 +39287,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: Some(foreign_instance),
                     service_name: Some("web".to_owned()),
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stdout,
                     message: "foreign".to_owned(),
                 },
@@ -38609,6 +39302,7 @@ type = "postgres"
                     service: "app:web".to_owned(),
                     instance_id: Some(target_instance),
                     service_name: Some("web".to_owned()),
+                    service_domain: None,
                     stream: locald_core::ipc::LogStream::Stderr,
                     message: "target".to_owned(),
                 },
