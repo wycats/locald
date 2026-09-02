@@ -211,6 +211,46 @@ struct AvailabilityRetryState {
     next_attempt_at: Option<SystemTime>,
 }
 
+#[derive(Debug)]
+struct AvailabilityRetryClaim {
+    retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
+    instance_id: ProjectInstanceId,
+    failure_count: usize,
+    restore_at: SystemTime,
+    armed: bool,
+}
+
+impl AvailabilityRetryClaim {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AvailabilityRetryClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut retries = self
+            .retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(retry) = retries.get_mut(&self.instance_id) else {
+            return;
+        };
+        if retry.failure_count == self.failure_count && retry.next_attempt_at.is_none() {
+            retry.next_attempt_at = Some(self.restore_at);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum AvailabilityRetryAttempt {
+    Proceed,
+    Claimed(AvailabilityRetryClaim),
+    Deferred,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AvailabilityRetryMode {
     Automatic,
@@ -1360,7 +1400,10 @@ impl ProcessManager {
         );
     }
 
-    fn should_defer_automatic_availability_retry(&self, instance_id: ProjectInstanceId) -> bool {
+    fn automatic_availability_retry_attempt(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> AvailabilityRetryAttempt {
         let now = self.availability_now();
         let mut retries = self
             .availability_retries
@@ -1374,10 +1417,17 @@ impl ProcessManager {
             });
         match retry.next_attempt_at {
             Some(next_attempt_at) if now >= next_attempt_at => {
+                let failure_count = retry.failure_count;
                 retry.next_attempt_at = None;
-                false
+                AvailabilityRetryAttempt::Claimed(AvailabilityRetryClaim {
+                    retries: self.availability_retries.clone(),
+                    instance_id,
+                    failure_count,
+                    restore_at: now + Self::availability_retry_delay(failure_count),
+                    armed: true,
+                })
             }
-            Some(_) | None => true,
+            Some(_) | None => AvailabilityRetryAttempt::Deferred,
         }
     }
 
@@ -1389,24 +1439,24 @@ impl ProcessManager {
             .and_then(|retry| retry.next_attempt_at)
     }
 
-    fn should_defer_availability_retry(
+    fn availability_retry_attempt(
         &self,
         instance_id: ProjectInstanceId,
         decision: ConvergenceDecision,
         availability: &ProjectAvailability,
         retry_mode: AvailabilityRetryMode,
-    ) -> bool {
+    ) -> AvailabilityRetryAttempt {
         if !matches!(decision, ConvergenceDecision::EnsureUp)
             || availability.last_convergence_error().is_none()
         {
             self.clear_availability_retry(instance_id);
-            return false;
+            return AvailabilityRetryAttempt::Proceed;
         }
         if matches!(retry_mode, AvailabilityRetryMode::Explicit) {
             self.clear_availability_retry(instance_id);
-            return false;
+            return AvailabilityRetryAttempt::Proceed;
         }
-        self.should_defer_automatic_availability_retry(instance_id)
+        self.automatic_availability_retry_attempt(instance_id)
     }
 
     async fn load_availability(
@@ -13445,21 +13495,25 @@ impl ProcessManager {
                     );
                 }
             };
-            if self.should_defer_availability_retry(
+            let mut retry_claim = match self.availability_retry_attempt(
                 instance_id,
                 decision,
                 &snapshot,
                 options.retry_mode,
             ) {
-                drop(publication_guard);
-                return Self::surface_availability_durability(
-                    Ok(AvailabilityConvergenceOutcome {
-                        decision,
-                        availability: snapshot,
-                    }),
-                    durability_error,
-                );
-            }
+                AvailabilityRetryAttempt::Proceed => None,
+                AvailabilityRetryAttempt::Claimed(claim) => Some(claim),
+                AvailabilityRetryAttempt::Deferred => {
+                    drop(publication_guard);
+                    return Self::surface_availability_durability(
+                        Ok(AvailabilityConvergenceOutcome {
+                            decision,
+                            availability: snapshot,
+                        }),
+                        durability_error,
+                    );
+                }
+            };
             drop(publication_guard);
             let project_path = requested_path
                 .take()
@@ -13476,10 +13530,16 @@ impl ProcessManager {
                     {
                         Ok(_) => {
                             self.record_availability_retry_failure(instance_id);
+                            if let Some(claim) = retry_claim.as_mut() {
+                                claim.disarm();
+                            }
                             Err(anyhow::anyhow!(message))
                         }
                         Err(error @ AvailabilityError::PublishedNotDurable { .. }) => {
                             self.record_availability_retry_failure(instance_id);
+                            if let Some(claim) = retry_claim.as_mut() {
+                                claim.disarm();
+                            }
                             Err(anyhow::anyhow!(message).context(format!(
                                 "the missing-project convergence error was published with incomplete durability: {error}"
                             )))
@@ -13497,6 +13557,7 @@ impl ProcessManager {
                         decision,
                         action,
                         matches!(decision, ConvergenceDecision::EnsureDown),
+                        retry_claim.as_mut(),
                     )
                     .await
                 {
@@ -13655,6 +13716,7 @@ impl ProcessManager {
                     decision,
                     action,
                     clear_on_success,
+                    retry_claim.as_mut(),
                 )
                 .await
             {
@@ -13680,6 +13742,7 @@ impl ProcessManager {
         decision: ConvergenceDecision,
         action: Result<()>,
         clear_on_success: bool,
+        retry_claim: Option<&mut AvailabilityRetryClaim>,
     ) -> Result<ConvergenceDecision> {
         self.ensure_lifecycle_publication_available()?;
         match action {
@@ -13688,6 +13751,9 @@ impl ProcessManager {
                     availability.clear_convergence_error().await?;
                 }
                 self.clear_availability_retry(instance_id);
+                if let Some(claim) = retry_claim {
+                    claim.disarm();
+                }
                 Ok(decision)
             }
             Err(error) => {
@@ -13701,6 +13767,9 @@ impl ProcessManager {
                     self.record_availability_retry_failure(instance_id);
                 } else {
                     self.clear_availability_retry(instance_id);
+                }
+                if let Some(claim) = retry_claim {
+                    claim.disarm();
                 }
                 Err(error)
             }
@@ -23771,6 +23840,119 @@ PATH = "/usr/bin:/bin"
         assert_eq!(
             failed_status.next_transition_at,
             Some(clock.time() + Duration::from_mins(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_automatic_retry_restores_a_bounded_deadline_and_retries_later() {
+        let dir = tempdir().expect("create cancelled automatic retry directory");
+        let project_path = dir.path().join("cancelled-automatic-retry-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "cancelled-automatic-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        write_availability_worker_config(
+            &project_path,
+            "cancelled-automatic-retry",
+            "cancelled-automatic-retry.localhost",
+            &["web"],
+        );
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load cancelled automatic retry availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed cancelled automatic retry demand");
+        availability
+            .record_convergence_error("seed cancelled automatic retry failure".to_owned())
+            .await
+            .expect("seed cancelled automatic retry error");
+        manager.record_availability_retry_failure(instance_id);
+        manager.record_availability_retry_failure(instance_id);
+        clock.advance(Duration::from_mins(1));
+
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        manager.factories.insert(
+            0,
+            Arc::new(BlockingFailPrepareFactory {
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+                create_count: Arc::new(AtomicUsize::new(0)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let retry = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.converge_all_project_availability().await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("automatic retry reaches blocked prepare before cancellation");
+        let in_flight_status = manager
+            .project_availability_status(instance_id, CatalogPresence::Active, &[])
+            .await
+            .expect("poll status before automatic retry cancellation")
+            .expect("cancelled automatic retry availability status");
+        assert_eq!(in_flight_status.next_transition_at, None);
+
+        retry.abort();
+        assert!(
+            retry
+                .await
+                .expect_err("aborted automatic retry task is cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 2,
+                next_attempt_at: Some(clock.time() + Duration::from_mins(1)),
+            }),
+            "dropping the in-flight claim restores a bounded retry deadline"
+        );
+        let restored_status = manager
+            .project_availability_status(instance_id, CatalogPresence::Active, &[])
+            .await
+            .expect("poll status after automatic retry cancellation")
+            .expect("restored automatic retry availability status");
+        assert_eq!(
+            restored_status.next_transition_at,
+            Some(clock.time() + Duration::from_mins(1))
+        );
+
+        clock.advance(Duration::from_mins(1));
+        release_prepare.notify_one();
+        tokio::time::timeout(
+            TEST_STARTUP_BOUNDARY_TIMEOUT,
+            manager.converge_all_project_availability(),
+        )
+        .await
+        .expect("restored automatic retry runs at its next deadline");
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 3,
+                next_attempt_at: Some(clock.time() + Duration::from_mins(2)),
+            }),
+            "the later failed attempt advances from the retained sequence position"
         );
     }
 
