@@ -13758,22 +13758,43 @@ impl ProcessManager {
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if let Err(record_error) = availability.record_convergence_error(message).await {
-                    return Err(error.context(format!(
-                        "failed to record availability convergence error: {record_error}"
-                    )));
-                }
-                if matches!(decision, ConvergenceDecision::EnsureUp) {
-                    self.record_availability_retry_failure(instance_id);
-                } else {
-                    self.clear_availability_retry(instance_id);
-                }
-                if let Some(claim) = retry_claim {
-                    claim.disarm();
-                }
-                Err(error)
+                let publication = availability.record_convergence_error(message).await;
+                self.finish_failed_availability_action(
+                    instance_id,
+                    decision,
+                    error,
+                    publication,
+                    retry_claim,
+                )
             }
         }
+    }
+
+    fn finish_failed_availability_action(
+        &self,
+        instance_id: ProjectInstanceId,
+        decision: ConvergenceDecision,
+        error: anyhow::Error,
+        publication: std::result::Result<bool, AvailabilityError>,
+        retry_claim: Option<&mut AvailabilityRetryClaim>,
+    ) -> Result<ConvergenceDecision> {
+        let record_durability_error = match Self::capture_availability_publication(publication) {
+            Ok((_, durability_error)) => durability_error,
+            Err(record_error) => {
+                return Err(error.context(format!(
+                    "failed to record availability convergence error: {record_error}"
+                )));
+            }
+        };
+        if matches!(decision, ConvergenceDecision::EnsureUp) {
+            self.record_availability_retry_failure(instance_id);
+        } else {
+            self.clear_availability_retry(instance_id);
+        }
+        if let Some(claim) = retry_claim {
+            claim.disarm();
+        }
+        Self::surface_availability_durability(Err(error), record_durability_error)
     }
 
     fn canonicalize_path(path: &Path) -> PathBuf {
@@ -23719,6 +23740,83 @@ PATH = "/usr/bin:/bin"
             failed_status.next_transition_at,
             Some(clock.time() + Duration::from_secs(30)),
             "the failed explicit attempt projects its newly scheduled retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_but_not_durable_failure_advances_automatic_retry_bookkeeping() {
+        let dir = tempdir().expect("create partial-durability retry directory");
+        let project_path = dir.path().join("partial-durability-retry-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "partial-durability-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let publication_path = availability_path(&availability_data_dir, instance_id);
+        let explicit_error = manager
+            .finish_failed_availability_action(
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                anyhow::anyhow!("injected explicit convergence failure"),
+                Err(AvailabilityError::PublishedNotDurable {
+                    path: publication_path.clone(),
+                    reason: "injected explicit parent sync failure".to_owned(),
+                }),
+                None,
+            )
+            .expect_err("surface incomplete durability after explicit retry bookkeeping");
+        assert!(format!("{explicit_error:#}").contains("published with incomplete durability"));
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + Duration::from_secs(30)),
+            }),
+            "a published explicit failure begins the retry sequence immediately"
+        );
+
+        clock.advance(Duration::from_secs(30));
+        let mut claim = match manager.automatic_availability_retry_attempt(instance_id) {
+            AvailabilityRetryAttempt::Claimed(claim) => claim,
+            other => panic!("expected automatic retry claim, got {other:?}"),
+        };
+
+        let publication_error = AvailabilityError::PublishedNotDurable {
+            path: publication_path,
+            reason: "injected automatic parent sync failure".to_owned(),
+        };
+        let error = manager
+            .finish_failed_availability_action(
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                anyhow::anyhow!("injected convergence failure"),
+                Err(publication_error),
+                Some(&mut claim),
+            )
+            .expect_err("surface incomplete durability after retry bookkeeping");
+        drop(claim);
+
+        assert!(format!("{error:#}").contains("published with incomplete durability"));
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 2,
+                next_attempt_at: Some(clock.time() + Duration::from_mins(1)),
+            }),
+            "a published failure advances the claimed retry instead of restoring its old deadline"
         );
     }
 
