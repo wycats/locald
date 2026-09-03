@@ -206,9 +206,15 @@ struct AvailabilityConvergenceOutcome {
     availability: ProjectAvailability,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AvailabilityRuntimeIdentity {
+    configuration_revision: Option<u64>,
+    service_runtimes: BTreeMap<ServiceKey, (u64, bool)>,
+}
+
 struct AvailabilityActionFinalization {
     result: Result<()>,
-    attempted_configuration_revision: Option<u64>,
+    attempted_runtime_identity: Option<AvailabilityRuntimeIdentity>,
     clear_on_success: bool,
 }
 
@@ -1200,7 +1206,8 @@ pub struct ProcessManager {
     config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     availability_coordinators: Arc<Mutex<HashMap<ProjectInstanceId, Arc<AvailabilityCoordinator>>>>,
     availability_retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
-    availability_runtime_recovery_revision: Arc<StdMutex<HashMap<ProjectInstanceId, u64>>>,
+    availability_runtime_recovery_identity:
+        Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRuntimeIdentity>>>,
     availability_retry_changed: Arc<Notify>,
     availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
@@ -1414,7 +1421,7 @@ impl ProcessManager {
             .remove(&instance_id)
             .is_some();
         let recovery_removed = self
-            .availability_runtime_recovery_revision
+            .availability_runtime_recovery_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&instance_id)
@@ -1424,18 +1431,18 @@ impl ProcessManager {
         }
     }
 
-    fn set_availability_runtime_recovery_revision(
+    fn set_availability_runtime_recovery_identity(
         &self,
         instance_id: ProjectInstanceId,
-        configuration_revision: Option<u64>,
+        runtime_identity: Option<AvailabilityRuntimeIdentity>,
     ) {
         let mut recoveries = self
-            .availability_runtime_recovery_revision
+            .availability_runtime_recovery_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match configuration_revision {
-            Some(configuration_revision) => {
-                recoveries.insert(instance_id, configuration_revision);
+        match runtime_identity {
+            Some(runtime_identity) => {
+                recoveries.insert(instance_id, runtime_identity);
             }
             None => {
                 recoveries.remove(&instance_id);
@@ -1446,13 +1453,44 @@ impl ProcessManager {
     fn availability_runtime_recovery_matches(
         &self,
         instance_id: ProjectInstanceId,
-        configuration_revision: Option<u64>,
+        runtime_identity: &AvailabilityRuntimeIdentity,
     ) -> bool {
-        self.availability_runtime_recovery_revision
+        self.availability_runtime_recovery_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&instance_id)
-            .is_some_and(|pending| Some(*pending) == configuration_revision)
+            .is_some_and(|pending| pending == runtime_identity)
+    }
+
+    async fn availability_runtime_identity(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> AvailabilityRuntimeIdentity {
+        let configuration_revision = self
+            .registry
+            .lock()
+            .await
+            .configuration_revision(instance_id);
+        let service_runtimes = self
+            .services
+            .lock()
+            .await
+            .iter()
+            .filter(|(key, _)| key.instance() == instance_id)
+            .map(|(key, service)| {
+                (
+                    key.clone(),
+                    (
+                        service.controller_generation,
+                        matches!(&service.runtime_state, ServiceRuntime::Controller(_)),
+                    ),
+                )
+            })
+            .collect();
+        AvailabilityRuntimeIdentity {
+            configuration_revision,
+            service_runtimes,
+        }
     }
 
     fn ensure_availability_retry_scheduled(&self, instance_id: ProjectInstanceId) {
@@ -1963,7 +2001,7 @@ impl ProcessManager {
             config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
             availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
             availability_retries: Arc::new(StdMutex::new(HashMap::new())),
-            availability_runtime_recovery_revision: Arc::new(StdMutex::new(HashMap::new())),
+            availability_runtime_recovery_identity: Arc::new(StdMutex::new(HashMap::new())),
             availability_retry_changed: Arc::new(Notify::new()),
             availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
@@ -12078,15 +12116,11 @@ impl ProcessManager {
         });
         let desired = availability.desired_up_at(now);
         let paused = availability.is_paused();
-        let configuration_revision = self
-            .registry
-            .lock()
-            .await
-            .configuration_revision(instance_id);
+        let runtime_identity = self.availability_runtime_identity(instance_id).await;
         let recovered_runtime = presence == CatalogPresence::Active
             && desired
             && runtime_ready
-            && self.availability_runtime_recovery_matches(instance_id, configuration_revision);
+            && self.availability_runtime_recovery_matches(instance_id, &runtime_identity);
         let last_error = (!recovered_runtime)
             .then(|| availability.last_convergence_error().map(ToOwned::to_owned))
             .flatten();
@@ -12979,13 +13013,9 @@ impl ProcessManager {
                 .filter(|(_, instance_id)| *instance_id != active_retry)
                 .filter_map(|(_, instance_id)| self.queue_overdue_availability_retry(instance_id))
                 .collect::<Vec<_>>();
-            let attempted = self
-                .converge_background_availability_instance_with_guard(active_retry, runtime_guard)
+            self.converge_background_availability_instance_with_guard(active_retry, runtime_guard)
                 .await;
             drop(queued_retries);
-            if attempted {
-                return;
-            }
         } else {
             for instance_id in skipped_busy_retries {
                 self.defer_overdue_availability_retry(instance_id);
@@ -13885,7 +13915,7 @@ impl ProcessManager {
                 if matches!(decision, ConvergenceDecision::EnsureUp) && action.is_ok() {
                     let message =
                         format!("project instance {instance_id} is missing from the filesystem");
-                    self.set_availability_runtime_recovery_revision(instance_id, None);
+                    self.set_availability_runtime_recovery_identity(instance_id, None);
                     let publication = availability.record_convergence_error(message.clone()).await;
                     let result = self.finish_failed_availability_action(
                         instance_id,
@@ -13907,7 +13937,7 @@ impl ProcessManager {
                         decision,
                         AvailabilityActionFinalization {
                             result: action,
-                            attempted_configuration_revision: None,
+                            attempted_runtime_identity: None,
                             clear_on_success: matches!(decision, ConvergenceDecision::EnsureDown),
                         },
                         retry_claim.as_mut(),
@@ -13928,11 +13958,8 @@ impl ProcessManager {
                 return Self::surface_availability_durability(result, durability_error);
             };
 
-            let configuration_revision_before_action = self
-                .registry
-                .lock()
-                .await
-                .configuration_revision(instance_id);
+            let runtime_identity_before_action =
+                self.availability_runtime_identity(instance_id).await;
             let (action, clear_on_success, applied_config) = match decision {
                 ConvergenceDecision::EnsureUp => {
                     let has_pending_reload = self
@@ -13991,15 +14018,10 @@ impl ProcessManager {
                     .await
                     .remove(&instance_id);
             }
-            let attempted_configuration_revision = if applied_config {
-                let revision_after_action = self
-                    .registry
-                    .lock()
-                    .await
-                    .configuration_revision(instance_id);
-                (revision_after_action != configuration_revision_before_action)
-                    .then_some(revision_after_action)
-                    .flatten()
+            let attempted_runtime_identity = if applied_config {
+                let identity_after_action = self.availability_runtime_identity(instance_id).await;
+                (identity_after_action != runtime_identity_before_action)
+                    .then_some(identity_after_action)
             } else {
                 None
             };
@@ -14089,7 +14111,7 @@ impl ProcessManager {
                     decision,
                     AvailabilityActionFinalization {
                         result: action,
-                        attempted_configuration_revision,
+                        attempted_runtime_identity,
                         clear_on_success,
                     },
                     retry_claim.as_mut(),
@@ -14135,14 +14157,16 @@ impl ProcessManager {
                 )
             }
             Err(error) => {
-                let recovery_revision = if matches!(decision, ConvergenceDecision::EnsureUp)
+                let recovery_identity = if matches!(decision, ConvergenceDecision::EnsureUp)
                     && !self.project_runtime_is_ready(instance_id).await
                 {
-                    finalization.attempted_configuration_revision
+                    finalization.attempted_runtime_identity
                 } else {
                     None
                 };
-                self.set_availability_runtime_recovery_revision(instance_id, recovery_revision);
+                if recovery_identity.is_some() || retry_claim.is_none() {
+                    self.set_availability_runtime_recovery_identity(instance_id, recovery_identity);
+                }
                 let message = format!("{error:#}");
                 let publication = availability.record_convergence_error(message).await;
                 self.finish_failed_availability_action(
@@ -24215,7 +24239,7 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
-    async fn late_runtime_readiness_hides_stale_scheduled_failure() {
+    async fn managed_runtime_identity_recovers_late_readiness_without_catalog_revision_change() {
         let dir = tempdir().expect("create late readiness directory");
         let project_path = dir.path().join("late-readiness-project");
         let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
@@ -24240,23 +24264,23 @@ PATH = "/usr/bin:/bin"
             .await
             .replace_configuration_projection(instance_id, [], [])
             .expect("admit the configuration whose runtime is still becoming ready");
+
+        let mut prior_service =
+            availability_test_service(instance_id, "late-readiness", &project_path, false);
+        prior_service.controller_generation = 1;
+        prior_service.sticky_port = Some(3000);
+        prior_service.health_status = HealthStatus::Starting;
         manager
-            .finish_availability_action_locked(
-                &mut availability,
-                instance_id,
-                ConvergenceDecision::EnsureUp,
-                AvailabilityActionFinalization {
-                    result: Err(anyhow::anyhow!("seed late readiness failure")),
-                    attempted_configuration_revision: Some(attempted_configuration_revision),
-                    clear_on_success: true,
-                },
-                None,
-            )
+            .services
+            .lock()
             .await
-            .expect_err("seed late readiness convergence failure");
+            .insert_display("late-readiness:web".to_owned(), prior_service);
+        let runtime_identity_before_action =
+            manager.availability_runtime_identity(instance_id).await;
 
         let mut service =
             availability_test_service(instance_id, "late-readiness", &project_path, false);
+        service.controller_generation = 2;
         service.sticky_port = Some(3000);
         service.health_status = HealthStatus::Starting;
         let controller = match &service.runtime_state {
@@ -24271,6 +24295,34 @@ PATH = "/usr/bin:/bin"
             .lock()
             .await
             .insert_display("late-readiness:web".to_owned(), service);
+        let attempted_runtime_identity = manager.availability_runtime_identity(instance_id).await;
+        assert_eq!(
+            attempted_runtime_identity.configuration_revision,
+            Some(attempted_configuration_revision)
+        );
+        assert_eq!(
+            attempted_runtime_identity.configuration_revision,
+            runtime_identity_before_action.configuration_revision,
+            "a managed-only change leaves the catalog configuration revision unchanged"
+        );
+        assert_ne!(
+            attempted_runtime_identity, runtime_identity_before_action,
+            "the managed service projection independently identifies the attempted runtime"
+        );
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                AvailabilityActionFinalization {
+                    result: Err(anyhow::anyhow!("seed late readiness failure")),
+                    attempted_runtime_identity: Some(attempted_runtime_identity),
+                    clear_on_success: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("seed late readiness convergence failure");
 
         assert!(
             manager
@@ -24358,7 +24410,7 @@ PATH = "/usr/bin:/bin"
                 ConvergenceDecision::EnsureUp,
                 AvailabilityActionFinalization {
                     result: Err(anyhow::anyhow!("edited configuration is invalid")),
-                    attempted_configuration_revision: None,
+                    attempted_runtime_identity: None,
                     clear_on_success: true,
                 },
                 None,
@@ -24520,6 +24572,85 @@ PATH = "/usr/bin:/bin"
             AVAILABILITY_BUSY_RETRY_DELAY
         );
         drop(runtime_guard);
+    }
+
+    #[tokio::test]
+    async fn due_retry_does_not_skip_unrelated_stop_convergence() {
+        let dir = tempdir().expect("create retry and stop convergence directory");
+        let retry_path = dir.path().join("retry-project");
+        let stop_path = dir.path().join("stop-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, retry_instance, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &retry_path,
+            "retry-project",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        std::fs::create_dir_all(&stop_path).expect("create stop project");
+        let stop_discovery =
+            Registry::discover(std::fs::canonicalize(&stop_path).expect("canonical stop project"))
+                .await
+                .expect("discover stop project");
+        let stop_instance = manager
+            .registry
+            .lock()
+            .await
+            .register_project(stop_discovery, Some("stop-project".to_owned()))
+            .expect("register stop project");
+
+        let mut retry_availability = AvailabilityStore::load_with_clock(
+            &availability_data_dir,
+            retry_instance,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await
+        .expect("load retry availability");
+        retry_availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("demand retry project");
+        retry_availability
+            .record_convergence_error("seed due retry".to_owned())
+            .await
+            .expect("seed due retry failure");
+
+        let mut stop_availability = AvailabilityStore::load_with_clock(
+            &availability_data_dir,
+            stop_instance,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await
+        .expect("load stop availability");
+        stop_availability
+            .set_always_on(true)
+            .await
+            .expect("seed stop project lifecycle state");
+        stop_availability
+            .set_always_on(false)
+            .await
+            .expect("make stop project desired down");
+
+        manager.services.lock().await.insert_display(
+            "stop-project:web".to_owned(),
+            availability_test_service(stop_instance, "stop-project", &stop_path, false),
+        );
+        manager.record_availability_retry_failure(retry_instance);
+        clock.advance(locald_core::SHUTDOWN_COOLDOWN.max(Duration::from_secs(30)));
+        std::fs::remove_dir_all(&retry_path).expect("make the due retry fail promptly");
+
+        manager.converge_all_project_availability().await;
+
+        assert!(
+            manager
+                .availability_retry_deadline(retry_instance)
+                .is_none_or(|deadline| deadline > clock.time()),
+            "the due retry is consumed or advanced beyond its expired deadline"
+        );
+        assert!(
+            !manager.project_runtime_exists(stop_instance).await,
+            "the same maintenance sweep also performs unrelated desired-down convergence"
+        );
     }
 
     #[tokio::test]
