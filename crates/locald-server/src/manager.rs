@@ -80,13 +80,15 @@ const LOG_BUFFER_SIZE: usize = 2000;
 // their endpoint. Keep that work bounded without treating a normal build like
 // the much shorter daemon-proxy startup check.
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
-// Background convergence starts every managed project independently. Preserve
-// its shorter budget so each cold or stuck project remains bounded without
-// occupying a foreground readiness window.
+// Background convergence gives one due retry a bounded projection window at a
+// time. Other projects keep their runtime coordinators available for explicit
+// lifecycle work while they wait in the daemon-managed retry queue.
 const BACKGROUND_SERVICE_READINESS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const AVAILABILITY_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const AVAILABILITY_BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const AVAILABILITY_QUEUED_RETRY_DELAY: std::time::Duration =
+    BACKGROUND_SERVICE_READINESS_TIMEOUT.saturating_add(AVAILABILITY_BUSY_RETRY_DELAY);
 const AVAILABILITY_RETRY_DELAYS: [std::time::Duration; 5] = [
     std::time::Duration::from_secs(30),
     std::time::Duration::from_mins(1),
@@ -1466,17 +1468,44 @@ impl ProcessManager {
             .and_then(|retry| retry.next_attempt_at)
     }
 
-    fn defer_overdue_availability_retry(&self, instance_id: ProjectInstanceId) {
+    fn schedule_overdue_availability_retry(
+        &self,
+        instance_id: ProjectInstanceId,
+        delay: std::time::Duration,
+    ) -> Option<AvailabilityRetryState> {
         let now = self.availability_now();
         let mut retries = self
             .availability_retries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let deferred = retries.get_mut(&instance_id).is_some_and(|retry| {
-            if retry
+        let scheduled = retries.get_mut(&instance_id).and_then(|retry| {
+            retry
                 .next_attempt_at
                 .is_some_and(|next_attempt_at| next_attempt_at <= now)
-            {
+                .then(|| {
+                    retry.next_attempt_at = Some(now + delay);
+                    *retry
+                })
+        });
+        drop(retries);
+        if scheduled.is_some() {
+            self.availability_retry_changed.notify_one();
+        }
+        scheduled
+    }
+
+    fn release_queued_availability_retry(
+        &self,
+        instance_id: ProjectInstanceId,
+        queued: AvailabilityRetryState,
+    ) {
+        let now = self.availability_now();
+        let mut retries = self
+            .availability_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let released = retries.get_mut(&instance_id).is_some_and(|retry| {
+            if *retry == queued {
                 retry.next_attempt_at = Some(now + AVAILABILITY_BUSY_RETRY_DELAY);
                 true
             } else {
@@ -1484,9 +1513,13 @@ impl ProcessManager {
             }
         });
         drop(retries);
-        if deferred {
+        if released {
             self.availability_retry_changed.notify_one();
         }
+    }
+
+    fn defer_overdue_availability_retry(&self, instance_id: ProjectInstanceId) {
+        self.schedule_overdue_availability_retry(instance_id, AVAILABILITY_BUSY_RETRY_DELAY);
     }
 
     fn availability_maintenance_delay(&self) -> std::time::Duration {
@@ -12752,42 +12785,82 @@ impl ProcessManager {
             let registry = self.registry.lock().await;
             registry.instances.keys().copied().collect::<Vec<_>>()
         };
+        let now = self.availability_now();
+        let mut due_retries = {
+            let retries = self
+                .availability_retries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            instance_ids
+                .iter()
+                .filter_map(|instance_id| {
+                    retries
+                        .get(instance_id)
+                        .and_then(|retry| retry.next_attempt_at)
+                        .filter(|deadline| *deadline <= now)
+                        .map(|deadline| (deadline, *instance_id))
+                })
+                .collect::<Vec<_>>()
+        };
+        due_retries.sort_unstable();
 
-        futures_util::future::join_all(instance_ids.into_iter().map(|instance_id| {
-            let manager = self.clone();
-            async move {
-                if manager.is_shutting_down() {
-                    return;
-                }
-                match manager.availability_is_managed(instance_id).await {
-                    Ok(true) => {
-                        match manager
-                            .try_converge_managed_instance_with_readiness_timeout(
-                                instance_id,
-                                None,
-                                false,
-                                false,
-                                BACKGROUND_SERVICE_READINESS_TIMEOUT,
-                            )
-                            .await
-                        {
-                            Some(Ok(_)) => {}
-                            Some(Err(error)) => {
-                                warn!(
-                                    "Failed to converge availability for {instance_id}: {error:#}"
-                                );
-                            }
-                            None => manager.defer_overdue_availability_retry(instance_id),
-                        }
+        if let Some((_, active_retry)) = due_retries.first().copied() {
+            let queued_retries = due_retries
+                .into_iter()
+                .skip(1)
+                .filter_map(|(_, instance_id)| {
+                    self.schedule_overdue_availability_retry(
+                        instance_id,
+                        AVAILABILITY_QUEUED_RETRY_DELAY,
+                    )
+                    .map(|queued| (instance_id, queued))
+                })
+                .collect::<Vec<_>>();
+            self.converge_background_availability_instance(active_retry)
+                .await;
+            for (instance_id, queued) in queued_retries {
+                self.release_queued_availability_retry(instance_id, queued);
+            }
+            return;
+        }
+
+        for instance_id in instance_ids {
+            self.converge_background_availability_instance(instance_id)
+                .await;
+            if self.is_shutting_down() {
+                break;
+            }
+        }
+    }
+
+    async fn converge_background_availability_instance(&self, instance_id: ProjectInstanceId) {
+        if self.is_shutting_down() {
+            return;
+        }
+        match self.availability_is_managed(instance_id).await {
+            Ok(true) => {
+                match self
+                    .try_converge_managed_instance_with_readiness_timeout(
+                        instance_id,
+                        None,
+                        false,
+                        false,
+                        BACKGROUND_SERVICE_READINESS_TIMEOUT,
+                    )
+                    .await
+                {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        warn!("Failed to converge availability for {instance_id}: {error:#}");
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        warn!("Failed to inspect availability for {instance_id}: {error:#}");
-                    }
+                    None => self.defer_overdue_availability_retry(instance_id),
                 }
             }
-        }))
-        .await;
+            Ok(false) => {}
+            Err(error) => {
+                warn!("Failed to inspect availability for {instance_id}: {error:#}");
+            }
+        }
     }
 
     async fn availability_instance_for_path(
@@ -38665,7 +38738,7 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
-    async fn background_convergence_claims_shared_retry_deadlines_without_serial_drift() {
+    async fn background_convergence_queues_shared_retries_without_holding_later_coordinators() {
         let dir = tempdir().expect("create background convergence directory");
         let first_path = dir.path().join("first-project");
         let second_path = dir.path().join("second-project");
@@ -38795,28 +38868,38 @@ PATH = "/usr/bin:/bin"
         tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_observed.notified())
             .await
             .expect("the slow background project enters its readiness wait");
-        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
-            loop {
-                let retries = manager
-                    .availability_retries
-                    .lock()
-                    .expect("retry state mutex poisoned");
-                if [*slow_instance, *later_instance]
-                    .into_iter()
-                    .all(|instance_id| {
-                        retries
-                            .get(&instance_id)
-                            .is_some_and(|retry| retry.next_attempt_at.is_none())
-                    })
-                {
-                    break;
-                }
-                drop(retries);
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("both same-deadline retries are claimed before either readiness deadline");
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(slow_instance)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: None,
+            }),
+            "the first due retry owns the active attempt"
+        );
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(later_instance)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + AVAILABILITY_QUEUED_RETRY_DELAY),
+            }),
+            "the later retry exposes a bounded queue deadline"
+        );
+        let later_coordinator = manager.availability_coordinator(*later_instance).await;
+        let later_foreground_guard = later_coordinator
+            .runtime
+            .clone()
+            .try_lock_owned()
+            .expect("a queued background retry keeps its coordinator available");
         assert_eq!(
             *manager
                 .readiness_wait_timeout
@@ -38847,24 +38930,31 @@ PATH = "/usr/bin:/bin"
         assert_eq!(
             creates.load(Ordering::SeqCst),
             1,
-            "the shared runtime projection remains serialized after both retries are claimed"
+            "only the active retry enters the shared runtime projection"
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::time::resume();
-        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
-            while creates.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the later claimed retry enters projection after the bounded readiness wait");
+        drop(later_foreground_guard);
         tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, sweep)
             .await
             .expect("the sweep completes after the slow project's bounded deadline")
             .expect("background convergence task joins");
 
-        assert_eq!(creates.load(Ordering::SeqCst), 2);
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(later_instance)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY),
+            }),
+            "completing the active attempt pulls the queued retry forward"
+        );
         assert_eq!(
             manager
                 .services
@@ -38896,28 +38986,6 @@ PATH = "/usr/bin:/bin"
                 .is_none(),
             "the retained cold build's unbound port cannot be reallocated"
         );
-        assert_eq!(
-            manager
-                .services
-                .lock()
-                .await
-                .get_display("background-later:web")
-                .expect("test service")
-                .health_status,
-            HealthStatus::Healthy,
-            "the later project converges in the same sweep"
-        );
-        assert!(
-            manager
-                .services
-                .lock()
-                .await
-                .get_display("background-later:web")
-                .expect("test service")
-                .pending_port_guard
-                .is_none(),
-            "a ready service releases its allocator reservation"
-        );
         let slow_snapshot = AvailabilityStore::load(&availability_data_dir, *slow_instance)
             .await
             .expect("reload slow availability")
@@ -38931,10 +38999,46 @@ PATH = "/usr/bin:/bin"
         );
         let later_snapshot = AvailabilityStore::load(&availability_data_dir, *later_instance)
             .await
-            .expect("reload later availability")
+            .expect("reload queued availability")
             .snapshot()
             .await
-            .expect("read later convergence result");
+            .expect("read queued convergence result");
+        assert_eq!(
+            later_snapshot.last_convergence_error(),
+            Some("seed shared-deadline failure")
+        );
+
+        clock.advance(AVAILABILITY_BUSY_RETRY_DELAY);
+        manager.converge_all_project_availability().await;
+        assert_eq!(creates.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("background-later:web")
+                .expect("test service")
+                .health_status,
+            HealthStatus::Healthy,
+            "the queued project converges at its revised deadline"
+        );
+        assert!(
+            manager
+                .services
+                .lock()
+                .await
+                .get_display("background-later:web")
+                .expect("test service")
+                .pending_port_guard
+                .is_none(),
+            "a ready service releases its allocator reservation"
+        );
+        let later_snapshot = AvailabilityStore::load(&availability_data_dir, *later_instance)
+            .await
+            .expect("reload completed queued availability")
+            .snapshot()
+            .await
+            .expect("read completed queued convergence result");
         assert_eq!(later_snapshot.last_convergence_error(), None);
 
         let slow_coordinator = manager.availability_coordinator(*slow_instance).await;
