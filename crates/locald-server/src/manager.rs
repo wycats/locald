@@ -86,6 +86,7 @@ const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from
 const BACKGROUND_SERVICE_READINESS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const AVAILABILITY_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const AVAILABILITY_BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const AVAILABILITY_RETRY_DELAYS: [std::time::Duration; 5] = [
     std::time::Duration::from_secs(30),
     std::time::Duration::from_mins(1),
@@ -1463,6 +1464,29 @@ impl ProcessManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&instance_id)
             .and_then(|retry| retry.next_attempt_at)
+    }
+
+    fn defer_overdue_availability_retry(&self, instance_id: ProjectInstanceId) {
+        let now = self.availability_now();
+        let mut retries = self
+            .availability_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deferred = retries.get_mut(&instance_id).is_some_and(|retry| {
+            if retry
+                .next_attempt_at
+                .is_some_and(|next_attempt_at| next_attempt_at <= now)
+            {
+                retry.next_attempt_at = Some(now + AVAILABILITY_BUSY_RETRY_DELAY);
+                true
+            } else {
+                false
+            }
+        });
+        drop(retries);
+        if deferred {
+            self.availability_retry_changed.notify_one();
+        }
     }
 
     fn availability_maintenance_delay(&self) -> std::time::Duration {
@@ -12726,7 +12750,7 @@ impl ProcessManager {
             }
             match self.availability_is_managed(instance_id).await {
                 Ok(true) => {
-                    if let Some(Err(error)) = self
+                    match self
                         .try_converge_managed_instance_with_readiness_timeout(
                             instance_id,
                             None,
@@ -12736,7 +12760,11 @@ impl ProcessManager {
                         )
                         .await
                     {
-                        warn!("Failed to converge availability for {instance_id}: {error:#}");
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            warn!("Failed to converge availability for {instance_id}: {error:#}");
+                        }
+                        None => self.defer_overdue_availability_retry(instance_id),
                     }
                 }
                 Ok(false) => {}
@@ -23828,6 +23856,57 @@ PATH = "/usr/bin:/bin"
             Duration::from_secs(19),
             "maintenance wakes at the published retry deadline rather than the next fixed sweep"
         );
+    }
+
+    #[tokio::test]
+    async fn busy_runtime_coordinator_defers_an_overdue_retry_without_advancing_it() {
+        let dir = tempdir().expect("create busy retry directory");
+        let project_path = dir.path().join("busy-retry-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "busy-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load busy retry availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed busy retry demand");
+        availability
+            .record_convergence_error("seed busy retry failure".to_owned())
+            .await
+            .expect("seed busy retry failure");
+        manager.record_availability_retry_failure(instance_id);
+        clock.advance(Duration::from_secs(30));
+
+        let coordinator = manager.availability_coordinator(instance_id).await;
+        let runtime_guard = coordinator.runtime.lock().await;
+        manager.converge_all_project_availability().await;
+
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY),
+            }),
+            "a busy coordinator retains the sequence and schedules a nonzero follow-up"
+        );
+        assert_eq!(
+            manager.availability_maintenance_delay(),
+            AVAILABILITY_BUSY_RETRY_DELAY
+        );
+        drop(runtime_guard);
     }
 
     #[tokio::test]
