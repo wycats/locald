@@ -1195,6 +1195,7 @@ pub struct ProcessManager {
     config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     availability_coordinators: Arc<Mutex<HashMap<ProjectInstanceId, Arc<AvailabilityCoordinator>>>>,
     availability_retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
+    availability_runtime_recovery_pending: Arc<StdMutex<HashSet<ProjectInstanceId>>>,
     availability_retry_changed: Arc<Notify>,
     availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
@@ -1401,14 +1402,97 @@ impl ProcessManager {
     }
 
     fn clear_availability_retry(&self, instance_id: ProjectInstanceId) {
-        let removed = self
+        let retry_removed = self
             .availability_retries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&instance_id)
             .is_some();
-        if removed {
+        let recovery_removed = self
+            .availability_runtime_recovery_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&instance_id);
+        if retry_removed || recovery_removed {
             self.notify_availability_retry_changed();
+        }
+    }
+
+    fn set_availability_runtime_recovery_pending(
+        &self,
+        instance_id: ProjectInstanceId,
+        pending: bool,
+    ) {
+        let mut recoveries = self
+            .availability_runtime_recovery_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending {
+            recoveries.insert(instance_id);
+        } else {
+            recoveries.remove(&instance_id);
+        }
+    }
+
+    fn availability_runtime_recovery_pending(&self, instance_id: ProjectInstanceId) -> bool {
+        self.availability_runtime_recovery_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&instance_id)
+    }
+
+    fn ensure_availability_retry_scheduled(&self, instance_id: ProjectInstanceId) {
+        let now = self.availability_now();
+        let mut retries = self
+            .availability_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inserted =
+            if let std::collections::hash_map::Entry::Vacant(entry) = retries.entry(instance_id) {
+                entry.insert(AvailabilityRetryState {
+                    failure_count: 1,
+                    next_attempt_at: Some(now + Self::availability_retry_delay(1)),
+                });
+                true
+            } else {
+                false
+            };
+        drop(retries);
+        if inserted {
+            self.notify_availability_retry_changed();
+        }
+    }
+
+    async fn hydrate_availability_retries(&self, instance_ids: &[ProjectInstanceId]) {
+        let now = self.availability_now();
+        for instance_id in instance_ids.iter().copied() {
+            if self
+                .availability_retries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&instance_id)
+            {
+                continue;
+            }
+            let mut availability = match self.load_availability(instance_id).await {
+                Ok(availability) => availability,
+                Err(error) => {
+                    warn!("Failed to hydrate availability retry for {instance_id}: {error:#}");
+                    continue;
+                }
+            };
+            match availability.snapshot().await {
+                Ok(snapshot)
+                    if snapshot.desired_up_at(now)
+                        && snapshot.last_convergence_error().is_some() =>
+                {
+                    self.ensure_availability_retry_scheduled(instance_id);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!("Failed to hydrate availability retry for {instance_id}: {error:#}");
+                }
+            }
         }
     }
 
@@ -1855,6 +1939,7 @@ impl ProcessManager {
             config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
             availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
             availability_retries: Arc::new(StdMutex::new(HashMap::new())),
+            availability_runtime_recovery_pending: Arc::new(StdMutex::new(HashSet::new())),
             availability_retry_changed: Arc::new(Notify::new()),
             availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
@@ -4323,6 +4408,15 @@ impl ProcessManager {
         if self.is_shutting_down() {
             return;
         }
+        let instance_ids = {
+            let registry = self.registry.lock().await;
+            registry.instances.keys().copied().collect::<Vec<_>>()
+        };
+        // Hydrate every durable desired-up failure before restoring any runtime.
+        // Startup convergence is serial, so per-instance lazy hydration could
+        // otherwise leave later failures unscheduled while an earlier project
+        // waits for readiness.
+        self.hydrate_availability_retries(&instance_ids).await;
         self.converge_all_project_availability().await;
 
         let _runtime_projection_guard = self.runtime_projection_lock.lock().await;
@@ -11963,7 +12057,7 @@ impl ProcessManager {
         let recovered_runtime = presence == CatalogPresence::Active
             && desired
             && runtime_ready
-            && self.availability_retry_deadline(instance_id).is_some();
+            && self.availability_runtime_recovery_pending(instance_id);
         let last_error = (!recovered_runtime)
             .then(|| availability.last_convergence_error().map(ToOwned::to_owned))
             .flatten();
@@ -11976,10 +12070,10 @@ impl ProcessManager {
         } else if paused {
             ProjectLifecycleState::Paused
         } else if desired {
-            if runtime_ready {
-                ProjectLifecycleState::Ready
-            } else if last_error.is_some() {
+            if last_error.is_some() {
                 ProjectLifecycleState::Failed
+            } else if runtime_ready {
+                ProjectLifecycleState::Ready
             } else if !suppressed.is_empty() {
                 ProjectLifecycleState::Degraded
             } else if runtime_starting || !runtime_running {
@@ -13765,27 +13859,18 @@ impl ProcessManager {
                 if matches!(decision, ConvergenceDecision::EnsureUp) && action.is_ok() {
                     let message =
                         format!("project instance {instance_id} is missing from the filesystem");
-                    let result = match availability.record_convergence_error(message.clone()).await
-                    {
-                        Ok(_) => {
-                            self.record_availability_retry_failure(instance_id);
-                            if let Some(claim) = retry_claim.as_mut() {
-                                claim.disarm();
-                            }
-                            Err(anyhow::anyhow!(message))
-                        }
-                        Err(error @ AvailabilityError::PublishedNotDurable { .. }) => {
-                            self.record_availability_retry_failure(instance_id);
-                            if let Some(claim) = retry_claim.as_mut() {
-                                claim.disarm();
-                            }
-                            Err(anyhow::anyhow!(message).context(format!(
-                                "the missing-project convergence error was published with incomplete durability: {error}"
-                            )))
-                        }
-                        Err(error) => Err(anyhow::anyhow!(message).context(format!(
-                            "failed to record the missing-project convergence error: {error}"
-                        ))),
+                    self.set_availability_runtime_recovery_pending(instance_id, false);
+                    let publication = availability.record_convergence_error(message.clone()).await;
+                    let result = self.finish_failed_availability_action(
+                        instance_id,
+                        decision,
+                        anyhow::anyhow!(message),
+                        publication,
+                        retry_claim.as_mut(),
+                    );
+                    let result = match result {
+                        Ok(_) => unreachable!("a failed availability action cannot succeed"),
+                        Err(error) => Err(error),
                     };
                     return Self::surface_availability_durability(result, durability_error);
                 }
@@ -13999,6 +14084,11 @@ impl ProcessManager {
                 Ok(decision)
             }
             Err(error) => {
+                self.set_availability_runtime_recovery_pending(
+                    instance_id,
+                    matches!(decision, ConvergenceDecision::EnsureUp)
+                        && !self.project_runtime_is_ready(instance_id).await,
+                );
                 let message = format!("{error:#}");
                 let publication = availability.record_convergence_error(message).await;
                 self.finish_failed_availability_action(
@@ -24066,11 +24156,17 @@ PATH = "/usr/bin:/bin"
             .set_always_on(true)
             .await
             .expect("enable late readiness Always On");
-        availability
-            .record_convergence_error("seed late readiness failure".to_owned())
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                Err(anyhow::anyhow!("seed late readiness failure")),
+                true,
+                None,
+            )
             .await
-            .expect("seed late readiness convergence failure");
-        manager.record_availability_retry_failure(instance_id);
+            .expect_err("seed late readiness convergence failure");
 
         let mut service =
             availability_test_service(instance_id, "late-readiness", &project_path, false);
@@ -24127,6 +24223,71 @@ PATH = "/usr/bin:/bin"
                 .last_convergence_error(),
             Some("seed late readiness failure"),
             "status becomes truthful before the immediate convergence pass clears durable history"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_prior_runtime_does_not_hide_failed_configuration_projection() {
+        let dir = tempdir().expect("create failed configuration directory");
+        let project_path = dir.path().join("failed-configuration-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "failed-configuration",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load failed configuration availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable failed configuration Always On");
+
+        let mut service =
+            availability_test_service(instance_id, "failed-configuration", &project_path, true);
+        service.health_status = HealthStatus::Healthy;
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("failed-configuration:web".to_owned(), service);
+
+        manager
+            .finish_availability_action_locked(
+                &mut availability,
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                Err(anyhow::anyhow!("edited configuration is invalid")),
+                true,
+                None,
+            )
+            .await
+            .expect_err("record failed configuration convergence");
+
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read failed configuration status")
+            .availability
+            .expect("failed configuration availability status");
+        assert_eq!(status.state, ProjectLifecycleState::Failed);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("edited configuration is invalid")
+        );
+        assert_eq!(
+            status.next_transition_at,
+            Some(clock.time() + Duration::from_secs(30))
+        );
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "convergence_failed")
         );
     }
 
@@ -25119,7 +25280,9 @@ PATH = "/usr/bin:/bin"
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }),
         );
-        reopened.converge_all_project_availability().await;
+        reopened
+            .restore_policy_owned_projects(RuntimeRestorePlan)
+            .await;
         assert!(!reopened.project_runtime_exists(instance_id).await);
         let retry = reopened
             .availability_retries
@@ -25204,8 +25367,128 @@ PATH = "/usr/bin:/bin"
                 stop_count: Arc::new(AtomicUsize::new(0)),
             }),
         );
-        healthy_reopened.converge_all_project_availability().await;
+        healthy_reopened
+            .restore_policy_owned_projects(RuntimeRestorePlan)
+            .await;
         assert!(healthy_reopened.project_runtime_is_ready(healthy_id).await);
+    }
+
+    #[tokio::test]
+    async fn startup_hydrates_all_failed_retries_before_restoring_any_runtime() {
+        let dir = tempdir().expect("create startup hydration directory");
+        let first_path = dir.path().join("first-startup-project");
+        let second_path = dir.path().join("second-startup-project");
+        std::fs::create_dir_all(&first_path).expect("create first startup project");
+        std::fs::create_dir_all(&second_path).expect("create second startup project");
+        write_availability_worker_config(
+            &first_path,
+            "first-startup",
+            "first-startup.localhost",
+            &["web"],
+        );
+        write_availability_worker_config(
+            &second_path,
+            "second-startup",
+            "second-startup.localhost",
+            &["web"],
+        );
+
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        for (path, name) in [
+            (&first_path, "first-startup"),
+            (&second_path, "second-startup"),
+        ] {
+            let discovery =
+                Registry::discover(std::fs::canonicalize(path).expect("canonical startup project"))
+                    .await
+                    .expect("discover startup project");
+            catalog
+                .register_project(discovery, Some(name.to_owned()))
+                .expect("register startup project");
+        }
+        catalog.save().await.expect("save startup catalog");
+        let ordered_instances = catalog.instances.keys().copied().collect::<Vec<_>>();
+        let failed_instance = ordered_instances[1];
+        let availability_data_dir = dir.path().join("availability-data");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+
+        for instance_id in ordered_instances.iter().copied() {
+            let mut availability = AvailabilityStore::load_with_clock(
+                &availability_data_dir,
+                instance_id,
+                SharedAvailabilityClock::new(clock.clone()),
+            )
+            .await
+            .expect("load startup availability");
+            availability
+                .ensure_demand(DemandKey::manual_cli())
+                .await
+                .expect("persist startup demand");
+            if instance_id == failed_instance {
+                availability
+                    .record_convergence_error("durable later-project failure".to_owned())
+                    .await
+                    .expect("persist later-project failure");
+            }
+        }
+
+        let mut manager = ProcessManager::new_with_availability_data_dir_and_clock(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .expect("create startup hydration manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        manager.factories.insert(
+            0,
+            Arc::new(FirstPrepareDelayFactory {
+                creates: Arc::new(AtomicUsize::new(0)),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let manager = Arc::new(manager);
+
+        let convergence = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .restore_policy_owned_projects(RuntimeRestorePlan)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("first runtime restoration reaches the blocking prepare");
+
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&failed_instance)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + Duration::from_secs(30)),
+            }),
+            "the later durable failure is scheduled before the first runtime finishes restoring"
+        );
+        assert!(!manager.project_runtime_exists(failed_instance).await);
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), convergence)
+            .await
+            .expect("startup convergence finishes after release")
+            .expect("startup convergence task succeeds");
     }
 
     #[tokio::test]
