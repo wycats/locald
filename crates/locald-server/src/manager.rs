@@ -278,6 +278,7 @@ enum AvailabilityRetryAttempt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AvailabilityRetryMode {
     Automatic,
+    AutomaticLifecycleOnly,
     Explicit,
     ConfigurationChange,
 }
@@ -1720,6 +1721,9 @@ impl ProcessManager {
         {
             self.clear_availability_retry(instance_id);
             return AvailabilityRetryAttempt::Proceed;
+        }
+        if matches!(retry_mode, AvailabilityRetryMode::AutomaticLifecycleOnly) {
+            return AvailabilityRetryAttempt::Deferred;
         }
         if matches!(
             retry_mode,
@@ -13007,24 +13011,37 @@ impl ProcessManager {
             skipped_busy_retries.push(instance_id);
         }
 
+        let mut retry_instances_seen_this_sweep = HashSet::new();
         if let Some((active_retry, runtime_guard)) = active_retry {
+            retry_instances_seen_this_sweep.insert(active_retry);
             let queued_retries = due_retries
                 .into_iter()
                 .filter(|(_, instance_id)| *instance_id != active_retry)
-                .filter_map(|(_, instance_id)| self.queue_overdue_availability_retry(instance_id))
+                .filter_map(|(_, instance_id)| {
+                    self.queue_overdue_availability_retry(instance_id)
+                        .inspect(|_| {
+                            retry_instances_seen_this_sweep.insert(instance_id);
+                        })
+                })
                 .collect::<Vec<_>>();
             self.converge_background_availability_instance_with_guard(active_retry, runtime_guard)
                 .await;
             drop(queued_retries);
         } else {
             for instance_id in skipped_busy_retries {
+                retry_instances_seen_this_sweep.insert(instance_id);
                 self.defer_overdue_availability_retry(instance_id);
             }
         }
 
         for instance_id in instance_ids {
-            self.converge_background_availability_instance(instance_id)
-                .await;
+            if retry_instances_seen_this_sweep.contains(&instance_id) {
+                self.converge_background_availability_lifecycle_only(instance_id)
+                    .await;
+            } else {
+                self.converge_background_availability_instance(instance_id)
+                    .await;
+            }
             if self.is_shutting_down() {
                 break;
             }
@@ -13035,6 +13052,29 @@ impl ProcessManager {
         &self,
         instance_id: ProjectInstanceId,
     ) -> bool {
+        self.converge_background_availability_instance_with_mode(
+            instance_id,
+            AvailabilityRetryMode::Automatic,
+        )
+        .await
+    }
+
+    async fn converge_background_availability_lifecycle_only(
+        &self,
+        instance_id: ProjectInstanceId,
+    ) -> bool {
+        self.converge_background_availability_instance_with_mode(
+            instance_id,
+            AvailabilityRetryMode::AutomaticLifecycleOnly,
+        )
+        .await
+    }
+
+    async fn converge_background_availability_instance_with_mode(
+        &self,
+        instance_id: ProjectInstanceId,
+        retry_mode: AvailabilityRetryMode,
+    ) -> bool {
         if self.is_shutting_down() {
             return false;
         }
@@ -13042,14 +13082,32 @@ impl ProcessManager {
             self.defer_overdue_availability_retry(instance_id);
             return false;
         };
-        self.converge_background_availability_instance_with_guard(instance_id, runtime_guard)
-            .await
+        self.converge_background_availability_instance_with_guard_and_mode(
+            instance_id,
+            runtime_guard,
+            retry_mode,
+        )
+        .await
     }
 
     async fn converge_background_availability_instance_with_guard(
         &self,
         instance_id: ProjectInstanceId,
+        runtime_guard: OwnedMutexGuard<()>,
+    ) -> bool {
+        self.converge_background_availability_instance_with_guard_and_mode(
+            instance_id,
+            runtime_guard,
+            AvailabilityRetryMode::Automatic,
+        )
+        .await
+    }
+
+    async fn converge_background_availability_instance_with_guard_and_mode(
+        &self,
+        instance_id: ProjectInstanceId,
         _runtime_guard: OwnedMutexGuard<()>,
+        retry_mode: AvailabilityRetryMode,
     ) -> bool {
         if self.is_shutting_down() {
             return false;
@@ -13063,7 +13121,7 @@ impl ProcessManager {
                         false,
                         false,
                         BACKGROUND_SERVICE_READINESS_TIMEOUT,
-                        AvailabilityRetryMode::Automatic,
+                        retry_mode,
                     )
                     .await
                 {
@@ -13838,6 +13896,7 @@ impl ProcessManager {
                 share_service_readiness_budget: matches!(
                     retry_mode,
                     AvailabilityRetryMode::Automatic
+                        | AvailabilityRetryMode::AutomaticLifecycleOnly
                 ) && service_readiness_timeout
                     == BACKGROUND_SERVICE_READINESS_TIMEOUT,
                 retry_mode,
@@ -24650,6 +24709,206 @@ PATH = "/usr/bin:/bin"
         assert!(
             !manager.project_runtime_exists(stop_instance).await,
             "the same maintenance sweep also performs unrelated desired-down convergence"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_sweep_defers_queued_start_but_applies_a_changed_stop() {
+        let dir = tempdir().expect("create lifecycle-only convergence directory");
+        let project_path = dir.path().join("lifecycle-only-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "lifecycle-only",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load lifecycle-only availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("make lifecycle-only project desired up");
+        availability
+            .record_convergence_error("seed queued retry".to_owned())
+            .await
+            .expect("seed queued retry failure");
+        drop(availability);
+        manager.record_availability_retry_failure(instance_id);
+        clock.advance(Duration::from_secs(30));
+
+        manager
+            .converge_background_availability_lifecycle_only(instance_id)
+            .await;
+
+        assert_eq!(
+            manager.availability_retry_deadline(instance_id),
+            Some(clock.time()),
+            "a lifecycle-only pass leaves the due failed start for the next retry sweep"
+        );
+        assert!(
+            !manager.project_runtime_exists(instance_id).await,
+            "the lifecycle-only pass does not re-enter a queued EnsureUp attempt"
+        );
+
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("reload lifecycle-only availability");
+        availability
+            .set_always_on(false)
+            .await
+            .expect("change lifecycle-only project to desired down");
+        drop(availability);
+        manager.services.lock().await.insert_display(
+            "lifecycle-only:web".to_owned(),
+            availability_test_service(instance_id, "lifecycle-only", &project_path, false),
+        );
+        clock.advance(locald_core::SHUTDOWN_COOLDOWN);
+
+        manager
+            .converge_background_availability_lifecycle_only(instance_id)
+            .await;
+
+        assert!(
+            !manager.project_runtime_exists(instance_id).await,
+            "a changed EnsureDown decision remains immediate in the lifecycle-only pass"
+        );
+        assert_eq!(
+            manager.availability_retry_deadline(instance_id),
+            None,
+            "the changed down decision retires the queued start retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_retry_does_not_reenter_after_an_ordinary_slow_start() {
+        let dir = tempdir().expect("create queued retry sweep directory");
+        let mut catalog = Registry::with_path(dir.path().join("catalog.json"));
+        for index in 0..3 {
+            let path = dir.path().join(format!("project-{index}"));
+            std::fs::create_dir_all(&path).expect("create queued retry project");
+            write_availability_worker_config(
+                &path,
+                &format!("project-{index}"),
+                &format!("project-{index}.localhost"),
+                &["web"],
+            );
+            let discovery = Registry::discover(
+                std::fs::canonicalize(&path).expect("canonical queued retry project"),
+            )
+            .await
+            .expect("discover queued retry project");
+            catalog
+                .register_project(discovery, None)
+                .expect("register queued retry project");
+        }
+        catalog.save().await.expect("save queued retry catalog");
+        let ordered_instances = catalog
+            .instances
+            .iter()
+            .map(|(instance_id, record)| {
+                (
+                    *instance_id,
+                    record
+                        .current_path
+                        .clone()
+                        .expect("queued retry fixture is active"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (active_retry, active_path) = ordered_instances[0].clone();
+        let slow_start = ordered_instances[1].0;
+        let queued_retry = ordered_instances[2].0;
+        let availability_data_dir = dir.path().join("availability-data");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+
+        for (instance_id, _) in &ordered_instances {
+            let mut availability = AvailabilityStore::load_with_clock(
+                &availability_data_dir,
+                *instance_id,
+                SharedAvailabilityClock::new(clock.clone()),
+            )
+            .await
+            .expect("load queued retry availability");
+            availability
+                .set_always_on(true)
+                .await
+                .expect("make queued retry fixture desired up");
+            if *instance_id != slow_start {
+                availability
+                    .record_convergence_error("seed shared-deadline retry".to_owned())
+                    .await
+                    .expect("seed shared-deadline retry failure");
+            }
+        }
+
+        let mut manager = ProcessManager::new_with_availability_data_dir_and_clock(
+            dir.path().join("notify.sock"),
+            Arc::new(StateManager::with_path(dir.path().join("state.json"))),
+            Arc::new(Mutex::new(catalog)),
+            Arc::new(Mutex::new(AttachmentStore::new(
+                dir.path().join("attachments.json"),
+            ))),
+            None,
+            availability_data_dir,
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .expect("create queued retry manager");
+        manager.set_host_syncer(Arc::new(NoopHostSyncer));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        manager.factories.insert(
+            0,
+            Arc::new(FirstPrepareDelayFactory {
+                creates: creates.clone(),
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+            }),
+        );
+        manager.record_availability_retry_failure(active_retry);
+        manager.record_availability_retry_failure(queued_retry);
+        clock.advance(Duration::from_secs(30));
+        std::fs::remove_dir_all(active_path).expect("make active retry fail promptly");
+        let manager = Arc::new(manager);
+
+        let sweep = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.converge_all_project_availability().await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("ordinary slow start reaches preparation");
+        clock.advance(Duration::from_secs(2));
+        release_prepare.notify_one();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, sweep)
+            .await
+            .expect("queued retry sweep finishes")
+            .expect("queued retry sweep joins");
+
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            1,
+            "the ordinary slow start is the only service created in this sweep"
+        );
+        assert!(
+            manager.project_runtime_is_ready(slow_start).await,
+            "the unrelated ordinary start still converges"
+        );
+        let queued_state = manager
+            .availability_retries
+            .lock()
+            .expect("retry state mutex poisoned")[&queued_retry];
+        assert_eq!(queued_state.failure_count, 1);
+        assert!(
+            queued_state
+                .next_attempt_at
+                .is_some_and(|deadline| deadline <= clock.time()),
+            "the queued retry remains eligible for the next sweep instead of re-entering this one"
         );
     }
 
