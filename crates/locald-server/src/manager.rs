@@ -80,9 +80,9 @@ const LOG_BUFFER_SIZE: usize = 2000;
 // their endpoint. Keep that work bounded without treating a normal build like
 // the much shorter daemon-proxy startup check.
 const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
-// The periodic sweep visits every managed project serially. Preserve its
-// shorter budget so one cold or stuck project cannot defer convergence for all
-// later project instances for the full foreground readiness window.
+// Background convergence starts every managed project independently. Preserve
+// its shorter budget so each cold or stuck project remains bounded without
+// occupying a foreground readiness window.
 const BACKGROUND_SERVICE_READINESS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const AVAILABILITY_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1537,6 +1537,14 @@ impl ProcessManager {
             return AvailabilityRetryAttempt::Proceed;
         }
         self.automatic_availability_retry_attempt(instance_id)
+    }
+
+    fn convergence_failure_reason(desired_up: bool) -> &'static str {
+        if desired_up {
+            "The last convergence attempt failed; locald will retry automatically. Resume retries immediately."
+        } else {
+            "The last convergence attempt toward stopped failed; locald will retry automatically."
+        }
     }
 
     async fn load_availability(
@@ -10796,7 +10804,8 @@ impl ProcessManager {
         if availability.last_convergence_error().is_some() {
             reasons.push(AvailabilityReason {
                 code: "convergence_failed".to_owned(),
-                message: "The last convergence attempt failed; inspect logs, then resume the project to retry.".to_owned(),
+                message: Self::convergence_failure_reason(availability.desired_up_at(now))
+                    .to_owned(),
             });
         }
         if matches!(state, ProjectLifecycleState::CoolingDown) {
@@ -11938,7 +11947,7 @@ impl ProcessManager {
         if last_error.is_some() {
             reasons.push(AvailabilityReason {
                 code: "convergence_failed".to_owned(),
-                message: "The last convergence attempt failed; locald will retry automatically. Resume retries immediately.".to_owned(),
+                message: Self::convergence_failure_reason(desired).to_owned(),
             });
         }
         if !suppressed.is_empty() {
@@ -12744,35 +12753,41 @@ impl ProcessManager {
             registry.instances.keys().copied().collect::<Vec<_>>()
         };
 
-        for instance_id in instance_ids {
-            if self.is_shutting_down() {
-                break;
-            }
-            match self.availability_is_managed(instance_id).await {
-                Ok(true) => {
-                    match self
-                        .try_converge_managed_instance_with_readiness_timeout(
-                            instance_id,
-                            None,
-                            false,
-                            false,
-                            BACKGROUND_SERVICE_READINESS_TIMEOUT,
-                        )
-                        .await
-                    {
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
-                            warn!("Failed to converge availability for {instance_id}: {error:#}");
+        futures_util::future::join_all(instance_ids.into_iter().map(|instance_id| {
+            let manager = self.clone();
+            async move {
+                if manager.is_shutting_down() {
+                    return;
+                }
+                match manager.availability_is_managed(instance_id).await {
+                    Ok(true) => {
+                        match manager
+                            .try_converge_managed_instance_with_readiness_timeout(
+                                instance_id,
+                                None,
+                                false,
+                                false,
+                                BACKGROUND_SERVICE_READINESS_TIMEOUT,
+                            )
+                            .await
+                        {
+                            Some(Ok(_)) => {}
+                            Some(Err(error)) => {
+                                warn!(
+                                    "Failed to converge availability for {instance_id}: {error:#}"
+                                );
+                            }
+                            None => manager.defer_overdue_availability_retry(instance_id),
                         }
-                        None => self.defer_overdue_availability_retry(instance_id),
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!("Failed to inspect availability for {instance_id}: {error:#}");
                     }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    warn!("Failed to inspect availability for {instance_id}: {error:#}");
-                }
             }
-        }
+        }))
+        .await;
     }
 
     async fn availability_instance_for_path(
@@ -23534,6 +23549,17 @@ PATH = "/usr/bin:/bin"
                 .last_convergence_error()
                 .is_some_and(|message| message.contains("injected stop failure"))
         );
+        let failed_status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read failed desired-down status")
+            .availability
+            .expect("failed desired-down availability status");
+        assert!(failed_status.reasons.iter().any(|reason| {
+            reason.code == "convergence_failed"
+                && reason.message
+                    == "The last convergence attempt toward stopped failed; locald will retry automatically."
+        }));
 
         let replacement = Arc::new(Mutex::new(TestController::new(
             "retry:web",
@@ -38639,7 +38665,7 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
-    async fn background_convergence_bounds_readiness_before_visiting_later_projects() {
+    async fn background_convergence_claims_shared_retry_deadlines_without_serial_drift() {
         let dir = tempdir().expect("create background convergence directory");
         let first_path = dir.path().join("first-project");
         let second_path = dir.path().join("second-project");
@@ -38704,17 +38730,26 @@ PATH = "/usr/bin:/bin"
         }
 
         let availability_data_dir = dir.path().join("availability-data");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
         for instance_id in [*slow_instance, *later_instance] {
-            let mut availability = AvailabilityStore::load(&availability_data_dir, instance_id)
-                .await
-                .expect("load background availability");
+            let mut availability = AvailabilityStore::load_with_clock(
+                &availability_data_dir,
+                instance_id,
+                SharedAvailabilityClock::new(clock.clone()),
+            )
+            .await
+            .expect("load background availability");
             availability
                 .ensure_demand(DemandKey::manual_cli())
                 .await
                 .expect("demand background project");
+            availability
+                .record_convergence_error("seed shared-deadline failure".to_owned())
+                .await
+                .expect("seed shared-deadline failure");
         }
 
-        let mut manager = ProcessManager::new_with_availability_data_dir(
+        let mut manager = ProcessManager::new_with_availability_data_dir_and_clock(
             dir.path().join("notify.sock"),
             Arc::new(StateManager::with_path(dir.path().join("state.json"))),
             Arc::new(Mutex::new(catalog)),
@@ -38723,6 +38758,7 @@ PATH = "/usr/bin:/bin"
             ))),
             None,
             availability_data_dir.clone(),
+            SharedAvailabilityClock::new(clock.clone()),
         )
         .expect("create background convergence manager");
         manager.set_host_syncer(Arc::new(NoopHostSyncer));
@@ -38736,6 +38772,10 @@ PATH = "/usr/bin:/bin"
                 stops: Arc::new(AtomicUsize::new(0)),
             }),
         );
+        for instance_id in [*slow_instance, *later_instance] {
+            manager.record_availability_retry_failure(instance_id);
+        }
+        clock.advance(Duration::from_secs(30));
         for (instance_id, path) in &ordered_instances {
             assert!(
                 manager
@@ -38752,15 +38792,31 @@ PATH = "/usr/bin:/bin"
             let manager = manager.clone();
             async move { manager.converge_all_project_availability().await }
         });
-        let readiness_observed =
-            tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_observed.notified())
-                .await;
-        assert!(
-            readiness_observed.is_ok(),
-            "the first background project enters its readiness wait; creates={}, sweep_finished={}",
-            creates.load(Ordering::SeqCst),
-            sweep.is_finished()
-        );
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, readiness_observed.notified())
+            .await
+            .expect("the slow background project enters its readiness wait");
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            loop {
+                let retries = manager
+                    .availability_retries
+                    .lock()
+                    .expect("retry state mutex poisoned");
+                if [*slow_instance, *later_instance]
+                    .into_iter()
+                    .all(|instance_id| {
+                        retries
+                            .get(&instance_id)
+                            .is_some_and(|retry| retry.next_attempt_at.is_none())
+                    })
+                {
+                    break;
+                }
+                drop(retries);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both same-deadline retries are claimed before either readiness deadline");
         assert_eq!(
             *manager
                 .readiness_wait_timeout
@@ -38791,24 +38847,21 @@ PATH = "/usr/bin:/bin"
         assert_eq!(
             creates.load(Ordering::SeqCst),
             1,
-            "later projects wait only for the bounded background deadline"
+            "the shared runtime projection remains serialized after both retries are claimed"
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::time::resume();
         tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
-            loop {
-                if creates.load(Ordering::SeqCst) == 2 {
-                    break;
-                }
+            while creates.load(Ordering::SeqCst) < 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the sweep visits the later project at the background deadline");
+        .expect("the later claimed retry enters projection after the bounded readiness wait");
         tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, sweep)
             .await
-            .expect("the sweep completes after visiting the later project")
+            .expect("the sweep completes after the slow project's bounded deadline")
             .expect("background convergence task joins");
 
         assert_eq!(creates.load(Ordering::SeqCst), 2);
