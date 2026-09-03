@@ -12852,6 +12852,7 @@ impl ProcessManager {
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         warn!("Failed to converge availability for {instance_id}: {error:#}");
+                        self.defer_overdue_availability_retry(instance_id);
                     }
                     None => self.defer_overdue_availability_retry(instance_id),
                 }
@@ -12859,6 +12860,7 @@ impl ProcessManager {
             Ok(false) => {}
             Err(error) => {
                 warn!("Failed to inspect availability for {instance_id}: {error:#}");
+                self.defer_overdue_availability_retry(instance_id);
             }
         }
     }
@@ -24006,6 +24008,60 @@ PATH = "/usr/bin:/bin"
             AVAILABILITY_BUSY_RETRY_DELAY
         );
         drop(runtime_guard);
+    }
+
+    #[tokio::test]
+    async fn unreadable_availability_defers_an_overdue_retry_without_spinning() {
+        let dir = tempdir().expect("create unreadable retry directory");
+        let project_path = dir.path().join("unreadable-retry-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "unreadable-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load unreadable retry availability");
+        availability
+            .ensure_demand(DemandKey::manual_cli())
+            .await
+            .expect("seed unreadable retry demand");
+        availability
+            .record_convergence_error("seed unreadable retry failure".to_owned())
+            .await
+            .expect("seed unreadable retry failure");
+        manager.record_availability_retry_failure(instance_id);
+        clock.advance(Duration::from_secs(30));
+        drop(availability);
+        std::fs::write(
+            availability_path(&availability_data_dir, instance_id),
+            "{invalid",
+        )
+        .expect("make availability unreadable");
+
+        manager.converge_all_project_availability().await;
+
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + AVAILABILITY_BUSY_RETRY_DELAY),
+            }),
+            "a pre-claim read error preserves the sequence and schedules a nonzero retry"
+        );
+        assert_eq!(
+            manager.availability_maintenance_delay(),
+            AVAILABILITY_BUSY_RETRY_DELAY
+        );
     }
 
     #[tokio::test]
