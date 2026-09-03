@@ -323,12 +323,28 @@ fn print_availability(availability: &ProjectAvailabilityStatus) {
     }
 }
 
-const fn availability_deadline_label(availability: &ProjectAvailabilityStatus) -> &'static str {
-    if availability.desired && availability.last_error.is_some() {
+fn availability_deadline_label(availability: &ProjectAvailabilityStatus) -> &'static str {
+    if availability.desired
+        && availability.last_error.is_some()
+        && !availability_deadline_is_final_demand_expiry(availability)
+    {
         "Next retry"
     } else {
         "Next transition"
     }
+}
+
+fn availability_deadline_is_final_demand_expiry(availability: &ProjectAvailabilityStatus) -> bool {
+    if availability.always_on || availability.paused || availability.demands.is_empty() {
+        return false;
+    }
+    availability
+        .demands
+        .iter()
+        .map(|demand| demand.expires_at)
+        .collect::<Option<Vec<_>>>()
+        .and_then(|expiries| expiries.into_iter().max())
+        == availability.next_transition_at
 }
 
 fn is_semantic_status_url(url: &str) -> bool {
@@ -2531,6 +2547,20 @@ mod tests {
         );
         assert_eq!(
             availability_deadline_label(&availability_status(true, None)),
+            "Next transition"
+        );
+
+        let mut expiry_first = availability_status(true, Some("failed"));
+        expiry_first.next_transition_at = Some(std::time::UNIX_EPOCH);
+        expiry_first
+            .demands
+            .push(locald_core::AvailabilityDemandStatus {
+                kind: locald_core::DemandKind::VsCodeWindow,
+                safe_label: "VS Code window".to_owned(),
+                expires_at: Some(std::time::UNIX_EPOCH),
+            });
+        assert_eq!(
+            availability_deadline_label(&expiry_first),
             "Next transition"
         );
     }

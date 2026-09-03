@@ -87,5 +87,21 @@ describe('project availability presentation', () => {
 			transitionLabel(status({ state: 'cooling_down', desired: false, last_error: 'stopping' }))
 		).toBe('Next transition');
 		expect(transitionLabel(status({ state: 'cooling_down' }))).toBe('Next transition');
+		expect(
+			transitionLabel(
+				status({
+					state: 'failed',
+					last_error: 'failed',
+					demands: [
+						{
+							kind: 'vs_code_window',
+							safe_label: 'VS Code window',
+							expires_at: { secs_since_epoch: 1_000, nanos_since_epoch: 0 }
+						}
+					],
+					next_transition_at: { secs_since_epoch: 1_000, nanos_since_epoch: 0 }
+				})
+			)
+		).toBe('Next transition');
 	});
 });

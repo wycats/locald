@@ -85,6 +85,7 @@ const SERVICE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from
 // later project instances for the full foreground readiness window.
 const BACKGROUND_SERVICE_READINESS_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
+const AVAILABILITY_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const AVAILABILITY_RETRY_DELAYS: [std::time::Duration; 5] = [
     std::time::Duration::from_secs(30),
     std::time::Duration::from_mins(1),
@@ -214,9 +215,11 @@ struct AvailabilityRetryState {
 #[derive(Debug)]
 struct AvailabilityRetryClaim {
     retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
+    retry_changed: Arc<Notify>,
+    clock: SharedAvailabilityClock,
     instance_id: ProjectInstanceId,
     failure_count: usize,
-    restore_at: SystemTime,
+    restore_delay: std::time::Duration,
     armed: bool,
 }
 
@@ -238,8 +241,13 @@ impl Drop for AvailabilityRetryClaim {
         let Some(retry) = retries.get_mut(&self.instance_id) else {
             return;
         };
-        if retry.failure_count == self.failure_count && retry.next_attempt_at.is_none() {
-            retry.next_attempt_at = Some(self.restore_at);
+        let restored = retry.failure_count == self.failure_count && retry.next_attempt_at.is_none();
+        if restored {
+            retry.next_attempt_at = Some(self.clock.now() + self.restore_delay);
+        }
+        drop(retries);
+        if restored {
+            self.retry_changed.notify_one();
         }
     }
 }
@@ -255,6 +263,7 @@ enum AvailabilityRetryAttempt {
 enum AvailabilityRetryMode {
     Automatic,
     Explicit,
+    ConfigurationChange,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -1176,6 +1185,7 @@ pub struct ProcessManager {
     config_transition_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     availability_coordinators: Arc<Mutex<HashMap<ProjectInstanceId, Arc<AvailabilityCoordinator>>>>,
     availability_retries: Arc<StdMutex<HashMap<ProjectInstanceId, AvailabilityRetryState>>>,
+    availability_retry_changed: Arc<Notify>,
     availability_transition_gate: Arc<RwLock<()>>,
     pending_config_reloads: Arc<Mutex<HashSet<ProjectInstanceId>>>,
     forgotten_reload_paths: Arc<Mutex<HashSet<PathBuf>>>,
@@ -1376,10 +1386,15 @@ impl ProcessManager {
     }
 
     fn clear_availability_retry(&self, instance_id: ProjectInstanceId) {
-        self.availability_retries
+        let removed = self
+            .availability_retries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&instance_id);
+            .remove(&instance_id)
+            .is_some();
+        if removed {
+            self.availability_retry_changed.notify_one();
+        }
     }
 
     fn record_availability_retry_failure(&self, instance_id: ProjectInstanceId) {
@@ -1398,6 +1413,8 @@ impl ProcessManager {
                 next_attempt_at: Some(now + Self::availability_retry_delay(failure_count)),
             },
         );
+        drop(retries);
+        self.availability_retry_changed.notify_one();
     }
 
     fn automatic_availability_retry_attempt(
@@ -1409,26 +1426,35 @@ impl ProcessManager {
             .availability_retries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inserted = !retries.contains_key(&instance_id);
         let retry = retries
             .entry(instance_id)
             .or_insert_with(|| AvailabilityRetryState {
                 failure_count: 1,
                 next_attempt_at: Some(now + Self::availability_retry_delay(1)),
             });
-        match retry.next_attempt_at {
+        let attempt = match retry.next_attempt_at {
             Some(next_attempt_at) if now >= next_attempt_at => {
                 let failure_count = retry.failure_count;
                 retry.next_attempt_at = None;
                 AvailabilityRetryAttempt::Claimed(AvailabilityRetryClaim {
                     retries: self.availability_retries.clone(),
+                    retry_changed: self.availability_retry_changed.clone(),
+                    clock: self.availability_clock.clone(),
                     instance_id,
                     failure_count,
-                    restore_at: now + Self::availability_retry_delay(failure_count),
+                    restore_delay: Self::availability_retry_delay(failure_count),
                     armed: true,
                 })
             }
             Some(_) | None => AvailabilityRetryAttempt::Deferred,
+        };
+        let changed = inserted || matches!(&attempt, AvailabilityRetryAttempt::Claimed(_));
+        drop(retries);
+        if changed {
+            self.availability_retry_changed.notify_one();
         }
+        attempt
     }
 
     fn availability_retry_deadline(&self, instance_id: ProjectInstanceId) -> Option<SystemTime> {
@@ -1437,6 +1463,33 @@ impl ProcessManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&instance_id)
             .and_then(|retry| retry.next_attempt_at)
+    }
+
+    fn availability_maintenance_delay(&self) -> std::time::Duration {
+        let now = self.availability_now();
+        self.availability_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(|retry| retry.next_attempt_at)
+            .map(|deadline| deadline.duration_since(now).unwrap_or_default())
+            .min()
+            .map_or(AVAILABILITY_MAINTENANCE_INTERVAL, |delay| {
+                delay.min(AVAILABILITY_MAINTENANCE_INTERVAL)
+            })
+    }
+
+    pub(crate) async fn wait_for_availability_maintenance(&self) {
+        let periodic_deadline = tokio::time::Instant::now() + AVAILABILITY_MAINTENANCE_INTERVAL;
+        loop {
+            let retry_changed = self.availability_retry_changed.notified();
+            let retry_deadline =
+                tokio::time::Instant::now() + self.availability_maintenance_delay();
+            tokio::select! {
+                () = tokio::time::sleep_until(periodic_deadline.min(retry_deadline)) => return,
+                () = retry_changed => {}
+            }
+        }
     }
 
     fn availability_retry_attempt(
@@ -1452,7 +1505,10 @@ impl ProcessManager {
             self.clear_availability_retry(instance_id);
             return AvailabilityRetryAttempt::Proceed;
         }
-        if matches!(retry_mode, AvailabilityRetryMode::Explicit) {
+        if matches!(
+            retry_mode,
+            AvailabilityRetryMode::Explicit | AvailabilityRetryMode::ConfigurationChange
+        ) {
             self.clear_availability_retry(instance_id);
             return AvailabilityRetryAttempt::Proceed;
         }
@@ -1721,6 +1777,7 @@ impl ProcessManager {
             config_transition_locks: Arc::new(Mutex::new(HashMap::new())),
             availability_coordinators: Arc::new(Mutex::new(HashMap::new())),
             availability_retries: Arc::new(StdMutex::new(HashMap::new())),
+            availability_retry_changed: Arc::new(Notify::new()),
             availability_transition_gate: Arc::new(RwLock::new(())),
             pending_config_reloads: Arc::new(Mutex::new(HashSet::new())),
             forgotten_reload_paths: Arc::new(Mutex::new(HashSet::new())),
@@ -11921,11 +11978,7 @@ impl ProcessManager {
             });
         }
 
-        let next_transition_at = if convergence_failed {
-            retry_deadline
-        } else if matches!(state, ProjectLifecycleState::CoolingDown) {
-            availability.shutdown_cooldown_until()
-        } else if desired
+        let final_demand_expiry = if desired
             && !paused
             && !availability.always_on()
             && has_effective_demand
@@ -11943,6 +11996,16 @@ impl ProcessManager {
                 .max()
         } else {
             None
+        };
+        let next_transition_at = if convergence_failed {
+            match (retry_deadline, final_demand_expiry) {
+                (Some(retry), Some(expiry)) => Some(retry.min(expiry)),
+                (retry, expiry) => retry.or(expiry),
+            }
+        } else if matches!(state, ProjectLifecycleState::CoolingDown) {
+            availability.shutdown_cooldown_until()
+        } else {
+            final_demand_expiry
         };
         let demands = live_demands
             .into_iter()
@@ -13268,7 +13331,7 @@ impl ProcessManager {
                         apply_config_when_up: true,
                         defer_config_reload_during_cooldown: true,
                         service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
-                        retry_mode: AvailabilityRetryMode::Automatic,
+                        retry_mode: AvailabilityRetryMode::ConfigurationChange,
                     },
                 )
                 .await?;
@@ -13296,7 +13359,7 @@ impl ProcessManager {
                         apply_config_when_up: true,
                         defer_config_reload_during_cooldown: true,
                         service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
-                        retry_mode: AvailabilityRetryMode::Automatic,
+                        retry_mode: AvailabilityRetryMode::ConfigurationChange,
                     },
                 )
                 .await?;
@@ -23626,6 +23689,148 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn watched_configuration_change_bypasses_a_stale_retry_deadline() {
+        let dir = tempdir().expect("create watched retry directory");
+        let project_path = dir.path().join("watched-retry-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "watched-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        manager.factories.insert(
+            0,
+            Arc::new(RetryPrepareFactory {
+                failure_consumed: Arc::new(AtomicBool::new(false)),
+                stop_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        write_availability_worker_config(
+            &project_path,
+            "watched-retry",
+            "watched-retry.localhost",
+            &["first", "second"],
+        );
+
+        manager
+            .project_ensure_availability(&project_path, DemandKey::manual_cli())
+            .await
+            .expect_err("initial convergence records a retryable failure");
+        assert_eq!(
+            manager
+                .availability_retry_deadline(instance_id)
+                .expect("initial retry deadline"),
+            clock.time() + Duration::from_secs(30)
+        );
+
+        write_availability_worker_config(
+            &project_path,
+            "watched-retry",
+            "watched-retry.localhost",
+            &["first", "second", "third"],
+        );
+        manager
+            .reload_catalogued_instance(instance_id, project_path.clone())
+            .await
+            .expect("watched configuration change retries immediately");
+
+        assert!(manager.project_runtime_is_ready(instance_id).await);
+        assert_eq!(manager.availability_retry_deadline(instance_id), None);
+        assert_eq!(
+            AvailabilityStore::load(&availability_data_dir, instance_id)
+                .await
+                .expect("load watched retry availability")
+                .snapshot()
+                .await
+                .expect("read watched retry availability")
+                .last_convergence_error(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn status_prefers_final_demand_expiry_when_it_precedes_a_retry() {
+        let dir = tempdir().expect("create retry transition directory");
+        let project_path = dir.path().join("retry-transition-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "retry-transition",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load retry transition availability");
+        availability
+            .ensure_demand(
+                DemandKey::vs_code_window("expiring-window").expect("construct editor demand"),
+            )
+            .await
+            .expect("seed finite demand");
+        availability
+            .record_convergence_error("seed convergence failure".to_owned())
+            .await
+            .expect("seed convergence failure");
+
+        manager.record_availability_retry_failure(instance_id);
+        let early_retry = manager
+            .project_availability_status(instance_id, CatalogPresence::Active, &[])
+            .await
+            .expect("read early retry status")
+            .expect("early retry availability status");
+        assert_eq!(
+            early_retry.next_transition_at,
+            Some(clock.time() + Duration::from_secs(30)),
+            "a retry remains the next event while it precedes demand expiry"
+        );
+
+        manager.record_availability_retry_failure(instance_id);
+        manager.record_availability_retry_failure(instance_id);
+        manager.record_availability_retry_failure(instance_id);
+        let expiry_first = manager
+            .project_availability_status(instance_id, CatalogPresence::Active, &[])
+            .await
+            .expect("read expiry-first status")
+            .expect("expiry-first availability status");
+        assert_eq!(
+            expiry_first.next_transition_at,
+            Some(clock.time() + locald_core::VSCODE_DEMAND_TTL),
+            "the final demand expiry supersedes a retry that can no longer occur"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_delay_tracks_the_earliest_retry_deadline() {
+        let dir = tempdir().expect("create maintenance deadline directory");
+        let project_path = dir.path().join("maintenance-deadline-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, _availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "maintenance-deadline",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+
+        assert_eq!(
+            manager.availability_maintenance_delay(),
+            AVAILABILITY_MAINTENANCE_INTERVAL
+        );
+        manager.record_availability_retry_failure(instance_id);
+        clock.advance(Duration::from_secs(11));
+        assert_eq!(
+            manager.availability_maintenance_delay(),
+            Duration::from_secs(19),
+            "maintenance wakes at the published retry deadline rather than the next fixed sweep"
+        );
+    }
+
+    #[tokio::test]
     async fn status_during_blocked_explicit_retry_does_not_advance_the_reset_backoff() {
         let dir = tempdir().expect("create blocked explicit retry directory");
         let project_path = dir.path().join("blocked-explicit-retry-project");
@@ -23651,6 +23856,13 @@ PATH = "/usr/bin:/bin"
             .ensure_demand(DemandKey::manual_cli())
             .await
             .expect("seed blocked explicit retry demand");
+        let demand_expiry = availability
+            .snapshot()
+            .await
+            .expect("read blocked explicit retry demand")
+            .demands()[0]
+            .expires_at()
+            .expect("manual demand expires");
         availability
             .record_convergence_error("seed retry failure".to_owned())
             .await
@@ -23702,8 +23914,9 @@ PATH = "/usr/bin:/bin"
             Some("seed retry failure")
         );
         assert_eq!(
-            in_flight_status.next_transition_at, None,
-            "a convergence failure projects only its actual retry schedule"
+            in_flight_status.next_transition_at,
+            Some(demand_expiry),
+            "an in-flight retry still projects the finite demand's lifecycle deadline"
         );
         assert!(
             manager
@@ -23846,6 +24059,13 @@ PATH = "/usr/bin:/bin"
             .ensure_demand(DemandKey::manual_cli())
             .await
             .expect("seed blocked automatic retry demand");
+        let demand_expiry = availability
+            .snapshot()
+            .await
+            .expect("read blocked automatic retry demand")
+            .demands()[0]
+            .expires_at()
+            .expect("manual demand expires");
         availability
             .record_convergence_error("seed automatic retry failure".to_owned())
             .await
@@ -23894,7 +24114,7 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("poll status during blocked automatic retry")
             .expect("blocked automatic retry availability status");
-        assert_eq!(in_flight_status.next_transition_at, None);
+        assert_eq!(in_flight_status.next_transition_at, Some(demand_expiry));
 
         manager.converge_all_project_availability().await;
         assert_eq!(
@@ -23967,6 +24187,13 @@ PATH = "/usr/bin:/bin"
             .ensure_demand(DemandKey::manual_cli())
             .await
             .expect("seed cancelled automatic retry demand");
+        let demand_expiry = availability
+            .snapshot()
+            .await
+            .expect("read cancelled automatic retry demand")
+            .demands()[0]
+            .expires_at()
+            .expect("manual demand expires");
         availability
             .record_convergence_error("seed cancelled automatic retry failure".to_owned())
             .await
@@ -23999,7 +24226,9 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("poll status before automatic retry cancellation")
             .expect("cancelled automatic retry availability status");
-        assert_eq!(in_flight_status.next_transition_at, None);
+        assert_eq!(in_flight_status.next_transition_at, Some(demand_expiry));
+
+        clock.advance(Duration::from_mins(5));
 
         retry.abort();
         assert!(

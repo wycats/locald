@@ -78,5 +78,20 @@ export function formatTransition(
 export function transitionLabel(
 	availability: ProjectAvailabilityStatus | null | undefined
 ): 'Next retry' | 'Next transition' {
-	return availability?.desired && availability.last_error ? 'Next retry' : 'Next transition';
+	if (!availability?.desired || !availability.last_error) return 'Next transition';
+	if (availability.always_on || availability.paused || availability.demands.length === 0) {
+		return 'Next retry';
+	}
+	const expiries = availability.demands.map((demand) => demand.expires_at);
+	if (expiries.some((expiry) => expiry === undefined)) return 'Next retry';
+	const finalExpiry = Math.max(
+		...expiries.map(
+			(expiry) => expiry!.secs_since_epoch * 1_000 + expiry!.nanos_since_epoch / 1_000_000
+		)
+	);
+	const deadline = availability.next_transition_at;
+	const deadlineMillis = deadline
+		? deadline.secs_since_epoch * 1_000 + deadline.nanos_since_epoch / 1_000_000
+		: null;
+	return deadlineMillis === finalExpiry ? 'Next transition' : 'Next retry';
 }

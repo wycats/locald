@@ -1060,7 +1060,7 @@ async fn async_main(
     let manager_reaper = manager.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            manager_reaper.wait_for_availability_maintenance().await;
             if manager_reaper.is_shutting_down() {
                 break;
             }
