@@ -998,6 +998,7 @@ struct ConfigApplyOptions<'a> {
     start_services: bool,
     service_activation: Option<&'a str>,
     service_readiness_timeout: std::time::Duration,
+    share_service_readiness_budget: bool,
     agent_conversation: Option<&'a AgentConversationKey>,
     preserve_projection_for_config: Option<&'a LocaldConfig>,
     publisher_cold_admission: Option<PublisherColdAdmission<'a>>,
@@ -1009,6 +1010,7 @@ impl<'a> ConfigApplyOptions<'a> {
             start_services,
             service_activation,
             service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
+            share_service_readiness_budget: false,
             agent_conversation: None,
             preserve_projection_for_config: None,
             publisher_cold_admission: None,
@@ -1017,11 +1019,13 @@ impl<'a> ConfigApplyOptions<'a> {
 
     const fn start_all_with_readiness_timeout(
         service_readiness_timeout: std::time::Duration,
+        share_service_readiness_budget: bool,
     ) -> Self {
         Self {
             start_services: true,
             service_activation: None,
             service_readiness_timeout,
+            share_service_readiness_budget,
             agent_conversation: None,
             preserve_projection_for_config: None,
             publisher_cold_admission: None,
@@ -1086,6 +1090,7 @@ struct AvailabilityConvergenceOptions {
     apply_config_when_up: bool,
     defer_config_reload_during_cooldown: bool,
     service_readiness_timeout: std::time::Duration,
+    share_service_readiness_budget: bool,
     retry_mode: AvailabilityRetryMode,
 }
 
@@ -6223,25 +6228,25 @@ impl ProcessManager {
         expected_instance: Option<ProjectInstanceId>,
         reject_forgotten: bool,
     ) -> Result<()> {
-        self.apply_config_for_instance_with_readiness_timeout(
+        self.apply_config_for_instance_with_options(
             path,
             event_tx,
             verbose,
             expected_instance,
             reject_forgotten,
-            SERVICE_READINESS_TIMEOUT,
+            ConfigApplyOptions::foreground(true, None),
         )
         .await
     }
 
-    async fn apply_config_for_instance_with_readiness_timeout(
+    async fn apply_config_for_instance_with_options(
         &self,
         path: PathBuf,
         event_tx: Option<tokio::sync::mpsc::Sender<BootEvent>>,
         verbose: bool,
         expected_instance: Option<ProjectInstanceId>,
         reject_forgotten: bool,
-        service_readiness_timeout: std::time::Duration,
+        options: ConfigApplyOptions<'_>,
     ) -> Result<()> {
         let (path, transition_lock) = self.transition_lock_for_path(&path).await;
         let _transition_guard = transition_lock.lock().await;
@@ -6254,7 +6259,7 @@ impl ProcessManager {
             event_tx,
             verbose,
             expected_instance.map(ConfigIdentityExpectation::Existing),
-            ConfigApplyOptions::start_all_with_readiness_timeout(service_readiness_timeout),
+            options,
         )
         .await
         .map(|_| ())
@@ -6272,6 +6277,7 @@ impl ProcessManager {
             start_services,
             service_activation,
             service_readiness_timeout,
+            share_service_readiness_budget,
             agent_conversation,
             preserve_projection_for_config,
             publisher_cold_admission,
@@ -6982,6 +6988,9 @@ impl ProcessManager {
             });
         }
 
+        let service_readiness_deadline = share_service_readiness_budget
+            .then(|| tokio::time::Instant::now() + service_readiness_timeout);
+
         for service_name in sorted_services {
             anyhow::ensure!(
                 self.path_matches_instance(&path, instance_id).await,
@@ -7024,10 +7033,16 @@ impl ProcessManager {
                     match health_status {
                         HealthStatus::Healthy => {}
                         HealthStatus::Starting => {
+                            let readiness_timeout = service_readiness_deadline.map_or(
+                                service_readiness_timeout,
+                                |deadline| {
+                                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                                },
+                            );
                             self.wait_for_health_with_timeout(
                                 &name,
                                 instance_id,
-                                service_readiness_timeout,
+                                readiness_timeout,
                             )
                             .await?;
                         }
@@ -7411,8 +7426,12 @@ impl ProcessManager {
 
             // Wait for health before starting next service (which might depend on this one)
             info!("Waiting for service {} to be ready...", name);
+            let readiness_timeout = service_readiness_deadline
+                .map_or(service_readiness_timeout, |deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                });
             if let Err(e) = self
-                .wait_for_health_with_timeout(&name, instance_id, service_readiness_timeout)
+                .wait_for_health_with_timeout(&name, instance_id, readiness_timeout)
                 .await
             {
                 error!("Dependency failed: {}", e);
@@ -11941,7 +11960,13 @@ impl ProcessManager {
         });
         let desired = availability.desired_up_at(now);
         let paused = availability.is_paused();
-        let last_error = availability.last_convergence_error().map(ToOwned::to_owned);
+        let recovered_runtime = presence == CatalogPresence::Active
+            && desired
+            && runtime_ready
+            && self.availability_retry_deadline(instance_id).is_some();
+        let last_error = (!recovered_runtime)
+            .then(|| availability.last_convergence_error().map(ToOwned::to_owned))
+            .flatten();
         let convergence_failed = desired && last_error.is_some();
         let retry_deadline = convergence_failed
             .then(|| self.availability_retry_deadline(instance_id))
@@ -13493,6 +13518,7 @@ impl ProcessManager {
                         apply_config_when_up: true,
                         defer_config_reload_during_cooldown: true,
                         service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
+                        share_service_readiness_budget: false,
                         retry_mode: AvailabilityRetryMode::ConfigurationChange,
                     },
                 )
@@ -13521,6 +13547,7 @@ impl ProcessManager {
                         apply_config_when_up: true,
                         defer_config_reload_during_cooldown: true,
                         service_readiness_timeout: SERVICE_READINESS_TIMEOUT,
+                        share_service_readiness_budget: false,
                         retry_mode: AvailabilityRetryMode::ConfigurationChange,
                     },
                 )
@@ -13658,6 +13685,11 @@ impl ProcessManager {
                 apply_config_when_up,
                 defer_config_reload_during_cooldown: false,
                 service_readiness_timeout,
+                share_service_readiness_budget: matches!(
+                    retry_mode,
+                    AvailabilityRetryMode::Automatic
+                ) && service_readiness_timeout
+                    == BACKGROUND_SERVICE_READINESS_TIMEOUT,
                 retry_mode,
             },
         )
@@ -13795,13 +13827,16 @@ impl ProcessManager {
                         || !self.project_runtime_is_ready(instance_id).await;
                     if should_apply {
                         let action = async {
-                            self.apply_config_for_instance_with_readiness_timeout(
+                            self.apply_config_for_instance_with_options(
                                 project_path,
                                 event_tx.clone(),
                                 options.verbose,
                                 Some(instance_id),
                                 false,
-                                options.service_readiness_timeout,
+                                ConfigApplyOptions::start_all_with_readiness_timeout(
+                                    options.service_readiness_timeout,
+                                    options.share_service_readiness_budget,
+                                ),
                             )
                             .await?;
                             anyhow::ensure!(
@@ -13988,6 +14023,9 @@ impl ProcessManager {
         let record_durability_error = match Self::capture_availability_publication(publication) {
             Ok((_, durability_error)) => durability_error,
             Err(record_error) => {
+                if matches!(decision, ConvergenceDecision::EnsureUp) && retry_claim.is_none() {
+                    self.record_availability_retry_failure(instance_id);
+                }
                 return Err(error.context(format!(
                     "failed to record availability convergence error: {record_error}"
                 )));
@@ -15229,6 +15267,13 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct FirstPrepareDelayFactory {
+        creates: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Debug)]
     struct BlockingFailPrepareFactory {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -15300,6 +15345,48 @@ mod tests {
                 start_count: Some(self.start_count.clone()),
                 fail_prepare: false,
                 stop_count: self.stop_count.clone(),
+            }))
+        }
+    }
+
+    impl ServiceFactory for FirstPrepareDelayFactory {
+        fn can_handle(&self, config: &ServiceConfig) -> bool {
+            matches!(config, ServiceConfig::Typed(TypedServiceConfig::Worker(_)))
+        }
+
+        fn create(
+            &self,
+            name: String,
+            _config: &ServiceConfig,
+            _ctx: &ServiceContext,
+        ) -> Arc<Mutex<dyn ServiceController>> {
+            let creation = self.creates.fetch_add(1, Ordering::SeqCst);
+            let delayed = creation == 0;
+            let pid = 80 + u32::try_from(creation).expect("creation count fits in a PID");
+            Arc::new(Mutex::new(ScriptedController {
+                id: name,
+                state: RuntimeState {
+                    pid: None,
+                    port: None,
+                    status: ServiceState::Building,
+                    health_status: HealthStatus::Unknown,
+                },
+                process_identity: None,
+                spawn_identity: Some((
+                    pid,
+                    test_process_identity(
+                        3_000 + u64::try_from(creation).expect("creation count fits in u64"),
+                        i32::try_from(pid).expect("fixture PID fits i32"),
+                        "/test/first-prepare-delay-worker",
+                    ),
+                )),
+                prepare_entered: delayed.then(|| self.entered.clone()),
+                release_prepare: delayed.then(|| self.release.clone()),
+                start_entered: None,
+                start_release: None,
+                start_count: None,
+                fail_prepare: false,
+                stop_count: Arc::new(AtomicUsize::new(0)),
             }))
         }
     }
@@ -23960,6 +24047,90 @@ PATH = "/usr/bin:/bin"
     }
 
     #[tokio::test]
+    async fn late_runtime_readiness_hides_stale_scheduled_failure() {
+        let dir = tempdir().expect("create late readiness directory");
+        let project_path = dir.path().join("late-readiness-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "late-readiness",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load late readiness availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable late readiness Always On");
+        availability
+            .record_convergence_error("seed late readiness failure".to_owned())
+            .await
+            .expect("seed late readiness convergence failure");
+        manager.record_availability_retry_failure(instance_id);
+
+        let mut service =
+            availability_test_service(instance_id, "late-readiness", &project_path, false);
+        service.sticky_port = Some(3000);
+        service.health_status = HealthStatus::Starting;
+        let controller = match &service.runtime_state {
+            ServiceRuntime::Controller(controller) => controller.clone(),
+            ServiceRuntime::None => panic!("late readiness fixture has a controller"),
+        };
+        let requirement =
+            ReadinessRequirement::for_service(&service.service_config, service.sticky_port)
+                .expect("derive late readiness requirement");
+        manager
+            .services
+            .lock()
+            .await
+            .insert_display("late-readiness:web".to_owned(), service);
+
+        assert!(
+            manager
+                .publish_successful_readiness_probe("web", instance_id, &controller, &requirement,)
+                .await,
+            "the late successful probe updates the owned runtime"
+        );
+        assert_eq!(
+            manager.availability_retry_deadline(instance_id),
+            Some(clock.time() + Duration::from_secs(30)),
+            "late readiness leaves the authoritative retry schedule intact for cleanup convergence"
+        );
+
+        let status = manager
+            .project_status(&project_path)
+            .await
+            .expect("read late readiness status")
+            .availability
+            .expect("late readiness availability status");
+        assert_eq!(status.state, ProjectLifecycleState::Ready);
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.next_transition_at, None);
+        assert!(
+            status
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "convergence_failed"),
+            "a fully ready desired runtime no longer advertises the stale failure"
+        );
+        assert_eq!(
+            AvailabilityStore::load(&availability_data_dir, instance_id)
+                .await
+                .expect("reload late readiness availability")
+                .snapshot()
+                .await
+                .expect("read durable late readiness state")
+                .last_convergence_error(),
+            Some("seed late readiness failure"),
+            "status becomes truthful before the immediate convergence pass clears durable history"
+        );
+    }
+
+    #[tokio::test]
     async fn maintenance_delay_tracks_the_earliest_retry_deadline() {
         let dir = tempdir().expect("create maintenance deadline directory");
         let project_path = dir.path().join("maintenance-deadline-project");
@@ -24438,6 +24609,85 @@ PATH = "/usr/bin:/bin"
                 next_attempt_at: Some(clock.time() + Duration::from_mins(1)),
             }),
             "a published failure advances the claimed retry instead of restoring its old deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepublication_failure_preserves_or_recreates_retry_bookkeeping() {
+        let dir = tempdir().expect("create prepublication retry directory");
+        let project_path = dir.path().join("prepublication-retry-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "prepublication-retry",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        let publication_path = availability_path(&availability_data_dir, instance_id);
+
+        manager.record_availability_retry_failure(instance_id);
+        manager.clear_availability_retry(instance_id);
+        let explicit_error = manager
+            .finish_failed_availability_action(
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                anyhow::anyhow!("injected explicit convergence failure"),
+                Err(AvailabilityError::Io {
+                    operation: "publish test availability",
+                    path: publication_path.clone(),
+                    source: std::io::Error::other("injected prepublication failure"),
+                }),
+                None,
+            )
+            .expect_err("surface explicit prepublication failure");
+        assert!(format!("{explicit_error:#}").contains("failed to record availability"));
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + Duration::from_secs(30)),
+            }),
+            "an explicit attempt recreates its retry schedule when failure publication never begins"
+        );
+
+        clock.advance(Duration::from_secs(30));
+        let mut claim = match manager.automatic_availability_retry_attempt(instance_id) {
+            AvailabilityRetryAttempt::Claimed(claim) => claim,
+            other => panic!("expected automatic retry claim, got {other:?}"),
+        };
+        let automatic_error = manager
+            .finish_failed_availability_action(
+                instance_id,
+                ConvergenceDecision::EnsureUp,
+                anyhow::anyhow!("injected automatic convergence failure"),
+                Err(AvailabilityError::Io {
+                    operation: "publish test availability",
+                    path: publication_path,
+                    source: std::io::Error::other("injected automatic prepublication failure"),
+                }),
+                Some(&mut claim),
+            )
+            .expect_err("surface automatic prepublication failure");
+        drop(claim);
+        assert!(format!("{automatic_error:#}").contains("failed to record availability"));
+        assert_eq!(
+            manager
+                .availability_retries
+                .lock()
+                .expect("retry state mutex poisoned")
+                .get(&instance_id)
+                .copied(),
+            Some(AvailabilityRetryState {
+                failure_count: 1,
+                next_attempt_at: Some(clock.time() + Duration::from_secs(30)),
+            }),
+            "an automatic attempt restores its claimed retry schedule when publication fails"
         );
     }
 
@@ -39130,12 +39380,15 @@ PATH = "/usr/bin:/bin"
             .clone()
             .try_lock_owned()
             .expect("a queued background retry keeps its coordinator available");
-        assert_eq!(
-            *manager
-                .readiness_wait_timeout
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some(BACKGROUND_SERVICE_READINESS_TIMEOUT)
+        let first_timeout = manager
+            .readiness_wait_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("the first service receives a readiness budget");
+        assert!(
+            first_timeout <= BACKGROUND_SERVICE_READINESS_TIMEOUT
+                && first_timeout > Duration::from_secs(29),
+            "the first service receives the attempt budget remaining after setup: {first_timeout:?}"
         );
         assert_eq!(creates.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -39225,7 +39478,7 @@ PATH = "/usr/bin:/bin"
         assert!(
             slow_snapshot
                 .last_convergence_error()
-                .is_some_and(|message| message.contains("timed out after 30s"))
+                .is_some_and(|message| message.contains("timed out after"))
         );
         let later_snapshot = AvailabilityStore::load(&availability_data_dir, *later_instance)
             .await
@@ -39316,6 +39569,131 @@ PATH = "/usr/bin:/bin"
                 .try_allocate_specific(slow_port)
                 .is_some(),
             "stopping the retained runtime releases its allocator reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_convergence_shares_one_readiness_budget_across_services() {
+        let dir = tempdir().expect("create shared readiness budget directory");
+        let project_path = dir.path().join("shared-readiness-budget-project");
+        let clock = FakeAvailabilityClock::new(TEST_AVAILABILITY_START_SECONDS);
+        let (mut manager, instance_id, availability_data_dir) = availability_manager_with_clock(
+            dir.path(),
+            &project_path,
+            "shared-readiness-budget",
+            SharedAvailabilityClock::new(clock.clone()),
+        )
+        .await;
+        tokio::fs::write(
+            project_path.join("locald.toml"),
+            r#"
+[project]
+name = "shared-readiness-budget"
+domain = "shared-readiness-budget.localhost"
+
+[services.db]
+type = "worker"
+command = "unused-by-test-factory"
+
+[services.db.env]
+PATH = "/usr/bin:/bin"
+
+[services.web]
+type = "worker"
+command = "unused-by-test-factory"
+depends_on = ["db"]
+health_check = "false"
+
+[services.web.env]
+PATH = "/usr/bin:/bin"
+"#,
+        )
+        .await
+        .expect("write shared readiness budget config");
+        let mut availability = manager
+            .load_availability(instance_id)
+            .await
+            .expect("load shared readiness budget availability");
+        availability
+            .set_always_on(true)
+            .await
+            .expect("enable shared readiness budget Always On");
+        availability
+            .record_convergence_error("seed shared readiness budget failure".to_owned())
+            .await
+            .expect("seed shared readiness budget failure");
+
+        let creates = Arc::new(AtomicUsize::new(0));
+        let prepare_entered = Arc::new(tokio::sync::Notify::new());
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+        manager.set_readiness_wait_hook(Arc::new(tokio::sync::Notify::new()));
+        manager.factories.insert(
+            0,
+            Arc::new(FirstPrepareDelayFactory {
+                creates: creates.clone(),
+                entered: prepare_entered.clone(),
+                release: release_prepare.clone(),
+            }),
+        );
+        manager.record_availability_retry_failure(instance_id);
+        clock.advance(Duration::from_secs(30));
+
+        let sweep = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.converge_all_project_availability().await }
+        });
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, prepare_entered.notified())
+            .await
+            .expect("the first service enters preparation");
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        release_prepare.notify_one();
+        tokio::time::resume();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, async {
+            while creates.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the dependent enters readiness within the shared budget");
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            2,
+            "the dependent endpoint starts after the worker finishes preparation"
+        );
+        let remaining_timeout = manager
+            .readiness_wait_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("the service sequence enters readiness after preparation");
+        assert!(
+            remaining_timeout <= Duration::from_secs(10),
+            "the service sequence receives only the attempt budget that remains: {remaining_timeout:?}"
+        );
+        assert!(
+            remaining_timeout > Duration::ZERO,
+            "the first service leaves some readiness budget for its dependent"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(remaining_timeout + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        tokio::time::timeout(TEST_STARTUP_BOUNDARY_TIMEOUT, sweep)
+            .await
+            .expect("the background attempt completes at its shared deadline")
+            .expect("shared readiness budget task joins");
+
+        assert!(
+            AvailabilityStore::load(&availability_data_dir, instance_id)
+                .await
+                .expect("reload shared readiness budget availability")
+                .snapshot()
+                .await
+                .expect("read shared readiness budget failure")
+                .last_convergence_error()
+                .is_some_and(|message| message.contains("timed out after")),
+            "the second unready service fails within the single background attempt budget"
         );
     }
 
@@ -39649,7 +40027,10 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("join timed EnsureProject")
             .expect_err("unbound assigned endpoint times out");
-        assert!(format!("{error:#}").contains("timed out after 300s"));
+        assert!(
+            format!("{error:#}").contains("timed out after 300s"),
+            "unexpected readiness failure: {error:#}"
+        );
         assert!(
             manager
                 .ensure_project_superseded_result(&project_path, &error)
@@ -39786,7 +40167,10 @@ PATH = "/usr/bin:/bin"
             .await
             .expect("first ensure task joins")
             .expect_err("first controller never satisfies its readiness probe");
-        assert!(format!("{error:#}").contains("timed out after 300s"));
+        assert!(
+            format!("{error:#}").contains("timed out after 300s"),
+            "unexpected readiness failure: {error:#}"
+        );
 
         let mut availability = manager
             .load_availability(instance_id)
